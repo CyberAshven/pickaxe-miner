@@ -14,7 +14,7 @@ pub fn secp_ctx() -> Secp256k1<secp256k1::All> {
 /// Derive compressed pubkey bytes (33) from a 32-byte secret. Never log the secret.
 pub fn compressed_pubkey(sk_bytes: &[u8; 32]) -> Result<[u8; 33], String> {
     let _secp = secp_ctx();
-    let sk = SecretKey::from_slice(sk_bytes).map_err(|e| e.to_string())?;
+    let sk = SecretKey::from_byte_array(*sk_bytes).map_err(|e| e.to_string())?;
     let pk = PublicKey::from_secret_key(&sk);
     Ok(pk.serialize())
 }
