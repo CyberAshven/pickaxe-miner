@@ -17,3 +17,13 @@ Commands: `help`, `status`, `intensity <0-100>`, `payout <cashaddr>`, `donation`
 - **Coinbase-style:** two outputs on the verified win tx only — visible before arm; never skim unrelated funds or keys
 
 `reference/` mirrors https://photon.postcorps.com/ for protocol study only (not the product).
+
+## Electrum / Fulcrum
+
+- ulcrum <wss://…> — custom node (Start9 Fulcrum etc.); tried first
+- ulcrum clear — bootstrap only
+- servers — show try-order (custom + public WSS bootstrap)
+- connect / job / dryrun — failover across that list
+
+Public bootstrap is multiple WSS :50004 hosts (not a single Imaginary Cash dependency). Future interactive UI: Ratatui TUI (not Tauri unless the operator asks).
+

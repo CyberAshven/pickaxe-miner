@@ -19,8 +19,16 @@ pub const TEMPLATE_BYTES: usize = 615;
 /// Redeem script hex (P2SH32 / covenant spend path) — from postcorps miner.js.
 pub const REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_redeem.hex");
 
-/// Imaginary Cash Electrum WSS endpoints used by the reference miner (failover order).
-pub const ELECTRUM_WSS: &[&str] = &[
+/// Public Fulcrum/Electrum WSS bootstrap (failover + redundancy).
+/// Custom user URL (Start9 Fulcrum etc.) is tried first when set in RuntimeConfig.
+/// Prefer WSS :50004 hosts with CA-signed certs.
+pub const ELECTRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://electrum.imaginary.cash:50004",
     "wss://bch.imaginary.cash:50004",
+    "wss://electroncash.dk:50004",
+    "wss://btc.electroncash.dk:50004",
+    "wss://fulcrum.greyh.at:50004",
 ];
+
+/// Back-compat alias.
+pub const ELECTRUM_WSS: &[&str] = ELECTRUM_WSS_BOOTSTRAP;

@@ -2,7 +2,7 @@
 //! Owned by Dev Assist. Search consumes MiningJob; no keys, no broadcast.
 
 use crate::config::RuntimeConfig;
-use crate::protocol::{ELECTRUM_WSS, EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
+use crate::protocol::{EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
 use crate::search::MiningJob;
 use num_bigint::BigUint;
 use serde_json::{json, Value};
@@ -67,18 +67,32 @@ pub struct ElectrumSession {
 }
 
 impl ElectrumSession {
-    pub fn connect_failover() -> Result<Self, String> {
+    /// Connect with failover over `endpoints` (custom first, then bootstrap).
+    pub fn connect_failover(endpoints: &[String]) -> Result<Self, String> {
+        if endpoints.is_empty() {
+            return Err("no Electrum/Fulcrum endpoints configured".into());
+        }
         let mut failures = Vec::new();
-        for url in ELECTRUM_WSS {
+        for url in endpoints {
             match Self::connect_one(url) {
                 Ok(s) => return Ok(s),
                 Err(e) => failures.push(format!("{url}: {e}")),
             }
         }
         Err(format!(
-            "All Electrum WSS endpoints failed:\n{}",
+            "All Electrum/Fulcrum endpoints failed:\n{}",
             failures.join("\n")
         ))
+    }
+
+    /// Bootstrap-only (no custom URL).
+    pub fn connect_bootstrap() -> Result<Self, String> {
+        use crate::protocol::ELECTRUM_WSS_BOOTSTRAP;
+        let eps: Vec<String> = ELECTRUM_WSS_BOOTSTRAP
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        Self::connect_failover(&eps)
     }
 
     fn connect_one(url_str: &str) -> Result<Self, String> {

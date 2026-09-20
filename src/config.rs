@@ -15,6 +15,9 @@ pub struct RuntimeConfig {
     pub intensity: u8,
     /// Miner reward cashaddr (user). Empty until set.
     pub payout_address: String,
+    /// Optional custom Fulcrum/Electrum URL (ws:// or wss://). Tried before bootstrap.
+    /// Example Start9: `wss://start9oslinux.local:50004`
+    pub fulcrum_url: Option<String>,
     /// When true, a stub "mining" loop is considered running.
     pub mining: bool,
 }
@@ -24,6 +27,7 @@ impl Default for RuntimeConfig {
         Self {
             intensity: 50,
             payout_address: String::new(),
+            fulcrum_url: None,
             mining: false,
         }
     }
@@ -48,6 +52,41 @@ impl RuntimeConfig {
         }
         self.payout_address = trimmed;
         Ok(())
+    }
+
+
+    /// Set custom Fulcrum/Electrum endpoint (`ws://` or `wss://`). Empty clears.
+    pub fn set_fulcrum_url(&mut self, url: &str) -> Result<(), String> {
+        let trimmed = url.trim().to_string();
+        if trimmed.is_empty() {
+            self.fulcrum_url = None;
+            return Ok(());
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !(lower.starts_with("wss://") || lower.starts_with("ws://")) {
+            return Err("fulcrum URL must start with wss:// or ws://".into());
+        }
+        self.fulcrum_url = Some(trimmed);
+        Ok(())
+    }
+
+    pub fn clear_fulcrum_url(&mut self) {
+        self.fulcrum_url = None;
+    }
+
+    /// Endpoint try-order: custom (if set), then public bootstrap.
+    pub fn electrum_endpoints(&self) -> Vec<String> {
+        use crate::protocol::ELECTRUM_WSS_BOOTSTRAP;
+        let mut out = Vec::new();
+        if let Some(u) = &self.fulcrum_url {
+            out.push(u.clone());
+        }
+        for u in ELECTRUM_WSS_BOOTSTRAP {
+            if !out.iter().any(|x| x == *u) {
+                out.push((*u).to_string());
+            }
+        }
+        out
     }
 
     /// Split amounts for a reward of `reward_raw` atomic units (floor math).

@@ -34,7 +34,10 @@ fn print_help() {
   intensity <0-100>            Set work intensity (default 50)
   payout <cashaddr>            Set miner payout address
   donation                     Show donation address and split
-  connect                      Electrum WSS connect (failover)
+  connect                      Electrum/Fulcrum connect (custom then bootstrap)
+  fulcrum <wss://…>            Set custom Fulcrum/node URL (Start9 etc.)
+  fulcrum clear                Clear custom URL (bootstrap only)
+  servers                      Show custom + bootstrap endpoint list
   job                          Fetch live PHOTON baton → MiningJob
   dryrun                       connect+job + 98/2 win-tx preview (no broadcast)
   start                        Start CPU search (uses last job if present)
@@ -74,6 +77,10 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
     }
     println!("donation:      {DONATION_BPS} bps → {DONATION_ADDRESS}");
     println!("miner share:   {MINER_BPS} bps");
+    match &cfg.fulcrum_url {
+        Some(u) => println!("fulcrum:       {u} (custom, tried first)"),
+        None => println!("fulcrum:       (bootstrap only)"),
+    }
     if let Some(j) = job {
         println!("electrum:      {}", j.url);
         println!("job height:    {}", j.height);
@@ -149,7 +156,35 @@ fn handle_line(
                 }
             }
         }
-        "connect" => match ElectrumSession::connect_failover() {
+                "servers" => {
+            println!("Electrum/Fulcrum try-order:");
+            for (i, u) in cfg.electrum_endpoints().iter().enumerate() {
+                let tag = if cfg.fulcrum_url.as_ref() == Some(u) {
+                    " custom"
+                } else {
+                    " bootstrap"
+                };
+                println!("  {}. {}{}", i + 1, u, tag);
+            }
+        }
+        "fulcrum" => {
+            let rest: Vec<&str> = parts.collect();
+            if rest.is_empty() {
+                match &cfg.fulcrum_url {
+                    Some(u) => println!("fulcrum (custom): {u}"),
+                    None => println!("fulcrum: (not set — using bootstrap). usage: fulcrum <wss://…> | fulcrum clear"),
+                }
+            } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("clear") {
+                cfg.clear_fulcrum_url();
+                println!("fulcrum custom URL cleared — bootstrap only");
+            } else {
+                match cfg.set_fulcrum_url(&rest.join(" ")) {
+                    Ok(()) => println!("fulcrum set to {}", cfg.fulcrum_url.as_deref().unwrap_or("")),
+                    Err(e) => println!("error: {e}"),
+                }
+            }
+        }
+        "connect" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
             Ok(s) => {
                 println!("connected: {}", s.url);
                 println!("server.version: {}", s.server_version);
@@ -158,7 +193,7 @@ fn handle_line(
             }
             Err(e) => println!("error: {e}"),
         },
-        "job" => match ElectrumSession::connect_failover() {
+        "job" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
             Ok(mut s) => match s.fetch_live_job() {
                 Ok(j) => {
                     j.print_summary();
@@ -172,7 +207,7 @@ fn handle_line(
             if cfg.payout_address.is_empty() {
                 println!("error: set payout first (`payout bitcoincash:…`)");
             } else {
-                match ElectrumSession::connect_failover() {
+                match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
                     Ok(mut s) => match s.fetch_live_job() {
                         Ok(j) => {
                             j.print_summary();
@@ -197,7 +232,7 @@ fn handle_line(
                 // Prefer last live job; otherwise fetch once so start is one-shot usable.
                 if live.is_none() {
                     println!("no cached job — fetching via Electrum…");
-                    match ElectrumSession::connect_failover() {
+                    match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
                         Ok(mut s) => match s.fetch_live_job() {
                             Ok(j) => {
                                 j.print_summary();
