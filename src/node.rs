@@ -36,6 +36,50 @@ pub fn connect_failover(endpoints: &[String]) -> Result<(String, Value), String>
     ))
 }
 
+
+/// Broadcast raw tx via `sendrawtransaction`. Explicit only; never auto.
+pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, String), String> {
+    let hex = raw_tx_hex.trim();
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return Err("raw tx hex empty or odd length".into());
+    }
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("raw tx must be hex".into());
+    }
+    if endpoints.is_empty() {
+        return Err("no node endpoints — set `node http://user:pass@127.0.0.1:8332`".into());
+    }
+    let mut failures = Vec::new();
+    let mut backoff_ms: u64 = 400;
+    for (i, url) in endpoints.iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(backoff_ms));
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
+        }
+        match rpc_call(url, "sendrawtransaction", json!([hex])) {
+            Ok(Value::String(txid)) => return Ok((redact_url(url), txid)),
+            Ok(other) => return Ok((redact_url(url), other.to_string())),
+            Err(e) => failures.push(format!("{}: {e}", redact_url(url))),
+        }
+    }
+    Err(format!(
+        "All node sendrawtransaction failed (ban-safe):\n{}",
+        failures.join("\n")
+    ))
+}
+
+fn redact_url(url: &str) -> String {
+    // Strip userinfo before @ so credentials never land in logs.
+    if let Some(scheme_end) = url.find("://") {
+        let scheme = &url[..scheme_end + 3];
+        let rest = &url[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            return format!("{scheme}***@{}", &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
 fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     let lower = url.to_ascii_lowercase();
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
