@@ -170,6 +170,7 @@ fn handle_line(
     handle: &mut Option<SearchHandle>,
     live: &mut Option<LiveJob>,
     armed: &mut Option<String>,
+    last_template: &mut Option<node::BlockTemplate>,
     line: &str,
 ) -> bool {
     let line = line.trim();
@@ -360,24 +361,14 @@ fn handle_line(
             } else {
                 match node::fetch_block_template(&nodes) {
                     Ok(t) => {
-                        println!(
-                            "template ok via {} ({})",
-                            t.endpoint,
-                            if t.light { "getblocktemplatelight" } else { "getblocktemplate" }
-                        );
-                        if let Some(j) = &t.job_id {
-                            println!("  job_id: {j}");
-                        }
-                        if let Some(p) = &t.previousblockhash {
-                            println!("  prev:   {p}");
-                        }
+                        t.print_summary();
                         if let Some(v) = t.version {
                             println!("  ver:    {v}");
                         }
-                        // compact summary keys
                         if let Some(obj) = t.raw.as_object() {
                             println!("  keys:   {}", obj.keys().take(12).cloned().collect::<Vec<_>>().join(", "));
                         }
+                        *last_template = Some(t);
                     }
                     Err(e) => println!("error: {e}"),
                 }
@@ -562,43 +553,76 @@ fn handle_line(
         }
         "start" => {
             if cfg.payout_address.is_empty() {
-                println!("error: set payout first (`payout bitcoincash:â€¦`)");
+                println!("error: set payout first: payout bitcoincash:...");
             } else if handle.is_some() {
-                println!("already mining â€” `status` for rate");
+                println!("already mining - status for rate");
             } else {
-                // Prefer last live job; otherwise fetch once so start is one-shot usable.
-                if live.is_none() {
-                    println!("no cached job â€” fetching via Electrumâ€¦");
-                    match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
-                        Ok(mut s) => match s.fetch_live_job() {
+                use crate::config::JobSource;
+                let job = match cfg.source {
+                    JobSource::Node => {
+                        let nodes = cfg.node_endpoints();
+                        if nodes.is_empty() {
+                            println!("error: set node http://user:pass@127.0.0.1:8332 or --node-rpc");
+                            return true;
+                        }
+                        let tpl = match last_template.as_ref() {
+                            Some(t) => t.clone(),
+                            None => match node::fetch_block_template(&nodes) {
+                                Ok(t) => {
+                                    t.print_summary();
+                                    *last_template = Some(t.clone());
+                                    t
+                                }
+                                Err(e) => {
+                                    println!("error: node template failed: {e}");
+                                    return true;
+                                }
+                            },
+                        };
+                        match tpl.to_mining_job() {
                             Ok(j) => {
-                                j.print_summary();
-                                *live = Some(j);
+                                println!("using node template height={} prev={}", j.height, j.baton_txid);
+                                j
                             }
-                            Err(e) => println!("error: job fetch failed: {e}"),
-                        },
-                        Err(e) => println!("error: electrum connect failed: {e}"),
+                            Err(e) => {
+                                println!("error: bad template: {e}");
+                                return true;
+                            }
+                        }
                     }
-                }
-                let Some(job) = live.as_ref().map(|j| j.to_mining_job()) else {
-                    println!("error: no live job â€” fix Electrum then `job` / `start` again");
-                    return true;
+                    JobSource::Fulcrum => {
+                        if live.is_none() {
+                            println!("source=fulcrum - fetching baton via Electrum (auxiliary)");
+                            match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                                Ok(mut s) => match s.fetch_live_job() {
+                                    Ok(j) => {
+                                        j.print_summary();
+                                        *live = Some(j);
+                                    }
+                                    Err(e) => println!("error: job fetch failed: {e}"),
+                                },
+                                Err(e) => println!("error: electrum connect failed: {e}"),
+                            }
+                        }
+                        let Some(job) = live.as_ref().map(|j| j.to_mining_job()) else {
+                            println!("error: no live job - job then start, or source node");
+                            return true;
+                        };
+                        println!("using fulcrum job height={} baton={}", job.height, job.baton_txid);
+                        job
+                    }
                 };
                 if job.target_le_hex.is_empty() {
-                    println!("error: live job missing target â€” refuse easy-target fallback");
+                    println!("error: job missing target - refuse easy-target fallback");
                     return true;
                 }
-                println!(
-                    "using live job height={} baton={}",
-                    job.height, job.baton_txid
-                );
                 match SearchHandle::start(cfg.intensity, job) {
                     Ok(h) => {
                         *handle = Some(h);
                         cfg.mining = true;
                         println!(
-                            "GPU search ON â€” intensity {}%, payout {}",
-                            cfg.intensity, cfg.payout_address
+                            "GPU search ON - intensity {}%, payout {}, source {}",
+                            cfg.intensity, cfg.payout_address, cfg.source.as_str()
                         );
                         println!("mode: CUDA HASH256 M1 against live target");
                     }
@@ -606,6 +630,7 @@ fn handle_line(
                 }
             }
         }
+
         "stop" => {
             if let Some(h) = handle.take() {
                 let s = h.stop();
@@ -645,6 +670,7 @@ fn run_repl() {
     let mut handle: Option<SearchHandle> = None;
     let mut live: Option<LiveJob> = None;
     let mut armed: Option<String> = None;
+    let mut last_template: Option<node::BlockTemplate> = None;
     print_banner();
 
     let stdin = io::stdin();
@@ -658,7 +684,7 @@ fn run_repl() {
                 break;
             }
             Ok(_) => {
-                if !handle_line(&mut cfg, &mut handle, &mut live, &mut armed, &line) {
+                if !handle_line(&mut cfg, &mut handle, &mut live, &mut armed, &mut last_template, &line) {
                     break;
                 }
             }
