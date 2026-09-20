@@ -1,12 +1,32 @@
-﻿//! Secp256k1 helpers + **BCH Schnorr** (CashVM-style challenge).
+//! BCH Schnorr signing gate (Codex PERFORMANCE CONTRACT sec18).
 //!
-//! Product mining is **GPU/CUDA**. This module is a correctness / win-tx signing
-//! gate — not a CPU hashrate product.
+//! Matches postcorps/photon reference:
+//! - RFC6979 nonce with algo tag `Schnorr+SHA256  `
+//! - challenge `e = SHA256(r_x || compressed_pubkey || msg)`
+//! - if R.y is not a quadratic residue mod p, use `k' = n - k` (r_x unchanged)
 //!
-//! Challenge (postcorps reference): `e = SHA256(r_x || compressed_pubkey || msg)`.
+//! Production private keys are BLOCKED until vector tests pass.
 
+use hmac::{Hmac, Mac};
+use num_bigint::BigUint;
+use num_traits::{One, Zero};
 use secp256k1::{PublicKey, Scalar, SecretKey};
 use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const SECP_P_BE: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xFF, 0xFF, 0xFC, 0x2F,
+];
+
+const SECP_N_BE: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+
+pub const SCHNORR_PRODUCTION_GATE_DOC: &str =
+    "Do not sign with production keys until crypto::tests::bch_schnorr_matches_photon_vectors passes.";
 
 pub fn compressed_pubkey(sk_bytes: &[u8; 32]) -> Result<[u8; 33], String> {
     let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
@@ -19,33 +39,92 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn secret_from_hash(mut bytes: [u8; 32]) -> SecretKey {
-    let mut counter: u32 = 0;
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
+    mac.update(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
+fn reduce_msg_mod_n(msg32: &[u8; 32]) -> [u8; 32] {
+    let m = BigUint::from_bytes_be(msg32);
+    let n = BigUint::from_bytes_be(&SECP_N_BE);
+    let r = m % n;
+    let bytes = r.to_bytes_be();
+    let mut out = [0u8; 32];
+    out[32 - bytes.len()..].copy_from_slice(&bytes);
+    out
+}
+
+/// RFC6979 nonce for BCH Schnorr (algo tag ASCII `Schnorr+SHA256  `).
+pub fn bch_rfc6979_nonce(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 32], String> {
+    let reduced = reduce_msg_mod_n(msg32);
+    let algo = b"Schnorr+SHA256  ";
+    let mut v = [1u8; 32];
+    let mut k = [0u8; 32];
+
+    let mut buf = Vec::with_capacity(113);
+    buf.extend_from_slice(&v);
+    buf.push(0);
+    buf.extend_from_slice(sk_bytes);
+    buf.extend_from_slice(&reduced);
+    buf.extend_from_slice(algo);
+    k = hmac_sha256(&k, &buf);
+    v = hmac_sha256(&k, &v);
+
+    buf.clear();
+    buf.extend_from_slice(&v);
+    buf.push(1);
+    buf.extend_from_slice(sk_bytes);
+    buf.extend_from_slice(&reduced);
+    buf.extend_from_slice(algo);
+    k = hmac_sha256(&k, &buf);
+    v = hmac_sha256(&k, &v);
+
+    let n = BigUint::from_bytes_be(&SECP_N_BE);
     loop {
-        if let Ok(k) = SecretKey::from_secret_bytes(bytes) {
-            return k;
+        v = hmac_sha256(&k, &v);
+        let cand = BigUint::from_bytes_be(&v);
+        if cand > BigUint::zero() && cand < n {
+            return Ok(v);
         }
-        counter = counter.wrapping_add(1);
-        let mut buf = [0u8; 36];
-        buf[..32].copy_from_slice(&bytes);
-        buf[32..].copy_from_slice(&counter.to_le_bytes());
-        bytes = sha256(&buf);
+        let mut t = Vec::with_capacity(33);
+        t.extend_from_slice(&v);
+        t.push(0);
+        k = hmac_sha256(&k, &t);
+        v = hmac_sha256(&k, &v);
     }
 }
 
-/// BCH Schnorr sign → 64-byte `r_x || s`.
+fn y_is_quadratic_residue(y_be: &[u8; 32]) -> bool {
+    let y = BigUint::from_bytes_be(y_be);
+    let p = BigUint::from_bytes_be(&SECP_P_BE);
+    if y.is_zero() {
+        return true;
+    }
+    let exp = (&p - BigUint::one()) >> 1;
+    y.modpow(&exp, &p) == BigUint::one()
+}
+
 pub fn bch_schnorr_sign(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 64], String> {
     let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
     let pk_bytes = PublicKey::from_secret_key(&sk).serialize();
 
-    let mut seed = [0u8; 64];
-    seed[..32].copy_from_slice(sk_bytes);
-    seed[32..].copy_from_slice(msg32);
-    let k = secret_from_hash(sha256(&seed));
-
-    let r_ser = PublicKey::from_secret_key(&k).serialize();
+    let k_bytes = bch_rfc6979_nonce(sk_bytes, msg32)?;
+    let k = SecretKey::from_secret_bytes(k_bytes).map_err(|e| e.to_string())?;
+    let r_pk = PublicKey::from_secret_key(&k);
+    let r_unc = r_pk.serialize_uncompressed();
     let mut r_x = [0u8; 32];
-    r_x.copy_from_slice(&r_ser[1..33]);
+    r_x.copy_from_slice(&r_unc[1..33]);
+    let mut r_y = [0u8; 32];
+    r_y.copy_from_slice(&r_unc[33..65]);
+
+    let k_adj = if y_is_quadratic_residue(&r_y) {
+        k
+    } else {
+        k.negate()
+    };
 
     let mut chal = Vec::with_capacity(97);
     chal.extend_from_slice(&r_x);
@@ -54,9 +133,10 @@ pub fn bch_schnorr_sign(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 64
     let e_bytes = sha256(&chal);
     let e = Scalar::from_be_bytes(e_bytes).map_err(|_| "bad e")?;
 
-    // s = k + e*d  via libsecp tweaks
     let ed = sk.mul_tweak(&e).map_err(|err| err.to_string())?;
-    let s_key = k.add_tweak(&Scalar::from(ed)).map_err(|err| err.to_string())?;
+    let s_key = k_adj
+        .add_tweak(&Scalar::from(ed))
+        .map_err(|err| err.to_string())?;
     let s_bytes = s_key.to_secret_bytes();
 
     let mut sig = [0u8; 64];
@@ -65,7 +145,11 @@ pub fn bch_schnorr_sign(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 64
     Ok(sig)
 }
 
-pub fn bch_schnorr_verify(pk33: &[u8; 33], msg32: &[u8; 32], sig64: &[u8; 64]) -> Result<bool, String> {
+pub fn bch_schnorr_verify(
+    pk33: &[u8; 33],
+    msg32: &[u8; 32],
+    sig64: &[u8; 64],
+) -> Result<bool, String> {
     let pk = PublicKey::from_slice(pk33).map_err(|e| e.to_string())?;
     let mut r_x = [0u8; 32];
     let mut s_bytes = [0u8; 32];
@@ -87,6 +171,33 @@ pub fn bch_schnorr_verify(pk33: &[u8; 33], msg32: &[u8; 32], sig64: &[u8; 64]) -
     Ok(r_ser[1..33] == r_x)
 }
 
+pub fn schnorr_production_gate_ok() -> bool {
+    let mut sk = [0u8; 32];
+    sk[31] = 1;
+    let msg = hex_32("098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f");
+    let expect_k = hex_32("615da2b700fbb1ae10a72a391ce49b17cd4d0f614311ac7d216281217fd7797a");
+    let expect_sig = hex_64(
+        "5b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604fc6e8cc2b6b38de1c5630da8356e2e07a403ddeba8835caba0b80d75a5ac471e4",
+    );
+    match (bch_rfc6979_nonce(&sk, &msg), bch_schnorr_sign(&sk, &msg)) {
+        (Ok(k), Ok(sig)) => k == expect_k && sig == expect_sig,
+        _ => false,
+    }
+}
+
+fn hex_32(s: &str) -> [u8; 32] {
+    let b = hex::decode(s).unwrap();
+    let mut o = [0u8; 32];
+    o.copy_from_slice(&b);
+    o
+}
+fn hex_64(s: &str) -> [u8; 64] {
+    let b = hex::decode(s).unwrap();
+    let mut o = [0u8; 64];
+    o.copy_from_slice(&b);
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,7 +207,37 @@ mod tests {
         let mut sk = [0u8; 32];
         sk[31] = 1;
         let pk = compressed_pubkey(&sk).unwrap();
-        assert!(pk[0] == 0x02 || pk[0] == 0x03);
+        assert_eq!(
+            hex::encode(pk),
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+    }
+
+    #[test]
+    fn bch_rfc6979_matches_photon_vector() {
+        let mut sk = [0u8; 32];
+        sk[31] = 1;
+        let msg = hex_32("098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f");
+        let k = bch_rfc6979_nonce(&sk, &msg).unwrap();
+        assert_eq!(
+            hex::encode(k),
+            "615da2b700fbb1ae10a72a391ce49b17cd4d0f614311ac7d216281217fd7797a"
+        );
+    }
+
+    #[test]
+    fn bch_schnorr_matches_photon_vectors() {
+        let mut sk = [0u8; 32];
+        sk[31] = 1;
+        let msg = hex_32("098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f");
+        let pk = compressed_pubkey(&sk).unwrap();
+        let sig = bch_schnorr_sign(&sk, &msg).unwrap();
+        assert_eq!(
+            hex::encode(sig),
+            "5b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604fc6e8cc2b6b38de1c5630da8356e2e07a403ddeba8835caba0b80d75a5ac471e4"
+        );
+        assert!(bch_schnorr_verify(&pk, &msg, &sig).unwrap());
+        assert!(schnorr_production_gate_ok());
     }
 
     #[test]
