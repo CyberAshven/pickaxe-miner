@@ -2,6 +2,7 @@
 //! Ban-safe: sequential endpoint tries + backoff; no parallel fan-out.
 //! Job/baton indexing stays on Fulcrum until a node path is wired.
 
+use hex;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -89,6 +90,84 @@ pub struct BlockTemplate {
     pub previousblockhash: Option<String>,
     pub version: Option<u64>,
     pub raw: Value,
+}
+
+
+impl BlockTemplate {
+    pub fn to_mining_job(&self) -> Result<crate::search::MiningJob, String> {
+        let height = self.raw.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let prev = self.previousblockhash.clone().unwrap_or_else(|| "unknown".into());
+        let target_le_hex = if let Some(t) = self.raw.get("target").and_then(|v| v.as_str()) {
+            be_hex32_to_le_hex(t)?
+        } else if let Some(bits) = self.raw.get("bits") {
+            let bits_u = match bits {
+                Value::String(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)
+                    .map_err(|e| format!("bits: {e}"))?,
+                Value::Number(n) => n.as_u64().ok_or("bits num")? as u32,
+                _ => return Err("bits field unexpected type".into()),
+            };
+            bits_to_target_le_hex(bits_u)
+        } else {
+            return Err("template missing target and bits".into());
+        };
+        Ok(crate::search::MiningJob {
+            height,
+            target_le_hex,
+            baton_txid: prev,
+        })
+    }
+
+    pub fn print_summary(&self) {
+        println!(
+            "node template via {} ({})",
+            self.endpoint,
+            if self.light { "getblocktemplatelight" } else { "getblocktemplate" }
+        );
+        if let Some(j) = &self.job_id { println!("  job_id: {j}"); }
+        if let Some(p) = &self.previousblockhash { println!("  prev:   {p}"); }
+        if let Some(h) = self.raw.get("height").and_then(|v| v.as_u64()) {
+            println!("  height: {h}");
+        }
+    }
+}
+
+fn be_hex32_to_le_hex(be: &str) -> Result<String, String> {
+    let b = hex::decode(be.trim()).map_err(|e| e.to_string())?;
+    if b.len() != 32 {
+        return Err(format!("target must be 32 bytes, got {}", b.len()));
+    }
+    Ok(hex::encode(b.iter().rev().copied().collect::<Vec<_>>()))
+}
+
+fn bits_to_target_le_hex(bits: u32) -> String {
+    let exp = (bits >> 24) as i32;
+    let mant = bits & 0x00ff_ffff;
+    let mut target = [0u8; 32];
+    if exp <= 3 {
+        let m = mant >> (8 * (3 - exp) as u32);
+        target[29] = ((m >> 16) & 0xff) as u8;
+        target[30] = ((m >> 8) & 0xff) as u8;
+        target[31] = (m & 0xff) as u8;
+    } else {
+        let idx = (32 - exp) as usize;
+        if idx < 30 {
+            target[idx] = ((mant >> 16) & 0xff) as u8;
+            target[idx + 1] = ((mant >> 8) & 0xff) as u8;
+            target[idx + 2] = (mant & 0xff) as u8;
+        }
+    }
+    hex::encode(target.iter().rev().copied().collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod gbt_tests {
+    use super::*;
+    #[test]
+    fn bits_genesis_style_nonzero() {
+        let h = bits_to_target_le_hex(0x1d00ffff);
+        assert_eq!(h.len(), 64);
+        assert_ne!(h, "00".repeat(32));
+    }
 }
 
 pub fn fetch_block_template(endpoints: &[String]) -> Result<BlockTemplate, String> {
