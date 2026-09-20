@@ -18,6 +18,9 @@ pub struct RuntimeConfig {
     /// Optional custom Fulcrum/Electrum URL (ws:// or wss://). Tried before bootstrap.
     /// Example Start9: `wss://start9oslinux.local:50004`
     pub fulcrum_url: Option<String>,
+    /// Optional native node JSON-RPC URL (`http://` / `https://`).
+    /// Example Start9: `http://127.0.0.1:8332` (auth via env, never logged).
+    pub node_url: Option<String>,
     /// When true, a stub "mining" loop is considered running.
     pub mining: bool,
 }
@@ -28,6 +31,7 @@ impl Default for RuntimeConfig {
             intensity: 50,
             payout_address: String::new(),
             fulcrum_url: None,
+            node_url: None,
             mining: false,
         }
     }
@@ -76,12 +80,47 @@ impl RuntimeConfig {
 
     /// Endpoint try-order: custom (if set), then public bootstrap.
     pub fn electrum_endpoints(&self) -> Vec<String> {
-        use crate::protocol::ELECTRUM_WSS_BOOTSTRAP;
+        use crate::protocol::FULCRUM_WSS_BOOTSTRAP;
         let mut out = Vec::new();
         if let Some(u) = &self.fulcrum_url {
             out.push(u.clone());
         }
-        for u in ELECTRUM_WSS_BOOTSTRAP {
+        for u in FULCRUM_WSS_BOOTSTRAP {
+            if !out.iter().any(|x| x == *u) {
+                out.push((*u).to_string());
+            }
+        }
+        out
+    }
+
+
+    pub fn set_node_url(&mut self, url: &str) -> Result<(), String> {
+        let trimmed = url.trim().to_string();
+        if trimmed.is_empty() {
+            self.node_url = None;
+            return Ok(());
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+            return Err("node URL must start with http:// or https://".into());
+        }
+        // Never require embedding user:pass in chat logs — accept URL as given.
+        self.node_url = Some(trimmed);
+        Ok(())
+    }
+
+    pub fn clear_node_url(&mut self) {
+        self.node_url = None;
+    }
+
+    /// Node try-order: custom (if set), then curated NODE_RPC_BOOTSTRAP.
+    pub fn node_endpoints(&self) -> Vec<String> {
+        use crate::protocol::NODE_RPC_BOOTSTRAP;
+        let mut out = Vec::new();
+        if let Some(u) = &self.node_url {
+            out.push(u.clone());
+        }
+        for u in NODE_RPC_BOOTSTRAP {
             if !out.iter().any(|x| x == *u) {
                 out.push((*u).to_string());
             }

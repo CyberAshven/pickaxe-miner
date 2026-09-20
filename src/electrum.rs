@@ -7,6 +7,7 @@ use crate::search::MiningJob;
 use num_bigint::BigUint;
 use serde_json::{json, Value};
 use std::net::TcpStream;
+use std::thread;
 use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
@@ -67,28 +68,34 @@ pub struct ElectrumSession {
 }
 
 impl ElectrumSession {
-    /// Connect with failover over `endpoints` (custom first, then bootstrap).
+    /// Ban-safe connect: **one endpoint at a time**, exponential backoff between
+    /// tries, never parallel fan-out. Custom URL should already be first in `endpoints`.
     pub fn connect_failover(endpoints: &[String]) -> Result<Self, String> {
         if endpoints.is_empty() {
             return Err("no Electrum/Fulcrum endpoints configured".into());
         }
         let mut failures = Vec::new();
-        for url in endpoints {
+        let mut backoff_ms: u64 = 400;
+        for (i, url) in endpoints.iter().enumerate() {
+            if i > 0 {
+                thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
+            }
             match Self::connect_one(url) {
                 Ok(s) => return Ok(s),
                 Err(e) => failures.push(format!("{url}: {e}")),
             }
         }
         Err(format!(
-            "All Electrum/Fulcrum endpoints failed:\n{}",
+            "All Electrum/Fulcrum endpoints failed (sequential, ban-safe):\n{}",
             failures.join("\n")
         ))
     }
 
     /// Bootstrap-only (no custom URL).
     pub fn connect_bootstrap() -> Result<Self, String> {
-        use crate::protocol::ELECTRUM_WSS_BOOTSTRAP;
-        let eps: Vec<String> = ELECTRUM_WSS_BOOTSTRAP
+        use crate::protocol::FULCRUM_WSS_BOOTSTRAP;
+        let eps: Vec<String> = FULCRUM_WSS_BOOTSTRAP
             .iter()
             .map(|s| (*s).to_string())
             .collect();
