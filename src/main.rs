@@ -5,6 +5,7 @@
 //! Search/CPU owned here; Electrum/win-tx owned by Dev Assist.
 
 mod config;
+mod protocol;
 mod search;
 
 use config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, MINER_BPS};
@@ -232,3 +233,4 @@ mod tests {
         assert!(c.set_intensity(101).is_err());
     }
 }
+
