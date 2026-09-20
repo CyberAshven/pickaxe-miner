@@ -48,6 +48,7 @@ fn print_help() {
   dryrun                       connect+job + 98/2 win-tx preview (no broadcast)
 arm                          like dryrun + message SHA256 for Schnorr (no keys)
 applysig <nonce> <pk33hex> <sig64hex>  rebuild 98/2 win-tx hex (no broadcast)
+  broadcast [rawhex]             submit last armed tx or given hex (Electrum)
   start                        Start CPU search (uses last job if present)
   stop                         Stop search
   split <reward_raw>           Preview 98%/2% split for a raw reward amount
@@ -125,6 +126,7 @@ fn handle_line(
     cfg: &mut RuntimeConfig,
     handle: &mut Option<SearchHandle>,
     live: &mut Option<LiveJob>,
+    armed: &mut Option<String>,
     line: &str,
 ) -> bool {
     let line = line.trim();
@@ -138,6 +140,29 @@ fn handle_line(
         "help" | "?" => print_help(),
         "status" => print_status(cfg, handle, live),
         "donation" => print_donation(),
+        
+        "broadcast" => {
+            let args: Vec<&str> = parts.collect();
+            let hex_opt = if args.is_empty() {
+                armed.clone()
+            } else {
+                Some(args.join(""))
+            };
+            match hex_opt {
+                None => println!("nothing to broadcast — run applysig first or: broadcast <rawhex>"),
+                Some(hx) => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                    Err(e) => println!("error: {e}"),
+                    Ok(mut s) => match s.broadcast_raw(&hx) {
+                        Ok(txid) => {
+                            println!("broadcast ok: {txid}");
+                            *armed = None;
+                        }
+                        Err(e) => println!("broadcast error: {e}"),
+                    },
+                },
+            }
+        }
+
         "quit" | "exit" => {
             if let Some(h) = handle.take() {
                 let s = h.stop();
@@ -339,8 +364,10 @@ fn handle_line(
                         args[2],
                     ) {
                         Ok(bytes) => {
-                            println!("armed win-tx {} bytes (no broadcast):", bytes.len());
-                            println!("{}", hex::encode(&bytes));
+                            let hx = hex::encode(&bytes);
+                            *armed = Some(hx.clone());
+                            println!("armed win-tx {} bytes (cached; no broadcast yet):", bytes.len());
+                            println!("{hx}");
                             match tx::photon_message_sha256(nonce, &j.target_le_hex) {
                                 Ok(h) => println!("message_sha256: {}", hex::encode(h)),
                                 Err(e) => println!("hash err: {e}"),
@@ -465,6 +492,7 @@ fn main() {
     let mut cfg = RuntimeConfig::default();
     let mut handle: Option<SearchHandle> = None;
     let mut live: Option<LiveJob> = None;
+    let mut armed: Option<String> = None;
     print_banner();
 
     let stdin = io::stdin();
@@ -478,7 +506,7 @@ fn main() {
                 break;
             }
             Ok(_) => {
-                if !handle_line(&mut cfg, &mut handle, &mut live, &line) {
+                if !handle_line(&mut cfg, &mut handle, &mut live, &mut armed, &line) {
                     break;
                 }
             }

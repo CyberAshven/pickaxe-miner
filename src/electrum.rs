@@ -1,5 +1,6 @@
 //! Electrum WSS client: live PHOTON baton / MiningJob fetch.
-//! Owned by Dev Assist. Search consumes MiningJob; no keys, no broadcast.
+//! Owned by Dev Assist. Search consumes MiningJob; no keys.
+//! Broadcast is explicit CLI only (never auto).
 
 use crate::config::RuntimeConfig;
 use crate::protocol::{EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
@@ -187,6 +188,23 @@ impl ElectrumSession {
                 Message::Close(_) => return Err("socket closed".into()),
                 _ => {}
             }
+        }
+    }
+
+
+    /// Submit a raw tx hex via lockchain.transaction.broadcast. Explicit only.
+    pub fn broadcast_raw(&mut self, raw_tx_hex: &str) -> Result<String, String> {
+        let hex = raw_tx_hex.trim();
+        if hex.is_empty() || hex.len() % 2 != 0 {
+            return Err("raw tx hex empty or odd length".into());
+        }
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("raw tx must be hex".into());
+        }
+        let v = self.rpc("blockchain.transaction.broadcast", json!([hex]))?;
+        match v {
+            Value::String(txid) => Ok(txid),
+            other => Ok(other.to_string()),
         }
     }
 
