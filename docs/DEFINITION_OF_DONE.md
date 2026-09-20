@@ -25,4 +25,12 @@ Bandar mining live end-to-end, committed/pushed to CyberAshven/pickaxe-miner.
 - Dev Assist: Electrum/node, win-tx, arm/applysig/broadcast
 
 ## Mining source (locked 2026-09-21)
-Full node RPC is authoritative (getblocktemplatelight → search → submitblocklight, with normal GBT fallback). Fulcrum is auxiliary (wallet/UTXO), not template authority. Flags: `--source node --node-rpc …`; optional `--fulcrum …`.
+PHOTON jobs are derived from the live covenant/CashToken mutable baton state:
+baton outpoint and height, NFT commitment, current height, PHOTON target, token
+amount, and reward. Fulcrum/Electrum is the current indexed baton-discovery path.
+If a node-native indexed path is added, it must recover and validate the same
+PHOTON state.
+
+Native node RPC remains authoritative for chain validation and raw transaction
+broadcast. BCH `getblocktemplatelight` / `getblocktemplate` data must never be
+substituted for a PHOTON baton or target.
