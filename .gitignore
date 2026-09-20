@@ -9,3 +9,6 @@ Thumbs.db
 cuda/build/
 *.obj
 
+
+!cuda/build/stage_a_hash256.ptx
+

@@ -1,4 +1,4 @@
-//! Pickaxe Miner - interactive CLI (Stage 2/3).
+﻿//! Pickaxe Miner - interactive CLI (Stage 2/3).
 //!
 //! Controls mirror the postcorps WebGPU site (esp. intensity).
 //! Donation: 2% coinbase-style split on the win tx only - never skim unrelated funds.
@@ -6,6 +6,7 @@
 
 mod config;
 mod crypto;
+mod cuda_stage_a;
 mod electrum;
 mod node;
 mod protocol;
@@ -20,7 +21,7 @@ use std::io::{self, Write};
 fn print_banner() {
     println!("Pickaxe Miner 0.1.0 - interactive CLI");
     println!(
-        "Donation: {DONATION_BPS} bps ({:.2}%) → {DONATION_ADDRESS}",
+        "Donation: {DONATION_BPS} bps ({:.2}%) â†’ {DONATION_ADDRESS}",
         DONATION_BPS as f64 / 100.0
     );
     println!("Miner keeps {MINER_BPS} bps. Split is on the win tx only (coinbase-style).");
@@ -36,13 +37,13 @@ fn print_help() {
   payout <cashaddr>            Set miner payout address
   donation                     Show donation address and split
   connect                      Electrum/Fulcrum connect (custom then bootstrap)
-  fulcrum <wss://…>            Set custom Fulcrum/Electrum WSS URL
+  fulcrum <wss://â€¦>            Set custom Fulcrum/Electrum WSS URL
   fulcrum clear                Clear custom Fulcrum URL
-  node <http://…>              Set custom native node JSON-RPC URL
+  node <http://â€¦>              Set custom native node JSON-RPC URL
   node clear                   Clear custom node URL
   servers                      Show Fulcrum + node try-order (ban-safe)
   nodeprobe                    Probe native node RPC (getblockchaininfo)
-  job                          Fetch live PHOTON baton → MiningJob
+  job                          Fetch live PHOTON baton â†’ MiningJob
   dryrun                       connect+job + 98/2 win-tx preview (no broadcast)
   start                        Start CPU search (uses last job if present)
   stop                         Stop search
@@ -79,7 +80,7 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
         println!("elapsed:       {}s", s.elapsed_secs);
         println!("rate:          {:.0} H/s (HASH256 M1)", s.rate);
     }
-    println!("donation:      {DONATION_BPS} bps → {DONATION_ADDRESS}");
+    println!("donation:      {DONATION_BPS} bps â†’ {DONATION_ADDRESS}");
     println!("miner share:   {MINER_BPS} bps");
     match &cfg.fulcrum_url {
         Some(u) => println!("fulcrum:       {u} (custom, tried first)"),
@@ -164,7 +165,7 @@ fn handle_line(
         "payout" => {
             let rest: Vec<&str> = parts.collect();
             if rest.is_empty() {
-                println!("usage: payout <bitcoincash:…>");
+                println!("usage: payout <bitcoincash:â€¦>");
             } else {
                 match cfg.set_payout(rest.join(" ")) {
                     Ok(()) => println!("payout set to {}", cfg.payout_address),
@@ -189,7 +190,7 @@ fn handle_line(
             println!("Native node JSON-RPC try-order (sequential, ban-safe backoff):");
             let ne = cfg.node_endpoints();
             if ne.is_empty() {
-                println!("  (none — set `node http://127.0.0.1:8332` for Start9/bitcoincashd)");
+                println!("  (none â€” set `node http://127.0.0.1:8332` for Start9/bitcoincashd)");
             }
             for (i, u) in ne.iter().enumerate() {
                 let tag = if cfg.node_url.as_ref() == Some(u) {
@@ -207,11 +208,11 @@ fn handle_line(
             if rest.is_empty() {
                 match &cfg.fulcrum_url {
                     Some(u) => println!("fulcrum (custom): {u}"),
-                    None => println!("fulcrum: (not set — using bootstrap). usage: fulcrum <wss://…> | fulcrum clear"),
+                    None => println!("fulcrum: (not set â€” using bootstrap). usage: fulcrum <wss://â€¦> | fulcrum clear"),
                 }
             } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("clear") {
                 cfg.clear_fulcrum_url();
-                println!("fulcrum custom URL cleared — bootstrap only");
+                println!("fulcrum custom URL cleared â€” bootstrap only");
             } else {
                 match cfg.set_fulcrum_url(&rest.join(" ")) {
                     Ok(()) => println!("fulcrum set to {}", cfg.fulcrum_url.as_deref().unwrap_or("")),
@@ -224,7 +225,7 @@ fn handle_line(
             if rest.is_empty() {
                 match &cfg.node_url {
                     Some(u) => println!("node (custom): {}", redact_url(u)),
-                    None => println!("node: (not set). usage: node <http://…> | node clear"),
+                    None => println!("node: (not set). usage: node <http://â€¦> | node clear"),
                 }
             } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("clear") {
                 cfg.clear_node_url();
@@ -264,7 +265,7 @@ fn handle_line(
         },
         "dryrun" => {
             if cfg.payout_address.is_empty() {
-                println!("error: set payout first (`payout bitcoincash:…`)");
+                println!("error: set payout first (`payout bitcoincash:â€¦`)");
             } else {
                 match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
                     Ok(mut s) => match s.fetch_live_job() {
@@ -289,7 +290,7 @@ fn handle_line(
                                     ) {
                                         println!("error: {e}");
                                     }
-                                    println!("note: signature is zero placeholder — Lead Dev Schnorr fills real win");
+                                    println!("note: signature is zero placeholder â€” Lead Dev Schnorr fills real win");
                                 }
                                 Err(e) => println!("error building unsigned template: {e}"),
                             }
@@ -303,13 +304,13 @@ fn handle_line(
         }
         "start" => {
             if cfg.payout_address.is_empty() {
-                println!("error: set payout first (`payout bitcoincash:…`)");
+                println!("error: set payout first (`payout bitcoincash:â€¦`)");
             } else if handle.is_some() {
-                println!("already mining — `status` for rate");
+                println!("already mining â€” `status` for rate");
             } else {
                 // Prefer last live job; otherwise fetch once so start is one-shot usable.
                 if live.is_none() {
-                    println!("no cached job — fetching via Electrum…");
+                    println!("no cached job â€” fetching via Electrumâ€¦");
                     match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
                         Ok(mut s) => match s.fetch_live_job() {
                             Ok(j) => {
@@ -322,11 +323,11 @@ fn handle_line(
                     }
                 }
                 let Some(job) = live.as_ref().map(|j| j.to_mining_job()) else {
-                    println!("error: no live job — fix Electrum then `job` / `start` again");
+                    println!("error: no live job â€” fix Electrum then `job` / `start` again");
                     return true;
                 };
                 if job.target_le_hex.is_empty() {
-                    println!("error: live job missing target — refuse easy-target fallback");
+                    println!("error: live job missing target â€” refuse easy-target fallback");
                     return true;
                 }
                 println!(
@@ -336,7 +337,7 @@ fn handle_line(
                 *handle = Some(SearchHandle::start(cfg.clone(), job));
                 cfg.mining = true;
                 println!(
-                    "CPU search ON — intensity {}%, payout {}",
+                    "CPU search ON â€” intensity {}%, payout {}",
                     cfg.intensity, cfg.payout_address
                 );
                 println!("mode: HASH256 M1 rate against live target (full PHOTON Schnorr next)");
@@ -360,7 +361,7 @@ fn handle_line(
                     let (miner, donation) = RuntimeConfig::split_reward(raw);
                     println!("reward_raw={raw}");
                     println!("  miner    ({MINER_BPS} bps): {miner}");
-                    println!("  donation ({DONATION_BPS} bps): {donation} → {DONATION_ADDRESS}");
+                    println!("  donation ({DONATION_BPS} bps): {donation} â†’ {DONATION_ADDRESS}");
                 }
                 Err(_) => println!("error: split needs a non-negative integer"),
             },
@@ -424,3 +425,4 @@ mod tests {
         assert!(c.set_intensity(101).is_err());
     }
 }
+
