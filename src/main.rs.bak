@@ -6,7 +6,6 @@
 
 mod config;
 mod protocol;
-mod crypto;
 mod search;
 
 use config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, MINER_BPS};
@@ -234,5 +233,4 @@ mod tests {
         assert!(c.set_intensity(101).is_err());
     }
 }
-
 
