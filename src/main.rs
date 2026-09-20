@@ -192,27 +192,41 @@ fn handle_line(
             if cfg.payout_address.is_empty() {
                 println!("error: set payout first (`payout bitcoincash:…`)");
             } else if handle.is_some() {
-                println!("already mining - `status` for rate");
+                println!("already mining — `status` for rate");
             } else {
-                let job = live
-                    .as_ref()
-                    .map(|j| j.to_mining_job())
-                    .unwrap_or_default();
-                if job.target_le_hex.is_empty() {
-                    println!("warn: no Electrum job yet - using default/easy target (run `job` first)");
-                } else {
-                    println!(
-                        "using live job height={} baton={}",
-                        job.height, job.baton_txid
-                    );
+                // Prefer last live job; otherwise fetch once so start is one-shot usable.
+                if live.is_none() {
+                    println!("no cached job — fetching via Electrum…");
+                    match ElectrumSession::connect_failover() {
+                        Ok(mut s) => match s.fetch_live_job() {
+                            Ok(j) => {
+                                j.print_summary();
+                                *live = Some(j);
+                            }
+                            Err(e) => println!("error: job fetch failed: {e}"),
+                        },
+                        Err(e) => println!("error: electrum connect failed: {e}"),
+                    }
                 }
+                let Some(job) = live.as_ref().map(|j| j.to_mining_job()) else {
+                    println!("error: no live job — fix Electrum then `job` / `start` again");
+                    return true;
+                };
+                if job.target_le_hex.is_empty() {
+                    println!("error: live job missing target — refuse easy-target fallback");
+                    return true;
+                }
+                println!(
+                    "using live job height={} baton={}",
+                    job.height, job.baton_txid
+                );
                 *handle = Some(SearchHandle::start(cfg.clone(), job));
                 cfg.mining = true;
                 println!(
-                    "CPU search ON - intensity {}%, payout {}",
+                    "CPU search ON — intensity {}%, payout {}",
                     cfg.intensity, cfg.payout_address
                 );
-                println!("mode: HASH256 M1 rate (full PHOTON candidate path next)");
+                println!("mode: HASH256 M1 rate against live target (full PHOTON Schnorr next)");
             }
         }
         "stop" => {
