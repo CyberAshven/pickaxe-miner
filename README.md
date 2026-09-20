@@ -1,3 +1,7 @@
+# Codex sec15 — PHOTON job source
+
+PHOTON jobs = Fulcrum CashToken baton discovery (listunspent). Node = validate/broadcast. Never map previousblockhash to baton_txid. GBT template/submitblock stay as optional tooling only.
+
 # Pickaxe Miner
 
 Native Rust **GPU** PHOTON miner (CLI now; Ratatui TUI next). Windows + Linux. NVIDIA (CUDA) and AMD (HIP/wgpu) backends — Lead Dev owns kernels.
