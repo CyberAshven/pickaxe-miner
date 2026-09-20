@@ -1,7 +1,9 @@
 //! Win-tx: CashAddr, PHOTON template serializer, coinbase-style 98/2 donation split.
-//! Unsigned templates only here — Schnorr/signing is Lead Dev. No keys, no broadcast.
+//! Template assemble + message hash here. Schnorr sign stays Lead Dev / crypto.
+//! Never keys/mnemonics. No broadcast until explicitly armed.
 
 use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, MINER_BPS};
+use sha2::Digest;
 use crate::protocol::{
     COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX, REDEEM_SCRIPT_HEX,
 };
@@ -417,6 +419,59 @@ pub fn print_win_tx_preview(
     Ok(())
 }
 
+
+/// PHOTON M1 message = nonce_le (4) || target (32). Hash = SHA256(message) for Schnorr msg32.
+pub fn photon_message_sha256(nonce: u32, target_hex: &str) -> Result<[u8; 32], String> {
+    let target = parse_hex(target_hex)?;
+    if target.len() != 32 {
+        return Err("PHOTON target must be 32 bytes".into());
+    }
+    let mut msg = [0u8; 36];
+    msg[..4].copy_from_slice(&nonce.to_le_bytes());
+    msg[4..].copy_from_slice(&target);
+    let dig = sha2::Sha256::digest(msg);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&dig);
+    Ok(out)
+}
+
+/// Rebuild donation-split template with a real 64-byte Schnorr (hex). No keys touched here.
+pub fn apply_donation_signature(
+    prev_txid: &str,
+    prev_vout: u32,
+    age: u32,
+    target_le_hex: &str,
+    contract_value_sats: u64,
+    contract_token_amount: u128,
+    reward_raw: u128,
+    miner_payout: &str,
+    public_key_hex: &str,
+    nonce: u32,
+    signature_hex: &str,
+) -> Result<Vec<u8>, String> {
+    let sig = parse_hex(signature_hex)?;
+    if sig.len() != 64 {
+        return Err("signature must be 64 bytes".into());
+    }
+    let payout = cashaddr_to_p2pkh_locking(miner_payout)?;
+    let donation = cashaddr_to_p2pkh_locking(DONATION_ADDRESS)?;
+    let p = TemplateParams {
+        prev_tx_hash_hex: prev_txid.to_string(),
+        prev_index: prev_vout,
+        age,
+        public_key_hex: public_key_hex.to_string(),
+        target_hex: target_le_hex.to_string(),
+        signature_hex: signature_hex.to_string(),
+        nonce,
+        contract_value_sats,
+        contract_token_amount,
+        reward_amount: reward_raw,
+        payout_locking: payout,
+    };
+    build_photon_template_donation_split(&p, &donation)
+}
+
+
 /// Build unsigned donation-split template using zero signature (placeholder) for preview.
 pub fn build_unsigned_donation_preview(
     prev_txid: &str,
@@ -494,6 +549,19 @@ mod tests {
         let built = build_photon_template_bytes(&p).expect("build");
         assert_eq!(hex::encode(&built), expected);
         assert_eq!(built.len(), 615);
+    }
+
+    #[test]
+    fn message_hash_matches_vector() {
+        let h = photon_message_sha256(
+            0x1234_5678,
+            "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000",
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(h),
+            "098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f"
+        );
     }
 
     #[test]
