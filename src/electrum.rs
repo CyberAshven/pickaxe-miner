@@ -38,6 +38,7 @@ impl LiveJob {
             height: self.height,
             target_le_hex: self.target_le_hex.clone(),
             baton_txid: self.baton_txid.clone(),
+            generation_id: 0,
         }
     }
 
@@ -52,7 +53,7 @@ impl LiveJob {
         let t = &self.target_le_hex;
         let head = &t[..t.len().min(8)];
         let tail = &t[t.len().saturating_sub(8)..];
-        println!("target_le:     {head}…{tail}");
+        println!("target_le:     {head}â€¦{tail}");
         println!("token_amount:  {}", self.token_amount);
         println!("reward_raw:    {}", self.reward_raw);
         println!("  miner 98%:   {miner}");
