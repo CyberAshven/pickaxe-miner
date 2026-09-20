@@ -36,7 +36,8 @@ fn print_help() {
         r#"Commands:
   help                         Show this help
   status                       Show intensity, payout, mining, donation, job, rate
-  intensity <0-100>            Set work intensity (default 50)
+  intensity <10-100>           Set live GPU intensity (default 100)
+  pause | p                    Pause/resume GPU mining
   payout <cashaddr>            Set miner payout address
   donation                     Show donation address and split
   connect                      Electrum/Fulcrum connect (custom then bootstrap)
@@ -51,7 +52,7 @@ fn print_help() {
 arm                          like dryrun + message SHA256 for Schnorr (no keys)
 applysig <nonce> <pk33hex> <sig64hex>  rebuild 98/2 win-tx hex (no broadcast)
   broadcast [rawhex]             submit last armed tx/hex (Fulcrum then node)
-  start                        Start CPU search (uses last job if present)
+  start                        Start GPU search (uses last job if present)
   stop                         Stop search
   split <reward_raw>           Preview 98%/2% split for a raw reward amount
   quit | exit                  Leave
@@ -75,13 +76,14 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
     println!(
         "mining:        {}",
         if cfg.mining {
-            "ON (CPU M1 rate)"
+            "ON (GPU M1 rate)"
         } else {
             "off"
         }
     );
     if let Some(h) = handle {
-        let s = h.snapshot(cfg.intensity);
+        let s = h.snapshot();
+        println!("state:         {}", if s.paused { "PAUSED" } else { "MINING" });
         println!("candidates:    {}", s.candidates);
         println!("elapsed:       {}s", s.elapsed_secs);
         println!("rate:          {:.0} H/s (HASH256 M1)", s.rate);
@@ -101,7 +103,7 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
     } else {
         println!("electrum/job:  (run `connect` / `job`)");
     }
-    println!("gpu:           not wired yet");
+    println!("gpu:           CUDA Stage A");
 }
 
 fn redact_url(url: &str) -> String {
@@ -200,16 +202,23 @@ fn handle_line(
             Some(v) => match v.parse::<u8>() {
                 Ok(n) => match cfg.set_intensity(n) {
                     Ok(()) => {
-                        println!("intensity set to {n}%");
-                        if handle.is_some() {
-                            println!("note: restart `start` to apply intensity to the search thread");
+                        if let Some(h) = handle.as_ref() {
+                            if let Err(e) = h.set_intensity(n) {
+                                println!("error: {e}");
+                                return true;
+                            }
                         }
+                        println!("intensity set to {n}%");
                     }
                     Err(e) => println!("error: {e}"),
                 },
-                Err(_) => println!("error: intensity must be an integer 0..=100"),
+                Err(_) => println!("error: intensity must be an integer 10..=100"),
             },
-            None => println!("usage: intensity <0-100>  (current {}%)", cfg.intensity),
+            None => println!("usage: intensity <10-100>  (current {}%)", cfg.intensity),
+        },
+        "pause" | "p" => match handle.as_ref() {
+            Some(h) => println!("{}", if h.toggle_pause() { "PAUSED" } else { "MINING" }),
+            None => println!("not mining"),
         },
         "payout" => {
             let rest: Vec<&str> = parts.collect();
@@ -471,13 +480,18 @@ fn handle_line(
                     "using live job height={} baton={}",
                     job.height, job.baton_txid
                 );
-                *handle = Some(SearchHandle::start(cfg.clone(), job));
-                cfg.mining = true;
-                println!(
-                    "CPU search ON â€” intensity {}%, payout {}",
-                    cfg.intensity, cfg.payout_address
-                );
-                println!("mode: HASH256 M1 rate against live target (full PHOTON Schnorr next)");
+                match SearchHandle::start(cfg.intensity, job) {
+                    Ok(h) => {
+                        *handle = Some(h);
+                        cfg.mining = true;
+                        println!(
+                            "GPU search ON â€” intensity {}%, payout {}",
+                            cfg.intensity, cfg.payout_address
+                        );
+                        println!("mode: CUDA HASH256 M1 against live target");
+                    }
+                    Err(e) => println!("error starting CUDA search: {e}"),
+                }
             }
         }
         "stop" => {
@@ -563,6 +577,9 @@ mod tests {
     #[test]
     fn intensity_bounds() {
         let mut c = RuntimeConfig::default();
+        assert_eq!(c.intensity, 100);
+        assert!(c.set_intensity(10).is_ok());
+        assert!(c.set_intensity(9).is_err());
         assert!(c.set_intensity(100).is_ok());
         assert!(c.set_intensity(101).is_err());
     }
