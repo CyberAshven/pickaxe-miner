@@ -1,0 +1,37 @@
+import test from 'ava';
+
+import { binToHex } from '@bitauth/libauth';
+import Timeout from "../index.js";
+
+
+// Async arrow function
+test('test timeout address', t => {
+
+    const record = {
+        recipient: "a914e78564d75c446f8c00c757a2bd783d30c4f0819a87",
+        timeout: 10,
+        auth: "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+
+    let data = Timeout.dataToBytecode(record)
+    t.is(binToHex(Timeout.getLockingBytecode(data)), "bitcoincash:rwfmu83h5jgh33zhhqscdt6wwzv5elvt8n935w8nehyuxl06rv8dyz2axtpxf")
+});
+
+// Async arrow function
+test('test cat serialized data address', t => {
+
+    const initialData = {
+        recipient: "a914e78564d75c446f8c00c757a2bd783d30c4f0819a87",
+        timeout: 1000,
+        auth: "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+
+    
+    let data = Timeout.dataToBytecode(initialData)
+
+    let record = binToHex(Timeout.encodeCommitment(initialData))
+    // cspell:disable-next-line
+    t.is(
+        binToHex(Timeout.getLockingBytecode(data)), "0355334c17a914e78564d75c446f8c00c757a2bd783d30c4f0819a875ac2529db175c0cd88c0ccc0c602c40994a269c0d3c0d09dc0d1c0ce88c0d2c0cf8777"
+    )
+});

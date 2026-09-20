@@ -17,3 +17,9 @@ Version string: M67.38-MainContinuousWins-v1
 - 64 MiB M29 production table: site generates locally / OPFS; network fetch is blocked in miner.js. Skip for Stage 1.
 
 REFERENCE ONLY. Product path is native Rust (CLI → GPU), not a web rewrite.
+
+## vox (added 2026-09-21)
+
+- https://github.com/2qx/vox
+- Local: `reference/vox/`
+- Unspent v3 DeFi apps — companion reference alongside PHOTON; see `reference/README.md`.

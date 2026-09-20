@@ -1,0 +1,335 @@
+import template from './template.v3.1.json' with { type: "json" };
+import packageInfo from '../package.json' with { type: "json" };
+
+import {
+    bigIntToVmNumber,
+    binToHex,
+    CompilerBch,
+    createVirtualMachineBch,
+    deriveHdPublicKey,
+    generateTransaction,
+    hdPrivateKeyToP2pkhLockingBytecode,
+    hexToBin,
+    InputTemplate,
+    OutputTemplate,
+    Output,
+    stringify,
+    Transaction,
+    verifyTransactionTokens
+} from '@bitauth/libauth';
+
+import {
+    getTransactionFees,
+    getAddress,
+    type CashAddressNetworkPrefix,
+    getLibauthCompiler,
+    getScriptHash,
+    UtxoI,
+    sumTokenAmounts,
+    sumSourceOutputValue,
+    sumSourceOutputTokenAmounts
+} from '@unspent/tau';
+
+export const BPTS = hexToBin('7fe0cd5197494e47ade81eb164dcdbd51859ffbe581fe4a818085d56b2f3062c')
+export const tBPTS = hexToBin('8214f234225e5f555663290e0fb7b7b607bf0778221e6da97248bf020306831b')
+
+
+export default class BlockPoint {
+
+    static USER_AGENT = packageInfo.name;
+
+    static tokenAware = true;
+
+    static template = template;
+
+    static compiler: CompilerBch = getLibauthCompiler(this.template);
+
+    static vm = createVirtualMachineBch();
+
+    static getLockingBytecode(data = {}): Uint8Array {
+        const lockingBytecodeResult = this.compiler.generateBytecode(
+            {
+                data: data,
+                scriptId: 'lock'
+            })
+        if (!lockingBytecodeResult.success) throw new Error(
+            'Failed to generate bytecode, script: , ' + JSON.stringify(lockingBytecodeResult, null, '  '
+            ));
+        return lockingBytecodeResult.bytecode
+    }
+
+    static getScriptHash(reversed = true): string {
+        return getScriptHash(this.getLockingBytecode(), reversed)
+    }
+
+    /**
+     * Get cashaddress
+     *
+     * @param prefix - cashaddress prefix.
+     * @throws {Error} if transaction generation fails.
+     * @returns a cashaddress.
+     */
+
+    static getAddress(prefix = "bitcoincash" as CashAddressNetworkPrefix): string {
+        return getAddress(this.getLockingBytecode(), prefix, this.tokenAware)
+    }
+
+    static getSourceOutput(utxo: UtxoI): Output {
+
+        return {
+            lockingBytecode: this.getLockingBytecode(),
+            valueSatoshis: BigInt(utxo.value),
+            token: {
+                category: hexToBin(utxo.token_data!.category!),
+                amount: BigInt(utxo.token_data?.amount!)
+            }
+        }
+
+    }
+
+    static getInput(utxo: UtxoI, age: number): InputTemplate<CompilerBch> {
+        return {
+            outpointIndex: utxo.tx_pos,
+            outpointTransactionHash: hexToBin(utxo.tx_hash),
+            sequenceNumber: age,
+            unlockingBytecode: {
+                data: {
+                    "bytecode": {
+                        "age": bigIntToVmNumber(BigInt(age))
+                    }
+                },
+                compiler: this.compiler,
+                script: 'unlock',
+                valueSatoshis: BigInt(utxo.value),
+            },
+        } as InputTemplate<CompilerBch>
+    }
+
+    static getOutput(utxo: UtxoI, amount: number, age: number): OutputTemplate<CompilerBch> {
+
+        return {
+            lockingBytecode: {
+                data: {
+                    "bytecode": {
+                        "age": bigIntToVmNumber(BigInt(age))
+                    }
+                },
+                compiler: this.compiler,
+                script: 'lock'
+            },
+            valueSatoshis: BigInt(utxo.value),
+            token: {
+                category: hexToBin(utxo.token_data!.category!),
+                amount: BigInt(utxo.token_data?.amount!) - BigInt(amount)
+
+            }
+        }
+
+    }
+
+    static getWalletSourceOutput(utxo: UtxoI, key?: string): Output {
+
+        const lockingBytecode = key ? hdPrivateKeyToP2pkhLockingBytecode({
+            addressIndex: 0,
+            hdPrivateKey: key
+        }) : Uint8Array.from(Array(33))
+
+        return {
+            lockingBytecode: lockingBytecode,
+            valueSatoshis: BigInt(utxo.value),
+            token: utxo.token_data ? {
+                category: hexToBin(utxo.token_data!.category!),
+                amount: BigInt(utxo.token_data?.amount!)
+            } : undefined
+        }
+
+    }
+
+
+    static getWalletInput(utxo: UtxoI, age: number, privateKey?: string, addressIndex = 0): InputTemplate<CompilerBch> {
+        const unlockingData = privateKey ? {
+            compiler: this.compiler,
+            data: {
+                hdKeys: {
+                    addressIndex: addressIndex,
+                    hdPrivateKeys: {
+                        'wallet': privateKey
+                    },
+                }
+            },
+            script: 'wallet_unlock',
+            valueSatoshis: BigInt(utxo.value)
+        } : Uint8Array.from(Array())
+
+        return {
+            outpointIndex: utxo.tx_pos,
+            outpointTransactionHash: hexToBin(utxo.tx_hash),
+            sequenceNumber: age,
+            unlockingBytecode: unlockingData,
+        } as InputTemplate<CompilerBch>
+    }
+
+    static getTokenOutput(amount: number, privateKey?: any, addressIndex = 0, category = BPTS): OutputTemplate<CompilerBch> {
+
+        const lockingBytecode = privateKey ? {
+            compiler: this.compiler,
+            data: {
+                hdKeys: {
+                    addressIndex: addressIndex,
+                    hdPublicKeys: {
+                        'wallet': deriveHdPublicKey(privateKey).hdPublicKey
+                    },
+                },
+            },
+            script: 'wallet_lock'
+        } : Uint8Array.from(Array(33))
+
+        return {
+            lockingBytecode: lockingBytecode,
+            valueSatoshis: 800n,
+            token: {
+                category: category,
+                amount: BigInt(amount)
+            }
+        }
+
+    }
+
+    static getChangeOutput(utxo: UtxoI, privateKey?: any, addressIndex = 0): OutputTemplate<CompilerBch> {
+
+
+        const lockingBytecode = privateKey ? {
+            compiler: this.compiler,
+            data: {
+                hdKeys: {
+                    addressIndex: addressIndex,
+                    hdPublicKeys: {
+                        'wallet': deriveHdPublicKey(privateKey).hdPublicKey
+                    },
+                },
+            },
+            script: 'wallet_lock'
+        } : Uint8Array.from(Array(33))
+
+        return {
+            lockingBytecode: lockingBytecode,
+            valueSatoshis: BigInt(utxo.value) - 800n
+        }
+
+    }
+
+    /**
+     * Get source outputs, transform contract & wallet outpoints for spending verification.
+     *
+     * @param contractUtxo - contract outputs to use as input.
+     * @param walletUtxo - wallet outputs to use as input.
+     * @param key - private key to sign transaction wallet inputs.
+     *
+     * @returns a transaction template.
+     */
+
+    static getSourceOutputs(
+        contractUtxo: UtxoI,
+        walletUtxo: UtxoI,
+        key?: string
+    ): Output[] {
+        const sourceOutputs: Output[] = [];
+        sourceOutputs.push(this.getWalletSourceOutput(walletUtxo, key));
+        sourceOutputs.push(this.getSourceOutput(contractUtxo));
+        return sourceOutputs
+    }
+
+    /**
+     * Claim some Block Points.
+     *
+     * @param now - The current bitcoin block height timestamp (expressed in blocks).
+     * @param contractUtxo - contract outputs to use as input.
+     * @param walletUtxos - wallet outputs to use as input.
+     * @param key - private key to sign transaction wallet inputs.
+     * @param fee - transaction fee to pay (per byte); default 1 sat/byte.
+     *
+     * @throws {Error} if transaction generation fails.
+     * @returns a transaction template.
+     */
+
+    static claim(
+        now: number,
+        contractUtxo: UtxoI,
+        walletUtxo: UtxoI,
+        key?: string,
+        category?: string,
+        fee = 1
+    ): {
+        transaction: Transaction,
+        sourceOutputs: Output[],
+        verify: string | boolean
+    } {
+
+        const inputs: InputTemplate<CompilerBch>[] = [];
+        const outputs: OutputTemplate<CompilerBch>[] = [];
+
+        let bptCat = category ? hexToBin(category) : BPTS
+
+        const youngerUtxo = walletUtxo.height > contractUtxo.height ? walletUtxo.height : contractUtxo.height
+
+        const age = now - youngerUtxo;
+        const amount = Math.floor(age * walletUtxo.value / 100000000)
+
+        let config = {
+            locktime: 0,
+            version: 2,
+            inputs,
+            outputs
+        }
+
+        config.inputs.push(this.getWalletInput(walletUtxo, age, key));
+        config.outputs.push(this.getTokenOutput(amount, key, 0, bptCat));
+
+        config.inputs.push(this.getInput(contractUtxo, age));
+        config.outputs.push(this.getOutput(contractUtxo, amount, age));
+
+        config.outputs.push(this.getChangeOutput(walletUtxo, key, 0));
+
+        let result = generateTransaction(config);
+        if (!result.success) throw new Error('generate transaction failed!, errors: ' + JSON.stringify(result.errors, null, '  '));
+
+        const estimatedFee = getTransactionFees(result.transaction, fee)
+
+        // subtract fees off the change output
+        config.outputs[2]!.valueSatoshis = config.outputs[2]!.valueSatoshis - estimatedFee
+
+        result = generateTransaction(config);
+        if (!result.success) throw new Error('generate transaction failed!, errors: ' + JSON.stringify(result.errors, null, '  '));
+
+        const sourceOutputs = this.getSourceOutputs(contractUtxo, walletUtxo, key);
+
+        const transaction = result.transaction
+
+        const tokenValidationResult = verifyTransactionTokens(
+            transaction,
+            sourceOutputs,
+            { maximumTokenCommitmentLength: 40 }
+        );
+        if (tokenValidationResult !== true && fee > 0) throw tokenValidationResult;
+
+        let verify = this.vm.verify({
+            sourceOutputs: sourceOutputs,
+            transaction: transaction,
+        })
+        if(typeof verify =="string") throw Error(verify)
+
+        let feeEstimate = sumSourceOutputValue(sourceOutputs) - sumSourceOutputValue(transaction.outputs)
+        if (feeEstimate > 5000) verify = `Excessive fees ${feeEstimate}`
+        if (sumSourceOutputTokenAmounts(sourceOutputs, category) == 0n) verify = `Error checking token input`
+        let tokenDiff = sumSourceOutputTokenAmounts(sourceOutputs, category) -
+            sumSourceOutputTokenAmounts(transaction.outputs, category)
+        if (tokenDiff !== 0n) throw Error(`Claiming should not create destroy tokens, token difference: ${tokenDiff}`)
+        return {
+            sourceOutputs: sourceOutputs,
+            transaction: transaction,
+            verify: verify
+        }
+
+    }
+
+}

@@ -1,0 +1,142 @@
+{
+  "$schema": "https://libauth.org/schemas/wallet-template-v0.schema.json",
+  "description": "Dutch: A descending ask token auction contract.",
+  "name": "Dutch",
+  "entities": {
+    "lock": {
+      "description": "Allow anyone to spend tokens held by the contract, provided the consignor is paid in the same transaction and a minimum ask descending price is met",
+      "name": "Dutch Auction Covenant",
+      "scripts": [
+        "unlock"
+      ],
+      "variables": {
+        "recipient": {
+          "description": "Locking bytecode for the proceeds from the auction sale.",
+          "name": "Recipient",
+          "type": "AddressData"
+        },
+        "open": {
+          "description": "Integer setting the starting minimum bid value in satoshis.",
+          "name": "Open",
+          "type": "WalletData"
+        }
+      }
+    },
+    "wallet": {
+      "description": "The entity buying tokens.",
+      "name": "Funding Entity",
+      "scripts": [
+        "wallet_lock",
+        "wallet_unlock"
+      ],
+      "variables": {
+        "key": {
+          "description": "The private key that controls this wallet.",
+          "name": "Key",
+          "type": "HdKey"
+        }
+      }
+    }
+  },
+  "scenarios": {
+    "base": {
+      "data": {
+        "bytecode": {
+          "open": "100_000_000_000"
+        }
+      },
+      "description": "",
+      "name": "Unnamed Scenario"
+    },
+    "buy": {
+      "data": {
+        "bytecode": {
+          "recipient": "0xa914e78564d75c446f8c00c757a2bd783d30c4f0819a87"
+        },
+        "currentBlockHeight": 100
+      },
+      "description": "Anyone may buy any token output held by the auction contract by paying the consignor (receipt) the minimum required bid in the corresponding output.",
+      "extends": "base",
+      "name": "Buy token",
+      "transaction": {
+        "inputs": [
+          {
+            "unlockingBytecode": [
+              "slot"
+            ],
+            "sequenceNumber": 10
+          },
+          {
+            "unlockingBytecode": {
+              "script": "wallet_unlock"
+            },
+            "outpointTransactionHash": "dead00000000000000000000000000000000000000000000000000000000beef",
+            "outpointIndex": 1
+          }
+        ],
+        "outputs": [
+          {
+            "lockingBytecode": "a914e78564d75c446f8c00c757a2bd783d30c4f0819a87",
+            "valueSatoshis": 10000000000
+          },
+          {
+            "token": {
+              "amount": 10,
+              "category": "0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+            },
+            "valueSatoshis": 800
+          }
+        ],
+        "version": 2
+      },
+      "sourceOutputs": [
+        {
+          "lockingBytecode": [
+            "slot"
+          ],
+          "token": {
+            "amount": 10,
+            "category": "0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+          },
+          "valueSatoshis": 800
+        },
+        {
+          "lockingBytecode": {
+            "script": "wallet_lock"
+          },
+          "valueSatoshis": 10000000000
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "unlock": {
+      "passes": [
+        "buy"
+      ],
+      "name": "Buy Lot",
+      "script": "// ",
+      "timeLockType": "height",
+      "unlocks": "lock"
+    },
+    "wallet_unlock": {
+      "name": "Wallet Unlock",
+      "script": "<key.schnorr_signature.all_outputs>\n<key.public_key>",
+      "unlocks": "wallet_lock"
+    },
+    "lock": {
+      "lockingType": "standard",
+      "name": "Dutch Auction Lock Script",
+      "script": "<\"U3A\"> <recipient> <open> \n\n// contract DutchAuction(\n\n//   // Opening bid \n//   int open,\n\n//   // LockingBytecode of the consigner, the address receiving proceeds\n//   bytes recipientLockingBytecode\n\n// ) {\n\n// Require version 2 for BIP68 support\nOP_TXVERSION OP_2 OP_NUMEQUALVERIFY \n// require(tx.version == 2);\n\n// The asking price is the opening bid divided by the utxo age in blocks.\nOP_INPUTINDEX OP_OUTPUTVALUE OP_DIV \n// int requiredAge = open/tx.outputs[this.activeInputIndex].value;\n\n// Require the active input nSequence number is provided in blocks.\n<65535> OP_OVER OP_GREATERTHAN OP_VERIFY \n// require(65535 > requiredAge);\n\n// Enforce the minium ask given the age of the input. \n  OP_CHECKSEQUENCEVERIFY OP_DROP \n// require(tx.age >= requiredAge);\n\n// Check that each output sends to the consignor\nOP_INPUTINDEX OP_OUTPUTBYTECODE OP_EQUAL\n// require(tx.outputs[this.activeInputIndex].lockingBytecode == \n//       recipientLockingBytecode,);\n\n//  }\n//}\n\nOP_NIP"
+    },
+    "wallet_lock": {
+      "lockingType": "standard",
+      "name": "Wallet Lock",
+      "script": "OP_DUP\nOP_HASH160 <$(<key.public_key> OP_HASH160\n)> OP_EQUALVERIFY\nOP_CHECKSIG"
+    }
+  },
+  "supported": [
+    "BCH_2026_05",
+    "BCH_SPEC"
+  ]
+}
