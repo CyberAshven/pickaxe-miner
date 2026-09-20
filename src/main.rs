@@ -9,11 +9,11 @@ mod cli;
 mod config;
 mod crypto;
 mod cuda_stage_a;
-mod stage_b;
 mod electrum;
 mod node;
 mod protocol;
 mod search;
+mod stage_b;
 mod tx;
 
 use config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, MINER_BPS};
@@ -29,6 +29,41 @@ fn print_banner() {
     );
     println!("Miner keeps {MINER_BPS} bps. Split is on the win tx only (coinbase-style).");
     println!("Type `help` for commands.\n");
+}
+
+
+fn parse_cli_args(cfg: &mut RuntimeConfig) {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--source" => {
+                if let Some(v) = args.next() {
+                    if let Err(e) = cfg.set_source(&v) {
+                        eprintln!("--source: {e}");
+                    }
+                }
+            }
+            "--node-rpc" | "--node" => {
+                if let Some(v) = args.next() {
+                    if let Err(e) = cfg.set_node_url(&v) {
+                        eprintln!("--node-rpc: {e}");
+                    }
+                }
+            }
+            "--fulcrum" => {
+                if let Some(v) = args.next() {
+                    if let Err(e) = cfg.set_fulcrum_url(&v) {
+                        eprintln!("--fulcrum: {e}");
+                    }
+                }
+            }
+            "--help" | "-h" => {
+                println!("pickaxe_miner [--source node|fulcrum] [--node-rpc URL] [--fulcrum URL]");
+            }
+            other if other.starts_with('-') => eprintln!("unknown flag: {other}"),
+            _ => {}
+        }
+    }
 }
 
 fn print_help() {
@@ -83,7 +118,10 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
     );
     if let Some(h) = handle {
         let s = h.snapshot();
-        println!("state:         {}", if s.paused { "PAUSED" } else { "MINING" });
+        println!(
+            "state:         {}",
+            if s.paused { "PAUSED" } else { "MINING" }
+        );
         println!("candidates:    {}", s.candidates);
         println!("elapsed:       {}s", s.elapsed_secs);
         println!("rate:          {:.0} H/s (HASH256 M1)", s.rate);
@@ -103,6 +141,7 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
     } else {
         println!("electrum/job:  (run `connect` / `job`)");
     }
+    println!("source:        {} (templates/submit)", cfg.source.as_str());
     println!("gpu:           CUDA Stage A");
 }
 
@@ -112,7 +151,7 @@ fn redact_url(url: &str) -> String {
         let scheme = &url[..scheme_end + 3];
         let rest = &url[scheme_end + 3..];
         if let Some(at) = rest.find('@') {
-            return format!("{scheme}***@{}" , &rest[at + 1..]);
+            return format!("{scheme}***@{}", &rest[at + 1..]);
         }
     }
     url.to_string()
@@ -144,7 +183,7 @@ fn handle_line(
         "help" | "?" => print_help(),
         "status" => print_status(cfg, handle, live),
         "donation" => print_donation(),
-        
+
         "broadcast" => {
             let args: Vec<&str> = parts.collect();
             let hex_opt = if args.is_empty() {
@@ -153,7 +192,9 @@ fn handle_line(
                 Some(args.join(""))
             };
             match hex_opt {
-                None => println!("nothing to broadcast — run applysig first or: broadcast <rawhex>"),
+                None => {
+                    println!("nothing to broadcast — run applysig first or: broadcast <rawhex>")
+                }
                 Some(hx) => {
                     // Prefer Fulcrum; fall back to native node if configured.
                     let mut ok = false;
@@ -231,7 +272,7 @@ fn handle_line(
                 }
             }
         }
-                "servers" => {
+        "servers" => {
             println!("Fulcrum/Electrum WSS try-order (sequential, ban-safe backoff):");
             let fe = cfg.electrum_endpoints();
             if fe.is_empty() {
@@ -273,7 +314,10 @@ fn handle_line(
                 println!("fulcrum custom URL cleared â€” bootstrap only");
             } else {
                 match cfg.set_fulcrum_url(&rest.join(" ")) {
-                    Ok(()) => println!("fulcrum set to {}", cfg.fulcrum_url.as_deref().unwrap_or("")),
+                    Ok(()) => println!(
+                        "fulcrum set to {}",
+                        cfg.fulcrum_url.as_deref().unwrap_or("")
+                    ),
                     Err(e) => println!("error: {e}"),
                 }
             }
@@ -290,11 +334,74 @@ fn handle_line(
                 println!("node custom URL cleared");
             } else {
                 match cfg.set_node_url(&rest.join(" ")) {
-                    Ok(()) => println!("node set to {}", redact_url(cfg.node_url.as_deref().unwrap_or(""))),
+                    Ok(()) => println!(
+                        "node set to {}",
+                        redact_url(cfg.node_url.as_deref().unwrap_or(""))
+                    ),
                     Err(e) => println!("error: {e}"),
                 }
             }
         }
+        
+        "source" => {
+            let rest: Vec<&str> = parts.collect();
+            if rest.is_empty() {
+                println!("source: {} (node=templates/submit first-class; fulcrum=auxiliary)", cfg.source.as_str());
+            } else if let Err(e) = cfg.set_source(rest[0]) {
+                println!("error: {e}");
+            } else {
+                println!("source set to {}", cfg.source.as_str());
+            }
+        }
+        "template" => {
+            let nodes = cfg.node_endpoints();
+            if nodes.is_empty() {
+                println!("set node first: node http://user:pass@127.0.0.1:8332  (or --node-rpc)");
+            } else {
+                match node::fetch_block_template(&nodes) {
+                    Ok(t) => {
+                        println!(
+                            "template ok via {} ({})",
+                            t.endpoint,
+                            if t.light { "getblocktemplatelight" } else { "getblocktemplate" }
+                        );
+                        if let Some(j) = &t.job_id {
+                            println!("  job_id: {j}");
+                        }
+                        if let Some(p) = &t.previousblockhash {
+                            println!("  prev:   {p}");
+                        }
+                        if let Some(v) = t.version {
+                            println!("  ver:    {v}");
+                        }
+                        // compact summary keys
+                        if let Some(obj) = t.raw.as_object() {
+                            println!("  keys:   {}", obj.keys().take(12).cloned().collect::<Vec<_>>().join(", "));
+                        }
+                    }
+                    Err(e) => println!("error: {e}"),
+                }
+            }
+        }
+        "submitblock" => {
+            let args: Vec<&str> = parts.collect();
+            if args.is_empty() {
+                println!("usage: submitblock <hex> [job_id]");
+            } else {
+                let hex = args[0];
+                let jid = args.get(1).copied();
+                let nodes = cfg.node_endpoints();
+                if nodes.is_empty() {
+                    println!("set node first");
+                } else {
+                    match node::submit_block(&nodes, hex, jid) {
+                        Ok((url, v)) => println!("submit ok via {url}: {v}"),
+                        Err(e) => println!("submit error: {e}"),
+                    }
+                }
+            }
+        }
+
         "nodeprobe" => match node::connect_failover(&cfg.node_endpoints()) {
             Ok((url, v)) => {
                 println!("node connected: {}", redact_url(&url));
@@ -321,7 +428,7 @@ fn handle_line(
             },
             Err(e) => println!("error: {e}"),
         },
-        
+
         "arm" => {
             if cfg.payout_address.is_empty() {
                 println!("set payout first: payout bitcoincash:...");
@@ -334,7 +441,9 @@ fn handle_line(
                             j.print_summary();
                             let nonce = 0u32;
                             match tx::photon_message_sha256(nonce, &j.target_le_hex) {
-                                Ok(h) => println!("message_sha256(nonce={nonce}): {}", hex::encode(h)),
+                                Ok(h) => {
+                                    println!("message_sha256(nonce={nonce}): {}", hex::encode(h))
+                                }
                                 Err(e) => println!("error: {e}"),
                             }
                             match tx::build_unsigned_donation_preview(
@@ -396,7 +505,10 @@ fn handle_line(
                         Ok(bytes) => {
                             let hx = hex::encode(&bytes);
                             *armed = Some(hx.clone());
-                            println!("armed win-tx {} bytes (cached; no broadcast yet):", bytes.len());
+                            println!(
+                                "armed win-tx {} bytes (cached; no broadcast yet):",
+                                bytes.len()
+                            );
                             println!("{hx}");
                             match tx::photon_message_sha256(nonce, &j.target_le_hex) {
                                 Ok(h) => println!("message_sha256: {}", hex::encode(h)),
@@ -529,6 +641,7 @@ fn main() {
 
 fn run_repl() {
     let mut cfg = RuntimeConfig::default();
+    parse_cli_args(&mut cfg);
     let mut handle: Option<SearchHandle> = None;
     let mut live: Option<LiveJob> = None;
     let mut armed: Option<String> = None;
@@ -584,5 +697,3 @@ mod tests {
         assert!(c.set_intensity(101).is_err());
     }
 }
-
-

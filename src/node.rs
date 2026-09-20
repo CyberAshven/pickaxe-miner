@@ -36,7 +36,6 @@ pub fn connect_failover(endpoints: &[String]) -> Result<(String, Value), String>
     ))
 }
 
-
 /// Broadcast raw tx via `sendrawtransaction`. Explicit only; never auto.
 pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, String), String> {
     let hex = raw_tx_hex.trim();
@@ -80,6 +79,114 @@ fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
+
+/// Light block template from BCHN. Prefers `getblocktemplatelight`, falls back to `getblocktemplate`.
+#[derive(Debug, Clone)]
+pub struct BlockTemplate {
+    pub endpoint: String,
+    pub light: bool,
+    pub job_id: Option<String>,
+    pub previousblockhash: Option<String>,
+    pub version: Option<u64>,
+    pub raw: Value,
+}
+
+pub fn fetch_block_template(endpoints: &[String]) -> Result<BlockTemplate, String> {
+    if endpoints.is_empty() {
+        return Err("no node endpoints — set `node http://user:pass@127.0.0.1:8332`".into());
+    }
+    let mut failures = Vec::new();
+    let mut backoff_ms: u64 = 400;
+    let light_params = json!([{"mode": "template", "capabilities": ["coinbasetxn", "workid"]}]);
+    let gbt_params = json!([{"rules": ["segwit"], "capabilities": ["coinbasetxn", "workid"]}]);
+    for (i, url) in endpoints.iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(backoff_ms));
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
+        }
+        match rpc_call(url, "getblocktemplatelight", light_params.clone()) {
+            Ok(v) => {
+                let job_id = v.get("job_id").and_then(|x| x.as_str()).map(|s| s.to_string());
+                let prev = v
+                    .get("previousblockhash")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                let version = v.get("version").and_then(|x| x.as_u64());
+                return Ok(BlockTemplate {
+                    endpoint: redact_url(url),
+                    light: true,
+                    job_id,
+                    previousblockhash: prev,
+                    version,
+                    raw: v,
+                });
+            }
+            Err(e_light) => match rpc_call(url, "getblocktemplate", gbt_params.clone()) {
+                Ok(v) => {
+                    let prev = v
+                        .get("previousblockhash")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                    let version = v.get("version").and_then(|x| x.as_u64());
+                    return Ok(BlockTemplate {
+                        endpoint: redact_url(url),
+                        light: false,
+                        job_id: None,
+                        previousblockhash: prev,
+                        version,
+                        raw: v,
+                    });
+                }
+                Err(e_gbt) => failures.push(format!(
+                    "{}: light={e_light} | gbt={e_gbt}",
+                    redact_url(url)
+                )),
+            },
+        }
+    }
+    Err(format!(
+        "All node template RPCs failed (ban-safe):\n{}",
+        failures.join("\n")
+    ))
+}
+
+/// Submit solved work. Prefers `submitblocklight` when `job_id` is set; else `submitblock`.
+pub fn submit_block(
+    endpoints: &[String],
+    hexdata: &str,
+    job_id: Option<&str>,
+) -> Result<(String, Value), String> {
+    let hex = hexdata.trim();
+    if hex.is_empty() || hex.len() % 2 != 0 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("block hex invalid".into());
+    }
+    if endpoints.is_empty() {
+        return Err("no node endpoints".into());
+    }
+    let mut failures = Vec::new();
+    let mut backoff_ms: u64 = 400;
+    for (i, url) in endpoints.iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(backoff_ms));
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
+        }
+        if let Some(jid) = job_id {
+            match rpc_call(url, "submitblocklight", json!([hex, jid])) {
+                Ok(v) => return Ok((redact_url(url), v)),
+                Err(e) => failures.push(format!("{}: submitblocklight: {e}", redact_url(url))),
+            }
+        }
+        match rpc_call(url, "submitblock", json!([hex])) {
+            Ok(v) => return Ok((redact_url(url), v)),
+            Err(e) => failures.push(format!("{}: submitblock: {e}", redact_url(url))),
+        }
+    }
+    Err(format!(
+        "All node submit RPCs failed (ban-safe):\n{}",
+        failures.join("\n")
+    ))
+}
+
 fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     let lower = url.to_ascii_lowercase();
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
@@ -120,14 +227,18 @@ fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
         .map_err(|e| format!("resolve: {e}"))?
         .next()
         .ok_or_else(|| "resolve: no addrs".to_string())?;
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(8)).map_err(|e| format!("connect: {e}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(8))
+        .map_err(|e| format!("connect: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(12)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
-    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
 
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).map_err(|e| format!("read: {e}"))?;
+    stream
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("read: {e}"))?;
     let text = String::from_utf8_lossy(&resp);
     let Some(idx) = text.find("\r\n\r\n") else {
         return Err("malformed HTTP response".into());
