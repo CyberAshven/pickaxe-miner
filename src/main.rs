@@ -270,9 +270,28 @@ fn handle_line(
                     Ok(mut s) => match s.fetch_live_job() {
                         Ok(j) => {
                             j.print_summary();
-                            if let Err(e) = tx::print_win_tx_preview(j.reward_raw, &cfg.payout_address)
-                            {
-                                println!("error: {e}");
+                            match tx::build_unsigned_donation_preview(
+                                &j.baton_txid,
+                                j.baton_vout,
+                                j.age,
+                                &j.target_le_hex,
+                                j.baton_value_sats,
+                                j.token_amount,
+                                j.reward_raw,
+                                &cfg.payout_address,
+                            ) {
+                                Ok(bytes) => {
+                                    let hx = hex::encode(&bytes);
+                                    if let Err(e) = tx::print_win_tx_preview(
+                                        j.reward_raw,
+                                        &cfg.payout_address,
+                                        Some(&hx),
+                                    ) {
+                                        println!("error: {e}");
+                                    }
+                                    println!("note: signature is zero placeholder — Lead Dev Schnorr fills real win");
+                                }
+                                Err(e) => println!("error building unsigned template: {e}"),
                             }
                             *live = Some(j);
                         }
