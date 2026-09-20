@@ -5,3 +5,7 @@ Thumbs.db
 *.pdb
 .env
 .env.*
+
+cuda/build/
+*.obj
+

@@ -1,14 +1,16 @@
 ﻿# CUDA kernels (ship path)
 
-**Status:** NVIDIA driver present on MasterChief (RTX 5070, CUDA 13.2 capable) but
-**CUDA Toolkit / `nvcc` not installed** — kernels cannot be compiled until Bandar
-installs the toolkit.
+Toolkit confirmed on MasterChief: **CUDA 13.4** + VS 2022 Build Tools (`cl.exe`).
 
-## Plan (Researchy / CoS lock)
-1. Stage A — message / RFC6979-ish SHA midstates
-2. Stage B — fixed-base kG (16-bit ~64MiB table; split-B if regs spill)
-3. Stage C — Schnorr + HASH256 tail
-4. Host via `cudarc` on Windows + Linux NVIDIA
-5. wgpu fallback later for non-NVIDIA
+## Build
 
-Do not treat CPU search as the product miner.
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+nvcc -O3 -c cuda\stage_a_hash256.cu -o cuda\build\stage_a_hash256.obj
+```
+
+## Kernels
+- `stage_a_hash256.cu` — GPU HASH256(nonce_le || target32) batch (toward PHOTON Stage A)
+- Stage B/C (kG / Schnorr) still TODO
+
+Product = GPU only. `src/crypto.rs` BCH Schnorr is signing/verify gate, not a CPU miner.
