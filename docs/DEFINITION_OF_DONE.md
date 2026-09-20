@@ -23,3 +23,6 @@ Bandar mining live end-to-end, committed/pushed to CyberAshven/pickaxe-miner.
 ## Owners
 - Lead Dev: CUDA/HIP/wgpu search, backends, intensity, devices
 - Dev Assist: Electrum/node, win-tx, arm/applysig/broadcast
+
+## Mining source (locked 2026-09-21)
+Full node RPC is authoritative (getblocktemplatelight → search → submitblocklight, with normal GBT fallback). Fulcrum is auxiliary (wallet/UTXO), not template authority. Flags: `--source node --node-rpc …`; optional `--fulcrum …`.
