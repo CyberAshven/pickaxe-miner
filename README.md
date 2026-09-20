@@ -4,6 +4,22 @@ Native Rust **GPU** PHOTON miner (CLI now; Ratatui TUI next). Windows + Linux. N
 
 **Definition of done:** Operator mining live with a commit on [CyberAshven/pickaxe-miner](https://github.com/CyberAshven/pickaxe-miner).
 
+
+## Templates / submit (architecture lock)
+
+**Node RPC is first-class** for mining templates and block submit:
+
+- `getblocktemplatelight` with fallback to `getblocktemplate`
+- `submitblocklight` with fallback to `submitblock`
+
+```text
+pickaxe_miner --source node --node-rpc http://user:pass@127.0.0.1:8332 [--fulcrum wss://…]
+```
+
+Interactive: `source node`, `node http://…`, `template`, `submitblock <hex> [job_id]`.
+
+**Fulcrum/Electrum is auxiliary** (wallet/UTXO/PHOTON baton index until a node-indexed path exists) — not the template source. Ban-safe sequential bootstrap stays.
+
 ## Quick start
 
 ```text
