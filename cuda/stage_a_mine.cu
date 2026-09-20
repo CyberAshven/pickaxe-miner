@@ -1,4 +1,4 @@
-// Pickaxe Stage A mine — HASH256 + on-GPU target filter. Persistent engine uses this.
+// Pickaxe Stage A mine â€” HASH256 + on-GPU target filter. Persistent engine uses this.
 // Compact winners only (nonce + digest). Correctness sibling: stage_a_hash256.cu
 #include <cstdint>
 
@@ -88,11 +88,12 @@ __device__ void hash256_nonce_target(uint32_t nonce, const uint32_t target_be[8]
 
 // LE unsigned compare: digest_le[0]=LSB ... digest_le[31]=MSB
 __device__ int meets_target_le_bytes(const uint8_t digest_le[32], const uint8_t target_le[32]) {
+    // strict hash < target (Codex audit)
     for (int i = 31; i >= 0; --i) {
         if (digest_le[i] < target_le[i]) return 1;
         if (digest_le[i] > target_le[i]) return 0;
     }
-    return 1;
+    return 0;
 }
 
 // Winner record: nonce + 32-byte digest (LE) = 36 bytes
@@ -122,15 +123,15 @@ extern "C" __global__ void pickaxe_stage_a_mine(
         digest_le[t*4+2] = (uint8_t)(w >> 8);
         digest_le[t*4+3] = (uint8_t)(w);
     }
-    // Host meets_target_le treats digest[0] as LSB — Bitcoin HASH256 digest is usually big-endian bytes in arrays.
+    // Host meets_target_le treats digest[0] as LSB â€” Bitcoin HASH256 digest is usually big-endian bytes in arrays.
     // Existing host test uses digest as returned from SHA256 (BE byte order in [0]=MSB of first word...).
     // stage_a host compare in cuda_stage_a tests equality of BE digests.
-    // search.rs meets_target_le walks index 31 down as MSB — so digest[31] is most significant.
+    // search.rs meets_target_le walks index 31 down as MSB â€” so digest[31] is most significant.
     // sha2 Digest output: out[0] is MSB of hash. So for LE compare as coded, target_le_hex parsed into out[0]=first hex byte = MSB if hex is BE.
     // Keep same as host: use BE byte array as `digest` in meets_target_le (index 31 = last byte = LSB of number if BE encoding...)
-    // Actually meets_target_le: "walk from most-significant byte (index 31) down" — so index 31 is MSB.
+    // Actually meets_target_le: "walk from most-significant byte (index 31) down" â€” so index 31 is MSB.
     // That means digest is stored LE (index 0 = LSB). But SHA256::digest gives BE (index 0 = MSB).
-    // There may be a bug in existing meets_target_le vs hash256 usage — for mine kernel use same as host hash256 + meets_target_le:
+    // There may be a bug in existing meets_target_le vs hash256 usage â€” for mine kernel use same as host hash256 + meets_target_le:
     uint8_t digest_as_host[32];
     for (int t = 0; t < 8; ++t) {
         uint32_t w = digest_be[t];
