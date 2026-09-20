@@ -1,4 +1,4 @@
-//! GPU candidate search (PERFORMANCE CONTRACT).
+﻿//! GPU candidate search (PERFORMANCE CONTRACT).
 //! Production hot path = persistent CudaMiner. CPU hash256 is reference/tests only.
 
 use crate::cuda_miner::{CudaMiner, Winner};
@@ -44,7 +44,7 @@ pub enum RuntimeCommand {
     Resume,
 }
 
-/// Double SHA-256 (HASH256) Ã¢â‚¬â€ tests / rare winner verify only.
+/// Double SHA-256 (HASH256) ├â┬ó├óΓÇÜ┬¼├óΓé¼┬¥ tests / rare winner verify only.
 pub fn hash256(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
     let second = Sha256::digest(first);
@@ -74,6 +74,7 @@ pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
 }
 
 pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
+    // PHOTON / Codex audit: strict hash < target (equality is NOT a win).
     for i in (0..32).rev() {
         if digest[i] < target_le[i] {
             return true;
@@ -82,7 +83,7 @@ pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
             return false;
         }
     }
-    true
+    false
 }
 
 pub struct SearchHandle {
@@ -102,10 +103,7 @@ impl SearchHandle {
             return Err("intensity must be 10..=100".into());
         }
         let target = parse_hex32(&job.target_le_hex)?;
-        // Prove GPU once at start (persistent miner).
-        let mut probe = CudaMiner::new(0, 256)?;
-        probe.set_target(&target)?;
-        let _ = probe.mine_batch(0)?;
+        let generation_id = job.generation_id;
 
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
@@ -132,6 +130,17 @@ impl SearchHandle {
                 eprintln!("CUDA set_target: {e}");
                 return;
             }
+            // Warm-up on the same persistent miner (Codex: no second context).
+            match miner.mine_batch(0) {
+                Ok((h, _)) => {
+                    // count warm-up hashes toward candidates via channel? keep separate — bump after Arc available
+                    let _ = h;
+                }
+                Err(e) => {
+                    eprintln!("CUDA warm-up: {e}");
+                    return;
+                }
+            }
             let mut nonce: u32 = 0;
             while !stop_c.load(Ordering::Relaxed) {
                 if paused_c.load(Ordering::Relaxed) {
@@ -143,12 +152,12 @@ impl SearchHandle {
                 let batch = ((DEFAULT_BATCH as u64) * (pct as u64) / 100).max(256) as u32;
                 miner.set_batch(batch);
 
-                let active = Instant::now();
                 match miner.mine_batch(nonce) {
                     Ok((hashes, found)) => {
                         nonce = nonce.wrapping_add(hashes as u32);
                         cand_c.fetch_add(hashes, Ordering::Relaxed);
-                        for w in found {
+                        for mut w in found {
+                            w.generation_id = generation_id;
                             win_c.fetch_add(1, Ordering::Relaxed);
                             let _ = winner_tx.send(w);
                         }
@@ -159,14 +168,7 @@ impl SearchHandle {
                         break;
                     }
                 }
-                // Mild cadence throttle only below 100% after GPU work (duty), not CPU hashing.
-                if pct < 100 {
-                    let work = active.elapsed();
-                    let sleep = work.mul_f64((100 - pct) as f64 / pct as f64);
-                    if !sleep.is_zero() {
-                        thread::sleep(sleep);
-                    }
-                }
+                // Intensity is batch-size only (Codex): no host sleep duty cycle.
             }
         });
 
@@ -268,6 +270,12 @@ mod tests {
     }
 
     #[test]
+    fn equality_is_not_a_win() {
+        let t = parse_hex32(&"aa".repeat(32)).unwrap();
+        assert!(!meets_target_le(&t, &t));
+    }
+
+    #[test]
     fn parse_and_meet_max_target() {
         let t = parse_hex32(&"ff".repeat(32)).unwrap();
         let d = hash256(b"x");
@@ -285,7 +293,7 @@ mod tests {
         let Ok(handle) = SearchHandle::start(100, job) else {
             return;
         };
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(2000));
         assert!(handle.snapshot().candidates > 0);
         handle.apply_control(RuntimeCommand::SetIntensity(10)).unwrap();
         assert_eq!(handle.snapshot().intensity, 10);

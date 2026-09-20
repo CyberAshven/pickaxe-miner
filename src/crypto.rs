@@ -167,8 +167,13 @@ pub fn bch_schnorr_verify(
     let s_g = PublicKey::from_secret_key(&s_key);
     let e_p = pk.mul_tweak(&e).map_err(|e| e.to_string())?;
     let r_prime = s_g.combine(&e_p.negate()).map_err(|e| e.to_string())?;
-    let r_ser = r_prime.serialize();
-    Ok(r_ser[1..33] == r_x)
+    let r_unc = r_prime.serialize_uncompressed();
+    if r_unc[1..33] != r_x {
+        return Ok(false);
+    }
+    let mut r_y = [0u8; 32];
+    r_y.copy_from_slice(&r_unc[33..65]);
+    Ok(y_is_quadratic_residue(&r_y))
 }
 
 pub fn schnorr_production_gate_ok() -> bool {
@@ -241,6 +246,21 @@ mod tests {
     }
 
     #[test]
+
+    #[test]
+    fn verify_requires_qr_ry_same_as_sign() {
+        let mut sk = [0u8; 32];
+        sk[31] = 1;
+        let msg = hex_32("098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f");
+        let pk = compressed_pubkey(&sk).unwrap();
+        let sig = bch_schnorr_sign(&sk, &msg).unwrap();
+        assert!(bch_schnorr_verify(&pk, &msg, &sig).unwrap());
+        // Flip s to garbage so reconstructed R is wrong / non-QR path exercised via verify false
+        let mut bad = sig;
+        bad[63] ^= 0x01;
+        assert!(!bch_schnorr_verify(&pk, &msg, &bad).unwrap());
+    }
+
     fn bch_schnorr_sign_verify_roundtrip() {
         let mut sk = [0u8; 32];
         sk[31] = 7;

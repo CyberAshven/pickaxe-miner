@@ -12,6 +12,7 @@ const WINNER_CAP: u32 = 64;
 pub struct Winner {
     pub nonce: u32,
     pub digest: [u8; 32],
+    pub generation_id: u64,
 }
 
 pub struct CudaMiner {
@@ -155,6 +156,7 @@ impl CudaMiner {
                 winners.push(Winner {
                     nonce: nonces[i],
                     digest: d,
+                    generation_id: 0,
                 });
             }
         }

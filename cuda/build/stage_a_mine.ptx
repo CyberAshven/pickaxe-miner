@@ -4426,7 +4426,7 @@
 	setp.lt.u16 	%p63, %rs63, %rs87;
 	@%p63 bra 	$L__BB0_66;
 	ld.global.nc.b8 	%rs88, [%rd1];
-	setp.lt.u16 	%p64, %rs88, %rs1;
+	setp.le.u16 	%p64, %rs88, %rs1;
 	@%p64 bra 	$L__BB0_66;
 $L__BB0_64:
 	ld.param.b32 	%r4182, [pickaxe_stage_a_mine_param_6];
