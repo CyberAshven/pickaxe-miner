@@ -1,9 +1,11 @@
-﻿//! Pickaxe Miner - interactive CLI (Stage 2/3).
+//! Pickaxe Miner - interactive CLI (Stage 2/3).
 //!
 //! Controls mirror the postcorps WebGPU site (esp. intensity).
 //! Donation: 2% coinbase-style split on the win tx only - never skim unrelated funds.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
+mod backend;
+mod cli;
 mod config;
 mod crypto;
 mod cuda_stage_a;
@@ -48,7 +50,7 @@ fn print_help() {
   dryrun                       connect+job + 98/2 win-tx preview (no broadcast)
 arm                          like dryrun + message SHA256 for Schnorr (no keys)
 applysig <nonce> <pk33hex> <sig64hex>  rebuild 98/2 win-tx hex (no broadcast)
-  broadcast [rawhex]             submit last armed tx or given hex (Electrum)
+  broadcast [rawhex]             submit last armed tx/hex (Fulcrum then node)
   start                        Start CPU search (uses last job if present)
   stop                         Stop search
   split <reward_raw>           Preview 98%/2% split for a raw reward amount
@@ -150,16 +152,35 @@ fn handle_line(
             };
             match hex_opt {
                 None => println!("nothing to broadcast — run applysig first or: broadcast <rawhex>"),
-                Some(hx) => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
-                    Err(e) => println!("error: {e}"),
-                    Ok(mut s) => match s.broadcast_raw(&hx) {
-                        Ok(txid) => {
-                            println!("broadcast ok: {txid}");
-                            *armed = None;
+                Some(hx) => {
+                    // Prefer Fulcrum; fall back to native node if configured.
+                    let mut ok = false;
+                    match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                        Ok(mut s) => match s.broadcast_raw(&hx) {
+                            Ok(txid) => {
+                                println!("broadcast ok (fulcrum): {txid}");
+                                *armed = None;
+                                ok = true;
+                            }
+                            Err(e) => println!("fulcrum broadcast failed: {e}"),
+                        },
+                        Err(e) => println!("fulcrum connect failed: {e}"),
+                    }
+                    if !ok {
+                        let nodes = cfg.node_endpoints();
+                        if nodes.is_empty() {
+                            println!("no node fallback — set `node http://…` or fix Fulcrum");
+                        } else {
+                            match node::broadcast_raw(&nodes, &hx) {
+                                Ok((url, txid)) => {
+                                    println!("broadcast ok (node {url}): {txid}");
+                                    *armed = None;
+                                }
+                                Err(e) => println!("node broadcast error: {e}"),
+                            }
                         }
-                        Err(e) => println!("broadcast error: {e}"),
-                    },
-                },
+                    }
+                }
             }
         }
 
@@ -489,6 +510,10 @@ fn handle_line(
 }
 
 fn main() {
+    cli::run_cli(run_repl);
+}
+
+fn run_repl() {
     let mut cfg = RuntimeConfig::default();
     let mut handle: Option<SearchHandle> = None;
     let mut live: Option<LiveJob> = None;
