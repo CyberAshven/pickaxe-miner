@@ -45,6 +45,8 @@ fn print_help() {
   nodeprobe                    Probe native node RPC (getblockchaininfo)
   job                          Fetch live PHOTON baton â†’ MiningJob
   dryrun                       connect+job + 98/2 win-tx preview (no broadcast)
+arm                          like dryrun + message SHA256 for Schnorr (no keys)
+applysig <nonce> <pk33hex> <sig64hex>  rebuild 98/2 win-tx hex (no broadcast)
   start                        Start CPU search (uses last job if present)
   stop                         Stop search
   split <reward_raw>           Preview 98%/2% split for a raw reward amount
@@ -263,6 +265,92 @@ fn handle_line(
             },
             Err(e) => println!("error: {e}"),
         },
+        
+        "arm" => {
+            if cfg.payout_address.is_empty() {
+                println!("set payout first: payout bitcoincash:...");
+            } else {
+                match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                    Err(e) => println!("error: {e}"),
+                    Ok(mut s) => match s.fetch_live_job() {
+                        Err(e) => println!("error: {e}"),
+                        Ok(j) => {
+                            j.print_summary();
+                            let nonce = 0u32;
+                            match tx::photon_message_sha256(nonce, &j.target_le_hex) {
+                                Ok(h) => println!("message_sha256(nonce={nonce}): {}", hex::encode(h)),
+                                Err(e) => println!("error: {e}"),
+                            }
+                            match tx::build_unsigned_donation_preview(
+                                &j.baton_txid,
+                                j.baton_vout,
+                                j.age,
+                                &j.target_le_hex,
+                                j.baton_value_sats,
+                                j.token_amount,
+                                j.reward_raw,
+                                &cfg.payout_address,
+                            ) {
+                                Ok(bytes) => {
+                                    let hx = hex::encode(&bytes);
+                                    let _ = tx::print_win_tx_preview(
+                                        j.reward_raw,
+                                        &cfg.payout_address,
+                                        Some(&hx),
+                                    );
+                                    println!("arm: unsigned 98/2 ready — Lead Dev signs message_sha256; then applysig");
+                                }
+                                Err(e) => println!("error: {e}"),
+                            }
+                            *live = Some(j);
+                        }
+                    },
+                }
+            }
+        }
+        "applysig" => {
+            let args: Vec<&str> = parts.collect();
+            if args.len() != 3 {
+                println!("usage: applysig <nonce> <pubkey33hex> <sig64hex>");
+            } else if cfg.payout_address.is_empty() {
+                println!("set payout first");
+            } else {
+                let nonce: u32 = match args[0].parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        println!("bad nonce");
+                        return false;
+                    }
+                };
+                match live.as_ref() {
+                    None => println!("run job or arm first to cache LiveJob"),
+                    Some(j) => match tx::apply_donation_signature(
+                        &j.baton_txid,
+                        j.baton_vout,
+                        j.age,
+                        &j.target_le_hex,
+                        j.baton_value_sats,
+                        j.token_amount,
+                        j.reward_raw,
+                        &cfg.payout_address,
+                        args[1],
+                        nonce,
+                        args[2],
+                    ) {
+                        Ok(bytes) => {
+                            println!("armed win-tx {} bytes (no broadcast):", bytes.len());
+                            println!("{}", hex::encode(&bytes));
+                            match tx::photon_message_sha256(nonce, &j.target_le_hex) {
+                                Ok(h) => println!("message_sha256: {}", hex::encode(h)),
+                                Err(e) => println!("hash err: {e}"),
+                            }
+                        }
+                        Err(e) => println!("error: {e}"),
+                    },
+                }
+            }
+        }
+
         "dryrun" => {
             if cfg.payout_address.is_empty() {
                 println!("error: set payout first (`payout bitcoincash:â€¦`)");
