@@ -22,7 +22,8 @@ pub enum JobSource {
 
 impl Default for JobSource {
     fn default() -> Self {
-        JobSource::Node
+        // Codex sec15: PHOTON discovery defaults to Fulcrum baton path.
+        JobSource::Fulcrum
     }
 }
 
@@ -68,7 +69,7 @@ impl Default for RuntimeConfig {
             payout_address: String::new(),
             fulcrum_url: None,
             node_url: None,
-            source: JobSource::Node,
+            source: JobSource::Fulcrum,
             mining: false,
         }
     }
