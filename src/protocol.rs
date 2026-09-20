@@ -19,16 +19,23 @@ pub const TEMPLATE_BYTES: usize = 615;
 /// Redeem script hex (P2SH32 / covenant spend path) — from postcorps miner.js.
 pub const REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_redeem.hex");
 
-/// Public Fulcrum/Electrum WSS bootstrap (failover + redundancy).
-/// Custom user URL (Start9 Fulcrum etc.) is tried first when set in RuntimeConfig.
-/// Prefer WSS :50004 hosts with CA-signed certs.
-pub const ELECTRUM_WSS_BOOTSTRAP: &[&str] = &[
+/// Curated Fulcrum/Electrum **WSS** bootstrap (small, redundant).
+/// Custom `fulcrum` URL is tried first. Prefer CA-signed `:50004`.
+pub const FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://electrum.imaginary.cash:50004",
-    "wss://bch.imaginary.cash:50004",
     "wss://electroncash.dk:50004",
-    "wss://btc.electroncash.dk:50004",
     "wss://fulcrum.greyh.at:50004",
 ];
 
-/// Back-compat alias.
-pub const ELECTRUM_WSS: &[&str] = ELECTRUM_WSS_BOOTSTRAP;
+/// Curated native **node** JSON-RPC bootstrap (BCHN/bitcoind-style HTTP).
+/// Public RPC is rare — keep this list tiny; custom `node` URL is the usual path
+/// (Start9 `bitcoincashd` etc.). Job/baton fetch still prefers Fulcrum until a
+/// node-indexed path exists; node list is for health/broadcast versatility.
+pub const NODE_RPC_BOOTSTRAP: &[&str] = &[
+    // Intentionally empty of third-party public RPC (ban risk / auth required).
+    // Add only endpoints the operator explicitly curates later.
+];
+
+/// Back-compat aliases.
+pub const ELECTRUM_WSS_BOOTSTRAP: &[&str] = FULCRUM_WSS_BOOTSTRAP;
+pub const ELECTRUM_WSS: &[&str] = FULCRUM_WSS_BOOTSTRAP;

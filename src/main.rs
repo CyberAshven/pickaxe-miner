@@ -7,6 +7,7 @@
 mod config;
 mod crypto;
 mod electrum;
+mod node;
 mod protocol;
 mod search;
 mod tx;
@@ -35,9 +36,12 @@ fn print_help() {
   payout <cashaddr>            Set miner payout address
   donation                     Show donation address and split
   connect                      Electrum/Fulcrum connect (custom then bootstrap)
-  fulcrum <wss://…>            Set custom Fulcrum/node URL (Start9 etc.)
-  fulcrum clear                Clear custom URL (bootstrap only)
-  servers                      Show custom + bootstrap endpoint list
+  fulcrum <wss://…>            Set custom Fulcrum/Electrum WSS URL
+  fulcrum clear                Clear custom Fulcrum URL
+  node <http://…>              Set custom native node JSON-RPC URL
+  node clear                   Clear custom node URL
+  servers                      Show Fulcrum + node try-order (ban-safe)
+  nodeprobe                    Probe native node RPC (getblockchaininfo)
   job                          Fetch live PHOTON baton → MiningJob
   dryrun                       connect+job + 98/2 win-tx preview (no broadcast)
   start                        Start CPU search (uses last job if present)
@@ -91,6 +95,18 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
         println!("electrum/job:  (run `connect` / `job`)");
     }
     println!("gpu:           not wired yet");
+}
+
+fn redact_url(url: &str) -> String {
+    // Strip userinfo so passwords never hit the terminal/logs.
+    if let Some(scheme_end) = url.find("://") {
+        let scheme = &url[..scheme_end + 3];
+        let rest = &url[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            return format!("{scheme}***@{}" , &rest[at + 1..]);
+        }
+    }
+    url.to_string()
 }
 
 fn print_donation() {
@@ -157,14 +173,33 @@ fn handle_line(
             }
         }
                 "servers" => {
-            println!("Electrum/Fulcrum try-order:");
-            for (i, u) in cfg.electrum_endpoints().iter().enumerate() {
+            println!("Fulcrum/Electrum WSS try-order (sequential, ban-safe backoff):");
+            let fe = cfg.electrum_endpoints();
+            if fe.is_empty() {
+                println!("  (empty)");
+            }
+            for (i, u) in fe.iter().enumerate() {
                 let tag = if cfg.fulcrum_url.as_ref() == Some(u) {
                     " custom"
                 } else {
                     " bootstrap"
                 };
                 println!("  {}. {}{}", i + 1, u, tag);
+            }
+            println!("Native node JSON-RPC try-order (sequential, ban-safe backoff):");
+            let ne = cfg.node_endpoints();
+            if ne.is_empty() {
+                println!("  (none — set `node http://127.0.0.1:8332` for Start9/bitcoincashd)");
+            }
+            for (i, u) in ne.iter().enumerate() {
+                let tag = if cfg.node_url.as_ref() == Some(u) {
+                    " custom"
+                } else {
+                    " bootstrap"
+                };
+                // Never print embedded basic-auth passwords: redact userinfo.
+                let display = redact_url(u);
+                println!("  {}. {}{}", i + 1, display, tag);
             }
         }
         "fulcrum" => {
@@ -184,6 +219,30 @@ fn handle_line(
                 }
             }
         }
+        "node" => {
+            let rest: Vec<&str> = parts.collect();
+            if rest.is_empty() {
+                match &cfg.node_url {
+                    Some(u) => println!("node (custom): {}", redact_url(u)),
+                    None => println!("node: (not set). usage: node <http://…> | node clear"),
+                }
+            } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("clear") {
+                cfg.clear_node_url();
+                println!("node custom URL cleared");
+            } else {
+                match cfg.set_node_url(&rest.join(" ")) {
+                    Ok(()) => println!("node set to {}", redact_url(cfg.node_url.as_deref().unwrap_or(""))),
+                    Err(e) => println!("error: {e}"),
+                }
+            }
+        }
+        "nodeprobe" => match node::connect_failover(&cfg.node_endpoints()) {
+            Ok((url, v)) => {
+                println!("node connected: {}", redact_url(&url));
+                println!("rpc result: {v}");
+            }
+            Err(e) => println!("error: {e}"),
+        },
         "connect" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
             Ok(s) => {
                 println!("connected: {}", s.url);
