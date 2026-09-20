@@ -1,7 +1,3 @@
-# Codex sec15 — PHOTON job source
-
-PHOTON jobs = Fulcrum CashToken baton discovery (listunspent). Node = validate/broadcast. Never map previousblockhash to baton_txid. GBT template/submitblock stay as optional tooling only.
-
 # Pickaxe Miner
 
 Native Rust **GPU** PHOTON miner (CLI now; Ratatui TUI next). Windows + Linux. NVIDIA (CUDA) and AMD (HIP/wgpu) backends — Lead Dev owns kernels.
@@ -9,20 +5,20 @@ Native Rust **GPU** PHOTON miner (CLI now; Ratatui TUI next). Windows + Linux. N
 **Definition of done:** Operator mining live with a commit on [CyberAshven/pickaxe-miner](https://github.com/CyberAshven/pickaxe-miner).
 
 
-## Templates / submit (architecture lock)
+## PHOTON job and node roles
 
-**Node RPC is first-class** for mining templates and block submit:
+PHOTON mining jobs come from the live covenant/CashToken baton state. Today that
+state is discovered through Fulcrum/Electrum `blockchain.scripthash.listunspent`
+with token data. A BCH block `getblocktemplate` response is not a PHOTON job and
+must never be mapped into a baton or PHOTON target.
 
-- `getblocktemplatelight` with fallback to `getblocktemplate`
-- `submitblocklight` with fallback to `submitblock`
+Native node RPC remains available for chain validation and raw transaction
+broadcast. `getblocktemplatelight` / `getblocktemplate` and the matching block
+submit calls are optional BCH block tooling only.
 
-```text
-pickaxe_miner --source node --node-rpc http://user:pass@127.0.0.1:8332 [--fulcrum wss://…]
-```
-
-Interactive: `source node`, `node http://…`, `template`, `submitblock <hex> [job_id]`.
-
-**Fulcrum/Electrum is auxiliary** (wallet/UTXO/PHOTON baton index until a node-indexed path exists) — not the template source. Ban-safe sequential bootstrap stays.
+Use `--fulcrum wss://…` for custom baton discovery and `--node-rpc
+http://user:pass@127.0.0.1:8332` for a custom node endpoint. Ban-safe sequential
+failover stays in both connectivity paths.
 
 ## Quick start
 
