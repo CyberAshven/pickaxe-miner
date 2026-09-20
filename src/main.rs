@@ -7,6 +7,7 @@
 mod config;
 mod crypto;
 mod cuda_stage_a;
+mod stage_b;
 mod electrum;
 mod node;
 mod protocol;
@@ -513,4 +514,5 @@ mod tests {
         assert!(c.set_intensity(101).is_err());
     }
 }
+
 
