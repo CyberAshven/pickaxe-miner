@@ -1,0 +1,106 @@
+//   
+// CatDex - WIP 20251202, Mock, regtest
+//
+//   Parameters:
+//
+//     authCat - the token category authorizing trades or transfers (owner's NFT)
+//     assetCat - the category of the fungible token being traded
+//
+
+contract CatDex(bytes32 authCat, bytes32 assetCat){
+
+
+    function swap(){
+    
+        // If the first input has a minting baton (owner),
+        //   the spending of outputs is unrestricted. 
+        // OP_0 OP_UTXOTOKENCATEGORY OP_OVER OP_2 OP_CAT OP_EQUAL OP_IF 
+        if(tx.inputs[0].tokenCategory == authCat + 0x02){
+            // pass 
+        }
+
+        // If the order input (even input) is a mutable auth Baton ... 
+        // OP_ELSE    
+        else{
+            // Push the index of this order baton to the stack
+            // OP_INPUTINDEX OP_INPUTINDEX OP_2 OP_MOD OP_SUB 
+            int orderIndex = this.activeInputIndex - (this.activeInputIndex % 2);  
+
+            // OP_DUP OP_OUTPUTTOKENCATEGORY OP_2 OP_PICK OP_1 OP_CAT OP_EQUALVERIFY
+            require(tx.outputs[orderIndex].tokenCategory ==  authCat + 0x01);
+            
+            // Require order category is fixed
+            // OP_DUP OP_UTXOTOKENCATEGORY OP_OVER OP_OUTPUTTOKENCATEGORY OP_EQUALVERIFY
+            require(tx.inputs[orderIndex].tokenCategory == tx.outputs[orderIndex].tokenCategory);
+
+            // Require the order baton be passed back to the contract
+            // OP_DUP OP_OUTPUTBYTECODE OP_OVER OP_UTXOBYTECODE OP_EQUALVERIFY 
+            require(tx.outputs[orderIndex].lockingBytecode == 
+                     tx.inputs[orderIndex].lockingBytecode);
+
+            // Get the next index of the asset thread
+            // OP_DUP OP_1ADD 
+            int assetIndex = orderIndex + 1; 
+
+            // Require the asset thread be sent at the current contract
+            // OP_DUP OP_OUTPUTBYTECODE OP_OVER OP_UTXOBYTECODE OP_EQUALVERIFY 
+            require(tx.outputs[assetIndex].lockingBytecode == 
+                    tx.inputs[assetIndex].lockingBytecode);                 
+                        
+            // Require the asset and order threads originate from the same contract
+            // OP_OVER OP_UTXOBYTECODE OP_OVER OP_UTXOBYTECODE OP_EQUALVERIFY 
+            require(tx.inputs[orderIndex].lockingBytecode == 
+                    tx.inputs[assetIndex].lockingBytecode);  
+
+            // if the amount of tokens is greater than zero,
+            // OP_DUP OP_OUTPUTTOKENAMOUNT OP_0 OP_GREATERTHAN OP_IF 
+            if(tx.outputs[assetIndex].tokenAmount > 0){
+              // require the asset output contain token category specified by the order
+              // OP_DUP OP_OUTPUTTOKENCATEGORY OP_4 OP_PICK OP_EQUALVERIFY
+              require(tx.outputs[assetIndex].tokenCategory == assetCat);
+            } // OP_ENDIF 
+
+            // Parse the order data from the NFT commitment
+            // OP_OVER OP_UTXOTOKENCOMMITMENT OP_16 OP_SPLIT 
+            bytes quantityBin, bytes priceBin = 
+                          tx.inputs[orderIndex].nftCommitment.split(16);
+
+            //  OP_OVER OP_BIN2NUM 
+            int orderQuantity = int(quantityBin);  
+
+            // OP_OVER OP_BIN2NUM 
+            int price = int(priceBin);
+
+            // Get the amount of the token traded
+            // OP_4 OP_PICK OP_OUTPUTTOKENAMOUNT OP_5 OP_PICK OP_UTXOTOKENAMOUNT OP_SUB 
+            int tradeQuantity = tx.outputs[assetIndex].tokenAmount - 
+                                 tx.inputs[assetIndex].tokenAmount;
+
+            // Verify new authCat order baton NFT commitment
+            // OP_2 OP_PICK OP_OVER OP_SUB OP_16 OP_NUM2BIN OP_2 OP_PICK OP_16 OP_NUM2BIN OP_CAT 
+            bytes32 nextCommitment = bytes16(orderQuantity-tradeQuantity) + bytes16(price);
+
+            // Require updating order baton
+            // OP_7 OP_PICK OP_OUTPUTTOKENCOMMITMENT OP_OVER OP_EQUALVERIFY 
+            require(tx.outputs[orderIndex].nftCommitment == nextCommitment);
+
+            // require the sign of the quantity traded is matches the order sign  
+            // OP_OVER OP_0 OP_GREATERTHAN OP_4 OP_PICK OP_0 OP_GREATERTHAN OP_EQUAL OP_VERIFY
+            require((tradeQuantity > 0 == orderQuantity > 0)); 
+
+            // require the amount traded be less than (or equal to) the quantity available
+            // OP_OVER OP_ABS OP_4 OP_PICK OP_ABS OP_LESSTHANOREQUAL OP_VERIFY 
+            require(abs(tradeQuantity) <= abs(orderQuantity));
+
+            // Verify the value returned with the order exceeds the quantity traded times the price.
+            // OP_7 OP_PICK OP_OUTPUTVALUE OP_8 OP_PICK OP_UTXOVALUE OP_SUB
+            // OP_2OVER OP_SWAP OP_MUL <100_000_000> OP_DIV OP_NEGATE OP_NUMEQUALVERIFY 
+            require((tx.outputs[orderIndex].value - tx.inputs[orderIndex].value) >= -(tradeQuantity*price/100_000_000));
+
+            
+        } // OP_2DROP OP_2DROP OP_2DROP OP_2DROP 
+        //
+    } 
+    // OP_ENDIF 
+} 
+// OP_2DROP OP_1
