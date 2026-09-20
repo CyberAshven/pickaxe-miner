@@ -13,7 +13,7 @@ use std::time::Duration;
 pub fn connect_failover(endpoints: &[String]) -> Result<(String, Value), String> {
     if endpoints.is_empty() {
         return Err(
-            "no native node endpoints — set `node http://127.0.0.1:8332` (Start9 etc.)".into(),
+            "no native node endpoints â€” set `node http://127.0.0.1:8332` (Start9 etc.)".into(),
         );
     }
     let mut failures = Vec::new();
@@ -47,7 +47,7 @@ pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, 
         return Err("raw tx must be hex".into());
     }
     if endpoints.is_empty() {
-        return Err("no node endpoints — set `node http://user:pass@127.0.0.1:8332`".into());
+        return Err("no node endpoints â€” set `node http://user:pass@127.0.0.1:8332`".into());
     }
     let mut failures = Vec::new();
     let mut backoff_ms: u64 = 400;
@@ -94,37 +94,30 @@ pub struct BlockTemplate {
 
 
 impl BlockTemplate {
+    /// Codex sec15: never map GBT fields into a PHOTON MiningJob.
     pub fn to_mining_job(&self) -> Result<crate::search::MiningJob, String> {
-        let height = self.raw.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let prev = self.previousblockhash.clone().unwrap_or_else(|| "unknown".into());
-        let target_le_hex = if let Some(t) = self.raw.get("target").and_then(|v| v.as_str()) {
-            be_hex32_to_le_hex(t)?
-        } else if let Some(bits) = self.raw.get("bits") {
-            let bits_u = match bits {
-                Value::String(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)
-                    .map_err(|e| format!("bits: {e}"))?,
-                Value::Number(n) => n.as_u64().ok_or("bits num")? as u32,
-                _ => return Err("bits field unexpected type".into()),
-            };
-            bits_to_target_le_hex(bits_u)
-        } else {
-            return Err("template missing target and bits".into());
-        };
-        Ok(crate::search::MiningJob {
-            height,
-            target_le_hex,
-            baton_txid: prev,
-        })
+        Err(
+            "Codex sec15: getblocktemplate is not a PHOTON job â€” use Fulcrum CashToken baton (listunspent). Node is for validate/broadcast only."
+                .into(),
+        )
     }
 
     pub fn print_summary(&self) {
         println!(
             "node template via {} ({})",
             self.endpoint,
-            if self.light { "getblocktemplatelight" } else { "getblocktemplate" }
+            if self.light {
+                "getblocktemplatelight"
+            } else {
+                "getblocktemplate"
+            }
         );
-        if let Some(j) = &self.job_id { println!("  job_id: {j}"); }
-        if let Some(p) = &self.previousblockhash { println!("  prev:   {p}"); }
+        if let Some(j) = &self.job_id {
+            println!("  job_id: {j}");
+        }
+        if let Some(p) = &self.previousblockhash {
+            println!("  prev:   {p}");
+        }
         if let Some(h) = self.raw.get("height").and_then(|v| v.as_u64()) {
             println!("  height: {h}");
         }
@@ -172,7 +165,7 @@ mod gbt_tests {
 
 pub fn fetch_block_template(endpoints: &[String]) -> Result<BlockTemplate, String> {
     if endpoints.is_empty() {
-        return Err("no node endpoints — set `node http://user:pass@127.0.0.1:8332`".into());
+        return Err("no node endpoints â€” set `node http://user:pass@127.0.0.1:8332`".into());
     }
     let mut failures = Vec::new();
     let mut backoff_ms: u64 = 400;
@@ -272,7 +265,7 @@ fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
         return Err("node URL must be http(s)".into());
     }
     if lower.starts_with("https://") {
-        return Err("https node RPC not wired yet — use http:// on LAN/Tailscale for now".into());
+        return Err("https node RPC not wired yet â€” use http:// on LAN/Tailscale for now".into());
     }
     let rest = &url["http://".len()..];
     let (auth, hostport_path) = if let Some(at) = rest.find('@') {
