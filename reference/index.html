@@ -1,0 +1,1041 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+
+    <title>PHOTON WebGPU Miner</title>
+
+    <style>
+        :root {
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #171717;
+            background: #f6f7f9;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 40px 20px;
+        }
+
+        main {
+            width: min(920px, 100%);
+            margin: 0 auto;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: clamp(2rem, 5vw, 3rem);
+        }
+
+        h2 {
+            margin-top: 0;
+            font-size: 1.15rem;
+        }
+
+        .subtitle {
+            margin: 0 0 28px;
+            color: #5f6368;
+        }
+
+        .card {
+            background: #fff;
+            border: 1px solid #dfe3e8;
+            border-radius: 14px;
+            padding: 22px;
+            margin-bottom: 18px;
+        }
+
+        .field {
+            display: grid;
+            gap: 8px;
+            margin-bottom: 18px;
+        }
+
+        label { font-weight: 650; }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 12px 14px;
+            border: 1px solid #c8cdd3;
+            border-radius: 9px;
+            font: inherit;
+        }
+
+        .check-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 18px;
+        }
+
+        input[type="checkbox"] {
+            width: 19px;
+            height: 19px;
+        }
+
+        .button-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: 0;
+            border-radius: 9px;
+            padding: 11px 16px;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+            background: #171717;
+            color: #fff;
+        }
+
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.45;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: 170px 1fr;
+            gap: 9px 14px;
+            margin: 0;
+        }
+
+        .status-grid dt { font-weight: 700; }
+
+        .status-grid dd {
+            margin: 0;
+            overflow-wrap: anywhere;
+        }
+
+        .result {
+            margin-top: 16px;
+            padding: 14px;
+            border-radius: 9px;
+            background: #f3f4f6;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+            font-size: 0.92rem;
+        }
+
+        .pass { border-left: 5px solid #16803a; }
+        .fail { border-left: 5px solid #b42318; }
+
+        .note {
+            color: #5f6368;
+            font-size: 0.93rem;
+            line-height: 1.45;
+        }
+
+        code {
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                color: #f1f3f4;
+                background: #111315;
+            }
+
+            .card {
+                background: #191c1f;
+                border-color: #343a40;
+            }
+
+            .subtitle, .note { color: #aeb4bb; }
+
+            input[type="text"] {
+                color: inherit;
+                background: #111315;
+                border-color: #4b5259;
+            }
+
+            button {
+                background: #f1f3f4;
+                color: #171717;
+            }
+
+            .result { background: #111315; }
+        }
+
+        /* Focused production/test UI */
+        .focus-hidden {
+            display: none !important;
+        }
+
+        #runM50Live {
+            font-size: 1.1rem;
+            font-weight: 750;
+            padding: 14px 20px;
+            min-width: 245px;
+        }
+
+        #stopM50Live {
+            padding: 12px 18px;
+        }
+
+        .current-test-card {
+            border-width: 2px;
+        }
+
+        .current-test-card > h2 {
+            font-size: 1.35rem;
+        }
+
+        #runM53HardwareDiagnostics {
+            font-size: 1.05rem;
+            font-weight: 750;
+            padding: 13px 18px;
+        }
+
+        .focus-kicker {
+            font-size: 0.8rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            opacity: 0.72;
+            margin-bottom: 6px;
+        }
+
+        .focus-steps {
+            margin: 12px 0 18px;
+            padding-left: 22px;
+        }
+
+        .focus-steps li {
+            margin: 6px 0;
+        }
+
+        .legacy-disclosure {
+            margin: 18px 0 8px;
+            opacity: 0.8;
+        }
+
+        .legacy-disclosure summary {
+            cursor: pointer;
+            font-weight: 650;
+        }
+
+        .legacy-disclosure button {
+            margin-top: 10px;
+        }
+
+    </style>
+</head>
+
+<body>
+<main>
+    <h1>PHOTON WebGPU Miner</h1>
+    <p class="subtitle">PHOTON WebGPU Miner — Apple/Metal compatibility + locally generated persistent 64 MiB table. — HTML Version: M67.38-MainContinuousWins-v1</p>
+
+    <section class="card">
+        <div class="focus-kicker">GPU mining validation</div>
+        <h2 style="font-size: 1.35rem;">Confirm this GPU can mine PHOTON</h2>
+        <p class="note">
+            Start mining runs the staged WebGPU preflight and direct adaptive batch
+            calibration automatically. If the dashboard reaches
+            <strong>REAL MAINNET MINING</strong> and shows a steady hash rate,
+            this GPU mining path is working. GPU-specific debugging tools are shown directly below the status panel;
+            unrelated historical optimization experiments remain hidden.
+        </p>
+        <div class="field">
+            <label for="payoutAddress">PHOTON payout address</label>
+            <input
+                id="payoutAddress"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Enter BCH cash address"
+            >
+                <div class="small-note" style="margin-top: 8px;">
+                    <button id="useM53ProvidedPayout" type="button">
+                        Use provided test payout address
+                    </button>
+                    <div style="margin-top: 4px;">
+                        For testers who do not have a BCH payment address handy.
+                        This fills the payout field with
+                        <code>bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh</code>.
+                        Any real PHOTON reward mined with this address selected
+                        will be paid to that address.
+                    </div>
+                </div>
+            <div class="note">
+                Used only to construct the PHOTON reward output. The address and
+                browser-owned mining private key are not transmitted to a server;
+                only a fully verified winning transaction is broadcast to BCH mainnet.
+            </div>
+        </div>
+
+        <div class="check-row">
+            <input id="enableWebGpu" type="checkbox" autocomplete="off">
+            <label for="enableWebGpu">Enable WebGPU</label>
+        </div>
+
+        <div class="button-row">
+            <button id="runShaTest" type="button" disabled>
+                Run Milestone 1 SHA-256
+            </button>
+
+            <button id="runHash256Test" type="button" disabled>
+                Run Milestone 2 HASH256
+            </button>
+
+            
+            <label for="gpuIntensity"><strong>GPU intensity</strong></label>
+            <select id="gpuIntensity">
+                <option value="25">25%</option>
+                <option value="50">50%</option>
+                <option value="75">75%</option>
+                <option value="100" selected>100%</option>
+            </select>
+            <div class="small-note">
+                Controls idle time between WebGPU batches. It does not change PHOTON cryptography or batch contents.
+            </div>
+
+
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            <div class="note" style="width: 100%; margin-top: 8px;">
+                To confirm GPU operation, watch the selected batch and hash rate
+                in the live dashboard. The separate arm below is still required
+                before a verified winner can be broadcast.
+            </div>
+
+            <div class="check-row" style="margin-top: 18px;">
+                <input id="armLiveBroadcast" type="checkbox">
+                <label for="armLiveBroadcast">
+                    Arm BCH mainnet broadcast — a verified PHOTON winner will be submitted
+                </label>
+            </div>
+
+            <button id="runM52SplitResearch" type="button">
+                Analyze Per-Win Reward Split
+            </button>
+
+            <button id="runM51Bakeoff" type="button">
+                Run M51 Stage-B Split-Depth Bake-Off
+            </button>
+
+            <button id="runM50Live" type="button">
+                Start Adaptive REAL PHOTON Mining
+            </button>
+
+            <div id="persistentTableCacheStatus" class="small-note" style="width: 100%; white-space: pre-wrap;">
+                Generator table: cache not checked yet. Mining will verify OPFS or generate locally.
+            </div>
+
+            <button id="stopM50Live" type="button" disabled>
+                Stop Real Mining
+            </button>
+
+            <button id="runM47Bakeoff" type="button">
+                Run M47 Square-Revival Bake-Off
+            </button>
+
+            <button id="runM46Bakeoff" type="button">
+                Run M46 Table-Width Full-Path Bake-Off
+            </button>
+
+            <button id="runM45Bakeoff" type="button">
+                Run M45 Split Stage-B Bake-Off
+            </button>
+
+            <button id="runM43Bakeoff" type="button">
+                Run M43 Chunked kG Bake-Off
+            </button>
+
+            <button id="runM42Bakeoff" type="button">
+                Run M42 Cooperative kG Bake-Off
+            </button>
+
+            <button id="runM41Bakeoff" type="button">
+                Run M41 Full-Path Tuning
+            </button>
+
+            <button id="runM40Bakeoff" type="button">
+                Run M40 Stage-B Register-Pressure Bake-Off
+            </button>
+
+            <button id="runM39Bakeoff" type="button">
+                Run M39 Fixed-d Stage C Bake-Off
+            </button>
+
+            <button id="runM38Bakeoff" type="button">
+                Run M38 Split-Stage Tuning
+            </button>
+
+            <button id="runM37Bakeoff" type="button">
+                Run M37 Split-Kernel + Timing Verification
+            </button>
+<button id="runM36Bakeoff" type="button">
+                Run M36 Field Arithmetic Bake-Off
+            </button>
+<button id="runM35Bakeoff" type="button">
+                Run M35 Signed-16 Half-Table Bake-Off
+            </button>
+<button id="runM34Bakeoff" type="button">
+                Run M34 XYZZ Fixed-Base Bake-Off
+            </button>
+<button id="runM33Profiler" type="button">
+                Run M33 Post-RFC Profiler + QR Optimization
+            </button>
+<button id="runM32Bakeoff" type="button">
+                Run M32 Fixed RFC6979 Bake-Off
+            </button>
+<button id="runM31Profiler" type="button">
+                Run M31 Prefix Final + Bottleneck Profile
+            </button>
+<button id="runM30Profiler" type="button">
+                Run M30 SHA Specialization Profiler
+            </button>
+<button id="runM29Bakeoff" type="button">
+                Run M29 Isolated Window Final
+            </button>
+<button id="runM28Bakeoff" type="button">
+                Run M28 Final 14/15/16 Optimized Bake-Off
+            </button>
+<button id="runM27Bakeoff" type="button">
+                Run M27 16-bit + RFC6979 Precompute Bake-Off
+            </button>
+<button id="runM26Profiler" type="button">
+                Run M26 Extreme Window + RFC6979 Profiler
+            </button>
+<button id="runM25WideSweep" type="button">
+                Run M25 Wide-Window Sweep + Profiler
+            </button>
+<button id="runM24Bakeoff" type="button">
+                Run M24 Fixed-Base Bake-Off
+            </button>
+<button id="runM23Profiler" type="button">
+                Run M23 Performance Profiler
+            </button>
+<button id="runSecpTest" type="button" disabled>
+                Run Milestone 22 Live Dry-Run Miner
+            </button>
+            <button id="stopDryRun" type="button" disabled>Stop Live Dry-Run</button>
+        </div>
+    </section>
+
+    <section class="card">
+        <dl class="status-grid">
+            <dt>Secure context</dt>
+            <dd id="secureContext">Checking…</dd>
+
+            <dt>WebGPU API</dt>
+            <dd id="webGpuApi">Checking…</dd>
+
+            <dt>JavaScript</dt>
+            <dd id="jsVersion">Waiting for miner.js…</dd>
+
+            <dt>Adapter</dt>
+            <dd id="adapterName">Not initialized</dd>
+
+            <dt>Status</dt>
+            <dd id="status">Waiting for WebGPU opt-in.</dd>
+        </dl>
+    </section>
+
+    <section id="gpuDebugSection" class="card current-test-card">
+            <h2>GPU Debugging Tools</h2>
+            <p class="note">
+                These tools are for miners trying new GPUs, drivers, WebGPU
+                backends, and mobile devices. M67.6 retains the direct adaptive
+                ladder down to 1,024 candidates for slower GPUs. None of the
+                primary diagnostics below query Electrum, mine a live target,
+                or broadcast a transaction. The One GPU -> CPU check gives the GPU
+                a synthetic ~1/64 target, stops on the first reported solution, and
+                compares that exact nonce's split-GPU Schnorr/HASH256 result with
+                an independent strict CPU reconstruction.
+            </p>
+
+            <div class="status-grid" style="margin-top: 12px;">
+                <div>
+                    <strong>Adapter details</strong>
+                    <div id="m673AdapterDetails">Enable WebGPU to populate.</div>
+                </div>
+                <div>
+                    <strong>Last device loss</strong>
+                    <div id="m673DeviceLoss">None observed this page load.</div>
+                </div>
+                <div>
+                    <strong>Adaptive batch</strong>
+                    <div id="m673AdaptiveBatch">Not calibrated.</div>
+                </div>
+                <div>
+                    <strong>Validation time</strong>
+                    <div id="m673AdaptiveValidation">—</div>
+                </div>
+                <div>
+                    <strong>Table upload</strong>
+                    <div id="m673TableUpload">—</div>
+                </div>
+            </div>
+
+            <div style="margin-top: 12px;">
+                <strong>Direct batch ladder</strong>
+                <pre id="m673AdaptiveLadder">Not calibrated.</pre>
+            </div>
+
+            <div class="button-row" style="margin-top: 12px;">
+                <button id="runOneGpuCpuSolution" type="button">
+                    Run Exact Apple C1 Reproducibility + Benchmark
+                </button>
+                <button id="copyM673DiagnosticReport" type="button">
+                    Copy Diagnostic Report
+                </button>
+            </div>
+            <p class="small-note" style="margin-top: 10px;">
+                This compatibility test uses the real optimized Stage A and M45 64 MiB table Stage B, then the exact normalized-Z WG64 C1 body that passed M67.29/M67.31. It repeats strict GPU-vs-CPU probes at multiple nonces, validates a synthetic GPU winner through strict CPU verification, and benchmarks the complete single-submission A+B+C1+C2+C3 path. No Electrum query or broadcast occurs.
+            </p>
+
+            <details style="margin-top: 14px;">
+                <summary><strong>Compatibility-build scope</strong></summary>
+                <p class="small-note">
+                    Production mining and table-using diagnostics are intentionally disabled here. This page is only for validate and benchmark the complete Apple/Metal compatibility pipeline: CPU M27 precompute + fast 64 MiB fixed-base Stage A/B + split GPU C1/C2.
+                </p>
+            </details>
+
+            <pre id="m53HardwareResult">No diagnostic run yet.</pre>
+
+            <div style="margin-top: 12px;">
+                <strong>Diagnostic report</strong>
+                <pre id="m673DiagnosticReport">Enable WebGPU, run a diagnostic, or press Copy Diagnostic Report.</pre>
+            </div>
+        </section>
+
+
+    <section class="card">
+        
+        <section id="m22Dashboard" hidden>
+            <h2>Live PHOTON Mining Dashboard</h2>
+            <div class="status-grid">
+                <div><strong>Mining state</strong><div id="m22MiningState">Idle</div></div>
+                <div><strong>GPU intensity</strong><div id="m22IntensityDisplay">50%</div></div>
+                <div><strong>BCH height</strong><div id="m22Height">—</div></div>
+                <div><strong>Baton height</strong><div id="m22BatonHeight">—</div></div>
+                <div><strong>Baton age</strong><div id="m22Age">—</div></div>
+                <div><strong>Reward</strong><div id="m22Reward">—</div></div>
+                <div><strong>Instant GPU kernel rate</strong><div id="m22InstantRate">—</div></div>
+                <div><strong>Average GPU kernel rate</strong><div id="m22AverageRate">—</div></div>
+                <div><strong>Wall-clock effective rate</strong><div id="m22WallRate">—</div></div>
+                <div><strong>Candidates searched</strong><div id="m22Candidates">0</div></div>
+                <div><strong>Elapsed</strong><div id="m22Elapsed">0 s</div></div>
+                <div><strong>Job rebuilds / stale work</strong><div id="m22StaleRebuilds">0</div></div>
+                <div><strong>Wins this mining session</strong><div id="m6738SessionWins">0</div></div>
+                <div><strong>Lifetime verified wins (this browser)</strong><div id="m6738LifetimeWins">0</div></div>
+                <div><strong>Expected time at current target (wall rate)</strong><div id="m22ExpectedTime">—</div></div>
+            </div>
+            <div><strong>Current target</strong></div>
+            <pre id="m22Target">—</pre>
+            <div><strong>Current baton</strong></div>
+            <pre id="m22Baton">—</pre>
+            <div><strong>Most recent verified win</strong></div>
+            <div id="m6738LastWin" class="small-note" style="white-space: pre-wrap;">No verified wins recorded yet.</div>
+        </section>
+
+<h2>Milestone 1 — PHOTON signing-message SHA-256</h2>
+        <p class="note">
+            GPU computes SHA-256 of <code>nonceLE || target</code> for the deterministic
+            CUDA vector.
+        </p>
+        <div id="shaResult" class="result">Not run.</div>
+    </section>
+
+    <section class="card">
+        <h2>Milestone 2 — Complete transaction HASH256</h2>
+        <p class="note">
+            GPU hashes the full 615-byte completed deterministic PHOTON transaction,
+            then hashes the 32-byte first digest again. Both SHA-256 operations run
+            in WGSL.
+        </p>
+        <div id="hash256Result" class="result">Not run.</div>
+    </section>
+
+    <section class="card">
+        
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            
+        <section>
+            <h2>Milestone 54 — Trustless PHOTON fee-sponsor covenant prototype</h2>
+            <p>
+                Local covenant construction and adversarial simulation only.
+                No Electrum access, WebGPU work, funding transaction, or broadcast.
+                <strong>Do not fund this prototype.</strong>
+            </p>
+
+            <label>
+                Site-owner / maintenance BCH address
+                <input id="m54OwnerAddress" type="text"
+                       value="bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh">
+            </label>
+
+            <label>
+                Site share (%)
+                <input id="m54SitePercent" type="number"
+                       min="0.01" max="99.99" step="0.01"
+                       value="5.00">
+            </label>
+
+            <label>
+                Expected PHOTON baton txid
+                <input id="m54ExpectedBatonTxid" type="text"
+                       value="0000000000000000000000000000000000000000000000000000000000000000">
+            </label>
+            <div class="small-note">
+                The all-zero value is a placeholder for structural analysis.
+                A real covenant instance would be initialized with the live
+                PHOTON baton transaction ID.
+            </div>
+
+            <label>
+                Modeled PHOTON reward
+                <input id="m54RewardPhoton" type="number"
+                       min="0.00000001" step="0.00000001"
+                       value="49.93432879">
+            </label>
+
+            <label>
+                Parent mining transaction size (bytes)
+                <input id="m54ParentBytes" type="number"
+                       min="100" max="5000" step="1"
+                       value="615">
+            </label>
+
+            <label>
+                Reward UTXO BCH value (sats)
+                <input id="m54RewardSats" type="number"
+                       min="700" max="1500" step="1"
+                       value="800">
+            </label>
+
+            <label>
+                Each split token output BCH value (sats)
+                <input id="m54TokenOutputSats" type="number"
+                       min="546" max="5000" step="1"
+                       value="700">
+            </label>
+
+            <label>
+                Sponsor reserve consumption per split (sats)
+                <input id="m54SponsorSubsidy" type="number"
+                       min="1" max="100000" step="1"
+                       value="2000">
+            </label>
+
+            <label>
+                Example sponsor reserve (sats)
+                <input id="m54ReserveSats" type="number"
+                       min="1" step="1"
+                       value="100000">
+            </label>
+
+            <button id="runM54SponsorPrototype" type="button">
+                Analyze Trustless Sponsor Prototype
+            </button>
+
+            <pre id="m54SponsorResult">Not run.</pre>
+        </section>
+
+        
+
+        <section>
+            <h2>Milestone 52 — Per-win PHOTON reward split research</h2>
+            <p>
+                This is a local structural/fee analysis only. It does not mine,
+                connect to Electrum, or broadcast. It inspects the exact PHOTON
+                redeem script used by this miner and models whether one winning
+                reward can be divided between the miner and site owner.
+            </p>
+
+            <label>
+                Example PHOTON reward
+                <input id="m52RewardPhoton" type="number"
+                       min="0.00000001" step="0.00000001"
+                       value="49.93432879">
+            </label>
+
+            <label>
+                Site-owner share (%)
+                <input id="m52OwnerPercent" type="number"
+                       min="0.01" max="99.99" step="0.01"
+                       value="5.00">
+            </label>
+
+            <button id="runM52SplitResearch" type="button">
+                Analyze Per-Win Reward Split
+            </button>
+
+            <pre id="m52SplitResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 51 — Stage-B split depth</h2>
+            <p>
+                Compares the proven four-split WG32 Stage-B path against
+                eight two-window kernels and sixteen one-window kernels.
+                Same 16-bit table and M36 two-pass Jacobian+affine arithmetic.
+                This benchmark performs no live network access or broadcast.
+            </p>
+            <pre id="m51BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>GPU validation result</h2>
+            <p>
+                Uses the proven 16-bit / four-split WG32 Stage-B path with a
+                hardware-neutral calibrated batch size (maximum 524,288). Reads the live PHOTON baton
+                directly from Electrum WSS. A GPU winner is reconstructed and
+                independently verified on the CPU using strict BCH
+                RFC6979/Schnorr semantics and HASH256, then the live baton and
+                BCH height are rechecked. Broadcast occurs only when the
+                separate mainnet arm checkbox is checked.
+            </p>
+            <pre id="m50LiveResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 47 — specialized field-square revival</h2>
+            <p>
+                Re-tests the M36 symmetric two-pass field-square now that
+                Stage B is split into four small kernels. Compares the M46
+                winner against selective Z², selective H²/R², and all-square
+                mixed-add formulas. Complete 524,288-candidate PHOTON
+                throughput is authoritative. No live network access or
+                broadcast occurs.
+            </p>
+            <pre id="m47BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 46 — full-path fixed-base table width</h2>
+            <p>
+                Re-tests 15-bit versus 16-bit fixed-base tables after M45
+                established four-way serial Stage-B splitting. The 15-bit
+                table is about 44% smaller but uses 18 windows instead of 16.
+                Both unsplit and four-split paths are measured in the complete
+                524,288-candidate PHOTON pipeline. No live network access or
+                broadcast occurs.
+            </p>
+            <pre id="m46BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 45 — serial Stage-B kernel splitting</h2>
+            <p>
+                Keeps the proven 16-bit table and Jacobian+affine two-pass
+                arithmetic, but divides the 16 fixed-base windows across two
+                or four serial GPU dispatches. This tests whether reducing
+                Stage-B shader/register pressure outweighs the intermediate
+                point read/write traffic. No live network access or broadcast
+                occurs.
+            </p>
+            <pre id="m45BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 43 — chunked fixed-base kG</h2>
+            <p>
+                Tests partial intra-candidate parallelism while preserving the
+                cheap Jacobian+affine mixed-add path. Two-way mode uses two
+                serial 8-window accumulators plus one Jacobian+Jacobian merge;
+                four-way mode uses four 4-window accumulators plus three full
+                merges. Complete 524,288-candidate PHOTON throughput is
+                authoritative. No live network access or broadcast occurs.
+            </p>
+            <pre id="m43BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 42 — cooperative fixed-base kG</h2>
+            <p>
+                Assigns 16 GPU lanes to each candidate so the 16 fixed-base
+                table points are reduced as a four-level workgroup tree instead
+                of a serial 15-addition dependency chain. Complete PHOTON
+                throughput at the M41 524,288-candidate batch is authoritative.
+                No live network access or broadcast occurs.
+            </p>
+            <pre id="m42BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 41 — full-path Stage-B and batch tuning</h2>
+            <p>
+                Treats complete A→B→C throughput as the authority after M40
+                showed isolated Stage-B timing can select the wrong winner.
+                Sweeps every M40 baseline and streamed Stage-B workgroup size
+                inside the complete PHOTON pipeline, with M39 fixed-d Stage C,
+                then sweeps candidate batch size using the full-path winner.
+                No live network access or broadcast occurs.
+            </p>
+            <pre id="m41BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 40 — Stage-B register-pressure reduction</h2>
+            <p>
+                Tests a two-pass field multiplier that eliminates the two
+                temporary 16-element operand arrays and extracts 16-bit digits
+                directly from the original U256 limbs. Baseline and streamed
+                fixed-base kG are tested across a fine workgroup sweep before
+                complete PHOTON timing. M39 fixed-d Stage C is retained.
+                No live network access or broadcast occurs.
+            </p>
+            <pre id="m40BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 39 — fixed-private-key Stage C</h2>
+            <p>
+                Replaces the per-candidate 256-bit e*d double-and-add with a
+                256 KiB table specialized to the persistent mining private key.
+                Also tests WG32 for Stage C and applies the proven two-pass
+                field reduction to its explicit affine-x multiplications.
+                Primitive and end-to-end correctness gates run before timing.
+                No live network access or broadcast occurs.
+            </p>
+            <pre id="m39BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 38 — split-stage tuning</h2>
+            <p>
+                Tunes workgroup size independently for SHA/RFC, fixed-base kG,
+                and the Schnorr/HASH tail; re-tests 15-bit versus 16-bit tables
+                in the isolated two-pass kG stage; and compares the three-stage
+                split with a lower-traffic two-stage A + (kG+tail) layout.
+                Every timed pipeline is explicitly pre-warmed. No live network
+                access or broadcast occurs.
+            </p>
+            <pre id="m38BakeoffResult">Not run.</pre>
+        </section>
+
+        <section>
+            <h2>Milestone 37 — split-kernel + timing verification</h2>
+            <p>
+                Verifies the unexpected M36 absolute-rate jump using longer,
+                interleaved control measurements, then tests a three-pass GPU
+                pipeline that isolates message/RFC, fixed-base kG, and the
+                Schnorr/HASH256 tail. This lets the fast M36 squaring kG run
+                without inflating the register footprint of the entire miner.
+                Exact signature/HASH256 equivalence is required first. No live
+                network access or broadcast occurs.
+            </p>
+            <pre id="m37BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 36 — field arithmetic bake-off</h2>
+            <p>
+                Keeps M32's exact 16-bit scalar/window/table structure and
+                tests only field arithmetic: a two-pass secp256k1
+                pseudo-Mersenne reduction and a symmetric radix-2^16 squaring
+                routine. GPU primitive fuzzing and end-to-end
+                signature/HASH256 equivalence must pass before timing.
+                No live network access or broadcast occurs.
+            </p>
+            <pre id="m36BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 35 — signed-16 half-table + direct Jacobian</h2>
+            <p>
+                Keeps M32's ordinary Jacobian formulas, fixed RFC6979,
+                transaction-prefix hashing, and WG256. First isolates direct
+                aligned 16-bit digit extraction and first-point initialization,
+                then tests balanced signed-16 recoding using a ~32 MiB
+                magnitude table instead of the 64 MiB unsigned table. Exact
+                signatures and HASH256 are required before timing. No live
+                network access or broadcast occurs.
+            </p>
+            <pre id="m35BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 34 — XYZZ fixed-base accumulation</h2>
+            <p>
+                Keeps M32 fixed RFC6979, transaction-prefix hashing, the
+                16-bit generator table, and WG256 unchanged. Replaces only the
+                running fixed-base point representation with XYZZ coordinates,
+                which removes one general field square per real mixed addition
+                and one field multiplication during final affine-x recovery.
+                End-to-end signature/HASH256 equivalence is required before
+                timing. No live network access or broadcast occurs.
+            </p>
+            <pre id="m34BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 33 — post-RFC profiler + QR optimization</h2>
+            <p>
+                Profiles the exact M32 winner with finer post-ECC stages,
+                correctness-checks a one-Legendre Jacobian QR identity, and
+                retests WG64/WG128/WG256 after the large M32 RFC reduction.
+                The fastest correctness-proven full path is then profiled over
+                eight cumulative stages. No live network access or broadcast.
+            </p>
+            <pre id="m33ProfilerResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 32 — fixed-length RFC6979/HMAC bake-off</h2>
+            <p>
+                Keeps the M31-winning transaction-prefix, original signing SHA,
+                16-bit fixed-base kG, and WG256 path unchanged. Replaces only
+                the remaining RFC6979 HMAC work with fixed 32-byte/113-byte
+                SHA-256 block layouts and reuses K-specific ipad/opad SHA
+                states. Exact RFC nonce, Schnorr signature, and HASH256
+                equivalence is required before timing. No live network access
+                or broadcast occurs.
+            </p>
+            <pre id="m32BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 31 — transaction-prefix final + fresh bottleneck profile</h2>
+            <p>
+                Compares the M29-equivalent baseline, transaction-prefix-only,
+                and combined M30 SHA-specialized paths using the winning 16-bit
+                table and optimized RFC6979. After selecting the fastest full
+                path, it reruns a cumulative six-stage profiler on that exact
+                winner. Seven timed rounds, WG256, no live network or broadcast.
+            </p>
+            <pre id="m31ProfilerResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 30 — PHOTON SHA specialization profiler</h2>
+            <p>
+                Keeps the M29-winning 16-bit + precomputed RFC6979 + WG256
+                cryptographic path fixed, then tests a direct one-block
+                signing-message SHA-256 and a transaction HASH256 path that
+                resumes after six precomputed constant SHA-256 blocks.
+                Exact digest, signature, and HASH256 equivalence is required
+                before timing. No live network access or broadcast occurs.
+            </p>
+            <pre id="m30ProfilerResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 29 — isolated generator-buffer final</h2>
+            <p>
+                Benchmarks the already-proven optimized RFC6979 PHOTON path
+                using separate 14-, 15-, and 16-bit generator buffers. Each
+                width is timed in isolation for seven rounds at WG256 so the
+                M28 combined 119 MiB binding cannot influence the result.
+                No live network access or broadcast occurs.
+            </p>
+            <pre id="m29BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 28 — final 14/15/16-bit optimized bake-off</h2>
+            <p>
+                Runs an end-to-end deterministic equivalence gate comparing
+                production and precomputed RFC6979 candidate signatures and
+                transaction hashes, then benchmarks 14-, 15-, and 16-bit
+                fixed-base paths at workgroup_size(256). No live network access
+                or broadcast occurs.
+            </p>
+            <pre id="m28BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 27 — 16-bit fixed-base + RFC6979 precomputation</h2>
+            <p>
+                Correctness-checks a 16-bit fixed-base secp256k1 table against
+                the proven 4-bit table, precomputes constant first-HMAC SHA-256
+                states for the persistent browser mining key, verifies optimized
+                RFC6979 output byte-for-byte against production, then benchmarks
+                RFC6979 and the complete PHOTON candidate path at WG256.
+                No live network access or broadcast occurs.
+            </p>
+            <pre id="m27BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 26 — extreme window sweep + RFC6979 sub-profiler</h2>
+            <p>
+                Correctness-checks and benchmarks 12-, 13-, 14-, and 15-bit
+                unsigned fixed-base secp256k1 tables at workgroup_size(256),
+                then profiles the RFC6979 path as message SHA-256 plus each
+                sequential HMAC step. No live network access or broadcast occurs.
+            </p>
+            <pre id="m26ProfilerResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 25 — wide-window sweep + optimized profiler</h2>
+            <p>
+                Correctness-checks and benchmarks 8-, 9-, 10-, 11-, and 12-bit
+                unsigned fixed-base secp256k1 tables at workgroup_size(256),
+                selects the fastest complete PHOTON candidate path, then reruns
+                the cumulative arbitrary-key profiler using that winning window.
+                No live network access or broadcast occurs.
+            </p>
+            <pre id="m25WideSweepResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 24 — fixed-base scalar multiplication bake-off</h2>
+            <p>
+                Correctness-checks and benchmarks 4-bit, 5-bit, 6-bit, 8-bit,
+                and width-6 wNAF fixed-base secp256k1 multiplication using the
+                same arbitrary-key RFC6979 workload as live PHOTON mining.
+                All timed kernels use workgroup_size(256).
+            </p>
+            <pre id="m24BakeoffResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 23 — WebGPU performance profiler</h2>
+            <p>
+                Profiles the live arbitrary-key cryptographic path cumulatively,
+                then benchmarks the complete search kernel at workgroup sizes
+                32, 64, 128, and 256. No network access, mining target search,
+                or broadcast is required.
+            </p>
+            <pre id="m23ProfilerResult">Not run.</pre>
+        </section>
+
+<h2>Milestone 22 — live dry-run PHOTON mining</h2>
+        <p class="note">
+            This milestone performs real PHOTON proof-of-work against the current live target. The browser builds the live 615-byte transaction, searches nonce batches with WebGPU, re-checks BCH height and baton state between batches, discards stale work, and independently verifies any returned winner on the CPU before reporting it. No transaction is broadcast.
+        </p>
+        <div id="secpResult" class="result">Not run.</div>
+    </section>
+
+</main>
+
+<script type="module" src="./miner.js?v=M67.38-MainContinuousWins-v1"></script>
+</body>
+</html>

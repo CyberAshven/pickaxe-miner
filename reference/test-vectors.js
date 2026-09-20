@@ -1,0 +1,257 @@
+// Deterministic PHOTON vector from photon-vector-test.cu.
+
+export const PHOTON_VECTOR = Object.freeze({
+    nonce: 0x12345678,
+
+    target:
+        "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000",
+
+    expectedMessageSha256:
+        "098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f",
+
+    transactionHex:
+        "020000000142a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae12471200000000000000fd2901210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817985a4d0301c2529dc0cdc0c788c0d1c0ce88c351a063c0cc02401f93c0c6a269c0d2c0cf88c0d3c0d09d6776b2757603ffff009f69c4529dc0ccc0c602dc0594a269c0d3c0d0c0d003a068069694a269c0d2827701649dc0d201247f78547f777853795679bb7681c0cf547f7701207f7581906e5779028f009395029000969d51d3827754a06301ff51d358807e776701fe51d354807e7768c25480c37e00c87e00c954807e01fd7e00ca8277527f757e00ca7e00cb54807ec47e00cc58807e02b3ef7e00d101207f757e01717e01647e00d27e01ff7e00d358807e00cd7e51cc58807e0244ef7e51d17e607e787e51cd7e0054807e76aa01207f7581907777789f696d6d6d68510a00000002d0aef30000000000b3efef9b7cc84af88060a41fa8d04da605561c17f8fa1bb8dc6c76dcf0d659299729716478563412ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f0140000005b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604fc6e8cc2b6b38de1c5630da8356e2e07a403ddeba8835caba0b80d75a5ac471e4ff8edbb211d9750700aa209a2c0f31147dda170e59aaa7982e4fe3fc25928bf09f15fe1e797a2ccb05c6e087bc0200000000000044efef9b7cc84af88060a41fa8d04da605561c17f8fa1bb8dc6c76dcf0d65929972910ff757e022a0100000076a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac00000000",
+
+    transactionSize:
+        615,
+
+    expectedTransactionSha256:
+        "117b954c8ade1b14993b870d9a6c79309ceaba1b2b3aba4f08e3bf2ae39732bb",
+
+    expectedTransactionHash256:
+        "051e3c16e4d1bd51d59030594462372acc787d0ee3f77bb2724950bd6ad64c28",
+    arbitraryKeyCandidate: Object.freeze({
+        privateKey:
+            "0000000000000000000000000000000000000000000000000000000000000002",
+
+        publicKey:
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+
+        nonce:
+            0x12345678,
+
+        target:
+            "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000",
+
+        unsignedTemplateHex:
+            "020000000142a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae12471200000000000000fd29012102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee55a4d0301c2529dc0cdc0c788c0d1c0ce88c351a063c0cc02401f93c0c6a269c0d2c0cf88c0d3c0d09d6776b2757603ffff009f69c4529dc0ccc0c602dc0594a269c0d3c0d0c0d003a068069694a269c0d2827701649dc0d201247f78547f777853795679bb7681c0cf547f7701207f7581906e5779028f009395029000969d51d3827754a06301ff51d358807e776701fe51d354807e7768c25480c37e00c87e00c954807e01fd7e00ca8277527f757e00ca7e00cb54807ec47e00cc58807e02b3ef7e00d101207f757e01717e01647e00d27e01ff7e00d358807e00cd7e51cc58807e0244ef7e51d17e607e787e51cd7e0054807e76aa01207f7581907777789f696d6d6d68510a00000002d0aef30000000000b3efef9b7cc84af88060a41fa8d04da605561c17f8fa1bb8dc6c76dcf0d659299729716400000000ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f01400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff8edbb211d9750700aa209a2c0f31147dda170e59aaa7982e4fe3fc25928bf09f15fe1e797a2ccb05c6e087bc0200000000000044efef9b7cc84af88060a41fa8d04da605561c17f8fa1bb8dc6c76dcf0d65929972910ff757e022a0100000076a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac00000000",
+
+        expectedMessageHash:
+            "098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f",
+
+        expectedRfc6979Nonce:
+            "68382d4f1025c198b5a7b60591fa31929379d6d3c8a3430ee7306183f50d976f",
+
+        expectedQuadraticResidue:
+            true,
+
+        expectedAdjustedNonce:
+            "68382d4f1025c198b5a7b60591fa31929379d6d3c8a3430ee7306183f50d976f",
+
+        expectedChallengeHash:
+            "87609195970248eb9f719ff3b271c881edbfe901fefad1764cb27dc370f85b3d",
+
+        expectedSignature:
+            "fa109c5e0ed71afbb0c9241487bd87c0627e529b2b0b3abec497eee6c120f10076f9507a3e2a536ff48af5ecf6ddc297b44acbf1175045bfc0c2fe7e06c80ca8",
+
+        expectedTransactionSha256:
+            "616ce4c0b904b4e8a427ef0f0b4a3383502c8efcd0e9eaf894bf4189ea955a56",
+
+        expectedTransactionHash256:
+            "be728b747b638f4df57df5c100d9e4a4be4da40bb5e8d812d093d76020a1a415",
+    }),
+
+    photonIntegratedCandidate: Object.freeze({
+        batonStart:
+            390,
+
+        nonce:
+            0x12345678,
+
+        target:
+            "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000",
+
+        unsignedTemplateHex:
+            "020000000142a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae12471200000000000000fd2901210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817985a4d0301c2529dc0cdc0c788c0d1c0ce88c351a063c0cc02401f93c0c6a269c0d2c0cf88c0d3c0d09d6776b2757603ffff009f69c4529dc0ccc0c602dc0594a269c0d3c0d0c0d003a068069694a269c0d2827701649dc0d201247f78547f777853795679bb7681c0cf547f7701207f7581906e5779028f009395029000969d51d3827754a06301ff51d358807e776701fe51d354807e7768c25480c37e00c87e00c954807e01fd7e00ca8277527f757e00ca7e00cb54807ec47e00cc58807e02b3ef7e00d101207f757e01717e01647e00d27e01ff7e00d358807e00cd7e51cc58807e0244ef7e51d17e607e787e51cd7e0054807e76aa01207f7581907777789f696d6d6d68510a00000002d0aef30000000000b3efef9b7cc84af88060a41fa8d04da605561c17f8fa1bb8dc6c76dcf0d659299729716400000000ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f01400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff8edbb211d9750700aa209a2c0f31147dda170e59aaa7982e4fe3fc25928bf09f15fe1e797a2ccb05c6e087bc0200000000000044efef9b7cc84af88060a41fa8d04da605561c17f8fa1bb8dc6c76dcf0d65929972910ff757e022a0100000076a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac00000000",
+
+        expectedSignature:
+            "5b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604fc6e8cc2b6b38de1c5630da8356e2e07a403ddeba8835caba0b80d75a5ac471e4",
+
+        expectedTransactionSha256:
+            "117b954c8ade1b14993b870d9a6c79309ceaba1b2b3aba4f08e3bf2ae39732bb",
+
+        expectedTransactionHash256:
+            "051e3c16e4d1bd51d59030594462372acc787d0ee3f77bb2724950bd6ad64c28",
+    }),
+
+    bchFullSchnorr: Object.freeze({
+        r:
+            "5b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604f",
+
+        compressedPublicKey:
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+
+        messageHash:
+            "098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f",
+
+        originalNonce:
+            "615da2b700fbb1ae10a72a391ce49b17cd4d0f614311ac7d216281217fd7797a",
+
+        expectedQuadraticResidue:
+            false,
+
+        expectedAdjustedNonce:
+            "9ea25d48ff044e51ef58d5c6e31b64e6ed61cd856c36f3be9e6fdd6b505ec7c7",
+
+        expectedChallengeHash:
+            "28466ee26c348fca66d804bc73c77b9352dc11351bfed6fb6d10f9ef0a65aa1d",
+
+        expectedS:
+            "c6e8cc2b6b38de1c5630da8356e2e07a403ddeba8835caba0b80d75a5ac471e4",
+
+        expectedSignature:
+            "5b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604fc6e8cc2b6b38de1c5630da8356e2e07a403ddeba8835caba0b80d75a5ac471e4",
+    }),
+
+    bchSchnorrPoint: Object.freeze({
+        nonce:
+            "615da2b700fbb1ae10a72a391ce49b17cd4d0f614311ac7d216281217fd7797a",
+
+        expectedAffineX:
+            "5b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604f",
+
+        expectedAffineY:
+            "4b574c015e8a3149605cb27b69b73a939e1251b10524eed4631acc27c6aa9347",
+
+        expectedNegatedY:
+            "b4a8b3fea175ceb69fa34d849648c56c61ed0e4efadb112b9ce533d7395568e8",
+
+        expectedAdjustedNonce:
+            "9ea25d48ff044e51ef58d5c6e31b64e6ed61cd857c36f3be9e703d6b506ec7c7",
+
+        yIsQuadraticResidue:
+            false,
+    }),
+
+    bchRfc6979: Object.freeze({
+        privateKey:
+            "0000000000000000000000000000000000000000000000000000000000000001",
+
+        messageHash:
+            "098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f",
+
+        algorithmTagHex:
+            "5363686e6f72722b5348413235362020",
+
+        expectedKAfterStepD:
+            "57ed1dfb96a48dd0298e69b8cc22841137b96f18d66923a642c6d0d28762fb46",
+
+        expectedVAfterStepD:
+            "934c0039dd2a49bc84bbe0ec78e4406e4b7afe07082d62797ccae8877ec8dbca",
+
+        expectedKAfterStepF:
+            "012bb90c7a5e8c9cf8b46b38d75da0633d366fec9eda2d0351598285f3c4fe71",
+
+        expectedVAfterStepF:
+            "51c204102a9f36292b8bdce958a30e3b8597320ec963670d4e865c7cdccfabbc",
+
+        expectedNonce:
+            "615da2b700fbb1ae10a72a391ce49b17cd4d0f614311ac7d216281217fd7797a",
+    }),
+
+    secp256k1FullScalarMultiplication: Object.freeze([
+        Object.freeze({
+            scalarHex: "098d398ffeb43910012db426eb01279563beaf5e070abae77afacf312030457f",
+            expectedX: "ad93585f8229a5b860eb83776ae20ccda7bffd480bd6f7e953f373355b4897fa",
+            expectedY: "8ce93092f712dd1460cc2dac170378c71f5a3dc3ba290c91a60be5888205400c",
+            expectedZ: "0f1435391d2c2c7192b1f17cdaa4bd74a34dd262c1b42db3d2e4166da24f9a67",
+        }),
+        Object.freeze({
+            scalarHex: "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0",
+            expectedX: "536e0ca7212367bd07dd963a5b23f923ee376689b6345fa4629fde53bff40b0a",
+            expectedY: "9b8cb646e1a62cc9fa265d06e0e8345551853697057d5e4e27c5db7bc8daf345",
+            expectedZ: "4a1bd34b830e9b82bb1f8efcefe5760280ff1577960caf1c55243dd3a1200adc",
+        })
+    ]),
+
+    secp256k1ScalarMultiplication: Object.freeze([
+        Object.freeze({
+            scalar: 1,
+            expectedX: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            expectedY: "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+            expectedZ: "0000000000000000000000000000000000000000000000000000000000000001",
+        }),
+        Object.freeze({
+            scalar: 2,
+            expectedX: "7d152c041ea8e1dc2191843d1fa9db55b68f88fef695e2c791d40444b365afc2",
+            expectedY: "56915849f52cc8f76f5fd7e4bf60db4a43bf633e1b1383f85fe89164bfadcbdb",
+            expectedZ: "9075b4ee4d4788cabb49f7f81c221151fa2f68914d0aa833388fa11ff621a970",
+        }),
+        Object.freeze({
+            scalar: 3,
+            expectedX: "0ca90ef9b06d7eb51d650e9145e3083cbd8df8759168862036f97a358f089848",
+            expectedY: "bca50189fe8472aa2fb007567229f4d458149078094d7e7d35bb6c27e9a22b08",
+            expectedZ: "6dbd0563f460dc5c401595f1492430343b7ac0165da116b7efa23994d564a085",
+        }),
+        Object.freeze({
+            scalar: 7,
+            expectedX: "a730951385f1b50a67dbc4b609b25a3dd7e567279ded01675f17afad98237b7a",
+            expectedY: "d947909cc917f7602f701f85434da99cdc012146cb812041a8d78ec0d12809e4",
+            expectedZ: "fb2e498e6fe1a16b7510b125c9a527554cdab84a9cb696e729cd32f46631edf9",
+        }),
+        Object.freeze({
+            scalar: 13,
+            expectedX: "a0878e94d52e85d4a7956af0acf4ea094c29c38b72abac92fc942d648de43ecb",
+            expectedY: "277945e28ddd8e9466c1798db2709c4ce1ba63781565e089f5d3b7d93dacaf4d",
+            expectedZ: "d70130186b577ffc9be821ce31419c7fd6140b3ed88aa2f8ced437950a35674e",
+        })
+    ]),
+
+    secp256k1JacobianDiagnostics: Object.freeze({
+        expectedA: "8550e7d238fcf3086ba9adcf0fb52a9de3652194d06cb5bb38d50229b854fc49",
+        expectedB: "4866d6a5ab41ab2c6bcc57ccd3735da5f16f80a548e5e20a44e4e9b8118c26f2",
+        expectedC: "b3f3b2bfaada891a60cca114ac98c39d6ede11e439ee42ea773d88a81cb21c86",
+        expectedD: "cbc1950e6fec4514d0271c6bcb96483d6bcb0bbcf147c112d207673669cfc671",
+        expectedE: "8ff2b776aaf6d91942fd096d2f1f7fd9aa2f64be71462131aa7f067e28fef8ac",
+        expectedF: "14985620fe816c05c1dfbd14b6d66bd08e25a078d92564ed35e2d2b387054446",
+        expectedX3: "7d152c041ea8e1dc2191843d1fa9db55b68f88fef695e2c791d40444b365afc2",
+        expectedY3: "56915849f52cc8f76f5fd7e4bf60db4a43bf633e1b1383f85fe89164bfadcbdb",
+        expectedZ3: "9075b4ee4d4788cabb49f7f81c221151fa2f68914d0aa833388fa11ff621a970",
+    }),
+
+    secp256k1FieldDiagnostics: Object.freeze({
+        expectedGeneratorX:
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+
+        expectedTwoPlusThree:
+            "0000000000000000000000000000000000000000000000000000000000000005",
+
+        expectedTwoTimesThree:
+            "0000000000000000000000000000000000000000000000000000000000000006",
+
+        expectedGeneratorXTimesOne:
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+
+        expectedGeneratorXSquared:
+            "8550e7d238fcf3086ba9adcf0fb52a9de3652194d06cb5bb38d50229b854fc49",
+    }),
+
+    secp256k1TwoG: Object.freeze({
+        scalar: 2,
+
+        expectedAffineX:
+            "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+
+        expectedAffineY:
+            "1ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a",
+
+        expectedJacobianX:
+            "7d152c041ea8e1dc2191843d1fa9db55b68f88fef695e2c791d40444b365afc2",
+
+        expectedJacobianY:
+            "56915849f52cc8f76f5fd7e4bf60db4a43bf633e1b1383f85fe89164bfadcbdb",
+
+        expectedJacobianZ:
+            "9075b4ee4d4788cabb49f7f81c221151fa2f68914d0aa833388fa11ff621a970",
+    }),
+});
