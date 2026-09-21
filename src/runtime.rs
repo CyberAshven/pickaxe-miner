@@ -8,7 +8,7 @@
 
 use crate::backend::BackendKind;
 use crate::config::{JobSource, RuntimeConfig};
-use crate::electrum::{ElectrumSession, LiveJob};
+use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::reward;
 use crate::search::VerifiedWinner;
 use crate::search::{MiningState, RuntimeCommand as SearchCommand, SearchHandle, SearchStats};
@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)]
 mod source_pool;
 
-use self::source_pool::{SourceCatalog, SourceKind, AUTO_PROBE_LIMIT};
+use self::source_pool::{
+    SourceCapability, SourceCatalog, SourceKind, AUTO_PROBE_LIMIT, DEFAULT_CAPABILITY_TTL_MS,
+};
 
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
@@ -39,6 +41,42 @@ const PHOTON_TX_BYTES: usize = 615;
 const PHOTON_TARGET_OFFSET: usize = 394;
 const BATON_LINEAGE_MAX_STEPS: usize = 256;
 const VERIFIED_WINNER_DURABILITY_READY: bool = true;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativePhotonEquivalenceProof {
+    endpoint: String,
+    tip_hash: String,
+}
+
+impl NativePhotonEquivalenceProof {
+    fn from_verified_snapshot(
+        endpoint: &str,
+        snapshot: &LiveStateSnapshot,
+    ) -> Result<Self, String> {
+        let endpoint = endpoint.trim();
+        if endpoint.is_empty() {
+            return Err("native PHOTON equivalence proof requires an endpoint".into());
+        }
+        if snapshot.tip_hash.len() != 64
+            || !snapshot
+                .tip_hash
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err(
+                "native PHOTON equivalence proof requires a valid same-tip block hash".into(),
+            );
+        }
+        Ok(Self {
+            endpoint: endpoint.to_string(),
+            tip_hash: snapshot.tip_hash.to_ascii_lowercase(),
+        })
+    }
+}
+
+fn source_capability_now_ms(epoch: Instant) -> u64 {
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettlementState {
@@ -1474,8 +1512,11 @@ impl RuntimeSupervisor {
                 run_supervisor(
                     cfg,
                     endpoints,
+                    sources,
                     initial,
                     session,
+                    None,
+                    Instant::now(),
                     search,
                     reward_secret,
                     reward_public_key,
@@ -1579,8 +1620,11 @@ impl Drop for RuntimeSupervisor {
 fn run_supervisor(
     mut cfg: RuntimeConfig,
     mut endpoints: Vec<String>,
+    mut sources: SourceCatalog,
     mut live: LiveJob,
     initial_session: ElectrumSession,
+    mut native_photon_session: Option<crate::node::NativePhotonSession>,
+    source_capability_epoch: Instant,
     search: SearchHandle,
     mut reward_secret: [u8; 32],
     reward_public_key: [u8; 33],
@@ -2085,6 +2129,20 @@ fn run_supervisor(
                 }
             }
         } else if search.refresh_required() {
+            if let Some(canonical) = session.as_mut() {
+                if let Err(error) = maybe_refresh_native_photon_capability(
+                    &cfg,
+                    canonical,
+                    &mut sources,
+                    &mut native_photon_session,
+                    source_capability_epoch,
+                ) {
+                    let message =
+                        format!("native-node PHOTON capability remains disabled: {error}");
+                    last_error = Some(message.clone());
+                    emit(&event_tx, RuntimeEvent::Error(message));
+                }
+            }
             let refreshed = session
                 .as_mut()
                 .expect("checked session above")
@@ -2235,6 +2293,64 @@ fn run_supervisor(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     snapshot.state = SupervisorState::Stopped;
     snapshot.search = final_stats;
+}
+
+fn maybe_refresh_native_photon_capability(
+    cfg: &RuntimeConfig,
+    canonical: &mut ElectrumSession,
+    sources: &mut SourceCatalog,
+    native_session: &mut Option<crate::node::NativePhotonSession>,
+    epoch: Instant,
+) -> Result<(), String> {
+    let Some(endpoint) = cfg.node_url.as_deref() else {
+        return Ok(());
+    };
+    let now_ms = source_capability_now_ms(epoch);
+    if sources.supports_at(
+        SourceKind::NativeNode,
+        endpoint,
+        SourceCapability::PhotonState,
+        now_ms,
+    ) {
+        return Ok(());
+    }
+    if !sources.available_at(SourceKind::NativeNode, endpoint, now_ms) {
+        return Ok(());
+    }
+
+    if native_session.is_none() {
+        let candidate = crate::node::NativePhotonSession::connect_failover(&[endpoint.to_string()])
+            .map_err(|error| {
+                let _ = sources.revoke_native_photon_capability(endpoint);
+                let _ = sources.record_failure(SourceKind::NativeNode, endpoint, now_ms);
+                format!("native BCHN PHOTON session bootstrap failed: {error}")
+            })?;
+        *native_session = Some(candidate);
+    }
+
+    let probe_started = Instant::now();
+    let verified = crate::node::verify_live_photon_equivalence(
+        native_session
+            .as_mut()
+            .expect("native PHOTON session was initialized above"),
+        canonical,
+    );
+    match verified {
+        Ok(snapshot) => {
+            let proof = NativePhotonEquivalenceProof::from_verified_snapshot(endpoint, &snapshot)?;
+            let latency_ms = u32::try_from(probe_started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            sources.record_success(SourceKind::NativeNode, endpoint, now_ms, latency_ms)?;
+            sources.verify_native_photon_capability(&proof, now_ms, DEFAULT_CAPABILITY_TTL_MS)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sources.revoke_native_photon_capability(endpoint);
+            let _ = sources.record_failure(SourceKind::NativeNode, endpoint, now_ms);
+            Err(format!(
+                "same-tip BCHN/Fulcrum equivalence proof failed: {error}"
+            ))
+        }
+    }
 }
 
 fn prepare_generation_transition<F>(
