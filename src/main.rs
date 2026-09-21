@@ -882,6 +882,8 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             serde_json::json!({
                 "event": "status",
                 "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
+                "backend": snapshot.gpu_backend,
+                "device": snapshot.gpu_device,
                 "generation_id": snapshot.generation_id,
                 "endpoint": redact_url(&snapshot.endpoint),
                 "height": snapshot.height,
@@ -903,8 +905,10 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
         );
     } else {
         println!(
-            "state={:?} generation={} height={} baton={}:{} intensity={} candidates={} batches={} rate={:.0}/s refreshes={} stale_rebuilds={} reconnects={} winners={} pending={}",
+            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} rate={:.0}/s refreshes={} stale_rebuilds={} reconnects={} winners={} pending={}",
             snapshot.state,
+            snapshot.gpu_backend,
+            snapshot.gpu_device,
             snapshot.generation_id,
             snapshot.height,
             snapshot.baton_txid,
@@ -924,14 +928,15 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
 
 fn run_headless_mining(
     cfg: RuntimeConfig,
+    device_ordinal: u32,
     json: bool,
     dry_run: bool,
     use_tui: bool,
 ) -> Result<(), String> {
     let supervisor = if dry_run {
-        runtime::RuntimeSupervisor::start_dry_run(cfg)?
+        runtime::RuntimeSupervisor::start_dry_run_on_device(cfg, device_ordinal)?
     } else {
-        runtime::RuntimeSupervisor::start(cfg)?
+        runtime::RuntimeSupervisor::start_on_device(cfg, device_ordinal)?
     };
     if use_tui {
         let final_snapshot = tui::run(supervisor, dry_run)?;
@@ -1031,18 +1036,24 @@ fn main() {
             }
         },
         cli::Commands::Mine => {
-            if backend_kind != backend::BackendKind::Cuda {
+            let selected = match backend::resolve_mining_device(backend_kind, args.device) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            };
+            if selected.backend == backend::BackendKind::Hip {
                 eprintln!(
-                    "error: live PHOTON runtime currently requires --backend cuda; cross-vendor production search is not complete"
+                    "error: HIP device {} ({}) is available, but the exact PHOTON HIP A->B->C kernel path is not implemented yet; refusing CPU or detached-wgpu fallback",
+                    selected.index, selected.name
                 );
                 std::process::exit(2);
             }
-            if args.device.is_some_and(|device| device != 0) {
-                eprintln!("error: live PHOTON runtime currently supports CUDA device 0 only");
-                std::process::exit(2);
-            }
             let use_tui = !(args.no_tui || args.json);
-            if let Err(error) = run_headless_mining(cfg, args.json, args.dry_run, use_tui) {
+            if let Err(error) =
+                run_headless_mining(cfg, selected.index, args.json, args.dry_run, use_tui)
+            {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             }

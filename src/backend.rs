@@ -2,6 +2,9 @@
 //! No CPU mining fallback.
 
 use cudarc::driver::{sys, CudaContext};
+use libloading::Library;
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -41,18 +44,76 @@ pub struct GpuDevice {
 
 pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
     match prefer {
-        BackendKind::Cuda | BackendKind::Auto => match list_cuda_devices() {
-            Ok(d) if !d.is_empty() => Ok(d),
-            Ok(_) => Err("CUDA runtime present but zero devices".into()),
-            Err(e) if matches!(prefer, BackendKind::Cuda) => Err(e),
-            Err(e) => Err(format!(
-                "{e} No validated native GPU backend is available; HIP/ROCm auto-detection is not implemented yet."
-            )),
-        },
-        BackendKind::Hip => Err(
-            "HIP/ROCm backend not wired yet. Use --backend cuda on NVIDIA or wait for HIP.".into(),
-        ),
+        BackendKind::Cuda => list_cuda_devices(),
+        BackendKind::Hip => list_hip_devices(),
+        BackendKind::Auto => {
+            let cuda = list_cuda_devices();
+            let hip = list_hip_devices();
+            let mut devices = Vec::new();
+            let mut errors = Vec::new();
+
+            match cuda {
+                Ok(mut found) => devices.append(&mut found),
+                Err(error) => errors.push(error),
+            }
+            match hip {
+                Ok(mut found) => devices.append(&mut found),
+                Err(error) => errors.push(error),
+            }
+
+            if devices.is_empty() {
+                Err(format!(
+                    "no validated native GPU device found ({})",
+                    errors.join("; ")
+                ))
+            } else {
+                Ok(devices)
+            }
+        }
     }
+}
+
+pub fn resolve_mining_device(
+    prefer: BackendKind,
+    requested_index: Option<u32>,
+) -> Result<GpuDevice, String> {
+    let wanted = requested_index.unwrap_or(0);
+    match prefer {
+        BackendKind::Cuda => find_device(list_cuda_devices()?, wanted, BackendKind::Cuda),
+        BackendKind::Hip => find_device(list_hip_devices()?, wanted, BackendKind::Hip),
+        BackendKind::Auto => {
+            if let Ok(cuda) = list_cuda_devices() {
+                if let Some(device) = cuda.into_iter().find(|device| device.index == wanted) {
+                    return Ok(device);
+                }
+            }
+            if let Ok(hip) = list_hip_devices() {
+                if let Some(device) = hip.into_iter().find(|device| device.index == wanted) {
+                    return Ok(device);
+                }
+            }
+            Err(format!(
+                "no native GPU device at backend-local ordinal {wanted}; run `pickaxe devices`"
+            ))
+        }
+    }
+}
+
+fn find_device(
+    devices: Vec<GpuDevice>,
+    wanted: u32,
+    backend: BackendKind,
+) -> Result<GpuDevice, String> {
+    devices
+        .into_iter()
+        .find(|device| device.index == wanted)
+        .ok_or_else(|| {
+            format!(
+                "{} device {wanted} not found; run `pickaxe devices --backend {}`",
+                backend.as_str().to_ascii_uppercase(),
+                backend.as_str()
+            )
+        })
 }
 
 fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
@@ -76,6 +137,152 @@ fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
         });
     }
     Ok(out)
+}
+
+type HipError = c_int;
+type HipDevice = c_int;
+type HipInit = unsafe extern "C" fn(u32) -> HipError;
+type HipGetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipError;
+type HipDeviceGet = unsafe extern "C" fn(*mut HipDevice, c_int) -> HipError;
+type HipDeviceGetName = unsafe extern "C" fn(*mut c_char, c_int, HipDevice) -> HipError;
+type HipSetDevice = unsafe extern "C" fn(c_int) -> HipError;
+type HipMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> HipError;
+type HipRuntimeGetVersion = unsafe extern "C" fn(*mut c_int) -> HipError;
+type HipDriverGetVersion = unsafe extern "C" fn(*mut c_int) -> HipError;
+type HipGetErrorString = unsafe extern "C" fn(HipError) -> *const c_char;
+
+#[cfg(target_os = "windows")]
+const HIP_LIBRARY_CANDIDATES: &[&str] = &["amdhip64.dll", "amdhip64_6.dll"];
+
+#[cfg(not(target_os = "windows"))]
+const HIP_LIBRARY_CANDIDATES: &[&str] = &["libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"];
+
+fn load_hip_library() -> Result<Library, String> {
+    let mut errors = Vec::new();
+    for candidate in HIP_LIBRARY_CANDIDATES {
+        let loaded = unsafe { Library::new(*candidate) };
+        match loaded {
+            Ok(library) => return Ok(library),
+            Err(error) => errors.push(format!("{candidate}: {error}")),
+        }
+    }
+    Err(format!(
+        "HIP/ROCm runtime unavailable: {}",
+        errors.join("; ")
+    ))
+}
+
+fn hip_error(library: &Library, code: HipError, operation: &str) -> String {
+    let detail = unsafe {
+        library
+            .get::<HipGetErrorString>(b"hipGetErrorString\0")
+            .ok()
+            .and_then(|get_error_string| {
+                let pointer = get_error_string(code);
+                (!pointer.is_null()).then(|| CStr::from_ptr(pointer).to_string_lossy().into_owned())
+            })
+    };
+    match detail {
+        Some(detail) => format!("{operation} failed with HIP error {code}: {detail}"),
+        None => format!("{operation} failed with HIP error {code}"),
+    }
+}
+
+fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
+    let library = load_hip_library()?;
+    unsafe {
+        let hip_init = library
+            .get::<HipInit>(b"hipInit\0")
+            .map_err(|error| format!("load hipInit: {error}"))?;
+        let hip_get_device_count = library
+            .get::<HipGetDeviceCount>(b"hipGetDeviceCount\0")
+            .map_err(|error| format!("load hipGetDeviceCount: {error}"))?;
+        let hip_device_get = library
+            .get::<HipDeviceGet>(b"hipDeviceGet\0")
+            .map_err(|error| format!("load hipDeviceGet: {error}"))?;
+        let hip_device_get_name = library
+            .get::<HipDeviceGetName>(b"hipDeviceGetName\0")
+            .map_err(|error| format!("load hipDeviceGetName: {error}"))?;
+        let hip_set_device = library
+            .get::<HipSetDevice>(b"hipSetDevice\0")
+            .map_err(|error| format!("load hipSetDevice: {error}"))?;
+        let hip_mem_get_info = library
+            .get::<HipMemGetInfo>(b"hipMemGetInfo\0")
+            .map_err(|error| format!("load hipMemGetInfo: {error}"))?;
+        let hip_runtime_get_version = library
+            .get::<HipRuntimeGetVersion>(b"hipRuntimeGetVersion\0")
+            .map_err(|error| format!("load hipRuntimeGetVersion: {error}"))?;
+        let hip_driver_get_version = library
+            .get::<HipDriverGetVersion>(b"hipDriverGetVersion\0")
+            .map_err(|error| format!("load hipDriverGetVersion: {error}"))?;
+
+        let init_code = hip_init(0);
+        if init_code != 0 {
+            return Err(hip_error(&library, init_code, "hipInit"));
+        }
+
+        let mut count = 0;
+        let count_code = hip_get_device_count(&mut count);
+        if count_code != 0 {
+            return Err(hip_error(&library, count_code, "hipGetDeviceCount"));
+        }
+        if count <= 0 {
+            return Err("HIP runtime present but zero AMD devices".into());
+        }
+
+        let mut runtime_version = 0;
+        let _ = hip_runtime_get_version(&mut runtime_version);
+        let mut driver_version = 0;
+        let _ = hip_driver_get_version(&mut driver_version);
+
+        let mut out = Vec::with_capacity(count as usize);
+        for ordinal in 0..count {
+            let mut device = 0;
+            let device_code = hip_device_get(&mut device, ordinal);
+            if device_code != 0 {
+                return Err(hip_error(&library, device_code, "hipDeviceGet"));
+            }
+
+            let mut name_buffer = [0 as c_char; 256];
+            let name_code =
+                hip_device_get_name(name_buffer.as_mut_ptr(), name_buffer.len() as c_int, device);
+            if name_code != 0 {
+                return Err(hip_error(&library, name_code, "hipDeviceGetName"));
+            }
+            let name = CStr::from_ptr(name_buffer.as_ptr())
+                .to_string_lossy()
+                .trim()
+                .to_string();
+
+            let mut vram = None;
+            if hip_set_device(ordinal) == 0 {
+                let mut free_bytes = 0usize;
+                let mut total_bytes = 0usize;
+                if hip_mem_get_info(&mut free_bytes, &mut total_bytes) == 0 && total_bytes != 0 {
+                    vram = Some(total_bytes as u64);
+                }
+            }
+            let vram_gb = vram
+                .map(|bytes| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
+                .unwrap_or_else(|| "N/A".into());
+            let detail = format!(
+                "hip ordinal={ordinal}; runtime={runtime_version}; driver={driver_version}; vram={vram_gb}"
+            );
+            out.push(GpuDevice {
+                index: ordinal as u32,
+                name: if name.is_empty() {
+                    format!("AMD GPU {ordinal}")
+                } else {
+                    name
+                },
+                vendor: "AMD".into(),
+                vram_bytes: vram,
+                backend: BackendKind::Hip,
+                detail,
+            });
+        }
+        Ok(out)
+    }
 }
 
 fn cuda_device_info(index: u32, ctx: &CudaContext) -> (String, String, Option<u64>) {
@@ -143,11 +350,11 @@ pub fn print_devices(prefer: BackendKind) -> Result<(), String> {
             .map(|b| format!("{:.1} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0)))
             .unwrap_or_else(|| "N/A".into());
         println!(
-            "[{}] {} | {} | backend={} | VRAM {} | {}",
+            "[{}:{}] {} | {} | VRAM {} | {}",
+            d.backend.as_str(),
             d.index,
             d.vendor,
             d.name,
-            d.backend.as_str(),
             vram,
             d.detail
         );
@@ -168,5 +375,20 @@ mod tests {
 
         let error = BackendKind::parse("wgpu").unwrap_err();
         assert_eq!(error, "unknown backend `wgpu` (auto|cuda|hip)");
+    }
+
+    #[test]
+    fn explicit_device_selection_uses_backend_local_ordinal() {
+        let devices = vec![GpuDevice {
+            index: 2,
+            name: "test".into(),
+            vendor: "AMD".into(),
+            vram_bytes: Some(1024),
+            backend: BackendKind::Hip,
+            detail: String::new(),
+        }];
+        let selected = find_device(devices, 2, BackendKind::Hip).unwrap();
+        assert_eq!(selected.backend, BackendKind::Hip);
+        assert_eq!(selected.index, 2);
     }
 }
