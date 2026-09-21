@@ -165,9 +165,14 @@ try {
 
     $privateSummary = Get-GrowthSummary -Values $samples.private_mib -ToleranceMiB 32
     $vramSummary = Get-GrowthSummary -Values $samples.gpu_vram_mib -ToleranceMiB 32
+    $monotonicGrowthDetected = (
+        $privateSummary.monotonic_growth -eq $true -or
+        $vramSummary.monotonic_growth -eq $true
+    )
+    $status = if ($exitCode -eq 0 -and !$monotonicGrowthDetected) { "PASS" } else { "FAIL" }
 
     $summary = [ordered]@{
-        status = if ($exitCode -eq 0) { "PASS" } else { "FAIL" }
+        status = $status
         exit_code = $exitCode
         requested_total_minutes = $TotalMinutes
         benchmark_window_seconds = $windowSeconds
@@ -177,10 +182,7 @@ try {
         device = $Device
         private_memory = $privateSummary
         gpu_vram = $vramSummary
-        monotonic_growth_detected = (
-            $privateSummary.monotonic_growth -eq $true -or
-            $vramSummary.monotonic_growth -eq $true
-        )
+        monotonic_growth_detected = $monotonicGrowthDetected
         benchmark_json = $benchmarkPath
         samples_csv = $csvPath
         stderr = $stderrPath
