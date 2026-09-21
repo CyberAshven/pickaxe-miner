@@ -20,6 +20,12 @@ const FIXED_D_WORDS: usize = 32 * 256 * 8;
 const HIP_SUCCESS: c_int = 0;
 const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+const HIP_CODE_OBJECT_NAMES: [&str; 4] = [
+    "stage_a_rfc6979.hsaco",
+    "photon_stage_b16.hsaco",
+    "photon_c1_schnorr.hsaco",
+    "stage_c_hash.hsaco",
+];
 
 type HipError = c_int;
 type HipInit = unsafe extern "C" fn(c_uint) -> HipError;
@@ -375,15 +381,61 @@ pub fn detected_architecture(device_ordinal: usize) -> Result<String, String> {
     device_architecture(&api, device_ordinal)
 }
 
-fn code_object_dir(architecture: &str) -> PathBuf {
-    if let Ok(path) = std::env::var("PICKAXE_HIP_CODE_OBJECT_DIR") {
-        PathBuf::from(path)
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("hip")
-            .join("build")
-            .join(architecture)
+fn code_object_candidate_dirs(
+    architecture: &str,
+    override_dir: Option<PathBuf>,
+    executable_dir: Option<&Path>,
+    manifest_dir: &Path,
+) -> Vec<PathBuf> {
+    if let Some(path) = override_dir {
+        return vec![path];
     }
+
+    let mut candidates = Vec::new();
+    if let Some(executable_dir) = executable_dir {
+        candidates.push(executable_dir.join("hip").join("build").join(architecture));
+        candidates.push(executable_dir.join("hip").join(architecture));
+    }
+    candidates.push(manifest_dir.join("hip").join("build").join(architecture));
+    candidates.dedup();
+    candidates
+}
+
+fn code_object_candidate_dirs_for_runtime(architecture: &str) -> Vec<PathBuf> {
+    let override_dir = std::env::var_os("PICKAXE_HIP_CODE_OBJECT_DIR").map(PathBuf::from);
+    let executable = std::env::current_exe().ok();
+    let executable_dir = executable.as_deref().and_then(Path::parent);
+    code_object_candidate_dirs(
+        architecture,
+        override_dir,
+        executable_dir,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+fn directory_has_complete_code_objects(directory: &Path) -> bool {
+    HIP_CODE_OBJECT_NAMES
+        .iter()
+        .all(|name| directory.join(name).is_file())
+}
+
+fn resolve_code_object_dir(architecture: &str) -> Result<PathBuf, String> {
+    let candidates = code_object_candidate_dirs_for_runtime(architecture);
+    if let Some(directory) = candidates
+        .iter()
+        .find(|directory| directory_has_complete_code_objects(directory))
+    {
+        return Ok(directory.clone());
+    }
+
+    let searched = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "missing complete PHOTON HIP code-object set for {architecture}; searched: {searched}; run `python tools/build_hip.py --arch {architecture}` with a matching ROCm/HIP compiler"
+    ))
 }
 
 fn verify_code_object_architecture(path: &Path, architecture: &str) -> Result<(), String> {
@@ -504,20 +556,9 @@ impl HipPhotonEngine {
             "select HIP device",
         )?;
         let architecture = device_architecture(&api, device_ordinal)?;
-        let directory = code_object_dir(&architecture);
-        for name in [
-            "stage_a_rfc6979.hsaco",
-            "photon_stage_b16.hsaco",
-            "photon_c1_schnorr.hsaco",
-            "stage_c_hash.hsaco",
-        ] {
+        let directory = resolve_code_object_dir(&architecture)?;
+        for name in HIP_CODE_OBJECT_NAMES {
             let path = directory.join(name);
-            if !path.is_file() {
-                return Err(format!(
-                    "missing PHOTON HIP code object {} for {architecture}; run `python tools/build_hip.py --arch {architecture}` with a matching ROCm/HIP compiler",
-                    path.display()
-                ));
-            }
             verify_code_object_architecture(&path, &architecture)?;
         }
 
@@ -850,14 +891,48 @@ mod tests {
     }
 
     #[test]
-    fn default_code_object_path_is_architecture_scoped() {
-        let expected = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("hip")
-            .join("build")
-            .join("gfx1036");
-        if std::env::var_os("PICKAXE_HIP_CODE_OBJECT_DIR").is_none() {
-            assert_eq!(code_object_dir("gfx1036"), expected);
+    fn code_object_search_prefers_portable_release_layout() {
+        let executable_dir = Path::new("release-root");
+        let manifest_dir = Path::new("source-root");
+        let candidates =
+            code_object_candidate_dirs("gfx1036", None, Some(executable_dir), manifest_dir);
+        assert_eq!(
+            candidates,
+            vec![
+                executable_dir.join("hip").join("build").join("gfx1036"),
+                executable_dir.join("hip").join("gfx1036"),
+                manifest_dir.join("hip").join("build").join("gfx1036"),
+            ]
+        );
+    }
+
+    #[test]
+    fn code_object_override_disables_implicit_search_paths() {
+        let override_dir = PathBuf::from("custom-hip-artifacts");
+        let candidates = code_object_candidate_dirs(
+            "gfx1036",
+            Some(override_dir.clone()),
+            Some(Path::new("release-root")),
+            Path::new("source-root"),
+        );
+        assert_eq!(candidates, vec![override_dir]);
+    }
+
+    #[test]
+    fn code_object_set_requires_every_production_stage() {
+        let directory =
+            std::env::temp_dir().join(format!("pickaxe-hip-complete-set-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create HIP complete-set test directory");
+        for name in HIP_CODE_OBJECT_NAMES {
+            fs::write(directory.join(name), b"probe").expect("write HIP code-object probe");
         }
+        assert!(directory_has_complete_code_objects(&directory));
+
+        fs::remove_file(directory.join(HIP_CODE_OBJECT_NAMES[2]))
+            .expect("remove one HIP code-object probe");
+        assert!(!directory_has_complete_code_objects(&directory));
+
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -911,16 +986,11 @@ mod tests {
                 return;
             }
         };
-        let directory = code_object_dir(&architecture);
-        let all_present = [
-            "stage_a_rfc6979.hsaco",
-            "photon_stage_b16.hsaco",
-            "photon_c1_schnorr.hsaco",
-            "stage_c_hash.hsaco",
-        ]
-        .iter()
-        .all(|name| directory.join(name).is_file());
-        if all_present {
+        let candidates = code_object_candidate_dirs_for_runtime(&architecture);
+        if candidates
+            .iter()
+            .any(|directory| directory_has_complete_code_objects(directory))
+        {
             eprintln!(
                 "skip missing-artifact assertion: PHOTON HIP code objects already exist for {architecture}"
             );
@@ -931,7 +1001,7 @@ mod tests {
             Ok(_) => panic!("HIP engine unexpectedly started without all required code objects"),
             Err(error) => error,
         };
-        assert!(error.contains("missing PHOTON HIP code object"));
+        assert!(error.contains("missing complete PHOTON HIP code-object set"));
         assert!(error.contains(&architecture));
     }
 }
