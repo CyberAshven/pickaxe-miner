@@ -8,9 +8,6 @@ pub const DONATION_BPS: u16 = 200;
 /// Locked donation payout for distribution builds (BCH cashaddr).
 pub const DONATION_ADDRESS: &str = "bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3";
 
-/// Miner keeps the remainder (9800 bps = 98%).
-pub const MINER_BPS: u16 = 10_000 - DONATION_BPS;
-
 /// Preferred network transport for explicit submission/diagnostic operations.
 /// PHOTON mining jobs come from the covenant CashToken baton through Fulcrum
 /// until an equivalent node-native indexed query is implemented.

@@ -34,6 +34,3 @@ PHOTON state.
 Native node RPC remains authoritative for chain validation and raw transaction
 broadcast. BCH `getblocktemplatelight` / `getblocktemplate` data must never be
 substituted for a PHOTON baton or target.
-
-## Official donation policy (locked 2026-09-21)
-See `docs/DONATION_POLICY.md`. Summary: 2% of PHOTON mining reward only, compile-time hard-coded donation address, user cannot override; 98% to user payout; no PHOTON covenant change to enforce; forks may diverge.

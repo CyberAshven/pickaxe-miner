@@ -1,8 +1,9 @@
 //! Electrum WSS client: live PHOTON baton / MiningJob fetch.
 //! Owned by Dev Assist. Search consumes MiningJob; no keys.
-//! Broadcast is explicit CLI only (never auto).
+//! Runtime winner settlement uses this session for ordered parent/child broadcast.
 
 use crate::protocol::{EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
+use crate::reward::{self, SponsorReserve, SPONSOR_MIN_RESERVE_SATS};
 use crate::search::MiningJob;
 use num_bigint::BigUint;
 use serde_json::{json, Value};
@@ -203,6 +204,27 @@ impl ElectrumSession {
         }
     }
 
+    /// Return true when this server can retrieve the transaction by txid.
+    /// Used only to make retrying a previously journaled submission idempotent.
+    pub fn transaction_known(&mut self, txid: &str) -> Result<bool, String> {
+        if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("transaction id must be exactly 64 hexadecimal characters".into());
+        }
+        match self.rpc("blockchain.transaction.get", json!([txid, false])) {
+            Ok(Value::String(_)) => Ok(true),
+            Ok(Value::Null) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(error) => {
+                let lower = error.to_ascii_lowercase();
+                if lower.contains("no such") || lower.contains("not found") {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub fn fetch_live_job(&mut self) -> Result<LiveJob, String> {
         let header = self.rpc("blockchain.headers.subscribe", json!([]))?;
         let height = header
@@ -302,6 +324,67 @@ impl ElectrumSession {
             reward_raw,
         })
     }
+
+    /// Find the unique BCH-only M54 sponsor reserve bound to this PHOTON baton.
+    ///
+    /// Production reward settlement is fail-closed: no reserve, a token-bearing
+    /// reserve, an undersized reserve, or multiple matching reserves all block
+    /// submission rather than guessing which state to spend.
+    pub fn fetch_sponsor_reserve(
+        &mut self,
+        expected_baton_txid: &str,
+    ) -> Result<SponsorReserve, String> {
+        let locking_script = reward::build_sponsor_script(expected_baton_txid)?;
+        let scripthash = reward::sponsor_electrum_scripthash(expected_baton_txid)?;
+        let unspent = self.rpc(
+            "blockchain.scripthash.listunspent",
+            json!([scripthash, "include_tokens"]),
+        )?;
+        select_sponsor_reserve(&unspent, locking_script)
+    }
+}
+
+fn select_sponsor_reserve(
+    unspent: &Value,
+    locking_script: Vec<u8>,
+) -> Result<SponsorReserve, String> {
+    let rows = unspent
+        .as_array()
+        .ok_or("invalid sponsor-reserve UTXO response")?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        if row.get("token_data").is_some_and(|token| !token.is_null()) {
+            continue;
+        }
+        let Some(txid) = row.get("tx_hash").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(vout) = row.get("tx_pos").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(value_sats) = row.get("value").and_then(Value::as_u64) else {
+            continue;
+        };
+        if value_sats < SPONSOR_MIN_RESERVE_SATS || vout > u32::MAX as u64 {
+            continue;
+        }
+        candidates.push(SponsorReserve {
+            txid: txid.to_string(),
+            vout: vout as u32,
+            value_sats,
+            locking_script: locking_script.clone(),
+        });
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(format!(
+            "no usable sponsor reserve for current PHOTON baton (minimum {SPONSOR_MIN_RESERVE_SATS} sats)"
+        )),
+        count => Err(format!(
+            "ambiguous sponsor state: expected exactly one reserve, found {count}"
+        )),
+    }
 }
 
 fn id_matches(v: &Value, id: u64) -> bool {
@@ -336,5 +419,35 @@ mod tests {
         let n = le_hex_to_biguint(h).unwrap();
         assert_eq!(n, BigUint::from(1u32));
         assert_eq!(biguint_to_le_hex32(&n).unwrap(), h);
+    }
+
+    #[test]
+    fn sponsor_reserve_selection_is_unique_bch_only_and_dust_safe() {
+        let script = vec![0x51; 197];
+        let valid = serde_json::json!([{
+            "tx_hash": "11".repeat(32),
+            "tx_pos": 2,
+            "height": 900,
+            "value": 100000
+        }]);
+        let selected = select_sponsor_reserve(&valid, script.clone()).unwrap();
+        assert_eq!(selected.txid, "11".repeat(32));
+        assert_eq!(selected.vout, 2);
+        assert_eq!(selected.value_sats, 100_000);
+        assert_eq!(selected.locking_script, script);
+
+        let token_only = serde_json::json!([{
+            "tx_hash": "22".repeat(32),
+            "tx_pos": 0,
+            "value": 100000,
+            "token_data": {"amount": "1"}
+        }]);
+        assert!(select_sponsor_reserve(&token_only, vec![0x51]).is_err());
+
+        let duplicate = serde_json::json!([
+            {"tx_hash": "33".repeat(32), "tx_pos": 0, "value": 100000},
+            {"tx_hash": "44".repeat(32), "tx_pos": 2, "value": 98000}
+        ]);
+        assert!(select_sponsor_reserve(&duplicate, vec![0x51]).is_err());
     }
 }

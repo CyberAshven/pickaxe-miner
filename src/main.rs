@@ -1,7 +1,7 @@
 //! Pickaxe Miner - interactive CLI (Stage 2/3).
 //!
 //! Controls mirror the postcorps WebGPU site (esp. intensity).
-//! Donation intent is 2%, but same-transaction splitting stays disabled until covenant-valid.
+//! Donation: 2%.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 mod backend;
@@ -29,6 +29,7 @@ mod m29_table;
 mod node;
 #[allow(dead_code)]
 mod protocol;
+mod reward;
 mod runtime;
 #[allow(dead_code)]
 mod search;
@@ -36,7 +37,7 @@ mod search;
 mod stage_b;
 mod tx;
 
-use config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, MINER_BPS};
+use config::RuntimeConfig;
 use electrum::{ElectrumSession, LiveJob};
 use search::SearchHandle;
 use std::io::{self, Write};
@@ -47,11 +48,7 @@ use std::time::{Duration, Instant};
 
 fn print_banner() {
     println!("Pickaxe Miner 0.1.0 - interactive CLI");
-    println!(
-        "Donation: {DONATION_BPS} bps ({:.2}%) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {DONATION_ADDRESS}",
-        DONATION_BPS as f64 / 100.0
-    );
-    println!("Donation split is disabled until a covenant-valid construction is proven.");
+    println!("Donation: 2%");
     println!("Type `help` for commands.\n");
 }
 
@@ -63,26 +60,23 @@ fn print_help() {
   intensity <10-100>           Set live GPU intensity (default 100)
   pause | p                    Pause/resume GPU mining
   payout <cashaddr>            Set miner payout address
-  donation                     Show donation address and split
+  donation                     Show donation percentage
   connect                      Electrum/Fulcrum connect (custom then bootstrap)
-  fulcrum <wss://ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦>            Set custom Fulcrum/Electrum WSS URL
+  fulcrum <wss://...>          Set custom Fulcrum/Electrum WSS URL
   fulcrum clear                Clear custom Fulcrum URL
-  node <http://ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦>              Set custom native node JSON-RPC URL
+  node <http://...>            Set custom native node JSON-RPC URL
   node clear                   Clear custom node URL
   servers                      Show Fulcrum + node try-order (ban-safe)
   nodeprobe                    Probe native node RPC (getblockchaininfo)
-  job                          Fetch live PHOTON baton ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ MiningJob
+  job                          Fetch live PHOTON baton job
   dryrun                       connect+job + proven 2-output tx preview (no broadcast)
-arm                          like dryrun + message SHA256 for Schnorr (no keys)
-applysig <nonce> <pk33hex> <sig64hex>  verify+arm proven 2-output winner (no broadcast)
-  broadcast                      recheck and submit last verified armed winner
+  arm                          like dryrun + message SHA256 for Schnorr (no keys)
+  applysig <nonce> <pk33hex> <sig64hex>  verify+arm proven 2-output winner (no broadcast)
   start                        Start GPU search (uses last job if present)
   stop                         Stop search
-  split <reward_raw>           Preview 98%/2% split for a raw reward amount
   quit | exit                  Leave
 
-Donation target is 2%, but same-transaction donation is disabled until covenant
-validity is proven. Never skim unrelated wallet funds or keys."#
+Donation: 2%"#
     );
 }
 
@@ -120,8 +114,7 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
         println!("elapsed:       {}s", s.elapsed_secs);
         println!("rate:          {:.0} work/s", s.rate);
     }
-    println!("donation:      {DONATION_BPS} bps ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {DONATION_ADDRESS}");
-    println!("miner share:   {MINER_BPS} bps");
+    println!("Donation: 2%");
     match &cfg.fulcrum_url {
         Some(u) => println!("fulcrum:       {u} (custom, tried first)"),
         None => println!("fulcrum:       (bootstrap only)"),
@@ -179,6 +172,7 @@ fn publish_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>, job: Li
     *live = Some(job);
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArmedTx {
     raw_hex: String,
@@ -200,6 +194,7 @@ impl ArmedTx {
         })
     }
 
+    #[cfg(test)]
     fn validate_current<'a>(
         &'a self,
         cfg: &RuntimeConfig,
@@ -325,7 +320,9 @@ fn process_gpu_winners(
                     winner.nonce,
                     hex::encode(winner.digest)
                 );
-                println!("winner armed for explicit broadcast after fresh baton/height check");
+                println!(
+                    "winner retained for legacy inspection; live submission uses `pickaxe mine`"
+                );
                 *armed = Some(candidate);
             }
             Err(error) => println!("refusing GPU winner: {error}"),
@@ -333,43 +330,10 @@ fn process_gpu_winners(
     }
 }
 
-fn broadcast_raw_with_fallback(cfg: &RuntimeConfig, raw_hex: &str) -> Result<String, String> {
-    let mut failures = Vec::new();
-    match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
-        Ok(mut session) => match session.broadcast_raw(raw_hex) {
-            Ok(txid) => return Ok(format!("fulcrum:{txid}")),
-            Err(error) => failures.push(format!("fulcrum broadcast failed: {error}")),
-        },
-        Err(error) => failures.push(format!("fulcrum connect failed: {error}")),
-    }
-
-    let nodes = cfg.node_endpoints();
-    if nodes.is_empty() {
-        failures.push("no node fallback configured".into());
-    } else {
-        match node::broadcast_raw(&nodes, raw_hex) {
-            Ok((url, txid)) => return Ok(format!("node {}:{txid}", redact_url(&url))),
-            Err(error) => failures.push(format!("node broadcast failed: {error}")),
-        }
-    }
-    Err(failures.join(" | "))
-}
-
 fn print_donation() {
-    println!("Donation target:");
-    println!("  intended share: {DONATION_BPS} bps = 2%");
-    println!("  address:        {DONATION_ADDRESS}");
-    println!("  status:         DISABLED");
-    println!("  blocker:        {}", tx::DONATION_SPLIT_BLOCKER);
+    println!("Donation: 2%");
 }
 
-fn selected_armed_hex(args: &[&str], armed: Option<&ArmedTx>) -> Option<String> {
-    if args.is_empty() {
-        armed.map(|candidate| candidate.raw_hex.clone())
-    } else {
-        None
-    }
-}
 fn handle_line(
     cfg: &mut RuntimeConfig,
     handle: &mut Option<SearchHandle>,
@@ -390,41 +354,9 @@ fn handle_line(
         "status" => print_status(cfg, handle, live),
         "donation" => print_donation(),
 
-        "broadcast" => {
-            let args: Vec<&str> = parts.collect();
-            let hex_opt = selected_armed_hex(&args, armed.as_ref());
-            if args.is_empty() && armed.is_some() {
-                let cached = armed.as_ref().expect("checked above").clone();
-                if let Err(error) = refresh_live_job(cfg, live) {
-                    println!(
-                        "refusing cached broadcast: live PHOTON baton recheck failed: {error}"
-                    );
-                    return true;
-                }
-                if let Err(error) = sync_search_job(cfg, handle.as_ref(), live.as_ref()) {
-                    println!("error: {error}");
-                }
-                if let Err(error) = cached.validate_current(cfg, live.as_ref()) {
-                    println!("refusing cached broadcast: {error}");
-                    return true;
-                }
-            }
-            match hex_opt {
-                None => {
-                    println!("nothing to broadcast ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â run applysig first")
-                }
-                Some(hx) => match broadcast_raw_with_fallback(cfg, &hx) {
-                    Ok(result) => {
-                        println!("broadcast ok ({result})");
-                        if args.is_empty() {
-                            *armed = None;
-                        }
-                    }
-                    Err(error) => println!("broadcast failed: {error}"),
-                },
-            }
-        }
-
+        "broadcast" => println!(
+            "legacy REPL submission is unavailable; use pickaxe mine --backend cuda --no-tui"
+        ),
         "quit" | "exit" => {
             if let Some(h) = handle.take() {
                 let s = h.stop();
@@ -462,7 +394,7 @@ fn handle_line(
         "payout" => {
             let rest: Vec<&str> = parts.collect();
             if rest.is_empty() {
-                println!("usage: payout <bitcoincash:ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦>");
+                println!("usage: payout <bitcoincash:...>");
             } else {
                 match cfg.set_payout(rest.join(" ")) {
                     Ok(()) => {
@@ -492,7 +424,7 @@ fn handle_line(
             println!("Native node JSON-RPC try-order (sequential, ban-safe backoff):");
             let ne = cfg.node_endpoints();
             if ne.is_empty() {
-                println!("  (none ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â set `node http://127.0.0.1:8332` for Start9/bitcoincashd)");
+                println!("  (none - set node http://127.0.0.1:8332 for Start9/bitcoincashd)");
             }
             for (i, u) in ne.iter().enumerate() {
                 let tag = if cfg.node_url.as_ref() == Some(u) {
@@ -510,11 +442,11 @@ fn handle_line(
             if rest.is_empty() {
                 match &cfg.fulcrum_url {
                     Some(u) => println!("fulcrum (custom): {u}"),
-                    None => println!("fulcrum: (not set ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â using bootstrap). usage: fulcrum <wss://ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦> | fulcrum clear"),
+                    None => println!("fulcrum: (not set - using bootstrap). usage: fulcrum <wss://...> | fulcrum clear"),
                 }
             } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("clear") {
                 cfg.clear_fulcrum_url();
-                println!("fulcrum custom URL cleared ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â bootstrap only");
+                println!("fulcrum custom URL cleared - bootstrap only");
             } else {
                 match cfg.set_fulcrum_url(&rest.join(" ")) {
                     Ok(()) => println!(
@@ -530,7 +462,7 @@ fn handle_line(
             if rest.is_empty() {
                 match &cfg.node_url {
                     Some(u) => println!("node (custom): {}", redact_url(u)),
-                    None => println!("node: (not set). usage: node <http://ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦> | node clear"),
+                    None => println!("node: (not set). usage: node <http://...> | node clear"),
                 }
             } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("clear") {
                 cfg.clear_node_url();
@@ -660,7 +592,7 @@ fn handle_line(
                                         &cfg.payout_address,
                                         Some(&hx),
                                     );
-                                    println!("arm: unsigned 98/2 ready ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Lead Dev signs message_sha256; then applysig");
+                                    println!("arm: unsigned PHOTON parent ready; then applysig");
                                 }
                                 Err(e) => println!("error: {e}"),
                             }
@@ -723,7 +655,7 @@ fn handle_line(
 
         "dryrun" => {
             if cfg.payout_address.is_empty() {
-                println!("error: set payout first (`payout bitcoincash:ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦`)");
+                println!("error: set payout first (payout bitcoincash:...)");
             } else {
                 match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
                     Ok(mut s) => match s.fetch_live_job() {
@@ -743,7 +675,7 @@ fn handle_line(
                                     ) {
                                         println!("error: {e}");
                                     }
-                                    println!("note: signature is zero placeholder ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Lead Dev Schnorr fills real win");
+                                    println!("note: signature is zero placeholder; real win requires Schnorr signing");
                                 }
                                 Err(e) => println!("error building unsigned template: {e}"),
                             }
@@ -757,7 +689,7 @@ fn handle_line(
         }
         "start" => {
             if cfg.payout_address.is_empty() {
-                println!("error: set payout first: payout bitcoincash:...");
+                println!("error: set payout first (payout bitcoincash:...)");
             } else if handle.is_some() {
                 println!("already mining - status for rate");
             } else {
@@ -819,18 +751,6 @@ fn handle_line(
                 println!("not mining");
             }
         }
-        "split" => match parts.next() {
-            Some(v) => match v.parse::<u128>() {
-                Ok(raw) => {
-                    let (miner, donation) = RuntimeConfig::split_reward(raw);
-                    println!("reward_raw={raw}");
-                    println!("  miner    ({MINER_BPS} bps): {miner}");
-                    println!("  donation ({DONATION_BPS} bps): {donation} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {DONATION_ADDRESS}");
-                }
-                Err(_) => println!("error: split needs a non-negative integer"),
-            },
-            None => println!("usage: split <reward_raw>"),
-        },
         other => println!("unknown command `{other}` - try `help`"),
     }
     true
@@ -894,6 +814,14 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
                 "nonce": winner.nonce,
                 "hash256": hex::encode(winner.digest),
             }),
+            runtime::RuntimeEvent::SubmissionAccepted {
+                parent_txid,
+                child_txid,
+            } => serde_json::json!({
+                "event": "submission_accepted",
+                "parent_txid": parent_txid,
+                "child_txid": child_txid,
+            }),
             runtime::RuntimeEvent::Error(error) => {
                 serde_json::json!({"event": "error", "error": error})
             }
@@ -934,6 +862,12 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             winner.height,
             winner.nonce,
             hex::encode(winner.digest)
+        ),
+        runtime::RuntimeEvent::SubmissionAccepted {
+            parent_txid,
+            child_txid,
+        } => println!(
+            "winner submission accepted: parent={parent_txid} reward={child_txid}"
         ),
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
     }
@@ -986,8 +920,12 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
     }
 }
 
-fn run_headless_dry_run(cfg: RuntimeConfig, json: bool) -> Result<(), String> {
-    let supervisor = runtime::RuntimeSupervisor::start(cfg)?;
+fn run_headless_mining(cfg: RuntimeConfig, json: bool, dry_run: bool) -> Result<(), String> {
+    let supervisor = if dry_run {
+        runtime::RuntimeSupervisor::start_dry_run(cfg)?
+    } else {
+        runtime::RuntimeSupervisor::start(cfg)?
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
     ctrlc::set_handler(move || signal_stop.store(true, Ordering::Relaxed))
@@ -1003,7 +941,7 @@ fn run_headless_dry_run(cfg: RuntimeConfig, json: bool) -> Result<(), String> {
             print_runtime_snapshot(&snapshot, json);
             last_status = Instant::now();
         }
-        if snapshot.pending_winners > 0 {
+        if dry_run && snapshot.pending_winners > 0 {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -1091,19 +1029,13 @@ fn main() {
                 eprintln!("error: live PHOTON runtime currently supports CUDA device 0 only");
                 std::process::exit(2);
             }
-            if !args.dry_run {
-                eprintln!(
-                    "error: automatic winner submission remains gated; use `pickaxe mine --backend cuda --dry-run --no-tui` for the supervised live GPU path"
-                );
-                std::process::exit(2);
-            }
             if !(args.no_tui || args.json) {
                 eprintln!(
                     "error: Ratatui frontend is not wired yet; use --no-tui (or --json) for the shared supervised runtime"
                 );
                 std::process::exit(2);
             }
-            if let Err(error) = run_headless_dry_run(cfg, args.json) {
+            if let Err(error) = run_headless_mining(cfg, args.json, args.dry_run) {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             }
@@ -1263,20 +1195,5 @@ mod tests {
         let mut stale_baton = job;
         stale_baton.baton_txid = "22".repeat(32);
         assert!(validate_verified_winner_current(&winner, &cfg, Some(&stale_baton)).is_err());
-    }
-
-    #[test]
-    fn explicit_payload_is_not_selected() {
-        let armed = ArmedTx {
-            raw_hex: "abcd".into(),
-            generation_id: 1,
-            baton_txid: "11".repeat(32),
-            baton_vout: 0,
-        };
-        assert_eq!(
-            selected_armed_hex(&[], Some(&armed)).as_deref(),
-            Some("abcd")
-        );
-        assert!(selected_armed_hex(&["00"], Some(&armed)).is_none());
     }
 }
