@@ -30,7 +30,61 @@ const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const SUBMISSION_JOURNAL_VERSION: u8 = 2;
 const PHOTON_TX_BYTES: usize = 615;
 const PHOTON_TARGET_OFFSET: usize = 394;
-const VERIFIED_WINNER_DURABILITY_READY: bool = false;
+const VERIFIED_WINNER_DURABILITY_READY: bool = true;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettlementState {
+    generation_id: u64,
+    baton_txid: String,
+    baton_vout: u32,
+    sponsor: reward::SponsorReserve,
+}
+
+impl SettlementState {
+    fn new(
+        generation_id: u64,
+        live: &LiveJob,
+        sponsor: reward::SponsorReserve,
+    ) -> Result<Self, String> {
+        if live.baton_vout != 0 {
+            return Err(format!(
+                "PHOTON sponsor settlement requires baton output 0, got {}",
+                live.baton_vout
+            ));
+        }
+        if sponsor.value_sats < reward::SPONSOR_MIN_RESERVE_SATS {
+            return Err("settlement sponsor reserve is below the minimum".into());
+        }
+        let expected_locking = reward::build_sponsor_script(&live.baton_txid)?;
+        if sponsor.locking_script != expected_locking {
+            return Err("settlement sponsor state does not match PHOTON baton".into());
+        }
+        Ok(Self {
+            generation_id,
+            baton_txid: live.baton_txid.clone(),
+            baton_vout: live.baton_vout,
+            sponsor,
+        })
+    }
+
+    fn restamp(&self, generation_id: u64, live: &LiveJob) -> Result<Self, String> {
+        Self::new(generation_id, live, self.sponsor.clone())
+    }
+
+    fn sponsor_for(
+        &self,
+        generation_id: u64,
+        live: &LiveJob,
+    ) -> Result<&reward::SponsorReserve, String> {
+        if self.generation_id != generation_id
+            || self.baton_txid != live.baton_txid
+            || self.baton_vout != live.baton_vout
+        {
+            return Err("settlement sponsor is stale for the current PHOTON generation".into());
+        }
+        Ok(&self.sponsor)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingSubmission {
@@ -364,12 +418,13 @@ fn prepare_pending_submission(
     live: &LiveJob,
     reward_secret: &[u8; 32],
     reward_public_key: &[u8; 33],
-    sponsor: &reward::SponsorReserve,
+    settlement: &SettlementState,
     journal_path: &Path,
 ) -> Result<PendingSubmission, String> {
     if !winner_matches_live(winner, cfg.generation_id, live) {
         return Err("verified winner is stale before reward-child preparation".into());
     }
+    let sponsor = settlement.sponsor_for(cfg.generation_id, live)?;
     validate_verified_parent(winner, live, reward_public_key)?;
     let split = reward::build_reward_split_child(
         &winner.transaction,
@@ -719,6 +774,8 @@ impl RuntimeSupervisor {
             &journal_path,
         )?;
         cfg.bump_generation();
+        let initial_settlement =
+            SettlementState::new(cfg.generation_id, &initial, initial_sponsor)?;
 
         let initial_job = initial.to_mining_job(cfg.generation_id, &mining_payout_address);
         let search = SearchHandle::start_supervised_on_backend_device(
@@ -765,7 +822,7 @@ impl RuntimeSupervisor {
                     reward_secret,
                     reward_public_key,
                     mining_payout_address,
-                    initial_sponsor,
+                    initial_settlement,
                     journal_path,
                     None,
                     command_rx,
@@ -870,7 +927,7 @@ fn run_supervisor(
     mut reward_secret: [u8; 32],
     reward_public_key: [u8; 33],
     mining_payout_address: String,
-    settlement_sponsor: reward::SponsorReserve,
+    mut settlement: SettlementState,
     journal_path: PathBuf,
     mut pending_submission: Option<PendingSubmission>,
     command_rx: Receiver<SupervisorCommand>,
@@ -914,7 +971,7 @@ fn run_supervisor(
                         &live,
                         &reward_secret,
                         &reward_public_key,
-                        &settlement_sponsor,
+                        &settlement,
                         &journal_path,
                     ) {
                         Ok(pending) => {
@@ -985,14 +1042,27 @@ fn run_supervisor(
                         ));
                         continue;
                     }
-                    let before = cfg.generation_id;
-                    let result = cfg.set_payout(payout).and_then(|()| {
-                        if cfg.generation_id != before {
-                            search.replace_job(
-                                live.to_mining_job(cfg.generation_id, &mining_payout_address),
-                            )?;
-                            stale_rebuilds = stale_rebuilds.saturating_add(1);
+                    let mut next_cfg = cfg.clone();
+                    let result = next_cfg.set_payout(payout).and_then(|()| {
+                        if next_cfg.generation_id == cfg.generation_id {
+                            return Ok(());
                         }
+                        production_preflight_local(
+                            &next_cfg,
+                            &live,
+                            &reward_secret,
+                            &reward_public_key,
+                            &mining_payout_address,
+                            &settlement.sponsor,
+                            &journal_path,
+                        )?;
+                        let next_settlement = settlement.restamp(next_cfg.generation_id, &live)?;
+                        search.replace_job(
+                            live.to_mining_job(next_cfg.generation_id, &mining_payout_address),
+                        )?;
+                        cfg = next_cfg;
+                        settlement = next_settlement;
+                        stale_rebuilds = stale_rebuilds.saturating_add(1);
                         Ok(())
                     });
                     let _ = reply.send(result);
@@ -1004,36 +1074,49 @@ fn run_supervisor(
                         ));
                         continue;
                     }
-                    let result =
-                        match prepare_fulcrum_endpoint_change(&cfg, endpoint.as_deref()) {
-                            Err(error) => Err(error),
-                            Ok(None) => Ok(()),
-                            Ok(Some((next_cfg, next_endpoints))) => search
-                                .apply_control(SearchCommand::Pause)
-                                .map(|_| ())
-                                .and_then(|()| {
-                                    search.replace_job(live.to_mining_job(
-                                        next_cfg.generation_id,
+                    let result = match prepare_fulcrum_endpoint_change(&cfg, endpoint.as_deref()) {
+                        Err(error) => Err(error),
+                        Ok(None) => Ok(()),
+                        Ok(Some((next_cfg, next_endpoints))) => {
+                            let next_settlement = settlement
+                                .restamp(next_cfg.generation_id, &live)
+                                .and_then(|next_settlement| {
+                                    production_preflight_local(
+                                        &next_cfg,
+                                        &live,
+                                        &reward_secret,
+                                        &reward_public_key,
                                         &mining_payout_address,
-                                    ))
-                                })
-                                .map(|()| {
-                                    cfg = next_cfg;
-                                    endpoints = next_endpoints;
-                                    stale_rebuilds = stale_rebuilds.saturating_add(1);
-                                    session = None;
-                                    state = SupervisorState::Reconnecting;
-                                    last_error = None;
-                                    reconnect_backoff = RECONNECT_MIN;
-                                    next_reconnect = Instant::now();
-                                    emit(
-                                        &event_tx,
-                                        RuntimeEvent::Reconnecting(
-                                            "Fulcrum endpoint changed; reconnecting".into(),
-                                        ),
-                                    );
-                                }),
-                        };
+                                        &next_settlement.sponsor,
+                                        &journal_path,
+                                    )?;
+                                    Ok(next_settlement)
+                                });
+                            next_settlement.and_then(|next_settlement| {
+                                search.apply_control(SearchCommand::Pause)?;
+                                search.replace_job(live.to_mining_job(
+                                    next_cfg.generation_id,
+                                    &mining_payout_address,
+                                ))?;
+                                cfg = next_cfg;
+                                settlement = next_settlement;
+                                endpoints = next_endpoints;
+                                stale_rebuilds = stale_rebuilds.saturating_add(1);
+                                session = None;
+                                state = SupervisorState::Reconnecting;
+                                last_error = None;
+                                reconnect_backoff = RECONNECT_MIN;
+                                next_reconnect = Instant::now();
+                                emit(
+                                    &event_tx,
+                                    RuntimeEvent::Reconnecting(
+                                        "Fulcrum endpoint changed; reconnecting".into(),
+                                    ),
+                                );
+                                Ok(())
+                            })
+                        }
+                    };
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Reconnect(reply)) => {
@@ -1097,10 +1180,15 @@ fn run_supervisor(
                         last_error = None;
                         session = Some(next_session);
                         match apply_refreshed_job(
+                            session.as_mut().expect("session was just installed"),
                             &mut cfg,
                             &mut live,
+                            &mut settlement,
                             &search,
+                            &reward_secret,
+                            &reward_public_key,
                             &mining_payout_address,
+                            &journal_path,
                             next_job,
                         ) {
                             Ok(changed) => {
@@ -1120,8 +1208,19 @@ fn run_supervisor(
                             }
                             Err(error) => {
                                 last_error = Some(error.clone());
-                                state = SupervisorState::Error;
-                                emit(&event_tx, RuntimeEvent::Error(error));
+                                state = SupervisorState::Reconnecting;
+                                emit(
+                                    &event_tx,
+                                    RuntimeEvent::Reconnecting(format!(
+                                        "generation settlement preflight retry: {error}"
+                                    )),
+                                );
+                                session = None;
+                                next_reconnect = Instant::now() + reconnect_backoff;
+                                reconnect_backoff = reconnect_backoff
+                                    .checked_mul(2)
+                                    .unwrap_or(RECONNECT_MAX)
+                                    .min(RECONNECT_MAX);
                             }
                         }
                     }
@@ -1146,7 +1245,7 @@ fn run_supervisor(
                     &live,
                     &reward_secret,
                     &reward_public_key,
-                    &settlement_sponsor,
+                    &settlement,
                     &journal_path,
                 ) {
                     Ok(pending) => {
@@ -1199,10 +1298,15 @@ fn run_supervisor(
                                     .fetch_live_job();
                                 match refreshed.and_then(|next_job| {
                                     apply_refreshed_job(
+                                        session.as_mut().expect("checked session above"),
                                         &mut cfg,
                                         &mut live,
+                                        &mut settlement,
                                         &search,
+                                        &reward_secret,
+                                        &reward_public_key,
                                         &mining_payout_address,
+                                        &journal_path,
                                         next_job,
                                     )
                                 }) {
@@ -1224,6 +1328,10 @@ fn run_supervisor(
                                         emit(&event_tx, RuntimeEvent::Reconnecting(error));
                                         session = None;
                                         next_reconnect = Instant::now() + reconnect_backoff;
+                                        reconnect_backoff = reconnect_backoff
+                                            .checked_mul(2)
+                                            .unwrap_or(RECONNECT_MAX)
+                                            .min(RECONNECT_MAX);
                                     }
                                 }
                             }
@@ -1247,10 +1355,15 @@ fn run_supervisor(
                                 stale_winners = stale_winners.saturating_add(1);
                                 last_error = None;
                                 match apply_refreshed_job(
+                                    session.as_mut().expect("checked session above"),
                                     &mut cfg,
                                     &mut live,
+                                    &mut settlement,
                                     &search,
+                                    &reward_secret,
+                                    &reward_public_key,
                                     &mining_payout_address,
+                                    &journal_path,
                                     next_job,
                                 ) {
                                     Ok(changed) => {
@@ -1267,8 +1380,19 @@ fn run_supervisor(
                                     }
                                     Err(error) => {
                                         last_error = Some(error.clone());
-                                        state = SupervisorState::Error;
-                                        emit(&event_tx, RuntimeEvent::Error(error));
+                                        state = SupervisorState::Reconnecting;
+                                        emit(
+                                            &event_tx,
+                                            RuntimeEvent::Reconnecting(format!(
+                                                "generation settlement preflight retry: {error}"
+                                            )),
+                                        );
+                                        session = None;
+                                        next_reconnect = Instant::now() + reconnect_backoff;
+                                        reconnect_backoff = reconnect_backoff
+                                            .checked_mul(2)
+                                            .unwrap_or(RECONNECT_MAX)
+                                            .min(RECONNECT_MAX);
                                     }
                                 }
                             }
@@ -1306,10 +1430,15 @@ fn run_supervisor(
                 Ok(next_job) => {
                     refreshes = refreshes.saturating_add(1);
                     match apply_refreshed_job(
+                        session.as_mut().expect("checked session above"),
                         &mut cfg,
                         &mut live,
+                        &mut settlement,
                         &search,
+                        &reward_secret,
+                        &reward_public_key,
                         &mining_payout_address,
+                        &journal_path,
                         next_job,
                     ) {
                         Ok(changed) => {
@@ -1340,7 +1469,7 @@ fn run_supervisor(
                                         &live,
                                         &reward_secret,
                                         &reward_public_key,
-                                        &settlement_sponsor,
+                                        &settlement,
                                         &journal_path,
                                     ) {
                                         Ok(pending) => {
@@ -1391,9 +1520,20 @@ fn run_supervisor(
                         }
                         Err(error) => {
                             last_error = Some(error.clone());
-                            state = SupervisorState::Error;
+                            state = SupervisorState::Reconnecting;
                             let _ = search.apply_control(SearchCommand::Pause);
-                            emit(&event_tx, RuntimeEvent::Error(error));
+                            emit(
+                                &event_tx,
+                                RuntimeEvent::Reconnecting(format!(
+                                    "generation settlement preflight retry: {error}"
+                                )),
+                            );
+                            session = None;
+                            next_reconnect = Instant::now() + reconnect_backoff;
+                            reconnect_backoff = reconnect_backoff
+                                .checked_mul(2)
+                                .unwrap_or(RECONNECT_MAX)
+                                .min(RECONNECT_MAX);
                         }
                     }
                 }
@@ -1434,20 +1574,94 @@ fn run_supervisor(
     snapshot.search = final_stats;
 }
 
+fn baton_outpoint_changed(current: &LiveJob, next: &LiveJob) -> bool {
+    current.baton_txid != next.baton_txid || current.baton_vout != next.baton_vout
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_generation_transition<F>(
+    cfg: &RuntimeConfig,
+    live: &LiveJob,
+    settlement: &SettlementState,
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    mining_payout_address: &str,
+    journal_path: &Path,
+    next: &LiveJob,
+    mut fetch_preflighted_sponsor: F,
+) -> Result<Option<(RuntimeConfig, SettlementState)>, String>
+where
+    F: FnMut(&RuntimeConfig, &LiveJob) -> Result<reward::SponsorReserve, String>,
+{
+    if !live_job_changed(live, next) {
+        return Ok(None);
+    }
+
+    let mut next_cfg = cfg.clone();
+    next_cfg.bump_generation();
+    let sponsor = if baton_outpoint_changed(live, next) || live.url != next.url {
+        fetch_preflighted_sponsor(&next_cfg, next)?
+    } else {
+        let sponsor = settlement.sponsor_for(cfg.generation_id, live)?.clone();
+        production_preflight_local(
+            &next_cfg,
+            next,
+            reward_secret,
+            reward_public_key,
+            mining_payout_address,
+            &sponsor,
+            journal_path,
+        )?;
+        sponsor
+    };
+    let next_settlement = SettlementState::new(next_cfg.generation_id, next, sponsor)?;
+    Ok(Some((next_cfg, next_settlement)))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_refreshed_job(
+    session: &mut ElectrumSession,
     cfg: &mut RuntimeConfig,
     live: &mut LiveJob,
+    settlement: &mut SettlementState,
     search: &SearchHandle,
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
     mining_payout_address: &str,
+    journal_path: &Path,
     next: LiveJob,
 ) -> Result<bool, String> {
-    let changed = live_job_changed(live, &next);
-    if changed {
-        cfg.bump_generation();
-        search.replace_job(next.to_mining_job(cfg.generation_id, mining_payout_address))?;
+    let staged = prepare_generation_transition(
+        cfg,
+        live,
+        settlement,
+        reward_secret,
+        reward_public_key,
+        mining_payout_address,
+        journal_path,
+        &next,
+        |next_cfg, next_live| {
+            production_preflight(
+                session,
+                next_cfg,
+                next_live,
+                reward_secret,
+                reward_public_key,
+                mining_payout_address,
+                journal_path,
+            )
+        },
+    )?;
+    if let Some((next_cfg, next_settlement)) = staged {
+        search.replace_job(next.to_mining_job(next_cfg.generation_id, mining_payout_address))?;
+        *cfg = next_cfg;
+        *settlement = next_settlement;
+        *live = next;
+        Ok(true)
+    } else {
+        *live = next;
+        Ok(false)
     }
-    *live = next;
-    Ok(changed)
 }
 
 fn prepare_fulcrum_endpoint_change(
@@ -1577,6 +1791,49 @@ mod tests {
             public_key: [0u8; 33],
             signature: [0u8; 64],
             transaction: Vec::new(),
+        }
+    }
+
+    fn signed_winner(
+        generation_id: u64,
+        job: &LiveJob,
+        mining_payout_address: &str,
+    ) -> VerifiedWinner {
+        let mining_secret = [1u8; 32];
+        let mining_public = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes(mining_secret).unwrap(),
+        )
+        .serialize();
+        let nonce = 7;
+        let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+        let signature = crate::crypto::bch_schnorr_sign(&mining_secret, &message).unwrap();
+        let context = tx::ReferenceJobContext {
+            prev_txid: job.baton_txid.clone(),
+            prev_vout: job.baton_vout,
+            age: job.age,
+            target_le_hex: job.target_le_hex.clone(),
+            contract_value_sats: job.baton_value_sats,
+            contract_token_amount: job.token_amount,
+            reward_raw: job.reward_raw,
+        };
+        let transaction = tx::apply_reference_signature(
+            &context,
+            mining_payout_address,
+            &hex::encode(mining_public),
+            nonce,
+            &hex::encode(signature),
+        )
+        .unwrap();
+        VerifiedWinner {
+            generation_id,
+            height: job.height,
+            baton_txid: job.baton_txid.clone(),
+            baton_vout: job.baton_vout,
+            nonce,
+            digest: crate::search::hash256(&transaction),
+            public_key: mining_public,
+            signature,
+            transaction,
         }
     }
 
@@ -1718,6 +1975,7 @@ mod tests {
     fn verified_winner_is_journaled_from_prevalidated_state_before_network_retry() {
         let (cfg, job, reward_secret, reward_public, reward_payout, sponsor, journal) =
             preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor.clone()).unwrap();
         let mining_secret = [1u8; 32];
         let mining_public = secp256k1::PublicKey::from_secret_key(
             &secp256k1::SecretKey::from_secret_bytes(mining_secret).unwrap(),
@@ -1761,7 +2019,7 @@ mod tests {
             &job,
             &reward_secret,
             &reward_public,
-            &sponsor,
+            &settlement,
             &journal,
         )
         .unwrap();
@@ -1780,7 +2038,7 @@ mod tests {
             &job,
             &reward_secret,
             &reward_public,
-            &sponsor,
+            &settlement,
             &journal,
         )
         .unwrap();
@@ -1879,10 +2137,170 @@ mod tests {
     }
 
     #[test]
-    fn live_search_remains_gated_until_verified_winner_is_durable() {
-        let error = require_complete_live_winner_lifecycle().unwrap_err();
-        assert!(error.contains("durably recoverable"));
-        assert!(error.contains("live GPU search was not started"));
+    fn baton_transition_requires_preflighted_replacement_sponsor() {
+        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor.clone()).unwrap();
+        let mut next = job.clone();
+        next.height += 1;
+        next.baton_txid = "22".repeat(32);
+        next.baton_height = next.height - 1;
+        next.age = 1;
+
+        let error = prepare_generation_transition(
+            &cfg,
+            &job,
+            &settlement,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            &next,
+            |_next_cfg, _next_live| Err("temporary Fulcrum sponsor lookup failure".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("temporary Fulcrum"));
+        assert_eq!(settlement.generation_id, cfg.generation_id);
+        assert_eq!(settlement.baton_txid, job.baton_txid);
+        assert_eq!(settlement.sponsor, sponsor);
+
+        let replacement = reward::SponsorReserve {
+            txid: "44".repeat(32),
+            vout: 2,
+            value_sats: 98_000,
+            locking_script: reward::build_sponsor_script(&next.baton_txid).unwrap(),
+        };
+        let staged = prepare_generation_transition(
+            &cfg,
+            &job,
+            &settlement,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            &next,
+            |next_cfg, next_live| {
+                production_preflight_local(
+                    next_cfg,
+                    next_live,
+                    &secret,
+                    &public,
+                    &mining_payout,
+                    &replacement,
+                    &journal,
+                )?;
+                Ok(replacement.clone())
+            },
+        )
+        .unwrap()
+        .expect("baton transition must stage a new generation");
+        assert_eq!(staged.0.generation_id, cfg.generation_id + 1);
+        assert_eq!(staged.1.generation_id, staged.0.generation_id);
+        assert_eq!(staged.1.baton_txid, next.baton_txid);
+        assert_eq!(staged.1.sponsor, replacement);
+        assert_eq!(settlement.baton_txid, job.baton_txid);
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn same_baton_generation_restamps_existing_settlement_without_sponsor_lookup() {
+        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor.clone()).unwrap();
+        let mut next = job.clone();
+        next.height += 1;
+        next.age += 1;
+
+        let staged = prepare_generation_transition(
+            &cfg,
+            &job,
+            &settlement,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            &next,
+            |_next_cfg, _next_live| panic!("same baton must not fetch replacement sponsor state"),
+        )
+        .unwrap()
+        .expect("height change must publish a new generation");
+        assert_eq!(staged.0.generation_id, cfg.generation_id + 1);
+        assert_eq!(staged.1.generation_id, staged.0.generation_id);
+        assert_eq!(staged.1.baton_txid, job.baton_txid);
+        assert_eq!(staged.1.sponsor, sponsor);
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn transitioned_generation_journal_survives_restart_and_duplicate_retry() {
+        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor).unwrap();
+        let mut next = job.clone();
+        next.height += 1;
+        next.baton_txid = "22".repeat(32);
+        next.baton_height = next.height - 1;
+        next.age = 1;
+        let replacement = reward::SponsorReserve {
+            txid: "44".repeat(32),
+            vout: 2,
+            value_sats: 98_000,
+            locking_script: reward::build_sponsor_script(&next.baton_txid).unwrap(),
+        };
+        let (next_cfg, next_settlement) = prepare_generation_transition(
+            &cfg,
+            &job,
+            &settlement,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            &next,
+            |next_cfg, next_live| {
+                production_preflight_local(
+                    next_cfg,
+                    next_live,
+                    &secret,
+                    &public,
+                    &mining_payout,
+                    &replacement,
+                    &journal,
+                )?;
+                Ok(replacement.clone())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let winner = signed_winner(next_cfg.generation_id, &next, &mining_payout);
+        let first = prepare_pending_submission(
+            &winner,
+            &next_cfg,
+            &next,
+            &secret,
+            &public,
+            &next_settlement,
+            &journal,
+        )
+        .unwrap();
+        let restarted = PendingSubmission::load(&journal).unwrap().unwrap();
+        assert_eq!(restarted, first);
+        assert_eq!(restarted.expected_baton_txid, next.baton_txid);
+        assert_eq!(restarted.sponsor_txid, replacement.txid);
+
+        let duplicate = prepare_pending_submission(
+            &winner,
+            &next_cfg,
+            &next,
+            &secret,
+            &public,
+            &next_settlement,
+            &journal,
+        )
+        .unwrap();
+        assert_eq!(duplicate, restarted);
+        PendingSubmission::remove(&journal).unwrap();
+    }
+
+    #[test]
+    fn live_search_gate_opens_after_generation_bound_winner_durability() {
+        require_complete_live_winner_lifecycle().unwrap();
     }
 
     #[test]
