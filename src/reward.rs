@@ -8,13 +8,17 @@
 
 use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS};
 use crate::crypto;
-use crate::protocol::MAINNET_CATEGORY_HEX;
+use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX, REDEEM_SCRIPT_HEX};
 use crate::tx;
 use ripemd::Ripemd160;
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 
 pub const TOKEN_OUTPUT_SATS: u64 = 700;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS: u64 = 8_000;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MIN_RELAY_FEE_SATS_PER_KB: u64 = 1_000;
 pub const SPONSOR_SUBSIDY_SATS: u64 = 2_000;
 pub const SPONSOR_STANDARD_MAX_LOCKING_BYTES: usize = 201;
 pub const SPONSOR_OUTPUT_DUST_SATS: u64 = 1_062;
@@ -39,6 +43,29 @@ pub struct PreparedRewardSplit {
     pub fee_sats: u64,
     pub next_sponsor_locking_script: Vec<u8>,
     pub next_sponsor_value_sats: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSelfFundedSettlement {
+    pub parent_txid: String,
+    pub settlement_txid: String,
+    pub raw_settlement: Vec<u8>,
+    pub baton_input_value_sats: u64,
+    pub baton_output_value_sats: u64,
+    pub miner_output_value_sats: u64,
+    pub donation_output_value_sats: u64,
+    pub miner_token_amount: u128,
+    pub donation_token_amount: u128,
+    pub required_relay_fee_sats: u64,
+    pub fee_sats: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedOutput {
+    value_sats: u64,
+    token_and_locking_bytecode: Vec<u8>,
 }
 
 fn hash256(data: &[u8]) -> [u8; 32] {
@@ -160,6 +187,105 @@ fn encode_output(value_sats: u64, token: Option<u128>, locking: &[u8]) -> Result
     Ok(out)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_raw_output(value_sats: u64, bytecode: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&value_sats.to_le_bytes());
+    out.extend_from_slice(&compact_uint(bytecode.len() as u64));
+    out.extend_from_slice(bytecode);
+    out
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn read_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let first = *bytes.get(*cursor).ok_or("truncated CompactSize prefix")?;
+    *cursor += 1;
+    let count = match first {
+        0xfd => 2,
+        0xfe => 4,
+        0xff => 8,
+        value => return Ok(u64::from(value)),
+    };
+    let end = cursor
+        .checked_add(count)
+        .ok_or("CompactSize cursor overflow")?;
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or("truncated CompactSize value")?;
+    *cursor = end;
+    let mut padded = [0u8; 8];
+    padded[..count].copy_from_slice(slice);
+    Ok(u64::from_le_bytes(padded))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_parent_outputs(parent_raw: &[u8]) -> Result<[ParsedOutput; 2], String> {
+    if parent_raw.len() < 10 {
+        return Err("winning PHOTON parent transaction is truncated".into());
+    }
+    let mut cursor = 4usize;
+    let input_count = read_compact_uint(parent_raw, &mut cursor)?;
+    if input_count != 1 {
+        return Err(format!(
+            "winning PHOTON parent must have exactly one covenant input (got {input_count})"
+        ));
+    }
+    cursor = cursor
+        .checked_add(36)
+        .ok_or("parent input cursor overflow")?;
+    if cursor > parent_raw.len() {
+        return Err("winning PHOTON parent input outpoint is truncated".into());
+    }
+    let script_len = usize::try_from(read_compact_uint(parent_raw, &mut cursor)?)
+        .map_err(|_| "parent input script length exceeds usize")?;
+    cursor = cursor
+        .checked_add(script_len)
+        .and_then(|value| value.checked_add(4))
+        .ok_or("parent input cursor overflow")?;
+    if cursor > parent_raw.len() {
+        return Err("winning PHOTON parent input is truncated".into());
+    }
+    let output_count = read_compact_uint(parent_raw, &mut cursor)?;
+    if output_count != 2 {
+        return Err(format!(
+            "winning PHOTON parent must have exactly two outputs (got {output_count})"
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let value_end = cursor
+            .checked_add(8)
+            .ok_or("parent output value cursor overflow")?;
+        let value_bytes: [u8; 8] = parent_raw
+            .get(cursor..value_end)
+            .ok_or("winning PHOTON parent output value is truncated")?
+            .try_into()
+            .map_err(|_| "parent output value length error")?;
+        cursor = value_end;
+        let bytecode_len = usize::try_from(read_compact_uint(parent_raw, &mut cursor)?)
+            .map_err(|_| "parent output bytecode length exceeds usize")?;
+        let bytecode_end = cursor
+            .checked_add(bytecode_len)
+            .ok_or("parent output bytecode cursor overflow")?;
+        let bytecode = parent_raw
+            .get(cursor..bytecode_end)
+            .ok_or("winning PHOTON parent output bytecode is truncated")?
+            .to_vec();
+        cursor = bytecode_end;
+        parsed.push(ParsedOutput {
+            value_sats: u64::from_le_bytes(value_bytes),
+            token_and_locking_bytecode: bytecode,
+        });
+    }
+    if cursor.checked_add(4) != Some(parent_raw.len()) {
+        return Err("winning PHOTON parent has trailing or truncated bytes".into());
+    }
+    parsed
+        .try_into()
+        .map_err(|_| "internal parent output count error".into())
+}
+
 fn serialized_outpoint(txid: &str, vout: u32) -> Result<Vec<u8>, String> {
     let hash = parse_txid_display(txid)?;
     let mut out = reverse(&hash);
@@ -207,6 +333,36 @@ fn p2pkh_sighash(
     Ok(hash256(&preimage))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn self_funded_p2pkh_sighash(
+    parent_txid: &str,
+    reward_token_amount: u128,
+    reward_value_sats: u64,
+    reward_lock: &[u8],
+    outputs: &[u8],
+) -> Result<[u8; 32], String> {
+    let mut outpoints = serialized_outpoint(parent_txid, 0)?;
+    outpoints.extend_from_slice(&serialized_outpoint(parent_txid, 1)?);
+    let hash_prevouts = hash256(&outpoints);
+    let hash_sequence = hash256(&[0u8; 8]);
+    let hash_outputs = hash256(outputs);
+
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(&2u32.to_le_bytes());
+    preimage.extend_from_slice(&hash_prevouts);
+    preimage.extend_from_slice(&hash_sequence);
+    preimage.extend_from_slice(&serialized_outpoint(parent_txid, 1)?);
+    preimage.extend_from_slice(&token_prefix(reward_token_amount)?);
+    preimage.extend_from_slice(&compact_uint(reward_lock.len() as u64));
+    preimage.extend_from_slice(reward_lock);
+    preimage.extend_from_slice(&reward_value_sats.to_le_bytes());
+    preimage.extend_from_slice(&0u32.to_le_bytes());
+    preimage.extend_from_slice(&hash_outputs);
+    preimage.extend_from_slice(&0u32.to_le_bytes());
+    preimage.extend_from_slice(&(SIGHASH_ALL_FORKID as u32).to_le_bytes());
+    Ok(hash256(&preimage))
+}
+
 pub fn p2pkh_locking_from_public_key(public_key: &[u8; 33]) -> Vec<u8> {
     let sha = Sha256::digest(public_key);
     let hash = Ripemd160::digest(sha);
@@ -231,6 +387,214 @@ pub fn new_intermediate_identity() -> Result<([u8; 32], [u8; 33], String), Strin
     let public_key = PublicKey::from_secret_key(&secret).serialize();
     let address = p2pkh_cashaddr_from_public_key(&public_key)?;
     Ok((secret_bytes, public_key, address))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn required_relay_fee_sats(serialized_bytes: usize) -> Result<u64, String> {
+    let bytes = u64::try_from(serialized_bytes).map_err(|_| "transaction size exceeds u64")?;
+    bytes
+        .checked_mul(MIN_RELAY_FEE_SATS_PER_KB)
+        .and_then(|value| value.checked_add(999))
+        .map(|value| value / 1_000)
+        .ok_or_else(|| "relay-fee calculation overflow".into())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn build_self_funded_raw(
+    parent_txid: &str,
+    baton_output_value_sats: u64,
+    baton_token_and_locking_bytecode: &[u8],
+    reward_value_sats: u64,
+    reward_token_amount: u128,
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    miner_lock: &[u8],
+    donation_lock: &[u8],
+    miner_token_amount: u128,
+    donation_token_amount: u128,
+) -> Result<Vec<u8>, String> {
+    let redeem_script = hex::decode(REDEEM_SCRIPT_HEX.trim()).map_err(|error| error.to_string())?;
+    if redeem_script.len() != 259 {
+        return Err(format!(
+            "PHOTON redeem script must be 259 bytes (got {})",
+            redeem_script.len()
+        ));
+    }
+    let reward_lock = p2pkh_locking_from_public_key(reward_public_key);
+
+    let mut outputs = Vec::new();
+    outputs.extend_from_slice(&encode_raw_output(
+        baton_output_value_sats,
+        baton_token_and_locking_bytecode,
+    ));
+    outputs.extend_from_slice(&encode_output(
+        reward_value_sats,
+        Some(miner_token_amount),
+        miner_lock,
+    )?);
+    outputs.extend_from_slice(&encode_output(
+        reward_value_sats,
+        Some(donation_token_amount),
+        donation_lock,
+    )?);
+
+    let sighash = self_funded_p2pkh_sighash(
+        parent_txid,
+        reward_token_amount,
+        reward_value_sats,
+        &reward_lock,
+        &outputs,
+    )?;
+    let signature = crypto::bch_schnorr_sign(reward_secret, &sighash)?;
+    if !crypto::bch_schnorr_verify(reward_public_key, &sighash, &signature)? {
+        return Err("self-funded settlement Schnorr signature failed local verification".into());
+    }
+    let mut bitcoin_signature = signature.to_vec();
+    bitcoin_signature.push(SIGHASH_ALL_FORKID);
+    let mut reward_unlocking = push_data(&bitcoin_signature)?;
+    reward_unlocking.extend_from_slice(&push_data(reward_public_key)?);
+    let baton_unlocking = push_data(&redeem_script)?;
+
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&2u32.to_le_bytes());
+    raw.push(2);
+    raw.extend_from_slice(&encode_input(parent_txid, 0, &baton_unlocking)?);
+    raw.extend_from_slice(&encode_input(parent_txid, 1, &reward_unlocking)?);
+    raw.push(3);
+    raw.extend_from_slice(&outputs);
+    raw.extend_from_slice(&0u32.to_le_bytes());
+    Ok(raw)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn build_self_funded_settlement(
+    parent_raw: &[u8],
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    miner_payout: &str,
+    reward_token_amount: u128,
+) -> Result<PreparedSelfFundedSettlement, String> {
+    let derived_public = PublicKey::from_secret_key(
+        &SecretKey::from_secret_bytes(*reward_secret).map_err(|error| error.to_string())?,
+    )
+    .serialize();
+    if &derived_public != reward_public_key {
+        return Err("reward public key does not match the runtime reward secret".into());
+    }
+
+    let [baton, reward] = parse_parent_outputs(parent_raw)?;
+    let covenant_lock =
+        hex::decode(COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
+    if baton.token_and_locking_bytecode.first() != Some(&0xef)
+        || !baton.token_and_locking_bytecode.ends_with(&covenant_lock)
+    {
+        return Err("parent output 0 is not the authoritative PHOTON baton".into());
+    }
+    if reward.value_sats != TOKEN_OUTPUT_SATS {
+        return Err(format!(
+            "parent reward BCH value must be the proven {TOKEN_OUTPUT_SATS} sats (got {})",
+            reward.value_sats
+        ));
+    }
+    let reward_lock = p2pkh_locking_from_public_key(reward_public_key);
+    let mut expected_reward = token_prefix(reward_token_amount)?;
+    expected_reward.extend_from_slice(&reward_lock);
+    if reward.token_and_locking_bytecode != expected_reward {
+        return Err("parent reward output does not match the signed runtime reward state".into());
+    }
+
+    let miner_lock = tx::cashaddr_to_p2pkh_locking(miner_payout)?;
+    let donation_lock = tx::cashaddr_to_p2pkh_locking(DONATION_ADDRESS)?;
+    let (miner_token_amount, donation_token_amount) =
+        RuntimeConfig::split_reward(reward_token_amount);
+    if donation_token_amount
+        != reward_token_amount.saturating_mul(u128::from(DONATION_BPS)) / 10_000
+        || miner_token_amount
+            .checked_add(donation_token_amount)
+            .ok_or("reward split overflow")?
+            != reward_token_amount
+    {
+        return Err("reward split failed exact 98/2 conservation".into());
+    }
+
+    let parent_txid = transaction_id(parent_raw);
+    let provisional_baton_value = baton
+        .value_sats
+        .checked_sub(PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS)
+        .ok_or("baton BCH value is too small for settlement")?;
+    let provisional = build_self_funded_raw(
+        &parent_txid,
+        provisional_baton_value,
+        &baton.token_and_locking_bytecode,
+        reward.value_sats,
+        reward_token_amount,
+        reward_secret,
+        reward_public_key,
+        &miner_lock,
+        &donation_lock,
+        miner_token_amount,
+        donation_token_amount,
+    )?;
+    let required_relay_fee_sats = required_relay_fee_sats(provisional.len())?;
+    let baton_decrease = reward
+        .value_sats
+        .checked_add(required_relay_fee_sats)
+        .ok_or("baton decrease overflow")?;
+    if baton_decrease > PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS {
+        return Err(format!(
+            "settlement needs {baton_decrease} baton sats but covenant permits at most {PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS}"
+        ));
+    }
+    let baton_output_value_sats = baton
+        .value_sats
+        .checked_sub(baton_decrease)
+        .ok_or("baton output value underflow")?;
+    let raw_settlement = build_self_funded_raw(
+        &parent_txid,
+        baton_output_value_sats,
+        &baton.token_and_locking_bytecode,
+        reward.value_sats,
+        reward_token_amount,
+        reward_secret,
+        reward_public_key,
+        &miner_lock,
+        &donation_lock,
+        miner_token_amount,
+        donation_token_amount,
+    )?;
+    if raw_settlement.len() != provisional.len() {
+        return Err("settlement relay-fee sizing changed after finalization".into());
+    }
+    let input_value = baton
+        .value_sats
+        .checked_add(reward.value_sats)
+        .ok_or("settlement input value overflow")?;
+    let output_value = baton_output_value_sats
+        .checked_add(reward.value_sats)
+        .and_then(|value| value.checked_add(reward.value_sats))
+        .ok_or("settlement output value overflow")?;
+    let fee_sats = input_value
+        .checked_sub(output_value)
+        .ok_or("settlement outputs exceed BCH inputs")?;
+    if fee_sats != required_relay_fee_sats {
+        return Err(format!(
+            "settlement fee {fee_sats} does not equal required relay fee {required_relay_fee_sats}"
+        ));
+    }
+    Ok(PreparedSelfFundedSettlement {
+        parent_txid,
+        settlement_txid: transaction_id(&raw_settlement),
+        raw_settlement,
+        baton_input_value_sats: baton.value_sats,
+        baton_output_value_sats,
+        miner_output_value_sats: reward.value_sats,
+        donation_output_value_sats: reward.value_sats,
+        miner_token_amount,
+        donation_token_amount,
+        required_relay_fee_sats,
+        fee_sats,
+    })
 }
 
 /// Build the exact 197-byte M54 stateful sponsor covenant for one PHOTON baton.
@@ -519,6 +883,83 @@ mod tests {
             tx::cashaddr_to_p2pkh_locking(&address).unwrap(),
             p2pkh_locking_from_public_key(&public)
         );
+    }
+
+    #[test]
+    fn self_funded_settlement_matches_vm_fixture_accounting() {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let miner_payout = p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+        let settlement = build_self_funded_settlement(
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+        )
+        .unwrap();
+
+        assert_eq!(settlement.raw_settlement.len(), 794);
+        assert_eq!(settlement.required_relay_fee_sats, 794);
+        assert_eq!(settlement.fee_sats, 794);
+        assert_eq!(settlement.baton_input_value_sats, 15_970_000);
+        assert_eq!(settlement.baton_output_value_sats, 15_968_506);
+        assert_eq!(settlement.miner_token_amount, 4_899_778_337);
+        assert_eq!(settlement.donation_token_amount, 99_995_476);
+        assert_eq!(
+            hex::encode(hash256(&settlement.raw_settlement)),
+            "dab595f2cf51f796a722f4fd75c2d31c1607ed42ed4bd1983d7344f050fee3bc"
+        );
+        assert_eq!(
+            settlement.miner_token_amount + settlement.donation_token_amount,
+            4_999_773_813
+        );
+        assert_eq!(
+            settlement.baton_input_value_sats - settlement.baton_output_value_sats,
+            TOKEN_OUTPUT_SATS + settlement.fee_sats
+        );
+        assert!(
+            settlement.baton_input_value_sats - settlement.baton_output_value_sats
+                <= PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS
+        );
+
+        let parent_outpoint = reverse(&hex::decode(&settlement.parent_txid).unwrap());
+        let raw = &settlement.raw_settlement;
+        assert_eq!(raw[4], 2);
+        let mut cursor = 5usize;
+        for expected_vout in [0u32, 1] {
+            assert_eq!(&raw[cursor..cursor + 32], parent_outpoint.as_slice());
+            cursor += 32;
+            assert_eq!(&raw[cursor..cursor + 4], &expected_vout.to_le_bytes());
+            cursor += 4;
+            let script_len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            cursor += script_len + 4;
+        }
+        assert_eq!(raw[cursor], 3);
+    }
+
+    #[test]
+    fn self_funded_settlement_rejects_reward_state_mismatch() {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let miner_payout = p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+        let error = build_self_funded_settlement(
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_812,
+        )
+        .unwrap_err();
+        assert!(error.contains("reward output does not match"));
     }
 
     #[test]
