@@ -396,17 +396,29 @@ pub struct SearchHandle {
 
 impl SearchHandle {
     pub fn start(intensity: u8, job: MiningJob) -> Result<Self, String> {
-        Self::start_inner(intensity, job, false)
+        Self::start_inner(intensity, job, false, false)
     }
 
     /// Start the exact CUDA search with an authoritative live-state gate after
     /// every GPU batch. The caller must refresh Fulcrum state and call
     /// `complete_refresh` before the next batch can begin.
     pub fn start_supervised(intensity: u8, job: MiningJob) -> Result<Self, String> {
-        Self::start_inner(intensity, job, true)
+        Self::start_inner(intensity, job, true, false)
     }
 
-    fn start_inner(intensity: u8, job: MiningJob, supervised: bool) -> Result<Self, String> {
+    /// Start supervised search in a paused state. This is used while a
+    /// crash-recovered winner submission is pending, so no GPU batch can begin
+    /// before the durable parent/child pair is resolved.
+    pub fn start_supervised_paused(intensity: u8, job: MiningJob) -> Result<Self, String> {
+        Self::start_inner(intensity, job, true, true)
+    }
+
+    fn start_inner(
+        intensity: u8,
+        job: MiningJob,
+        supervised: bool,
+        initially_paused: bool,
+    ) -> Result<Self, String> {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
         }
@@ -421,7 +433,7 @@ impl SearchHandle {
         engine.set_job(&prepared.template, &prepared.target, &sk)?;
 
         let stop = Arc::new(AtomicBool::new(false));
-        let paused = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(initially_paused));
         let intensity_state = Arc::new(AtomicU8::new(intensity));
         let candidates = Arc::new(AtomicU64::new(0));
         let batches = Arc::new(AtomicU64::new(0));

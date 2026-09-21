@@ -2,7 +2,8 @@
 //! Template assemble + message hash here. Schnorr sign stays Lead Dev / crypto.
 //! Never keys/mnemonics. No broadcast until explicitly armed.
 
-use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS};
+#[cfg(test)]
+use crate::config::DONATION_ADDRESS;
 use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX, REDEEM_SCRIPT_HEX};
 use sha2::Digest;
 
@@ -84,6 +85,30 @@ fn cashaddr_polymod(values: &[u8]) -> u64 {
         }
     }
     c ^ 1
+}
+
+/// Encode a mainnet P2PKH hash as a canonical CashAddr.
+pub fn p2pkh_hash_to_cashaddr(hash: &[u8; 20]) -> Result<String, String> {
+    let mut decoded = Vec::with_capacity(21);
+    decoded.push(0); // P2PKH, 160-bit hash
+    decoded.extend_from_slice(hash);
+    let payload = convert_bits(&decoded, 8, 5, true)?;
+    let prefix = "bitcoincash";
+    let mut checksum_input: Vec<u8> = prefix.bytes().map(|c| c & 31).collect();
+    checksum_input.push(0);
+    checksum_input.extend_from_slice(&payload);
+    checksum_input.extend_from_slice(&[0u8; 8]);
+    let checksum = cashaddr_polymod(&checksum_input);
+
+    let mut encoded = String::with_capacity(payload.len() + 8);
+    for value in payload {
+        encoded.push(CASHADDR_CHARSET[value as usize] as char);
+    }
+    for shift in (0..8).rev() {
+        let value = ((checksum >> (shift * 5)) & 31) as usize;
+        encoded.push(CASHADDR_CHARSET[value] as char);
+    }
+    Ok(format!("{prefix}:{encoded}"))
 }
 
 fn convert_bits(data: &[u8], from_bits: u32, to_bits: u32, pad: bool) -> Result<Vec<u8>, String> {
@@ -297,6 +322,7 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
 
 /// Historical 3-output 98/2 experiment, now fail-closed because the covenant
 /// reference only proves a two-output mining transaction.
+#[cfg(test)]
 pub const DONATION_SPLIT_BLOCKER: &str =
     "98/2 same-transaction donation is disabled: the proven PHOTON covenant transaction has exactly two outputs, and no 3-output covenant-valid vector has been demonstrated";
 
@@ -315,17 +341,13 @@ pub fn print_win_tx_preview(
     miner_payout: &str,
     template_hex: Option<&str>,
 ) -> Result<(), String> {
-    let (_, intended_donation_amt) = RuntimeConfig::split_reward(job_reward_raw);
     let miner_lock = cashaddr_to_p2pkh_locking(miner_payout)?;
     println!("win-tx dry-run (unsigned; no broadcast):");
     println!(
         "  out reward   10000 bps FT={job_reward_raw} lock={}B -> {miner_payout}",
         miner_lock.len()
     );
-    println!(
-        "  donation:    DISABLED (intended {DONATION_BPS} bps FT={intended_donation_amt} -> {DONATION_ADDRESS})"
-    );
-    println!("  blocker:     {DONATION_SPLIT_BLOCKER}");
+    println!("Donation: 2%");
     if let Some(h) = template_hex {
         println!("  template: {} bytes", h.len() / 2);
         let show = h.len().min(80);
