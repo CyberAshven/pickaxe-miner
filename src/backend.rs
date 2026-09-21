@@ -1,4 +1,4 @@
-//! GPU backend selection (DoD): auto | cuda | hip | wgpu.
+//! Native production GPU backend selection: auto | cuda | hip.
 //! No CPU mining fallback.
 
 use cudarc::driver::{sys, CudaContext};
@@ -8,7 +8,6 @@ pub enum BackendKind {
     Auto,
     Cuda,
     Hip,
-    Wgpu,
 }
 
 impl BackendKind {
@@ -17,8 +16,7 @@ impl BackendKind {
             "auto" => Ok(Self::Auto),
             "cuda" => Ok(Self::Cuda),
             "hip" | "rocm" => Ok(Self::Hip),
-            "wgpu" => Ok(Self::Wgpu),
-            other => Err(format!("unknown backend `{other}` (auto|cuda|hip|wgpu)")),
+            other => Err(format!("unknown backend `{other}` (auto|cuda|hip)")),
         }
     }
 
@@ -27,7 +25,6 @@ impl BackendKind {
             Self::Auto => "auto",
             Self::Cuda => "cuda",
             Self::Hip => "hip",
-            Self::Wgpu => "wgpu",
         }
     }
 }
@@ -49,26 +46,21 @@ pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
             Ok(_) => Err("CUDA runtime present but zero devices".into()),
             Err(e) if matches!(prefer, BackendKind::Cuda) => Err(e),
             Err(e) => Err(format!(
-                "{e} Falling back to wgpu is not wired yet — install CUDA or wait for wgpu backend."
+                "{e} No validated native GPU backend is available; HIP/ROCm auto-detection is not implemented yet."
             )),
         },
         BackendKind::Hip => Err(
             "HIP/ROCm backend not wired yet. Use --backend cuda on NVIDIA or wait for HIP.".into(),
         ),
-        BackendKind::Wgpu => {
-            Err("wgpu backend not wired yet. On NVIDIA use --backend cuda (or auto).".into())
-        }
     }
 }
 
 fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
     // Driver must be initialized before get_count (same path CudaContext::new uses).
-    cudarc::driver::result::init().map_err(|e| {
-        format!("CUDA unavailable: {e}. Install/fix CUDA runtime, or try --backend wgpu when available.")
-    })?;
-    let n = cudarc::driver::result::device::get_count().map_err(|e| {
-        format!("CUDA unavailable: {e}. Install/fix CUDA runtime, or try --backend wgpu when available.")
-    })?;
+    cudarc::driver::result::init()
+        .map_err(|e| format!("CUDA unavailable: {e}. Install or fix the CUDA runtime."))?;
+    let n = cudarc::driver::result::device::get_count()
+        .map_err(|e| format!("CUDA unavailable: {e}. Install or fix the CUDA runtime."))?;
     let mut out = Vec::new();
     for i in 0..n {
         let ctx = CudaContext::new(i as usize)
@@ -161,4 +153,20 @@ pub fn print_devices(prefer: BackendKind) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_backend_parser_rejects_detached_wgpu() {
+        assert_eq!(BackendKind::parse("auto").unwrap(), BackendKind::Auto);
+        assert_eq!(BackendKind::parse("cuda").unwrap(), BackendKind::Cuda);
+        assert_eq!(BackendKind::parse("hip").unwrap(), BackendKind::Hip);
+        assert_eq!(BackendKind::parse("rocm").unwrap(), BackendKind::Hip);
+
+        let error = BackendKind::parse("wgpu").unwrap_err();
+        assert_eq!(error, "unknown backend `wgpu` (auto|cuda|hip)");
+    }
 }

@@ -5,8 +5,12 @@ Researchy brief + CoS product lock.
 ## Ship path (Windows RTX)
 
 1. **CUDA first** — `cudarc` host + `.cu`/PTX kernels (peak hashrate on NVIDIA).
-2. **wgpu/Vulkan** — portable / AMD second path only (not RTX ship-critical).
+2. **Native AMD path** — HIP/ROCm where validated, otherwise an appropriate native GPU API.
 3. **FPGA** — later optional; do not block GPU ship.
+
+wgpu/WebGPU is detached from the production backend stack. The authoritative
+WGSL implementation remains useful for correctness comparison and portability
+research, but the production binary does not select or fall back to it.
 
 ## Sequence after Electrum/job
 
@@ -25,7 +29,7 @@ Researchy brief + CoS product lock.
 
 ## Prior art
 
-- https://photon.postcorps.com/ (WebGPU reference, M24–M67 kernel design)
+- https://photon.postcorps.com/ (detached WebGPU correctness/performance reference, M24–M67 kernel design)
 - https://github.com/2qx/UltrafastSecp256k1 (bch-photon CUDA worker branch — prior art only)
 - https://github.com/shrec/UltrafastSecp256k1
 - https://docs.rs/cudarc/latest/cudarc/

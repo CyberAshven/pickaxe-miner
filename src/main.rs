@@ -1,6 +1,6 @@
 //! Pickaxe Miner - interactive CLI (Stage 2/3).
 //!
-//! Controls mirror the postcorps WebGPU site (esp. intensity).
+//! Runtime controls preserve the authoritative PHOTON reference semantics.
 //! Donation: 2%.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
