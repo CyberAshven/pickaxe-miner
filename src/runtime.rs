@@ -22,6 +22,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[path = "source_pool.rs"]
+#[allow(dead_code)]
+mod source_pool;
+
+use self::source_pool::{SourceCapability, SourceCatalog, SourceKind};
+
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
@@ -1404,7 +1410,16 @@ impl RuntimeSupervisor {
         }
         require_complete_live_winner_lifecycle()?;
 
-        let endpoints = cfg.electrum_endpoints();
+        let mut sources = SourceCatalog::configured(&cfg)?;
+        if let Some(endpoint) = cfg.fulcrum_url.as_deref() {
+            sources.add_user(SourceKind::Fulcrum, endpoint, "Configured Fulcrum")?;
+        }
+        let router = sources.router();
+        let endpoints = router
+            .candidates(SourceCapability::PhotonState, 0)
+            .into_iter()
+            .map(|entry| entry.endpoint.clone())
+            .collect::<Vec<_>>();
         let mut session = ElectrumSession::connect_failover(&endpoints)?;
         let journal_path = submission_journal_path();
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
@@ -2296,7 +2311,13 @@ fn prepare_fulcrum_endpoint_change(
     if next.fulcrum_url == cfg.fulcrum_url {
         return Ok(None);
     }
-    let endpoints = next.electrum_endpoints();
+    let sources = SourceCatalog::configured(&next)?;
+    let router = sources.router();
+    let endpoints = router
+        .candidates(SourceCapability::PhotonState, 0)
+        .into_iter()
+        .map(|entry| entry.endpoint.clone())
+        .collect();
     Ok(Some((next, endpoints)))
 }
 
