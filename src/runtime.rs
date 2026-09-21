@@ -27,7 +27,7 @@ const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
-const SUBMISSION_JOURNAL_VERSION: u8 = 2;
+const SUBMISSION_JOURNAL_VERSION: u8 = 3;
 const PHOTON_TX_BYTES: usize = 615;
 const PHOTON_TARGET_OFFSET: usize = 394;
 const VERIFIED_WINNER_DURABILITY_READY: bool = true;
@@ -37,69 +37,55 @@ struct SettlementState {
     generation_id: u64,
     baton_txid: String,
     baton_vout: u32,
-    sponsor: reward::SponsorReserve,
 }
 
 impl SettlementState {
-    fn new(
-        generation_id: u64,
-        live: &LiveJob,
-        sponsor: reward::SponsorReserve,
-    ) -> Result<Self, String> {
+    fn new(generation_id: u64, live: &LiveJob) -> Result<Self, String> {
         if live.baton_vout != 0 {
             return Err(format!(
-                "PHOTON sponsor settlement requires baton output 0, got {}",
+                "PHOTON settlement requires baton output 0, got {}",
                 live.baton_vout
             ));
-        }
-        if sponsor.value_sats < reward::SPONSOR_MIN_RESERVE_SATS {
-            return Err("settlement sponsor reserve is below the minimum".into());
-        }
-        let expected_locking = reward::build_sponsor_script(&live.baton_txid)?;
-        if sponsor.locking_script != expected_locking {
-            return Err("settlement sponsor state does not match PHOTON baton".into());
         }
         Ok(Self {
             generation_id,
             baton_txid: live.baton_txid.clone(),
             baton_vout: live.baton_vout,
-            sponsor,
         })
     }
 
     fn restamp(&self, generation_id: u64, live: &LiveJob) -> Result<Self, String> {
-        Self::new(generation_id, live, self.sponsor.clone())
+        self.ensure_current(self.generation_id, live)?;
+        Self::new(generation_id, live)
     }
 
-    fn sponsor_for(
-        &self,
-        generation_id: u64,
-        live: &LiveJob,
-    ) -> Result<&reward::SponsorReserve, String> {
+    fn ensure_current(&self, generation_id: u64, live: &LiveJob) -> Result<(), String> {
         if self.generation_id != generation_id
             || self.baton_txid != live.baton_txid
             || self.baton_vout != live.baton_vout
         {
-            return Err("settlement sponsor is stale for the current PHOTON generation".into());
+            return Err("settlement state is stale for the current PHOTON generation".into());
         }
-        Ok(&self.sponsor)
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingSubmission {
     version: u8,
+    generation_id: u64,
     expected_height: u32,
     expected_baton_txid: String,
     expected_baton_vout: u32,
-    sponsor_txid: String,
-    sponsor_vout: u32,
-    sponsor_value_sats: u64,
-    sponsor_locking_hex: String,
     parent_txid: String,
     parent_hex: String,
-    child_txid: String,
-    child_hex: String,
+    settlement_txid: String,
+    settlement_hex: String,
+    resulting_baton_txid: String,
+    resulting_baton_vout: u32,
+    resulting_baton_value_sats: u64,
+    miner_token_amount: u128,
+    donation_token_amount: u128,
 }
 
 impl PendingSubmission {
@@ -218,26 +204,27 @@ impl PendingSubmission {
 
     fn from_verified(
         winner: &VerifiedWinner,
-        split: &reward::PreparedRewardSplit,
-        sponsor: &reward::SponsorReserve,
+        settlement: &reward::PreparedSelfFundedSettlement,
     ) -> Result<Self, String> {
         let parent_txid = reward::transaction_id(&winner.transaction);
-        if parent_txid != split.parent_txid {
-            return Err("reward child parent txid does not match verified PHOTON winner".into());
+        if parent_txid != settlement.parent_txid {
+            return Err("settlement parent txid does not match verified PHOTON winner".into());
         }
         let pending = Self {
             version: SUBMISSION_JOURNAL_VERSION,
+            generation_id: winner.generation_id,
             expected_height: winner.height,
             expected_baton_txid: winner.baton_txid.clone(),
             expected_baton_vout: winner.baton_vout,
-            sponsor_txid: sponsor.txid.clone(),
-            sponsor_vout: sponsor.vout,
-            sponsor_value_sats: sponsor.value_sats,
-            sponsor_locking_hex: hex::encode(&sponsor.locking_script),
             parent_txid,
             parent_hex: hex::encode(&winner.transaction),
-            child_txid: split.child_txid.clone(),
-            child_hex: hex::encode(&split.raw_child),
+            settlement_txid: settlement.settlement_txid.clone(),
+            settlement_hex: hex::encode(&settlement.raw_settlement),
+            resulting_baton_txid: settlement.settlement_txid.clone(),
+            resulting_baton_vout: 0,
+            resulting_baton_value_sats: settlement.baton_output_value_sats,
+            miner_token_amount: settlement.miner_token_amount,
+            donation_token_amount: settlement.donation_token_amount,
         };
         pending.validate()?;
         Ok(pending)
@@ -258,22 +245,27 @@ impl PendingSubmission {
         {
             return Err("pending submission has invalid PHOTON baton txid".into());
         }
-        if self.sponsor_txid.len() != 64
-            || !self
-                .sponsor_txid
-                .chars()
-                .all(|value| value.is_ascii_hexdigit())
+        if self.generation_id == 0 {
+            return Err("pending submission has invalid generation id".into());
+        }
+        if self.resulting_baton_vout != 0 {
+            return Err("pending submission resulting PHOTON baton must be output 0".into());
+        }
+        if self.resulting_baton_txid != self.settlement_txid {
+            return Err(
+                "pending submission resulting baton txid must equal settlement txid".into(),
+            );
+        }
+        let reward_amount = self
+            .miner_token_amount
+            .checked_add(self.donation_token_amount)
+            .ok_or("pending submission reward token amount overflow")?;
+        let expected_donation =
+            reward_amount.saturating_mul(u128::from(crate::config::DONATION_BPS)) / 10_000;
+        if self.donation_token_amount != expected_donation
+            || self.miner_token_amount != reward_amount - expected_donation
         {
-            return Err("pending submission has invalid sponsor txid".into());
-        }
-        if self.sponsor_value_sats < reward::SPONSOR_MIN_RESERVE_SATS {
-            return Err("pending submission sponsor reserve is below the minimum".into());
-        }
-        let sponsor_locking = hex::decode(&self.sponsor_locking_hex)
-            .map_err(|error| format!("pending submission sponsor locking bytecode: {error}"))?;
-        let expected_sponsor_locking = reward::build_sponsor_script(&self.expected_baton_txid)?;
-        if sponsor_locking != expected_sponsor_locking {
-            return Err("pending submission sponsor state does not match PHOTON baton".into());
+            return Err("pending submission does not encode the exact 98/2 reward split".into());
         }
         for (label, expected, raw_hex) in [
             (
@@ -281,7 +273,11 @@ impl PendingSubmission {
                 self.parent_txid.as_str(),
                 self.parent_hex.as_str(),
             ),
-            ("child", self.child_txid.as_str(), self.child_hex.as_str()),
+            (
+                "settlement",
+                self.settlement_txid.as_str(),
+                self.settlement_hex.as_str(),
+            ),
         ] {
             if expected.len() != 64 || !expected.chars().all(|value| value.is_ascii_hexdigit()) {
                 return Err(format!("pending submission has invalid {label} txid"));
@@ -482,22 +478,22 @@ fn submission_journal_path() -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionDecision {
     Complete,
-    BroadcastChild,
-    BroadcastParentThenChild,
+    BroadcastSettlement,
+    BroadcastParentThenSettlement,
     StaleUnbroadcast,
 }
 
 fn submission_decision(
     parent_known: bool,
-    child_known: bool,
+    settlement_known: bool,
     live_matches_expected: bool,
 ) -> SubmissionDecision {
-    if child_known {
+    if settlement_known {
         SubmissionDecision::Complete
     } else if parent_known {
-        SubmissionDecision::BroadcastChild
+        SubmissionDecision::BroadcastSettlement
     } else if live_matches_expected {
-        SubmissionDecision::BroadcastParentThenChild
+        SubmissionDecision::BroadcastParentThenSettlement
     } else {
         SubmissionDecision::StaleUnbroadcast
     }
@@ -565,14 +561,26 @@ fn broadcast_pending_transaction(
     )
 }
 
-fn broadcast_child(
+fn broadcast_settlement(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
     pending: &PendingSubmission,
 ) -> Result<SubmissionAttempt, String> {
-    let returned = broadcast_pending_transaction(session, cfg, &pending.child_hex)?;
-    ensure_broadcast_txid("reward child", &pending.child_txid, &returned)?;
-    Ok(SubmissionAttempt::Complete)
+    let returned = broadcast_pending_transaction(session, cfg, &pending.settlement_hex)?;
+    ensure_broadcast_txid("PHOTON settlement", &pending.settlement_txid, &returned)?;
+    let fresh = session.fetch_live_job()?;
+    if fresh
+        .baton_txid
+        .eq_ignore_ascii_case(&pending.resulting_baton_txid)
+        && fresh.baton_vout == pending.resulting_baton_vout
+    {
+        Ok(SubmissionAttempt::Complete)
+    } else {
+        Err(
+            "settlement broadcast is known but the resulting PHOTON baton is not yet authoritative"
+                .into(),
+        )
+    }
 }
 
 fn attempt_pending_submission(
@@ -583,26 +591,42 @@ fn attempt_pending_submission(
 ) -> Result<SubmissionAttempt, String> {
     pending.validate()?;
 
-    let child_known = session.transaction_known(&pending.child_txid)?;
-    if child_known {
-        return Ok(SubmissionAttempt::Complete);
+    let settlement_known = session.transaction_known(&pending.settlement_txid)?;
+    if settlement_known {
+        let fresh = session.fetch_live_job()?;
+        if fresh
+            .baton_txid
+            .eq_ignore_ascii_case(&pending.resulting_baton_txid)
+            && fresh.baton_vout == pending.resulting_baton_vout
+        {
+            return Ok(SubmissionAttempt::Complete);
+        }
+        if fresh.baton_txid != pending.expected_baton_txid
+            || fresh.baton_vout != pending.expected_baton_vout
+        {
+            return Ok(SubmissionAttempt::Complete);
+        }
+        return Err(
+            "settlement transaction is known but authoritative PHOTON baton discovery has not advanced"
+                .into(),
+        );
     }
 
     if pending.parent_accepted(journal_path)? {
-        return broadcast_child(session, cfg, pending);
+        return broadcast_settlement(session, cfg, pending);
     }
 
     let parent_known = session.transaction_known(&pending.parent_txid)?;
     if parent_known {
         pending.mark_parent_accepted(journal_path)?;
-        return broadcast_child(session, cfg, pending);
+        return broadcast_settlement(session, cfg, pending);
     }
 
     let parent_attempted = pending.parent_attempted(journal_path)?;
     let fresh = session.fetch_live_job()?;
     if fresh.baton_txid.eq_ignore_ascii_case(&pending.parent_txid) && fresh.baton_vout == 0 {
         pending.mark_parent_accepted(journal_path)?;
-        return broadcast_child(session, cfg, pending);
+        return broadcast_settlement(session, cfg, pending);
     }
     let baton_conflicted = fresh.baton_txid != pending.expected_baton_txid
         || fresh.baton_vout != pending.expected_baton_vout;
@@ -621,7 +645,7 @@ fn attempt_pending_submission(
     ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned_parent)?;
     pending.mark_parent_accepted(journal_path)?;
 
-    broadcast_child(session, cfg, pending)
+    broadcast_settlement(session, cfg, pending)
 }
 
 fn prepare_pending_submission(
@@ -634,20 +658,18 @@ fn prepare_pending_submission(
     journal_path: &Path,
 ) -> Result<PendingSubmission, String> {
     if !winner_matches_live(winner, cfg.generation_id, live) {
-        return Err("verified winner is stale before reward-child preparation".into());
+        return Err("verified winner is stale before settlement preparation".into());
     }
-    let sponsor = settlement.sponsor_for(cfg.generation_id, live)?;
+    settlement.ensure_current(cfg.generation_id, live)?;
     validate_verified_parent(winner, live, reward_public_key)?;
-    let split = reward::build_reward_split_child(
+    let split = reward::build_self_funded_settlement(
         &winner.transaction,
-        &winner.baton_txid,
         reward_secret,
         reward_public_key,
         &cfg.payout_address,
         live.reward_raw,
-        sponsor,
     )?;
-    let pending = PendingSubmission::from_verified(winner, &split, sponsor)?;
+    let pending = PendingSubmission::from_verified(winner, &split)?;
     pending.persist_new(journal_path)?;
     Ok(pending)
 }
@@ -768,16 +790,11 @@ fn production_preflight(
     reward_public_key: &[u8; 33],
     mining_payout_address: &str,
     journal_path: &Path,
-) -> Result<reward::SponsorReserve, String> {
-    let sponsor = session.fetch_sponsor_reserve(&live.baton_txid)?;
-
+) -> Result<(), String> {
     if !session.transaction_known(&live.baton_txid)? {
         return Err(
             "production preflight cannot retrieve the live PHOTON baton transaction".into(),
         );
-    }
-    if !session.transaction_known(&sponsor.txid)? {
-        return Err("production preflight cannot retrieve the sponsor-reserve transaction".into());
     }
 
     production_preflight_local(
@@ -786,10 +803,8 @@ fn production_preflight(
         reward_secret,
         reward_public_key,
         mining_payout_address,
-        &sponsor,
         journal_path,
-    )?;
-    Ok(sponsor)
+    )
 }
 
 fn require_complete_live_winner_lifecycle() -> Result<(), String> {
@@ -810,7 +825,6 @@ fn production_preflight_local(
     reward_secret: &[u8; 32],
     reward_public_key: &[u8; 33],
     mining_payout_address: &str,
-    sponsor: &reward::SponsorReserve,
     journal_path: &Path,
 ) -> Result<(), String> {
     if cfg.payout_address.trim().is_empty() {
@@ -847,14 +861,12 @@ fn production_preflight_local(
         return Err("PHOTON parent builder target placement disagrees with the live target".into());
     }
 
-    let split = reward::build_reward_split_child(
+    let split = reward::build_self_funded_settlement(
         &parent_preview,
-        &live.baton_txid,
         reward_secret,
         reward_public_key,
         &cfg.payout_address,
         live.reward_raw,
-        sponsor,
     )?;
     let (expected_miner, expected_donation) = RuntimeConfig::split_reward(live.reward_raw);
     if split.miner_token_amount != expected_miner
@@ -864,7 +876,14 @@ fn production_preflight_local(
             .checked_add(split.donation_token_amount)
             != Some(live.reward_raw)
     {
-        return Err("reward-child preflight failed exact 98/2 token conservation".into());
+        return Err("self-funded settlement preflight failed exact 98/2 token conservation".into());
+    }
+    if split.fee_sats != split.required_relay_fee_sats
+        || split.baton_input_value_sats < split.baton_output_value_sats
+        || split.baton_input_value_sats - split.baton_output_value_sats
+            > reward::PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS
+    {
+        return Err("self-funded settlement preflight failed BCH fee/value accounting".into());
     }
 
     Ok(())
@@ -1004,7 +1023,7 @@ impl RuntimeSupervisor {
         let initial = session.fetch_live_job()?;
         let (reward_secret, reward_public_key, mining_payout_address) =
             reward::new_intermediate_identity()?;
-        let initial_sponsor = production_preflight(
+        production_preflight(
             &mut session,
             &cfg,
             &initial,
@@ -1014,8 +1033,7 @@ impl RuntimeSupervisor {
             &journal_path,
         )?;
         cfg.bump_generation();
-        let initial_settlement =
-            SettlementState::new(cfg.generation_id, &initial, initial_sponsor)?;
+        let initial_settlement = SettlementState::new(cfg.generation_id, &initial)?;
 
         let initial_job = initial.to_mining_job(cfg.generation_id, &mining_payout_address);
         let search = SearchHandle::start_supervised_on_backend_device(
@@ -1293,7 +1311,6 @@ fn run_supervisor(
                             &reward_secret,
                             &reward_public_key,
                             &mining_payout_address,
-                            &settlement.sponsor,
                             &journal_path,
                         )?;
                         let next_settlement = settlement.restamp(next_cfg.generation_id, &live)?;
@@ -1327,7 +1344,6 @@ fn run_supervisor(
                                         &reward_secret,
                                         &reward_public_key,
                                         &mining_payout_address,
-                                        &next_settlement.sponsor,
                                         &journal_path,
                                     )?;
                                     Ok(next_settlement)
@@ -1525,7 +1541,7 @@ fn run_supervisor(
                                     &event_tx,
                                     RuntimeEvent::SubmissionAccepted {
                                         parent_txid: pending.parent_txid,
-                                        child_txid: pending.child_txid,
+                                        child_txid: pending.settlement_txid,
                                     },
                                 );
                                 pending_submission = None;
@@ -1727,7 +1743,7 @@ fn run_supervisor(
                                             emit(
                                                 &event_tx,
                                                 RuntimeEvent::Reconnecting(format!(
-                                                    "reward-child preparation retry: {error}"
+                                                    "settlement preparation retry: {error}"
                                                 )),
                                             );
                                             session = None;
@@ -1816,47 +1832,25 @@ fn run_supervisor(
     snapshot.search = final_stats;
 }
 
-fn baton_outpoint_changed(current: &LiveJob, next: &LiveJob) -> bool {
-    current.baton_txid != next.baton_txid || current.baton_vout != next.baton_vout
-}
-
-#[allow(clippy::too_many_arguments)]
 fn prepare_generation_transition<F>(
     cfg: &RuntimeConfig,
     live: &LiveJob,
     settlement: &SettlementState,
-    reward_secret: &[u8; 32],
-    reward_public_key: &[u8; 33],
-    mining_payout_address: &str,
-    journal_path: &Path,
     next: &LiveJob,
-    mut fetch_preflighted_sponsor: F,
+    mut preflight_next: F,
 ) -> Result<Option<(RuntimeConfig, SettlementState)>, String>
 where
-    F: FnMut(&RuntimeConfig, &LiveJob) -> Result<reward::SponsorReserve, String>,
+    F: FnMut(&RuntimeConfig, &LiveJob) -> Result<(), String>,
 {
     if !live_job_changed(live, next) {
         return Ok(None);
     }
 
+    settlement.ensure_current(cfg.generation_id, live)?;
     let mut next_cfg = cfg.clone();
     next_cfg.bump_generation();
-    let sponsor = if baton_outpoint_changed(live, next) || live.url != next.url {
-        fetch_preflighted_sponsor(&next_cfg, next)?
-    } else {
-        let sponsor = settlement.sponsor_for(cfg.generation_id, live)?.clone();
-        production_preflight_local(
-            &next_cfg,
-            next,
-            reward_secret,
-            reward_public_key,
-            mining_payout_address,
-            &sponsor,
-            journal_path,
-        )?;
-        sponsor
-    };
-    let next_settlement = SettlementState::new(next_cfg.generation_id, next, sponsor)?;
+    preflight_next(&next_cfg, next)?;
+    let next_settlement = SettlementState::new(next_cfg.generation_id, next)?;
     Ok(Some((next_cfg, next_settlement)))
 }
 
@@ -1873,16 +1867,8 @@ fn apply_refreshed_job(
     journal_path: &Path,
     next: LiveJob,
 ) -> Result<bool, String> {
-    let staged = prepare_generation_transition(
-        cfg,
-        live,
-        settlement,
-        reward_secret,
-        reward_public_key,
-        mining_payout_address,
-        journal_path,
-        &next,
-        |next_cfg, next_live| {
+    let staged =
+        prepare_generation_transition(cfg, live, settlement, &next, |next_cfg, next_live| {
             production_preflight(
                 session,
                 next_cfg,
@@ -1892,8 +1878,7 @@ fn apply_refreshed_job(
                 mining_payout_address,
                 journal_path,
             )
-        },
-    )?;
+        })?;
     if let Some((next_cfg, next_settlement)) = staged {
         search.replace_job(next.to_mining_job(next_cfg.generation_id, mining_payout_address))?;
         *cfg = next_cfg;
@@ -2079,15 +2064,7 @@ mod tests {
         }
     }
 
-    fn preflight_fixture() -> (
-        RuntimeConfig,
-        LiveJob,
-        [u8; 32],
-        [u8; 33],
-        String,
-        reward::SponsorReserve,
-        PathBuf,
-    ) {
+    fn preflight_fixture() -> (RuntimeConfig, LiveJob, [u8; 32], [u8; 33], String, PathBuf) {
         let mut cfg = RuntimeConfig::default();
         cfg.set_payout(TEST_PAYOUT.into()).unwrap();
         let job = live_job();
@@ -2097,12 +2074,6 @@ mod tests {
         )
         .serialize();
         let mining_payout = reward::p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
-        let sponsor = reward::SponsorReserve {
-            txid: "33".repeat(32),
-            vout: 1,
-            value_sats: 100_000,
-            locking_script: reward::build_sponsor_script(&job.baton_txid).unwrap(),
-        };
         let unique = format!(
             "pickaxe-preflight-{}-{}.json",
             std::process::id(),
@@ -2118,7 +2089,6 @@ mod tests {
             reward_secret,
             reward_public,
             mining_payout,
-            sponsor,
             journal,
         )
     }
@@ -2215,9 +2185,8 @@ mod tests {
 
     #[test]
     fn verified_winner_is_journaled_from_prevalidated_state_before_network_retry() {
-        let (cfg, job, reward_secret, reward_public, reward_payout, sponsor, journal) =
-            preflight_fixture();
-        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor.clone()).unwrap();
+        let (cfg, job, reward_secret, reward_public, reward_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
         let mining_secret = [1u8; 32];
         let mining_public = secp256k1::PublicKey::from_secret_key(
             &secp256k1::SecretKey::from_secret_bytes(mining_secret).unwrap(),
@@ -2270,9 +2239,13 @@ mod tests {
             PendingSubmission::load(&journal).unwrap(),
             Some(first.clone())
         );
-        assert_eq!(first.sponsor_txid, sponsor.txid);
-        assert_eq!(first.sponsor_vout, sponsor.vout);
-        assert_eq!(first.sponsor_value_sats, sponsor.value_sats);
+        assert_eq!(first.generation_id, cfg.generation_id);
+        assert_eq!(first.resulting_baton_txid, first.settlement_txid);
+        assert_eq!(first.resulting_baton_vout, 0);
+        assert_eq!(
+            first.miner_token_amount + first.donation_token_amount,
+            job.reward_raw
+        );
 
         let duplicate = prepare_pending_submission(
             &winner,
@@ -2286,10 +2259,9 @@ mod tests {
         .unwrap();
         assert_eq!(duplicate, first);
 
-        let mut wrong_sponsor_state = first;
-        wrong_sponsor_state.sponsor_locking_hex =
-            hex::encode(reward::build_sponsor_script(&"44".repeat(32)).unwrap());
-        assert!(wrong_sponsor_state.validate().is_err());
+        let mut wrong_split = first;
+        wrong_split.donation_token_amount += 1;
+        assert!(wrong_split.validate().is_err());
 
         PendingSubmission::remove(&journal).unwrap();
     }
@@ -2314,11 +2286,11 @@ mod tests {
         );
         assert_eq!(
             submission_decision(true, false, false),
-            SubmissionDecision::BroadcastChild
+            SubmissionDecision::BroadcastSettlement
         );
         assert_eq!(
             submission_decision(false, false, true),
-            SubmissionDecision::BroadcastParentThenChild
+            SubmissionDecision::BroadcastParentThenSettlement
         );
         assert_eq!(
             submission_decision(false, false, false),
@@ -2377,60 +2349,37 @@ mod tests {
 
     #[test]
     fn production_preflight_proves_parent_reward_split_and_journal_readiness() {
-        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
-        production_preflight_local(
-            &cfg,
-            &job,
-            &secret,
-            &public,
-            &mining_payout,
-            &sponsor,
-            &journal,
-        )
-        .unwrap();
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        production_preflight_local(&cfg, &job, &secret, &public, &mining_payout, &journal).unwrap();
         assert!(!journal.exists());
     }
 
     #[test]
-    fn production_preflight_refuses_wrong_sponsor_state_before_search() {
-        let (cfg, job, secret, public, mining_payout, mut sponsor, journal) = preflight_fixture();
-        sponsor.locking_script = reward::build_sponsor_script(&"44".repeat(32)).unwrap();
-        let error = production_preflight_local(
-            &cfg,
-            &job,
-            &secret,
-            &public,
-            &mining_payout,
-            &sponsor,
-            &journal,
-        )
-        .unwrap_err();
-        assert!(error.contains("sponsor reserve does not match"));
+    fn production_preflight_refuses_insufficient_self_funded_baton_value_before_search() {
+        let (cfg, mut job, secret, public, mining_payout, journal) = preflight_fixture();
+        job.baton_value_sats = 1_500;
+        let error =
+            production_preflight_local(&cfg, &job, &secret, &public, &mining_payout, &journal)
+                .unwrap_err();
+        assert!(error.contains("baton BCH value is too small"));
         assert!(!journal.exists());
     }
 
     #[test]
     fn production_preflight_refuses_unresolved_submission_journal() {
-        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         fs::write(&journal, b"occupied").unwrap();
-        let error = production_preflight_local(
-            &cfg,
-            &job,
-            &secret,
-            &public,
-            &mining_payout,
-            &sponsor,
-            &journal,
-        )
-        .unwrap_err();
+        let error =
+            production_preflight_local(&cfg, &job, &secret, &public, &mining_payout, &journal)
+                .unwrap_err();
         assert!(error.contains("unresolved previous winner submission"));
         fs::remove_file(&journal).unwrap();
     }
 
     #[test]
-    fn baton_transition_requires_preflighted_replacement_sponsor() {
-        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
-        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor.clone()).unwrap();
+    fn baton_transition_requires_preflighted_self_funded_settlement() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
         let mut next = job.clone();
         next.height += 1;
         next.baton_txid = "22".repeat(32);
@@ -2441,124 +2390,83 @@ mod tests {
             &cfg,
             &job,
             &settlement,
-            &secret,
-            &public,
-            &mining_payout,
-            &journal,
             &next,
-            |_next_cfg, _next_live| Err("temporary Fulcrum sponsor lookup failure".into()),
+            |_next_cfg, _next_live| Err("temporary settlement preflight failure".into()),
         )
         .unwrap_err();
-        assert!(error.contains("temporary Fulcrum"));
+        assert!(error.contains("temporary settlement"));
         assert_eq!(settlement.generation_id, cfg.generation_id);
         assert_eq!(settlement.baton_txid, job.baton_txid);
-        assert_eq!(settlement.sponsor, sponsor);
 
-        let replacement = reward::SponsorReserve {
-            txid: "44".repeat(32),
-            vout: 2,
-            value_sats: 98_000,
-            locking_script: reward::build_sponsor_script(&next.baton_txid).unwrap(),
-        };
-        let staged = prepare_generation_transition(
-            &cfg,
-            &job,
-            &settlement,
-            &secret,
-            &public,
-            &mining_payout,
-            &journal,
-            &next,
-            |next_cfg, next_live| {
+        let staged =
+            prepare_generation_transition(&cfg, &job, &settlement, &next, |next_cfg, next_live| {
                 production_preflight_local(
                     next_cfg,
                     next_live,
                     &secret,
                     &public,
                     &mining_payout,
-                    &replacement,
                     &journal,
-                )?;
-                Ok(replacement.clone())
-            },
-        )
-        .unwrap()
-        .expect("baton transition must stage a new generation");
+                )
+            })
+            .unwrap()
+            .expect("baton transition must stage a new generation");
         assert_eq!(staged.0.generation_id, cfg.generation_id + 1);
         assert_eq!(staged.1.generation_id, staged.0.generation_id);
         assert_eq!(staged.1.baton_txid, next.baton_txid);
-        assert_eq!(staged.1.sponsor, replacement);
         assert_eq!(settlement.baton_txid, job.baton_txid);
         assert!(!journal.exists());
     }
 
     #[test]
-    fn same_baton_generation_restamps_existing_settlement_without_sponsor_lookup() {
-        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
-        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor.clone()).unwrap();
+    fn same_baton_generation_revalidates_self_funded_settlement() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
         let mut next = job.clone();
         next.height += 1;
         next.age += 1;
 
-        let staged = prepare_generation_transition(
-            &cfg,
-            &job,
-            &settlement,
-            &secret,
-            &public,
-            &mining_payout,
-            &journal,
-            &next,
-            |_next_cfg, _next_live| panic!("same baton must not fetch replacement sponsor state"),
-        )
-        .unwrap()
-        .expect("height change must publish a new generation");
+        let staged =
+            prepare_generation_transition(&cfg, &job, &settlement, &next, |next_cfg, next_live| {
+                production_preflight_local(
+                    next_cfg,
+                    next_live,
+                    &secret,
+                    &public,
+                    &mining_payout,
+                    &journal,
+                )
+            })
+            .unwrap()
+            .expect("height change must publish a new generation");
         assert_eq!(staged.0.generation_id, cfg.generation_id + 1);
         assert_eq!(staged.1.generation_id, staged.0.generation_id);
         assert_eq!(staged.1.baton_txid, job.baton_txid);
-        assert_eq!(staged.1.sponsor, sponsor);
         assert!(!journal.exists());
     }
 
     #[test]
     fn transitioned_generation_journal_survives_restart_and_duplicate_retry() {
-        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
-        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor).unwrap();
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
         let mut next = job.clone();
         next.height += 1;
         next.baton_txid = "22".repeat(32);
         next.baton_height = next.height - 1;
         next.age = 1;
-        let replacement = reward::SponsorReserve {
-            txid: "44".repeat(32),
-            vout: 2,
-            value_sats: 98_000,
-            locking_script: reward::build_sponsor_script(&next.baton_txid).unwrap(),
-        };
-        let (next_cfg, next_settlement) = prepare_generation_transition(
-            &cfg,
-            &job,
-            &settlement,
-            &secret,
-            &public,
-            &mining_payout,
-            &journal,
-            &next,
-            |next_cfg, next_live| {
+        let (next_cfg, next_settlement) =
+            prepare_generation_transition(&cfg, &job, &settlement, &next, |next_cfg, next_live| {
                 production_preflight_local(
                     next_cfg,
                     next_live,
                     &secret,
                     &public,
                     &mining_payout,
-                    &replacement,
                     &journal,
-                )?;
-                Ok(replacement.clone())
-            },
-        )
-        .unwrap()
-        .unwrap();
+                )
+            })
+            .unwrap()
+            .unwrap();
         let winner = signed_winner(next_cfg.generation_id, &next, &mining_payout);
         let first = prepare_pending_submission(
             &winner,
@@ -2573,7 +2481,12 @@ mod tests {
         let restarted = PendingSubmission::load(&journal).unwrap().unwrap();
         assert_eq!(restarted, first);
         assert_eq!(restarted.expected_baton_txid, next.baton_txid);
-        assert_eq!(restarted.sponsor_txid, replacement.txid);
+        assert_eq!(restarted.generation_id, next_cfg.generation_id);
+        assert_eq!(restarted.resulting_baton_txid, restarted.settlement_txid);
+        assert_eq!(
+            restarted.miner_token_amount + restarted.donation_token_amount,
+            next.reward_raw
+        );
 
         let duplicate = prepare_pending_submission(
             &winner,
@@ -2597,22 +2510,23 @@ mod tests {
     #[test]
     fn pending_submission_journal_round_trips_signed_bytes_without_secrets() {
         let parent = vec![0x02, 0x00, 0x00, 0x00, 0x01];
-        let child = vec![0x02, 0x00, 0x00, 0x00, 0x02];
+        let settlement = vec![0x02, 0x00, 0x00, 0x00, 0x02];
+        let settlement_txid = reward::transaction_id(&settlement);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            generation_id: 1,
             expected_height: 1_000,
             expected_baton_txid: "11".repeat(32),
             expected_baton_vout: 0,
-            sponsor_txid: "33".repeat(32),
-            sponsor_vout: 1,
-            sponsor_value_sats: 100_000,
-            sponsor_locking_hex: hex::encode(
-                reward::build_sponsor_script(&"11".repeat(32)).unwrap(),
-            ),
             parent_txid: reward::transaction_id(&parent),
             parent_hex: hex::encode(&parent),
-            child_txid: reward::transaction_id(&child),
-            child_hex: hex::encode(&child),
+            settlement_txid: settlement_txid.clone(),
+            settlement_hex: hex::encode(&settlement),
+            resulting_baton_txid: settlement_txid,
+            resulting_baton_vout: 0,
+            resulting_baton_value_sats: 10_000,
+            miner_token_amount: 98,
+            donation_token_amount: 2,
         };
 
         let unique = format!(
@@ -2629,6 +2543,7 @@ mod tests {
         let serialized = fs::read_to_string(&path).unwrap();
         assert!(!serialized.contains("secret"));
         assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("sponsor"));
         assert_eq!(PendingSubmission::load(&path).unwrap(), Some(pending));
 
         PendingSubmission::remove(&path).unwrap();
@@ -2637,8 +2552,8 @@ mod tests {
 
     #[test]
     fn parent_broadcast_progress_survives_restart_and_is_removed_with_journal() {
-        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
-        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor).unwrap();
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
         let winner = signed_winner(cfg.generation_id, &job, &mining_payout);
         let pending = prepare_pending_submission(
             &winner,
@@ -2670,19 +2585,12 @@ mod tests {
 
     #[test]
     fn production_preflight_refuses_orphan_submission_progress() {
-        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let marker = PendingSubmission::parent_attempted_path(&journal);
         fs::write(&marker, format!("{}\n", "aa".repeat(32))).unwrap();
-        let error = production_preflight_local(
-            &cfg,
-            &job,
-            &secret,
-            &public,
-            &mining_payout,
-            &sponsor,
-            &journal,
-        )
-        .unwrap_err();
+        let error =
+            production_preflight_local(&cfg, &job, &secret, &public, &mining_payout, &journal)
+                .unwrap_err();
         assert!(error.contains("orphan pending-submission progress marker"));
         fs::remove_file(marker).unwrap();
     }
@@ -2690,21 +2598,22 @@ mod tests {
     #[test]
     fn unbroadcast_pending_pair_requires_exact_height_and_baton() {
         let job = live_job();
+        let settlement_txid = reward::transaction_id(&[2]);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: job.baton_txid.clone(),
             expected_baton_vout: job.baton_vout,
-            sponsor_txid: "33".repeat(32),
-            sponsor_vout: 1,
-            sponsor_value_sats: 100_000,
-            sponsor_locking_hex: hex::encode(
-                reward::build_sponsor_script(&job.baton_txid).unwrap(),
-            ),
             parent_txid: reward::transaction_id(&[1]),
             parent_hex: "01".into(),
-            child_txid: reward::transaction_id(&[2]),
-            child_hex: "02".into(),
+            settlement_txid: settlement_txid.clone(),
+            settlement_hex: "02".into(),
+            resulting_baton_txid: settlement_txid,
+            resulting_baton_vout: 0,
+            resulting_baton_value_sats: 10_000,
+            miner_token_amount: 98,
+            donation_token_amount: 2,
         };
         assert!(pending.matches_live(&job));
 
