@@ -16,7 +16,6 @@ const VECTOR_CONTRACT_VALUE_SATS: u64 = 15_971_500;
 const VECTOR_TOKEN_AMOUNT: u128 = 2_099_905_002_035_715;
 const VECTOR_REWARD_RAW: u128 = 4_999_773_813;
 const CONTROLLED_NONCE: u32 = 0x1234_5678;
-const SYNTHETIC_SPONSOR_VALUE_SATS: u64 = 100_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SelfTestReport {
@@ -30,11 +29,11 @@ pub struct SelfTestReport {
     pub schnorr_valid: bool,
     pub strict_target_valid: bool,
     pub parent_txid: String,
-    pub child_txid: String,
+    pub settlement_txid: String,
     pub miner_token_amount: u128,
     pub donation_token_amount: u128,
     pub reward_token_amount: u128,
-    pub reward_fee_sats: u64,
+    pub settlement_fee_sats: u64,
     pub persistent_device_bytes: usize,
     pub network_access: bool,
     pub broadcast: bool,
@@ -44,10 +43,10 @@ pub struct SelfTestReport {
 struct ValidatedWinner {
     digest: [u8; 32],
     parent_txid: String,
-    child_txid: String,
+    settlement_txid: String,
     miner_token_amount: u128,
     donation_token_amount: u128,
-    reward_fee_sats: u64,
+    settlement_fee_sats: u64,
 }
 fn deterministic_secret(last_byte: u8) -> [u8; 32] {
     let mut secret = [0u8; 32];
@@ -152,47 +151,38 @@ fn validate_gpu_winner_and_reward(
     let miner_secret = deterministic_secret(2);
     let miner_public_key = public_key(&miner_secret)?;
     let miner_payout = reward::p2pkh_cashaddr_from_public_key(&miner_public_key)?;
-    let sponsor = reward::SponsorReserve {
-        txid: "55".repeat(32),
-        vout: 0,
-        value_sats: SYNTHETIC_SPONSOR_VALUE_SATS,
-        locking_script: reward::build_sponsor_script(VECTOR_BATON_TXID)?,
-    };
-    let split = reward::build_reward_split_child(
+    let settlement = reward::build_self_funded_settlement(
         &completed,
-        VECTOR_BATON_TXID,
         reward_secret,
         reward_public_key,
         &miner_payout,
         VECTOR_REWARD_RAW,
-        &sponsor,
     )?;
 
     let (expected_miner, expected_donation) = RuntimeConfig::split_reward(VECTOR_REWARD_RAW);
-    if split.miner_token_amount != expected_miner
-        || split.donation_token_amount != expected_donation
-        || split.miner_token_amount + split.donation_token_amount != VECTOR_REWARD_RAW
-        || split.donation_token_amount
+    if settlement.miner_token_amount != expected_miner
+        || settlement.donation_token_amount != expected_donation
+        || settlement.miner_token_amount + settlement.donation_token_amount != VECTOR_REWARD_RAW
+        || settlement.donation_token_amount
             != VECTOR_REWARD_RAW.saturating_mul(u128::from(DONATION_BPS)) / 10_000
     {
-        return Err("reward child failed exact 98/2 token conservation".into());
+        return Err("self-funded settlement failed exact 98/2 token conservation".into());
     }
     let parent_txid = reward::transaction_id(&completed);
-    if split.parent_txid != parent_txid {
-        return Err("reward child does not spend the reconstructed PHOTON parent".into());
+    if settlement.parent_txid != parent_txid {
+        return Err("settlement does not spend the reconstructed PHOTON parent".into());
     }
-    if split.next_sponsor_value_sats != SYNTHETIC_SPONSOR_VALUE_SATS - reward::SPONSOR_SUBSIDY_SATS
-    {
-        return Err("reward child sponsor continuation value is incorrect".into());
+    if settlement.fee_sats != settlement.required_relay_fee_sats {
+        return Err("self-funded settlement fee does not equal its required relay fee".into());
     }
 
     Ok(ValidatedWinner {
         digest: host_digest,
         parent_txid,
-        child_txid: split.child_txid,
-        miner_token_amount: split.miner_token_amount,
-        donation_token_amount: split.donation_token_amount,
-        reward_fee_sats: split.fee_sats,
+        settlement_txid: settlement.settlement_txid,
+        miner_token_amount: settlement.miner_token_amount,
+        donation_token_amount: settlement.donation_token_amount,
+        settlement_fee_sats: settlement.fee_sats,
     })
 }
 pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport, String> {
@@ -259,11 +249,11 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
         schnorr_valid: true,
         strict_target_valid: true,
         parent_txid: validated.parent_txid,
-        child_txid: validated.child_txid,
+        settlement_txid: validated.settlement_txid,
         miner_token_amount: validated.miner_token_amount,
         donation_token_amount: validated.donation_token_amount,
         reward_token_amount: VECTOR_REWARD_RAW,
-        reward_fee_sats: validated.reward_fee_sats,
+        settlement_fee_sats: validated.settlement_fee_sats,
         persistent_device_bytes,
         network_access: false,
         broadcast: false,
@@ -292,14 +282,14 @@ pub fn print_report(report: &SelfTestReport, json: bool) {
     println!("BCH Schnorr: valid");
     println!("Strict hash < target: valid");
     println!(
-        "Reward child: miner={} donation={} total={} fee={} sats",
+        "Self-funded settlement: miner={} donation={} total={} fee={} sats",
         report.miner_token_amount,
         report.donation_token_amount,
         report.reward_token_amount,
-        report.reward_fee_sats
+        report.settlement_fee_sats
     );
     println!("Parent txid: {}", report.parent_txid);
-    println!("Reward child txid: {}", report.child_txid);
+    println!("Settlement txid: {}", report.settlement_txid);
     println!(
         "Persistent {} allocation: {} bytes",
         report.backend.to_ascii_uppercase(),
@@ -327,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_host_validation_builds_exact_98_2_reward_child() {
+    fn offline_host_validation_builds_exact_self_funded_98_2_settlement() {
         let target = [0xffu8; 32];
         let secret = deterministic_secret(1);
         let public = public_key(&secret).unwrap();
@@ -353,7 +343,7 @@ mod tests {
             validated.donation_token_amount,
             VECTOR_REWARD_RAW * u128::from(DONATION_BPS) / 10_000
         );
-        assert_eq!(validated.reward_fee_sats, 1_300);
+        assert_eq!(validated.settlement_fee_sats, 794);
     }
     #[test]
     fn offline_host_validation_rejects_gpu_digest_mismatch() {

@@ -3,6 +3,7 @@
 //! Runtime winner settlement uses this session for ordered parent/settlement broadcast.
 
 use crate::protocol::{EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
+#[cfg(test)]
 use crate::reward::{self, SponsorReserve, SPONSOR_MIN_RESERVE_SATS};
 use crate::search::MiningJob;
 use num_bigint::BigUint;
@@ -327,6 +328,7 @@ impl ElectrumSession {
 
     /// Legacy M54 sponsor-reserve research helper. Production mining no longer
     /// queries or depends on this state before GPU search or winner settlement.
+    #[cfg(test)]
     pub fn fetch_sponsor_reserve(
         &mut self,
         expected_baton_txid: &str,
@@ -341,6 +343,7 @@ impl ElectrumSession {
     }
 }
 
+#[cfg(test)]
 fn select_sponsor_reserve(
     unspent: &Value,
     locking_script: Vec<u8>,
