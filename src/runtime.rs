@@ -27,7 +27,7 @@ const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
-const SUBMISSION_JOURNAL_VERSION: u8 = 1;
+const SUBMISSION_JOURNAL_VERSION: u8 = 2;
 const PHOTON_TX_BYTES: usize = 615;
 const PHOTON_TARGET_OFFSET: usize = 394;
 const VERIFIED_WINNER_DURABILITY_READY: bool = false;
@@ -38,6 +38,10 @@ struct PendingSubmission {
     expected_height: u32,
     expected_baton_txid: String,
     expected_baton_vout: u32,
+    sponsor_txid: String,
+    sponsor_vout: u32,
+    sponsor_value_sats: u64,
+    sponsor_locking_hex: String,
     parent_txid: String,
     parent_hex: String,
     child_txid: String,
@@ -48,6 +52,7 @@ impl PendingSubmission {
     fn from_verified(
         winner: &VerifiedWinner,
         split: &reward::PreparedRewardSplit,
+        sponsor: &reward::SponsorReserve,
     ) -> Result<Self, String> {
         let parent_txid = reward::transaction_id(&winner.transaction);
         if parent_txid != split.parent_txid {
@@ -58,6 +63,10 @@ impl PendingSubmission {
             expected_height: winner.height,
             expected_baton_txid: winner.baton_txid.clone(),
             expected_baton_vout: winner.baton_vout,
+            sponsor_txid: sponsor.txid.clone(),
+            sponsor_vout: sponsor.vout,
+            sponsor_value_sats: sponsor.value_sats,
+            sponsor_locking_hex: hex::encode(&sponsor.locking_script),
             parent_txid,
             parent_hex: hex::encode(&winner.transaction),
             child_txid: split.child_txid.clone(),
@@ -81,6 +90,23 @@ impl PendingSubmission {
                 .all(|value| value.is_ascii_hexdigit())
         {
             return Err("pending submission has invalid PHOTON baton txid".into());
+        }
+        if self.sponsor_txid.len() != 64
+            || !self
+                .sponsor_txid
+                .chars()
+                .all(|value| value.is_ascii_hexdigit())
+        {
+            return Err("pending submission has invalid sponsor txid".into());
+        }
+        if self.sponsor_value_sats < reward::SPONSOR_MIN_RESERVE_SATS {
+            return Err("pending submission sponsor reserve is below the minimum".into());
+        }
+        let sponsor_locking = hex::decode(&self.sponsor_locking_hex)
+            .map_err(|error| format!("pending submission sponsor locking bytecode: {error}"))?;
+        let expected_sponsor_locking = reward::build_sponsor_script(&self.expected_baton_txid)?;
+        if sponsor_locking != expected_sponsor_locking {
+            return Err("pending submission sponsor state does not match PHOTON baton".into());
         }
         for (label, expected, raw_hex) in [
             (
@@ -147,8 +173,11 @@ impl PendingSubmission {
             )
         })?;
         if path.exists() {
+            if Self::load(path)?.as_ref() == Some(self) {
+                return Self::sync_committed(path, parent);
+            }
             return Err(format!(
-                "pending-submission journal already exists at {}",
+                "different pending-submission journal already exists at {}",
                 path.display()
             ));
         }
@@ -189,6 +218,30 @@ impl PendingSubmission {
                 path.display()
             ));
         }
+        Self::sync_committed(path, parent)
+    }
+
+    fn sync_committed(path: &Path, _parent: &Path) -> Result<(), String> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                format!(
+                    "sync committed pending-submission journal {}: {error}",
+                    path.display()
+                )
+            })?;
+        #[cfg(unix)]
+        fs::File::open(_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "sync pending-submission journal directory {}: {error}",
+                    _parent.display()
+                )
+            })?;
         Ok(())
     }
 
@@ -306,19 +359,18 @@ fn attempt_pending_submission(
 }
 
 fn prepare_pending_submission(
-    session: &mut ElectrumSession,
     winner: &VerifiedWinner,
     cfg: &RuntimeConfig,
     live: &LiveJob,
     reward_secret: &[u8; 32],
     reward_public_key: &[u8; 33],
+    sponsor: &reward::SponsorReserve,
     journal_path: &Path,
 ) -> Result<PendingSubmission, String> {
     if !winner_matches_live(winner, cfg.generation_id, live) {
         return Err("verified winner is stale before reward-child preparation".into());
     }
     validate_verified_parent(winner, live, reward_public_key)?;
-    let sponsor = session.fetch_sponsor_reserve(&winner.baton_txid)?;
     let split = reward::build_reward_split_child(
         &winner.transaction,
         &winner.baton_txid,
@@ -326,9 +378,9 @@ fn prepare_pending_submission(
         reward_public_key,
         &cfg.payout_address,
         live.reward_raw,
-        &sponsor,
+        sponsor,
     )?;
-    let pending = PendingSubmission::from_verified(winner, &split)?;
+    let pending = PendingSubmission::from_verified(winner, &split, sponsor)?;
     pending.persist_new(journal_path)?;
     Ok(pending)
 }
@@ -422,7 +474,7 @@ fn production_preflight(
     reward_public_key: &[u8; 33],
     mining_payout_address: &str,
     journal_path: &Path,
-) -> Result<(), String> {
+) -> Result<reward::SponsorReserve, String> {
     let sponsor = session.fetch_sponsor_reserve(&live.baton_txid)?;
 
     if !session.transaction_known(&live.baton_txid)? {
@@ -442,7 +494,8 @@ fn production_preflight(
         mining_payout_address,
         &sponsor,
         journal_path,
-    )
+    )?;
+    Ok(sponsor)
 }
 
 fn require_complete_live_winner_lifecycle() -> Result<(), String> {
@@ -656,7 +709,7 @@ impl RuntimeSupervisor {
         let initial = session.fetch_live_job()?;
         let (reward_secret, reward_public_key, mining_payout_address) =
             reward::new_intermediate_identity()?;
-        production_preflight(
+        let initial_sponsor = production_preflight(
             &mut session,
             &cfg,
             &initial,
@@ -712,6 +765,7 @@ impl RuntimeSupervisor {
                     reward_secret,
                     reward_public_key,
                     mining_payout_address,
+                    initial_sponsor,
                     journal_path,
                     None,
                     command_rx,
@@ -816,6 +870,7 @@ fn run_supervisor(
     mut reward_secret: [u8; 32],
     reward_public_key: [u8; 33],
     mining_payout_address: String,
+    settlement_sponsor: reward::SponsorReserve,
     journal_path: PathBuf,
     mut pending_submission: Option<PendingSubmission>,
     command_rx: Receiver<SupervisorCommand>,
@@ -841,9 +896,58 @@ fn run_supervisor(
     let mut next_reconnect = Instant::now();
     let mut submission_backoff = RECONNECT_MIN;
     let mut next_submission_retry = Instant::now();
+    let mut shutdown_requested = false;
     let mut stop = false;
 
     while !stop {
+        if pending_submission.is_none() && pending_winner.is_none() && search.refresh_required() {
+            for winner in search.drain_winners() {
+                if winner_matches_live(&winner, cfg.generation_id, &live) {
+                    verified_winners = verified_winners.saturating_add(1);
+                    pending_winners = 1;
+                    let _ = search.apply_control(SearchCommand::Pause);
+                    state = SupervisorState::Paused;
+                    emit(&event_tx, RuntimeEvent::VerifiedWinner(winner.clone()));
+                    match prepare_pending_submission(
+                        &winner,
+                        &cfg,
+                        &live,
+                        &reward_secret,
+                        &reward_public_key,
+                        &settlement_sponsor,
+                        &journal_path,
+                    ) {
+                        Ok(pending) => {
+                            pending_submission = Some(pending);
+                            submission_backoff = RECONNECT_MIN;
+                            next_submission_retry = Instant::now();
+                            last_error = None;
+                        }
+                        Err(error) => {
+                            pending_winner = Some(winner);
+                            last_error = Some(error.clone());
+                            state = SupervisorState::Error;
+                            emit(&event_tx, RuntimeEvent::Error(error));
+                            next_submission_retry = Instant::now() + submission_backoff;
+                            submission_backoff = submission_backoff
+                                .checked_mul(2)
+                                .unwrap_or(RECONNECT_MAX)
+                                .min(RECONNECT_MAX);
+                        }
+                    }
+                    break;
+                }
+                stale_winners = stale_winners.saturating_add(1);
+                emit(
+                    &event_tx,
+                    RuntimeEvent::StaleWinner {
+                        winner_generation: winner.generation_id,
+                        current_generation: cfg.generation_id,
+                    },
+                );
+            }
+        }
+
         loop {
             match command_rx.try_recv() {
                 Ok(SupervisorCommand::SetIntensity(value, reply)) => {
@@ -956,14 +1060,30 @@ fn run_supervisor(
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Stop) | Err(TryRecvError::Disconnected) => {
-                    stop = true;
+                    shutdown_requested = true;
+                    user_paused = true;
+                    let _ = search.apply_control(SearchCommand::Pause);
+                    state = SupervisorState::Paused;
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
             }
         }
+        if shutdown_requested
+            && shutdown_can_exit(pending_winner.is_some(), search.batch_in_flight())
+        {
+            stop = true;
+        }
         if stop {
             break;
+        }
+        if wait_for_batch_boundary(
+            pending_winner.is_some(),
+            pending_submission.is_some(),
+            search.batch_in_flight(),
+        ) {
+            thread::sleep(SUPERVISOR_POLL);
+            continue;
         }
 
         if session.is_none() {
@@ -1019,99 +1139,29 @@ fn run_supervisor(
             }
         } else if pending_winner.is_some() {
             if Instant::now() >= next_submission_retry {
-                let refreshed = session
-                    .as_mut()
-                    .expect("checked session above")
-                    .fetch_live_job();
-                match refreshed {
-                    Ok(next_job) => {
-                        refreshes = refreshes.saturating_add(1);
-                        let winner_is_fresh = pending_winner.as_ref().is_some_and(|winner| {
-                            !live_job_changed(&live, &next_job)
-                                && winner_matches_live(winner, cfg.generation_id, &next_job)
-                        });
-                        if !winner_is_fresh {
-                            let winner = pending_winner.take().expect("checked above");
-                            stale_winners = stale_winners.saturating_add(1);
-                            pending_winners = 0;
-                            emit(
-                                &event_tx,
-                                RuntimeEvent::StaleWinner {
-                                    winner_generation: winner.generation_id,
-                                    current_generation: cfg.generation_id,
-                                },
-                            );
-                            match apply_refreshed_job(
-                                &mut cfg,
-                                &mut live,
-                                &search,
-                                &mining_payout_address,
-                                next_job,
-                            ) {
-                                Ok(changed) => {
-                                    if changed {
-                                        stale_rebuilds = stale_rebuilds.saturating_add(1);
-                                    }
-                                    last_error = None;
-                                    let _ = search.complete_refresh();
-                                    if !user_paused {
-                                        let _ = search.apply_control(SearchCommand::Resume);
-                                        state = SupervisorState::Mining;
-                                    }
-                                }
-                                Err(error) => {
-                                    last_error = Some(error.clone());
-                                    state = SupervisorState::Error;
-                                    emit(&event_tx, RuntimeEvent::Error(error));
-                                }
-                            }
-                        } else {
-                            live = next_job;
-                            let winner = pending_winner.as_ref().expect("checked above");
-                            match prepare_pending_submission(
-                                session.as_mut().expect("checked session above"),
-                                winner,
-                                &cfg,
-                                &live,
-                                &reward_secret,
-                                &reward_public_key,
-                                &journal_path,
-                            ) {
-                                Ok(pending) => {
-                                    pending_submission = Some(pending);
-                                    pending_winner = None;
-                                    last_error = None;
-                                    submission_backoff = RECONNECT_MIN;
-                                    next_submission_retry = Instant::now();
-                                    state = SupervisorState::Paused;
-                                }
-                                Err(error) => {
-                                    last_error = Some(error.clone());
-                                    state = SupervisorState::Reconnecting;
-                                    emit(
-                                        &event_tx,
-                                        RuntimeEvent::Reconnecting(format!(
-                                            "reward-child preparation retry: {error}"
-                                        )),
-                                    );
-                                    let _ = search.apply_control(SearchCommand::Pause);
-                                    session = None;
-                                    next_reconnect = Instant::now() + submission_backoff;
-                                    submission_backoff = submission_backoff
-                                        .checked_mul(2)
-                                        .unwrap_or(RECONNECT_MAX)
-                                        .min(RECONNECT_MAX);
-                                }
-                            }
-                        }
+                let winner = pending_winner.as_ref().expect("checked above");
+                match prepare_pending_submission(
+                    winner,
+                    &cfg,
+                    &live,
+                    &reward_secret,
+                    &reward_public_key,
+                    &settlement_sponsor,
+                    &journal_path,
+                ) {
+                    Ok(pending) => {
+                        pending_submission = Some(pending);
+                        pending_winner = None;
+                        last_error = None;
+                        submission_backoff = RECONNECT_MIN;
+                        next_submission_retry = Instant::now();
+                        state = SupervisorState::Paused;
                     }
                     Err(error) => {
                         last_error = Some(error.clone());
-                        state = SupervisorState::Reconnecting;
-                        emit(&event_tx, RuntimeEvent::Reconnecting(error));
-                        let _ = search.apply_control(SearchCommand::Pause);
-                        session = None;
-                        next_reconnect = Instant::now() + submission_backoff;
+                        state = SupervisorState::Error;
+                        emit(&event_tx, RuntimeEvent::Error(error));
+                        next_submission_retry = Instant::now() + submission_backoff;
                         submission_backoff = submission_backoff
                             .checked_mul(2)
                             .unwrap_or(RECONNECT_MAX)
@@ -1285,12 +1335,12 @@ fn run_supervisor(
                                     state = SupervisorState::Paused;
                                     emit(&event_tx, RuntimeEvent::VerifiedWinner(winner.clone()));
                                     match prepare_pending_submission(
-                                        session.as_mut().expect("checked session above"),
                                         &winner,
                                         &cfg,
                                         &live,
                                         &reward_secret,
                                         &reward_public_key,
+                                        &settlement_sponsor,
                                         &journal_path,
                                     ) {
                                         Ok(pending) => {
@@ -1435,6 +1485,18 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
         && winner.height == live.height
         && winner.baton_txid == live.baton_txid
         && winner.baton_vout == live.baton_vout
+}
+
+fn shutdown_can_exit(pending_winner: bool, batch_in_flight: bool) -> bool {
+    !pending_winner && !batch_in_flight
+}
+
+fn wait_for_batch_boundary(
+    pending_winner: bool,
+    pending_submission: bool,
+    batch_in_flight: bool,
+) -> bool {
+    !pending_winner && !pending_submission && batch_in_flight
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1653,6 +1715,98 @@ mod tests {
     }
 
     #[test]
+    fn verified_winner_is_journaled_from_prevalidated_state_before_network_retry() {
+        let (cfg, job, reward_secret, reward_public, reward_payout, sponsor, journal) =
+            preflight_fixture();
+        let mining_secret = [1u8; 32];
+        let mining_public = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes(mining_secret).unwrap(),
+        )
+        .serialize();
+        let nonce = 7;
+        let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+        let signature = crate::crypto::bch_schnorr_sign(&mining_secret, &message).unwrap();
+        let context = tx::ReferenceJobContext {
+            prev_txid: job.baton_txid.clone(),
+            prev_vout: job.baton_vout,
+            age: job.age,
+            target_le_hex: job.target_le_hex.clone(),
+            contract_value_sats: job.baton_value_sats,
+            contract_token_amount: job.token_amount,
+            reward_raw: job.reward_raw,
+        };
+        let transaction = tx::apply_reference_signature(
+            &context,
+            &reward_payout,
+            &hex::encode(mining_public),
+            nonce,
+            &hex::encode(signature),
+        )
+        .unwrap();
+        let winner = VerifiedWinner {
+            generation_id: cfg.generation_id,
+            height: job.height,
+            baton_txid: job.baton_txid.clone(),
+            baton_vout: job.baton_vout,
+            nonce,
+            digest: crate::search::hash256(&transaction),
+            public_key: mining_public,
+            signature,
+            transaction,
+        };
+
+        let first = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &reward_secret,
+            &reward_public,
+            &sponsor,
+            &journal,
+        )
+        .unwrap();
+        assert!(journal.exists());
+        assert_eq!(
+            PendingSubmission::load(&journal).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(first.sponsor_txid, sponsor.txid);
+        assert_eq!(first.sponsor_vout, sponsor.vout);
+        assert_eq!(first.sponsor_value_sats, sponsor.value_sats);
+
+        let duplicate = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &reward_secret,
+            &reward_public,
+            &sponsor,
+            &journal,
+        )
+        .unwrap();
+        assert_eq!(duplicate, first);
+
+        let mut wrong_sponsor_state = first;
+        wrong_sponsor_state.sponsor_locking_hex =
+            hex::encode(reward::build_sponsor_script(&"44".repeat(32)).unwrap());
+        assert!(wrong_sponsor_state.validate().is_err());
+
+        PendingSubmission::remove(&journal).unwrap();
+    }
+
+    #[test]
+    fn shutdown_waits_for_inflight_or_unpersisted_winner() {
+        assert!(shutdown_can_exit(false, false));
+        assert!(!shutdown_can_exit(true, false));
+        assert!(!shutdown_can_exit(false, true));
+        assert!(!shutdown_can_exit(true, true));
+        assert!(wait_for_batch_boundary(false, false, true));
+        assert!(!wait_for_batch_boundary(true, false, true));
+        assert!(!wait_for_batch_boundary(false, true, true));
+        assert!(!wait_for_batch_boundary(false, false, false));
+    }
+
+    #[test]
     fn submission_retry_never_rebroadcasts_parent_after_it_is_known() {
         assert_eq!(
             submission_decision(false, true, false),
@@ -1740,6 +1894,12 @@ mod tests {
             expected_height: 1_000,
             expected_baton_txid: "11".repeat(32),
             expected_baton_vout: 0,
+            sponsor_txid: "33".repeat(32),
+            sponsor_vout: 1,
+            sponsor_value_sats: 100_000,
+            sponsor_locking_hex: hex::encode(
+                reward::build_sponsor_script(&"11".repeat(32)).unwrap(),
+            ),
             parent_txid: reward::transaction_id(&parent),
             parent_hex: hex::encode(&parent),
             child_txid: reward::transaction_id(&child),
@@ -1774,6 +1934,12 @@ mod tests {
             expected_height: job.height,
             expected_baton_txid: job.baton_txid.clone(),
             expected_baton_vout: job.baton_vout,
+            sponsor_txid: "33".repeat(32),
+            sponsor_vout: 1,
+            sponsor_value_sats: 100_000,
+            sponsor_locking_hex: hex::encode(
+                reward::build_sponsor_script(&job.baton_txid).unwrap(),
+            ),
             parent_txid: reward::transaction_id(&[1]),
             parent_hex: "01".into(),
             child_txid: reward::transaction_id(&[2]),
