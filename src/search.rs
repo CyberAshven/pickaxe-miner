@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// remaining product backends are complete.
 pub const REFERENCE_GPU_PIPELINE_READY: bool = true;
 
-const MAX_BATCH_CANDIDATES: u32 = 65_536;
+pub(crate) const MAX_BATCH_CANDIDATES: u32 = 65_536;
 const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = 8;
 const JOB_UPDATE_CHANNEL_CAP: usize = 2;
@@ -276,12 +276,12 @@ fn verify_gpu_winner(
     })
 }
 
-fn batch_candidates(intensity: u8) -> u32 {
+pub(crate) fn batch_candidates(intensity: u8) -> u32 {
     ((u64::from(MAX_BATCH_CANDIDATES) * u64::from(intensity)) / 100)
         .clamp(1, u64::from(MAX_BATCH_CANDIDATES)) as u32
 }
 
-fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
+pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     if intensity >= 100 || compute_time.is_zero() {
         return Duration::ZERO;
     }
