@@ -20,6 +20,25 @@ const DONATION_BPS = 200n;
 const MULTI_INPUT_MAX_BATON_DECREASE_SATS = 8000n;
 const RELAY_FEE_SATS_PER_KB = 1000n;
 const PRIVATE_KEY = hexToBin('00'.repeat(31) + '01');
+const EXPECTED_SETTLEMENT_HASH_INTERNAL =
+  'dab595f2cf51f796a722f4fd75c2d31c1607ed42ed4bd1983d7344f050fee3bc';
+
+const rustConfig = readFileSync(
+  new URL('../../src/config.rs', import.meta.url),
+  'utf8',
+);
+const rustDonationBps = rustConfig.match(
+  /pub const DONATION_BPS:\s*u16\s*=\s*(\d+)\s*;/,
+)?.[1];
+const rustDonationAddress = rustConfig.match(
+  /pub const DONATION_ADDRESS:\s*&str\s*=\s*"([^"]+)"\s*;/,
+)?.[1];
+if (rustDonationBps === undefined || BigInt(rustDonationBps) !== DONATION_BPS) {
+  throw new Error('Rust donation basis points drifted from the BCH 2026 VM proof');
+}
+if (rustDonationAddress !== DONATION_ADDRESS) {
+  throw new Error('Rust donation address drifted from the BCH 2026 VM proof');
+}
 
 const concat = (...parts) => {
   const length = parts.reduce((sum, part) => sum + part.length, 0);
@@ -159,6 +178,12 @@ if (batonDecrease > MULTI_INPUT_MAX_BATON_DECREASE_SATS) {
 const settlement = buildSettlement(batonDecrease);
 const finalBytes = encodeTransactionBch(settlement);
 if (finalBytes.length !== settlementBytes) throw new Error('fee selection changed serialized size');
+const settlementHashInternal = binToHex(hash256(finalBytes));
+if (settlementHashInternal !== EXPECTED_SETTLEMENT_HASH_INTERNAL) {
+  throw new Error(
+    `settlement serialization drifted: ${settlementHashInternal} != ${EXPECTED_SETTLEMENT_HASH_INTERNAL}`,
+  );
+}
 
 const sourceOutputs = [baton, reward];
 const tokenResult = verifyTransactionTokens(settlement, sourceOutputs, {
@@ -252,5 +277,5 @@ console.log(`donation_output_sats=${settlement.outputs[2].valueSatoshis}`);
 console.log(`reward_raw=${rewardRaw}`);
 console.log(`miner_raw=${minerRaw}`);
 console.log(`donation_raw=${donationRaw}`);
-console.log(`settlement_txid_internal=${binToHex(hash256(finalBytes))}`);
+console.log(`settlement_txid_internal=${settlementHashInternal}`);
 console.log(`adversarial_cases=${attacks.length + 1}`);
