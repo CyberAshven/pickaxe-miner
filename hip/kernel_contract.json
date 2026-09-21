@@ -1,0 +1,98 @@
+{
+  "architecture": "gfx1036",
+  "code_objects": [
+    {
+      "file": "stage_a_rfc6979.hsaco",
+      "kernels": [
+        {
+          "symbol": "pickaxe_stage_a_rfc6979",
+          "args": [
+            { "kind": "u32", "offset": 0, "size": 4 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "u32", "offset": 40, "size": 4 }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "photon_stage_b16.hsaco",
+      "kernels": [
+        {
+          "symbol": "pickaxe_photon_b16_part0",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u32", "offset": 24, "size": 4 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_photon_b16_part1",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u32", "offset": 24, "size": 4 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_photon_b16_part2",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u32", "offset": 24, "size": 4 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_photon_b16_part3",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u32", "offset": 24, "size": 4 }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "photon_c1_schnorr.hsaco",
+      "kernels": [
+        {
+          "symbol": "pickaxe_photon_c1_schnorr",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "u32", "offset": 48, "size": 4 }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "stage_c_hash.hsaco",
+      "kernels": [
+        {
+          "symbol": "pickaxe_stage_c_hash_filter",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "u32", "offset": 16, "size": 4 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "u32", "offset": 32, "size": 4 },
+            { "kind": "u32", "offset": 36, "size": 4 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "ptr", "offset": 56, "size": 8 }
+          ]
+        }
+      ]
+    }
+  ]
+}

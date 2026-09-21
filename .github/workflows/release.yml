@@ -81,9 +81,64 @@ jobs:
 
           echo "Release version: ${version}"
 
+  hip-gfx1036:
+    name: Build HIP gfx1036 code objects
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install pinned ROCm HIP compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gpg python3
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key |
+            gpg --batch --yes --dearmor |
+            sudo tee /etc/apt/keyrings/rocm.gpg >/dev/null
+          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.0.2 noble main' |
+            sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libxml2 \
+            rocm-llvm=20.0.0.25385.70002-56~24.04 \
+            rocm-device-libs=1.0.0.70002-56~24.04 \
+            hip-dev=7.0.51831.70002-56~24.04 \
+            hipcc=1.1.1.70002-56~24.04
+
+      - name: Build and verify gfx1036 HSACO set
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/opt/rocm/llvm/bin:${PATH}"
+          hipcc --version
+          python3 tools/build_hip.py --arch gfx1036 --check-reproducible
+          (cd hip/build/gfx1036 && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
+          cat hip/build/gfx1036/SHA256SUMS.txt
+
+      - name: Upload gfx1036 code objects
+        uses: actions/upload-artifact@v7
+        with:
+          name: hip-gfx1036-codeobjects
+          path: hip/build/gfx1036/
+          if-no-files-found: error
+          retention-days: 14
+
   build:
     name: Build ${{ matrix.name }}
-    needs: validate
+    needs:
+      - validate
+      - hip-gfx1036
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +166,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Download verified gfx1036 HIP code objects
+        uses: actions/download-artifact@v8
+        with:
+          name: hip-gfx1036-codeobjects
+          path: hip/build/gfx1036
+
       - name: Release tests
         run: cargo test --locked --release --all-features --no-fail-fast
 
@@ -137,10 +198,15 @@ jobs:
           mkdir -p "dist/${package}"
           install -m 0755 "${bin}" "dist/${package}/pickaxe"
 
-          if [[ -d hip/build ]]; then
-            mkdir -p "dist/${package}/hip"
-            cp -R hip/build "dist/${package}/hip/"
-          fi
+          for artifact in \
+            stage_a_rfc6979.hsaco \
+            photon_stage_b16.hsaco \
+            photon_c1_schnorr.hsaco \
+            stage_c_hash.hsaco; do
+            test -s "hip/build/gfx1036/${artifact}"
+          done
+          mkdir -p "dist/${package}/hip"
+          cp -R hip/build "dist/${package}/hip/"
 
           if [[ -f README.md ]]; then
             cp README.md "dist/${package}/"
@@ -188,11 +254,21 @@ jobs:
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item -LiteralPath $binary -Destination (Join-Path $packageDir 'pickaxe.exe')
 
-          if (Test-Path -LiteralPath 'hip\build') {
-            $hipDir = Join-Path $packageDir 'hip'
-            New-Item -ItemType Directory -Force -Path $hipDir | Out-Null
-            Copy-Item -LiteralPath 'hip\build' -Destination $hipDir -Recurse
+          $requiredHipArtifacts = @(
+            'stage_a_rfc6979.hsaco',
+            'photon_stage_b16.hsaco',
+            'photon_c1_schnorr.hsaco',
+            'stage_c_hash.hsaco'
+          )
+          foreach ($artifact in $requiredHipArtifacts) {
+            $artifactPath = Join-Path 'hip\build\gfx1036' $artifact
+            if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+              throw "Required gfx1036 HIP artifact not found: $artifactPath"
+            }
           }
+          $hipDir = Join-Path $packageDir 'hip'
+          New-Item -ItemType Directory -Force -Path $hipDir | Out-Null
+          Copy-Item -LiteralPath 'hip\build' -Destination $hipDir -Recurse
 
           if (Test-Path -LiteralPath 'README.md') {
             Copy-Item -LiteralPath 'README.md' -Destination $packageDir
