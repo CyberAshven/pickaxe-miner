@@ -14,8 +14,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// SearchHandle now owns the exact persistent CUDA A -> B -> C candidate path.
-/// Higher-level product mining remains gated until its continuous live-state
-/// refresh/submission/TUI loop is complete.
+/// Higher-level product mining remains gated until submission/TUI and the
+/// remaining product backends are complete.
 pub const REFERENCE_GPU_PIPELINE_READY: bool = true;
 
 const MAX_BATCH_CANDIDATES: u32 = 65_536;
@@ -56,6 +56,7 @@ pub struct VerifiedWinner {
 #[derive(Debug, Clone, Default)]
 pub struct SearchStats {
     pub candidates: u64,
+    pub batches: u64,
     pub intensity: u8,
     pub state: MiningState,
     pub elapsed_secs: u64,
@@ -269,8 +270,10 @@ fn run_worker(
     paused: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
     candidates: Arc<AtomicU64>,
+    batches: Arc<AtomicU64>,
     winners: Arc<AtomicU64>,
     generation_id: Arc<AtomicU64>,
+    refresh_required: Option<Arc<AtomicBool>>,
     job_rx: Receiver<WorkerCommand>,
     winner_tx: SyncSender<VerifiedWinner>,
 ) {
@@ -317,6 +320,7 @@ fn run_worker(
         };
         let compute_time = batch_started.elapsed();
         candidates.fetch_add(u64::from(result.candidates), Ordering::Relaxed);
+        batches.fetch_add(1, Ordering::Release);
 
         for gpu_winner in &result.winners {
             let verified = match verify_gpu_winner(&prepared, &sk, &public_key, gpu_winner) {
@@ -334,6 +338,40 @@ fn run_worker(
         }
 
         nonce_base = nonce_base.wrapping_add(batch_size);
+
+        // The authoritative M22 reference rechecks BCH height + PHOTON baton
+        // state after every 65,536-candidate batch before the next batch may
+        // begin. In supervised product mode, hold this exact batch boundary
+        // until the runtime supervisor has refreshed Fulcrum state, applied
+        // any immutable generation change through ReplaceJob, and explicitly
+        // released the gate. The worker still services ReplaceJob while gated,
+        // so a state change cannot deadlock re-jobbing.
+        if let Some(required) = refresh_required.as_ref() {
+            required.store(true, Ordering::Release);
+            while required.load(Ordering::Acquire) && !stop.load(Ordering::Relaxed) {
+                match job_rx.try_recv() {
+                    Ok(WorkerCommand::ReplaceJob { job, reply }) => {
+                        let result = prepare_job(job, &sk, &public_key).and_then(|next| {
+                            engine.set_job(&next.template, &next.target, &sk)?;
+                            generation_id.store(next.job.generation_id, Ordering::Release);
+                            prepared = next;
+                            nonce_base = rng.random::<u32>();
+                            Ok(())
+                        });
+                        let _ = reply.send(result);
+                    }
+                    Err(TryRecvError::Empty) => thread::park_timeout(PAUSE_POLL),
+                    Err(TryRecvError::Disconnected) => {
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
         let rest = duty_rest(compute_time, active_intensity);
         if !rest.is_zero() {
             thread::park_timeout(rest);
@@ -346,8 +384,10 @@ pub struct SearchHandle {
     paused: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
     candidates: Arc<AtomicU64>,
+    batches: Arc<AtomicU64>,
     winners: Arc<AtomicU64>,
     generation_id: Arc<AtomicU64>,
+    refresh_required: Option<Arc<AtomicBool>>,
     job_tx: SyncSender<WorkerCommand>,
     winner_rx: Receiver<VerifiedWinner>,
     worker: Option<JoinHandle<()>>,
@@ -356,6 +396,17 @@ pub struct SearchHandle {
 
 impl SearchHandle {
     pub fn start(intensity: u8, job: MiningJob) -> Result<Self, String> {
+        Self::start_inner(intensity, job, false)
+    }
+
+    /// Start the exact CUDA search with an authoritative live-state gate after
+    /// every GPU batch. The caller must refresh Fulcrum state and call
+    /// `complete_refresh` before the next batch can begin.
+    pub fn start_supervised(intensity: u8, job: MiningJob) -> Result<Self, String> {
+        Self::start_inner(intensity, job, true)
+    }
+
+    fn start_inner(intensity: u8, job: MiningJob, supervised: bool) -> Result<Self, String> {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
         }
@@ -373,8 +424,10 @@ impl SearchHandle {
         let paused = Arc::new(AtomicBool::new(false));
         let intensity_state = Arc::new(AtomicU8::new(intensity));
         let candidates = Arc::new(AtomicU64::new(0));
+        let batches = Arc::new(AtomicU64::new(0));
         let winners = Arc::new(AtomicU64::new(0));
         let generation_id = Arc::new(AtomicU64::new(prepared.job.generation_id));
+        let refresh_required = supervised.then(|| Arc::new(AtomicBool::new(false)));
         let (job_tx, job_rx) = mpsc::sync_channel(JOB_UPDATE_CHANNEL_CAP);
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
 
@@ -385,8 +438,10 @@ impl SearchHandle {
                 let worker_paused = Arc::clone(&paused);
                 let worker_intensity = Arc::clone(&intensity_state);
                 let worker_candidates = Arc::clone(&candidates);
+                let worker_batches = Arc::clone(&batches);
                 let worker_winners = Arc::clone(&winners);
                 let worker_generation = Arc::clone(&generation_id);
+                let worker_refresh_required = refresh_required.as_ref().map(Arc::clone);
                 move || {
                     run_worker(
                         engine,
@@ -397,8 +452,10 @@ impl SearchHandle {
                         worker_paused,
                         worker_intensity,
                         worker_candidates,
+                        worker_batches,
                         worker_winners,
                         worker_generation,
+                        worker_refresh_required,
                         job_rx,
                         winner_tx,
                     )
@@ -411,8 +468,10 @@ impl SearchHandle {
             paused,
             intensity: intensity_state,
             candidates,
+            batches,
             winners,
             generation_id,
+            refresh_required,
             job_tx,
             winner_rx,
             worker: Some(worker),
@@ -445,6 +504,24 @@ impl SearchHandle {
         self.winner_rx.try_iter().collect()
     }
 
+    pub fn refresh_required(&self) -> bool {
+        self.refresh_required
+            .as_ref()
+            .is_some_and(|required| required.load(Ordering::Acquire))
+    }
+
+    pub fn complete_refresh(&self) -> Result<(), String> {
+        let required = self
+            .refresh_required
+            .as_ref()
+            .ok_or("search was not started in supervised refresh mode")?;
+        required.store(false, Ordering::Release);
+        if let Some(worker) = self.worker.as_ref() {
+            worker.thread().unpark();
+        }
+        Ok(())
+    }
+
     pub fn apply_control(&self, command: RuntimeCommand) -> Result<SearchStats, String> {
         match command {
             RuntimeCommand::SetIntensity(value) => {
@@ -471,7 +548,11 @@ impl SearchHandle {
 
     pub fn stop(mut self) -> SearchStats {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(required) = self.refresh_required.as_ref() {
+            required.store(false, Ordering::Release);
+        }
         if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
             let _ = worker.join();
         }
         self.snapshot_final()
@@ -482,6 +563,7 @@ impl SearchHandle {
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
         SearchStats {
             candidates,
+            batches: self.batches.load(Ordering::Acquire),
             intensity: self.intensity.load(Ordering::Relaxed),
             state: self.state(),
             elapsed_secs: elapsed as u64,
@@ -512,7 +594,11 @@ impl SearchHandle {
 impl Drop for SearchHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(required) = self.refresh_required.as_ref() {
+            required.store(false, Ordering::Release);
+        }
         if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
             let _ = worker.join();
         }
     }
@@ -661,5 +747,46 @@ mod tests {
             stats.candidates, stats.elapsed_secs, stats.rate
         );
         assert!(stats.candidates > 0);
+    }
+
+    #[test]
+    fn supervised_search_holds_exact_batch_boundary_until_refresh_if_cuda_present() {
+        let handle = match SearchHandle::start_supervised(100, integration_job(1)) {
+            Ok(handle) => handle,
+            Err(error)
+                if error.to_ascii_lowercase().contains("cuda context")
+                    || error.to_ascii_lowercase().contains("missing cuda ptx")
+                    || error.to_ascii_lowercase().contains("no device")
+                    || error.to_ascii_lowercase().contains("not initialized") =>
+            {
+                eprintln!("skip supervised PHOTON CUDA refresh-gate test: {error}");
+                return;
+            }
+            Err(error) => panic!("supervised PHOTON CUDA start failed: {error}"),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !handle.refresh_required() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handle.refresh_required(),
+            "GPU worker never reached the supervised refresh boundary"
+        );
+
+        let gated = handle.snapshot();
+        assert_eq!(gated.batches, 1);
+        thread::sleep(Duration::from_millis(150));
+        let still_gated = handle.snapshot();
+        assert_eq!(still_gated.batches, gated.batches);
+        assert_eq!(still_gated.candidates, gated.candidates);
+
+        handle.complete_refresh().unwrap();
+        let second_deadline = Instant::now() + Duration::from_secs(20);
+        while handle.snapshot().batches == gated.batches && Instant::now() < second_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.snapshot().batches > gated.batches);
+        let _ = handle.stop();
     }
 }

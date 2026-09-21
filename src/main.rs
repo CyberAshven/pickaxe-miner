@@ -29,6 +29,7 @@ mod m29_table;
 mod node;
 #[allow(dead_code)]
 mod protocol;
+mod runtime;
 #[allow(dead_code)]
 mod search;
 #[cfg(test)]
@@ -39,6 +40,10 @@ use config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, MINER_BPS};
 use electrum::{ElectrumSession, LiveJob};
 use search::SearchHandle;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn print_banner() {
     println!("Pickaxe Miner 0.1.0 - interactive CLI");
@@ -849,6 +854,166 @@ fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
     Ok(cfg)
 }
 
+fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
+    if json {
+        let value = match event {
+            runtime::RuntimeEvent::JobRefreshed {
+                generation_id,
+                height,
+                baton_txid,
+                baton_vout,
+                changed,
+            } => serde_json::json!({
+                "event": "job_refreshed",
+                "generation_id": generation_id,
+                "height": height,
+                "baton_txid": baton_txid,
+                "baton_vout": baton_vout,
+                "changed": changed,
+            }),
+            runtime::RuntimeEvent::Reconnecting(error) => {
+                serde_json::json!({"event": "reconnecting", "error": error})
+            }
+            runtime::RuntimeEvent::Reconnected(endpoint) => {
+                serde_json::json!({"event": "reconnected", "endpoint": endpoint})
+            }
+            runtime::RuntimeEvent::StaleWinner {
+                winner_generation,
+                current_generation,
+            } => serde_json::json!({
+                "event": "stale_winner",
+                "winner_generation": winner_generation,
+                "current_generation": current_generation,
+            }),
+            runtime::RuntimeEvent::VerifiedWinner(winner) => serde_json::json!({
+                "event": "verified_winner",
+                "generation_id": winner.generation_id,
+                "height": winner.height,
+                "baton_txid": winner.baton_txid,
+                "baton_vout": winner.baton_vout,
+                "nonce": winner.nonce,
+                "hash256": hex::encode(winner.digest),
+            }),
+            runtime::RuntimeEvent::Error(error) => {
+                serde_json::json!({"event": "error", "error": error})
+            }
+        };
+        println!("{value}");
+        return;
+    }
+
+    match event {
+        runtime::RuntimeEvent::JobRefreshed {
+            generation_id,
+            height,
+            baton_txid,
+            baton_vout,
+            changed,
+        } => {
+            if changed {
+                println!(
+                    "live PHOTON work updated: generation={generation_id} height={height} baton={baton_txid}:{baton_vout}"
+                );
+            }
+        }
+        runtime::RuntimeEvent::Reconnecting(error) => {
+            eprintln!("PHOTON state refresh failed; GPU held at batch boundary: {error}");
+        }
+        runtime::RuntimeEvent::Reconnected(endpoint) => {
+            eprintln!("PHOTON state source reconnected: {}", redact_url(&endpoint));
+        }
+        runtime::RuntimeEvent::StaleWinner {
+            winner_generation,
+            current_generation,
+        } => println!(
+            "discarded stale GPU winner: generation {winner_generation} != current {current_generation}"
+        ),
+        runtime::RuntimeEvent::VerifiedWinner(winner) => println!(
+            "verified fresh GPU winner; mining paused: generation={} height={} nonce={} hash={}",
+            winner.generation_id,
+            winner.height,
+            winner.nonce,
+            hex::encode(winner.digest)
+        ),
+        runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
+    }
+}
+
+fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "status",
+                "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
+                "generation_id": snapshot.generation_id,
+                "endpoint": redact_url(&snapshot.endpoint),
+                "height": snapshot.height,
+                "baton_txid": snapshot.baton_txid,
+                "baton_vout": snapshot.baton_vout,
+                "payout_address": snapshot.payout_address,
+                "intensity": snapshot.search.intensity,
+                "candidates": snapshot.search.candidates,
+                "batches": snapshot.search.batches,
+                "rate": snapshot.search.rate,
+                "refreshes": snapshot.refreshes,
+                "stale_rebuilds": snapshot.stale_rebuilds,
+                "reconnects": snapshot.reconnects,
+                "stale_winners": snapshot.stale_winners,
+                "verified_winners": snapshot.verified_winners,
+                "pending_winners": snapshot.pending_winners,
+                "last_error": snapshot.last_error,
+            })
+        );
+    } else {
+        println!(
+            "state={:?} generation={} height={} baton={}:{} intensity={} candidates={} batches={} rate={:.0}/s refreshes={} stale_rebuilds={} reconnects={} winners={} pending={}",
+            snapshot.state,
+            snapshot.generation_id,
+            snapshot.height,
+            snapshot.baton_txid,
+            snapshot.baton_vout,
+            snapshot.search.intensity,
+            snapshot.search.candidates,
+            snapshot.search.batches,
+            snapshot.search.rate,
+            snapshot.refreshes,
+            snapshot.stale_rebuilds,
+            snapshot.reconnects,
+            snapshot.verified_winners,
+            snapshot.pending_winners,
+        );
+    }
+}
+
+fn run_headless_dry_run(cfg: RuntimeConfig, json: bool) -> Result<(), String> {
+    let supervisor = runtime::RuntimeSupervisor::start(cfg)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal_stop = Arc::clone(&stop);
+    ctrlc::set_handler(move || signal_stop.store(true, Ordering::Relaxed))
+        .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
+
+    let mut last_status = Instant::now() - Duration::from_secs(1);
+    while !stop.load(Ordering::Relaxed) {
+        for event in supervisor.drain_events() {
+            print_runtime_event(event, json);
+        }
+        let snapshot = supervisor.snapshot();
+        if last_status.elapsed() >= Duration::from_secs(1) {
+            print_runtime_snapshot(&snapshot, json);
+            last_status = Instant::now();
+        }
+        if snapshot.pending_winners > 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let final_snapshot = supervisor.stop();
+    print_runtime_snapshot(&final_snapshot, json);
+    Ok(())
+}
+
 fn main() {
     let args = cli::parse();
     let backend_kind = match backend::BackendKind::parse(&args.backend) {
@@ -916,21 +1081,32 @@ fn main() {
             }
         },
         cli::Commands::Mine => {
-            let mode = if args.json {
-                "JSON headless"
-            } else if args.no_tui {
-                "headless"
-            } else {
-                "TUI"
-            };
-            let device = args
-                .device
-                .map_or_else(|| "auto".to_string(), |index| index.to_string());
-            eprintln!(
-                "error: {mode} mining on backend={} device={device} dry_run={} is gated until the exact PHOTON GPU RFC6979/kG/Schnorr/full-transaction HASH256 pipeline is production-ready",
-                args.backend, args.dry_run
-            );
-            std::process::exit(2);
+            if backend_kind != backend::BackendKind::Cuda {
+                eprintln!(
+                    "error: live PHOTON runtime currently requires --backend cuda; cross-vendor production search is not complete"
+                );
+                std::process::exit(2);
+            }
+            if args.device.is_some_and(|device| device != 0) {
+                eprintln!("error: live PHOTON runtime currently supports CUDA device 0 only");
+                std::process::exit(2);
+            }
+            if !args.dry_run {
+                eprintln!(
+                    "error: automatic winner submission remains gated; use `pickaxe mine --backend cuda --dry-run --no-tui` for the supervised live GPU path"
+                );
+                std::process::exit(2);
+            }
+            if !(args.no_tui || args.json) {
+                eprintln!(
+                    "error: Ratatui frontend is not wired yet; use --no-tui (or --json) for the shared supervised runtime"
+                );
+                std::process::exit(2);
+            }
+            if let Err(error) = run_headless_dry_run(cfg, args.json) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
         }
         cli::Commands::Repl => run_repl(cfg),
     }
