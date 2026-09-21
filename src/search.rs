@@ -2,7 +2,9 @@
 //! Production hot path = persistent reference-correct CudaPhotonEngine.
 //! CPU cryptography is limited to job setup and rare returned-winner verification.
 
-use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaWinner};
+use crate::backend::BackendKind;
+use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaBatchResult, PhotonCudaWinner};
+use crate::hip_photon::HipPhotonEngine;
 use crate::{crypto, tx};
 use rand::Rng;
 use secp256k1::{PublicKey, SecretKey};
@@ -13,7 +15,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// SearchHandle now owns the exact persistent CUDA A -> B -> C candidate path.
+/// SearchHandle owns an exact persistent native-GPU A -> B -> C candidate path.
 /// Higher-level product mining remains gated until submission/TUI and the
 /// remaining product backends are complete.
 pub const REFERENCE_GPU_PIPELINE_READY: bool = true;
@@ -23,6 +25,36 @@ const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = 8;
 const JOB_UPDATE_CHANNEL_CAP: usize = 2;
 const PAUSE_POLL: Duration = Duration::from_millis(25);
+
+enum PhotonEngine {
+    Cuda(Box<CudaPhotonEngine>),
+    Hip(Box<HipPhotonEngine>),
+}
+
+impl PhotonEngine {
+    fn set_job(
+        &mut self,
+        template: &[u8; 615],
+        target: &[u8; 32],
+        private_key: &[u8; 32],
+    ) -> Result<(), String> {
+        match self {
+            Self::Cuda(engine) => engine.set_job(template, target, private_key),
+            Self::Hip(engine) => engine.set_job(template, target, private_key),
+        }
+    }
+
+    fn search_batch(
+        &mut self,
+        nonce_base: u32,
+        candidate_count: u32,
+    ) -> Result<PhotonCudaBatchResult, String> {
+        match self {
+            Self::Cuda(engine) => engine.search_batch(nonce_base, candidate_count),
+            Self::Hip(engine) => engine.search_batch(nonce_base, candidate_count),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MiningJob {
@@ -262,7 +294,7 @@ fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
 
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
-    mut engine: CudaPhotonEngine,
+    mut engine: PhotonEngine,
     mut prepared: PreparedJob,
     sk: [u8; 32],
     public_key: [u8; 33],
@@ -404,7 +436,16 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(device_ordinal, intensity, job, false, false)
+        Self::start_on_backend_device(BackendKind::Cuda, device_ordinal, intensity, job)
+    }
+
+    pub fn start_on_backend_device(
+        backend: BackendKind,
+        device_ordinal: usize,
+        intensity: u8,
+        job: MiningJob,
+    ) -> Result<Self, String> {
+        Self::start_inner(backend, device_ordinal, intensity, job, false, false)
     }
 
     /// Start the exact CUDA search with an authoritative live-state gate after
@@ -419,7 +460,16 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(device_ordinal, intensity, job, true, false)
+        Self::start_supervised_on_backend_device(BackendKind::Cuda, device_ordinal, intensity, job)
+    }
+
+    pub fn start_supervised_on_backend_device(
+        backend: BackendKind,
+        device_ordinal: usize,
+        intensity: u8,
+        job: MiningJob,
+    ) -> Result<Self, String> {
+        Self::start_inner(backend, device_ordinal, intensity, job, true, false)
     }
 
     /// Start supervised search in a paused state. This is used while a
@@ -434,10 +484,25 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(device_ordinal, intensity, job, true, true)
+        Self::start_supervised_paused_on_backend_device(
+            BackendKind::Cuda,
+            device_ordinal,
+            intensity,
+            job,
+        )
+    }
+
+    pub fn start_supervised_paused_on_backend_device(
+        backend: BackendKind,
+        device_ordinal: usize,
+        intensity: u8,
+        job: MiningJob,
+    ) -> Result<Self, String> {
+        Self::start_inner(backend, device_ordinal, intensity, job, true, true)
     }
 
     fn start_inner(
+        backend: BackendKind,
         device_ordinal: usize,
         intensity: u8,
         job: MiningJob,
@@ -452,10 +517,23 @@ impl SearchHandle {
         let public_key = PublicKey::from_secret_key(&secret).serialize();
         let prepared = prepare_job(job, &sk, &public_key)?;
 
-        // Fail fast and create exactly one CUDA context. The configured engine
-        // is moved into the worker and remains resident across runtime controls.
-        let mut engine =
-            CudaPhotonEngine::new(device_ordinal, MAX_BATCH_CANDIDATES, WINNER_BUFFER_CAP)?;
+        // Fail fast and create exactly one native GPU context. The configured
+        // engine is moved into the worker and remains resident across controls.
+        let mut engine = match backend {
+            BackendKind::Cuda => PhotonEngine::Cuda(Box::new(CudaPhotonEngine::new(
+                device_ordinal,
+                MAX_BATCH_CANDIDATES,
+                WINNER_BUFFER_CAP,
+            )?)),
+            BackendKind::Hip => PhotonEngine::Hip(Box::new(HipPhotonEngine::new(
+                device_ordinal,
+                MAX_BATCH_CANDIDATES,
+                WINNER_BUFFER_CAP,
+            )?)),
+            BackendKind::Auto => {
+                return Err("auto backend must be resolved before GPU search starts".into())
+            }
+        };
         engine.set_job(&prepared.template, &prepared.target, &sk)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -470,7 +548,10 @@ impl SearchHandle {
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
 
         let worker = thread::Builder::new()
-            .name(format!("pickaxe-photon-cuda-{device_ordinal}"))
+            .name(format!(
+                "pickaxe-photon-{}-{device_ordinal}",
+                backend.as_str()
+            ))
             .spawn({
                 let worker_stop = Arc::clone(&stop);
                 let worker_paused = Arc::clone(&paused);

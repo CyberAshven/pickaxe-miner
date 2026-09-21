@@ -6,6 +6,7 @@
 //! next supervised batch until fresh Fulcrum state has been checked and any
 //! immutable generation change has been applied.
 
+use crate::backend::BackendKind;
 use crate::config::RuntimeConfig;
 use crate::electrum::{ElectrumSession, LiveJob};
 use crate::reward;
@@ -432,20 +433,39 @@ pub struct RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
+    #[allow(dead_code)]
     pub fn start_on_device(cfg: RuntimeConfig, device_ordinal: u32) -> Result<Self, String> {
-        Self::start_inner(cfg, true, device_ordinal)
+        Self::start_on_backend_device(cfg, BackendKind::Cuda, device_ordinal)
     }
 
+    pub fn start_on_backend_device(
+        cfg: RuntimeConfig,
+        backend: BackendKind,
+        device_ordinal: u32,
+    ) -> Result<Self, String> {
+        Self::start_inner(cfg, true, backend, device_ordinal)
+    }
+
+    #[allow(dead_code)]
     pub fn start_dry_run_on_device(
         cfg: RuntimeConfig,
         device_ordinal: u32,
     ) -> Result<Self, String> {
-        Self::start_inner(cfg, false, device_ordinal)
+        Self::start_dry_run_on_backend_device(cfg, BackendKind::Cuda, device_ordinal)
+    }
+
+    pub fn start_dry_run_on_backend_device(
+        cfg: RuntimeConfig,
+        backend: BackendKind,
+        device_ordinal: u32,
+    ) -> Result<Self, String> {
+        Self::start_inner(cfg, false, backend, device_ordinal)
     }
 
     fn start_inner(
         mut cfg: RuntimeConfig,
         submit_winners: bool,
+        backend: BackendKind,
         device_ordinal: u32,
     ) -> Result<Self, String> {
         if cfg.payout_address.trim().is_empty() {
@@ -470,13 +490,15 @@ impl RuntimeSupervisor {
 
         let initial_job = initial.to_mining_job(cfg.generation_id, &mining_payout_address);
         let search = if has_pending_submission {
-            SearchHandle::start_supervised_paused_on_device(
+            SearchHandle::start_supervised_paused_on_backend_device(
+                backend,
                 device_ordinal as usize,
                 cfg.intensity,
                 initial_job,
             )?
         } else {
-            SearchHandle::start_supervised_on_device(
+            SearchHandle::start_supervised_on_backend_device(
+                backend,
                 device_ordinal as usize,
                 cfg.intensity,
                 initial_job,
@@ -489,7 +511,7 @@ impl RuntimeSupervisor {
             } else {
                 SupervisorState::Mining
             },
-            gpu_backend: "cuda".into(),
+            gpu_backend: backend.as_str().into(),
             gpu_device: device_ordinal,
             generation_id: cfg.generation_id,
             payout_address: cfg.payout_address.clone(),
