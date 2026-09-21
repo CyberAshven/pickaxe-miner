@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(name = "pickaxe", about = "Pickaxe Miner - GPU-only PHOTON miner")]
 pub struct Cli {
-    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "cuda", "hip", "wgpu"])]
+    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "cuda", "hip"])]
     pub backend: String,
 
     #[arg(long, global = true)]
@@ -100,5 +100,10 @@ mod tests {
     fn clap_rejects_out_of_range_intensity() {
         assert!(Cli::try_parse_from(["pickaxe", "mine", "--intensity", "9"]).is_err());
         assert!(Cli::try_parse_from(["pickaxe", "mine", "--intensity", "101"]).is_err());
+    }
+
+    #[test]
+    fn clap_rejects_detached_wgpu_backend() {
+        assert!(Cli::try_parse_from(["pickaxe", "mine", "--backend", "wgpu"]).is_err());
     }
 }

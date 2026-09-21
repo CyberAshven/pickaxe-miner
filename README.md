@@ -1,6 +1,6 @@
 # Pickaxe Miner
 
-Native Rust **GPU** PHOTON miner (CLI now; Ratatui TUI next). Windows + Linux. NVIDIA (CUDA) and AMD (HIP/wgpu) backends — Lead Dev owns kernels.
+Native Rust **GPU** PHOTON miner (CLI now; Ratatui TUI next). Windows + Linux. NVIDIA uses native CUDA; AMD uses a native HIP/ROCm or appropriate native GPU path. wgpu/WebGPU is detached reference/experimental work, not a production fallback.
 
 **Definition of done:** Operator mining live with a commit on [CyberAshven/pickaxe-miner](https://github.com/CyberAshven/pickaxe-miner).
 
@@ -50,6 +50,6 @@ Sequential endpoint tries + exponential backoff. No parallel fan-out.
 | Lane | Owner |
 |------|--------|
 | Electrum, win-tx template, arm/applysig/broadcast | Dev Assist |
-| CUDA/HIP/wgpu kernels, intensity, Stage B→C, Ratatui | Lead Dev |
+| CUDA/HIP/native GPU kernels, intensity, Stage B→C, Ratatui | Lead Dev |
 
 `reference/` mirrors https://photon.postcorps.com/ for protocol study only (not the product).
