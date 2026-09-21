@@ -160,6 +160,92 @@ fn decimal_bch_to_sats(text: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| "relay fee exceeds u64 satoshis per kB".into())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MempoolAcceptance {
+    pub txid: String,
+    pub allowed: bool,
+    pub size: Option<u64>,
+    pub vsize: Option<u64>,
+    pub reject_reason: Option<String>,
+    pub reject_details: Option<String>,
+}
+
+/// Ask BCHN whether these exact signed transaction bytes satisfy the node's
+/// current consensus and mempool policy. BCHN currently accepts exactly one
+/// raw transaction per `testmempoolaccept` call, so parent and settlement
+/// checks are deliberately sequenced by the runtime.
+pub fn test_mempool_accept(
+    endpoints: &[String],
+    raw_tx_hex: &str,
+) -> Result<(String, MempoolAcceptance), String> {
+    let hex = raw_tx_hex.trim();
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return Err("raw tx hex empty or odd length".into());
+    }
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("raw tx must be hex".into());
+    }
+    if endpoints.is_empty() {
+        return Err("no node endpoints configured for mempool acceptance preflight".into());
+    }
+
+    let mut failures = Vec::new();
+    let mut backoff_ms: u64 = 400;
+    for (i, url) in endpoints.iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(backoff_ms));
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
+        }
+        match rpc_call(url, "testmempoolaccept", json!([[hex], false])) {
+            Ok(Value::Array(results)) if results.len() == 1 => {
+                let item = &results[0];
+                let txid = item
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "testmempoolaccept omitted txid".to_string());
+                let allowed = item
+                    .get("allowed")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| "testmempoolaccept omitted allowed".to_string());
+                match (txid, allowed) {
+                    (Ok(txid), Ok(allowed)) => {
+                        return Ok((
+                            redact_url(url),
+                            MempoolAcceptance {
+                                txid: txid.to_string(),
+                                allowed,
+                                size: item.get("size").and_then(Value::as_u64),
+                                vsize: item.get("vsize").and_then(Value::as_u64),
+                                reject_reason: item
+                                    .get("reject-reason")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                reject_details: item
+                                    .get("reject-details")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                            },
+                        ));
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        failures.push(format!("{}: {error}", redact_url(url)));
+                    }
+                }
+            }
+            Ok(_) => failures.push(format!(
+                "{}: testmempoolaccept returned an unexpected result shape",
+                redact_url(url)
+            )),
+            Err(error) => failures.push(format!("{}: {error}", redact_url(url))),
+        }
+    }
+
+    Err(format!(
+        "All native node mempool acceptance RPCs failed (sequential, ban-safe):\n{}",
+        failures.join("\n")
+    ))
+}
+
 /// Broadcast raw tx via `sendrawtransaction`. Explicit only; never auto.
 pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, String), String> {
     let hex = raw_tx_hex.trim();
@@ -507,5 +593,40 @@ mod gbt_tests {
         server.join().unwrap();
         assert_eq!(reported_endpoint, endpoint);
         assert_eq!(policy.mempool_min_fee_sats_per_kb, 1_234);
+    }
+
+    #[test]
+    fn mempool_acceptance_preserves_policy_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let txid = "11".repeat(32);
+        let expected_txid = txid.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("\"method\":\"testmempoolaccept\""));
+            assert!(request.contains("[[\"0200\"],false]"));
+            let body = format!(
+                "{{\"result\":[{{\"txid\":\"{txid}\",\"allowed\":false,\"reject-reason\":\"dust\",\"reject-details\":\"policy floor\"}}],\"error\":null,\"id\":\"pickaxe\"}}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let endpoint = format!("http://{address}");
+        let (reported_endpoint, acceptance) =
+            test_mempool_accept(std::slice::from_ref(&endpoint), "0200").unwrap();
+        server.join().unwrap();
+        assert_eq!(reported_endpoint, endpoint);
+        assert_eq!(acceptance.txid, expected_txid);
+        assert!(!acceptance.allowed);
+        assert_eq!(acceptance.reject_reason.as_deref(), Some("dust"));
+        assert_eq!(acceptance.reject_details.as_deref(), Some("policy floor"));
     }
 }
