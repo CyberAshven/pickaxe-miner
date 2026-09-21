@@ -31,6 +31,7 @@ const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EVENT_HISTORY_CAP: usize = 96;
 const RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(150);
+const RATE_MIN_MATURE_HISTORY: Duration = Duration::from_secs(1);
 const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(2);
 const RATE_HISTORY_CAP: usize = 32;
 const BENCHMARK_TERMINAL_WIDTH: u16 = 120;
@@ -274,7 +275,7 @@ impl TuiState {
             last_rate_sample: now,
             rate_samples,
             current_rate: 0.0,
-            peak_rate: snapshot.search.rate,
+            peak_rate: 0.0,
         }
     }
 
@@ -286,11 +287,14 @@ impl TuiState {
     }
 
     fn update_rates(&mut self, snapshot: &RuntimeSnapshot) {
-        if self.last_rate_sample.elapsed() < RATE_SAMPLE_INTERVAL {
+        self.update_rates_at(snapshot, Instant::now());
+    }
+
+    fn update_rates_at(&mut self, snapshot: &RuntimeSnapshot, now: Instant) {
+        if now.saturating_duration_since(self.last_rate_sample) < RATE_SAMPLE_INTERVAL {
             return;
         }
 
-        let now = Instant::now();
         if self.rate_samples.len() == RATE_HISTORY_CAP {
             self.rate_samples.pop_front();
         }
@@ -309,19 +313,16 @@ impl TuiState {
 
         if let Some((sample_time, sample_candidates)) = self.rate_samples.front() {
             let elapsed = now.duration_since(*sample_time).as_secs_f64();
-            if elapsed > 0.0 {
+            if elapsed >= RATE_MIN_MATURE_HISTORY.as_secs_f64() {
                 let completed = snapshot
                     .search
                     .candidates
                     .saturating_sub(*sample_candidates);
                 self.current_rate = completed as f64 / elapsed;
+                self.peak_rate = self.peak_rate.max(self.current_rate);
             }
         }
 
-        self.peak_rate = self
-            .peak_rate
-            .max(self.current_rate)
-            .max(snapshot.search.rate);
         self.last_rate_sample = now;
     }
 }
@@ -1327,29 +1328,105 @@ mod tests {
             search: Default::default(),
         };
         let mut state = TuiState::new(&snapshot);
-        let now = Instant::now();
+        let start = Instant::now();
         state.rate_samples.clear();
-        state
-            .rate_samples
-            .push_back((now - Duration::from_secs(1), 0));
-        state.last_rate_sample = now - RATE_SAMPLE_INTERVAL - Duration::from_millis(1);
+        state.rate_samples.push_back((start, 0));
+        state.last_rate_sample = start;
 
         snapshot.search.candidates = 100_000;
-        state.update_rates(&snapshot);
+        state.update_rates_at(&snapshot, start + Duration::from_secs(1));
         assert!(state.current_rate > 0.0);
 
-        state.last_rate_sample = Instant::now() - RATE_SAMPLE_INTERVAL - Duration::from_millis(1);
-        state.update_rates(&snapshot);
+        state.update_rates_at(&snapshot, start + Duration::from_millis(1_200));
         assert!(
             state.current_rate > 0.0,
             "a render between GPU batch completions must retain the rolling rate"
         );
 
-        for _ in 0..(RATE_HISTORY_CAP * 2) {
-            state.last_rate_sample =
-                Instant::now() - RATE_SAMPLE_INTERVAL - Duration::from_millis(1);
-            state.update_rates(&snapshot);
+        for index in 0..(RATE_HISTORY_CAP * 2) {
+            state.update_rates_at(
+                &snapshot,
+                start + Duration::from_millis(1_400 + (index as u64 * 200)),
+            );
         }
         assert!(state.rate_samples.len() <= RATE_HISTORY_CAP);
+    }
+
+    #[test]
+    fn rate_and_peak_wait_for_mature_history() {
+        let mut snapshot = RuntimeSnapshot {
+            state: SupervisorState::Mining,
+            gpu_backend: "cuda".into(),
+            gpu_device: 0,
+            generation_id: 1,
+            payout_address: "bitcoincash:qexample".into(),
+            endpoint: "wss://example.test".into(),
+            height: 1,
+            baton_txid: "00".repeat(32),
+            baton_vout: 0,
+            refreshes: 0,
+            stale_rebuilds: 0,
+            reconnects: 0,
+            stale_winners: 0,
+            verified_winners: 0,
+            pending_winners: 0,
+            last_error: None,
+            search: Default::default(),
+        };
+        snapshot.search.rate = 1_970_184.0;
+        let mut state = TuiState::new(&snapshot);
+        assert_eq!(state.peak_rate, 0.0);
+
+        let start = Instant::now();
+        state.rate_samples.clear();
+        state.rate_samples.push_back((start, 0));
+        state.last_rate_sample = start;
+        snapshot.search.candidates = 65_536;
+
+        state.update_rates_at(&snapshot, start + Duration::from_millis(200));
+        assert_eq!(state.current_rate, 0.0);
+        assert_eq!(state.peak_rate, 0.0);
+
+        state.update_rates_at(&snapshot, start + Duration::from_millis(1_100));
+        assert!(state.current_rate > 0.0);
+        assert!(state.current_rate < 100_000.0);
+        assert_eq!(state.peak_rate, state.current_rate);
+    }
+
+    #[test]
+    fn mature_sustained_rate_can_raise_peak() {
+        let mut snapshot = RuntimeSnapshot {
+            state: SupervisorState::Mining,
+            gpu_backend: "cuda".into(),
+            gpu_device: 0,
+            generation_id: 1,
+            payout_address: "bitcoincash:qexample".into(),
+            endpoint: "wss://example.test".into(),
+            height: 1,
+            baton_txid: "00".repeat(32),
+            baton_vout: 0,
+            refreshes: 0,
+            stale_rebuilds: 0,
+            reconnects: 0,
+            stale_winners: 0,
+            verified_winners: 0,
+            pending_winners: 0,
+            last_error: None,
+            search: Default::default(),
+        };
+        let mut state = TuiState::new(&snapshot);
+        let start = Instant::now();
+        state.rate_samples.clear();
+        state.rate_samples.push_back((start, 0));
+        state.last_rate_sample = start;
+
+        snapshot.search.candidates = 50_000;
+        state.update_rates_at(&snapshot, start + Duration::from_secs(1));
+        let first_peak = state.peak_rate;
+        assert!(first_peak > 0.0);
+
+        snapshot.search.candidates = 250_000;
+        state.update_rates_at(&snapshot, start + Duration::from_secs(2));
+        assert!(state.peak_rate > first_peak);
     }
 }

@@ -35,6 +35,20 @@ const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const PHOTON_STATE_RECHECK: Duration = Duration::from_millis(500);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
+
+fn next_periodic_deadline(previous_deadline: Instant, now: Instant, interval: Duration) -> Instant {
+    debug_assert!(!interval.is_zero());
+    if previous_deadline > now {
+        return previous_deadline;
+    }
+
+    let elapsed_ticks = now.duration_since(previous_deadline).as_nanos() / interval.as_nanos();
+    let ticks = elapsed_ticks.saturating_add(1).min(u128::from(u32::MAX)) as u32;
+    previous_deadline
+        .checked_add(interval.saturating_mul(ticks))
+        .filter(|deadline| *deadline > now)
+        .unwrap_or_else(|| now + interval)
+}
 const SUBMISSION_JOURNAL_VERSION: u8 = 3;
 const SUBMISSION_RESOLUTION_VERSION: u8 = 1;
 const PHOTON_TX_BYTES: usize = 615;
@@ -2070,6 +2084,7 @@ fn run_supervisor(
                 }
             }
         } else if Instant::now() >= next_state_refresh {
+            let previous_state_refresh = next_state_refresh;
             let refreshed = refresh_photon_job_on_cadence(
                 &cfg,
                 session.as_mut().expect("checked session above"),
@@ -2077,7 +2092,11 @@ fn run_supervisor(
                 &mut native_photon_session,
                 source_capability_epoch,
             );
-            next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
+            next_state_refresh = next_periodic_deadline(
+                previous_state_refresh,
+                Instant::now(),
+                PHOTON_STATE_RECHECK,
+            );
             match refreshed {
                 Ok(boundary) => {
                     if let Some(error) = boundary.native_error.as_ref() {
@@ -3006,6 +3025,22 @@ mod tests {
     #[test]
     fn photon_state_recheck_matches_authoritative_m67_cadence() {
         assert_eq!(PHOTON_STATE_RECHECK, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn photon_state_recheck_deadline_does_not_add_request_latency() {
+        let start = Instant::now();
+        let first_deadline = start + PHOTON_STATE_RECHECK;
+
+        let request_finished = first_deadline + Duration::from_millis(220);
+        let second_deadline =
+            next_periodic_deadline(first_deadline, request_finished, PHOTON_STATE_RECHECK);
+        assert_eq!(second_deadline, start + Duration::from_secs(1));
+
+        let slow_request_finished = second_deadline + Duration::from_millis(620);
+        let next_future_deadline =
+            next_periodic_deadline(second_deadline, slow_request_finished, PHOTON_STATE_RECHECK);
+        assert_eq!(next_future_deadline, start + Duration::from_secs(2));
     }
 
     #[test]
