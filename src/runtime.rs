@@ -662,12 +662,14 @@ fn prepare_pending_submission(
     }
     settlement.ensure_current(cfg.generation_id, live)?;
     validate_verified_parent(winner, live, reward_public_key)?;
-    let split = reward::build_self_funded_settlement(
+    let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(cfg)?;
+    let split = reward::build_self_funded_settlement_with_relay_fee(
         &winner.transaction,
         reward_secret,
         reward_public_key,
         &cfg.payout_address,
         live.reward_raw,
+        relay_fee_sats_per_kb,
     )?;
     let pending = PendingSubmission::from_verified(winner, &split)?;
     pending.persist_new(journal_path)?;
@@ -691,19 +693,17 @@ fn resolve_pending_before_search(
     }
 }
 
-fn production_submission_transport_preflight(cfg: &RuntimeConfig) -> Result<(), String> {
+fn production_relay_fee_sats_per_kb(cfg: &RuntimeConfig) -> Result<u64, String> {
     if cfg.source != JobSource::Node {
-        return Ok(());
+        return Ok(reward::MIN_RELAY_FEE_SATS_PER_KB);
     }
     let endpoints = cfg.node_endpoints();
     if endpoints.is_empty() {
         return Err("native-node broadcast selected but no node RPC endpoint is configured".into());
     }
-    crate::node::connect_failover(&endpoints)
-        .map(|_| ())
-        .map_err(|_| {
-            "native-node broadcast preflight failed: configured node RPC is unreachable".into()
-        })
+    let (_, policy) = crate::node::fetch_relay_policy(&endpoints)
+        .map_err(|error| format!("native-node relay-policy preflight failed: {error}"))?;
+    Ok(reward::MIN_RELAY_FEE_SATS_PER_KB.max(policy.mempool_min_fee_sats_per_kb))
 }
 
 fn probe_submission_journal(journal_path: &Path) -> Result<(), String> {
@@ -797,6 +797,7 @@ fn production_preflight(
         );
     }
 
+    let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(cfg)?;
     production_preflight_local(
         cfg,
         live,
@@ -804,6 +805,7 @@ fn production_preflight(
         reward_public_key,
         mining_payout_address,
         journal_path,
+        relay_fee_sats_per_kb,
     )
 }
 
@@ -826,6 +828,7 @@ fn production_preflight_local(
     reward_public_key: &[u8; 33],
     mining_payout_address: &str,
     journal_path: &Path,
+    relay_fee_sats_per_kb: u64,
 ) -> Result<(), String> {
     if cfg.payout_address.trim().is_empty() {
         return Err("mining payout address is required".into());
@@ -861,12 +864,13 @@ fn production_preflight_local(
         return Err("PHOTON parent builder target placement disagrees with the live target".into());
     }
 
-    let split = reward::build_self_funded_settlement(
+    let split = reward::build_self_funded_settlement_with_relay_fee(
         &parent_preview,
         reward_secret,
         reward_public_key,
         &cfg.payout_address,
         live.reward_raw,
+        relay_fee_sats_per_kb,
     )?;
     let (expected_miner, expected_donation) = RuntimeConfig::split_reward(live.reward_raw);
     if split.miner_token_amount != expected_miner
@@ -1019,7 +1023,6 @@ impl RuntimeSupervisor {
         let mut session = ElectrumSession::connect_failover(&endpoints)?;
         let journal_path = submission_journal_path();
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
-        production_submission_transport_preflight(&cfg)?;
         let initial = session.fetch_live_job()?;
         let (reward_secret, reward_public_key, mining_payout_address) =
             reward::new_intermediate_identity()?;
@@ -1305,6 +1308,7 @@ fn run_supervisor(
                         if next_cfg.generation_id == cfg.generation_id {
                             return Ok(());
                         }
+                        let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(&next_cfg)?;
                         production_preflight_local(
                             &next_cfg,
                             &live,
@@ -1312,6 +1316,7 @@ fn run_supervisor(
                             &reward_public_key,
                             &mining_payout_address,
                             &journal_path,
+                            relay_fee_sats_per_kb,
                         )?;
                         let next_settlement = settlement.restamp(next_cfg.generation_id, &live)?;
                         search.replace_job(
@@ -1335,9 +1340,11 @@ fn run_supervisor(
                         Err(error) => Err(error),
                         Ok(None) => Ok(()),
                         Ok(Some((next_cfg, next_endpoints))) => {
+                            let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(&next_cfg);
                             let next_settlement = settlement
                                 .restamp(next_cfg.generation_id, &live)
                                 .and_then(|next_settlement| {
+                                    let relay_fee_sats_per_kb = relay_fee_sats_per_kb?;
                                     production_preflight_local(
                                         &next_cfg,
                                         &live,
@@ -1345,6 +1352,7 @@ fn run_supervisor(
                                         &reward_public_key,
                                         &mining_payout_address,
                                         &journal_path,
+                                        relay_fee_sats_per_kb,
                                     )?;
                                     Ok(next_settlement)
                                 });
@@ -2343,14 +2351,54 @@ mod tests {
             source: JobSource::Node,
             ..RuntimeConfig::default()
         };
-        let error = production_submission_transport_preflight(&cfg).unwrap_err();
+        let error = production_relay_fee_sats_per_kb(&cfg).unwrap_err();
         assert!(error.contains("no node RPC endpoint"));
+    }
+
+    #[test]
+    fn native_node_source_binds_live_mempool_fee_floor() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("\"method\":\"getmempoolinfo\""));
+            let body = r#"{"result":{"mempoolminfee":0.00002000},"error":null,"id":"pickaxe"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let cfg = RuntimeConfig {
+            node_url: Some(format!("http://{address}")),
+            source: JobSource::Node,
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(production_relay_fee_sats_per_kb(&cfg).unwrap(), 2_000);
+        server.join().unwrap();
     }
 
     #[test]
     fn production_preflight_proves_parent_reward_split_and_journal_readiness() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
-        production_preflight_local(&cfg, &job, &secret, &public, &mining_payout, &journal).unwrap();
+        production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            reward::MIN_RELAY_FEE_SATS_PER_KB,
+        )
+        .unwrap();
         assert!(!journal.exists());
     }
 
@@ -2358,10 +2406,34 @@ mod tests {
     fn production_preflight_refuses_insufficient_self_funded_baton_value_before_search() {
         let (cfg, mut job, secret, public, mining_payout, journal) = preflight_fixture();
         job.baton_value_sats = 1_500;
-        let error =
-            production_preflight_local(&cfg, &job, &secret, &public, &mining_payout, &journal)
-                .unwrap_err();
+        let error = production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            reward::MIN_RELAY_FEE_SATS_PER_KB,
+        )
+        .unwrap_err();
         assert!(error.contains("baton BCH value is too small"));
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn production_preflight_refuses_relay_floor_above_covenant_budget() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let error = production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            10_000,
+        )
+        .unwrap_err();
+        assert!(error.contains("covenant permits at most"));
         assert!(!journal.exists());
     }
 
@@ -2369,9 +2441,16 @@ mod tests {
     fn production_preflight_refuses_unresolved_submission_journal() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         fs::write(&journal, b"occupied").unwrap();
-        let error =
-            production_preflight_local(&cfg, &job, &secret, &public, &mining_payout, &journal)
-                .unwrap_err();
+        let error = production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            reward::MIN_RELAY_FEE_SATS_PER_KB,
+        )
+        .unwrap_err();
         assert!(error.contains("unresolved previous winner submission"));
         fs::remove_file(&journal).unwrap();
     }
@@ -2407,6 +2486,7 @@ mod tests {
                     &public,
                     &mining_payout,
                     &journal,
+                    reward::MIN_RELAY_FEE_SATS_PER_KB,
                 )
             })
             .unwrap()
@@ -2435,6 +2515,7 @@ mod tests {
                     &public,
                     &mining_payout,
                     &journal,
+                    reward::MIN_RELAY_FEE_SATS_PER_KB,
                 )
             })
             .unwrap()
@@ -2463,6 +2544,7 @@ mod tests {
                     &public,
                     &mining_payout,
                     &journal,
+                    reward::MIN_RELAY_FEE_SATS_PER_KB,
                 )
             })
             .unwrap()
@@ -2588,9 +2670,16 @@ mod tests {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let marker = PendingSubmission::parent_attempted_path(&journal);
         fs::write(&marker, format!("{}\n", "aa".repeat(32))).unwrap();
-        let error =
-            production_preflight_local(&cfg, &job, &secret, &public, &mining_payout, &journal)
-                .unwrap_err();
+        let error = production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &journal,
+            reward::MIN_RELAY_FEE_SATS_PER_KB,
+        )
+        .unwrap_err();
         assert!(error.contains("orphan pending-submission progress marker"));
         fs::remove_file(marker).unwrap();
     }
