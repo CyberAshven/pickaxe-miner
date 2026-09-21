@@ -12,4 +12,11 @@
 - **Do NOT** modify the PHOTON protocol/covenant to enforce this.
 - Preserve original PHOTON compatibility. If a 3-output 98/2 tx is covenant-invalid, replace with a **protocol-valid** reward-splitting design — do not change PHOTON.
 
+## Verified execution shape
+
+- The authoritative PHOTON mining branch requires exactly **2 outputs**, so a direct 3-output 98/2 mining transaction remains disabled.
+- The protocol-compatible exact split is an immediate child CashToken transaction: the PHOTON parent pays its single reward output, then the child sends 98% to the miner, 2% to the hard-coded donation address, and rolls a BCH-only sponsor reserve forward.
+- `tools/reward-policy-vm/verify.mjs` executes this shape in Libauth's BCH 2026 VM using the authoritative 615-byte PHOTON transaction vector. It also checks CashToken conservation and adversarial mutations.
+- The proof is deterministic and offline: it does not fund a covenant, query a node/Fulcrum endpoint, or broadcast a transaction.
+
 Hard-coded address (current): `bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3`
