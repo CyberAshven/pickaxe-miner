@@ -30,6 +30,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const SUBMISSION_JOURNAL_VERSION: u8 = 3;
 const PHOTON_TX_BYTES: usize = 615;
 const PHOTON_TARGET_OFFSET: usize = 394;
+const BATON_LINEAGE_MAX_STEPS: usize = 256;
 const VERIFIED_WINNER_DURABILITY_READY: bool = true;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,6 +505,143 @@ fn resulting_baton_is_authoritative(pending: &PendingSubmission, fresh: &LiveJob
         && fresh.baton_vout == pending.resulting_baton_vout
 }
 
+fn read_compact_size(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
+    let marker = *bytes
+        .get(*offset)
+        .ok_or("transaction ended before CompactSize")?;
+    *offset += 1;
+    let (value, width) = match marker {
+        0x00..=0xfc => (u64::from(marker), 0usize),
+        0xfd => {
+            let slice = bytes
+                .get(*offset..*offset + 2)
+                .ok_or("transaction ended inside CompactSize u16")?;
+            (u64::from(u16::from_le_bytes([slice[0], slice[1]])), 2)
+        }
+        0xfe => {
+            let slice = bytes
+                .get(*offset..*offset + 4)
+                .ok_or("transaction ended inside CompactSize u32")?;
+            (
+                u64::from(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]])),
+                4,
+            )
+        }
+        0xff => {
+            let slice = bytes
+                .get(*offset..*offset + 8)
+                .ok_or("transaction ended inside CompactSize u64")?;
+            (
+                u64::from_le_bytes([
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+                ]),
+                8,
+            )
+        }
+    };
+    *offset += width;
+    Ok(value)
+}
+
+fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
+    let raw = hex::decode(raw_tx_hex.trim())
+        .map_err(|error| format!("decode PHOTON lineage transaction: {error}"))?;
+    if raw.len() < 5 {
+        return Err("PHOTON lineage transaction is too short".into());
+    }
+    let mut offset = 4usize;
+    let input_count = read_compact_size(&raw, &mut offset)?;
+    if input_count == 0 {
+        return Err("PHOTON lineage transaction has no inputs".into());
+    }
+    let prev_hash = raw
+        .get(offset..offset + 32)
+        .ok_or("PHOTON lineage transaction is truncated before input 0 txid")?;
+    offset += 32;
+    let prev_vout = raw
+        .get(offset..offset + 4)
+        .ok_or("PHOTON lineage transaction is truncated before input 0 vout")?;
+    let mut display_hash = prev_hash.to_vec();
+    display_hash.reverse();
+    Ok((
+        hex::encode(display_hash),
+        u32::from_le_bytes([prev_vout[0], prev_vout[1], prev_vout[2], prev_vout[3]]),
+    ))
+}
+
+fn prove_baton_descends_from<F>(
+    current_txid: &str,
+    current_vout: u32,
+    ancestor_txid: &str,
+    ancestor_vout: u32,
+    mut fetch_raw: F,
+) -> Result<bool, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    if current_vout != 0 || ancestor_vout != 0 {
+        return Ok(false);
+    }
+    if current_txid.eq_ignore_ascii_case(ancestor_txid) {
+        return Ok(true);
+    }
+
+    let mut cursor = current_txid.to_string();
+    for _ in 0..BATON_LINEAGE_MAX_STEPS {
+        let raw = fetch_raw(&cursor)?;
+        let raw_bytes = hex::decode(raw.trim())
+            .map_err(|error| format!("decode PHOTON lineage transaction: {error}"))?;
+        let actual_txid = reward::transaction_id(&raw_bytes);
+        if !actual_txid.eq_ignore_ascii_case(&cursor) {
+            return Err(format!(
+                "PHOTON baton lineage transaction bytes do not match requested txid {cursor}"
+            ));
+        }
+        let (previous_txid, previous_vout) = first_input_outpoint(&raw)?;
+        if previous_vout != 0 {
+            return Ok(false);
+        }
+        if previous_txid.eq_ignore_ascii_case(ancestor_txid) {
+            return Ok(previous_vout == ancestor_vout);
+        }
+        if previous_txid.eq_ignore_ascii_case(&cursor) {
+            return Err("PHOTON baton lineage contains a transaction cycle".into());
+        }
+        cursor = previous_txid;
+    }
+
+    Err(format!(
+        "PHOTON baton lineage exceeded the bounded {BATON_LINEAGE_MAX_STEPS}-transaction recovery window"
+    ))
+}
+
+fn resulting_baton_is_authoritative_or_descendant(
+    session: &mut ElectrumSession,
+    pending: &PendingSubmission,
+    fresh: &LiveJob,
+) -> Result<bool, String> {
+    if resulting_baton_is_authoritative(pending, fresh) {
+        return Ok(true);
+    }
+    prove_baton_descends_from(
+        &fresh.baton_txid,
+        fresh.baton_vout,
+        &pending.resulting_baton_txid,
+        pending.resulting_baton_vout,
+        |txid| {
+            match session.rpc(
+                "blockchain.transaction.get",
+                serde_json::json!([txid, false]),
+            )? {
+                serde_json::Value::String(raw) => Ok(raw),
+                other => Err(format!(
+                    "Fulcrum returned non-hex transaction data while proving PHOTON baton lineage: {other}"
+                )),
+            }
+        },
+    )
+}
+
 fn ensure_broadcast_txid(label: &str, expected: &str, returned: &str) -> Result<(), String> {
     if returned.eq_ignore_ascii_case(expected) {
         Ok(())
@@ -619,12 +757,11 @@ fn broadcast_settlement(
     let returned = broadcast_pending_transaction(session, cfg, &pending.settlement_hex)?;
     ensure_broadcast_txid("PHOTON settlement", &pending.settlement_txid, &returned)?;
     let fresh = session.fetch_live_job()?;
-    if resulting_baton_is_authoritative(pending, &fresh) {
+    if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
         Ok(SubmissionAttempt::Complete)
     } else {
         Err(
-            "settlement broadcast is known but the resulting PHOTON baton is not yet authoritative"
-                .into(),
+            "settlement broadcast is known but the resulting PHOTON baton is neither authoritative nor a proven ancestor of the live baton".into(),
         )
     }
 }
@@ -640,12 +777,11 @@ fn attempt_pending_submission(
     let settlement_known = session.transaction_known(&pending.settlement_txid)?;
     if settlement_known {
         let fresh = session.fetch_live_job()?;
-        if resulting_baton_is_authoritative(pending, &fresh) {
+        if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
             return Ok(SubmissionAttempt::Complete);
         }
         return Err(
-            "settlement transaction is known but the journaled resulting PHOTON baton is not authoritative"
-                .into(),
+            "settlement transaction is known but the journaled resulting PHOTON baton is neither authoritative nor a proven ancestor of the live baton".into(),
         );
     }
 
@@ -2060,6 +2196,23 @@ mod tests {
         }
     }
 
+    fn transaction_spending(txid: &str, vout: u32) -> String {
+        let mut previous = hex::decode(txid).unwrap();
+        previous.reverse();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.push(1);
+        raw.extend_from_slice(&previous);
+        raw.extend_from_slice(&vout.to_le_bytes());
+        raw.push(0);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        raw.push(1);
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.push(0);
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        hex::encode(raw)
+    }
+
     fn winner(generation_id: u64, job: &LiveJob) -> VerifiedWinner {
         VerifiedWinner {
             generation_id,
@@ -2383,6 +2536,56 @@ mod tests {
         let mut wrong_output = exact;
         wrong_output.baton_vout = 1;
         assert!(!resulting_baton_is_authoritative(&pending, &wrong_output));
+    }
+
+    #[test]
+    fn restart_recovery_accepts_only_proven_output_zero_baton_descendants() {
+        let settlement = "aa".repeat(32);
+        let child_raw = transaction_spending(&settlement, 0);
+        let child = reward::transaction_id(&hex::decode(&child_raw).unwrap());
+        let live_raw = transaction_spending(&child, 0);
+        let live = reward::transaction_id(&hex::decode(&live_raw).unwrap());
+
+        let proven = prove_baton_descends_from(&live, 0, &settlement, 0, |txid| {
+            if txid.eq_ignore_ascii_case(&live) {
+                Ok(live_raw.clone())
+            } else if txid.eq_ignore_ascii_case(&child) {
+                Ok(child_raw.clone())
+            } else {
+                Err(format!("unexpected lineage txid {txid}"))
+            }
+        })
+        .unwrap();
+        assert!(proven);
+
+        let wrong_link = transaction_spending(&settlement, 1);
+        let wrong_live = reward::transaction_id(&hex::decode(&wrong_link).unwrap());
+        assert!(
+            !prove_baton_descends_from(&wrong_live, 0, &settlement, 0, |_| {
+                Ok(wrong_link.clone())
+            })
+            .unwrap()
+        );
+        assert!(!prove_baton_descends_from(&live, 1, &settlement, 0, |_| {
+            panic!("wrong live baton output must fail before network lookup")
+        })
+        .unwrap());
+
+        let mismatched_claim = "dd".repeat(32);
+        let mismatch = prove_baton_descends_from(&mismatched_claim, 0, &settlement, 0, |_| {
+            Ok(live_raw.clone())
+        })
+        .unwrap_err();
+        assert!(mismatch.contains("do not match requested txid"));
+    }
+
+    #[test]
+    fn lineage_parser_reads_wire_endian_first_input_outpoint() {
+        let previous_txid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let raw = transaction_spending(previous_txid, 7);
+        let (parsed_txid, parsed_vout) = first_input_outpoint(&raw).unwrap();
+        assert_eq!(parsed_txid, previous_txid);
+        assert_eq!(parsed_vout, 7);
     }
 
     #[test]
