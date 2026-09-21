@@ -2,7 +2,7 @@
 //! The benchmark never reads live baton state and never broadcasts.
 
 use crate::cuda_photon::CudaPhotonEngine;
-use crate::{reward, search, tx};
+use crate::{reward, search, tui, tx};
 use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
 use std::process::Command;
@@ -57,8 +57,25 @@ pub struct BenchmarkReport {
     pub table_source: String,
     pub persistent_device_bytes: usize,
     pub samples: Vec<BenchmarkSample>,
+    pub ui_comparison: Option<UiComparison>,
     pub network_access: bool,
     pub broadcast: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UiComparison {
+    pub renderer: &'static str,
+    pub requested_seconds: u64,
+    pub draw_interval_millis: u64,
+    pub tui_draws: u64,
+    pub throughput_delta_percent: f64,
+    pub headless: BenchmarkSample,
+    pub tui: BenchmarkSample,
+}
+
+struct BenchmarkWindow {
+    sample: BenchmarkSample,
+    tui_draws: u64,
 }
 
 struct BenchmarkFixture {
@@ -267,10 +284,17 @@ fn run_intensity_window(
     intensity: u8,
     seconds: u64,
     nonce_base: &mut u32,
-) -> Result<BenchmarkSample, String> {
+    render_tui: bool,
+) -> Result<BenchmarkWindow, String> {
     let requested = Duration::from_secs(seconds);
     let batch_candidates = search::batch_candidates(intensity);
     let (telemetry_stop, telemetry_samples, telemetry_worker) = start_telemetry_sampler(device);
+    let tui_worker = render_tui.then(|| {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || tui::benchmark_render_load(worker_stop));
+        (stop, handle)
+    });
     let started = Instant::now();
     let mut candidates = 0u64;
     let mut batches = 0u64;
@@ -281,6 +305,10 @@ fn run_intensity_window(
         let result = match engine.search_batch(*nonce_base, batch_candidates) {
             Ok(result) => result,
             Err(error) => {
+                if let Some((stop, handle)) = tui_worker {
+                    stop.store(true, Ordering::Release);
+                    let _ = handle.join();
+                }
                 let _ =
                     finish_telemetry_sampler(telemetry_stop, telemetry_samples, telemetry_worker);
                 return Err(error);
@@ -300,22 +328,33 @@ fn run_intensity_window(
     }
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let tui_draws = if let Some((stop, handle)) = tui_worker {
+        stop.store(true, Ordering::Release);
+        handle
+            .join()
+            .map_err(|_| "Ratatui benchmark renderer panicked".to_string())??
+    } else {
+        0
+    };
     let telemetry = finish_telemetry_sampler(telemetry_stop, telemetry_samples, telemetry_worker);
     let candidates_per_second = candidates as f64 / elapsed;
     let candidates_per_watt = telemetry
         .power_watts
         .filter(|watts| *watts > 0.0)
         .map(|watts| candidates_per_second / watts);
-    Ok(BenchmarkSample {
-        intensity,
-        requested_seconds: seconds,
-        elapsed_seconds: elapsed,
-        candidates,
-        batches,
-        candidates_per_second,
-        candidates_per_watt,
-        gpu_winners: winners,
-        telemetry,
+    Ok(BenchmarkWindow {
+        sample: BenchmarkSample {
+            intensity,
+            requested_seconds: seconds,
+            elapsed_seconds: elapsed,
+            candidates,
+            batches,
+            candidates_per_second,
+            candidates_per_watt,
+            gpu_winners: winners,
+            telemetry,
+        },
+        tui_draws,
     })
 }
 
@@ -323,6 +362,7 @@ pub fn run_cuda_benchmark(
     device: u32,
     device_name: String,
     seconds: u64,
+    ui_compare: bool,
 ) -> Result<BenchmarkReport, String> {
     if !(1..=MAX_BENCHMARK_WINDOW_SECONDS).contains(&seconds) {
         return Err(format!(
@@ -349,14 +389,40 @@ pub fn run_cuda_benchmark(
 
     let mut samples = Vec::with_capacity(BENCHMARK_INTENSITIES.len());
     for intensity in BENCHMARK_INTENSITIES {
-        samples.push(run_intensity_window(
-            &mut engine,
-            device,
-            intensity,
-            seconds,
-            &mut nonce_base,
-        )?);
+        samples.push(
+            run_intensity_window(
+                &mut engine,
+                device,
+                intensity,
+                seconds,
+                &mut nonce_base,
+                false,
+            )?
+            .sample,
+        );
     }
+
+    let ui_comparison = if ui_compare {
+        let headless =
+            run_intensity_window(&mut engine, device, 100, seconds, &mut nonce_base, false)?;
+        let tui = run_intensity_window(&mut engine, device, 100, seconds, &mut nonce_base, true)?;
+        let throughput_delta_percent = if headless.sample.candidates_per_second > 0.0 {
+            (tui.sample.candidates_per_second / headless.sample.candidates_per_second - 1.0) * 100.0
+        } else {
+            0.0
+        };
+        Some(UiComparison {
+            renderer: "ratatui-crossterm-sink",
+            requested_seconds: seconds,
+            draw_interval_millis: tui::benchmark_draw_interval().as_millis() as u64,
+            tui_draws: tui.tui_draws,
+            throughput_delta_percent,
+            headless: headless.sample,
+            tui: tui.sample,
+        })
+    } else {
+        None
+    };
 
     Ok(BenchmarkReport {
         status: "PASS",
@@ -366,6 +432,7 @@ pub fn run_cuda_benchmark(
         table_source,
         persistent_device_bytes,
         samples,
+        ui_comparison,
         network_access: false,
         broadcast: false,
     })
@@ -412,6 +479,17 @@ pub fn print_report(report: &BenchmarkReport, json: bool) {
             fmt_metric(sample.telemetry.vram_used_mib, "MiB"),
         );
     }
+    if let Some(comparison) = &report.ui_comparison {
+        println!(
+            "Ratatui render comparison @100%: headless {:.0}/s, TUI {:.0}/s ({:+.2}%), {} draws every {} ms [{}]",
+            comparison.headless.candidates_per_second,
+            comparison.tui.candidates_per_second,
+            comparison.throughput_delta_percent,
+            comparison.tui_draws,
+            comparison.draw_interval_millis,
+            comparison.renderer,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -452,19 +530,20 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn benchmark_refuses_debug_measurements_before_gpu_initialization() {
-        let error = run_cuda_benchmark(0, "unused".into(), 1).unwrap_err();
+        let error = run_cuda_benchmark(0, "unused".into(), 1, false).unwrap_err();
         assert!(error.contains("release build"));
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn benchmark_accepts_one_hour_matrix_window_without_initializing_gpu() {
-        let accepted =
-            run_cuda_benchmark(0, "unused".into(), MAX_BENCHMARK_WINDOW_SECONDS).unwrap_err();
+        let accepted = run_cuda_benchmark(0, "unused".into(), MAX_BENCHMARK_WINDOW_SECONDS, false)
+            .unwrap_err();
         assert!(accepted.contains("release build"));
 
         let rejected =
-            run_cuda_benchmark(0, "unused".into(), MAX_BENCHMARK_WINDOW_SECONDS + 1).unwrap_err();
+            run_cuda_benchmark(0, "unused".into(), MAX_BENCHMARK_WINDOW_SECONDS + 1, false)
+                .unwrap_err();
         assert!(rejected.contains("1..=720"));
     }
 }

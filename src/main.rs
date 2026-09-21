@@ -956,7 +956,10 @@ fn main() {
                 }
             }
         }
-        cli::Commands::Benchmark { seconds } => {
+        cli::Commands::Benchmark {
+            seconds,
+            ui_compare,
+        } => {
             let selected = match backend::resolve_mining_device(backend_kind, args.device) {
                 Ok(device) => device,
                 Err(error) => {
@@ -970,7 +973,8 @@ fn main() {
                 );
                 std::process::exit(2);
             }
-            match benchmark::run_cuda_benchmark(selected.index, selected.name, seconds) {
+            match benchmark::run_cuda_benchmark(selected.index, selected.name, seconds, ui_compare)
+            {
                 Ok(report) => benchmark::print_report(&report, args.json),
                 Err(error) => {
                     eprintln!("error: benchmark failed: {error}");
