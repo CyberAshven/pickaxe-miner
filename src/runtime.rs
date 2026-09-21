@@ -10,12 +10,15 @@ use crate::config::{JobSource, RuntimeConfig};
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::reward;
 use crate::search::VerifiedWinner;
-use crate::search::{MiningState, RuntimeCommand as SearchCommand, SearchHandle, SearchStats};
+use crate::search::{
+    MiningState, RuntimeCommand as SearchCommand, SearchHandle, SearchPauseHandle, SearchStats,
+};
 use crate::tx;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -56,10 +59,42 @@ const PHOTON_TARGET_OFFSET: usize = 394;
 const BATON_LINEAGE_MAX_STEPS: usize = 256;
 const VERIFIED_WINNER_DURABILITY_READY: bool = true;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct NativePhotonWorkIdentity {
+    height: u32,
+    baton_txid: String,
+    baton_vout: u32,
+    baton_height: u32,
+    baton_value_sats: u64,
+    commitment_hex: String,
+    token_amount: u128,
+    age: u32,
+    target_le_hex: String,
+    reward_raw: u128,
+}
+
+impl From<&LiveJob> for NativePhotonWorkIdentity {
+    fn from(job: &LiveJob) -> Self {
+        Self {
+            height: job.height,
+            baton_txid: job.baton_txid.clone(),
+            baton_vout: job.baton_vout,
+            baton_height: job.baton_height,
+            baton_value_sats: job.baton_value_sats,
+            commitment_hex: job.commitment_hex.clone(),
+            token_amount: job.token_amount,
+            age: job.age,
+            target_le_hex: job.target_le_hex.clone(),
+            reward_raw: job.reward_raw,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativePhotonEquivalenceProof {
     endpoint: String,
     tip_hash: String,
+    proven_work: NativePhotonWorkIdentity,
 }
 
 impl NativePhotonEquivalenceProof {
@@ -84,7 +119,30 @@ impl NativePhotonEquivalenceProof {
         Ok(Self {
             endpoint: endpoint.to_string(),
             tip_hash: snapshot.tip_hash.to_ascii_lowercase(),
+            proven_work: NativePhotonWorkIdentity::from(&snapshot.job),
         })
+    }
+
+    fn validate_continuation(&self, snapshot: &LiveStateSnapshot) -> Result<(), String> {
+        if snapshot.job.url.trim() != self.endpoint {
+            return Err(format!(
+                "native PHOTON proof endpoint changed: proven={} current={}",
+                self.endpoint, snapshot.job.url
+            ));
+        }
+        if !snapshot.tip_hash.eq_ignore_ascii_case(&self.tip_hash) {
+            return Err(format!(
+                "native PHOTON tip changed outside canonical proof: proven={} current={}",
+                self.tip_hash, snapshot.tip_hash
+            ));
+        }
+        if self.proven_work != NativePhotonWorkIdentity::from(&snapshot.job) {
+            return Err(
+                "native PHOTON work changed outside canonical proof; canonical re-proof is required"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1430,10 +1488,35 @@ enum SupervisorCommand {
     Stop,
 }
 
+#[derive(Clone)]
+struct ShutdownSignal {
+    requested: Arc<AtomicBool>,
+    search_pause: SearchPauseHandle,
+}
+
+impl ShutdownSignal {
+    fn new(search_pause: SearchPauseHandle) -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            search_pause,
+        }
+    }
+
+    fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        self.search_pause.pause();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
 pub struct RuntimeSupervisor {
     command_tx: SyncSender<SupervisorCommand>,
     event_rx: Receiver<RuntimeEvent>,
     snapshot: Arc<Mutex<RuntimeSnapshot>>,
+    shutdown: ShutdownSignal,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -1494,6 +1577,7 @@ impl RuntimeSupervisor {
             initial_job,
         )?;
         let initial_search = search.snapshot();
+        let shutdown = ShutdownSignal::new(search.pause_handle());
         let initial_snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,
             gpu_backend: backend.as_str().into(),
@@ -1518,6 +1602,7 @@ impl RuntimeSupervisor {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAP);
         let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAP);
         let worker_snapshot = Arc::clone(&snapshot);
+        let worker_shutdown = shutdown.clone();
 
         let worker = thread::Builder::new()
             .name("pickaxe-live-supervisor".into())
@@ -1540,6 +1625,7 @@ impl RuntimeSupervisor {
                     command_rx,
                     event_tx,
                     worker_snapshot,
+                    worker_shutdown,
                 )
             })
             .map_err(|error| format!("start live PHOTON supervisor: {error}"))?;
@@ -1548,6 +1634,7 @@ impl RuntimeSupervisor {
             command_tx,
             event_rx,
             snapshot,
+            shutdown,
             worker: Some(worker),
         })
     }
@@ -1612,7 +1699,8 @@ impl RuntimeSupervisor {
     }
 
     pub fn stop(mut self) -> RuntimeSnapshot {
-        let _ = self.command_tx.send(SupervisorCommand::Stop);
+        self.shutdown.request();
+        let _ = self.command_tx.try_send(SupervisorCommand::Stop);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -1622,6 +1710,7 @@ impl RuntimeSupervisor {
 
 impl Drop for RuntimeSupervisor {
     fn drop(&mut self) {
+        self.shutdown.request();
         let _ = self.command_tx.try_send(SupervisorCommand::Stop);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1648,6 +1737,7 @@ fn run_supervisor(
     command_rx: Receiver<SupervisorCommand>,
     event_tx: SyncSender<RuntimeEvent>,
     shared_snapshot: Arc<Mutex<RuntimeSnapshot>>,
+    shutdown: ShutdownSignal,
 ) {
     let mut session = Some(initial_session);
     let mut state = if pending_submission.is_some() {
@@ -1669,10 +1759,14 @@ fn run_supervisor(
     let mut next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
     let mut submission_backoff = RECONNECT_MIN;
     let mut next_submission_retry = Instant::now();
-    let mut shutdown_requested = false;
     let mut stop = false;
 
     while !stop {
+        if shutdown.is_requested() {
+            user_paused = true;
+            let _ = search.apply_control(SearchCommand::Pause);
+            state = SupervisorState::Paused;
+        }
         loop {
             match command_rx.try_recv() {
                 Ok(SupervisorCommand::SetIntensity(value, reply)) => {
@@ -1691,7 +1785,9 @@ fn run_supervisor(
                 }
                 Ok(SupervisorCommand::Resume(reply)) => {
                     user_paused = false;
-                    let result = if session.is_none() {
+                    let result = if shutdown.is_requested() {
+                        Err("cannot resume while shutdown is requested".into())
+                    } else if session.is_none() {
                         Err("cannot resume while authoritative PHOTON state is disconnected".into())
                     } else if pending_winners > 0 {
                         Err("cannot resume while a verified winner is pending handling".into())
@@ -1814,7 +1910,7 @@ fn run_supervisor(
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Stop) | Err(TryRecvError::Disconnected) => {
-                    shutdown_requested = true;
+                    shutdown.request();
                     user_paused = true;
                     let _ = search.apply_control(SearchCommand::Pause);
                     state = SupervisorState::Paused;
@@ -1823,7 +1919,7 @@ fn run_supervisor(
                 Err(TryRecvError::Empty) => break,
             }
         }
-        if shutdown_requested
+        if shutdown.is_requested()
             && shutdown_can_exit(pending_winner.is_some(), search.batch_in_flight())
         {
             stop = true;
@@ -1859,7 +1955,7 @@ fn run_supervisor(
                                 }
                                 emit(&event_tx, RuntimeEvent::Reconnected(live.url.clone()));
                                 next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
-                                if !user_paused && pending_winners == 0 {
+                                if search_resume_allowed(&shutdown, user_paused, pending_winners) {
                                     let _ = search.apply_control(SearchCommand::Resume);
                                     state = SupervisorState::Mining;
                                 } else {
@@ -1977,7 +2073,11 @@ fn run_supervisor(
                                             stale_rebuilds = stale_rebuilds.saturating_add(1);
                                         }
                                         next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
-                                        if user_paused {
+                                        if !search_resume_allowed(
+                                            &shutdown,
+                                            user_paused,
+                                            pending_winners,
+                                        ) {
                                             state = SupervisorState::Paused;
                                         } else {
                                             let _ = search.apply_control(SearchCommand::Resume);
@@ -2033,7 +2133,11 @@ fn run_supervisor(
                                             stale_rebuilds = stale_rebuilds.saturating_add(1);
                                         }
                                         next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
-                                        if user_paused {
+                                        if !search_resume_allowed(
+                                            &shutdown,
+                                            user_paused,
+                                            pending_winners,
+                                        ) {
                                             state = SupervisorState::Paused;
                                         } else {
                                             let _ = search.apply_control(SearchCommand::Resume);
@@ -2185,7 +2289,9 @@ fn run_supervisor(
                             if pending_winners == 0 && boundary.route_warning.is_none() {
                                 last_error = None;
                             }
-                            if changed && session.is_some() && !user_paused && pending_winners == 0
+                            if changed
+                                && session.is_some()
+                                && search_resume_allowed(&shutdown, user_paused, pending_winners)
                             {
                                 let _ = search.apply_control(SearchCommand::Resume);
                                 state = SupervisorState::Mining;
@@ -2337,22 +2443,25 @@ fn refresh_native_with_current_proof(
     now_ms: u64,
     latency_ms: u32,
 ) -> Result<LiveStateSnapshot, String> {
-    if !sources.supports_at(
-        SourceKind::NativeNode,
-        endpoint,
-        SourceCapability::PhotonState,
-        now_ms,
-    ) {
-        return Err(
-            "native-node PHOTON continuity requires a current canonical equivalence proof".into(),
-        );
-    }
+    let proof = sources
+        .native_photon_proof_at(endpoint, now_ms)
+        .cloned()
+        .ok_or_else(|| {
+            "native-node PHOTON continuity requires a current canonical equivalence proof"
+                .to_string()
+        })?;
 
     match native_result {
         Ok(snapshot) => {
             // A native-only refresh proves liveness, not canonical equivalence. Keep the
             // original capability expiry so Fulcrum must be available again before the
-            // proof lease can be renewed.
+            // proof lease can be renewed. The lease remains bound to the exact proven
+            // tip/work state; a changed native snapshot requires canonical re-proof.
+            if let Err(error) = proof.validate_continuation(&snapshot) {
+                let _ = sources.revoke_native_photon_capability(endpoint);
+                let _ = sources.record_failure(SourceKind::NativeNode, endpoint, now_ms);
+                return Err(error);
+            }
             sources.record_success(SourceKind::NativeNode, endpoint, now_ms, latency_ms)?;
             Ok(snapshot)
         }
@@ -2585,6 +2694,14 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
 
 fn shutdown_can_exit(pending_winner: bool, batch_in_flight: bool) -> bool {
     !pending_winner && !batch_in_flight
+}
+
+fn search_resume_allowed(
+    shutdown: &ShutdownSignal,
+    user_paused: bool,
+    pending_winners: u64,
+) -> bool {
+    !shutdown.is_requested() && !user_paused && pending_winners == 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2943,6 +3060,64 @@ mod tests {
     }
 
     #[test]
+    fn native_outage_continuity_rejects_unproven_state_change_inside_lease() {
+        let endpoint = "http://node.invalid";
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_node_url(endpoint).unwrap();
+        let mut sources = SourceCatalog::configured(&cfg).unwrap();
+        let canonical = live_snapshot("wss://fulcrum.invalid");
+        let native = live_snapshot(endpoint);
+        record_canonical_fulcrum_probe(&mut sources, &canonical, 1_000, 50).unwrap();
+        let (accepted, error) = record_native_photon_probe(
+            &mut sources,
+            endpoint,
+            &canonical,
+            Ok(native.clone()),
+            1_000,
+            2,
+        );
+        assert!(error.is_none());
+        assert!(accepted.is_some());
+
+        let mut advanced_tip = native.clone();
+        advanced_tip.tip_hash = "55".repeat(32);
+        let error =
+            refresh_native_with_current_proof(&mut sources, endpoint, Ok(advanced_tip), 1_001, 2)
+                .unwrap_err();
+        assert!(error.contains("tip changed outside canonical proof"));
+        assert!(!sources.supports_at(
+            SourceKind::NativeNode,
+            endpoint,
+            SourceCapability::PhotonState,
+            1_001
+        ));
+
+        let (accepted, error) = record_native_photon_probe(
+            &mut sources,
+            endpoint,
+            &canonical,
+            Ok(native.clone()),
+            2_000,
+            2,
+        );
+        assert!(error.is_none());
+        assert!(accepted.is_some());
+
+        let mut advanced_baton = native;
+        advanced_baton.job.baton_txid = "66".repeat(32);
+        let error =
+            refresh_native_with_current_proof(&mut sources, endpoint, Ok(advanced_baton), 2_001, 2)
+                .unwrap_err();
+        assert!(error.contains("work changed outside canonical proof"));
+        assert!(!sources.supports_at(
+            SourceKind::NativeNode,
+            endpoint,
+            SourceCapability::PhotonState,
+            2_001
+        ));
+    }
+
+    #[test]
     fn route_only_refresh_skips_generation_transition_and_preflight() {
         let (cfg, job, _secret, _public, _mining_payout, _journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -3173,6 +3348,17 @@ mod tests {
         assert!(!shutdown_can_exit(true, false));
         assert!(!shutdown_can_exit(false, true));
         assert!(!shutdown_can_exit(true, true));
+    }
+
+    #[test]
+    fn shutdown_signal_pauses_search_immediately_and_blocks_resume() {
+        let paused = Arc::new(AtomicBool::new(false));
+        let shutdown = ShutdownSignal::new(SearchPauseHandle::from_shared(Arc::clone(&paused)));
+        assert!(search_resume_allowed(&shutdown, false, 0));
+        shutdown.request();
+        assert!(shutdown.is_requested());
+        assert!(paused.load(Ordering::SeqCst));
+        assert!(!search_resume_allowed(&shutdown, false, 0));
     }
 
     #[test]
