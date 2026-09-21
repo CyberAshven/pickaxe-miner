@@ -561,11 +561,61 @@ fn broadcast_pending_transaction(
     )
 }
 
+fn validate_node_mempool_acceptance(
+    label: &str,
+    expected_txid: &str,
+    endpoint: &str,
+    acceptance: &crate::node::MempoolAcceptance,
+) -> Result<(), String> {
+    if !acceptance.txid.eq_ignore_ascii_case(expected_txid) {
+        return Err(format!(
+            "{label} mempool preflight via {endpoint} returned unexpected txid {}; expected {expected_txid}",
+            acceptance.txid
+        ));
+    }
+    if acceptance.allowed {
+        return Ok(());
+    }
+
+    let reason = acceptance
+        .reject_reason
+        .as_deref()
+        .unwrap_or("node did not provide a rejection reason");
+    let details = acceptance
+        .reject_details
+        .as_deref()
+        .map(|value| format!(" ({value})"))
+        .unwrap_or_default();
+    Err(format!(
+        "{label} rejected by native-node mempool preflight via {endpoint}: {reason}{details}"
+    ))
+}
+
+fn preflight_pending_transaction(
+    cfg: &RuntimeConfig,
+    label: &str,
+    expected_txid: &str,
+    raw_tx_hex: &str,
+) -> Result<(), String> {
+    let endpoints = cfg.node_endpoints();
+    if endpoints.is_empty() {
+        return Ok(());
+    }
+    let (endpoint, acceptance) = crate::node::test_mempool_accept(&endpoints, raw_tx_hex)?;
+    validate_node_mempool_acceptance(label, expected_txid, &endpoint, &acceptance)
+}
+
 fn broadcast_settlement(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
     pending: &PendingSubmission,
 ) -> Result<SubmissionAttempt, String> {
+    preflight_pending_transaction(
+        cfg,
+        "PHOTON settlement",
+        &pending.settlement_txid,
+        &pending.settlement_hex,
+    )?;
     let returned = broadcast_pending_transaction(session, cfg, &pending.settlement_hex)?;
     ensure_broadcast_txid("PHOTON settlement", &pending.settlement_txid, &returned)?;
     let fresh = session.fetch_live_job()?;
@@ -640,7 +690,15 @@ fn attempt_pending_submission(
         return Ok(SubmissionAttempt::StaleUnbroadcast(fresh));
     }
 
-    pending.mark_parent_attempted(journal_path)?;
+    if !parent_attempted {
+        preflight_pending_transaction(
+            cfg,
+            "PHOTON parent",
+            &pending.parent_txid,
+            &pending.parent_hex,
+        )?;
+        pending.mark_parent_attempted(journal_path)?;
+    }
     let returned_parent = broadcast_pending_transaction(session, cfg, &pending.parent_hex)?;
     ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned_parent)?;
     pending.mark_parent_accepted(journal_path)?;
@@ -2343,6 +2401,50 @@ mod tests {
         .unwrap();
         assert_eq!(returned, "bb".repeat(32));
         assert_eq!(&*calls.borrow(), &["fulcrum", "node"]);
+    }
+
+    #[test]
+    fn native_node_mempool_preflight_requires_exact_txid_and_policy_acceptance() {
+        let expected_txid = "aa".repeat(32);
+        let allowed = crate::node::MempoolAcceptance {
+            txid: expected_txid.clone(),
+            allowed: true,
+            size: Some(615),
+            vsize: Some(615),
+            reject_reason: None,
+            reject_details: None,
+        };
+        validate_node_mempool_acceptance("PHOTON parent", &expected_txid, "http://node", &allowed)
+            .unwrap();
+
+        let mut mismatch = allowed.clone();
+        mismatch.txid = "bb".repeat(32);
+        let error = validate_node_mempool_acceptance(
+            "PHOTON parent",
+            &expected_txid,
+            "http://node",
+            &mismatch,
+        )
+        .unwrap_err();
+        assert!(error.contains("unexpected txid"));
+
+        let rejected = crate::node::MempoolAcceptance {
+            txid: expected_txid.clone(),
+            allowed: false,
+            size: None,
+            vsize: None,
+            reject_reason: Some("dust".into()),
+            reject_details: Some("policy floor".into()),
+        };
+        let error = validate_node_mempool_acceptance(
+            "PHOTON settlement",
+            &expected_txid,
+            "http://node",
+            &rejected,
+        )
+        .unwrap_err();
+        assert!(error.contains("dust"));
+        assert!(error.contains("policy floor"));
     }
 
     #[test]
