@@ -10,17 +10,24 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
-    Frame, Terminal,
+    Frame, Terminal, TerminalOptions, Viewport,
 };
 use std::{
     collections::VecDeque,
     io::{self, Stdout},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
 const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EVENT_HISTORY_CAP: usize = 96;
+const BENCHMARK_TERMINAL_WIDTH: u16 = 120;
+const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
 
 type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -170,6 +177,77 @@ pub fn run(supervisor: RuntimeSupervisor) -> Result<RuntimeSnapshot, String> {
 
     drop(terminal);
     Ok(supervisor.stop())
+}
+
+pub(crate) fn benchmark_draw_interval() -> Duration {
+    DRAW_INTERVAL
+}
+
+pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String> {
+    let mut snapshot = RuntimeSnapshot {
+        state: SupervisorState::Mining,
+        gpu_backend: "cuda".into(),
+        gpu_device: 0,
+        generation_id: 1,
+        payout_address: "bitcoincash:qbenchmark".into(),
+        endpoint: "offline-benchmark".into(),
+        height: 1,
+        baton_txid: "00".repeat(32),
+        baton_vout: 0,
+        refreshes: 1,
+        stale_rebuilds: 0,
+        reconnects: 0,
+        stale_winners: 0,
+        verified_winners: 0,
+        pending_winners: 0,
+        last_error: None,
+        search: Default::default(),
+    };
+    snapshot.search.intensity = 100;
+    snapshot.search.rate = 500_000.0;
+
+    let mut state = TuiState::new(&snapshot);
+    let backend = CrosstermBackend::new(io::sink());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(
+                0,
+                0,
+                BENCHMARK_TERMINAL_WIDTH,
+                BENCHMARK_TERMINAL_HEIGHT,
+            )),
+        },
+    )
+    .map_err(|error| format!("create Ratatui benchmark terminal: {error}"))?;
+    let started = Instant::now();
+    let mut next_draw = Instant::now();
+    let mut draws = 0u64;
+
+    while !stop.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now >= next_draw {
+            draws = draws.saturating_add(1);
+            snapshot.search.candidates = draws.saturating_mul(100_000);
+            snapshot.search.batches = draws;
+            snapshot.search.elapsed_secs = started.elapsed().as_secs();
+            state.update_rates(&snapshot);
+            terminal
+                .draw(|frame| render(frame, &snapshot, &state))
+                .map_err(|error| format!("draw Ratatui benchmark frame: {error}"))?;
+            next_draw += DRAW_INTERVAL;
+            continue;
+        }
+
+        let sleep_for = next_draw
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(10));
+        if !sleep_for.is_zero() {
+            thread::sleep(sleep_for);
+        }
+    }
+
+    Ok(draws)
 }
 
 fn handle_key(

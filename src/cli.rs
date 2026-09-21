@@ -44,6 +44,8 @@ pub enum Commands {
     Benchmark {
         #[arg(long, default_value_t = 5)]
         seconds: u64,
+        #[arg(long)]
+        ui_compare: bool,
     },
     Config {
         #[command(subcommand)]
@@ -127,9 +129,30 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Some(Commands::Benchmark { seconds: 7 })
+            Some(Commands::Benchmark {
+                seconds: 7,
+                ui_compare: false
+            })
         ));
         assert_eq!(cli.backend, "cuda");
+
+        let ui = Cli::try_parse_from([
+            "pickaxe",
+            "benchmark",
+            "--backend",
+            "cuda",
+            "--seconds",
+            "3",
+            "--ui-compare",
+        ])
+        .unwrap();
+        assert!(matches!(
+            ui.command,
+            Some(Commands::Benchmark {
+                seconds: 3,
+                ui_compare: true
+            })
+        ));
     }
 
     #[test]
