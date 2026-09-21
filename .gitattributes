@@ -1,0 +1,5 @@
+﻿# Third-party/reference PHOTON implementation and upstream source.
+reference/** linguist-vendored
+
+# Generated CUDA compiler output.
+cuda/build/** linguist-generated
