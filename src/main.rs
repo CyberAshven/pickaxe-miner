@@ -64,7 +64,7 @@ fn print_help() {
   dryrun                       connect+job + proven 2-output tx preview (no broadcast)
 arm                          like dryrun + message SHA256 for Schnorr (no keys)
 applysig <nonce> <pk33hex> <sig64hex>  verify+arm proven 2-output winner (no broadcast)
-  broadcast [rawhex]             submit last armed tx/hex (Fulcrum then node)
+  broadcast                      recheck and submit last verified armed winner
   start                        Start GPU search (uses last job if present)
   stop                         Stop search
   split <reward_raw>           Preview 98%/2% split for a raw reward amount
@@ -257,6 +257,13 @@ fn print_donation() {
     println!("  blocker:        {}", tx::DONATION_SPLIT_BLOCKER);
 }
 
+fn selected_armed_hex(args: &[&str], armed: Option<&ArmedTx>) -> Option<String> {
+    if args.is_empty() {
+        armed.map(|candidate| candidate.raw_hex.clone())
+    } else {
+        None
+    }
+}
 fn handle_line(
     cfg: &mut RuntimeConfig,
     handle: &mut Option<SearchHandle>,
@@ -279,11 +286,7 @@ fn handle_line(
 
         "broadcast" => {
             let args: Vec<&str> = parts.collect();
-            let hex_opt = if args.is_empty() {
-                armed.as_ref().map(|candidate| candidate.raw_hex.clone())
-            } else {
-                Some(args.join(""))
-            };
+            let hex_opt = selected_armed_hex(&args, armed.as_ref());
             if args.is_empty() && armed.is_some() {
                 let cached = armed.as_ref().expect("checked above").clone();
                 if let Err(error) = refresh_live_job(cfg, live) {
@@ -299,7 +302,7 @@ fn handle_line(
             }
             match hex_opt {
                 None => {
-                    println!("nothing to broadcast ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â run applysig first or: broadcast <rawhex>")
+                    println!("nothing to broadcast ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â run applysig first")
                 }
                 Some(hx) => match broadcast_raw_with_fallback(cfg, &hx) {
                     Ok(result) => {
@@ -939,5 +942,19 @@ mod tests {
         assert!(armed
             .validate_current(&same_generation, Some(&different_baton))
             .is_err());
+    }
+    #[test]
+    fn explicit_payload_is_not_selected() {
+        let armed = ArmedTx {
+            raw_hex: "abcd".into(),
+            generation_id: 1,
+            baton_txid: "11".repeat(32),
+            baton_vout: 0,
+        };
+        assert_eq!(
+            selected_armed_hex(&[], Some(&armed)).as_deref(),
+            Some("abcd")
+        );
+        assert!(selected_armed_hex(&["00"], Some(&armed)).is_none());
     }
 }
