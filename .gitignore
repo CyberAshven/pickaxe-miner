@@ -5,6 +5,7 @@ Thumbs.db
 *.pdb
 .env
 .env.*
+/artifacts/
 
 cuda/build/
 *.obj

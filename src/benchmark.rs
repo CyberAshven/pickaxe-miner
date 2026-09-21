@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 const TX_BYTES: usize = 615;
 const TARGET_OFFSET: usize = 394;
 const BENCHMARK_INTENSITIES: [u8; 5] = [10, 25, 50, 75, 100];
+const MAX_BENCHMARK_WINDOW_SECONDS: u64 = 12 * 60;
 const WINNER_BUFFER_CAP: u32 = 8;
 const VECTOR_BATON_TXID: &str = "000000124712ae4765fe9789372faebca19c99cc1d59f43df2508bf5c42ea042";
 const VECTOR_TARGET_LE: &str = "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000";
@@ -323,8 +324,10 @@ pub fn run_cuda_benchmark(
     device_name: String,
     seconds: u64,
 ) -> Result<BenchmarkReport, String> {
-    if !(1..=300).contains(&seconds) {
-        return Err("benchmark --seconds must be 1..=300".into());
+    if !(1..=MAX_BENCHMARK_WINDOW_SECONDS).contains(&seconds) {
+        return Err(format!(
+            "benchmark --seconds must be 1..={MAX_BENCHMARK_WINDOW_SECONDS}"
+        ));
     }
     if cfg!(debug_assertions) {
         return Err("benchmark requires an optimized release build".into());
@@ -418,6 +421,10 @@ mod tests {
     #[test]
     fn benchmark_matrix_covers_required_intensities() {
         assert_eq!(BENCHMARK_INTENSITIES, [10, 25, 50, 75, 100]);
+        assert_eq!(
+            BENCHMARK_INTENSITIES.len() as u64 * MAX_BENCHMARK_WINDOW_SECONDS,
+            60 * 60
+        );
     }
 
     #[test]
@@ -447,5 +454,17 @@ mod tests {
     fn benchmark_refuses_debug_measurements_before_gpu_initialization() {
         let error = run_cuda_benchmark(0, "unused".into(), 1).unwrap_err();
         assert!(error.contains("release build"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn benchmark_accepts_one_hour_matrix_window_without_initializing_gpu() {
+        let accepted =
+            run_cuda_benchmark(0, "unused".into(), MAX_BENCHMARK_WINDOW_SECONDS).unwrap_err();
+        assert!(accepted.contains("release build"));
+
+        let rejected =
+            run_cuda_benchmark(0, "unused".into(), MAX_BENCHMARK_WINDOW_SECONDS + 1).unwrap_err();
+        assert!(rejected.contains("1..=720"));
     }
 }
