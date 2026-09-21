@@ -751,14 +751,13 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
                 height,
                 baton_txid,
                 baton_vout,
-                changed,
             } => serde_json::json!({
                 "event": "job_refreshed",
                 "generation_id": generation_id,
                 "height": height,
                 "baton_txid": baton_txid,
                 "baton_vout": baton_vout,
-                "changed": changed,
+                "changed": true,
             }),
             runtime::RuntimeEvent::Reconnecting(error) => {
                 serde_json::json!({"event": "reconnecting", "error": error})
@@ -805,13 +804,10 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             height,
             baton_txid,
             baton_vout,
-            changed,
         } => {
-            if changed {
-                println!(
-                    "live PHOTON work updated: generation={generation_id} height={height} baton={baton_txid}:{baton_vout}"
-                );
-            }
+            println!(
+                "live PHOTON work updated: generation={generation_id} height={height} baton={baton_txid}:{baton_vout}"
+            );
         }
         runtime::RuntimeEvent::Reconnecting(error) => {
             eprintln!("PHOTON state refresh failed; GPU held at batch boundary: {error}");

@@ -30,6 +30,9 @@ use std::{
 const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EVENT_HISTORY_CAP: usize = 96;
+const RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(150);
+const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(2);
+const RATE_HISTORY_CAP: usize = 32;
 const BENCHMARK_TERMINAL_WIDTH: u16 = 120;
 const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
 
@@ -248,8 +251,8 @@ struct TuiState {
     settings_mode: bool,
     status_line: String,
     events: VecDeque<String>,
-    last_sample: Instant,
-    last_candidates: u64,
+    last_rate_sample: Instant,
+    rate_samples: VecDeque<(Instant, u64)>,
     current_rate: f64,
     peak_rate: f64,
 }
@@ -258,6 +261,9 @@ impl TuiState {
     fn new(snapshot: &RuntimeSnapshot) -> Self {
         let mut events = VecDeque::with_capacity(EVENT_HISTORY_CAP);
         events.push_back("Runtime started; authoritative PHOTON state is supervised.".into());
+        let now = Instant::now();
+        let mut rate_samples = VecDeque::with_capacity(RATE_HISTORY_CAP);
+        rate_samples.push_back((now, snapshot.search.candidates));
         Self {
             command_mode: false,
             command_input: String::new(),
@@ -265,8 +271,8 @@ impl TuiState {
             settings_mode: false,
             status_line: "Donation: 2%".into(),
             events,
-            last_sample: Instant::now(),
-            last_candidates: snapshot.search.candidates,
+            last_rate_sample: now,
+            rate_samples,
             current_rate: 0.0,
             peak_rate: snapshot.search.rate,
         }
@@ -280,20 +286,43 @@ impl TuiState {
     }
 
     fn update_rates(&mut self, snapshot: &RuntimeSnapshot) {
-        let elapsed = self.last_sample.elapsed().as_secs_f64();
-        if elapsed >= 0.15 {
-            let completed = snapshot
-                .search
-                .candidates
-                .saturating_sub(self.last_candidates);
-            self.current_rate = completed as f64 / elapsed;
-            self.peak_rate = self
-                .peak_rate
-                .max(self.current_rate)
-                .max(snapshot.search.rate);
-            self.last_candidates = snapshot.search.candidates;
-            self.last_sample = Instant::now();
+        if self.last_rate_sample.elapsed() < RATE_SAMPLE_INTERVAL {
+            return;
         }
+
+        let now = Instant::now();
+        if self.rate_samples.len() == RATE_HISTORY_CAP {
+            self.rate_samples.pop_front();
+        }
+        self.rate_samples
+            .push_back((now, snapshot.search.candidates));
+
+        while self.rate_samples.len() > 2 {
+            let Some((sample_time, _)) = self.rate_samples.front() else {
+                break;
+            };
+            if now.duration_since(*sample_time) <= CURRENT_RATE_WINDOW {
+                break;
+            }
+            self.rate_samples.pop_front();
+        }
+
+        if let Some((sample_time, sample_candidates)) = self.rate_samples.front() {
+            let elapsed = now.duration_since(*sample_time).as_secs_f64();
+            if elapsed > 0.0 {
+                let completed = snapshot
+                    .search
+                    .candidates
+                    .saturating_sub(*sample_candidates);
+                self.current_rate = completed as f64 / elapsed;
+            }
+        }
+
+        self.peak_rate = self
+            .peak_rate
+            .max(self.current_rate)
+            .max(snapshot.search.rate);
+        self.last_rate_sample = now;
     }
 }
 
@@ -880,7 +909,7 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, s
             snapshot.search.candidates, snapshot.search.batches, snapshot.search.elapsed_secs
         )),
         Line::from(format!(
-            "generation: {}   height: {}   refreshes: {}",
+            "generation: {}   height: {}   state checks: {}",
             snapshot.generation_id, snapshot.height, snapshot.refreshes
         )),
         Line::from(format!(
@@ -1035,18 +1064,11 @@ fn format_event(event: RuntimeEvent) -> String {
             height,
             baton_txid,
             baton_vout,
-            changed,
-        } => {
-            if changed {
-                format!(
-                    "job updated: gen={generation_id} height={height} baton={}:{}",
-                    shorten(&baton_txid, 18),
-                    baton_vout
-                )
-            } else {
-                format!("job refreshed: gen={generation_id} height={height}")
-            }
-        }
+        } => format!(
+            "job updated: gen={generation_id} height={height} baton={}:{}",
+            shorten(&baton_txid, 18),
+            baton_vout
+        ),
         RuntimeEvent::Reconnecting(error) => format!("reconnecting: {error}"),
         RuntimeEvent::Reconnected(endpoint) => {
             format!("reconnected: {}", redact_endpoint(&endpoint))
@@ -1281,5 +1303,53 @@ mod tests {
         }
         assert_eq!(state.events.len(), EVENT_HISTORY_CAP);
         assert_eq!(state.events.back().unwrap(), "event 115");
+    }
+
+    #[test]
+    fn current_rate_uses_bounded_rolling_window_between_batch_completions() {
+        let mut snapshot = RuntimeSnapshot {
+            state: SupervisorState::Mining,
+            gpu_backend: "cuda".into(),
+            gpu_device: 0,
+            generation_id: 1,
+            payout_address: "bitcoincash:qexample".into(),
+            endpoint: "wss://example.test".into(),
+            height: 1,
+            baton_txid: "00".repeat(32),
+            baton_vout: 0,
+            refreshes: 0,
+            stale_rebuilds: 0,
+            reconnects: 0,
+            stale_winners: 0,
+            verified_winners: 0,
+            pending_winners: 0,
+            last_error: None,
+            search: Default::default(),
+        };
+        let mut state = TuiState::new(&snapshot);
+        let now = Instant::now();
+        state.rate_samples.clear();
+        state
+            .rate_samples
+            .push_back((now - Duration::from_secs(1), 0));
+        state.last_rate_sample = now - RATE_SAMPLE_INTERVAL - Duration::from_millis(1);
+
+        snapshot.search.candidates = 100_000;
+        state.update_rates(&snapshot);
+        assert!(state.current_rate > 0.0);
+
+        state.last_rate_sample = Instant::now() - RATE_SAMPLE_INTERVAL - Duration::from_millis(1);
+        state.update_rates(&snapshot);
+        assert!(
+            state.current_rate > 0.0,
+            "a render between GPU batch completions must retain the rolling rate"
+        );
+
+        for _ in 0..(RATE_HISTORY_CAP * 2) {
+            state.last_rate_sample =
+                Instant::now() - RATE_SAMPLE_INTERVAL - Duration::from_millis(1);
+            state.update_rates(&snapshot);
+        }
+        assert!(state.rate_samples.len() <= RATE_HISTORY_CAP);
     }
 }

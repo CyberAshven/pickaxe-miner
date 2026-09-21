@@ -1390,7 +1390,6 @@ pub enum RuntimeEvent {
         height: u32,
         baton_txid: String,
         baton_vout: u32,
-        changed: bool,
     },
     Reconnecting(String),
     Reconnected(String),
@@ -2105,15 +2104,11 @@ fn run_supervisor(
                             if changed {
                                 stale_rebuilds = stale_rebuilds.saturating_add(1);
                             }
-                            emit(
+                            emit_job_change_if_changed(
                                 &event_tx,
-                                RuntimeEvent::JobRefreshed {
-                                    generation_id: cfg.generation_id,
-                                    height: live.height,
-                                    baton_txid: live.baton_txid.clone(),
-                                    baton_vout: live.baton_vout,
-                                    changed,
-                                },
+                                changed,
+                                cfg.generation_id,
+                                &live,
                             );
 
                             for winner in search.drain_winners() {
@@ -2172,7 +2167,8 @@ fn run_supervisor(
                             if pending_winners == 0 && boundary.native_error.is_none() {
                                 last_error = None;
                             }
-                            if session.is_some() && !user_paused && pending_winners == 0 {
+                            if changed && session.is_some() && !user_paused && pending_winners == 0
+                            {
                                 let _ = search.apply_control(SearchCommand::Resume);
                                 state = SupervisorState::Mining;
                             }
@@ -2531,9 +2527,29 @@ fn emit(tx: &SyncSender<RuntimeEvent>, event: RuntimeEvent) {
     }
 }
 
+fn emit_job_change_if_changed(
+    tx: &SyncSender<RuntimeEvent>,
+    changed: bool,
+    generation_id: u64,
+    live: &LiveJob,
+) {
+    if changed {
+        emit(
+            tx,
+            RuntimeEvent::JobRefreshed {
+                generation_id,
+                height: live.height,
+                baton_txid: live.baton_txid.clone(),
+                baton_vout: live.baton_vout,
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::sync_channel;
 
     const TEST_PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
 
@@ -2561,6 +2577,32 @@ mod tests {
             tip_hash: "22".repeat(32),
             job,
         }
+    }
+
+    #[test]
+    fn unchanged_state_check_emits_no_job_change_event() {
+        let job = live_job();
+        let (event_tx, event_rx) = sync_channel(1);
+
+        emit_job_change_if_changed(&event_tx, false, 7, &job);
+        assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        emit_job_change_if_changed(&event_tx, true, 8, &job);
+        match event_rx.try_recv().expect("changed state must emit once") {
+            RuntimeEvent::JobRefreshed {
+                generation_id,
+                height,
+                baton_txid,
+                baton_vout,
+            } => {
+                assert_eq!(generation_id, 8);
+                assert_eq!(height, job.height);
+                assert_eq!(baton_txid, job.baton_txid);
+                assert_eq!(baton_vout, job.baton_vout);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     fn transaction_spending(txid: &str, vout: u32) -> String {
