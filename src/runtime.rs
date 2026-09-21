@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)]
 mod source_pool;
 
-use self::source_pool::{SourceCapability, SourceCatalog, SourceKind};
+use self::source_pool::{SourceCatalog, SourceKind, AUTO_PROBE_LIMIT};
 
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
@@ -1410,13 +1410,10 @@ impl RuntimeSupervisor {
         }
         require_complete_live_winner_lifecycle()?;
 
-        let mut sources = SourceCatalog::configured(&cfg)?;
-        if let Some(endpoint) = cfg.fulcrum_url.as_deref() {
-            sources.add_user(SourceKind::Fulcrum, endpoint, "Configured Fulcrum")?;
-        }
-        let router = sources.router();
-        let endpoints = router
-            .candidates(SourceCapability::PhotonState, 0)
+        let sources = SourceCatalog::configured(&cfg)?;
+        let rotation_key = u64::from(std::process::id()).wrapping_add(cfg.generation_id);
+        let endpoints = sources
+            .probe_candidates(SourceKind::Fulcrum, 0, AUTO_PROBE_LIMIT, rotation_key)
             .into_iter()
             .map(|entry| entry.endpoint.clone())
             .collect::<Vec<_>>();
@@ -2312,9 +2309,9 @@ fn prepare_fulcrum_endpoint_change(
         return Ok(None);
     }
     let sources = SourceCatalog::configured(&next)?;
-    let router = sources.router();
-    let endpoints = router
-        .candidates(SourceCapability::PhotonState, 0)
+    let rotation_key = u64::from(std::process::id()).wrapping_add(next.generation_id);
+    let endpoints = sources
+        .probe_candidates(SourceKind::Fulcrum, 0, AUTO_PROBE_LIMIT, rotation_key)
         .into_iter()
         .map(|entry| entry.endpoint.clone())
         .collect();
