@@ -233,6 +233,101 @@ fn refresh_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>) -> Resu
     Ok(())
 }
 
+fn sync_search_job(
+    cfg: &RuntimeConfig,
+    handle: Option<&SearchHandle>,
+    live: Option<&LiveJob>,
+) -> Result<(), String> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    if handle.generation_id() == cfg.generation_id {
+        return Ok(());
+    }
+    let live = live.ok_or("cannot update GPU generation without a live PHOTON job")?;
+    let job = live.to_mining_job(cfg.generation_id, &cfg.payout_address);
+    if let Err(error) = handle.replace_job(job) {
+        let _ = handle.apply_control(search::RuntimeCommand::Pause);
+        return Err(format!(
+            "failed to apply GPU generation {}; search paused: {error}",
+            cfg.generation_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_verified_winner_current(
+    winner: &search::VerifiedWinner,
+    cfg: &RuntimeConfig,
+    live: Option<&LiveJob>,
+) -> Result<(), String> {
+    if winner.generation_id != cfg.generation_id {
+        return Err(format!(
+            "winner generation {} is stale; current generation is {}",
+            winner.generation_id, cfg.generation_id
+        ));
+    }
+    let live = live.ok_or("no current PHOTON baton job")?;
+    if winner.height != live.height {
+        return Err(format!(
+            "winner BCH height {} is stale; current height is {}",
+            winner.height, live.height
+        ));
+    }
+    if winner.baton_txid != live.baton_txid || winner.baton_vout != live.baton_vout {
+        return Err("winner PHOTON baton outpoint is stale".into());
+    }
+    Ok(())
+}
+
+fn process_gpu_winners(
+    cfg: &mut RuntimeConfig,
+    handle: &Option<SearchHandle>,
+    live: &mut Option<LiveJob>,
+    armed: &mut Option<ArmedTx>,
+) {
+    let pending = handle
+        .as_ref()
+        .map(SearchHandle::drain_winners)
+        .unwrap_or_default();
+    for winner in pending {
+        if winner.generation_id != cfg.generation_id {
+            println!(
+                "discarded stale GPU winner: generation {} != {}",
+                winner.generation_id, cfg.generation_id
+            );
+            continue;
+        }
+        if let Err(error) = refresh_live_job(cfg, live) {
+            println!("refusing GPU winner: fresh PHOTON state recheck failed: {error}");
+            continue;
+        }
+        if let Err(error) = sync_search_job(cfg, handle.as_ref(), live.as_ref()) {
+            println!("error: {error}");
+        }
+        if let Err(error) = validate_verified_winner_current(&winner, cfg, live.as_ref()) {
+            println!("discarded stale GPU winner: {error}");
+            continue;
+        }
+        let current = live
+            .as_ref()
+            .expect("fresh winner validation requires live job");
+        match ArmedTx::new(hex::encode(&winner.transaction), cfg, current) {
+            Ok(candidate) => {
+                println!(
+                    "GPU winner independently verified and fresh at height {}: nonce={} hash={}",
+                    winner.height,
+                    winner.nonce,
+                    hex::encode(winner.digest)
+                );
+                println!("winner armed for explicit broadcast after fresh baton/height check");
+                *armed = Some(candidate);
+            }
+            Err(error) => println!("refusing GPU winner: {error}"),
+        }
+    }
+}
+
 fn broadcast_raw_with_fallback(cfg: &RuntimeConfig, raw_hex: &str) -> Result<String, String> {
     let mut failures = Vec::new();
     match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
@@ -301,6 +396,9 @@ fn handle_line(
                     );
                     return true;
                 }
+                if let Err(error) = sync_search_job(cfg, handle.as_ref(), live.as_ref()) {
+                    println!("error: {error}");
+                }
                 if let Err(error) = cached.validate_current(cfg, live.as_ref()) {
                     println!("refusing cached broadcast: {error}");
                     return true;
@@ -362,7 +460,12 @@ fn handle_line(
                 println!("usage: payout <bitcoincash:ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦>");
             } else {
                 match cfg.set_payout(rest.join(" ")) {
-                    Ok(()) => println!("payout set to {}", cfg.payout_address),
+                    Ok(()) => {
+                        if let Err(error) = sync_search_job(cfg, handle.as_ref(), live.as_ref()) {
+                            println!("error: {error}");
+                        }
+                        println!("payout set to {}", cfg.payout_address);
+                    }
                     Err(e) => println!("error: {e}"),
                 }
             }
@@ -514,6 +617,9 @@ fn handle_line(
                 Ok(j) => {
                     j.print_summary();
                     publish_live_job(cfg, live, j);
+                    if let Err(error) = sync_search_job(cfg, handle.as_ref(), live.as_ref()) {
+                        println!("error: {error}");
+                    }
                 }
                 Err(e) => println!("error: {e}"),
             },
@@ -839,6 +945,7 @@ fn run_repl(mut cfg: RuntimeConfig) {
 
     let stdin = io::stdin();
     loop {
+        process_gpu_winners(&mut cfg, &handle, &mut live, &mut armed);
         print!("pickaxe> ");
         let _ = io::stdout().flush();
         let mut line = String::new();
@@ -949,6 +1056,39 @@ mod tests {
             .validate_current(&same_generation, Some(&different_baton))
             .is_err());
     }
+
+    #[test]
+    fn verified_gpu_winner_requires_same_generation_height_and_baton() {
+        let mut cfg = RuntimeConfig::default();
+        let mut live = None;
+        let job = live_job();
+        publish_live_job(&mut cfg, &mut live, job.clone());
+        let winner = search::VerifiedWinner {
+            generation_id: cfg.generation_id,
+            height: job.height,
+            baton_txid: job.baton_txid.clone(),
+            baton_vout: job.baton_vout,
+            nonce: 7,
+            digest: [0u8; 32],
+            public_key: [0u8; 33],
+            signature: [0u8; 64],
+            transaction: Vec::new(),
+        };
+        assert!(validate_verified_winner_current(&winner, &cfg, live.as_ref()).is_ok());
+
+        let mut stale_generation = winner.clone();
+        stale_generation.generation_id += 1;
+        assert!(validate_verified_winner_current(&stale_generation, &cfg, live.as_ref()).is_err());
+
+        let mut stale_height = job.clone();
+        stale_height.height += 1;
+        assert!(validate_verified_winner_current(&winner, &cfg, Some(&stale_height)).is_err());
+
+        let mut stale_baton = job;
+        stale_baton.baton_txid = "22".repeat(32);
+        assert!(validate_verified_winner_current(&winner, &cfg, Some(&stale_baton)).is_err());
+    }
+
     #[test]
     fn explicit_payload_is_not_selected() {
         let armed = ArmedTx {

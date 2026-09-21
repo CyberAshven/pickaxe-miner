@@ -471,6 +471,7 @@ dependencies = [
  "hmac",
  "num-bigint",
  "num-traits",
+ "rand 0.9.5",
  "secp256k1",
  "serde",
  "serde_json",
