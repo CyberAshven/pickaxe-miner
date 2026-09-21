@@ -300,6 +300,7 @@ fn run_worker(
     public_key: [u8; 33],
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    batch_in_flight: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
     candidates: Arc<AtomicU64>,
     batches: Arc<AtomicU64>,
@@ -335,7 +336,9 @@ fn run_worker(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        if paused.load(Ordering::Relaxed) {
+        batch_in_flight.store(true, Ordering::SeqCst);
+        if paused.load(Ordering::SeqCst) {
+            batch_in_flight.store(false, Ordering::SeqCst);
             thread::park_timeout(PAUSE_POLL);
             continue;
         }
@@ -346,6 +349,7 @@ fn run_worker(
         let result = match engine.search_batch(nonce_base, batch_size) {
             Ok(result) => result,
             Err(_) => {
+                batch_in_flight.store(false, Ordering::SeqCst);
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
@@ -368,6 +372,7 @@ fn run_worker(
                 }
             }
         }
+        batch_in_flight.store(false, Ordering::SeqCst);
 
         nonce_base = nonce_base.wrapping_add(batch_size);
 
@@ -414,6 +419,7 @@ fn run_worker(
 pub struct SearchHandle {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    batch_in_flight: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
     candidates: Arc<AtomicU64>,
     batches: Arc<AtomicU64>,
@@ -538,6 +544,7 @@ impl SearchHandle {
 
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(initially_paused));
+        let batch_in_flight = Arc::new(AtomicBool::new(false));
         let intensity_state = Arc::new(AtomicU8::new(intensity));
         let candidates = Arc::new(AtomicU64::new(0));
         let batches = Arc::new(AtomicU64::new(0));
@@ -555,6 +562,7 @@ impl SearchHandle {
             .spawn({
                 let worker_stop = Arc::clone(&stop);
                 let worker_paused = Arc::clone(&paused);
+                let worker_batch_in_flight = Arc::clone(&batch_in_flight);
                 let worker_intensity = Arc::clone(&intensity_state);
                 let worker_candidates = Arc::clone(&candidates);
                 let worker_batches = Arc::clone(&batches);
@@ -569,6 +577,7 @@ impl SearchHandle {
                         public_key,
                         worker_stop,
                         worker_paused,
+                        worker_batch_in_flight,
                         worker_intensity,
                         worker_candidates,
                         worker_batches,
@@ -585,6 +594,7 @@ impl SearchHandle {
         Ok(Self {
             stop,
             paused,
+            batch_in_flight,
             intensity: intensity_state,
             candidates,
             batches,
@@ -629,6 +639,10 @@ impl SearchHandle {
             .is_some_and(|required| required.load(Ordering::Acquire))
     }
 
+    pub fn batch_in_flight(&self) -> bool {
+        self.batch_in_flight.load(Ordering::SeqCst)
+    }
+
     pub fn complete_refresh(&self) -> Result<(), String> {
         let required = self
             .refresh_required
@@ -649,8 +663,8 @@ impl SearchHandle {
                 }
                 self.intensity.store(value, Ordering::Relaxed);
             }
-            RuntimeCommand::Pause => self.paused.store(true, Ordering::Relaxed),
-            RuntimeCommand::Resume => self.paused.store(false, Ordering::Relaxed),
+            RuntimeCommand::Pause => self.paused.store(true, Ordering::SeqCst),
+            RuntimeCommand::Resume => self.paused.store(false, Ordering::SeqCst),
         }
         Ok(self.snapshot())
     }
