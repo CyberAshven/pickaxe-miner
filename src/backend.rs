@@ -265,8 +265,10 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
             let vram_gb = vram
                 .map(|bytes| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
                 .unwrap_or_else(|| "N/A".into());
+            let architecture = crate::hip_photon::detected_architecture(ordinal as usize)
+                .unwrap_or_else(|_| "unknown".into());
             let detail = format!(
-                "hip ordinal={ordinal}; runtime={runtime_version}; driver={driver_version}; vram={vram_gb}"
+                "hip ordinal={ordinal}; gfx={architecture}; runtime={runtime_version}; driver={driver_version}; vram={vram_gb}"
             );
             out.push(GpuDevice {
                 index: ordinal as u32,

@@ -23,6 +23,7 @@ mod cuda_stage_b;
 mod cuda_stage_c;
 #[allow(dead_code)]
 mod electrum;
+mod hip_photon;
 #[allow(dead_code)]
 mod m29_table;
 #[allow(dead_code)]
@@ -928,15 +929,16 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
 
 fn run_headless_mining(
     cfg: RuntimeConfig,
+    backend: backend::BackendKind,
     device_ordinal: u32,
     json: bool,
     dry_run: bool,
     use_tui: bool,
 ) -> Result<(), String> {
     let supervisor = if dry_run {
-        runtime::RuntimeSupervisor::start_dry_run_on_device(cfg, device_ordinal)?
+        runtime::RuntimeSupervisor::start_dry_run_on_backend_device(cfg, backend, device_ordinal)?
     } else {
-        runtime::RuntimeSupervisor::start_on_device(cfg, device_ordinal)?
+        runtime::RuntimeSupervisor::start_on_backend_device(cfg, backend, device_ordinal)?
     };
     if use_tui {
         let final_snapshot = tui::run(supervisor, dry_run)?;
@@ -1043,17 +1045,15 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            if selected.backend == backend::BackendKind::Hip {
-                eprintln!(
-                    "error: HIP device {} ({}) is available, but the exact PHOTON HIP A->B->C kernel path is not implemented yet; refusing CPU or detached-wgpu fallback",
-                    selected.index, selected.name
-                );
-                std::process::exit(2);
-            }
             let use_tui = !(args.no_tui || args.json);
-            if let Err(error) =
-                run_headless_mining(cfg, selected.index, args.json, args.dry_run, use_tui)
-            {
+            if let Err(error) = run_headless_mining(
+                cfg,
+                selected.backend,
+                selected.index,
+                args.json,
+                args.dry_run,
+                use_tui,
+            ) {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             }
