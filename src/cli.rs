@@ -40,6 +40,7 @@ pub struct Cli {
 pub enum Commands {
     Mine,
     Devices,
+    SelfTest,
     Benchmark,
     Config {
         #[command(subcommand)]
@@ -101,6 +102,13 @@ mod tests {
     #[test]
     fn clap_rejects_detached_wgpu_backend() {
         assert!(Cli::try_parse_from(["pickaxe", "mine", "--backend", "wgpu"]).is_err());
+    }
+
+    #[test]
+    fn clap_parses_offline_self_test() {
+        let cli = Cli::try_parse_from(["pickaxe", "self-test", "--backend", "cuda"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::SelfTest)));
+        assert_eq!(cli.backend, "cuda");
     }
 
     #[test]
