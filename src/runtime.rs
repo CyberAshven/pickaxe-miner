@@ -1064,10 +1064,11 @@ fn production_preflight_local(
     {
         return Err("self-funded settlement preflight failed exact 98/2 token conservation".into());
     }
+    let multi_input_max_baton_decrease_sats = reward::photon_multi_input_max_baton_decrease_sats()?;
     if split.fee_sats != split.required_relay_fee_sats
         || split.baton_input_value_sats < split.baton_output_value_sats
         || split.baton_input_value_sats - split.baton_output_value_sats
-            > reward::PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS
+            > multi_input_max_baton_decrease_sats
     {
         return Err("self-funded settlement preflight failed BCH fee/value accounting".into());
     }
