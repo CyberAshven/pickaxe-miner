@@ -276,9 +276,14 @@ fn verify_gpu_winner(
     })
 }
 
-pub(crate) fn batch_candidates(intensity: u8) -> u32 {
-    ((u64::from(MAX_BATCH_CANDIDATES) * u64::from(intensity)) / 100)
-        .clamp(1, u64::from(MAX_BATCH_CANDIDATES)) as u32
+/// Keep production GPU launches at the tuned full batch size.
+///
+/// Runtime intensity is applied exactly once by [`duty_rest`]. Shrinking the
+/// batch as well would square the requested throttle (for example, 30% work
+/// followed by a 30% duty cycle yields roughly 9% throughput) and increases
+/// kernel-launch overhead.
+pub(crate) const fn scheduled_batch_candidates() -> u32 {
+    MAX_BATCH_CANDIDATES
 }
 
 pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
@@ -343,7 +348,7 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
-        let batch_size = batch_candidates(active_intensity);
+        let batch_size = scheduled_batch_candidates();
         let batch_started = Instant::now();
         let result = match engine.search_batch(nonce_base, batch_size) {
             Ok(result) => result,
@@ -701,10 +706,8 @@ mod tests {
     }
 
     #[test]
-    fn intensity_scales_batch_and_duty_without_recreating_gpu_state() {
-        assert_eq!(batch_candidates(100), MAX_BATCH_CANDIDATES);
-        assert_eq!(batch_candidates(50), MAX_BATCH_CANDIDATES / 2);
-        assert_eq!(batch_candidates(10), MAX_BATCH_CANDIDATES / 10);
+    fn intensity_uses_one_duty_cycle_throttle_with_full_gpu_batches() {
+        assert_eq!(scheduled_batch_candidates(), MAX_BATCH_CANDIDATES);
         assert_eq!(duty_rest(Duration::from_millis(10), 100), Duration::ZERO);
         assert_eq!(
             duty_rest(Duration::from_millis(10), 50),
@@ -820,8 +823,8 @@ mod tests {
     }
 
     #[test]
-    fn supervised_search_runs_back_to_back_batches_if_cuda_present() {
-        let handle = match SearchHandle::start_supervised(100, integration_job(1)) {
+    fn supervised_search_runs_full_back_to_back_batches_if_cuda_present() {
+        let handle = match SearchHandle::start_supervised(30, integration_job(1)) {
             Ok(handle) => handle,
             Err(error)
                 if error.to_ascii_lowercase().contains("cuda context")
@@ -852,6 +855,11 @@ mod tests {
         let after = handle.snapshot();
         assert!(after.batches > before.batches);
         assert!(after.candidates > before.candidates);
+        assert_eq!(
+            after.candidates,
+            after.batches * u64::from(MAX_BATCH_CANDIDATES),
+            "30% intensity must throttle between full GPU batches, not shrink each batch as well"
+        );
         let _ = handle.stop();
     }
 }
