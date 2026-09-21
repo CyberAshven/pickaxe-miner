@@ -71,11 +71,7 @@ jobs:
           set -euo pipefail
           version="$(
             cargo metadata --locked --no-deps --format-version 1 |
-            python3 -c 'import json, os, sys
-d=json.load(sys.stdin)
-root=os.path.abspath("Cargo.toml")
-p=next(p for p in d["packages"] if os.path.abspath(p["manifest_path"]) == root)
-print(p["version"])'
+            python3 -c 'import json, os, sys; d=json.load(sys.stdin); root=os.path.abspath("Cargo.toml"); p=next(p for p in d["packages"] if os.path.abspath(p["manifest_path"]) == root); print(p["version"])'
           )"
 
           if [[ "v${version}" != "${TAG}" ]]; then
@@ -131,11 +127,7 @@ print(p["version"])'
 
           bin_name="$(
             cargo metadata --locked --no-deps --format-version 1 |
-            python3 -c 'import json, os, sys
-d=json.load(sys.stdin)
-root=os.path.abspath("Cargo.toml")
-p=next(p for p in d["packages"] if os.path.abspath(p["manifest_path"]) == root)
-print(next(t["name"] for t in p["targets"] if "bin" in t["kind"]))'
+            python3 -c 'import json, os, sys; d=json.load(sys.stdin); root=os.path.abspath("Cargo.toml"); p=next(p for p in d["packages"] if os.path.abspath(p["manifest_path"]) == root); print(next(t["name"] for t in p["targets"] if "bin" in t["kind"]))'
           )"
 
           bin="target/release/${bin_name}"
@@ -144,6 +136,11 @@ print(next(t["name"] for t in p["targets"] if "bin" in t["kind"]))'
           package="pickaxe-${TAG}-linux-x86_64"
           mkdir -p "dist/${package}"
           install -m 0755 "${bin}" "dist/${package}/pickaxe"
+
+          if [[ -d hip/build ]]; then
+            mkdir -p "dist/${package}/hip"
+            cp -R hip/build "dist/${package}/hip/"
+          fi
 
           if [[ -f README.md ]]; then
             cp README.md "dist/${package}/"
@@ -190,6 +187,12 @@ print(next(t["name"] for t in p["targets"] if "bin" in t["kind"]))'
           $packageDir = Join-Path 'dist' $packageName
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item -LiteralPath $binary -Destination (Join-Path $packageDir 'pickaxe.exe')
+
+          if (Test-Path -LiteralPath 'hip\build') {
+            $hipDir = Join-Path $packageDir 'hip'
+            New-Item -ItemType Directory -Force -Path $hipDir | Out-Null
+            Copy-Item -LiteralPath 'hip\build' -Destination $hipDir -Recurse
+          }
 
           if (Test-Path -LiteralPath 'README.md') {
             Copy-Item -LiteralPath 'README.md' -Destination $packageDir
