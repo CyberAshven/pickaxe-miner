@@ -2,7 +2,6 @@
 //! Owned by Dev Assist. Search consumes MiningJob; no keys.
 //! Broadcast is explicit CLI only (never auto).
 
-use crate::config::RuntimeConfig;
 use crate::protocol::{EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
 use crate::search::MiningJob;
 use num_bigint::BigUint;
@@ -33,17 +32,24 @@ pub struct LiveJob {
 }
 
 impl LiveJob {
-    pub fn to_mining_job(&self) -> MiningJob {
+    pub fn to_mining_job(&self, generation_id: u64, payout_address: &str) -> MiningJob {
         MiningJob {
             height: self.height,
-            target_le_hex: self.target_le_hex.clone(),
             baton_txid: self.baton_txid.clone(),
-            generation_id: 0,
+            baton_vout: self.baton_vout,
+            baton_height: self.baton_height,
+            baton_value_sats: self.baton_value_sats,
+            age: self.age,
+            target_le_hex: self.target_le_hex.clone(),
+            token_amount: self.token_amount,
+            reward_raw: self.reward_raw,
+            payout_address: payout_address.to_string(),
+            source_identity: self.url.clone(),
+            generation_id,
         }
     }
 
     pub fn print_summary(&self) {
-        let (miner, donation) = RuntimeConfig::split_reward(self.reward_raw);
         println!("electrum:      {}", self.url);
         println!("server.version: {}", self.server_version);
         println!("height:        {}", self.height);
@@ -56,8 +62,8 @@ impl LiveJob {
         println!("target_le:     {head}â€¦{tail}");
         println!("token_amount:  {}", self.token_amount);
         println!("reward_raw:    {}", self.reward_raw);
-        println!("  miner 98%:   {miner}");
-        println!("  donation 2%: {donation}");
+        println!("commitment:    {} bytes", self.commitment_hex.len() / 2);
+        println!("donation:      disabled by two-output covenant");
     }
 }
 
@@ -94,16 +100,6 @@ impl ElectrumSession {
         ))
     }
 
-    /// Bootstrap-only (no custom URL).
-    pub fn connect_bootstrap() -> Result<Self, String> {
-        use crate::protocol::FULCRUM_WSS_BOOTSTRAP;
-        let eps: Vec<String> = FULCRUM_WSS_BOOTSTRAP
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        Self::connect_failover(&eps)
-    }
-
     fn connect_one(url_str: &str) -> Result<Self, String> {
         let (ws, _resp) = connect(url_str).map_err(|e| format!("connect: {e}"))?;
 
@@ -138,7 +134,7 @@ impl ElectrumSession {
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let line = format!("{req}\n");
         self.ws
-            .send(Message::Text(line.into()))
+            .send(Message::Text(line))
             .map_err(|e| format!("send: {e}"))?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -156,9 +152,8 @@ impl ElectrumSession {
                         if line.is_empty() {
                             continue;
                         }
-                        let v: Value = serde_json::from_str(&line).map_err(|e| {
-                            format!("json: {e}: {}", &line[..line.len().min(160)])
-                        })?;
+                        let v: Value = serde_json::from_str(&line)
+                            .map_err(|e| format!("json: {e}: {}", &line[..line.len().min(160)]))?;
                         if id_matches(&v, id) {
                             if let Some(err) = v.get("error") {
                                 if !err.is_null() {
@@ -192,11 +187,10 @@ impl ElectrumSession {
         }
     }
 
-
     /// Submit a raw tx hex via lockchain.transaction.broadcast. Explicit only.
     pub fn broadcast_raw(&mut self, raw_tx_hex: &str) -> Result<String, String> {
         let hex = raw_tx_hex.trim();
-        if hex.is_empty() || hex.len() % 2 != 0 {
+        if hex.is_empty() || !hex.len().is_multiple_of(2) {
             return Err("raw tx hex empty or odd length".into());
         }
         if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -284,9 +278,8 @@ impl ElectrumSession {
 
         let previous_target_hex = &commitment_hex[8..72];
         let previous_target = le_hex_to_biguint(previous_target_hex)?;
-        let next_target =
-            &previous_target * (BigUint::from(age as u64) + BigUint::from(143u64))
-                / BigUint::from(144u64);
+        let next_target = &previous_target * (BigUint::from(age as u64) + BigUint::from(143u64))
+            / BigUint::from(144u64);
         let target_le_hex = biguint_to_le_hex32(&next_target)?;
 
         let reward_raw = token_amount
@@ -317,7 +310,7 @@ fn id_matches(v: &Value, id: u64) -> bool {
 }
 
 fn le_hex_to_biguint(hex_str: &str) -> Result<BigUint, String> {
-    if hex_str.len() % 2 != 0 {
+    if !hex_str.len().is_multiple_of(2) {
         return Err("Invalid little-endian hex.".into());
     }
     let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;

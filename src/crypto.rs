@@ -7,12 +7,14 @@
 //!
 //! Production private keys are BLOCKED until vector tests pass.
 
+#[cfg(test)]
 use hmac::{Hmac, Mac};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use secp256k1::{PublicKey, Scalar, SecretKey};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 type HmacSha256 = Hmac<Sha256>;
 
 const SECP_P_BE: [u8; 32] = [
@@ -20,14 +22,13 @@ const SECP_P_BE: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xFF, 0xFF, 0xFC, 0x2F,
 ];
 
+#[cfg(test)]
 const SECP_N_BE: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
     0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
 ];
 
-pub const SCHNORR_PRODUCTION_GATE_DOC: &str =
-    "Do not sign with production keys until crypto::tests::bch_schnorr_matches_photon_vectors passes.";
-
+#[cfg(test)]
 pub fn compressed_pubkey(sk_bytes: &[u8; 32]) -> Result<[u8; 33], String> {
     let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
     Ok(PublicKey::from_secret_key(&sk).serialize())
@@ -39,6 +40,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+#[cfg(test)]
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
     mac.update(data);
@@ -47,6 +49,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
+#[cfg(test)]
 fn reduce_msg_mod_n(msg32: &[u8; 32]) -> [u8; 32] {
     let m = BigUint::from_bytes_be(msg32);
     let n = BigUint::from_bytes_be(&SECP_N_BE);
@@ -58,6 +61,7 @@ fn reduce_msg_mod_n(msg32: &[u8; 32]) -> [u8; 32] {
 }
 
 /// RFC6979 nonce for BCH Schnorr (algo tag ASCII `Schnorr+SHA256  `).
+#[cfg(test)]
 pub fn bch_rfc6979_nonce(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 32], String> {
     let reduced = reduce_msg_mod_n(msg32);
     let algo = b"Schnorr+SHA256  ";
@@ -107,6 +111,7 @@ fn y_is_quadratic_residue(y_be: &[u8; 32]) -> bool {
     y.modpow(&exp, &p) == BigUint::one()
 }
 
+#[cfg(test)]
 pub fn bch_schnorr_sign(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 64], String> {
     let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
     let pk_bytes = PublicKey::from_secret_key(&sk).serialize();
@@ -176,6 +181,7 @@ pub fn bch_schnorr_verify(
     Ok(y_is_quadratic_residue(&r_y))
 }
 
+#[cfg(test)]
 pub fn schnorr_production_gate_ok() -> bool {
     let mut sk = [0u8; 32];
     sk[31] = 1;
@@ -190,12 +196,14 @@ pub fn schnorr_production_gate_ok() -> bool {
     }
 }
 
+#[cfg(test)]
 fn hex_32(s: &str) -> [u8; 32] {
     let b = hex::decode(s).unwrap();
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     o
 }
+#[cfg(test)]
 fn hex_64(s: &str) -> [u8; 64] {
     let b = hex::decode(s).unwrap();
     let mut o = [0u8; 64];
@@ -246,8 +254,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn verify_requires_qr_ry_same_as_sign() {
         let mut sk = [0u8; 32];
         sk[31] = 1;
@@ -255,12 +261,29 @@ mod tests {
         let pk = compressed_pubkey(&sk).unwrap();
         let sig = bch_schnorr_sign(&sk, &msg).unwrap();
         assert!(bch_schnorr_verify(&pk, &msg, &sig).unwrap());
-        // Flip s to garbage so reconstructed R is wrong / non-QR path exercised via verify false
-        let mut bad = sig;
-        bad[63] ^= 0x01;
-        assert!(!bch_schnorr_verify(&pk, &msg, &bad).unwrap());
+
+        // Keep r_x unchanged while replacing R with -R.  Because secp256k1's
+        // field prime is 3 mod 4, exactly one of R.y and (-R).y is a QR.
+        // For sG - eP = R, s' = 2ed - s gives s'G - eP = -R.
+        let mut chal = Vec::with_capacity(97);
+        chal.extend_from_slice(&sig[..32]);
+        chal.extend_from_slice(&pk);
+        chal.extend_from_slice(&msg);
+        let e = BigUint::from_bytes_be(&sha256(&chal));
+        let d = BigUint::from_bytes_be(&sk);
+        let s = BigUint::from_bytes_be(&sig[32..]);
+        let n = BigUint::from_bytes_be(&SECP_N_BE);
+        let twin_s = (BigUint::from(2u8) * e * d + &n - s) % &n;
+        let twin_s_bytes = twin_s.to_bytes_be();
+        let mut twin = sig;
+        twin[32..].fill(0);
+        twin[64 - twin_s_bytes.len()..].copy_from_slice(&twin_s_bytes);
+
+        assert_eq!(&twin[..32], &sig[..32]);
+        assert!(!bch_schnorr_verify(&pk, &msg, &twin).unwrap());
     }
 
+    #[test]
     fn bch_schnorr_sign_verify_roundtrip() {
         let mut sk = [0u8; 32];
         sk[31] = 7;

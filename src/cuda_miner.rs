@@ -1,7 +1,9 @@
 //! Persistent CUDA miner (PERFORMANCE CONTRACT).
 //! Context/module/buffers created once. Host receives compact winners only.
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::Ptx;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,7 +32,8 @@ pub struct CudaMiner {
 
 impl CudaMiner {
     pub fn new(device_ordinal: usize, batch: u32) -> Result<Self, String> {
-        let ptx_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cuda/build/stage_a_mine.ptx");
+        let ptx_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cuda/build/stage_a_mine.ptx");
         if !ptx_path.is_file() {
             return Err(format!("missing PTX {}", ptx_path.display()));
         }
@@ -109,7 +112,7 @@ impl CudaMiner {
 
         let n = self.batch;
         let cfg = LaunchConfig {
-            grid_dim: ((n + 255) / 256, 1, 1),
+            grid_dim: (n.div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -176,7 +179,7 @@ mod tests {
 
     #[test]
     fn persistent_mine_finds_easy_target_if_cuda() {
-        let mut target = [0xffu8; 32];
+        let target = [0xffu8; 32];
         // very easy: almost everything meets
         match CudaMiner::new(0, 1024) {
             Ok(mut miner) => {

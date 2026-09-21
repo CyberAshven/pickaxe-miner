@@ -1,4 +1,4 @@
-﻿//! PHOTON mainnet protocol constants extracted from reference/miner.js (M67.38).
+//! PHOTON mainnet protocol constants extracted from reference/miner.js (M67.38).
 //! Electrum/win-tx stay in Dev Assist modules — this is search/crypto shared facts only.
 
 /// CashToken category id (hex, 32 bytes).
@@ -12,9 +12,6 @@ pub const COVENANT_LOCKING_BYTECODE_HEX: &str =
 /// Expected Electrum script hash for the covenant (hex, reversed-SHA256 of lock).
 pub const EXPECTED_SCRIPT_HASH_HEX: &str =
     "720bad85599cd504b114c65caedb76098cab45df5553be1c7cf260c4c2954031";
-
-/// Proven live mining template size required by the WebGPU kernel.
-pub const TEMPLATE_BYTES: usize = 615;
 
 /// Redeem script hex (P2SH32 / covenant spend path) — from postcorps miner.js.
 pub const REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_redeem.hex");
@@ -35,7 +32,3 @@ pub const NODE_RPC_BOOTSTRAP: &[&str] = &[
     // Intentionally empty of third-party public RPC (ban risk / auth required).
     // Add only endpoints Bandar explicitly curates later.
 ];
-
-/// Back-compat aliases.
-pub const ELECTRUM_WSS_BOOTSTRAP: &[&str] = FULCRUM_WSS_BOOTSTRAP;
-pub const ELECTRUM_WSS: &[&str] = FULCRUM_WSS_BOOTSTRAP;

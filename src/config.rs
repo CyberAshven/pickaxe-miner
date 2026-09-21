@@ -9,22 +9,16 @@ pub const DONATION_ADDRESS: &str = "bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37
 /// Miner keeps the remainder (9800 bps = 98%).
 pub const MINER_BPS: u16 = 10_000 - DONATION_BPS;
 
-
-/// Where mining **templates / block submit** come from.
-/// Bandar/CoS lock: node RPC is first-class; Fulcrum is auxiliary (UTXO/wallet).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Preferred network transport for explicit submission/diagnostic operations.
+/// PHOTON mining jobs come from the covenant CashToken baton through Fulcrum
+/// until an equivalent node-native indexed query is implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JobSource {
-    /// BCHN `getblocktemplatelight` / `submitblocklight` (GBT fallback).
+    /// Native BCH node RPC for validation/broadcast and BCH block tooling.
     Node,
-    /// Fulcrum/Electrum — ancillary only (PHOTON baton index until node path exists).
+    /// Fulcrum/Electrum, including the current PHOTON baton index.
+    #[default]
     Fulcrum,
-}
-
-impl Default for JobSource {
-    fn default() -> Self {
-        // Codex sec15: PHOTON discovery defaults to Fulcrum baton path.
-        JobSource::Fulcrum
-    }
 }
 
 impl JobSource {
@@ -56,10 +50,12 @@ pub struct RuntimeConfig {
     /// Optional native node JSON-RPC URL (`http://` / `https://`).
     /// Example Start9: `http://127.0.0.1:8332` (auth via env, never logged).
     pub node_url: Option<String>,
-    /// Template/submit source (default: node).
+    /// Preferred network transport for submission/diagnostics.
     pub source: JobSource,
     /// When true, the GPU mining loop is running.
     pub mining: bool,
+    /// Immutable mining-work generation. Zero means no live job is published yet.
+    pub generation_id: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -71,6 +67,7 @@ impl Default for RuntimeConfig {
             node_url: None,
             source: JobSource::Fulcrum,
             mining: false,
+            generation_id: 0,
         }
     }
 }
@@ -89,10 +86,17 @@ impl RuntimeConfig {
         if trimmed.is_empty() {
             return Err("payout address required".into());
         }
-        if !(trimmed.starts_with("bitcoincash:") || trimmed.starts_with("bchtest:")) {
-            return Err("expected bitcoincash:… (or bchtest: for tests)".into());
+        crate::tx::cashaddr_to_p2pkh_locking(&trimmed)
+            .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
+        let canonical = if trimmed.contains(':') {
+            trimmed.to_ascii_lowercase()
+        } else {
+            format!("bitcoincash:{}", trimmed.to_ascii_lowercase())
+        };
+        if self.payout_address != canonical {
+            self.bump_generation();
         }
-        self.payout_address = trimmed;
+        self.payout_address = canonical;
         Ok(())
     }
 
@@ -100,19 +104,24 @@ impl RuntimeConfig {
     pub fn set_fulcrum_url(&mut self, url: &str) -> Result<(), String> {
         let trimmed = url.trim().to_string();
         if trimmed.is_empty() {
-            self.fulcrum_url = None;
+            self.clear_fulcrum_url();
             return Ok(());
         }
         let lower = trimmed.to_ascii_lowercase();
         if !(lower.starts_with("wss://") || lower.starts_with("ws://")) {
             return Err("fulcrum URL must start with wss:// or ws://".into());
         }
-        self.fulcrum_url = Some(trimmed);
+        if self.fulcrum_url.as_deref() != Some(trimmed.as_str()) {
+            self.bump_generation();
+            self.fulcrum_url = Some(trimmed);
+        }
         Ok(())
     }
 
     pub fn clear_fulcrum_url(&mut self) {
-        self.fulcrum_url = None;
+        if self.fulcrum_url.take().is_some() {
+            self.bump_generation();
+        }
     }
 
     /// Endpoint try-order: custom (if set), then public bootstrap.
@@ -133,7 +142,7 @@ impl RuntimeConfig {
     pub fn set_node_url(&mut self, url: &str) -> Result<(), String> {
         let trimmed = url.trim().to_string();
         if trimmed.is_empty() {
-            self.node_url = None;
+            self.clear_node_url();
             return Ok(());
         }
         let lower = trimmed.to_ascii_lowercase();
@@ -141,17 +150,34 @@ impl RuntimeConfig {
             return Err("node URL must start with http:// or https://".into());
         }
         // Never require embedding user:pass in chat logs — accept URL as given.
-        self.node_url = Some(trimmed);
+        if self.node_url.as_deref() != Some(trimmed.as_str()) {
+            self.bump_generation();
+            self.node_url = Some(trimmed);
+        }
         Ok(())
     }
 
     pub fn clear_node_url(&mut self) {
-        self.node_url = None;
+        if self.node_url.take().is_some() {
+            self.bump_generation();
+        }
     }
 
     pub fn set_source(&mut self, s: &str) -> Result<(), String> {
-        self.source = JobSource::parse(s)?;
+        let source = JobSource::parse(s)?;
+        if self.source != source {
+            self.source = source;
+            self.bump_generation();
+        }
         Ok(())
+    }
+
+    pub fn bump_generation(&mut self) -> u64 {
+        self.generation_id = self.generation_id.wrapping_add(1);
+        if self.generation_id == 0 {
+            self.generation_id = 1;
+        }
+        self.generation_id
     }
 
     /// Node try-order: custom (if set), then curated NODE_RPC_BOOTSTRAP.
@@ -174,5 +200,52 @@ impl RuntimeConfig {
         let donation = reward_raw.saturating_mul(DONATION_BPS as u128) / 10_000;
         let miner = reward_raw.saturating_sub(donation);
         (miner, donation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
+
+    #[test]
+    fn payout_requires_valid_cashaddr_checksum() {
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.set_payout(PAYOUT.into()).is_ok());
+        assert!(cfg
+            .set_payout("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frq".into())
+            .is_err());
+    }
+
+    #[test]
+    fn generation_bumps_on_state_changes_but_not_intensity() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_intensity(50).unwrap();
+        assert_eq!(cfg.generation_id, 0);
+
+        cfg.set_payout(PAYOUT.into()).unwrap();
+        assert_eq!(cfg.generation_id, 1);
+        cfg.set_payout(PAYOUT.into()).unwrap();
+        assert_eq!(cfg.generation_id, 1);
+
+        cfg.set_source("fulcrum").unwrap();
+        assert_eq!(cfg.generation_id, 1);
+        cfg.set_source("node").unwrap();
+        assert_eq!(cfg.generation_id, 2);
+
+        cfg.set_fulcrum_url("ws://127.0.0.1:50003").unwrap();
+        assert_eq!(cfg.generation_id, 3);
+        cfg.set_fulcrum_url("ws://127.0.0.1:50003").unwrap();
+        assert_eq!(cfg.generation_id, 3);
+        cfg.clear_fulcrum_url();
+        assert_eq!(cfg.generation_id, 4);
+
+        cfg.set_node_url("http://127.0.0.1:8332").unwrap();
+        assert_eq!(cfg.generation_id, 5);
+        cfg.set_node_url("http://127.0.0.1:8332").unwrap();
+        assert_eq!(cfg.generation_id, 5);
+        cfg.clear_node_url();
+        assert_eq!(cfg.generation_id, 6);
     }
 }

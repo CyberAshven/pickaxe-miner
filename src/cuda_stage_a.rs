@@ -1,4 +1,4 @@
-﻿//! CUDA Stage A launcher via cudarc (load PTX at runtime).
+//! CUDA Stage A launcher via cudarc (load PTX at runtime).
 //! Product path = GPU. Falls back with a clear error if no NVIDIA device.
 
 use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
@@ -23,7 +23,7 @@ pub fn stage_a_hash256_batch(
     let ptx_file = ptx_path();
     if !ptx_file.is_file() {
         return Err(format!(
-            "missing PTX at {} — build with nvcc -ptx first",
+            "missing PTX at {} - build with nvcc -ptx first",
             ptx_file.display()
         ));
     }
@@ -38,9 +38,9 @@ pub fn stage_a_hash256_batch(
         .map_err(|e| format!("load fn: {e}"))?;
 
     let mut target_be = [0u32; 8];
-    for i in 0..8 {
+    for (i, word) in target_be.iter_mut().enumerate() {
         let j = i * 4;
-        target_be[i] = u32::from_be_bytes([
+        *word = u32::from_be_bytes([
             target32[j],
             target32[j + 1],
             target32[j + 2],
@@ -49,14 +49,14 @@ pub fn stage_a_hash256_batch(
     }
 
     let target_gpu = stream
-        .memcpy_stod(&target_be)
+        .clone_htod(&target_be)
         .map_err(|e| format!("memcpy target: {e}"))?;
     let out_words = (n as usize) * 8;
     let mut out_gpu = stream
         .alloc_zeros::<u32>(out_words)
         .map_err(|e| format!("alloc out: {e}"))?;
 
-    let cfg = LaunchConfig::for_num_elems(n as u32);
+    let cfg = LaunchConfig::for_num_elems(n);
     let mut builder = stream.launch_builder(&func);
     let n_arg = n;
     let nb = nonce_base;
@@ -69,7 +69,7 @@ pub fn stage_a_hash256_batch(
         builder.launch(cfg).map_err(|e| format!("launch: {e}"))?;
     }
     let out: Vec<u32> = stream
-        .memcpy_dtov(&out_gpu)
+        .clone_dtoh(&out_gpu)
         .map_err(|e| format!("memcpy back: {e}"))?;
 
     let mut digests = Vec::with_capacity(n as usize);

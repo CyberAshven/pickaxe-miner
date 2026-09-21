@@ -1,7 +1,7 @@
-﻿//! GPU backend selection (DoD): auto | cuda | hip | wgpu.
+//! GPU backend selection (DoD): auto | cuda | hip | wgpu.
 //! No CPU mining fallback.
 
-use cudarc::driver::{CudaContext, sys};
+use cudarc::driver::{sys, CudaContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -53,13 +53,11 @@ pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
             )),
         },
         BackendKind::Hip => Err(
-            "HIP/ROCm backend not wired yet. Use --backend cuda on NVIDIA or wait for HIP."
-                .into(),
+            "HIP/ROCm backend not wired yet. Use --backend cuda on NVIDIA or wait for HIP.".into(),
         ),
-        BackendKind::Wgpu => Err(
-            "wgpu backend not wired yet. On NVIDIA use --backend cuda (or auto)."
-                .into(),
-        ),
+        BackendKind::Wgpu => {
+            Err("wgpu backend not wired yet. On NVIDIA use --backend cuda (or auto).".into())
+        }
     }
 }
 
@@ -164,4 +162,3 @@ pub fn print_devices(prefer: BackendKind) -> Result<(), String> {
     }
     Ok(())
 }
-
