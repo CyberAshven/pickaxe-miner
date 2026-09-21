@@ -1,4 +1,8 @@
-use crate::runtime::{RuntimeEvent, RuntimeSnapshot, RuntimeSupervisor, SupervisorState};
+use crate::{
+    backend::{BackendKind, GpuDevice},
+    config::RuntimeConfig,
+    runtime::{RuntimeEvent, RuntimeSnapshot, RuntimeSupervisor, SupervisorState},
+};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -30,6 +34,158 @@ const BENCHMARK_TERMINAL_WIDTH: u16 = 120;
 const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
 
 type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct SetupResult {
+    pub config: RuntimeConfig,
+    pub backend: BackendKind,
+    pub device: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupStep {
+    Gpu,
+    Payout,
+    Intensity,
+    Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupAction {
+    Continue,
+    Complete,
+    Cancel,
+}
+
+struct SetupFlow {
+    step: SetupStep,
+    devices: Vec<GpuDevice>,
+    selected: usize,
+    config: RuntimeConfig,
+    payout_input: String,
+    status_line: String,
+}
+
+impl SetupFlow {
+    fn new(
+        config: RuntimeConfig,
+        devices: Vec<GpuDevice>,
+        default_device: &GpuDevice,
+    ) -> Result<Self, String> {
+        if devices.is_empty() {
+            return Err("no validated production GPU device found".into());
+        }
+        let selected = devices
+            .iter()
+            .position(|device| {
+                device.backend == default_device.backend && device.index == default_device.index
+            })
+            .unwrap_or(0);
+        let payout_input = config.payout_address.clone();
+        Ok(Self {
+            step: SetupStep::Gpu,
+            devices,
+            selected,
+            config,
+            payout_input,
+            status_line: String::new(),
+        })
+    }
+
+    fn selected_device(&self) -> &GpuDevice {
+        &self.devices[self.selected]
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> SetupAction {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return SetupAction::Cancel;
+        }
+
+        match self.step {
+            SetupStep::Gpu => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => SetupAction::Cancel,
+                KeyCode::Up => {
+                    self.selected = self
+                        .selected
+                        .checked_sub(1)
+                        .unwrap_or(self.devices.len().saturating_sub(1));
+                    SetupAction::Continue
+                }
+                KeyCode::Down => {
+                    self.selected = (self.selected + 1) % self.devices.len();
+                    SetupAction::Continue
+                }
+                KeyCode::Enter => {
+                    self.step = SetupStep::Payout;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                _ => SetupAction::Continue,
+            },
+            SetupStep::Payout => match key.code {
+                KeyCode::Esc => {
+                    self.step = SetupStep::Gpu;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Enter => match self.config.set_payout(self.payout_input.clone()) {
+                    Ok(()) => {
+                        self.step = SetupStep::Intensity;
+                        self.status_line.clear();
+                        SetupAction::Continue
+                    }
+                    Err(error) => {
+                        self.status_line = error;
+                        SetupAction::Continue
+                    }
+                },
+                KeyCode::Backspace => {
+                    self.payout_input.pop();
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.payout_input.push(ch);
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                _ => SetupAction::Continue,
+            },
+            SetupStep::Intensity => match key.code {
+                KeyCode::Esc => {
+                    self.step = SetupStep::Payout;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Enter => {
+                    self.step = SetupStep::Review;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Up | KeyCode::Right | KeyCode::Char('+') | KeyCode::Char(']') => {
+                    let next = self.config.intensity.saturating_add(10).min(100);
+                    let _ = self.config.set_intensity(next);
+                    SetupAction::Continue
+                }
+                KeyCode::Down | KeyCode::Left | KeyCode::Char('-') | KeyCode::Char('[') => {
+                    let next = self.config.intensity.saturating_sub(10).max(10);
+                    let _ = self.config.set_intensity(next);
+                    SetupAction::Continue
+                }
+                _ => SetupAction::Continue,
+            },
+            SetupStep::Review => match key.code {
+                KeyCode::Esc => {
+                    self.step = SetupStep::Intensity;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Enter => SetupAction::Complete,
+                _ => SetupAction::Continue,
+            },
+        }
+    }
+}
 
 struct TerminalSession {
     terminal: PickaxeTerminal,
@@ -89,6 +245,7 @@ struct TuiState {
     command_mode: bool,
     command_input: String,
     show_help: bool,
+    settings_mode: bool,
     status_line: String,
     events: VecDeque<String>,
     last_sample: Instant,
@@ -105,6 +262,7 @@ impl TuiState {
             command_mode: false,
             command_input: String::new(),
             show_help: false,
+            settings_mode: false,
             status_line: "Donation: 2%".into(),
             events,
             last_sample: Instant::now(),
@@ -135,6 +293,45 @@ impl TuiState {
                 .max(snapshot.search.rate);
             self.last_candidates = snapshot.search.candidates;
             self.last_sample = Instant::now();
+        }
+    }
+}
+
+pub(crate) fn run_setup(
+    config: RuntimeConfig,
+    devices: Vec<GpuDevice>,
+    default_device: &GpuDevice,
+) -> Result<Option<SetupResult>, String> {
+    run_setup_terminal(SetupFlow::new(config, devices, default_device)?)
+}
+
+fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, String> {
+    let mut terminal = TerminalSession::enter()?;
+    loop {
+        terminal
+            .terminal
+            .draw(|frame| render_setup(frame, &state))
+            .map_err(|error| format!("draw mining setup: {error}"))?;
+
+        let input = event::read().map_err(|error| format!("read mining setup input: {error}"))?;
+        let Event::Key(key) = input else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+            continue;
+        }
+
+        match state.handle_key(key) {
+            SetupAction::Continue => {}
+            SetupAction::Cancel => return Ok(None),
+            SetupAction::Complete => {
+                let selected = state.selected_device();
+                return Ok(Some(SetupResult {
+                    config: state.config.clone(),
+                    backend: selected.backend,
+                    device: selected.index,
+                }));
+            }
         }
     }
 }
@@ -296,10 +493,30 @@ fn handle_key(
         return Ok(false);
     }
 
+    if state.settings_mode {
+        match key.code {
+            KeyCode::Esc => {
+                state.settings_mode = false;
+                return Ok(false);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                state.settings_mode = false;
+                state.command_mode = true;
+                state.command_input = "address ".into();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => Ok(true),
         KeyCode::Char('?') => {
             state.show_help = true;
+            Ok(false)
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            state.settings_mode = !state.settings_mode;
             Ok(false)
         }
         KeyCode::Char(':') | KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -480,6 +697,115 @@ fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
     }
 }
 
+fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
+    let area = frame.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(4),
+        ])
+        .split(area);
+    let step = match state.step {
+        SetupStep::Gpu => "1/4 GPU",
+        SetupStep::Payout => "2/4 Payout",
+        SetupStep::Intensity => "3/4 Intensity",
+        SetupStep::Review => "4/4 Review",
+    };
+    frame.render_widget(
+        Paragraph::new(format!("PICKAXE MINER   Setup   {step}"))
+            .block(Block::default().borders(Borders::ALL)),
+        rows[0],
+    );
+    match state.step {
+        SetupStep::Gpu => render_setup_gpu(frame, rows[1], state),
+        SetupStep::Payout => render_setup_payout(frame, rows[1], state),
+        SetupStep::Intensity => render_setup_intensity(frame, rows[1], state),
+        SetupStep::Review => render_setup_review(frame, rows[1], state),
+    }
+    let keys = match state.step {
+        SetupStep::Gpu => "[Up/Down] choose   [Enter] accept default   [Esc] cancel",
+        SetupStep::Payout => "[Type] payout address   [Enter] continue   [Esc] Back",
+        SetupStep::Intensity => "[+/- or arrows] adjust   [Enter] continue   [Esc] Back",
+        SetupStep::Review => "[Enter] start mining   [Esc] Back",
+    };
+    let message = if state.status_line.is_empty() {
+        keys.to_string()
+    } else {
+        format!("{keys}\n{}", state.status_line)
+    };
+    frame.render_widget(
+        Paragraph::new(message)
+            .block(Block::default().borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        rows[2],
+    );
+}
+
+fn render_setup_gpu(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let items = state.devices.iter().enumerate().map(|(index, device)| {
+        let marker = if index == state.selected { "> " } else { "  " };
+        ListItem::new(format!(
+            "{marker}{}:{}  {}  {}",
+            device.backend.as_str().to_ascii_uppercase(),
+            device.index,
+            device.vendor,
+            device.name
+        ))
+    });
+    frame.render_widget(
+        List::new(items).block(Block::default().title(" GPUs ").borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn render_setup_payout(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    frame.render_widget(
+        Paragraph::new(state.payout_input.as_str())
+            .block(Block::default().title(" Address ").borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn render_setup_intensity(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let ratio = f64::from(state.config.intensity) / 100.0;
+    frame.render_widget(
+        Gauge::default()
+            .block(
+                Block::default()
+                    .title(" GPU intensity ")
+                    .borders(Borders::ALL),
+            )
+            .gauge_style(Style::default().fg(Color::Cyan))
+            .ratio(ratio)
+            .label(format!("{}%", state.config.intensity)),
+        area,
+    );
+}
+
+fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let device = state.selected_device();
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "GPU: {}:{}  {}",
+                device.backend.as_str().to_ascii_uppercase(),
+                device.index,
+                device.name
+            )),
+            Line::from(format!("Address: {}", state.config.payout_address)),
+            Line::from(format!("Intensity: {}%", state.config.intensity)),
+            Line::from("Donation: 2%"),
+            Line::from(""),
+            Line::from("Press Enter to start mining."),
+        ])
+        .block(Block::default().title(" Review ").borders(Borders::ALL))
+        .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     let area = frame.area();
     let rows = Layout::default()
@@ -505,6 +831,9 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
 
     if state.show_help {
         render_help(frame, area);
+    }
+    if state.settings_mode {
+        render_settings(frame, area, snapshot);
     }
 }
 
@@ -607,7 +936,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ])
     } else {
         Line::from(format!(
-            "{}   [+/-] intensity  [Space/P] pause  [R] reconnect  [:] command  [?] help  [Q] quit",
+            "{}   [S] settings  [+/-] intensity  [Space/P] pause  [R] reconnect  [:] command  [?] help  [Q] quit",
             state.status_line
         ))
     };
@@ -617,6 +946,36 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_settings(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
+    let popup = centered_rect(82, 58, area);
+    frame.render_widget(Clear, popup);
+    let settings = Paragraph::new(vec![
+        Line::from("Mining settings"),
+        Line::from(""),
+        Line::from(format!(
+            "Address: {}",
+            shorten(&snapshot.payout_address, 66)
+        )),
+        Line::from(format!("Intensity: {}%", snapshot.search.intensity)),
+        Line::from(format!(
+            "GPU/device: {}:{}",
+            snapshot.gpu_backend.to_ascii_uppercase(),
+            snapshot.gpu_device
+        )),
+        Line::from(format!(
+            "Connection: {}",
+            shorten(&redact_endpoint(&snapshot.endpoint), 60)
+        )),
+        Line::from(""),
+        Line::from("[A] edit address   [+/-] intensity   [R] reconnect"),
+        Line::from("GPU/device can be selected in startup setup or with --device."),
+        Line::from("[S/Esc] close settings"),
+    ])
+    .block(Block::default().title(" Settings ").borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(settings, popup);
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
@@ -633,6 +992,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("arrows       adjust intensity 5%"),
         Line::from("Space / P    pause or resume"),
         Line::from("R            reconnect authoritative Fulcrum source"),
+        Line::from("S            settings"),
         Line::from(": / C        command palette"),
         Line::from("?            close/open help"),
         Line::from("Q / Ctrl+C   graceful quit"),
@@ -750,6 +1110,105 @@ fn shorten(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_devices() -> Vec<GpuDevice> {
+        vec![
+            GpuDevice {
+                index: 0,
+                name: "Primary CUDA".into(),
+                vendor: "NVIDIA".into(),
+                vram_bytes: None,
+                backend: BackendKind::Cuda,
+                detail: String::new(),
+            },
+            GpuDevice {
+                index: 0,
+                name: "Secondary HIP".into(),
+                vendor: "AMD".into(),
+                vram_bytes: None,
+                backend: BackendKind::Hip,
+                detail: String::new(),
+            },
+        ]
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn setup_default_selection() {
+        let devices = test_devices();
+        let default_device = devices[0].clone();
+        let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
+        assert_eq!(setup.selected, 0);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert_eq!(setup.step, SetupStep::Payout);
+        setup.handle_key(key(KeyCode::Esc));
+        setup.handle_key(key(KeyCode::Down));
+        assert_eq!(setup.selected, 1);
+    }
+
+    #[test]
+    fn setup_validation_stays_on_input() {
+        let devices = test_devices();
+        let default_device = devices[0].clone();
+        let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
+        setup.handle_key(key(KeyCode::Enter));
+        setup.payout_input = "x".into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Payout);
+    }
+
+    #[test]
+    fn setup_valid_input_advances() {
+        let devices = test_devices();
+        let default_device = devices[0].clone();
+        let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
+        setup.handle_key(key(KeyCode::Enter));
+        setup.payout_input = crate::config::DONATION_ADDRESS.into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Intensity);
+        assert_eq!(setup.config.payout_address, crate::config::DONATION_ADDRESS);
+    }
+
+    #[test]
+    fn setup_intensity_stays_in_range() {
+        let devices = test_devices();
+        let default_device = devices[0].clone();
+        let mut config = RuntimeConfig::default();
+        config
+            .set_payout(crate::config::DONATION_ADDRESS.into())
+            .unwrap();
+        let mut setup = SetupFlow::new(config, devices, &default_device).unwrap();
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Enter));
+        for _ in 0..20 {
+            setup.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(setup.config.intensity, 10);
+        for _ in 0..20 {
+            setup.handle_key(key(KeyCode::Up));
+        }
+        assert_eq!(setup.config.intensity, 100);
+    }
+
+    #[test]
+    fn setup_review_values() {
+        let devices = test_devices();
+        let default_device = devices[0].clone();
+        let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
+        setup.handle_key(key(KeyCode::Down));
+        assert_eq!(setup.selected, 1);
+        setup.handle_key(key(KeyCode::Enter));
+        setup.payout_input = crate::config::DONATION_ADDRESS.into();
+        setup.handle_key(key(KeyCode::Enter));
+        setup.config.set_intensity(70).unwrap();
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Review);
+        assert_eq!(setup.config.intensity, 70);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+    }
 
     #[test]
     fn palette_parses_shared_runtime_controls() {

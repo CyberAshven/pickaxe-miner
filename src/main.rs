@@ -729,6 +729,20 @@ fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
     Ok(cfg)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MineStartup {
+    InteractiveSetup,
+    Direct,
+}
+
+fn mine_startup(args: &cli::Cli, cfg: &RuntimeConfig) -> MineStartup {
+    if !(args.no_tui || args.json) && cfg.payout_address.trim().is_empty() {
+        MineStartup::InteractiveSetup
+    } else {
+        MineStartup::Direct
+    }
+}
+
 fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
     if json {
         let value = match event {
@@ -1017,6 +1031,14 @@ fn main() {
             }
         },
         cli::Commands::Mine => {
+            let startup = mine_startup(&args, &cfg);
+            if matches!(startup, MineStartup::Direct)
+                && (args.no_tui || args.json)
+                && cfg.payout_address.trim().is_empty()
+            {
+                eprintln!("error: --address is required with --no-tui or --json");
+                std::process::exit(2);
+            }
             let selected = match backend::resolve_mining_device(backend_kind, args.device) {
                 Ok(device) => device,
                 Err(error) => {
@@ -1024,9 +1046,30 @@ fn main() {
                     std::process::exit(2);
                 }
             };
+            let (cfg, selected_backend, selected_device) = match startup {
+                MineStartup::InteractiveSetup => {
+                    let devices = match backend::list_devices(backend_kind) {
+                        Ok(devices) => devices,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(2);
+                        }
+                    };
+                    let setup = match tui::run_setup(cfg, devices, &selected) {
+                        Ok(Some(setup)) => setup,
+                        Ok(None) => return,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(1);
+                        }
+                    };
+                    (setup.config, setup.backend, setup.device)
+                }
+                MineStartup::Direct => (cfg, selected.backend, selected.index),
+            };
             let use_tui = !(args.no_tui || args.json);
             if let Err(error) =
-                run_headless_mining(cfg, selected.backend, selected.index, args.json, use_tui)
+                run_headless_mining(cfg, selected_backend, selected_device, args.json, use_tui)
             {
                 eprintln!("error: {error}");
                 std::process::exit(1);
@@ -1077,6 +1120,7 @@ fn run_repl(mut cfg: RuntimeConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn live_job() -> LiveJob {
         LiveJob {
@@ -1093,6 +1137,42 @@ mod tests {
             target_le_hex: "ff".repeat(32),
             reward_raw: 4_999_773_813,
         }
+    }
+
+    #[test]
+    fn startup_enters_setup_by_default() {
+        let args = cli::Cli::try_parse_from(["pickaxe", "mine"]).unwrap();
+        let cfg = runtime_config_from_cli(&args).unwrap();
+        assert_eq!(mine_startup(&args, &cfg), MineStartup::InteractiveSetup);
+    }
+
+    #[test]
+    fn startup_flag_keeps_direct_mode() {
+        let args = cli::Cli::try_parse_from(["pickaxe", "mine", "--no-tui"]).unwrap();
+        let cfg = runtime_config_from_cli(&args).unwrap();
+        assert_eq!(mine_startup(&args, &cfg), MineStartup::Direct);
+    }
+
+    #[test]
+    fn explicit_startup_values_feed_runtime_config() {
+        let args = cli::Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--backend",
+            "cuda",
+            "--device",
+            "0",
+            "--intensity",
+            "60",
+            "--address",
+            crate::config::DONATION_ADDRESS,
+        ])
+        .unwrap();
+        let cfg = runtime_config_from_cli(&args).unwrap();
+        assert_eq!(mine_startup(&args, &cfg), MineStartup::Direct);
+        assert_eq!(args.device, Some(0));
+        assert_eq!(cfg.intensity, 60);
+        assert_eq!(cfg.payout_address, crate::config::DONATION_ADDRESS);
     }
 
     #[test]
