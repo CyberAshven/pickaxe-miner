@@ -7,7 +7,7 @@
 //! immutable generation change has been applied.
 
 use crate::backend::BackendKind;
-use crate::config::RuntimeConfig;
+use crate::config::{JobSource, RuntimeConfig};
 use crate::electrum::{ElectrumSession, LiveJob};
 use crate::reward;
 use crate::search::VerifiedWinner;
@@ -103,6 +103,119 @@ struct PendingSubmission {
 }
 
 impl PendingSubmission {
+    fn marker_path(journal_path: &Path, suffix: &str) -> PathBuf {
+        let mut path = journal_path.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    fn parent_attempted_path(journal_path: &Path) -> PathBuf {
+        Self::marker_path(journal_path, ".parent-attempted")
+    }
+
+    fn parent_accepted_path(journal_path: &Path) -> PathBuf {
+        Self::marker_path(journal_path, ".parent-accepted")
+    }
+
+    fn marker_present(path: &Path, expected_parent_txid: &str) -> Result<bool, String> {
+        let marker = match fs::read_to_string(path) {
+            Ok(marker) => marker,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "read pending-submission progress marker {}: {error}",
+                    path.display()
+                ))
+            }
+        };
+        if marker.trim().eq_ignore_ascii_case(expected_parent_txid) {
+            Ok(true)
+        } else {
+            Err(format!(
+                "pending-submission progress marker {} does not match parent txid",
+                path.display()
+            ))
+        }
+    }
+
+    fn persist_marker(path: &Path, parent_txid: &str) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .ok_or("pending-submission progress marker has no parent directory")?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "create pending-submission progress directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        if Self::marker_present(path, parent_txid)? {
+            return Self::sync_committed(path, parent);
+        }
+
+        let temporary = Self::marker_path(path, ".tmp");
+        if temporary.exists() {
+            fs::remove_file(&temporary).map_err(|error| {
+                format!(
+                    "remove stale pending-submission progress temporary file {}: {error}",
+                    temporary.display()
+                )
+            })?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| {
+                format!(
+                    "create pending-submission progress temporary file {}: {error}",
+                    temporary.display()
+                )
+            })?;
+        if let Err(error) = file
+            .write_all(parent_txid.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "write pending-submission progress marker {}: {error}",
+                temporary.display()
+            ));
+        }
+        drop(file);
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "commit pending-submission progress marker {}: {error}",
+                path.display()
+            ));
+        }
+        Self::sync_committed(path, parent)
+    }
+
+    fn parent_attempted(&self, journal_path: &Path) -> Result<bool, String> {
+        Self::marker_present(
+            &Self::parent_attempted_path(journal_path),
+            &self.parent_txid,
+        )
+    }
+
+    fn parent_accepted(&self, journal_path: &Path) -> Result<bool, String> {
+        Self::marker_present(&Self::parent_accepted_path(journal_path), &self.parent_txid)
+    }
+
+    fn mark_parent_attempted(&self, journal_path: &Path) -> Result<(), String> {
+        Self::persist_marker(
+            &Self::parent_attempted_path(journal_path),
+            &self.parent_txid,
+        )
+    }
+
+    fn mark_parent_accepted(&self, journal_path: &Path) -> Result<(), String> {
+        self.mark_parent_attempted(journal_path)?;
+        Self::persist_marker(&Self::parent_accepted_path(journal_path), &self.parent_txid)
+    }
+
     fn from_verified(
         winner: &VerifiedWinner,
         split: &reward::PreparedRewardSplit,
@@ -235,6 +348,17 @@ impl PendingSubmission {
                 path.display()
             ));
         }
+        for marker in [
+            Self::parent_attempted_path(path),
+            Self::parent_accepted_path(path),
+        ] {
+            if marker.exists() {
+                return Err(format!(
+                    "orphan pending-submission progress marker exists at {}",
+                    marker.display()
+                ));
+            }
+        }
 
         let temporary = path.with_extension("json.tmp");
         if temporary.exists() {
@@ -300,6 +424,21 @@ impl PendingSubmission {
     }
 
     fn remove(path: &Path) -> Result<(), String> {
+        for marker in [
+            Self::parent_accepted_path(path),
+            Self::parent_attempted_path(path),
+        ] {
+            match fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "remove pending-submission progress marker {}: {error}",
+                        marker.display()
+                    ))
+                }
+            }
+        }
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -379,9 +518,68 @@ fn ensure_broadcast_txid(label: &str, expected: &str, returned: &str) -> Result<
     }
 }
 
+fn broadcast_with_preference<F, N>(
+    source: JobSource,
+    node_configured: bool,
+    mut fulcrum: F,
+    mut node: N,
+) -> Result<String, String>
+where
+    F: FnMut() -> Result<String, String>,
+    N: FnMut() -> Result<String, String>,
+{
+    match source {
+        JobSource::Node if node_configured => match node() {
+            Ok(txid) => Ok(txid),
+            Err(node_error) => fulcrum().map_err(|fulcrum_error| {
+                format!(
+                    "native-node broadcast failed: {node_error}; Fulcrum fallback failed: {fulcrum_error}"
+                )
+            }),
+        },
+        JobSource::Node => fulcrum(),
+        JobSource::Fulcrum => match fulcrum() {
+            Ok(txid) => Ok(txid),
+            Err(fulcrum_error) if node_configured => node().map_err(|node_error| {
+                format!(
+                    "Fulcrum broadcast failed: {fulcrum_error}; native-node fallback failed: {node_error}"
+                )
+            }),
+            Err(fulcrum_error) => Err(fulcrum_error),
+        },
+    }
+}
+
+fn broadcast_pending_transaction(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    raw_tx_hex: &str,
+) -> Result<String, String> {
+    let node_endpoints = cfg.node_endpoints();
+    let node_configured = !node_endpoints.is_empty();
+    broadcast_with_preference(
+        cfg.source,
+        node_configured,
+        || session.broadcast_raw(raw_tx_hex),
+        || crate::node::broadcast_raw(&node_endpoints, raw_tx_hex).map(|(_, txid)| txid),
+    )
+}
+
+fn broadcast_child(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    pending: &PendingSubmission,
+) -> Result<SubmissionAttempt, String> {
+    let returned = broadcast_pending_transaction(session, cfg, &pending.child_hex)?;
+    ensure_broadcast_txid("reward child", &pending.child_txid, &returned)?;
+    Ok(SubmissionAttempt::Complete)
+}
+
 fn attempt_pending_submission(
     session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
     pending: &PendingSubmission,
+    journal_path: &Path,
 ) -> Result<SubmissionAttempt, String> {
     pending.validate()?;
 
@@ -390,26 +588,40 @@ fn attempt_pending_submission(
         return Ok(SubmissionAttempt::Complete);
     }
 
-    let parent_known = session.transaction_known(&pending.parent_txid)?;
-    if parent_known {
-        let returned = session.broadcast_raw(&pending.child_hex)?;
-        ensure_broadcast_txid("reward child", &pending.child_txid, &returned)?;
-        return Ok(SubmissionAttempt::Complete);
+    if pending.parent_accepted(journal_path)? {
+        return broadcast_child(session, cfg, pending);
     }
 
+    let parent_known = session.transaction_known(&pending.parent_txid)?;
+    if parent_known {
+        pending.mark_parent_accepted(journal_path)?;
+        return broadcast_child(session, cfg, pending);
+    }
+
+    let parent_attempted = pending.parent_attempted(journal_path)?;
     let fresh = session.fetch_live_job()?;
-    if submission_decision(false, false, pending.matches_live(&fresh))
-        == SubmissionDecision::StaleUnbroadcast
+    if fresh.baton_txid.eq_ignore_ascii_case(&pending.parent_txid) && fresh.baton_vout == 0 {
+        pending.mark_parent_accepted(journal_path)?;
+        return broadcast_child(session, cfg, pending);
+    }
+    let baton_conflicted = fresh.baton_txid != pending.expected_baton_txid
+        || fresh.baton_vout != pending.expected_baton_vout;
+    if baton_conflicted {
+        return Ok(SubmissionAttempt::StaleUnbroadcast(fresh));
+    }
+    if !parent_attempted
+        && submission_decision(false, false, pending.matches_live(&fresh))
+            == SubmissionDecision::StaleUnbroadcast
     {
         return Ok(SubmissionAttempt::StaleUnbroadcast(fresh));
     }
 
-    let returned_parent = session.broadcast_raw(&pending.parent_hex)?;
+    pending.mark_parent_attempted(journal_path)?;
+    let returned_parent = broadcast_pending_transaction(session, cfg, &pending.parent_hex)?;
     ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned_parent)?;
+    pending.mark_parent_accepted(journal_path)?;
 
-    let returned_child = session.broadcast_raw(&pending.child_hex)?;
-    ensure_broadcast_txid("reward child", &pending.child_txid, &returned_child)?;
-    Ok(SubmissionAttempt::Complete)
+    broadcast_child(session, cfg, pending)
 }
 
 fn prepare_pending_submission(
@@ -442,18 +654,34 @@ fn prepare_pending_submission(
 
 fn resolve_pending_before_search(
     session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
     journal_path: &Path,
 ) -> Result<(), String> {
     let Some(pending) = PendingSubmission::load(journal_path)? else {
         return Ok(());
     };
 
-    match attempt_pending_submission(session, &pending)? {
+    match attempt_pending_submission(session, cfg, &pending, journal_path)? {
         SubmissionAttempt::Complete | SubmissionAttempt::StaleUnbroadcast(_) => {
             PendingSubmission::remove(journal_path)?;
             Ok(())
         }
     }
+}
+
+fn production_submission_transport_preflight(cfg: &RuntimeConfig) -> Result<(), String> {
+    if cfg.source != JobSource::Node {
+        return Ok(());
+    }
+    let endpoints = cfg.node_endpoints();
+    if endpoints.is_empty() {
+        return Err("native-node broadcast selected but no node RPC endpoint is configured".into());
+    }
+    crate::node::connect_failover(&endpoints)
+        .map(|_| ())
+        .map_err(|_| {
+            "native-node broadcast preflight failed: configured node RPC is unreachable".into()
+        })
 }
 
 fn probe_submission_journal(journal_path: &Path) -> Result<(), String> {
@@ -462,6 +690,17 @@ fn probe_submission_journal(journal_path: &Path) -> Result<(), String> {
             "unresolved previous winner submission exists at {}",
             journal_path.display()
         ));
+    }
+    for marker in [
+        PendingSubmission::parent_attempted_path(journal_path),
+        PendingSubmission::parent_accepted_path(journal_path),
+    ] {
+        if marker.exists() {
+            return Err(format!(
+                "orphan pending-submission progress marker exists at {}",
+                marker.display()
+            ));
+        }
     }
     let parent = journal_path
         .parent()
@@ -760,7 +999,8 @@ impl RuntimeSupervisor {
         let endpoints = cfg.electrum_endpoints();
         let mut session = ElectrumSession::connect_failover(&endpoints)?;
         let journal_path = submission_journal_path();
-        resolve_pending_before_search(&mut session, &journal_path)?;
+        resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
+        production_submission_transport_preflight(&cfg)?;
         let initial = session.fetch_live_job()?;
         let (reward_secret, reward_public_key, mining_payout_address) =
             reward::new_intermediate_identity()?;
@@ -1273,7 +1513,9 @@ fn run_supervisor(
                 let pending = pending_submission.as_ref().expect("checked above").clone();
                 let attempt = attempt_pending_submission(
                     session.as_mut().expect("checked session above"),
+                    &cfg,
                     &pending,
+                    &journal_path,
                 );
                 match attempt {
                     Ok(SubmissionAttempt::Complete) => {
@@ -2085,6 +2327,55 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_preference_uses_selected_transport_then_safe_fallback() {
+        use std::cell::RefCell;
+
+        let calls = RefCell::new(Vec::new());
+        let returned = broadcast_with_preference(
+            JobSource::Node,
+            true,
+            || {
+                calls.borrow_mut().push("fulcrum");
+                Ok("aa".repeat(32))
+            },
+            || {
+                calls.borrow_mut().push("node");
+                Err("node unavailable".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(returned, "aa".repeat(32));
+        assert_eq!(&*calls.borrow(), &["node", "fulcrum"]);
+
+        calls.borrow_mut().clear();
+        let returned = broadcast_with_preference(
+            JobSource::Fulcrum,
+            true,
+            || {
+                calls.borrow_mut().push("fulcrum");
+                Err("fulcrum unavailable".into())
+            },
+            || {
+                calls.borrow_mut().push("node");
+                Ok("bb".repeat(32))
+            },
+        )
+        .unwrap();
+        assert_eq!(returned, "bb".repeat(32));
+        assert_eq!(&*calls.borrow(), &["fulcrum", "node"]);
+    }
+
+    #[test]
+    fn native_node_source_refuses_live_search_without_node_endpoint() {
+        let cfg = RuntimeConfig {
+            source: JobSource::Node,
+            ..RuntimeConfig::default()
+        };
+        let error = production_submission_transport_preflight(&cfg).unwrap_err();
+        assert!(error.contains("no node RPC endpoint"));
+    }
+
+    #[test]
     fn production_preflight_proves_parent_reward_split_and_journal_readiness() {
         let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
         production_preflight_local(
@@ -2342,6 +2633,58 @@ mod tests {
 
         PendingSubmission::remove(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn parent_broadcast_progress_survives_restart_and_is_removed_with_journal() {
+        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job, sponsor).unwrap();
+        let winner = signed_winner(cfg.generation_id, &job, &mining_payout);
+        let pending = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+
+        assert!(!pending.parent_attempted(&journal).unwrap());
+        assert!(!pending.parent_accepted(&journal).unwrap());
+        pending.mark_parent_attempted(&journal).unwrap();
+        assert!(pending.parent_attempted(&journal).unwrap());
+        assert!(!pending.parent_accepted(&journal).unwrap());
+
+        let restarted = PendingSubmission::load(&journal).unwrap().unwrap();
+        assert!(restarted.parent_attempted(&journal).unwrap());
+        restarted.mark_parent_accepted(&journal).unwrap();
+        assert!(restarted.parent_accepted(&journal).unwrap());
+
+        PendingSubmission::remove(&journal).unwrap();
+        assert!(!journal.exists());
+        assert!(!PendingSubmission::parent_attempted_path(&journal).exists());
+        assert!(!PendingSubmission::parent_accepted_path(&journal).exists());
+    }
+
+    #[test]
+    fn production_preflight_refuses_orphan_submission_progress() {
+        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        let marker = PendingSubmission::parent_attempted_path(&journal);
+        fs::write(&marker, format!("{}\n", "aa".repeat(32))).unwrap();
+        let error = production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &sponsor,
+            &journal,
+        )
+        .unwrap_err();
+        assert!(error.contains("orphan pending-submission progress marker"));
+        fs::remove_file(marker).unwrap();
     }
 
     #[test]
