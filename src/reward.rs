@@ -397,13 +397,94 @@ pub fn new_intermediate_identity() -> Result<([u8; 32], [u8; 33], String), Strin
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn required_relay_fee_sats(serialized_bytes: usize) -> Result<u64, String> {
+fn required_relay_fee_sats(
+    serialized_bytes: usize,
+    relay_fee_sats_per_kb: u64,
+) -> Result<u64, String> {
     let bytes = u64::try_from(serialized_bytes).map_err(|_| "transaction size exceeds u64")?;
     bytes
-        .checked_mul(MIN_RELAY_FEE_SATS_PER_KB)
+        .checked_mul(relay_fee_sats_per_kb)
         .and_then(|value| value.checked_add(999))
         .map(|value| value / 1_000)
         .ok_or_else(|| "relay-fee calculation overflow".into())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn build_self_funded_outputs(
+    baton_output_value_sats: u64,
+    baton_token_and_locking_bytecode: &[u8],
+    reward_value_sats: u64,
+    miner_lock: &[u8],
+    donation_lock: &[u8],
+    miner_token_amount: u128,
+    donation_token_amount: u128,
+) -> Result<Vec<u8>, String> {
+    let mut outputs = Vec::new();
+    outputs.extend_from_slice(&encode_raw_output(
+        baton_output_value_sats,
+        baton_token_and_locking_bytecode,
+    ));
+    outputs.extend_from_slice(&encode_output(
+        reward_value_sats,
+        Some(miner_token_amount),
+        miner_lock,
+    )?);
+    outputs.extend_from_slice(&encode_output(
+        reward_value_sats,
+        Some(donation_token_amount),
+        donation_lock,
+    )?);
+    Ok(outputs)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn self_funded_serialized_len(
+    parent_txid: &str,
+    baton_output_value_sats: u64,
+    baton_token_and_locking_bytecode: &[u8],
+    reward_value_sats: u64,
+    reward_public_key: &[u8; 33],
+    miner_lock: &[u8],
+    donation_lock: &[u8],
+    miner_token_amount: u128,
+    donation_token_amount: u128,
+) -> Result<usize, String> {
+    let redeem_script = hex::decode(REDEEM_SCRIPT_HEX.trim()).map_err(|error| error.to_string())?;
+    if redeem_script.len() != 259 {
+        return Err(format!(
+            "PHOTON redeem script must be 259 bytes (got {})",
+            redeem_script.len()
+        ));
+    }
+    let baton_unlocking = push_data(&redeem_script)?;
+
+    // BCH Schnorr is exactly 64 bytes, followed by the one-byte sighash type.
+    // P2PKH then pushes that 65-byte value and the fixed 33-byte compressed key.
+    // These placeholders are used only for serialization sizing; no provisional
+    // signature is created with the live reward key.
+    let mut reward_unlocking = push_data(&[0u8; 65])?;
+    reward_unlocking.extend_from_slice(&push_data(reward_public_key)?);
+    let outputs = build_self_funded_outputs(
+        baton_output_value_sats,
+        baton_token_and_locking_bytecode,
+        reward_value_sats,
+        miner_lock,
+        donation_lock,
+        miner_token_amount,
+        donation_token_amount,
+    )?;
+
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&2u32.to_le_bytes());
+    raw.push(2);
+    raw.extend_from_slice(&encode_input(parent_txid, 0, &baton_unlocking)?);
+    raw.extend_from_slice(&encode_input(parent_txid, 1, &reward_unlocking)?);
+    raw.push(3);
+    raw.extend_from_slice(&outputs);
+    raw.extend_from_slice(&0u32.to_le_bytes());
+    Ok(raw.len())
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -429,22 +510,15 @@ fn build_self_funded_raw(
         ));
     }
     let reward_lock = p2pkh_locking_from_public_key(reward_public_key);
-
-    let mut outputs = Vec::new();
-    outputs.extend_from_slice(&encode_raw_output(
+    let outputs = build_self_funded_outputs(
         baton_output_value_sats,
         baton_token_and_locking_bytecode,
-    ));
-    outputs.extend_from_slice(&encode_output(
         reward_value_sats,
-        Some(miner_token_amount),
         miner_lock,
-    )?);
-    outputs.extend_from_slice(&encode_output(
-        reward_value_sats,
-        Some(donation_token_amount),
         donation_lock,
-    )?);
+        miner_token_amount,
+        donation_token_amount,
+    )?;
 
     let sighash = self_funded_p2pkh_sighash(
         parent_txid,
@@ -481,6 +555,25 @@ pub fn build_self_funded_settlement(
     reward_public_key: &[u8; 33],
     miner_payout: &str,
     reward_token_amount: u128,
+) -> Result<PreparedSelfFundedSettlement, String> {
+    build_self_funded_settlement_with_relay_fee(
+        parent_raw,
+        reward_secret,
+        reward_public_key,
+        miner_payout,
+        reward_token_amount,
+        MIN_RELAY_FEE_SATS_PER_KB,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn build_self_funded_settlement_with_relay_fee(
+    parent_raw: &[u8],
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    miner_payout: &str,
+    reward_token_amount: u128,
+    relay_fee_sats_per_kb: u64,
 ) -> Result<PreparedSelfFundedSettlement, String> {
     let derived_public = PublicKey::from_secret_key(
         &SecretKey::from_secret_bytes(*reward_secret).map_err(|error| error.to_string())?,
@@ -526,24 +619,22 @@ pub fn build_self_funded_settlement(
     }
 
     let parent_txid = transaction_id(parent_raw);
-    let provisional_baton_value = baton
+    let sizing_baton_value = baton
         .value_sats
         .checked_sub(PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS)
         .ok_or("baton BCH value is too small for settlement")?;
-    let provisional = build_self_funded_raw(
+    let serialized_len = self_funded_serialized_len(
         &parent_txid,
-        provisional_baton_value,
+        sizing_baton_value,
         &baton.token_and_locking_bytecode,
         reward.value_sats,
-        reward_token_amount,
-        reward_secret,
         reward_public_key,
         &miner_lock,
         &donation_lock,
         miner_token_amount,
         donation_token_amount,
     )?;
-    let required_relay_fee_sats = required_relay_fee_sats(provisional.len())?;
+    let required_relay_fee_sats = required_relay_fee_sats(serialized_len, relay_fee_sats_per_kb)?;
     let baton_decrease = reward
         .value_sats
         .checked_add(required_relay_fee_sats)
@@ -570,7 +661,7 @@ pub fn build_self_funded_settlement(
         miner_token_amount,
         donation_token_amount,
     )?;
-    if raw_settlement.len() != provisional.len() {
+    if raw_settlement.len() != serialized_len {
         return Err("settlement relay-fee sizing changed after finalization".into());
     }
     let input_value = baton
@@ -959,6 +1050,58 @@ mod tests {
             cursor += script_len + 4;
         }
         assert_eq!(raw[cursor], 3);
+    }
+
+    #[test]
+    fn self_funded_settlement_uses_supplied_relay_fee_floor() {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let miner_payout = p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+
+        let settlement = build_self_funded_settlement_with_relay_fee(
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+            2_000,
+        )
+        .unwrap();
+
+        assert_eq!(settlement.raw_settlement.len(), 794);
+        assert_eq!(settlement.required_relay_fee_sats, 1_588);
+        assert_eq!(settlement.fee_sats, 1_588);
+        assert_eq!(settlement.baton_output_value_sats, 15_967_712);
+        assert_eq!(
+            settlement.baton_input_value_sats - settlement.baton_output_value_sats,
+            TOKEN_OUTPUT_SATS + settlement.fee_sats
+        );
+    }
+
+    #[test]
+    fn self_funded_settlement_rejects_relay_floor_above_covenant_budget() {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let miner_payout = p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+
+        let error = build_self_funded_settlement_with_relay_fee(
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+            10_000,
+        )
+        .unwrap_err();
+        assert!(error.contains("covenant permits at most"));
     }
 
     #[test]

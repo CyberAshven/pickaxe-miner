@@ -37,6 +37,129 @@ pub fn connect_failover(endpoints: &[String]) -> Result<(String, Value), String>
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayPolicy {
+    /// Effective mempool admission floor reported by BCHN, in satoshis per kB.
+    pub mempool_min_fee_sats_per_kb: u64,
+}
+
+/// Read the active BCHN mempool fee floor from the configured native node.
+///
+/// BCHN reports `mempoolminfee` in BCH/kB and defines it as the maximum of
+/// `minrelaytxfee` and the current dynamic mempool minimum. Keep the same
+/// sequential/backoff behavior as the other native-node operations.
+pub fn fetch_relay_policy(endpoints: &[String]) -> Result<(String, RelayPolicy), String> {
+    if endpoints.is_empty() {
+        return Err("no native node endpoints configured for relay-policy preflight".into());
+    }
+
+    let mut failures = Vec::new();
+    let mut backoff_ms: u64 = 400;
+    for (i, url) in endpoints.iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(backoff_ms));
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
+        }
+        match rpc_call(url, "getmempoolinfo", json!([])) {
+            Ok(value) => {
+                let parsed = value
+                    .get("mempoolminfee")
+                    .ok_or_else(|| "getmempoolinfo omitted mempoolminfee".to_string())
+                    .and_then(bch_per_kb_to_sats);
+                match parsed {
+                    Ok(mempool_min_fee_sats_per_kb) => {
+                        return Ok((
+                            redact_url(url),
+                            RelayPolicy {
+                                mempool_min_fee_sats_per_kb,
+                            },
+                        ));
+                    }
+                    Err(error) => failures.push(format!("{}: {error}", redact_url(url))),
+                }
+            }
+            Err(error) => failures.push(format!("{}: {error}", redact_url(url))),
+        }
+    }
+
+    Err(format!(
+        "All native node relay-policy RPCs failed (sequential, ban-safe):\n{}",
+        failures.join("\n")
+    ))
+}
+
+fn bch_per_kb_to_sats(value: &Value) -> Result<u64, String> {
+    let text = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        _ => return Err("relay fee must be a numeric BCH/kB value".into()),
+    };
+    decimal_bch_to_sats(&text)
+}
+
+fn decimal_bch_to_sats(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    if text.is_empty() || text.starts_with('-') || text.starts_with('+') {
+        return Err("relay fee must be a non-negative BCH amount".into());
+    }
+
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(index) => {
+            let exponent = text[index + 1..]
+                .parse::<i32>()
+                .map_err(|_| "relay fee has an invalid decimal exponent")?;
+            (&text[..index], exponent)
+        }
+        None => (text, 0),
+    };
+    let (whole, fractional) = match mantissa.split_once('.') {
+        Some((whole, fractional)) => {
+            if fractional.contains('.') {
+                return Err("relay fee has more than one decimal point".into());
+            }
+            (whole, fractional)
+        }
+        None => (mantissa, ""),
+    };
+    if whole.is_empty() && fractional.is_empty() {
+        return Err("relay fee is empty".into());
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) || !fractional.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err("relay fee contains non-decimal characters".into());
+    }
+
+    let digits = format!("{whole}{fractional}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    let mut value = digits
+        .parse::<u128>()
+        .map_err(|_| "relay fee decimal is too large")?;
+    let scale = 8i32
+        .checked_add(exponent)
+        .and_then(|scale| scale.checked_sub(fractional.len() as i32))
+        .ok_or("relay fee scale overflow")?;
+    if scale >= 0 {
+        let multiplier = 10u128
+            .checked_pow(scale as u32)
+            .ok_or("relay fee scale is too large")?;
+        value = value
+            .checked_mul(multiplier)
+            .ok_or("relay fee satoshi value overflow")?;
+    } else {
+        let divisor = 10u128
+            .checked_pow(scale.unsigned_abs())
+            .ok_or("relay fee scale is too small")?;
+        if value % divisor != 0 {
+            return Err("relay fee has precision below one satoshi per kB".into());
+        }
+        value /= divisor;
+    }
+    u64::try_from(value).map_err(|_| "relay fee exceeds u64 satoshis per kB".into())
+}
+
 /// Broadcast raw tx via `sendrawtransaction`. Explicit only; never auto.
 pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, String), String> {
     let hex = raw_tx_hex.trim();
@@ -340,11 +463,49 @@ fn simple_b64(data: &[u8]) -> String {
 #[cfg(test)]
 mod gbt_tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn bits_genesis_style_nonzero() {
         let h = bits_to_target_le_hex(0x1d00ffff);
         assert_eq!(h.len(), 64);
         assert_ne!(h, "00".repeat(32));
+    }
+
+    #[test]
+    fn relay_fee_decimal_conversion_is_exact() {
+        assert_eq!(decimal_bch_to_sats("0.00001000").unwrap(), 1_000);
+        assert_eq!(decimal_bch_to_sats("0.00001234").unwrap(), 1_234);
+        assert_eq!(decimal_bch_to_sats("1e-5").unwrap(), 1_000);
+        assert!(decimal_bch_to_sats("0.000000001").is_err());
+        assert!(decimal_bch_to_sats("-0.00001").is_err());
+    }
+
+    #[test]
+    fn relay_policy_uses_live_mempool_minimum() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("\"method\":\"getmempoolinfo\""));
+            let body = r#"{"result":{"mempoolminfee":0.00001234,"minrelaytxfee":0.00001000},"error":null,"id":"pickaxe"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let endpoint = format!("http://{address}");
+        let (reported_endpoint, policy) =
+            fetch_relay_policy(std::slice::from_ref(&endpoint)).unwrap();
+        server.join().unwrap();
+        assert_eq!(reported_endpoint, endpoint);
+        assert_eq!(policy.mempool_min_fee_sats_per_kb, 1_234);
     }
 }
