@@ -47,7 +47,9 @@ pub struct RuntimeConfig {
     /// Example Start9: `wss://start9oslinux.local:50004`
     pub fulcrum_url: Option<String>,
     /// Optional native node JSON-RPC URL (`http://` / `https://`).
-    /// Example Start9: `http://127.0.0.1:8332` (auth via env, never logged).
+    /// Example Start9: `http://127.0.0.1:8332`. Prefer credentials in
+    /// `PICKAXE_NODE_RPC_USER` + `PICKAXE_NODE_RPC_PASSWORD` so secrets never
+    /// need to appear in command history or runtime endpoint identity.
     pub node_url: Option<String>,
     /// Preferred network transport for submission/diagnostics.
     pub source: JobSource,

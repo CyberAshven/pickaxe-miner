@@ -12,6 +12,9 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::thread;
 use std::time::Duration;
 
+const NODE_RPC_USER_ENV: &str = "PICKAXE_NODE_RPC_USER";
+const NODE_RPC_PASSWORD_ENV: &str = "PICKAXE_NODE_RPC_PASSWORD";
+
 /// Probe node RPC with `getblockchaininfo` (or `getblockcount` fallback).
 pub fn connect_failover(endpoints: &[String]) -> Result<(String, Value), String> {
     if endpoints.is_empty() {
@@ -28,10 +31,10 @@ pub fn connect_failover(endpoints: &[String]) -> Result<(String, Value), String>
             backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
         }
         match rpc_call(url, "getblockchaininfo", json!([])) {
-            Ok(v) => return Ok((url.clone(), v)),
+            Ok(v) => return Ok((redact_url(url), v)),
             Err(e1) => match rpc_call(url, "getblockcount", json!([])) {
-                Ok(v) => return Ok((url.clone(), v)),
-                Err(e2) => failures.push(format!("{url}: {e1} | {e2}")),
+                Ok(v) => return Ok((redact_url(url), v)),
+                Err(e2) => failures.push(format!("{}: {e1} | {e2}", redact_url(url))),
             },
         }
     }
@@ -927,7 +930,7 @@ pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, 
     ))
 }
 
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     // Strip userinfo before @ so credentials never land in logs.
     if let Some(scheme_end) = url.find("://") {
         let scheme = &url[..scheme_end + 3];
@@ -937,6 +940,29 @@ fn redact_url(url: &str) -> String {
         }
     }
     url.to_string()
+}
+
+fn select_node_rpc_basic_auth(
+    url_auth: Option<&str>,
+    env_user: Option<&str>,
+    env_password: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(auth) = url_auth {
+        return Ok(Some(auth.to_string()));
+    }
+    match (env_user, env_password) {
+        (None, None) => Ok(None),
+        (Some(user), Some(password)) => Ok(Some(format!("{user}:{password}"))),
+        _ => Err(format!(
+            "native node RPC environment auth requires both {NODE_RPC_USER_ENV} and {NODE_RPC_PASSWORD_ENV}"
+        )),
+    }
+}
+
+fn node_rpc_basic_auth(url_auth: Option<&str>) -> Result<Option<String>, String> {
+    let env_user = std::env::var(NODE_RPC_USER_ENV).ok();
+    let env_password = std::env::var(NODE_RPC_PASSWORD_ENV).ok();
+    select_node_rpc_basic_auth(url_auth, env_user.as_deref(), env_password.as_deref())
 }
 
 /// Light block template from BCHN. Prefers `getblocktemplatelight`, falls back to `getblocktemplate`.
@@ -1105,11 +1131,12 @@ fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
         );
     }
     let rest = &url["http://".len()..];
-    let (auth, hostport_path) = if let Some(at) = rest.find('@') {
+    let (url_auth, hostport_path) = if let Some(at) = rest.find('@') {
         (Some(&rest[..at]), &rest[at + 1..])
     } else {
         (None, rest)
     };
+    let auth = node_rpc_basic_auth(url_auth)?;
     let (hostport, path) = match hostport_path.split_once('/') {
         Some((hp, p)) => (hp, format!("/{p}")),
         None => (hostport_path, "/".to_string()),
@@ -1124,7 +1151,7 @@ fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
-    if let Some(a) = auth {
+    if let Some(a) = auth.as_deref() {
         let b64 = simple_b64(a.as_bytes());
         req.push_str(&format!("Authorization: Basic {b64}\r\n"));
     }
@@ -1301,6 +1328,43 @@ mod gbt_tests {
         assert_eq!(decimal_bch_to_sats("1e-5").unwrap(), 1_000);
         assert!(decimal_bch_to_sats("0.000000001").is_err());
         assert!(decimal_bch_to_sats("-0.00001").is_err());
+    }
+
+    #[test]
+    fn node_rpc_auth_uses_complete_env_pair_and_url_auth_takes_precedence() {
+        assert_eq!(
+            select_node_rpc_basic_auth(None, Some("rpc-user"), Some("rpc-password"))
+                .unwrap()
+                .as_deref(),
+            Some("rpc-user:rpc-password")
+        );
+        assert_eq!(
+            select_node_rpc_basic_auth(
+                Some("url-user:url-password"),
+                Some("rpc-user"),
+                Some("rpc-password")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("url-user:url-password")
+        );
+        assert!(select_node_rpc_basic_auth(None, Some("rpc-user"), None).is_err());
+        assert!(select_node_rpc_basic_auth(None, None, Some("rpc-password")).is_err());
+        assert_eq!(select_node_rpc_basic_auth(None, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn node_connection_failure_redacts_embedded_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint = format!("http://rpc-user:rpc-password@{address}");
+
+        let error = connect_failover(&[endpoint]).unwrap_err();
+
+        assert!(!error.contains("rpc-user"));
+        assert!(!error.contains("rpc-password"));
+        assert!(error.contains(&format!("http://***@{address}")));
     }
 
     #[test]
