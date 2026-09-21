@@ -897,6 +897,14 @@ mod tests {
     }
 
     #[test]
+    fn reward_split_rounding_regression() {
+        assert_eq!(RuntimeConfig::split_reward(0), (0, 0));
+        assert_eq!(RuntimeConfig::split_reward(49), (49, 0));
+        assert_eq!(RuntimeConfig::split_reward(50), (49, 1));
+        assert_eq!(RuntimeConfig::split_reward(100), (98, 2));
+    }
+
+    #[test]
     fn self_funded_settlement_matches_vm_fixture_accounting() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;
