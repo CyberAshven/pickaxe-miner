@@ -402,6 +402,22 @@ pub struct SearchHandle {
     started: Instant,
 }
 
+#[derive(Clone)]
+pub(crate) struct SearchPauseHandle {
+    paused: Arc<AtomicBool>,
+}
+
+impl SearchPauseHandle {
+    pub(crate) fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_shared(paused: Arc<AtomicBool>) -> Self {
+        Self { paused }
+    }
+}
+
 impl SearchHandle {
     pub fn start(intensity: u8, job: MiningJob) -> Result<Self, String> {
         Self::start_on_device(0, intensity, job)
@@ -601,6 +617,12 @@ impl SearchHandle {
 
     pub fn batch_in_flight(&self) -> bool {
         self.batch_in_flight.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn pause_handle(&self) -> SearchPauseHandle {
+        SearchPauseHandle {
+            paused: Arc::clone(&self.paused),
+        }
     }
 
     pub fn apply_control(&self, command: RuntimeCommand) -> Result<SearchStats, String> {

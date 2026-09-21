@@ -62,6 +62,7 @@ pub(crate) struct SourceEntry {
     pub(crate) failure_count: u8,
     pub(crate) retry_after_ms: Option<u64>,
     pub(crate) latency_ms: Option<u32>,
+    native_photon_proof: Option<super::NativePhotonEquivalenceProof>,
 }
 
 impl SourceEntry {
@@ -79,6 +80,7 @@ impl SourceEntry {
             failure_count: 0,
             retry_after_ms: None,
             latency_ms: None,
+            native_photon_proof: None,
         }
     }
 
@@ -121,6 +123,9 @@ impl SourceEntry {
     fn revoke_capability(&mut self, capability: SourceCapability) {
         self.capabilities
             .retain(|evidence| evidence.capability != capability);
+        if capability == SourceCapability::PhotonState {
+            self.native_photon_proof = None;
+        }
     }
 
     pub(crate) fn record_success(&mut self, now_ms: u64, latency_ms: u32) {
@@ -304,6 +309,7 @@ impl SourceCatalog {
                 "native PHOTON proof endpoint is not present in the source catalog".to_string()
             })?;
         entry.verify_capability(SourceCapability::PhotonState, now_ms, ttl_ms);
+        entry.native_photon_proof = Some(proof.clone());
         Ok(())
     }
 
@@ -313,6 +319,21 @@ impl SourceCatalog {
             .ok_or_else(|| "source not found".to_string())?;
         entry.revoke_capability(SourceCapability::PhotonState);
         Ok(())
+    }
+
+    pub(crate) fn native_photon_proof_at(
+        &self,
+        endpoint: &str,
+        now_ms: u64,
+    ) -> Option<&super::NativePhotonEquivalenceProof> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.kind == SourceKind::NativeNode
+                    && entry.endpoint == endpoint.trim()
+                    && entry.supports_at(SourceCapability::PhotonState, now_ms)
+            })
+            .and_then(|entry| entry.native_photon_proof.as_ref())
     }
 
     pub(crate) fn record_failure(
@@ -582,6 +603,7 @@ mod tests {
         let proof = super::super::NativePhotonEquivalenceProof {
             endpoint: "node-a".into(),
             tip_hash: "11".repeat(32),
+            proven_work: Default::default(),
         };
         catalog
             .verify_native_photon_capability(&proof, 1_000, 100)
@@ -592,17 +614,20 @@ mod tests {
             SourceCapability::PhotonState,
             1_100
         ));
+        assert!(catalog.native_photon_proof_at("node-a", 1_100).is_some());
         assert!(!catalog.supports_at(
             SourceKind::NativeNode,
             "node-a",
             SourceCapability::PhotonState,
             1_101
         ));
+        assert!(catalog.native_photon_proof_at("node-a", 1_101).is_none());
 
         catalog
             .verify_native_photon_capability(&proof, 2_000, 100)
             .unwrap();
         catalog.revoke_native_photon_capability("node-a").unwrap();
+        assert!(catalog.native_photon_proof_at("node-a", 2_000).is_none());
         assert!(!catalog.supports_at(
             SourceKind::NativeNode,
             "node-a",
