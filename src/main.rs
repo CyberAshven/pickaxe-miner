@@ -1,21 +1,32 @@
 //! Pickaxe Miner - interactive CLI (Stage 2/3).
 //!
 //! Controls mirror the postcorps WebGPU site (esp. intensity).
-//! Donation: 2% coinbase-style split on the win tx only - never skim unrelated funds.
+//! Donation intent is 2%, but same-transaction splitting stays disabled until covenant-valid.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 mod backend;
 mod cli;
 mod config;
 mod crypto;
-mod cuda_stage_a;
+#[cfg(test)]
+#[allow(dead_code, clippy::needless_range_loop)]
 mod cuda_miner;
-mod electrum;
-mod node;
-mod protocol;
-mod search;
-mod stage_b;
+#[cfg(test)]
+mod cuda_stage_a;
+#[cfg(test)]
+mod cuda_stage_a_ref;
+#[cfg(test)]
 mod cuda_stage_b;
+#[allow(dead_code)]
+mod electrum;
+#[allow(dead_code)]
+mod node;
+#[allow(dead_code)]
+mod protocol;
+#[allow(dead_code)]
+mod search;
+#[cfg(test)]
+mod stage_b;
 mod tx;
 
 use config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, MINER_BPS};
@@ -29,43 +40,8 @@ fn print_banner() {
         "Donation: {DONATION_BPS} bps ({:.2}%) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {DONATION_ADDRESS}",
         DONATION_BPS as f64 / 100.0
     );
-    println!("Miner keeps {MINER_BPS} bps. Split is on the win tx only (coinbase-style).");
+    println!("Donation split is disabled until a covenant-valid construction is proven.");
     println!("Type `help` for commands.\n");
-}
-
-
-fn parse_cli_args(cfg: &mut RuntimeConfig) {
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--source" => {
-                if let Some(v) = args.next() {
-                    if let Err(e) = cfg.set_source(&v) {
-                        eprintln!("--source: {e}");
-                    }
-                }
-            }
-            "--node-rpc" | "--node" => {
-                if let Some(v) = args.next() {
-                    if let Err(e) = cfg.set_node_url(&v) {
-                        eprintln!("--node-rpc: {e}");
-                    }
-                }
-            }
-            "--fulcrum" => {
-                if let Some(v) = args.next() {
-                    if let Err(e) = cfg.set_fulcrum_url(&v) {
-                        eprintln!("--fulcrum: {e}");
-                    }
-                }
-            }
-            "--help" | "-h" => {
-                println!("pickaxe_miner [--source node|fulcrum] [--node-rpc URL] [--fulcrum URL]");
-            }
-            other if other.starts_with('-') => eprintln!("unknown flag: {other}"),
-            _ => {}
-        }
-    }
 }
 
 fn print_help() {
@@ -85,18 +61,17 @@ fn print_help() {
   servers                      Show Fulcrum + node try-order (ban-safe)
   nodeprobe                    Probe native node RPC (getblockchaininfo)
   job                          Fetch live PHOTON baton ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ MiningJob
-  dryrun                       connect+job + 98/2 win-tx preview (no broadcast)
+  dryrun                       connect+job + proven 2-output tx preview (no broadcast)
 arm                          like dryrun + message SHA256 for Schnorr (no keys)
-applysig <nonce> <pk33hex> <sig64hex>  rebuild 98/2 win-tx hex (no broadcast)
+applysig <nonce> <pk33hex> <sig64hex>  verify+arm proven 2-output winner (no broadcast)
   broadcast [rawhex]             submit last armed tx/hex (Fulcrum then node)
   start                        Start GPU search (uses last job if present)
   stop                         Stop search
   split <reward_raw>           Preview 98%/2% split for a raw reward amount
   quit | exit                  Leave
 
-Invariant: distribution builds pay 98% miner + 2% donation on the verified win
-transaction itself. Visible before arm. Never call it a "dev fee". Never skim
-unrelated wallet funds or keys."#
+Donation target is 2%, but same-transaction donation is disabled until covenant
+validity is proven. Never skim unrelated wallet funds or keys."#
     );
 }
 
@@ -122,11 +97,17 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
         let s = h.snapshot();
         println!(
             "state:         {}",
-            match s.state { search::MiningState::Paused => "PAUSED", search::MiningState::Mining => "MINING", _ => "STOPPED" }
+            match s.state {
+                search::MiningState::Paused => "PAUSED",
+                search::MiningState::Mining => "MINING",
+                _ => "STOPPED",
+            }
         );
         println!("candidates:    {}", s.candidates);
+        println!("active intensity: {}%", s.intensity);
+        println!("winners:       {}", s.winners);
         println!("elapsed:       {}s", s.elapsed_secs);
-        println!("rate:          {:.0} H/s (HASH256 M1)", s.rate);
+        println!("rate:          {:.0} work/s", s.rate);
     }
     println!("donation:      {DONATION_BPS} bps ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {DONATION_ADDRESS}");
     println!("miner share:   {MINER_BPS} bps");
@@ -143,8 +124,16 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
     } else {
         println!("electrum/job:  (run `connect` / `job`)");
     }
-    println!("source:        {} (templates/submit)", cfg.source.as_str());
-    println!("gpu:           CUDA Stage A");
+    println!("PHOTON jobs:   Fulcrum CashToken baton index");
+    println!("broadcast pref:{}", cfg.source.as_str());
+    println!(
+        "gpu pipeline:  {}",
+        if search::REFERENCE_GPU_PIPELINE_READY {
+            "reference A->B->C ready"
+        } else {
+            "gated: exact Stage C/full-tx HASH256 not wired yet"
+        }
+    );
 }
 
 fn redact_url(url: &str) -> String {
@@ -159,19 +148,120 @@ fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
+fn publish_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>, job: LiveJob) {
+    let changed = live.as_ref().is_none_or(|current| {
+        current.baton_txid != job.baton_txid
+            || current.baton_vout != job.baton_vout
+            || current.baton_height != job.baton_height
+            || current.baton_value_sats != job.baton_value_sats
+            || current.height != job.height
+            || current.age != job.age
+            || current.commitment_hex != job.commitment_hex
+            || current.target_le_hex != job.target_le_hex
+            || current.token_amount != job.token_amount
+            || current.reward_raw != job.reward_raw
+            || current.url != job.url
+    });
+    if changed {
+        cfg.bump_generation();
+    }
+    *live = Some(job);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArmedTx {
+    raw_hex: String,
+    generation_id: u64,
+    baton_txid: String,
+    baton_vout: u32,
+}
+
+impl ArmedTx {
+    fn new(raw_hex: String, cfg: &RuntimeConfig, job: &LiveJob) -> Result<Self, String> {
+        if cfg.generation_id == 0 {
+            return Err("cannot arm a transaction before a live generation is published".into());
+        }
+        Ok(Self {
+            raw_hex,
+            generation_id: cfg.generation_id,
+            baton_txid: job.baton_txid.clone(),
+            baton_vout: job.baton_vout,
+        })
+    }
+
+    fn validate_current<'a>(
+        &'a self,
+        cfg: &RuntimeConfig,
+        live: Option<&LiveJob>,
+    ) -> Result<&'a str, String> {
+        if self.generation_id != cfg.generation_id {
+            return Err(format!(
+                "armed transaction is stale: generation {} != current {}",
+                self.generation_id, cfg.generation_id
+            ));
+        }
+        let live = live.ok_or("armed transaction is stale: no current PHOTON baton job")?;
+        if self.baton_txid != live.baton_txid || self.baton_vout != live.baton_vout {
+            return Err("armed transaction is stale: PHOTON baton outpoint changed".into());
+        }
+        Ok(&self.raw_hex)
+    }
+}
+
+fn reference_job_context(job: &LiveJob) -> tx::ReferenceJobContext {
+    tx::ReferenceJobContext {
+        prev_txid: job.baton_txid.clone(),
+        prev_vout: job.baton_vout,
+        age: job.age,
+        target_le_hex: job.target_le_hex.clone(),
+        contract_value_sats: job.baton_value_sats,
+        contract_token_amount: job.token_amount,
+        reward_raw: job.reward_raw,
+    }
+}
+
+fn refresh_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>) -> Result<(), String> {
+    let mut session = ElectrumSession::connect_failover(&cfg.electrum_endpoints())?;
+    let job = session.fetch_live_job()?;
+    publish_live_job(cfg, live, job);
+    Ok(())
+}
+
+fn broadcast_raw_with_fallback(cfg: &RuntimeConfig, raw_hex: &str) -> Result<String, String> {
+    let mut failures = Vec::new();
+    match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+        Ok(mut session) => match session.broadcast_raw(raw_hex) {
+            Ok(txid) => return Ok(format!("fulcrum:{txid}")),
+            Err(error) => failures.push(format!("fulcrum broadcast failed: {error}")),
+        },
+        Err(error) => failures.push(format!("fulcrum connect failed: {error}")),
+    }
+
+    let nodes = cfg.node_endpoints();
+    if nodes.is_empty() {
+        failures.push("no node fallback configured".into());
+    } else {
+        match node::broadcast_raw(&nodes, raw_hex) {
+            Ok((url, txid)) => return Ok(format!("node {}:{txid}", redact_url(&url))),
+            Err(error) => failures.push(format!("node broadcast failed: {error}")),
+        }
+    }
+    Err(failures.join(" | "))
+}
+
 fn print_donation() {
-    println!("Donation (not a \"dev fee\"):");
-    println!("  share:   {DONATION_BPS} bps = 2%");
-    println!("  address: {DONATION_ADDRESS}");
-    println!("  model:   coinbase-style - two outputs on the win tx (98% miner / 2% donation)");
-    println!("  never:   skim unrelated balances or keys");
+    println!("Donation target:");
+    println!("  intended share: {DONATION_BPS} bps = 2%");
+    println!("  address:        {DONATION_ADDRESS}");
+    println!("  status:         DISABLED");
+    println!("  blocker:        {}", tx::DONATION_SPLIT_BLOCKER);
 }
 
 fn handle_line(
     cfg: &mut RuntimeConfig,
     handle: &mut Option<SearchHandle>,
     live: &mut Option<LiveJob>,
-    armed: &mut Option<String>,
+    armed: &mut Option<ArmedTx>,
     last_template: &mut Option<node::BlockTemplate>,
     line: &str,
 ) -> bool {
@@ -190,43 +280,36 @@ fn handle_line(
         "broadcast" => {
             let args: Vec<&str> = parts.collect();
             let hex_opt = if args.is_empty() {
-                armed.clone()
+                armed.as_ref().map(|candidate| candidate.raw_hex.clone())
             } else {
                 Some(args.join(""))
             };
+            if args.is_empty() && armed.is_some() {
+                let cached = armed.as_ref().expect("checked above").clone();
+                if let Err(error) = refresh_live_job(cfg, live) {
+                    println!(
+                        "refusing cached broadcast: live PHOTON baton recheck failed: {error}"
+                    );
+                    return true;
+                }
+                if let Err(error) = cached.validate_current(cfg, live.as_ref()) {
+                    println!("refusing cached broadcast: {error}");
+                    return true;
+                }
+            }
             match hex_opt {
                 None => {
                     println!("nothing to broadcast ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â run applysig first or: broadcast <rawhex>")
                 }
-                Some(hx) => {
-                    // Prefer Fulcrum; fall back to native node if configured.
-                    let mut ok = false;
-                    match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
-                        Ok(mut s) => match s.broadcast_raw(&hx) {
-                            Ok(txid) => {
-                                println!("broadcast ok (fulcrum): {txid}");
-                                *armed = None;
-                                ok = true;
-                            }
-                            Err(e) => println!("fulcrum broadcast failed: {e}"),
-                        },
-                        Err(e) => println!("fulcrum connect failed: {e}"),
-                    }
-                    if !ok {
-                        let nodes = cfg.node_endpoints();
-                        if nodes.is_empty() {
-                            println!("no node fallback ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â set `node http://ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦` or fix Fulcrum");
-                        } else {
-                            match node::broadcast_raw(&nodes, &hx) {
-                                Ok((url, txid)) => {
-                                    println!("broadcast ok (node {url}): {txid}");
-                                    *armed = None;
-                                }
-                                Err(e) => println!("node broadcast error: {e}"),
-                            }
+                Some(hx) => match broadcast_raw_with_fallback(cfg, &hx) {
+                    Ok(result) => {
+                        println!("broadcast ok ({result})");
+                        if args.is_empty() {
+                            *armed = None;
                         }
                     }
-                }
+                    Err(error) => println!("broadcast failed: {error}"),
+                },
             }
         }
 
@@ -345,11 +428,14 @@ fn handle_line(
                 }
             }
         }
-        
+
         "source" => {
             let rest: Vec<&str> = parts.collect();
             if rest.is_empty() {
-                println!("source: {} (node=templates/submit first-class; fulcrum=auxiliary)", cfg.source.as_str());
+                println!(
+                    "source: {} (node=templates/submit first-class; fulcrum=auxiliary)",
+                    cfg.source.as_str()
+                );
             } else if let Err(e) = cfg.set_source(rest[0]) {
                 println!("error: {e}");
             } else {
@@ -368,7 +454,10 @@ fn handle_line(
                             println!("  ver:    {v}");
                         }
                         if let Some(obj) = t.raw.as_object() {
-                            println!("  keys:   {}", obj.keys().take(12).cloned().collect::<Vec<_>>().join(", "));
+                            println!(
+                                "  keys:   {}",
+                                obj.keys().take(12).cloned().collect::<Vec<_>>().join(", ")
+                            );
                         }
                         *last_template = Some(t);
                     }
@@ -415,7 +504,7 @@ fn handle_line(
             Ok(mut s) => match s.fetch_live_job() {
                 Ok(j) => {
                     j.print_summary();
-                    *live = Some(j);
+                    publish_live_job(cfg, live, j);
                 }
                 Err(e) => println!("error: {e}"),
             },
@@ -439,14 +528,9 @@ fn handle_line(
                                 }
                                 Err(e) => println!("error: {e}"),
                             }
-                            match tx::build_unsigned_donation_preview(
-                                &j.baton_txid,
-                                j.baton_vout,
-                                j.age,
-                                &j.target_le_hex,
-                                j.baton_value_sats,
-                                j.token_amount,
-                                j.reward_raw,
+                            let job_ctx = reference_job_context(&j);
+                            match tx::build_unsigned_reference_preview(
+                                &job_ctx,
                                 &cfg.payout_address,
                             ) {
                                 Ok(bytes) => {
@@ -460,7 +544,7 @@ fn handle_line(
                                 }
                                 Err(e) => println!("error: {e}"),
                             }
-                            *live = Some(j);
+                            publish_live_job(cfg, live, j);
                         }
                     },
                 }
@@ -482,34 +566,37 @@ fn handle_line(
                 };
                 match live.as_ref() {
                     None => println!("run job or arm first to cache LiveJob"),
-                    Some(j) => match tx::apply_donation_signature(
-                        &j.baton_txid,
-                        j.baton_vout,
-                        j.age,
-                        &j.target_le_hex,
-                        j.baton_value_sats,
-                        j.token_amount,
-                        j.reward_raw,
-                        &cfg.payout_address,
-                        args[1],
-                        nonce,
-                        args[2],
-                    ) {
-                        Ok(bytes) => {
-                            let hx = hex::encode(&bytes);
-                            *armed = Some(hx.clone());
-                            println!(
-                                "armed win-tx {} bytes (cached; no broadcast yet):",
-                                bytes.len()
-                            );
-                            println!("{hx}");
-                            match tx::photon_message_sha256(nonce, &j.target_le_hex) {
-                                Ok(h) => println!("message_sha256: {}", hex::encode(h)),
-                                Err(e) => println!("hash err: {e}"),
+                    Some(j) => {
+                        let job_ctx = reference_job_context(j);
+                        match tx::apply_reference_signature(
+                            &job_ctx,
+                            &cfg.payout_address,
+                            args[1],
+                            nonce,
+                            args[2],
+                        ) {
+                            Ok(bytes) => {
+                                let hx = hex::encode(&bytes);
+                                match ArmedTx::new(hx.clone(), cfg, j) {
+                                    Ok(candidate) => *armed = Some(candidate),
+                                    Err(error) => {
+                                        println!("error: {error}");
+                                        return true;
+                                    }
+                                }
+                                println!(
+                                    "armed win-tx {} bytes (cached; no broadcast yet):",
+                                    bytes.len()
+                                );
+                                println!("{hx}");
+                                match tx::photon_message_sha256(nonce, &j.target_le_hex) {
+                                    Ok(h) => println!("message_sha256: {}", hex::encode(h)),
+                                    Err(e) => println!("hash err: {e}"),
+                                }
                             }
+                            Err(e) => println!("error: {e}"),
                         }
-                        Err(e) => println!("error: {e}"),
-                    },
+                    }
                 }
             }
         }
@@ -522,14 +609,9 @@ fn handle_line(
                     Ok(mut s) => match s.fetch_live_job() {
                         Ok(j) => {
                             j.print_summary();
-                            match tx::build_unsigned_donation_preview(
-                                &j.baton_txid,
-                                j.baton_vout,
-                                j.age,
-                                &j.target_le_hex,
-                                j.baton_value_sats,
-                                j.token_amount,
-                                j.reward_raw,
+                            let job_ctx = reference_job_context(&j);
+                            match tx::build_unsigned_reference_preview(
+                                &job_ctx,
                                 &cfg.payout_address,
                             ) {
                                 Ok(bytes) => {
@@ -545,7 +627,7 @@ fn handle_line(
                                 }
                                 Err(e) => println!("error building unsigned template: {e}"),
                             }
-                            *live = Some(j);
+                            publish_live_job(cfg, live, j);
                         }
                         Err(e) => println!("error: {e}"),
                     },
@@ -566,14 +648,17 @@ fn handle_line(
                         Ok(mut s) => match s.fetch_live_job() {
                             Ok(j) => {
                                 j.print_summary();
-                                *live = Some(j);
+                                publish_live_job(cfg, live, j);
                             }
                             Err(e) => println!("error: baton fetch failed: {e}"),
                         },
                         Err(e) => println!("error: fulcrum connect failed: {e}"),
                     }
                 }
-                let Some(job) = live.as_ref().map(|j| j.to_mining_job()) else {
+                let Some(job) = live
+                    .as_ref()
+                    .map(|j| j.to_mining_job(cfg.generation_id, &cfg.payout_address))
+                else {
                     println!("error: no PHOTON baton job - check Fulcrum, then job / start");
                     return true;
                 };
@@ -631,16 +716,115 @@ fn handle_line(
     true
 }
 
-fn main() {
-    cli::run_cli(run_repl);
+fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
+    let mut cfg = RuntimeConfig::default();
+    cfg.set_intensity(args.intensity)?;
+    if let Some(address) = &args.address {
+        cfg.set_payout(address.clone())?;
+    }
+    if let Some(url) = &args.fulcrum {
+        cfg.set_fulcrum_url(url)?;
+    }
+    if let Some(url) = &args.node_rpc {
+        cfg.set_node_url(url)?;
+    }
+    if let Some(source) = &args.source {
+        cfg.set_source(source)?;
+    }
+    Ok(cfg)
 }
 
-fn run_repl() {
-    let mut cfg = RuntimeConfig::default();
-    parse_cli_args(&mut cfg);
+fn main() {
+    let args = cli::parse();
+    let backend_kind = match backend::BackendKind::parse(&args.backend) {
+        Ok(kind) => kind,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+    let cfg = match runtime_config_from_cli(&args) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    match args.command.unwrap_or(cli::Commands::Repl) {
+        cli::Commands::Devices => {
+            if let Err(error) = backend::print_devices(backend_kind) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
+        cli::Commands::Benchmark => {
+            eprintln!(
+                "error: benchmark is gated until the exact PHOTON GPU RFC6979/kG/Schnorr/full-transaction pipeline is production-ready"
+            );
+            std::process::exit(2);
+        }
+        cli::Commands::Config { command } => match command {
+            cli::ConfigCommand::Show => {
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "backend": args.backend,
+                            "device": args.device,
+                            "intensity": cfg.intensity,
+                            "address": cfg.payout_address,
+                            "fulcrum": cfg.fulcrum_url,
+                            "node_rpc": cfg.node_url.as_deref().map(redact_url),
+                            "source": cfg.source.as_str(),
+                            "no_tui": args.no_tui,
+                            "dry_run": args.dry_run,
+                            "generation_id": cfg.generation_id,
+                        })
+                    );
+                } else {
+                    println!("backend: {}", args.backend);
+                    println!("device: {:?}", args.device);
+                    println!("intensity: {}%", cfg.intensity);
+                    println!("address: {}", cfg.payout_address);
+                    println!("source: {}", cfg.source.as_str());
+                    println!("no_tui: {}", args.no_tui);
+                    println!("dry_run: {}", args.dry_run);
+                }
+            }
+            cli::ConfigCommand::Validate => {
+                if args.json {
+                    println!("{}", serde_json::json!({"valid": true}));
+                } else {
+                    println!("configuration syntax and CashAddr validation: OK");
+                }
+            }
+        },
+        cli::Commands::Mine => {
+            let mode = if args.json {
+                "JSON headless"
+            } else if args.no_tui {
+                "headless"
+            } else {
+                "TUI"
+            };
+            let device = args
+                .device
+                .map_or_else(|| "auto".to_string(), |index| index.to_string());
+            eprintln!(
+                "error: {mode} mining on backend={} device={device} dry_run={} is gated until the exact PHOTON GPU RFC6979/kG/Schnorr/full-transaction HASH256 pipeline is production-ready",
+                args.backend, args.dry_run
+            );
+            std::process::exit(2);
+        }
+        cli::Commands::Repl => run_repl(cfg),
+    }
+}
+
+fn run_repl(mut cfg: RuntimeConfig) {
     let mut handle: Option<SearchHandle> = None;
     let mut live: Option<LiveJob> = None;
-    let mut armed: Option<String> = None;
+    let mut armed: Option<ArmedTx> = None;
     let mut last_template: Option<node::BlockTemplate> = None;
     print_banner();
 
@@ -655,7 +839,14 @@ fn run_repl() {
                 break;
             }
             Ok(_) => {
-                if !handle_line(&mut cfg, &mut handle, &mut live, &mut armed, &mut last_template, &line) {
+                if !handle_line(
+                    &mut cfg,
+                    &mut handle,
+                    &mut live,
+                    &mut armed,
+                    &mut last_template,
+                    &line,
+                ) {
                     break;
                 }
             }
@@ -670,6 +861,23 @@ fn run_repl() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live_job() -> LiveJob {
+        LiveJob {
+            url: "wss://fulcrum.invalid".into(),
+            server_version: serde_json::json!(["Fulcrum", "1.5"]),
+            height: 1_000,
+            baton_txid: "11".repeat(32),
+            baton_vout: 0,
+            baton_height: 999,
+            baton_value_sats: 15_971_500,
+            commitment_hex: "00".repeat(101),
+            token_amount: 2_099_905_002_035_715,
+            age: 1,
+            target_le_hex: "ff".repeat(32),
+            reward_raw: 4_999_773_813,
+        }
+    }
 
     #[test]
     fn split_2_percent_floor() {
@@ -692,5 +900,44 @@ mod tests {
         assert!(c.set_intensity(9).is_err());
         assert!(c.set_intensity(100).is_ok());
         assert!(c.set_intensity(101).is_err());
+    }
+
+    #[test]
+    fn live_job_publication_changes_generation_only_when_job_changes() {
+        let mut cfg = RuntimeConfig::default();
+        let mut live = None;
+        let job = live_job();
+
+        publish_live_job(&mut cfg, &mut live, job.clone());
+        assert_eq!(cfg.generation_id, 1);
+        publish_live_job(&mut cfg, &mut live, job.clone());
+        assert_eq!(cfg.generation_id, 1);
+
+        let mut changed = job;
+        changed.target_le_hex = "fe".repeat(32);
+        publish_live_job(&mut cfg, &mut live, changed);
+        assert_eq!(cfg.generation_id, 2);
+    }
+
+    #[test]
+    fn armed_transaction_rejects_generation_or_baton_drift() {
+        let mut cfg = RuntimeConfig::default();
+        let mut live = None;
+        let job = live_job();
+        publish_live_job(&mut cfg, &mut live, job.clone());
+
+        let armed = ArmedTx::new("00".into(), &cfg, &job).unwrap();
+        assert!(armed.validate_current(&cfg, live.as_ref()).is_ok());
+
+        cfg.bump_generation();
+        assert!(armed.validate_current(&cfg, live.as_ref()).is_err());
+
+        let mut same_generation = cfg.clone();
+        same_generation.generation_id = armed.generation_id;
+        let mut different_baton = job;
+        different_baton.baton_txid = "22".repeat(32);
+        assert!(armed
+            .validate_current(&same_generation, Some(&different_baton))
+            .is_err());
     }
 }

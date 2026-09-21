@@ -1,33 +1,38 @@
-//! Win-tx: CashAddr, PHOTON template serializer, coinbase-style 98/2 donation split.
+//! Win-tx: CashAddr and the authoritative two-output PHOTON serializer.
 //! Template assemble + message hash here. Schnorr sign stays Lead Dev / crypto.
 //! Never keys/mnemonics. No broadcast until explicitly armed.
 
-use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, MINER_BPS};
+use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS};
+use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX, REDEEM_SCRIPT_HEX};
 use sha2::Digest;
-use crate::protocol::{
-    COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX, REDEEM_SCRIPT_HEX,
-};
 
 const CASHADDR_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const CASHADDR_GENERATORS: [u64; 5] = [
-    0x98f2_bc8e_61,
-    0x79b7_6d99_e2,
-    0xf33e_5fb3_c4,
-    0xae2e_abe2_a8,
-    0x1e4f_43e4_70,
+    0x0098_f2bc_8e61,
+    0x0079_b76d_99e2,
+    0x00f3_3e5f_b3c4,
+    0x00ae_2eab_e2a8,
+    0x001e_4f43_e470,
 ];
 
-/// Decode mainnet bitcoincash: P2PKH (or token-aware P2PKH) to 25-byte locking bytecode.
+/// Decode BCH mainnet/testnet P2PKH (or token-aware P2PKH) to 25-byte locking bytecode.
 pub fn cashaddr_to_p2pkh_locking(address: &str) -> Result<Vec<u8>, String> {
-    let mut normalized = address.trim().to_lowercase();
+    let raw = address.trim();
+    let has_lower = raw.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = raw.chars().any(|c| c.is_ascii_uppercase());
+    if has_lower && has_upper {
+        return Err("CashAddr must not mix upper and lower case".into());
+    }
+    let mut normalized = raw.to_ascii_lowercase();
     if !normalized.contains(':') {
         normalized = format!("bitcoincash:{normalized}");
     }
-    let pieces: Vec<&str> = normalized.split(':').collect();
-    if pieces.len() != 2 || pieces[0] != "bitcoincash" {
-        return Err("expected mainnet bitcoincash: address".into());
+    let (prefix, payload_text) = normalized
+        .split_once(':')
+        .ok_or("CashAddr must contain exactly one prefix separator")?;
+    if payload_text.contains(':') || !matches!(prefix, "bitcoincash" | "bchtest") {
+        return Err("expected bitcoincash: or bchtest: address".into());
     }
-    let (prefix, payload_text) = (pieces[0], pieces[1]);
     let mut values = Vec::new();
     for ch in payload_text.bytes() {
         let idx = CASHADDR_CHARSET
@@ -72,9 +77,9 @@ fn cashaddr_polymod(values: &[u8]) -> u64 {
     for &v in values {
         let c0 = c >> 35;
         c = ((c & 0x07_ffff_ffff) << 5) ^ u64::from(v);
-        for i in 0..5 {
+        for (i, generator) in CASHADDR_GENERATORS.iter().enumerate() {
             if ((c0 >> i) & 1) != 0 {
-                c ^= CASHADDR_GENERATORS[i];
+                c ^= generator;
             }
         }
     }
@@ -290,106 +295,18 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
     Ok(tx)
 }
 
-/// Coinbase-style 98/2 donation split: baton out + miner FT + donation FT (3 outputs).
-/// Sats: baton keeps contract-1500-700; miner/donation share 700 dust-style like reference,
-/// FT amounts split by `RuntimeConfig::split_reward`. Covenant validation of 3-out is TBD.
+/// Historical 3-output 98/2 experiment, now fail-closed because the covenant
+/// reference only proves a two-output mining transaction.
+pub const DONATION_SPLIT_BLOCKER: &str =
+    "98/2 same-transaction donation is disabled: the proven PHOTON covenant transaction has exactly two outputs, and no 3-output covenant-valid vector has been demonstrated";
+
+#[cfg(test)]
 pub fn build_photon_template_donation_split(
     p: &TemplateParams,
     donation_locking: &[u8],
 ) -> Result<Vec<u8>, String> {
-    if donation_locking.len() != 25 {
-        return Err("donation locking must be P2PKH 25 bytes".into());
-    }
-    let (miner_ft, donation_ft) = RuntimeConfig::split_reward(p.reward_amount);
-    if miner_ft + donation_ft != p.reward_amount {
-        return Err("split invariant broken".into());
-    }
-
-    let public_key = parse_hex(&p.public_key_hex)?;
-    let target = parse_hex(&p.target_hex)?;
-    let signature = parse_hex(&p.signature_hex)?;
-    let redeem_script = parse_hex(REDEEM_SCRIPT_HEX.trim())?;
-    let category = parse_hex(MAINNET_CATEGORY_HEX)?;
-    let covenant_lock = parse_hex(COVENANT_LOCKING_BYTECODE_HEX)?;
-    if public_key.len() != 33 || target.len() != 32 || signature.len() != 64 {
-        return Err("bad pubkey/target/sig lengths".into());
-    }
-    if redeem_script.len() != 259 {
-        return Err("bad redeem length".into());
-    }
-
-    let age_push = encode_positive_script_number_push(p.age)?;
-    let input_script = concat(&[
-        &[0x21],
-        &public_key,
-        &age_push,
-        &[0x4d, 0x03, 0x01],
-        &redeem_script,
-    ]);
-
-    let mut commitment = Vec::new();
-    commitment.extend_from_slice(&u32_le(p.nonce));
-    commitment.extend_from_slice(&target);
-    commitment.extend_from_slice(&signature);
-
-    let remaining = p
-        .contract_token_amount
-        .checked_sub(p.reward_amount)
-        .ok_or("reward exceeds contract token amount")?;
-    let cat_rev = reverse_bytes(&category);
-
-    let mut output0 = Vec::new();
-    output0.push(0xef);
-    output0.extend_from_slice(&cat_rev);
-    output0.push(0x71);
-    output0.extend_from_slice(&compact_uint(commitment.len() as u64));
-    output0.extend_from_slice(&commitment);
-    output0.extend_from_slice(&compact_token_amount(remaining)?);
-    output0.extend_from_slice(&covenant_lock);
-
-    let mut output_miner = Vec::new();
-    output_miner.push(0xef);
-    output_miner.extend_from_slice(&cat_rev);
-    output_miner.push(0x10);
-    output_miner.extend_from_slice(&compact_token_amount(miner_ft)?);
-    output_miner.extend_from_slice(&p.payout_locking);
-
-    let mut output_don = Vec::new();
-    output_don.push(0xef);
-    output_don.extend_from_slice(&cat_rev);
-    output_don.push(0x10);
-    output_don.extend_from_slice(&compact_token_amount(donation_ft)?);
-    output_don.extend_from_slice(donation_locking);
-
-    let prev = reverse_bytes(&parse_hex(&p.prev_tx_hash_hex)?);
-    let baton_sats = p
-        .contract_value_sats
-        .checked_sub(1500)
-        .ok_or("contract value too small")?;
-    // Split the reference 700 sats: 546 miner + 154 donation (both above dust-ish floors).
-    let miner_sats = 546u64;
-    let donation_sats = 154u64;
-
-    let mut tx = Vec::new();
-    tx.extend_from_slice(&u32_le(2));
-    tx.push(1);
-    tx.extend_from_slice(&prev);
-    tx.extend_from_slice(&u32_le(p.prev_index));
-    tx.extend_from_slice(&compact_uint(input_script.len() as u64));
-    tx.extend_from_slice(&input_script);
-    tx.extend_from_slice(&u32_le(p.age));
-    tx.push(3);
-    tx.extend_from_slice(&u64_le(baton_sats));
-    tx.extend_from_slice(&compact_uint(output0.len() as u64));
-    tx.extend_from_slice(&output0);
-    tx.extend_from_slice(&u64_le(miner_sats));
-    tx.extend_from_slice(&compact_uint(output_miner.len() as u64));
-    tx.extend_from_slice(&output_miner);
-    tx.extend_from_slice(&u64_le(donation_sats));
-    tx.extend_from_slice(&compact_uint(output_don.len() as u64));
-    tx.extend_from_slice(&output_don);
-    tx.extend_from_slice(&u32_le(0));
-    Ok(tx)
+    let _ = (p, donation_locking);
+    Err(DONATION_SPLIT_BLOCKER.into())
 }
 
 /// Dry-run preview + optional unsigned template hex (no broadcast).
@@ -398,19 +315,17 @@ pub fn print_win_tx_preview(
     miner_payout: &str,
     template_hex: Option<&str>,
 ) -> Result<(), String> {
-    let (miner_amt, donation_amt) = RuntimeConfig::split_reward(job_reward_raw);
+    let (_, intended_donation_amt) = RuntimeConfig::split_reward(job_reward_raw);
     let miner_lock = cashaddr_to_p2pkh_locking(miner_payout)?;
-    let donation_lock = cashaddr_to_p2pkh_locking(DONATION_ADDRESS)?;
     println!("win-tx dry-run (unsigned; no broadcast):");
     println!(
-        "  out miner    {MINER_BPS} bps FT={miner_amt} lock={}B → {miner_payout}",
+        "  out reward   10000 bps FT={job_reward_raw} lock={}B -> {miner_payout}",
         miner_lock.len()
     );
     println!(
-        "  out donation {DONATION_BPS} bps FT={donation_amt} lock={}B → {DONATION_ADDRESS}",
-        donation_lock.len()
+        "  donation:    DISABLED (intended {DONATION_BPS} bps FT={intended_donation_amt} -> {DONATION_ADDRESS})"
     );
-    println!("  model: coinbase-style on win tx only (never skim unrelated funds)");
+    println!("  blocker:     {DONATION_SPLIT_BLOCKER}");
     if let Some(h) = template_hex {
         println!("  template: {} bytes", h.len() / 2);
         let show = h.len().min(80);
@@ -418,7 +333,6 @@ pub fn print_win_tx_preview(
     }
     Ok(())
 }
-
 
 /// PHOTON M1 message = nonce_le (4) || target (32). Hash = SHA256(message) for Schnorr msg32.
 pub fn photon_message_sha256(nonce: u32, target_hex: &str) -> Result<[u8; 32], String> {
@@ -435,15 +349,21 @@ pub fn photon_message_sha256(nonce: u32, target_hex: &str) -> Result<[u8; 32], S
     Ok(out)
 }
 
-/// Rebuild donation-split template with a real 64-byte Schnorr (hex). No keys touched here.
-pub fn apply_donation_signature(
-    prev_txid: &str,
-    prev_vout: u32,
-    age: u32,
-    target_le_hex: &str,
-    contract_value_sats: u64,
-    contract_token_amount: u128,
-    reward_raw: u128,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceJobContext {
+    pub prev_txid: String,
+    pub prev_vout: u32,
+    pub age: u32,
+    pub target_le_hex: String,
+    pub contract_value_sats: u64,
+    pub contract_token_amount: u128,
+    pub reward_raw: u128,
+}
+
+/// Build the proven two-output candidate and arm it only if both Schnorr and
+/// PHOTON proof-of-work checks pass.
+pub fn apply_reference_signature(
+    job: &ReferenceJobContext,
     miner_payout: &str,
     public_key_hex: &str,
     nonce: u32,
@@ -453,54 +373,63 @@ pub fn apply_donation_signature(
     if sig.len() != 64 {
         return Err("signature must be 64 bytes".into());
     }
+    let public_key = parse_hex(public_key_hex)?;
+    let public_key: [u8; 33] = public_key
+        .try_into()
+        .map_err(|_| "compressed public key must be 33 bytes")?;
+    let signature: [u8; 64] = sig.try_into().map_err(|_| "signature must be 64 bytes")?;
+    let message = photon_message_sha256(nonce, &job.target_le_hex)?;
+    if !crate::crypto::bch_schnorr_verify(&public_key, &message, &signature)? {
+        return Err("BCH Schnorr signature does not match nonce/target/public key".into());
+    }
     let payout = cashaddr_to_p2pkh_locking(miner_payout)?;
-    let donation = cashaddr_to_p2pkh_locking(DONATION_ADDRESS)?;
     let p = TemplateParams {
-        prev_tx_hash_hex: prev_txid.to_string(),
-        prev_index: prev_vout,
-        age,
+        prev_tx_hash_hex: job.prev_txid.clone(),
+        prev_index: job.prev_vout,
+        age: job.age,
         public_key_hex: public_key_hex.to_string(),
-        target_hex: target_le_hex.to_string(),
+        target_hex: job.target_le_hex.clone(),
         signature_hex: signature_hex.to_string(),
         nonce,
-        contract_value_sats,
-        contract_token_amount,
-        reward_amount: reward_raw,
+        contract_value_sats: job.contract_value_sats,
+        contract_token_amount: job.contract_token_amount,
+        reward_amount: job.reward_raw,
         payout_locking: payout,
     };
-    build_photon_template_donation_split(&p, &donation)
+    let tx = build_photon_template_bytes(&p)?;
+    let target = crate::search::parse_hex32(&job.target_le_hex)?;
+    let digest = crate::search::hash256(&tx);
+    if !crate::search::meets_target_le(&digest, &target) {
+        return Err(format!(
+            "candidate HASH256 {} does not meet PHOTON target {}",
+            hex::encode(digest),
+            job.target_le_hex
+        ));
+    }
+    Ok(tx)
 }
 
-
-/// Build unsigned donation-split template using zero signature (placeholder) for preview.
-pub fn build_unsigned_donation_preview(
-    prev_txid: &str,
-    prev_vout: u32,
-    age: u32,
-    target_le_hex: &str,
-    contract_value_sats: u64,
-    contract_token_amount: u128,
-    reward_raw: u128,
+/// Build the authoritative two-output layout with a zero-signature placeholder.
+pub fn build_unsigned_reference_preview(
+    job: &ReferenceJobContext,
     miner_payout: &str,
 ) -> Result<Vec<u8>, String> {
     let payout = cashaddr_to_p2pkh_locking(miner_payout)?;
-    let donation = cashaddr_to_p2pkh_locking(DONATION_ADDRESS)?;
     // Placeholder compressed pubkey (secp order-2 style) + zero Schnorr — not a valid win.
     let p = TemplateParams {
-        prev_tx_hash_hex: prev_txid.to_string(),
-        prev_index: prev_vout,
-        age,
-        public_key_hex: "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
-            .into(),
-        target_hex: target_le_hex.to_string(),
+        prev_tx_hash_hex: job.prev_txid.clone(),
+        prev_index: job.prev_vout,
+        age: job.age,
+        public_key_hex: "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into(),
+        target_hex: job.target_le_hex.clone(),
         signature_hex: "00".repeat(64),
         nonce: 0,
-        contract_value_sats,
-        contract_token_amount,
-        reward_amount: reward_raw,
+        contract_value_sats: job.contract_value_sats,
+        contract_token_amount: job.contract_token_amount,
+        reward_amount: job.reward_raw,
         payout_locking: payout,
     };
-    build_photon_template_donation_split(&p, &donation)
+    build_photon_template_bytes(&p)
 }
 
 #[cfg(test)]
@@ -509,10 +438,9 @@ mod tests {
 
     #[test]
     fn decode_known_vector() {
-        let lock = cashaddr_to_p2pkh_locking(
-            "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh",
-        )
-        .expect("decode");
+        let lock =
+            cashaddr_to_p2pkh_locking("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh")
+                .expect("decode");
         assert_eq!(
             hex::encode(&lock),
             "76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac"
@@ -565,21 +493,19 @@ mod tests {
     }
 
     #[test]
-    fn donation_split_three_outputs() {
-        let payout = cashaddr_to_p2pkh_locking(
-            "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh",
-        )
-        .unwrap();
+    fn unproven_donation_split_is_disabled() {
+        let payout =
+            cashaddr_to_p2pkh_locking("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh")
+                .unwrap();
         let donation = cashaddr_to_p2pkh_locking(DONATION_ADDRESS).unwrap();
         let p = TemplateParams {
             prev_tx_hash_hex: "000000124712ae4765fe9789372faebca19c99cc1d59f43df2508bf5c42ea042"
                 .into(),
             prev_index: 0,
             age: 10,
-            public_key_hex:
-                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
-            target_hex: "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+            public_key_hex: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
                 .into(),
+            target_hex: "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000".into(),
             signature_hex: "00".repeat(64),
             nonce: 0,
             contract_value_sats: 15_971_500,
@@ -587,10 +513,8 @@ mod tests {
             reward_amount: 4_999_773_813,
             payout_locking: payout,
         };
-        let tx = build_photon_template_donation_split(&p, &donation).unwrap();
-        assert_eq!(tx[4 + 32 + 4 + 1..].iter().position(|_| false), None); // smoke
-        // output count byte: after version(4)+in_count(1)+outpoint(36)+scriptlen+script+seq(4)
-        assert!(tx.len() > 615); // 3 outputs larger than reference 2-out
-        assert_eq!(tx[0..4], [2, 0, 0, 0]);
+        let error = build_photon_template_donation_split(&p, &donation)
+            .expect_err("unproven 3-output split must be blocked");
+        assert_eq!(error, DONATION_SPLIT_BLOCKER);
     }
 }

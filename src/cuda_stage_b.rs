@@ -93,11 +93,7 @@ mod tests {
             Ok(gpu) => {
                 assert_eq!(gpu.len(), host.len());
                 for (i, (g, h)) in gpu.iter().zip(host.iter()).enumerate() {
-                    assert_eq!(
-                        hex::encode(g),
-                        hex::encode(h),
-                        "mismatch at index {i}"
-                    );
+                    assert_eq!(hex::encode(g), hex::encode(h), "mismatch at index {i}");
                 }
             }
             Err(e) => {

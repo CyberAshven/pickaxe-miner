@@ -1,21 +1,29 @@
 ﻿//! GPU candidate search (PERFORMANCE CONTRACT).
 //! Production hot path = persistent CudaMiner. CPU hash256 is reference/tests only.
 
-use crate::cuda_miner::{CudaMiner, Winner};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const DEFAULT_BATCH: u32 = 65_536;
+/// The legacy persistent CUDA kernel only hashes nonceLE || target and is not
+/// PHOTON proof-of-work. Keep product mining fail-closed until the exact
+/// reference A -> B -> C transaction pipeline is wired end-to-end.
+pub const REFERENCE_GPU_PIPELINE_READY: bool = false;
 
 #[derive(Debug, Clone, Default)]
 pub struct MiningJob {
     pub height: u32,
-    pub target_le_hex: String,
     pub baton_txid: String,
+    pub baton_vout: u32,
+    pub baton_height: u32,
+    pub baton_value_sats: u64,
+    pub age: u32,
+    pub target_le_hex: String,
+    pub token_amount: u128,
+    pub reward_raw: u128,
+    pub payout_address: String,
+    pub source_identity: String,
     pub generation_id: u64,
 }
 
@@ -53,6 +61,7 @@ pub fn hash256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+#[cfg(test)]
 pub fn photon_m1_message(nonce: u32, target32: &[u8; 32]) -> [u8; 36] {
     let mut msg = [0u8; 36];
     msg[0..4].copy_from_slice(&nonce.to_le_bytes());
@@ -92,9 +101,7 @@ pub struct SearchHandle {
     intensity: Arc<AtomicU8>,
     candidates: Arc<AtomicU64>,
     winners: Arc<AtomicU64>,
-    join: Option<thread::JoinHandle<()>>,
     started: Instant,
-    winner_rx: Receiver<Winner>,
 }
 
 impl SearchHandle {
@@ -102,86 +109,18 @@ impl SearchHandle {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
         }
-        let target = parse_hex32(&job.target_le_hex)?;
-        let generation_id = job.generation_id;
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let paused = Arc::new(AtomicBool::new(false));
-        let intensity_a = Arc::new(AtomicU8::new(intensity));
-        let candidates = Arc::new(AtomicU64::new(0));
-        let winners = Arc::new(AtomicU64::new(0));
-        let (winner_tx, winner_rx) = mpsc::channel::<Winner>();
-
-        let stop_c = Arc::clone(&stop);
-        let paused_c = Arc::clone(&paused);
-        let intensity_c = Arc::clone(&intensity_a);
-        let cand_c = Arc::clone(&candidates);
-        let win_c = Arc::clone(&winners);
-
-        let join = thread::spawn(move || {
-            let mut miner = match CudaMiner::new(0, DEFAULT_BATCH) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("CUDA miner init failed: {e}");
-                    return;
-                }
-            };
-            if let Err(e) = miner.set_target(&target) {
-                eprintln!("CUDA set_target: {e}");
-                return;
-            }
-            // Warm-up on the same persistent miner (Codex: no second context).
-            match miner.mine_batch(0) {
-                Ok((h, _)) => {
-                    // count warm-up hashes toward candidates via channel? keep separate — bump after Arc available
-                    let _ = h;
-                }
-                Err(e) => {
-                    eprintln!("CUDA warm-up: {e}");
-                    return;
-                }
-            }
-            let mut nonce: u32 = 0;
-            while !stop_c.load(Ordering::Relaxed) {
-                if paused_c.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                let pct = intensity_c.load(Ordering::Relaxed).clamp(10, 100);
-                // Intensity as GPU batch scale (scheduler), not CPU hash+sleep.
-                let batch = ((DEFAULT_BATCH as u64) * (pct as u64) / 100).max(256) as u32;
-                miner.set_batch(batch);
-
-                match miner.mine_batch(nonce) {
-                    Ok((hashes, found)) => {
-                        nonce = nonce.wrapping_add(hashes as u32);
-                        cand_c.fetch_add(hashes, Ordering::Relaxed);
-                        for mut w in found {
-                            w.generation_id = generation_id;
-                            win_c.fetch_add(1, Ordering::Relaxed);
-                            let _ = winner_tx.send(w);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("CUDA mine error: {e}");
-                        stop_c.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                // Intensity is batch-size only (Codex): no host sleep duty cycle.
-            }
-        });
-
-        Ok(Self {
-            stop,
-            paused,
-            intensity: intensity_a,
-            candidates,
-            winners,
-            join: Some(join),
-            started: Instant::now(),
-            winner_rx,
-        })
+        parse_hex32(&job.target_le_hex)?;
+        if job.generation_id == 0 {
+            return Err("mining job generation_id must be nonzero".into());
+        }
+        let _ = job;
+        if !REFERENCE_GPU_PIPELINE_READY {
+            return Err(
+                "production mining is gated: legacy CUDA HASH256(nonceLE || target) is not PHOTON proof-of-work; exact GPU RFC6979/kG/Schnorr/full-transaction HASH256 pipeline must complete first"
+                    .into(),
+            );
+        }
+        Err("reference GPU pipeline readiness flag is inconsistent".into())
     }
 
     pub fn apply_control(&self, command: RuntimeCommand) -> Result<SearchStats, String> {
@@ -198,14 +137,6 @@ impl SearchHandle {
         Ok(self.snapshot())
     }
 
-    pub fn drain_winners(&self) -> Vec<Winner> {
-        let mut out = Vec::new();
-        while let Ok(w) = self.winner_rx.try_recv() {
-            out.push(w);
-        }
-        out
-    }
-
     fn state(&self) -> MiningState {
         if self.stop.load(Ordering::Relaxed) {
             MiningState::Stopped
@@ -216,11 +147,8 @@ impl SearchHandle {
         }
     }
 
-    pub fn stop(mut self) -> SearchStats {
+    pub fn stop(self) -> SearchStats {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
         self.snapshot_final()
     }
 
@@ -283,26 +211,33 @@ mod tests {
     }
 
     #[test]
-    fn gpu_live_intensity_and_pause_if_cuda_present() {
+    fn production_search_refuses_legacy_hash_prototype() {
         let job = MiningJob {
             height: 1,
             target_le_hex: "ff".repeat(32),
             baton_txid: "00".repeat(32),
             generation_id: 1,
+            ..MiningJob::default()
         };
-        let Ok(handle) = SearchHandle::start(100, job) else {
-            return;
+        let error = SearchHandle::start(100, job)
+            .err()
+            .expect("legacy product search must stay gated");
+        assert!(error.contains("not PHOTON proof-of-work"));
+    }
+
+    #[test]
+    fn production_search_rejects_unpublished_generation() {
+        let job = MiningJob {
+            height: 1,
+            target_le_hex: "ff".repeat(32),
+            baton_txid: "00".repeat(32),
+            generation_id: 0,
+            ..MiningJob::default()
         };
-        std::thread::sleep(Duration::from_millis(2000));
-        assert!(handle.snapshot().candidates > 0);
-        handle.apply_control(RuntimeCommand::SetIntensity(10)).unwrap();
-        assert_eq!(handle.snapshot().intensity, 10);
-        handle.apply_control(RuntimeCommand::Pause).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-        let paused = handle.snapshot().candidates;
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(handle.snapshot().candidates, paused);
-        handle.apply_control(RuntimeCommand::Resume).unwrap();
-        let _ = handle.stop();
+        let error = match SearchHandle::start(100, job) {
+            Ok(_) => panic!("generation zero must not start"),
+            Err(error) => error,
+        };
+        assert!(error.contains("generation_id must be nonzero"));
     }
 }
