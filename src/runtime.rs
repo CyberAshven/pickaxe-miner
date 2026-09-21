@@ -28,6 +28,8 @@ const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const SUBMISSION_JOURNAL_VERSION: u8 = 1;
+const PHOTON_TX_BYTES: usize = 615;
+const PHOTON_TARGET_OFFSET: usize = 394;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingSubmission {
@@ -330,6 +332,185 @@ fn prepare_pending_submission(
     Ok(pending)
 }
 
+fn resolve_pending_before_search(
+    session: &mut ElectrumSession,
+    journal_path: &Path,
+) -> Result<(), String> {
+    let Some(pending) = PendingSubmission::load(journal_path)? else {
+        return Ok(());
+    };
+
+    match attempt_pending_submission(session, &pending)? {
+        SubmissionAttempt::Complete | SubmissionAttempt::StaleUnbroadcast(_) => {
+            PendingSubmission::remove(journal_path)?;
+            Ok(())
+        }
+    }
+}
+
+fn probe_submission_journal(journal_path: &Path) -> Result<(), String> {
+    if journal_path.exists() {
+        return Err(format!(
+            "unresolved previous winner submission exists at {}",
+            journal_path.display()
+        ));
+    }
+    let parent = journal_path
+        .parent()
+        .ok_or("pending-submission journal path has no parent directory")?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "create pending-submission journal directory {}: {error}",
+            parent.display()
+        )
+    })?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("submission journal clock error: {error}"))?
+        .as_nanos();
+    let stem = format!(".pickaxe-preflight-{}-{stamp}", std::process::id());
+    let temporary = parent.join(format!("{stem}.tmp"));
+    let committed = parent.join(format!("{stem}.ok"));
+
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| {
+                format!(
+                    "create submission-journal preflight file {}: {error}",
+                    temporary.display()
+                )
+            })?;
+        file.write_all(b"pickaxe submission journal preflight\n")
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                format!(
+                    "write submission-journal preflight file {}: {error}",
+                    temporary.display()
+                )
+            })?;
+        drop(file);
+        fs::rename(&temporary, &committed).map_err(|error| {
+            format!(
+                "commit submission-journal preflight file {}: {error}",
+                committed.display()
+            )
+        })?;
+        fs::remove_file(&committed).map_err(|error| {
+            format!(
+                "remove submission-journal preflight file {}: {error}",
+                committed.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&temporary);
+    let _ = fs::remove_file(&committed);
+    result
+}
+
+fn production_preflight(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    live: &LiveJob,
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    mining_payout_address: &str,
+    journal_path: &Path,
+) -> Result<(), String> {
+    let sponsor = session.fetch_sponsor_reserve(&live.baton_txid)?;
+
+    if !session.transaction_known(&live.baton_txid)? {
+        return Err(
+            "production preflight cannot retrieve the live PHOTON baton transaction".into(),
+        );
+    }
+    if !session.transaction_known(&sponsor.txid)? {
+        return Err("production preflight cannot retrieve the sponsor-reserve transaction".into());
+    }
+
+    production_preflight_local(
+        cfg,
+        live,
+        reward_secret,
+        reward_public_key,
+        mining_payout_address,
+        &sponsor,
+        journal_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn production_preflight_local(
+    cfg: &RuntimeConfig,
+    live: &LiveJob,
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    mining_payout_address: &str,
+    sponsor: &reward::SponsorReserve,
+    journal_path: &Path,
+) -> Result<(), String> {
+    if cfg.payout_address.trim().is_empty() {
+        return Err("mining payout address is required".into());
+    }
+    tx::cashaddr_to_p2pkh_locking(&cfg.payout_address)
+        .map_err(|error| format!("production payout validation failed: {error}"))?;
+    tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS)
+        .map_err(|error| format!("compiled donation address is invalid: {error}"))?;
+    if crate::config::DONATION_BPS != 200 {
+        return Err("compiled donation policy must be exactly 200 basis points".into());
+    }
+
+    probe_submission_journal(journal_path)?;
+
+    let context = tx::ReferenceJobContext {
+        prev_txid: live.baton_txid.clone(),
+        prev_vout: live.baton_vout,
+        age: live.age,
+        target_le_hex: live.target_le_hex.clone(),
+        contract_value_sats: live.baton_value_sats,
+        contract_token_amount: live.token_amount,
+        reward_raw: live.reward_raw,
+    };
+    let parent_preview = tx::build_unsigned_reference_preview(&context, mining_payout_address)?;
+    if parent_preview.len() != PHOTON_TX_BYTES {
+        return Err(format!(
+            "PHOTON parent builder produced {} bytes; expected {PHOTON_TX_BYTES}",
+            parent_preview.len()
+        ));
+    }
+    let target = crate::search::parse_hex32(&live.target_le_hex)?;
+    if parent_preview[PHOTON_TARGET_OFFSET..PHOTON_TARGET_OFFSET + 32] != target {
+        return Err("PHOTON parent builder target placement disagrees with the live target".into());
+    }
+
+    let split = reward::build_reward_split_child(
+        &parent_preview,
+        &live.baton_txid,
+        reward_secret,
+        reward_public_key,
+        &cfg.payout_address,
+        live.reward_raw,
+        sponsor,
+    )?;
+    let (expected_miner, expected_donation) = RuntimeConfig::split_reward(live.reward_raw);
+    if split.miner_token_amount != expected_miner
+        || split.donation_token_amount != expected_donation
+        || split
+            .miner_token_amount
+            .checked_add(split.donation_token_amount)
+            != Some(live.reward_raw)
+    {
+        return Err("reward-child preflight failed exact 98/2 token conservation".into());
+    }
+
+    Ok(())
+}
+
 fn validate_verified_parent(
     winner: &VerifiedWinner,
     live: &LiveJob,
@@ -443,28 +624,11 @@ impl RuntimeSupervisor {
         backend: BackendKind,
         device_ordinal: u32,
     ) -> Result<Self, String> {
-        Self::start_inner(cfg, true, backend, device_ordinal)
-    }
-
-    #[allow(dead_code)]
-    pub fn start_dry_run_on_device(
-        cfg: RuntimeConfig,
-        device_ordinal: u32,
-    ) -> Result<Self, String> {
-        Self::start_dry_run_on_backend_device(cfg, BackendKind::Cuda, device_ordinal)
-    }
-
-    pub fn start_dry_run_on_backend_device(
-        cfg: RuntimeConfig,
-        backend: BackendKind,
-        device_ordinal: u32,
-    ) -> Result<Self, String> {
-        Self::start_inner(cfg, false, backend, device_ordinal)
+        Self::start_inner(cfg, backend, device_ordinal)
     }
 
     fn start_inner(
         mut cfg: RuntimeConfig,
-        submit_winners: bool,
         backend: BackendKind,
         device_ordinal: u32,
     ) -> Result<Self, String> {
@@ -474,43 +638,32 @@ impl RuntimeSupervisor {
 
         let endpoints = cfg.electrum_endpoints();
         let mut session = ElectrumSession::connect_failover(&endpoints)?;
-        let initial = session.fetch_live_job()?;
         let journal_path = submission_journal_path();
-        let pending_submission = PendingSubmission::load(&journal_path)?;
-        if !submit_winners && pending_submission.is_some() {
-            return Err(
-                "a pending winner submission must be resolved before dry-run mining can start"
-                    .into(),
-            );
-        }
-        let has_pending_submission = pending_submission.is_some();
+        resolve_pending_before_search(&mut session, &journal_path)?;
+        let initial = session.fetch_live_job()?;
         let (reward_secret, reward_public_key, mining_payout_address) =
             reward::new_intermediate_identity()?;
+        production_preflight(
+            &mut session,
+            &cfg,
+            &initial,
+            &reward_secret,
+            &reward_public_key,
+            &mining_payout_address,
+            &journal_path,
+        )?;
         cfg.bump_generation();
 
         let initial_job = initial.to_mining_job(cfg.generation_id, &mining_payout_address);
-        let search = if has_pending_submission {
-            SearchHandle::start_supervised_paused_on_backend_device(
-                backend,
-                device_ordinal as usize,
-                cfg.intensity,
-                initial_job,
-            )?
-        } else {
-            SearchHandle::start_supervised_on_backend_device(
-                backend,
-                device_ordinal as usize,
-                cfg.intensity,
-                initial_job,
-            )?
-        };
+        let search = SearchHandle::start_supervised_on_backend_device(
+            backend,
+            device_ordinal as usize,
+            cfg.intensity,
+            initial_job,
+        )?;
         let initial_search = search.snapshot();
         let initial_snapshot = RuntimeSnapshot {
-            state: if has_pending_submission {
-                SupervisorState::Paused
-            } else {
-                SupervisorState::Mining
-            },
+            state: SupervisorState::Mining,
             gpu_backend: backend.as_str().into(),
             gpu_device: device_ordinal,
             generation_id: cfg.generation_id,
@@ -524,7 +677,7 @@ impl RuntimeSupervisor {
             reconnects: 0,
             stale_winners: 0,
             verified_winners: 0,
-            pending_winners: u64::from(has_pending_submission),
+            pending_winners: 0,
             last_error: None,
             search: initial_search,
         };
@@ -547,8 +700,7 @@ impl RuntimeSupervisor {
                     reward_public_key,
                     mining_payout_address,
                     journal_path,
-                    pending_submission,
-                    submit_winners,
+                    None,
                     command_rx,
                     event_tx,
                     worker_snapshot,
@@ -653,7 +805,6 @@ fn run_supervisor(
     mining_payout_address: String,
     journal_path: PathBuf,
     mut pending_submission: Option<PendingSubmission>,
-    submit_winners: bool,
     command_rx: Receiver<SupervisorCommand>,
     event_tx: SyncSender<RuntimeEvent>,
     shared_snapshot: Arc<Mutex<RuntimeSnapshot>>,
@@ -1120,10 +1271,6 @@ fn run_supervisor(
                                     let _ = search.apply_control(SearchCommand::Pause);
                                     state = SupervisorState::Paused;
                                     emit(&event_tx, RuntimeEvent::VerifiedWinner(winner.clone()));
-                                    if !submit_winners {
-                                        user_paused = true;
-                                        break;
-                                    }
                                     match prepare_pending_submission(
                                         session.as_mut().expect("checked session above"),
                                         &winner,
@@ -1325,6 +1472,8 @@ fn emit(tx: &SyncSender<RuntimeEvent>, event: RuntimeEvent) {
 mod tests {
     use super::*;
 
+    const TEST_PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
+
     fn live_job() -> LiveJob {
         LiveJob {
             url: "wss://one.invalid".into(),
@@ -1354,6 +1503,50 @@ mod tests {
             signature: [0u8; 64],
             transaction: Vec::new(),
         }
+    }
+
+    fn preflight_fixture() -> (
+        RuntimeConfig,
+        LiveJob,
+        [u8; 32],
+        [u8; 33],
+        String,
+        reward::SponsorReserve,
+        PathBuf,
+    ) {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_payout(TEST_PAYOUT.into()).unwrap();
+        let job = live_job();
+        let reward_secret = [2u8; 32];
+        let reward_public = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes(reward_secret).unwrap(),
+        )
+        .serialize();
+        let mining_payout = reward::p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+        let sponsor = reward::SponsorReserve {
+            txid: "33".repeat(32),
+            vout: 1,
+            value_sats: 100_000,
+            locking_script: reward::build_sponsor_script(&job.baton_txid).unwrap(),
+        };
+        let unique = format!(
+            "pickaxe-preflight-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let journal = std::env::temp_dir().join(unique);
+        (
+            cfg,
+            job,
+            reward_secret,
+            reward_public,
+            mining_payout,
+            sponsor,
+            journal,
+        )
     }
 
     #[test]
@@ -1464,6 +1657,58 @@ mod tests {
             submission_decision(false, false, false),
             SubmissionDecision::StaleUnbroadcast
         );
+    }
+
+    #[test]
+    fn production_preflight_proves_parent_reward_split_and_journal_readiness() {
+        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &sponsor,
+            &journal,
+        )
+        .unwrap();
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn production_preflight_refuses_wrong_sponsor_state_before_search() {
+        let (cfg, job, secret, public, mining_payout, mut sponsor, journal) = preflight_fixture();
+        sponsor.locking_script = reward::build_sponsor_script(&"44".repeat(32)).unwrap();
+        let error = production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &sponsor,
+            &journal,
+        )
+        .unwrap_err();
+        assert!(error.contains("sponsor reserve does not match"));
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn production_preflight_refuses_unresolved_submission_journal() {
+        let (cfg, job, secret, public, mining_payout, sponsor, journal) = preflight_fixture();
+        fs::write(&journal, b"occupied").unwrap();
+        let error = production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &mining_payout,
+            &sponsor,
+            &journal,
+        )
+        .unwrap_err();
+        assert!(error.contains("unresolved previous winner submission"));
+        fs::remove_file(&journal).unwrap();
     }
 
     #[test]

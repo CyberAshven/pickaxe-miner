@@ -335,14 +335,14 @@ pub fn build_photon_template_donation_split(
     Err(DONATION_SPLIT_BLOCKER.into())
 }
 
-/// Dry-run preview + optional unsigned template hex (no broadcast).
+/// Offline-style preview of the unsigned two-output PHOTON parent template.
 pub fn print_win_tx_preview(
     job_reward_raw: u128,
     miner_payout: &str,
     template_hex: Option<&str>,
 ) -> Result<(), String> {
     let miner_lock = cashaddr_to_p2pkh_locking(miner_payout)?;
-    println!("win-tx dry-run (unsigned; no broadcast):");
+    println!("win-tx preview (unsigned; no mining or broadcast):");
     println!(
         "  out reward   10000 bps FT={job_reward_raw} lock={}B -> {miner_payout}",
         miner_lock.len()

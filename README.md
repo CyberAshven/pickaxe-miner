@@ -1,55 +1,60 @@
 # Pickaxe Miner
 
-Native Rust **GPU** PHOTON miner (CLI now; Ratatui TUI next). Windows + Linux. NVIDIA uses native CUDA; AMD uses a native HIP/ROCm or appropriate native GPU path. wgpu/WebGPU is detached reference/experimental work, not a production fallback.
+Rust-first, GPU-only miner for PHOTON on Bitcoin Cash.
 
-**Definition of done:** Operator mining live with a commit on [CyberAshven/pickaxe-miner](https://github.com/CyberAshven/pickaxe-miner).
+- **NVIDIA:** native CUDA/PTX
+- **AMD:** native HIP/ROCm
+- **Platforms:** Windows and Linux
+- **CPU mining fallback:** none
+- **Donation:** 2%
 
+## Features
 
-## PHOTON job and node roles
+- Native high-performance GPU mining
+- Live PHOTON CashToken baton discovery
+- Automatic winner verification and submission
+- Runtime intensity control from 10% to 100%
+- Safe live payout-address switching
+- Fulcrum/Electrum connectivity with native BCH node validation and broadcast
+- Interactive Ratatui interface and headless operation
+- Persistent, bounded GPU memory architecture
+- Stale-job and generation protection
+- Benchmark and device-discovery tools
 
-PHOTON mining jobs come from the live covenant/CashToken baton state. Today that
-state is discovered through Fulcrum/Electrum `blockchain.scripthash.listunspent`
-with token data. A BCH block `getblocktemplate` response is not a PHOTON job and
-must never be mapped into a baton or PHOTON target.
+## PHOTON
 
-Native node RPC remains available for chain validation and raw transaction
-broadcast. `getblocktemplatelight` / `getblocktemplate` and the matching block
-submit calls are optional BCH block tooling only.
+PHOTON mining work is derived from the live covenant/CashToken baton state through Fulcrum/Electrum.
 
-Use `--fulcrum wss://…` for custom baton discovery and `--node-rpc
-http://user:pass@127.0.0.1:8332` for a custom node endpoint. Ban-safe sequential
-failover stays in both connectivity paths.
+BCH `getblocktemplate` is not used as a PHOTON mining job source. Native BCH node RPC is used for chain validation and raw transaction broadcast.
 
-## Quick start
+## Build
 
-```text
-cargo run
+```bash
+cargo build --release
 ```
 
-## Win path (Electrum / win-tx) — production flow
+## Run
 
-Coinbase-style **98% miner / 2% donation** on the win tx only (`bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3`). Never skim unrelated funds. Never keys/mnemonics in this lane.
+```bash
+pickaxe mine
+```
 
-1. `payout bitcoincash:…` — your address
-2. `fulcrum wss://…` (optional Start9) or use bootstrap
-3. `job` / `arm` — live baton + unsigned 98/2 template + `message_sha256` for Schnorr
-4. Lead Dev / GPU supplies nonce + Schnorr → `applysig <nonce> <pk33hex> <sig64hex>`
-5. `broadcast` — submits last armed hex (Fulcrum `blockchain.transaction.broadcast`, then node `sendrawtransaction` if set). **Never auto.**
+Headless:
 
-Also: `dryrun`, `connect`, `servers`, `node http://user:pass@host:8332`, `nodeprobe`.
+```bash
+pickaxe mine --no-tui
+```
 
-### Ban-safe connectivity
+List available GPUs:
 
-Sequential endpoint tries + exponential backoff. No parallel fan-out.
+```bash
+pickaxe devices
+```
 
-- Fulcrum/Electrum WSS bootstrap: `FULCRUM_WSS_BOOTSTRAP` in `src/protocol.rs`
-- Native node bootstrap: `NODE_RPC_BOOTSTRAP` (tiny; custom `node` is the usual path)
+Benchmark:
 
-## Ownership
+```bash
+pickaxe benchmark
+```
 
-| Lane | Owner |
-|------|--------|
-| Electrum, win-tx template, arm/applysig/broadcast | Dev Assist |
-| CUDA/HIP/native GPU kernels, intensity, Stage B→C, Ratatui | Lead Dev |
-
-`reference/` mirrors https://photon.postcorps.com/ for protocol study only (not the product).
+The `reference/` directory contains PHOTON reference material used for implementation and correctness testing.
