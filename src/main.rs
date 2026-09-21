@@ -11,6 +11,8 @@ mod crypto;
 #[cfg(test)]
 #[allow(dead_code, clippy::needless_range_loop)]
 mod cuda_miner;
+#[allow(dead_code)]
+mod cuda_photon;
 #[cfg(test)]
 mod cuda_stage_a;
 #[cfg(test)]
@@ -21,6 +23,8 @@ mod cuda_stage_b;
 mod cuda_stage_c;
 #[allow(dead_code)]
 mod electrum;
+#[allow(dead_code)]
+mod m29_table;
 #[allow(dead_code)]
 mod node;
 #[allow(dead_code)]
