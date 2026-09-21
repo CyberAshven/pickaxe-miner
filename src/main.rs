@@ -34,6 +34,7 @@ mod reward;
 mod runtime;
 #[allow(dead_code)]
 mod search;
+mod self_test;
 #[cfg(test)]
 mod stage_b;
 #[allow(dead_code)]
@@ -936,6 +937,27 @@ fn main() {
             if let Err(error) = backend::print_devices(backend_kind) {
                 eprintln!("error: {error}");
                 std::process::exit(1);
+            }
+        }
+        cli::Commands::SelfTest => {
+            if matches!(backend_kind, backend::BackendKind::Hip) {
+                eprintln!("error: pickaxe self-test currently requires the native CUDA backend");
+                std::process::exit(2);
+            }
+            let selected =
+                match backend::resolve_mining_device(backend::BackendKind::Cuda, args.device) {
+                    Ok(device) => device,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        std::process::exit(2);
+                    }
+                };
+            match self_test::run_cuda_self_test(selected.index) {
+                Ok(report) => self_test::print_report(&report, args.json),
+                Err(error) => {
+                    eprintln!("error: self-test failed: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         cli::Commands::Benchmark => {
