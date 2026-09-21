@@ -2,8 +2,6 @@
 
 Native Rust **GPU** PHOTON miner (CLI now; Ratatui TUI next). Windows + Linux. NVIDIA (CUDA) and AMD (HIP/wgpu) backends — Lead Dev owns kernels.
 
-**Definition of done:** Bandar mining live with a commit on [CyberAshven/pickaxe-miner](https://github.com/CyberAshven/pickaxe-miner).
-
 
 ## PHOTON job and node roles
 
