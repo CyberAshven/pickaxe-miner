@@ -26,6 +26,57 @@ const HIP_CODE_OBJECT_NAMES: [&str; 4] = [
     "photon_c1_schnorr.hsaco",
     "stage_c_hash.hsaco",
 ];
+const HIP_STAGE_A_SYMBOL: &str = "pickaxe_stage_a_rfc6979";
+const HIP_STAGE_B_SYMBOLS: [&str; 4] = [
+    "pickaxe_photon_b16_part0",
+    "pickaxe_photon_b16_part1",
+    "pickaxe_photon_b16_part2",
+    "pickaxe_photon_b16_part3",
+];
+const HIP_STAGE_C1_SYMBOL: &str = "pickaxe_photon_c1_schnorr";
+const HIP_STAGE_C3_SYMBOL: &str = "pickaxe_stage_c_hash_filter";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HipArgKind {
+    Ptr,
+    U32,
+}
+
+const HIP_STAGE_A_ABI: [HipArgKind; 6] = [
+    HipArgKind::U32,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+];
+const HIP_STAGE_B_ABI: [HipArgKind; 4] = [
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+];
+const HIP_STAGE_C1_ABI: [HipArgKind; 7] = [
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+];
+const HIP_STAGE_C3_ABI: [HipArgKind; 9] = [
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+    HipArgKind::U32,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+];
+const MAX_HIP_KERNEL_ARGS: usize = HIP_STAGE_C3_ABI.len();
 
 type HipError = c_int;
 type HipInit = unsafe extern "C" fn(c_uint) -> HipError;
@@ -508,11 +559,29 @@ fn launch(
     api: &HipApi,
     stream: &HipStream,
     function: usize,
-    grid_x: u32,
-    block_x: u32,
-    params: &mut [*mut c_void],
+    geometry: (u32, u32),
+    params: &mut [HipKernelArg],
+    expected_abi: &[HipArgKind],
     label: &str,
 ) -> Result<(), String> {
+    let (grid_x, block_x) = geometry;
+    if params.len() != expected_abi.len() {
+        return Err(format!(
+            "{label}: host HIP argument count {} does not match contract {}",
+            params.len(),
+            expected_abi.len()
+        ));
+    }
+    let mut raw_params = [ptr::null_mut(); MAX_HIP_KERNEL_ARGS];
+    for (index, (param, expected)) in params.iter().zip(expected_abi).enumerate() {
+        if param.kind != *expected {
+            return Err(format!(
+                "{label}: host HIP argument {index} is {:?}, contract requires {:?}",
+                param.kind, expected
+            ));
+        }
+        raw_params[index] = param.raw;
+    }
     api.check(
         unsafe {
             (api.module_launch_kernel)(
@@ -525,7 +594,7 @@ fn launch(
                 1,
                 0,
                 stream.raw as *mut c_void,
-                params.as_mut_ptr(),
+                raw_params.as_mut_ptr(),
                 ptr::null_mut(),
             )
         },
@@ -533,12 +602,24 @@ fn launch(
     )
 }
 
-fn ptr_arg(value: &mut usize) -> *mut c_void {
-    (value as *mut usize).cast()
+#[derive(Clone, Copy)]
+struct HipKernelArg {
+    raw: *mut c_void,
+    kind: HipArgKind,
 }
 
-fn u32_arg(value: &mut u32) -> *mut c_void {
-    (value as *mut u32).cast()
+fn ptr_arg(value: &mut usize) -> HipKernelArg {
+    HipKernelArg {
+        raw: (value as *mut usize).cast(),
+        kind: HipArgKind::Ptr,
+    }
+}
+
+fn u32_arg(value: &mut u32) -> HipKernelArg {
+    HipKernelArg {
+        raw: (value as *mut u32).cast(),
+        kind: HipArgKind::U32,
+    }
 }
 
 impl HipPhotonEngine {
@@ -567,15 +648,15 @@ impl HipPhotonEngine {
         let stage_b_module = HipModule::load(&api, &directory.join("photon_stage_b16.hsaco"))?;
         let stage_c1_module = HipModule::load(&api, &directory.join("photon_c1_schnorr.hsaco"))?;
         let stage_c3_module = HipModule::load(&api, &directory.join("stage_c_hash.hsaco"))?;
-        let stage_a = stage_a_module.function("pickaxe_stage_a_rfc6979")?;
+        let stage_a = stage_a_module.function(HIP_STAGE_A_SYMBOL)?;
         let stage_b = [
-            stage_b_module.function("pickaxe_photon_b16_part0")?,
-            stage_b_module.function("pickaxe_photon_b16_part1")?,
-            stage_b_module.function("pickaxe_photon_b16_part2")?,
-            stage_b_module.function("pickaxe_photon_b16_part3")?,
+            stage_b_module.function(HIP_STAGE_B_SYMBOLS[0])?,
+            stage_b_module.function(HIP_STAGE_B_SYMBOLS[1])?,
+            stage_b_module.function(HIP_STAGE_B_SYMBOLS[2])?,
+            stage_b_module.function(HIP_STAGE_B_SYMBOLS[3])?,
         ];
-        let stage_c1 = stage_c1_module.function("pickaxe_photon_c1_schnorr")?;
-        let stage_c3 = stage_c3_module.function("pickaxe_stage_c_hash_filter")?;
+        let stage_c1 = stage_c1_module.function(HIP_STAGE_C1_SYMBOL)?;
+        let stage_c3 = stage_c3_module.function(HIP_STAGE_C3_SYMBOL)?;
 
         let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
         let table_gpu = HipBuffer::allocate(&api, table_bytes.len(), "64 MiB M29 table")?;
@@ -737,9 +818,9 @@ impl HipPhotonEngine {
             &self.api,
             &self.stream,
             self.stage_a,
-            candidate_count.div_ceil(128),
-            128,
+            (candidate_count.div_ceil(128), 128),
             &mut stage_a_params,
+            &HIP_STAGE_A_ABI,
             "launch PHOTON HIP Stage A",
         )?;
 
@@ -772,9 +853,9 @@ impl HipPhotonEngine {
                 &self.api,
                 &self.stream,
                 function,
-                candidate_count.div_ceil(64),
-                64,
+                (candidate_count.div_ceil(64), 64),
                 &mut params,
+                &HIP_STAGE_B_ABI,
                 &format!("launch PHOTON HIP Stage B part {part}"),
             )?;
         }
@@ -802,9 +883,9 @@ impl HipPhotonEngine {
             &self.api,
             &self.stream,
             self.stage_c1,
-            candidate_count.div_ceil(64),
-            64,
+            (candidate_count.div_ceil(64), 64),
             &mut params,
+            &HIP_STAGE_C1_ABI,
             "launch PHOTON HIP Stage C1",
         )
     }
@@ -838,9 +919,9 @@ impl HipPhotonEngine {
             &self.api,
             &self.stream,
             self.stage_c3,
-            candidate_count.div_ceil(128),
-            128,
+            (candidate_count.div_ceil(128), 128),
             &mut params,
+            &HIP_STAGE_C3_ABI,
             "launch PHOTON HIP Stage C2/C3",
         )?;
         self.stream.synchronize()?;
@@ -878,6 +959,65 @@ impl HipPhotonEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn abi_kinds(abi: &[HipArgKind]) -> Vec<&'static str> {
+        abi.iter()
+            .map(|kind| match kind {
+                HipArgKind::Ptr => "ptr",
+                HipArgKind::U32 => "u32",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rust_launch_contract_matches_hip_artifact_contract() {
+        assert_eq!(
+            std::mem::size_of::<usize>(),
+            8,
+            "HIP HSACO contract is 64-bit"
+        );
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../hip/kernel_contract.json"))
+                .expect("parse HIP kernel contract");
+        assert_eq!(contract["architecture"], "gfx1036");
+        let objects = contract["code_objects"]
+            .as_array()
+            .expect("HIP contract code_objects array");
+        let files = objects
+            .iter()
+            .map(|object| object["file"].as_str().expect("HIP contract filename"))
+            .collect::<Vec<_>>();
+        assert_eq!(files, HIP_CODE_OBJECT_NAMES);
+
+        let expected = [
+            (HIP_STAGE_A_SYMBOL, abi_kinds(&HIP_STAGE_A_ABI)),
+            (HIP_STAGE_B_SYMBOLS[0], abi_kinds(&HIP_STAGE_B_ABI)),
+            (HIP_STAGE_B_SYMBOLS[1], abi_kinds(&HIP_STAGE_B_ABI)),
+            (HIP_STAGE_B_SYMBOLS[2], abi_kinds(&HIP_STAGE_B_ABI)),
+            (HIP_STAGE_B_SYMBOLS[3], abi_kinds(&HIP_STAGE_B_ABI)),
+            (HIP_STAGE_C1_SYMBOL, abi_kinds(&HIP_STAGE_C1_ABI)),
+            (HIP_STAGE_C3_SYMBOL, abi_kinds(&HIP_STAGE_C3_ABI)),
+        ];
+        let actual = objects
+            .iter()
+            .flat_map(|object| {
+                object["kernels"]
+                    .as_array()
+                    .expect("HIP contract kernels array")
+            })
+            .map(|kernel| {
+                let symbol = kernel["symbol"].as_str().expect("HIP kernel symbol");
+                let kinds = kernel["args"]
+                    .as_array()
+                    .expect("HIP kernel args")
+                    .iter()
+                    .map(|arg| arg["kind"].as_str().expect("HIP arg kind"))
+                    .collect::<Vec<_>>();
+                (symbol, kinds)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn gfx_architecture_is_extracted_without_binding_to_property_layout() {

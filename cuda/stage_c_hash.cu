@@ -1,6 +1,10 @@
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+#include <stdint.h>
+#else
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
+#endif
 
 // PHOTON Stage C correctness kernel.
 //

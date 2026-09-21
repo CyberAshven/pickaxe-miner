@@ -8,6 +8,8 @@ Thumbs.db
 /artifacts/
 
 cuda/build/
+hip/build/
+__pycache__/
 *.obj
 
 
