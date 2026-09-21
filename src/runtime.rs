@@ -30,6 +30,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const SUBMISSION_JOURNAL_VERSION: u8 = 1;
 const PHOTON_TX_BYTES: usize = 615;
 const PHOTON_TARGET_OFFSET: usize = 394;
+const VERIFIED_WINNER_DURABILITY_READY: bool = false;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingSubmission {
@@ -444,6 +445,17 @@ fn production_preflight(
     )
 }
 
+fn require_complete_live_winner_lifecycle() -> Result<(), String> {
+    if VERIFIED_WINNER_DURABILITY_READY {
+        Ok(())
+    } else {
+        Err(
+            "production mining is disabled until every verified GPU winner is durably recoverable before network-dependent settlement; live GPU search was not started"
+                .into(),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn production_preflight_local(
     cfg: &RuntimeConfig,
@@ -635,6 +647,7 @@ impl RuntimeSupervisor {
         if cfg.payout_address.trim().is_empty() {
             return Err("mining payout address is required".into());
         }
+        require_complete_live_winner_lifecycle()?;
 
         let endpoints = cfg.electrum_endpoints();
         let mut session = ElectrumSession::connect_failover(&endpoints)?;
@@ -1709,6 +1722,13 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("unresolved previous winner submission"));
         fs::remove_file(&journal).unwrap();
+    }
+
+    #[test]
+    fn live_search_remains_gated_until_verified_winner_is_durable() {
+        let error = require_complete_live_winner_lifecycle().unwrap_err();
+        assert!(error.contains("durably recoverable"));
+        assert!(error.contains("live GPU search was not started"));
     }
 
     #[test]
