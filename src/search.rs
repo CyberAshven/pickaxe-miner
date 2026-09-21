@@ -396,24 +396,49 @@ pub struct SearchHandle {
 
 impl SearchHandle {
     pub fn start(intensity: u8, job: MiningJob) -> Result<Self, String> {
-        Self::start_inner(intensity, job, false, false)
+        Self::start_on_device(0, intensity, job)
+    }
+
+    pub fn start_on_device(
+        device_ordinal: usize,
+        intensity: u8,
+        job: MiningJob,
+    ) -> Result<Self, String> {
+        Self::start_inner(device_ordinal, intensity, job, false, false)
     }
 
     /// Start the exact CUDA search with an authoritative live-state gate after
     /// every GPU batch. The caller must refresh Fulcrum state and call
     /// `complete_refresh` before the next batch can begin.
     pub fn start_supervised(intensity: u8, job: MiningJob) -> Result<Self, String> {
-        Self::start_inner(intensity, job, true, false)
+        Self::start_supervised_on_device(0, intensity, job)
+    }
+
+    pub fn start_supervised_on_device(
+        device_ordinal: usize,
+        intensity: u8,
+        job: MiningJob,
+    ) -> Result<Self, String> {
+        Self::start_inner(device_ordinal, intensity, job, true, false)
     }
 
     /// Start supervised search in a paused state. This is used while a
     /// crash-recovered winner submission is pending, so no GPU batch can begin
     /// before the durable parent/child pair is resolved.
     pub fn start_supervised_paused(intensity: u8, job: MiningJob) -> Result<Self, String> {
-        Self::start_inner(intensity, job, true, true)
+        Self::start_supervised_paused_on_device(0, intensity, job)
+    }
+
+    pub fn start_supervised_paused_on_device(
+        device_ordinal: usize,
+        intensity: u8,
+        job: MiningJob,
+    ) -> Result<Self, String> {
+        Self::start_inner(device_ordinal, intensity, job, true, true)
     }
 
     fn start_inner(
+        device_ordinal: usize,
         intensity: u8,
         job: MiningJob,
         supervised: bool,
@@ -429,7 +454,8 @@ impl SearchHandle {
 
         // Fail fast and create exactly one CUDA context. The configured engine
         // is moved into the worker and remains resident across runtime controls.
-        let mut engine = CudaPhotonEngine::new(0, MAX_BATCH_CANDIDATES, WINNER_BUFFER_CAP)?;
+        let mut engine =
+            CudaPhotonEngine::new(device_ordinal, MAX_BATCH_CANDIDATES, WINNER_BUFFER_CAP)?;
         engine.set_job(&prepared.template, &prepared.target, &sk)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -444,7 +470,7 @@ impl SearchHandle {
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
 
         let worker = thread::Builder::new()
-            .name("pickaxe-photon-cuda".into())
+            .name(format!("pickaxe-photon-cuda-{device_ordinal}"))
             .spawn({
                 let worker_stop = Arc::clone(&stop);
                 let worker_paused = Arc::clone(&paused);

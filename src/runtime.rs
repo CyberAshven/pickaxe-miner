@@ -372,6 +372,8 @@ pub enum SupervisorState {
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
     pub state: SupervisorState,
+    pub gpu_backend: String,
+    pub gpu_device: u32,
     pub generation_id: u64,
     pub payout_address: String,
     pub endpoint: String,
@@ -430,15 +432,22 @@ pub struct RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
-    pub fn start(cfg: RuntimeConfig) -> Result<Self, String> {
-        Self::start_inner(cfg, true)
+    pub fn start_on_device(cfg: RuntimeConfig, device_ordinal: u32) -> Result<Self, String> {
+        Self::start_inner(cfg, true, device_ordinal)
     }
 
-    pub fn start_dry_run(cfg: RuntimeConfig) -> Result<Self, String> {
-        Self::start_inner(cfg, false)
+    pub fn start_dry_run_on_device(
+        cfg: RuntimeConfig,
+        device_ordinal: u32,
+    ) -> Result<Self, String> {
+        Self::start_inner(cfg, false, device_ordinal)
     }
 
-    fn start_inner(mut cfg: RuntimeConfig, submit_winners: bool) -> Result<Self, String> {
+    fn start_inner(
+        mut cfg: RuntimeConfig,
+        submit_winners: bool,
+        device_ordinal: u32,
+    ) -> Result<Self, String> {
         if cfg.payout_address.trim().is_empty() {
             return Err("mining payout address is required".into());
         }
@@ -461,9 +470,17 @@ impl RuntimeSupervisor {
 
         let initial_job = initial.to_mining_job(cfg.generation_id, &mining_payout_address);
         let search = if has_pending_submission {
-            SearchHandle::start_supervised_paused(cfg.intensity, initial_job)?
+            SearchHandle::start_supervised_paused_on_device(
+                device_ordinal as usize,
+                cfg.intensity,
+                initial_job,
+            )?
         } else {
-            SearchHandle::start_supervised(cfg.intensity, initial_job)?
+            SearchHandle::start_supervised_on_device(
+                device_ordinal as usize,
+                cfg.intensity,
+                initial_job,
+            )?
         };
         let initial_search = search.snapshot();
         let initial_snapshot = RuntimeSnapshot {
@@ -472,6 +489,8 @@ impl RuntimeSupervisor {
             } else {
                 SupervisorState::Mining
             },
+            gpu_backend: "cuda".into(),
+            gpu_device: device_ordinal,
             generation_id: cfg.generation_id,
             payout_address: cfg.payout_address.clone(),
             endpoint: initial.url.clone(),

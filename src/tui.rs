@@ -447,7 +447,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, 
     let line = Line::from(vec![
         Span::styled(" PICKAXE ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "PHOTON   {state_text}{dry}   CUDA device 0   Donation: 2%"
+            "PHOTON   {state_text}{dry}   {} device {}   Donation: 2%",
+            snapshot.gpu_backend.to_ascii_uppercase(),
+            snapshot.gpu_device
         )),
     ]);
     frame.render_widget(
@@ -731,6 +733,8 @@ mod tests {
     fn event_history_is_bounded() {
         let snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,
+            gpu_backend: "cuda".into(),
+            gpu_device: 2,
             generation_id: 1,
             payout_address: "bitcoincash:qexample".into(),
             endpoint: "wss://example.test".into(),
