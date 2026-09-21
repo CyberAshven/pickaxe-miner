@@ -74,6 +74,7 @@ enum SupervisorCommand {
     Pause(SyncSender<Result<(), String>>),
     Resume(SyncSender<Result<(), String>>),
     SetPayout(String, SyncSender<Result<(), String>>),
+    SetFulcrum(Option<String>, SyncSender<Result<(), String>>),
     Stop,
 }
 
@@ -179,6 +180,16 @@ impl RuntimeSupervisor {
     }
 
     #[allow(dead_code)]
+    pub fn set_fulcrum_endpoint(&self, url: String) -> Result<(), String> {
+        self.request(|reply| SupervisorCommand::SetFulcrum(Some(url), reply))
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_fulcrum_endpoint(&self) -> Result<(), String> {
+        self.request(|reply| SupervisorCommand::SetFulcrum(None, reply))
+    }
+
+    #[allow(dead_code)]
     fn request(
         &self,
         build: impl FnOnce(SyncSender<Result<(), String>>) -> SupervisorCommand,
@@ -213,7 +224,7 @@ impl Drop for RuntimeSupervisor {
 #[allow(clippy::too_many_arguments)]
 fn run_supervisor(
     mut cfg: RuntimeConfig,
-    endpoints: Vec<String>,
+    mut endpoints: Vec<String>,
     mut live: LiveJob,
     initial_session: ElectrumSession,
     search: SearchHandle,
@@ -277,6 +288,44 @@ fn run_supervisor(
                         }
                         Ok(())
                     });
+                    let _ = reply.send(result);
+                }
+                Ok(SupervisorCommand::SetFulcrum(endpoint, reply)) => {
+                    if pending_winners != 0 {
+                        let _ = reply.send(Err(
+                            "endpoint change unavailable while runtime work is pending".into(),
+                        ));
+                        continue;
+                    }
+                    let result = match prepare_fulcrum_endpoint_change(&cfg, endpoint.as_deref()) {
+                        Err(error) => Err(error),
+                        Ok(None) => Ok(()),
+                        Ok(Some((next_cfg, next_endpoints))) => search
+                            .apply_control(SearchCommand::Pause)
+                            .map(|_| ())
+                            .and_then(|()| {
+                                search.replace_job(live.to_mining_job(
+                                    next_cfg.generation_id,
+                                    &next_cfg.payout_address,
+                                ))
+                            })
+                            .map(|()| {
+                                cfg = next_cfg;
+                                endpoints = next_endpoints;
+                                stale_rebuilds = stale_rebuilds.saturating_add(1);
+                                session = None;
+                                state = SupervisorState::Reconnecting;
+                                last_error = None;
+                                reconnect_backoff = RECONNECT_MIN;
+                                next_reconnect = Instant::now();
+                                emit(
+                                    &event_tx,
+                                    RuntimeEvent::Reconnecting(
+                                        "Fulcrum endpoint changed; reconnecting".into(),
+                                    ),
+                                );
+                            }),
+                    };
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Stop) | Err(TryRecvError::Disconnected) => {
@@ -444,6 +493,22 @@ fn apply_refreshed_job(
     Ok(changed)
 }
 
+fn prepare_fulcrum_endpoint_change(
+    cfg: &RuntimeConfig,
+    endpoint: Option<&str>,
+) -> Result<Option<(RuntimeConfig, Vec<String>)>, String> {
+    let mut next = cfg.clone();
+    match endpoint {
+        Some(url) => next.set_fulcrum_url(url)?,
+        None => next.clear_fulcrum_url(),
+    }
+    if next.fulcrum_url == cfg.fulcrum_url {
+        return Ok(None);
+    }
+    let endpoints = next.electrum_endpoints();
+    Ok(Some((next, endpoints)))
+}
+
 fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
     current.baton_txid != next.baton_txid
         || current.baton_vout != next.baton_vout
@@ -575,5 +640,39 @@ mod tests {
         let mut next_baton = job;
         next_baton.baton_vout = 1;
         assert!(!winner_matches_live(&current, 4, &next_baton));
+    }
+
+    #[test]
+    fn fulcrum_endpoint_change_is_atomic_and_invalidates_generation() {
+        let cfg = RuntimeConfig::default();
+        let original_generation = cfg.generation_id;
+
+        assert!(
+            prepare_fulcrum_endpoint_change(&cfg, Some("http://wrong-scheme.invalid")).is_err()
+        );
+        assert_eq!(cfg.generation_id, original_generation);
+        assert!(cfg.fulcrum_url.is_none());
+
+        let custom = "wss://unit-test.invalid:50004";
+        let (next, endpoints) = prepare_fulcrum_endpoint_change(&cfg, Some(custom))
+            .unwrap()
+            .expect("new endpoint must require a transition");
+        assert_eq!(cfg.generation_id, original_generation);
+        assert_eq!(next.generation_id, original_generation + 1);
+        assert_eq!(next.fulcrum_url.as_deref(), Some(custom));
+        assert_eq!(endpoints.first().map(String::as_str), Some(custom));
+        let replacement = live_job().to_mining_job(next.generation_id, "");
+        assert_eq!(replacement.generation_id, next.generation_id);
+
+        assert!(prepare_fulcrum_endpoint_change(&next, Some(custom))
+            .unwrap()
+            .is_none());
+
+        let (cleared, cleared_endpoints) = prepare_fulcrum_endpoint_change(&next, None)
+            .unwrap()
+            .expect("clearing a custom endpoint must require a transition");
+        assert_eq!(cleared.generation_id, next.generation_id + 1);
+        assert!(cleared.fulcrum_url.is_none());
+        assert!(!cleared_endpoints.iter().any(|value| value == custom));
     }
 }
