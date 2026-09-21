@@ -287,7 +287,7 @@ fn run_intensity_window(
     render_tui: bool,
 ) -> Result<BenchmarkWindow, String> {
     let requested = Duration::from_secs(seconds);
-    let batch_candidates = search::batch_candidates(intensity);
+    let batch_candidates = search::scheduled_batch_candidates();
     let (telemetry_stop, telemetry_samples, telemetry_worker) = start_telemetry_sampler(device);
     let tui_worker = render_tui.then(|| {
         let stop = Arc::new(AtomicBool::new(false));
@@ -384,7 +384,7 @@ pub fn run_cuda_benchmark(
 
     // Prime kernels and page residency before measuring any intensity window.
     let mut nonce_base = 0u32;
-    let warmup = engine.search_batch(nonce_base, search::batch_candidates(25))?;
+    let warmup = engine.search_batch(nonce_base, search::scheduled_batch_candidates())?;
     nonce_base = nonce_base.wrapping_add(warmup.candidates);
 
     let mut samples = Vec::with_capacity(BENCHMARK_INTENSITIES.len());
