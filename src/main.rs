@@ -18,6 +18,8 @@ mod cuda_stage_a_ref;
 #[cfg(test)]
 mod cuda_stage_b;
 #[allow(dead_code)]
+mod cuda_stage_c;
+#[allow(dead_code)]
 mod electrum;
 #[allow(dead_code)]
 mod node;
