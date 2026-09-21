@@ -875,12 +875,13 @@ fn resolve_pending_before_search(
 }
 
 fn production_relay_fee_sats_per_kb(cfg: &RuntimeConfig) -> Result<u64, String> {
-    if cfg.source != JobSource::Node {
-        return Ok(reward::MIN_RELAY_FEE_SATS_PER_KB);
-    }
     let endpoints = cfg.node_endpoints();
     if endpoints.is_empty() {
-        return Err("native-node broadcast selected but no node RPC endpoint is configured".into());
+        return if cfg.source == JobSource::Node {
+            Err("native-node broadcast selected but no node RPC endpoint is configured".into())
+        } else {
+            Ok(reward::MIN_RELAY_FEE_SATS_PER_KB)
+        };
     }
     let (_, policy) = crate::node::fetch_relay_policy(&endpoints)
         .map_err(|error| format!("native-node relay-policy preflight failed: {error}"))?;
@@ -2682,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn native_node_source_binds_live_mempool_fee_floor() {
+    fn configured_node_binds_live_mempool_fee_floor_with_fulcrum_preference() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -2705,7 +2706,7 @@ mod tests {
 
         let cfg = RuntimeConfig {
             node_url: Some(format!("http://{address}")),
-            source: JobSource::Node,
+            source: JobSource::Fulcrum,
             ..RuntimeConfig::default()
         };
         assert_eq!(production_relay_fee_sats_per_kb(&cfg).unwrap(), 2_000);
