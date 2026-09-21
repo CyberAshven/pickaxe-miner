@@ -1,4 +1,6 @@
-//! Distribution and runtime config. Donation is a coinbase-style split on the win tx only.
+//! Distribution and runtime config. Donation is split from each PHOTON win by the
+//! protocol-valid reward child path; the PHOTON mining transaction remains the
+//! authoritative two-output covenant transaction.
 
 /// Donation share in basis points (200 = 2%). Never call this a "dev fee".
 pub const DONATION_BPS: u16 = 200;
