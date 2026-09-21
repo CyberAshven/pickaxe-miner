@@ -6,6 +6,7 @@ use libloading::Library;
 use num_bigint::BigUint;
 use secp256k1::{PublicKey, SecretKey};
 use std::ffi::{CStr, CString};
+use std::fs;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -349,9 +350,7 @@ fn parse_gfx_arch(properties: &[u8]) -> Option<String> {
     let tail = &properties[start..];
     let len = tail
         .iter()
-        .position(|byte| {
-            !byte.is_ascii_alphanumeric() && !matches!(*byte, b':' | b'+' | b'-' | b'_' | b'.')
-        })
+        .position(|byte| !byte.is_ascii_alphanumeric())
         .unwrap_or(tail.len());
     (len > 3).then(|| String::from_utf8_lossy(&tail[..len]).into_owned())
 }
@@ -385,6 +384,50 @@ fn code_object_dir(architecture: &str) -> PathBuf {
             .join("build")
             .join(architecture)
     }
+}
+
+fn verify_code_object_architecture(path: &Path, architecture: &str) -> Result<(), String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("read HIP code object {}: {error}", path.display()))?;
+    let mut targets = Vec::new();
+    let mut index = 0usize;
+    while index + 3 <= bytes.len() {
+        if &bytes[index..index + 3] != b"gfx" {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 3;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_alphanumeric()
+                || matches!(bytes[index], b':' | b'+' | b'-' | b'_'))
+        {
+            index += 1;
+        }
+        if index > start + 3 {
+            let target = String::from_utf8_lossy(&bytes[start..index]).into_owned();
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+
+    if targets
+        .iter()
+        .any(|target| target.split(':').next() == Some(architecture))
+    {
+        return Ok(());
+    }
+
+    let observed = if targets.is_empty() {
+        "no gfx target metadata found".to_string()
+    } else {
+        format!("found {}", targets.join(", "))
+    };
+    Err(format!(
+        "PHOTON HIP code object {} is not bound to detected architecture {architecture}: {observed}",
+        path.display()
+    ))
 }
 
 fn fixed_d_table(private_key: &[u8; 32]) -> Vec<u32> {
@@ -475,6 +518,7 @@ impl HipPhotonEngine {
                     path.display()
                 ));
             }
+            verify_code_object_architecture(&path, &architecture)?;
         }
 
         let stream = HipStream::create(&api)?;
@@ -799,6 +843,10 @@ mod tests {
         let mut properties = [0u8; 256];
         properties[37..45].copy_from_slice(b"gfx1036\0");
         assert_eq!(parse_gfx_arch(&properties).as_deref(), Some("gfx1036"));
+        assert_eq!(
+            parse_gfx_arch(b"device\0gfx1036:sramecc-:xnack+\0").as_deref(),
+            Some("gfx1036")
+        );
     }
 
     #[test]
@@ -810,6 +858,41 @@ mod tests {
         if std::env::var_os("PICKAXE_HIP_CODE_OBJECT_DIR").is_none() {
             assert_eq!(code_object_dir("gfx1036"), expected);
         }
+    }
+
+    #[test]
+    fn hip_code_object_must_match_detected_architecture() {
+        let directory =
+            std::env::temp_dir().join(format!("pickaxe-hip-arch-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create HIP architecture test directory");
+        let path = directory.join("probe.hsaco");
+
+        fs::write(
+            &path,
+            b"\x7fELF\0amdgcn-amd-amdhsa--gfx1036:sramecc-:xnack+\0",
+        )
+        .expect("write matching HIP code object probe");
+        verify_code_object_architecture(&path, "gfx1036")
+            .expect("matching HIP architecture must be accepted");
+
+        let error = verify_code_object_architecture(&path, "gfx1100")
+            .expect_err("mismatched HIP architecture must fail closed");
+        assert!(error.contains("gfx1100"));
+        assert!(error.contains("gfx1036"));
+
+        fs::write(&path, b"\x7fELF\0amdgcn-amd-amdhsa--gfx10360\0")
+            .expect("write prefix-collision HIP code object probe");
+        verify_code_object_architecture(&path, "gfx1036")
+            .expect_err("longer HIP architecture must not match by prefix");
+
+        fs::write(&path, b"\x7fELF\0no-amdgpu-target-metadata\0")
+            .expect("write metadata-free HIP code object probe");
+        let error = verify_code_object_architecture(&path, "gfx1036")
+            .expect_err("missing HIP architecture metadata must fail closed");
+        assert!(error.contains("no gfx target metadata found"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&directory);
     }
 
     #[test]
