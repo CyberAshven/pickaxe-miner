@@ -41,7 +41,10 @@ pub enum Commands {
     Mine,
     Devices,
     SelfTest,
-    Benchmark,
+    Benchmark {
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -108,6 +111,24 @@ mod tests {
     fn clap_parses_offline_self_test() {
         let cli = Cli::try_parse_from(["pickaxe", "self-test", "--backend", "cuda"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::SelfTest)));
+        assert_eq!(cli.backend, "cuda");
+    }
+
+    #[test]
+    fn clap_parses_offline_benchmark_window() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "benchmark",
+            "--backend",
+            "cuda",
+            "--seconds",
+            "7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Benchmark { seconds: 7 })
+        ));
         assert_eq!(cli.backend, "cuda");
     }
 

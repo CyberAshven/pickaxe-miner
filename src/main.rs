@@ -5,6 +5,7 @@
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 mod backend;
+mod benchmark;
 mod cli;
 mod config;
 mod crypto;
@@ -960,11 +961,27 @@ fn main() {
                 }
             }
         }
-        cli::Commands::Benchmark => {
-            eprintln!(
-                "error: benchmark is gated until the exact PHOTON GPU RFC6979/kG/Schnorr/full-transaction pipeline is production-ready"
-            );
-            std::process::exit(2);
+        cli::Commands::Benchmark { seconds } => {
+            let selected = match backend::resolve_mining_device(backend_kind, args.device) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            };
+            if !matches!(selected.backend, backend::BackendKind::Cuda) {
+                eprintln!(
+                    "error: benchmark currently requires the validated native CUDA PHOTON backend"
+                );
+                std::process::exit(2);
+            }
+            match benchmark::run_cuda_benchmark(selected.index, selected.name, seconds) {
+                Ok(report) => benchmark::print_report(&report, args.json),
+                Err(error) => {
+                    eprintln!("error: benchmark failed: {error}");
+                    std::process::exit(1);
+                }
+            }
         }
         cli::Commands::Config { command } => match command {
             cli::ConfigCommand::Show => {
