@@ -28,6 +28,7 @@ const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const SUBMISSION_JOURNAL_VERSION: u8 = 3;
+const SUBMISSION_RESOLUTION_VERSION: u8 = 1;
 const PHOTON_TX_BYTES: usize = 615;
 const PHOTON_TARGET_OFFSET: usize = 394;
 const BATON_LINEAGE_MAX_STEPS: usize = 256;
@@ -87,6 +88,24 @@ struct PendingSubmission {
     resulting_baton_value_sats: u64,
     miner_token_amount: u128,
     donation_token_amount: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ResolvedSubmission {
+    version: u8,
+    journal_version: u8,
+    generation_id: u64,
+    expected_height: u32,
+    expected_baton_txid: String,
+    expected_baton_vout: u32,
+    parent_txid: String,
+    settlement_txid: String,
+    parent_attempted: bool,
+    parent_accepted: bool,
+    observed_height: u32,
+    observed_baton_txid: String,
+    observed_baton_vout: u32,
+    reason: String,
 }
 
 impl PendingSubmission {
@@ -445,6 +464,186 @@ impl PendingSubmission {
             )),
         }
     }
+}
+
+impl ResolvedSubmission {
+    fn path(journal_path: &Path) -> PathBuf {
+        let mut path = journal_path.as_os_str().to_os_string();
+        path.push(".resolved");
+        PathBuf::from(path)
+    }
+
+    fn from_stale(
+        pending: &PendingSubmission,
+        fresh: &LiveJob,
+        journal_path: &Path,
+    ) -> Result<Self, String> {
+        pending.validate()?;
+        let parent_attempted = pending.parent_attempted(journal_path)?;
+        let parent_accepted = pending.parent_accepted(journal_path)?;
+        if parent_accepted {
+            return Err(
+                "refusing to resolve a PHOTON winner as stale after parent acceptance".into(),
+            );
+        }
+        if fresh.baton_txid.eq_ignore_ascii_case(&pending.parent_txid) && fresh.baton_vout == 0 {
+            return Err(
+                "refusing to resolve a PHOTON winner as stale while its parent baton is live"
+                    .into(),
+            );
+        }
+        if pending.matches_live(fresh) {
+            return Err(
+                "refusing to resolve a PHOTON winner as stale while its expected job is live"
+                    .into(),
+            );
+        }
+
+        Ok(Self {
+            version: SUBMISSION_RESOLUTION_VERSION,
+            journal_version: pending.version,
+            generation_id: pending.generation_id,
+            expected_height: pending.expected_height,
+            expected_baton_txid: pending.expected_baton_txid.clone(),
+            expected_baton_vout: pending.expected_baton_vout,
+            parent_txid: pending.parent_txid.clone(),
+            settlement_txid: pending.settlement_txid.clone(),
+            parent_attempted,
+            parent_accepted,
+            observed_height: fresh.height,
+            observed_baton_txid: fresh.baton_txid.clone(),
+            observed_baton_vout: fresh.baton_vout,
+            reason: "stale-unbroadcast".into(),
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.version != SUBMISSION_RESOLUTION_VERSION {
+            return Err(format!(
+                "unsupported resolved-submission version {}",
+                self.version
+            ));
+        }
+        if self.journal_version != SUBMISSION_JOURNAL_VERSION {
+            return Err(format!(
+                "resolved submission references unsupported journal version {}",
+                self.journal_version
+            ));
+        }
+        if self.parent_accepted {
+            return Err("resolved stale submission cannot have an accepted parent".into());
+        }
+        for (label, txid) in [
+            ("expected baton", self.expected_baton_txid.as_str()),
+            ("parent", self.parent_txid.as_str()),
+            ("settlement", self.settlement_txid.as_str()),
+            ("observed baton", self.observed_baton_txid.as_str()),
+        ] {
+            if txid.len() != 64 || !txid.chars().all(|value| value.is_ascii_hexdigit()) {
+                return Err(format!("resolved submission has invalid {label} txid"));
+            }
+        }
+        if self.reason != "stale-unbroadcast" {
+            return Err("resolved submission has an unsupported resolution reason".into());
+        }
+        Ok(())
+    }
+
+    fn load(journal_path: &Path) -> Result<Option<Self>, String> {
+        let path = Self::path(journal_path);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "read resolved-submission record {}: {error}",
+                    path.display()
+                ))
+            }
+        };
+        let resolved: Self = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "parse resolved-submission record {}: {error}",
+                path.display()
+            )
+        })?;
+        resolved.validate()?;
+        Ok(Some(resolved))
+    }
+
+    fn persist_latest(&self, journal_path: &Path) -> Result<(), String> {
+        self.validate()?;
+        let path = Self::path(journal_path);
+        let parent = path
+            .parent()
+            .ok_or("resolved-submission record has no parent directory")?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "create resolved-submission directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        if Self::load(journal_path)?.as_ref() == Some(self) {
+            return PendingSubmission::sync_committed(&path, parent);
+        }
+
+        let temporary = PendingSubmission::marker_path(&path, ".tmp");
+        if temporary.exists() {
+            fs::remove_file(&temporary).map_err(|error| {
+                format!(
+                    "remove stale resolved-submission temporary file {}: {error}",
+                    temporary.display()
+                )
+            })?;
+        }
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| format!("serialize resolved-submission record: {error}"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| {
+                format!(
+                    "create resolved-submission temporary file {}: {error}",
+                    temporary.display()
+                )
+            })?;
+        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "write resolved-submission record {}: {error}",
+                temporary.display()
+            ));
+        }
+        drop(file);
+
+        if path.exists() {
+            fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "replace resolved-submission record {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "commit resolved-submission record {}: {error}",
+                path.display()
+            ));
+        }
+        PendingSubmission::sync_committed(&path, parent)
+    }
+}
+
+fn resolve_stale_submission(
+    pending: &PendingSubmission,
+    fresh: &LiveJob,
+    journal_path: &Path,
+) -> Result<(), String> {
+    let resolved = ResolvedSubmission::from_stale(pending, fresh, journal_path)?;
+    resolved.persist_latest(journal_path)?;
+    PendingSubmission::remove(journal_path)
 }
 
 fn submission_journal_path() -> PathBuf {
@@ -867,9 +1066,12 @@ fn resolve_pending_before_search(
     };
 
     match attempt_pending_submission(session, cfg, &pending, journal_path)? {
-        SubmissionAttempt::Complete | SubmissionAttempt::StaleUnbroadcast(_) => {
+        SubmissionAttempt::Complete => {
             PendingSubmission::remove(journal_path)?;
             Ok(())
+        }
+        SubmissionAttempt::StaleUnbroadcast(fresh) => {
+            resolve_stale_submission(&pending, &fresh, journal_path)
         }
     }
 }
@@ -1797,7 +1999,7 @@ fn run_supervisor(
                         }
                     }
                     Ok(SubmissionAttempt::StaleUnbroadcast(next_job)) => {
-                        match PendingSubmission::remove(&journal_path) {
+                        match resolve_stale_submission(&pending, &next_job, &journal_path) {
                             Ok(()) => {
                                 pending_submission = None;
                                 pending_winners = 0;
@@ -2991,6 +3193,75 @@ mod tests {
         assert!(!journal.exists());
         assert!(!PendingSubmission::parent_attempted_path(&journal).exists());
         assert!(!PendingSubmission::parent_accepted_path(&journal).exists());
+    }
+
+    #[test]
+    fn stale_unbroadcast_winner_keeps_durable_resolution_evidence() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let winner = signed_winner(cfg.generation_id, &job, &mining_payout);
+        let pending = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+        pending.mark_parent_attempted(&journal).unwrap();
+
+        let mut conflicting = job.clone();
+        conflicting.height += 1;
+        conflicting.baton_txid = "44".repeat(32);
+        resolve_stale_submission(&pending, &conflicting, &journal).unwrap();
+
+        assert!(!journal.exists());
+        assert!(!PendingSubmission::parent_attempted_path(&journal).exists());
+        assert!(!PendingSubmission::parent_accepted_path(&journal).exists());
+        let resolved = ResolvedSubmission::load(&journal).unwrap().unwrap();
+        assert_eq!(resolved.generation_id, cfg.generation_id);
+        assert_eq!(resolved.expected_height, job.height);
+        assert_eq!(resolved.expected_baton_txid, job.baton_txid);
+        assert_eq!(resolved.parent_txid, pending.parent_txid);
+        assert_eq!(resolved.settlement_txid, pending.settlement_txid);
+        assert!(resolved.parent_attempted);
+        assert!(!resolved.parent_accepted);
+        assert_eq!(resolved.observed_height, conflicting.height);
+        assert_eq!(resolved.observed_baton_txid, conflicting.baton_txid);
+        assert_eq!(resolved.reason, "stale-unbroadcast");
+
+        fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
+    }
+
+    #[test]
+    fn stale_resolution_never_discards_an_accepted_parent() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let winner = signed_winner(cfg.generation_id, &job, &mining_payout);
+        let pending = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+        pending.mark_parent_accepted(&journal).unwrap();
+
+        let mut conflicting = job;
+        conflicting.height += 1;
+        conflicting.baton_txid = "55".repeat(32);
+        let error = resolve_stale_submission(&pending, &conflicting, &journal).unwrap_err();
+        assert!(error.contains("after parent acceptance"));
+        assert!(journal.exists());
+        assert!(pending.parent_accepted(&journal).unwrap());
+        assert!(ResolvedSubmission::load(&journal).unwrap().is_none());
+
+        PendingSubmission::remove(&journal).unwrap();
     }
 
     #[test]
