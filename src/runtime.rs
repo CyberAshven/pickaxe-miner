@@ -477,20 +477,13 @@ fn submission_journal_path() -> PathBuf {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionDecision {
-    Complete,
     BroadcastSettlement,
     BroadcastParentThenSettlement,
     StaleUnbroadcast,
 }
 
-fn submission_decision(
-    parent_known: bool,
-    settlement_known: bool,
-    live_matches_expected: bool,
-) -> SubmissionDecision {
-    if settlement_known {
-        SubmissionDecision::Complete
-    } else if parent_known {
+fn submission_decision(parent_known: bool, live_matches_expected: bool) -> SubmissionDecision {
+    if parent_known {
         SubmissionDecision::BroadcastSettlement
     } else if live_matches_expected {
         SubmissionDecision::BroadcastParentThenSettlement
@@ -502,6 +495,13 @@ fn submission_decision(
 enum SubmissionAttempt {
     Complete,
     StaleUnbroadcast(LiveJob),
+}
+
+fn resulting_baton_is_authoritative(pending: &PendingSubmission, fresh: &LiveJob) -> bool {
+    fresh
+        .baton_txid
+        .eq_ignore_ascii_case(&pending.resulting_baton_txid)
+        && fresh.baton_vout == pending.resulting_baton_vout
 }
 
 fn ensure_broadcast_txid(label: &str, expected: &str, returned: &str) -> Result<(), String> {
@@ -619,11 +619,7 @@ fn broadcast_settlement(
     let returned = broadcast_pending_transaction(session, cfg, &pending.settlement_hex)?;
     ensure_broadcast_txid("PHOTON settlement", &pending.settlement_txid, &returned)?;
     let fresh = session.fetch_live_job()?;
-    if fresh
-        .baton_txid
-        .eq_ignore_ascii_case(&pending.resulting_baton_txid)
-        && fresh.baton_vout == pending.resulting_baton_vout
-    {
+    if resulting_baton_is_authoritative(pending, &fresh) {
         Ok(SubmissionAttempt::Complete)
     } else {
         Err(
@@ -644,20 +640,11 @@ fn attempt_pending_submission(
     let settlement_known = session.transaction_known(&pending.settlement_txid)?;
     if settlement_known {
         let fresh = session.fetch_live_job()?;
-        if fresh
-            .baton_txid
-            .eq_ignore_ascii_case(&pending.resulting_baton_txid)
-            && fresh.baton_vout == pending.resulting_baton_vout
-        {
-            return Ok(SubmissionAttempt::Complete);
-        }
-        if fresh.baton_txid != pending.expected_baton_txid
-            || fresh.baton_vout != pending.expected_baton_vout
-        {
+        if resulting_baton_is_authoritative(pending, &fresh) {
             return Ok(SubmissionAttempt::Complete);
         }
         return Err(
-            "settlement transaction is known but authoritative PHOTON baton discovery has not advanced"
+            "settlement transaction is known but the journaled resulting PHOTON baton is not authoritative"
                 .into(),
         );
     }
@@ -684,7 +671,7 @@ fn attempt_pending_submission(
         return Ok(SubmissionAttempt::StaleUnbroadcast(fresh));
     }
     if !parent_attempted
-        && submission_decision(false, false, pending.matches_live(&fresh))
+        && submission_decision(false, pending.matches_live(&fresh))
             == SubmissionDecision::StaleUnbroadcast
     {
         return Ok(SubmissionAttempt::StaleUnbroadcast(fresh));
@@ -2347,21 +2334,55 @@ mod tests {
     #[test]
     fn submission_retry_never_rebroadcasts_parent_after_it_is_known() {
         assert_eq!(
-            submission_decision(false, true, false),
-            SubmissionDecision::Complete
-        );
-        assert_eq!(
-            submission_decision(true, false, false),
+            submission_decision(true, false),
             SubmissionDecision::BroadcastSettlement
         );
         assert_eq!(
-            submission_decision(false, false, true),
+            submission_decision(false, true),
             SubmissionDecision::BroadcastParentThenSettlement
         );
         assert_eq!(
-            submission_decision(false, false, false),
+            submission_decision(false, false),
             SubmissionDecision::StaleUnbroadcast
         );
+    }
+
+    #[test]
+    fn completed_submission_requires_exact_journaled_resulting_baton() {
+        let job = live_job();
+        let settlement_txid = reward::transaction_id(&[2]);
+        let pending = PendingSubmission {
+            version: SUBMISSION_JOURNAL_VERSION,
+            generation_id: 1,
+            expected_height: job.height,
+            expected_baton_txid: job.baton_txid.clone(),
+            expected_baton_vout: job.baton_vout,
+            parent_txid: reward::transaction_id(&[1]),
+            parent_hex: "01".into(),
+            settlement_txid: settlement_txid.clone(),
+            settlement_hex: "02".into(),
+            resulting_baton_txid: settlement_txid,
+            resulting_baton_vout: 0,
+            resulting_baton_value_sats: 10_000,
+            miner_token_amount: 98,
+            donation_token_amount: 2,
+        };
+
+        let mut exact = job.clone();
+        exact.baton_txid = pending.resulting_baton_txid.to_uppercase();
+        exact.baton_vout = pending.resulting_baton_vout;
+        assert!(resulting_baton_is_authoritative(&pending, &exact));
+
+        let mut unrelated_advance = exact.clone();
+        unrelated_advance.baton_txid = "33".repeat(32);
+        assert!(!resulting_baton_is_authoritative(
+            &pending,
+            &unrelated_advance
+        ));
+
+        let mut wrong_output = exact;
+        wrong_output.baton_vout = 1;
+        assert!(!resulting_baton_is_authoritative(&pending, &wrong_output));
     }
 
     #[test]
