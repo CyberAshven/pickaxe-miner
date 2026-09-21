@@ -35,6 +35,8 @@ mod runtime;
 mod search;
 #[cfg(test)]
 mod stage_b;
+#[allow(dead_code)]
+mod tui;
 mod tx;
 
 use config::RuntimeConfig;
@@ -920,12 +922,22 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
     }
 }
 
-fn run_headless_mining(cfg: RuntimeConfig, json: bool, dry_run: bool) -> Result<(), String> {
+fn run_headless_mining(
+    cfg: RuntimeConfig,
+    json: bool,
+    dry_run: bool,
+    use_tui: bool,
+) -> Result<(), String> {
     let supervisor = if dry_run {
         runtime::RuntimeSupervisor::start_dry_run(cfg)?
     } else {
         runtime::RuntimeSupervisor::start(cfg)?
     };
+    if use_tui {
+        let final_snapshot = tui::run(supervisor, dry_run)?;
+        print_runtime_snapshot(&final_snapshot, false);
+        return Ok(());
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
     ctrlc::set_handler(move || signal_stop.store(true, Ordering::Relaxed))
@@ -1029,13 +1041,8 @@ fn main() {
                 eprintln!("error: live PHOTON runtime currently supports CUDA device 0 only");
                 std::process::exit(2);
             }
-            if !(args.no_tui || args.json) {
-                eprintln!(
-                    "error: Ratatui frontend is not wired yet; use --no-tui (or --json) for the shared supervised runtime"
-                );
-                std::process::exit(2);
-            }
-            if let Err(error) = run_headless_mining(cfg, args.json, args.dry_run) {
+            let use_tui = !(args.no_tui || args.json);
+            if let Err(error) = run_headless_mining(cfg, args.json, args.dry_run, use_tui) {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             }

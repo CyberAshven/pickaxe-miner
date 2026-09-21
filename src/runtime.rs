@@ -418,6 +418,7 @@ enum SupervisorCommand {
     Resume(SyncSender<Result<(), String>>),
     SetPayout(String, SyncSender<Result<(), String>>),
     SetFulcrum(Option<String>, SyncSender<Result<(), String>>),
+    Reconnect(SyncSender<Result<(), String>>),
     Stop,
 }
 
@@ -561,6 +562,10 @@ impl RuntimeSupervisor {
     #[allow(dead_code)]
     pub fn clear_fulcrum_endpoint(&self) -> Result<(), String> {
         self.request(|reply| SupervisorCommand::SetFulcrum(None, reply))
+    }
+
+    pub fn reconnect(&self) -> Result<(), String> {
+        self.request(SupervisorCommand::Reconnect)
     }
 
     #[allow(dead_code)]
@@ -720,6 +725,29 @@ fn run_supervisor(
                                     );
                                 }),
                         };
+                    let _ = reply.send(result);
+                }
+                Ok(SupervisorCommand::Reconnect(reply)) => {
+                    let result = if pending_winners != 0 {
+                        Err("reconnect unavailable while runtime work is pending".into())
+                    } else {
+                        search
+                            .apply_control(SearchCommand::Pause)
+                            .map(|_| ())
+                            .map(|()| {
+                                session = None;
+                                state = SupervisorState::Reconnecting;
+                                last_error = None;
+                                reconnect_backoff = RECONNECT_MIN;
+                                next_reconnect = Instant::now();
+                                emit(
+                                    &event_tx,
+                                    RuntimeEvent::Reconnecting(
+                                        "manual Fulcrum reconnect requested".into(),
+                                    ),
+                                );
+                            })
+                    };
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Stop) | Err(TryRecvError::Disconnected) => {
