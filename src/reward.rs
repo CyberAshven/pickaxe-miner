@@ -1,10 +1,8 @@
 //! Protocol-valid Pickaxe 98/2 reward settlement.
 //!
-//! The PHOTON mining transaction remains the authoritative two-output parent.
-//! Its reward output is paid to a process-local P2PKH key. A pre-signed child
-//! then spends that reward together with the stateful M54 sponsor reserve:
-//! 98% to the configured miner payout, 2% to the compiled donation address,
-//! and the remaining sponsor reserve to the next baton-bound sponsor script.
+//! Production settlement spends the newly-created PHOTON baton and reward
+//! together, preserves the baton at output 0, and splits the exact winning
+//! reward 98/2 without any external funding input.
 
 use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS};
 use crate::crypto;
@@ -597,7 +595,7 @@ pub fn build_self_funded_settlement(
     })
 }
 
-/// Build the exact 197-byte M54 stateful sponsor covenant for one PHOTON baton.
+/// Legacy M54 sponsor-covenant research helper. Production mining does not use it.
 pub fn build_sponsor_script(expected_baton_txid: &str) -> Result<Vec<u8>, String> {
     let baton = parse_txid_display(expected_baton_txid)?;
     let expected_baton_hash_le = reverse(&baton);

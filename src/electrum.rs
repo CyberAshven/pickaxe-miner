@@ -1,6 +1,6 @@
 //! Electrum WSS client: live PHOTON baton / MiningJob fetch.
 //! Owned by Dev Assist. Search consumes MiningJob; no keys.
-//! Runtime winner settlement uses this session for ordered parent/child broadcast.
+//! Runtime winner settlement uses this session for ordered parent/settlement broadcast.
 
 use crate::protocol::{EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
 use crate::reward::{self, SponsorReserve, SPONSOR_MIN_RESERVE_SATS};
@@ -325,11 +325,8 @@ impl ElectrumSession {
         })
     }
 
-    /// Find the unique BCH-only M54 sponsor reserve bound to this PHOTON baton.
-    ///
-    /// Production reward settlement is fail-closed: no reserve, a token-bearing
-    /// reserve, an undersized reserve, or multiple matching reserves all block
-    /// submission rather than guessing which state to spend.
+    /// Legacy M54 sponsor-reserve research helper. Production mining no longer
+    /// queries or depends on this state before GPU search or winner settlement.
     pub fn fetch_sponsor_reserve(
         &mut self,
         expected_baton_txid: &str,
