@@ -5,16 +5,15 @@
 //! - challenge `e = SHA256(r_x || compressed_pubkey || msg)`
 //! - if R.y is not a quadratic residue mod p, use `k' = n - k` (r_x unchanged)
 //!
-//! Production private keys are BLOCKED until vector tests pass.
+//! The signer is shared by deterministic vector tests, live job setup, and rare
+//! returned-winner reconstruction. Mining identities remain runtime-only.
 
-#[cfg(test)]
 use hmac::{Hmac, Mac};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use secp256k1::{PublicKey, Scalar, SecretKey};
 use sha2::{Digest, Sha256};
 
-#[cfg(test)]
 type HmacSha256 = Hmac<Sha256>;
 
 const SECP_P_BE: [u8; 32] = [
@@ -22,7 +21,6 @@ const SECP_P_BE: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xFF, 0xFF, 0xFC, 0x2F,
 ];
 
-#[cfg(test)]
 const SECP_N_BE: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
     0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
@@ -40,7 +38,6 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-#[cfg(test)]
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
     mac.update(data);
@@ -49,7 +46,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
-#[cfg(test)]
 fn reduce_msg_mod_n(msg32: &[u8; 32]) -> [u8; 32] {
     let m = BigUint::from_bytes_be(msg32);
     let n = BigUint::from_bytes_be(&SECP_N_BE);
@@ -61,7 +57,6 @@ fn reduce_msg_mod_n(msg32: &[u8; 32]) -> [u8; 32] {
 }
 
 /// RFC6979 nonce for BCH Schnorr (algo tag ASCII `Schnorr+SHA256  `).
-#[cfg(test)]
 pub fn bch_rfc6979_nonce(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 32], String> {
     let reduced = reduce_msg_mod_n(msg32);
     let algo = b"Schnorr+SHA256  ";
@@ -111,7 +106,6 @@ fn y_is_quadratic_residue(y_be: &[u8; 32]) -> bool {
     y.modpow(&exp, &p) == BigUint::one()
 }
 
-#[cfg(test)]
 pub fn bch_schnorr_sign(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 64], String> {
     let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
     let pk_bytes = PublicKey::from_secret_key(&sk).serialize();
