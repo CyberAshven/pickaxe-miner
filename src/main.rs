@@ -72,11 +72,9 @@ fn print_help() {
   servers                      Show Fulcrum + node try-order (ban-safe)
   nodeprobe                    Probe native node RPC (getblockchaininfo)
   job                          Fetch live PHOTON baton job
-  dryrun                       connect+job + proven 2-output tx preview (no broadcast)
-  arm                          like dryrun + message SHA256 for Schnorr (no keys)
+  preview                      connect+job + proven 2-output tx preview (no mining)
+  arm                          like preview + message SHA256 for Schnorr (no keys)
   applysig <nonce> <pk33hex> <sig64hex>  verify+arm proven 2-output winner (no broadcast)
-  start                        Start GPU search (uses last job if present)
-  stop                         Stop search
   quit | exit                  Leave
 
 Donation: 2%"#
@@ -656,7 +654,7 @@ fn handle_line(
             }
         }
 
-        "dryrun" => {
+        "preview" => {
             if cfg.payout_address.is_empty() {
                 println!("error: set payout first (payout bitcoincash:...)");
             } else {
@@ -690,57 +688,9 @@ fn handle_line(
                 }
             }
         }
-        "start" => {
-            if cfg.payout_address.is_empty() {
-                println!("error: set payout first (payout bitcoincash:...)");
-            } else if handle.is_some() {
-                println!("already mining - status for rate");
-            } else {
-                // Codex sec15: PHOTON jobs = Fulcrum CashToken baton only. Never GBT->baton.
-                if live.is_none() {
-                    println!("PHOTON job: fetching CashToken baton via Fulcrum (Codex sec15)...");
-                    match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
-                        Ok(mut s) => match s.fetch_live_job() {
-                            Ok(j) => {
-                                j.print_summary();
-                                publish_live_job(cfg, live, j);
-                            }
-                            Err(e) => println!("error: baton fetch failed: {e}"),
-                        },
-                        Err(e) => println!("error: fulcrum connect failed: {e}"),
-                    }
-                }
-                let Some(job) = live
-                    .as_ref()
-                    .map(|j| j.to_mining_job(cfg.generation_id, &cfg.payout_address))
-                else {
-                    println!("error: no PHOTON baton job - check Fulcrum, then job / start");
-                    return true;
-                };
-                if job.target_le_hex.is_empty() {
-                    println!("error: baton job missing target - refuse easy-target fallback");
-                    return true;
-                }
-                println!(
-                    "using PHOTON baton height={} baton={} (broadcast pref={})",
-                    job.height,
-                    job.baton_txid,
-                    cfg.source.as_str()
-                );
-                match SearchHandle::start(cfg.intensity, job) {
-                    Ok(h) => {
-                        *handle = Some(h);
-                        cfg.mining = true;
-                        println!(
-                            "GPU search ON - intensity {}%, payout {}",
-                            cfg.intensity, cfg.payout_address
-                        );
-                        println!("mode: CUDA vs live PHOTON target; node=validate/broadcast only");
-                    }
-                    Err(e) => println!("error starting CUDA search: {e}"),
-                }
-            }
-        }
+        "start" => println!(
+            "legacy REPL live search is disabled; use `pickaxe mine` so every verified winner enters the settlement/submission state machine"
+        ),
 
         "stop" => {
             if let Some(h) = handle.take() {
@@ -932,16 +882,12 @@ fn run_headless_mining(
     backend: backend::BackendKind,
     device_ordinal: u32,
     json: bool,
-    dry_run: bool,
     use_tui: bool,
 ) -> Result<(), String> {
-    let supervisor = if dry_run {
-        runtime::RuntimeSupervisor::start_dry_run_on_backend_device(cfg, backend, device_ordinal)?
-    } else {
-        runtime::RuntimeSupervisor::start_on_backend_device(cfg, backend, device_ordinal)?
-    };
+    let supervisor =
+        runtime::RuntimeSupervisor::start_on_backend_device(cfg, backend, device_ordinal)?;
     if use_tui {
-        let final_snapshot = tui::run(supervisor, dry_run)?;
+        let final_snapshot = tui::run(supervisor)?;
         print_runtime_snapshot(&final_snapshot, false);
         return Ok(());
     }
@@ -959,9 +905,6 @@ fn run_headless_mining(
         if last_status.elapsed() >= Duration::from_secs(1) {
             print_runtime_snapshot(&snapshot, json);
             last_status = Instant::now();
-        }
-        if dry_run && snapshot.pending_winners > 0 {
-            break;
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -1015,7 +958,6 @@ fn main() {
                             "node_rpc": cfg.node_url.as_deref().map(redact_url),
                             "source": cfg.source.as_str(),
                             "no_tui": args.no_tui,
-                            "dry_run": args.dry_run,
                             "generation_id": cfg.generation_id,
                         })
                     );
@@ -1026,7 +968,6 @@ fn main() {
                     println!("address: {}", cfg.payout_address);
                     println!("source: {}", cfg.source.as_str());
                     println!("no_tui: {}", args.no_tui);
-                    println!("dry_run: {}", args.dry_run);
                 }
             }
             cli::ConfigCommand::Validate => {
@@ -1046,14 +987,9 @@ fn main() {
                 }
             };
             let use_tui = !(args.no_tui || args.json);
-            if let Err(error) = run_headless_mining(
-                cfg,
-                selected.backend,
-                selected.index,
-                args.json,
-                args.dry_run,
-                use_tui,
-            ) {
+            if let Err(error) =
+                run_headless_mining(cfg, selected.backend, selected.index, args.json, use_tui)
+            {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             }

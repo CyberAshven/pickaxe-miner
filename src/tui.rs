@@ -88,28 +88,22 @@ struct TuiState {
     last_candidates: u64,
     current_rate: f64,
     peak_rate: f64,
-    dry_run: bool,
 }
 
 impl TuiState {
-    fn new(snapshot: &RuntimeSnapshot, dry_run: bool) -> Self {
+    fn new(snapshot: &RuntimeSnapshot) -> Self {
         let mut events = VecDeque::with_capacity(EVENT_HISTORY_CAP);
         events.push_back("Runtime started; authoritative PHOTON state is supervised.".into());
         Self {
             command_mode: false,
             command_input: String::new(),
             show_help: false,
-            status_line: if dry_run {
-                "DRY RUN: verified winners are never broadcast.".into()
-            } else {
-                "Donation: 2%".into()
-            },
+            status_line: "Donation: 2%".into(),
             events,
             last_sample: Instant::now(),
             last_candidates: snapshot.search.candidates,
             current_rate: 0.0,
             peak_rate: snapshot.search.rate,
-            dry_run,
         }
     }
 
@@ -138,9 +132,9 @@ impl TuiState {
     }
 }
 
-pub fn run(supervisor: RuntimeSupervisor, dry_run: bool) -> Result<RuntimeSnapshot, String> {
+pub fn run(supervisor: RuntimeSupervisor) -> Result<RuntimeSnapshot, String> {
     let initial = supervisor.snapshot();
-    let mut state = TuiState::new(&initial, dry_run);
+    let mut state = TuiState::new(&initial);
     let mut terminal = TerminalSession::enter()?;
     let mut quit = false;
     let mut last_draw = Instant::now() - DRAW_INTERVAL;
@@ -151,11 +145,6 @@ pub fn run(supervisor: RuntimeSupervisor, dry_run: bool) -> Result<RuntimeSnapsh
 
         for event in supervisor.drain_events() {
             state.push_event(format_event(event));
-        }
-
-        if dry_run && snapshot.pending_winners > 0 {
-            state.status_line =
-                "Dry-run winner verified; mining is paused. Press Q to exit.".into();
         }
 
         if last_draw.elapsed() >= DRAW_INTERVAL {
@@ -425,7 +414,7 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
         ])
         .split(area);
 
-    render_header(frame, rows[0], snapshot, state);
+    render_header(frame, rows[0], snapshot);
     render_intensity(frame, rows[1], snapshot);
 
     let body = Layout::default()
@@ -441,13 +430,12 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     }
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, state: &TuiState) {
+fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let state_text = format!("{:?}", snapshot.state).to_ascii_uppercase();
-    let dry = if state.dry_run { "  DRY RUN" } else { "" };
     let line = Line::from(vec![
         Span::styled(" PICKAXE ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "PHOTON   {state_text}{dry}   {} device {}   Donation: 2%",
+            "PHOTON   {state_text}   {} device {}   Donation: 2%",
             snapshot.gpu_backend.to_ascii_uppercase(),
             snapshot.gpu_device
         )),
@@ -750,7 +738,7 @@ mod tests {
             last_error: None,
             search: Default::default(),
         };
-        let mut state = TuiState::new(&snapshot, true);
+        let mut state = TuiState::new(&snapshot);
         for i in 0..(EVENT_HISTORY_CAP + 20) {
             state.push_event(format!("event {i}"));
         }

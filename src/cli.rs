@@ -32,9 +32,6 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    #[arg(long, global = true)]
-    pub dry_run: bool,
-
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -48,6 +45,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(hide = true)]
     Repl,
 }
 
@@ -77,7 +75,6 @@ mod tests {
             "--intensity",
             "75",
             "--no-tui",
-            "--dry-run",
         ])
         .unwrap();
         assert!(matches!(cli.command, Some(Commands::Mine)));
@@ -85,7 +82,6 @@ mod tests {
         assert_eq!(cli.device, Some(0));
         assert_eq!(cli.intensity, 75);
         assert!(cli.no_tui);
-        assert!(cli.dry_run);
 
         let show = Cli::try_parse_from(["pickaxe", "config", "show"]).unwrap();
         assert!(matches!(
@@ -105,5 +101,10 @@ mod tests {
     #[test]
     fn clap_rejects_detached_wgpu_backend() {
         assert!(Cli::try_parse_from(["pickaxe", "mine", "--backend", "wgpu"]).is_err());
+    }
+
+    #[test]
+    fn clap_rejects_removed_live_dry_run_flag() {
+        assert!(Cli::try_parse_from(["pickaxe", "mine", "--dry-run"]).is_err());
     }
 }
