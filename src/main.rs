@@ -896,10 +896,17 @@ fn run_headless_mining(
     json: bool,
     use_tui: bool,
 ) -> Result<(), String> {
+    // Cache device information before the live miner starts so `/devices` never
+    // probes drivers or creates temporary GPU contexts in the mining hot path.
+    let tui_devices = if use_tui {
+        backend::list_devices(backend::BackendKind::Auto).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let supervisor =
         runtime::RuntimeSupervisor::start_on_backend_device(cfg, backend, device_ordinal)?;
     if use_tui {
-        let final_snapshot = tui::run(supervisor)?;
+        let final_snapshot = tui::run(supervisor, tui_devices)?;
         print_runtime_snapshot(&final_snapshot, false);
         return Ok(());
     }

@@ -30,6 +30,7 @@ use std::{
 const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EVENT_HISTORY_CAP: usize = 96;
+const COMMAND_HISTORY_CAP: usize = 32;
 const RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(150);
 const RATE_MIN_MATURE_HISTORY: Duration = Duration::from_secs(1);
 const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(2);
@@ -241,6 +242,11 @@ enum PaletteCommand {
     SetPayout(String),
     SetEndpoint(Option<String>),
     Status,
+    Config,
+    Logs,
+    Devices,
+    Backend,
+    Benchmark,
     Help,
     Quit,
 }
@@ -248,10 +254,15 @@ enum PaletteCommand {
 struct TuiState {
     command_mode: bool,
     command_input: String,
+    command_history: VecDeque<String>,
+    command_history_cursor: Option<usize>,
+    command_draft: String,
     show_help: bool,
     settings_mode: bool,
+    logs_mode: bool,
     status_line: String,
     events: VecDeque<String>,
+    devices: Vec<GpuDevice>,
     last_rate_sample: Instant,
     rate_samples: VecDeque<(Instant, u64)>,
     current_rate: f64,
@@ -268,10 +279,15 @@ impl TuiState {
         Self {
             command_mode: false,
             command_input: String::new(),
+            command_history: VecDeque::with_capacity(COMMAND_HISTORY_CAP),
+            command_history_cursor: None,
+            command_draft: String::new(),
             show_help: false,
             settings_mode: false,
+            logs_mode: false,
             status_line: "Donation: 2%".into(),
             events,
+            devices: Vec::new(),
             last_rate_sample: now,
             rate_samples,
             current_rate: 0.0,
@@ -284,6 +300,72 @@ impl TuiState {
             self.events.pop_front();
         }
         self.events.push_back(message);
+    }
+
+    fn set_devices(&mut self, devices: Vec<GpuDevice>) {
+        self.devices = devices;
+    }
+
+    fn open_command(&mut self, prefill: &str) {
+        self.command_mode = true;
+        self.command_input.clear();
+        self.command_input.push_str(prefill);
+        self.command_history_cursor = None;
+        self.command_draft.clear();
+        self.show_help = false;
+        self.settings_mode = false;
+        self.logs_mode = false;
+    }
+
+    fn cancel_command(&mut self) {
+        self.command_mode = false;
+        self.command_input.clear();
+        self.command_history_cursor = None;
+        self.command_draft.clear();
+    }
+
+    fn finish_command(&mut self) -> String {
+        let input = std::mem::take(&mut self.command_input);
+        self.command_mode = false;
+        self.command_history_cursor = None;
+        self.command_draft.clear();
+        let trimmed = input.trim();
+        if !trimmed.is_empty() && self.command_history.back().map(String::as_str) != Some(trimmed) {
+            if self.command_history.len() == COMMAND_HISTORY_CAP {
+                self.command_history.pop_front();
+            }
+            self.command_history.push_back(trimmed.to_string());
+        }
+        input
+    }
+
+    fn history_previous(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+        let next = match self.command_history_cursor {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.command_draft = self.command_input.clone();
+                self.command_history.len() - 1
+            }
+        };
+        self.command_history_cursor = Some(next);
+        self.command_input = self.command_history[next].clone();
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.command_history_cursor else {
+            return;
+        };
+        if index + 1 < self.command_history.len() {
+            let next = index + 1;
+            self.command_history_cursor = Some(next);
+            self.command_input = self.command_history[next].clone();
+        } else {
+            self.command_history_cursor = None;
+            self.command_input = self.command_draft.clone();
+        }
     }
 
     fn update_rates(&mut self, snapshot: &RuntimeSnapshot) {
@@ -366,9 +448,13 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
     }
 }
 
-pub fn run(supervisor: RuntimeSupervisor) -> Result<RuntimeSnapshot, String> {
+pub fn run(
+    supervisor: RuntimeSupervisor,
+    devices: Vec<GpuDevice>,
+) -> Result<RuntimeSnapshot, String> {
     let initial = supervisor.snapshot();
     let mut state = TuiState::new(&initial);
+    state.set_devices(devices);
     let mut terminal = TerminalSession::enter()?;
     let mut quit = false;
     let mut last_draw = Instant::now() - DRAW_INTERVAL;
@@ -490,12 +576,10 @@ fn handle_key(
     if state.command_mode {
         match key.code {
             KeyCode::Esc => {
-                state.command_mode = false;
-                state.command_input.clear();
+                state.cancel_command();
             }
             KeyCode::Enter => {
-                let input = std::mem::take(&mut state.command_input);
-                state.command_mode = false;
+                let input = state.finish_command();
                 match parse_palette_command(&input) {
                     Ok(command) => {
                         return apply_palette_command(command, supervisor, snapshot, state)
@@ -505,9 +589,13 @@ fn handle_key(
             }
             KeyCode::Backspace => {
                 state.command_input.pop();
+                state.command_history_cursor = None;
             }
+            KeyCode::Up => state.history_previous(),
+            KeyCode::Down => state.history_next(),
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.command_input.push(ch);
+                state.command_history_cursor = None;
             }
             _ => {}
         }
@@ -530,13 +618,20 @@ fn handle_key(
                 return Ok(false);
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                state.settings_mode = false;
-                state.command_mode = true;
-                state.command_input = "address ".into();
+                state.open_command("address ");
                 return Ok(false);
             }
             _ => {}
         }
+    }
+
+    if state.logs_mode {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('L') => state.logs_mode = false,
+            KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
+            _ => {}
+        }
+        return Ok(false);
     }
 
     match key.code {
@@ -549,9 +644,8 @@ fn handle_key(
             state.settings_mode = !state.settings_mode;
             Ok(false)
         }
-        KeyCode::Char(':') | KeyCode::Char('c') | KeyCode::Char('C') => {
-            state.command_mode = true;
-            state.command_input.clear();
+        KeyCode::Char('/') | KeyCode::Char(':') | KeyCode::Char('c') | KeyCode::Char('C') => {
+            state.open_command("");
             Ok(false)
         }
         KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Char(' ') => {
@@ -655,13 +749,81 @@ fn apply_palette_command(
             state,
         ),
         PaletteCommand::Status => {
-            state.status_line = format!(
+            let status = format!(
                 "generation={} height={} rate={:.0}/s pending={}",
                 snapshot.generation_id,
                 snapshot.height,
                 snapshot.search.rate,
                 snapshot.pending_winners
             );
+            state.status_line = status.clone();
+            state.push_event(format!("status: {status}"));
+        }
+        PaletteCommand::Config => {
+            let config = format!(
+                "config: backend={}:{} intensity={} payout={} endpoint={} donation=2%-fixed generation={}",
+                snapshot.gpu_backend,
+                snapshot.gpu_device,
+                snapshot.search.intensity,
+                shorten(&snapshot.payout_address, 42),
+                shorten(&redact_endpoint(&snapshot.endpoint), 42),
+                snapshot.generation_id,
+            );
+            state.status_line = "Effective configuration added to runtime log".into();
+            state.push_event(config);
+        }
+        PaletteCommand::Logs => {
+            state.logs_mode = true;
+            state.status_line = format!(
+                "Runtime log focused ({} bounded events)",
+                state.events.len()
+            );
+        }
+        PaletteCommand::Devices => {
+            if state.devices.is_empty() {
+                state.push_event(format!(
+                    "device: {}:{} (startup device catalog unavailable)",
+                    snapshot.gpu_backend, snapshot.gpu_device
+                ));
+            } else {
+                state.push_event(format!(
+                    "devices: {} detected at startup",
+                    state.devices.len()
+                ));
+                let lines = state
+                    .devices
+                    .iter()
+                    .map(|device| {
+                        format!(
+                            "device {}:{} {} {} | {}",
+                            device.backend.as_str(),
+                            device.index,
+                            device.vendor,
+                            device.name,
+                            device.detail
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for line in lines {
+                    state.push_event(line);
+                }
+            }
+            state.status_line = "GPU device catalog added to runtime log".into();
+        }
+        PaletteCommand::Backend => {
+            let backend = format!(
+                "backend: {} device {}",
+                snapshot.gpu_backend.to_ascii_uppercase(),
+                snapshot.gpu_device
+            );
+            state.status_line = backend.clone();
+            state.push_event(backend);
+        }
+        PaletteCommand::Benchmark => {
+            let message =
+                "Benchmark not started: quit mining and run `pickaxe benchmark`; live mining remains active";
+            state.status_line = message.into();
+            state.push_event(message.into());
         }
         PaletteCommand::Help => state.show_help = true,
         PaletteCommand::Quit => return Ok(true),
@@ -683,7 +845,11 @@ fn apply_result(result: Result<(), String>, success: &str, state: &mut TuiState)
 }
 
 fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
-    let trimmed = input.trim();
+    let trimmed = input
+        .trim()
+        .strip_prefix('/')
+        .unwrap_or(input.trim())
+        .trim();
     if trimmed.is_empty() {
         return Err("Command required. Try help.".into());
     }
@@ -712,15 +878,20 @@ fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
             }
         }
         "endpoint" | "fulcrum" => {
-            if argument.eq_ignore_ascii_case("clear") {
+            if argument.eq_ignore_ascii_case("clear") || argument.eq_ignore_ascii_case("auto") {
                 Ok(PaletteCommand::SetEndpoint(None))
             } else if argument.is_empty() {
-                Err("usage: endpoint <wss://...> | endpoint clear".into())
+                Err("usage: endpoint <wss://...> | endpoint auto".into())
             } else {
                 Ok(PaletteCommand::SetEndpoint(Some(argument.into())))
             }
         }
         "status" => Ok(PaletteCommand::Status),
+        "config" => Ok(PaletteCommand::Config),
+        "logs" | "log" => Ok(PaletteCommand::Logs),
+        "devices" | "gpus" => Ok(PaletteCommand::Devices),
+        "backend" => Ok(PaletteCommand::Backend),
+        "benchmark" | "bench" => Ok(PaletteCommand::Benchmark),
         "help" | "?" => Ok(PaletteCommand::Help),
         "quit" | "exit" => Ok(PaletteCommand::Quit),
         _ => Err(format!("unknown command {command}. Try help.")),
@@ -844,7 +1015,7 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(area);
 
@@ -864,6 +1035,9 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     }
     if state.settings_mode {
         render_settings(frame, area, snapshot);
+    }
+    if state.logs_mode {
+        render_logs(frame, area, state);
     }
 }
 
@@ -960,15 +1134,17 @@ fn render_events(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let text = if state.command_mode {
-        Line::from(vec![
-            Span::styled(":", Style::default().fg(Color::Cyan)),
+        vec![Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(state.command_input.as_str()),
-        ])
+        ])]
     } else {
-        Line::from(format!(
-            "{}   [S] settings  [+/-] intensity  [Space/P] pause  [R] reconnect  [:] command  [?] help  [Q] quit",
-            state.status_line
-        ))
+        vec![
+            Line::from(
+                "[/] command  [P] pause  [+/-] intensity  [R] reconnect  [S] settings  [?] help  [Q] quit",
+            ),
+            Line::from(state.status_line.as_str()),
+        ]
     };
     frame.render_widget(
         Paragraph::new(text)
@@ -1023,20 +1199,40 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Space / P    pause or resume"),
         Line::from("R            reconnect authoritative Fulcrum source"),
         Line::from("S            settings"),
-        Line::from(": / C        command palette"),
+        Line::from("/ (: or C)   command bar"),
         Line::from("?            close/open help"),
         Line::from("Q / Ctrl+C   graceful quit"),
         Line::from(""),
         Line::from("Commands:"),
-        Line::from("  intensity <10-100>"),
-        Line::from("  pause | resume | reconnect | status"),
-        Line::from("  address <cashaddr>"),
-        Line::from("  endpoint <wss://...> | endpoint clear"),
-        Line::from("  help | quit"),
+        Line::from("  /intensity <10-100> | /pause | /resume | /reconnect"),
+        Line::from("  /address <cashaddr> | /endpoint <wss://...> | /endpoint auto"),
+        Line::from("  /status | /config | /devices | /backend | /logs"),
+        Line::from("  /benchmark | /help | /quit"),
     ])
     .block(Block::default().title(" Help ").borders(Borders::ALL))
     .wrap(Wrap { trim: false });
     frame.render_widget(help, popup);
+}
+
+fn render_logs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let popup = centered_rect(92, 82, area);
+    frame.render_widget(Clear, popup);
+    let max_items = popup.height.saturating_sub(2) as usize;
+    let items = state
+        .events
+        .iter()
+        .rev()
+        .take(max_items)
+        .map(|event| ListItem::new(event.as_str()))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(" Runtime logs - Esc/L close ")
+                .borders(Borders::ALL),
+        ),
+        popup,
+    );
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1159,6 +1355,28 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn test_snapshot() -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            state: SupervisorState::Mining,
+            gpu_backend: "cuda".into(),
+            gpu_device: 0,
+            generation_id: 1,
+            payout_address: "bitcoincash:qexample".into(),
+            endpoint: "wss://example.test".into(),
+            height: 1,
+            baton_txid: "00".repeat(32),
+            baton_vout: 0,
+            refreshes: 0,
+            stale_rebuilds: 0,
+            reconnects: 0,
+            stale_winners: 0,
+            verified_winners: 0,
+            pending_winners: 0,
+            last_error: None,
+            search: Default::default(),
+        }
+    }
+
     #[test]
     fn setup_default_selection() {
         let devices = test_devices();
@@ -1256,6 +1474,83 @@ mod tests {
             PaletteCommand::Reconnect
         );
         assert_eq!(parse_palette_command("quit").unwrap(), PaletteCommand::Quit);
+    }
+
+    #[test]
+    fn slash_palette_parses_extended_runtime_commands() {
+        assert_eq!(
+            parse_palette_command("/endpoint auto").unwrap(),
+            PaletteCommand::SetEndpoint(None)
+        );
+        assert_eq!(
+            parse_palette_command("/status").unwrap(),
+            PaletteCommand::Status
+        );
+        assert_eq!(
+            parse_palette_command("/config").unwrap(),
+            PaletteCommand::Config
+        );
+        assert_eq!(
+            parse_palette_command("/logs").unwrap(),
+            PaletteCommand::Logs
+        );
+        assert_eq!(
+            parse_palette_command("/devices").unwrap(),
+            PaletteCommand::Devices
+        );
+        assert_eq!(
+            parse_palette_command("/backend").unwrap(),
+            PaletteCommand::Backend
+        );
+        assert_eq!(
+            parse_palette_command("/benchmark").unwrap(),
+            PaletteCommand::Benchmark
+        );
+    }
+
+    #[test]
+    fn command_history_is_bounded_and_restores_draft() {
+        let snapshot = test_snapshot();
+        let mut state = TuiState::new(&snapshot);
+        for index in 0..(COMMAND_HISTORY_CAP + 8) {
+            state.open_command("");
+            state.command_input = format!("status {index}");
+            let _ = state.finish_command();
+        }
+        assert_eq!(state.command_history.len(), COMMAND_HISTORY_CAP);
+        assert_eq!(state.command_history.front().unwrap(), "status 8");
+        assert_eq!(
+            state.command_history.back().unwrap(),
+            &format!("status {}", COMMAND_HISTORY_CAP + 7)
+        );
+
+        state.open_command("sta");
+        state.history_previous();
+        assert_eq!(
+            state.command_input,
+            format!("status {}", COMMAND_HISTORY_CAP + 7)
+        );
+        state.history_next();
+        assert_eq!(state.command_input, "sta");
+    }
+
+    #[test]
+    fn eighty_column_footer_keeps_slash_command_hint_visible() {
+        let snapshot = test_snapshot();
+        let state = TuiState::new(&snapshot);
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &snapshot, &state))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[/] command"));
     }
 
     #[test]
