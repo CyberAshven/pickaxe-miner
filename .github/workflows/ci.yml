@@ -19,6 +19,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  reward-policy-vm:
+    name: BCH 2026 reward-policy VM proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tools/reward-policy-vm/package-lock.json
+
+      - name: Install proof dependencies
+        working-directory: tools/reward-policy-vm
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify BCH 2026 settlement
+        working-directory: tools/reward-policy-vm
+        run: npm test
+
   hip-gfx1036:
     name: HIP gfx1036 code objects
     runs-on: ubuntu-24.04

@@ -166,6 +166,21 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tools/reward-policy-vm/package-lock.json
+
+      - name: Install reward-policy proof dependencies
+        working-directory: tools/reward-policy-vm
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify BCH 2026 reward policy
+        working-directory: tools/reward-policy-vm
+        run: npm test
+
       - name: Download verified gfx1036 HIP code objects
         uses: actions/download-artifact@v8
         with:
