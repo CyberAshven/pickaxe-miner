@@ -185,7 +185,11 @@ impl SourceCatalog {
             catalog.add_user(SourceKind::Fulcrum, endpoint, "Configured Fulcrum")?;
         }
         if let Some(endpoint) = cfg.node_url.as_deref() {
-            catalog.add_user(SourceKind::NativeNode, endpoint, "Configured node")?;
+            catalog.add_user(
+                SourceKind::NativeNode,
+                &crate::node::redact_url(endpoint),
+                "Configured node",
+            )?;
         }
         Ok(catalog)
     }
