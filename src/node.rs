@@ -1,7 +1,11 @@
 //! Native BCH node JSON-RPC (bitcoind/BCHN-style).
 //! Ban-safe: sequential endpoint tries + backoff; no parallel fan-out.
-//! Job/baton indexing stays on Fulcrum until a node path is wired.
+//! Native PHOTON reconstruction is available for equivalence checks, including
+//! bounded unconfirmed-baton continuation. Runtime routing stays on Fulcrum
+//! until the native capability is explicitly promoted after equivalence review.
 
+use crate::electrum::LiveJob;
+use crate::protocol::{derive_photon_state, COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -65,7 +69,7 @@ pub fn fetch_relay_policy(endpoints: &[String]) -> Result<(String, RelayPolicy),
                 let parsed = value
                     .get("mempoolminfee")
                     .ok_or_else(|| "getmempoolinfo omitted mempoolminfee".to_string())
-                    .and_then(bch_per_kb_to_sats);
+                    .and_then(bch_value_to_sats);
                 match parsed {
                     Ok(mempool_min_fee_sats_per_kb) => {
                         return Ok((
@@ -88,11 +92,11 @@ pub fn fetch_relay_policy(endpoints: &[String]) -> Result<(String, RelayPolicy),
     ))
 }
 
-fn bch_per_kb_to_sats(value: &Value) -> Result<u64, String> {
+fn bch_value_to_sats(value: &Value) -> Result<u64, String> {
     let text = match value {
         Value::Number(number) => number.to_string(),
         Value::String(text) => text.clone(),
-        _ => return Err("relay fee must be a numeric BCH/kB value".into()),
+        _ => return Err("BCH amount must be numeric".into()),
     };
     decimal_bch_to_sats(&text)
 }
@@ -100,7 +104,7 @@ fn bch_per_kb_to_sats(value: &Value) -> Result<u64, String> {
 fn decimal_bch_to_sats(text: &str) -> Result<u64, String> {
     let text = text.trim();
     if text.is_empty() || text.starts_with('-') || text.starts_with('+') {
-        return Err("relay fee must be a non-negative BCH amount".into());
+        return Err("BCH amount must be non-negative".into());
     }
 
     let (mantissa, exponent) = match text.find(['e', 'E']) {
@@ -115,18 +119,18 @@ fn decimal_bch_to_sats(text: &str) -> Result<u64, String> {
     let (whole, fractional) = match mantissa.split_once('.') {
         Some((whole, fractional)) => {
             if fractional.contains('.') {
-                return Err("relay fee has more than one decimal point".into());
+                return Err("BCH amount has more than one decimal point".into());
             }
             (whole, fractional)
         }
         None => (mantissa, ""),
     };
     if whole.is_empty() && fractional.is_empty() {
-        return Err("relay fee is empty".into());
+        return Err("BCH amount is empty".into());
     }
     if !whole.chars().all(|c| c.is_ascii_digit()) || !fractional.chars().all(|c| c.is_ascii_digit())
     {
-        return Err("relay fee contains non-decimal characters".into());
+        return Err("BCH amount contains non-decimal characters".into());
     }
 
     let digits = format!("{whole}{fractional}");
@@ -136,28 +140,512 @@ fn decimal_bch_to_sats(text: &str) -> Result<u64, String> {
     }
     let mut value = digits
         .parse::<u128>()
-        .map_err(|_| "relay fee decimal is too large")?;
+        .map_err(|_| "BCH amount decimal is too large")?;
     let scale = 8i32
         .checked_add(exponent)
         .and_then(|scale| scale.checked_sub(fractional.len() as i32))
-        .ok_or("relay fee scale overflow")?;
+        .ok_or("BCH amount scale overflow")?;
     if scale >= 0 {
         let multiplier = 10u128
             .checked_pow(scale as u32)
-            .ok_or("relay fee scale is too large")?;
+            .ok_or("BCH amount scale is too large")?;
         value = value
             .checked_mul(multiplier)
-            .ok_or("relay fee satoshi value overflow")?;
+            .ok_or("BCH amount satoshi value overflow")?;
     } else {
         let divisor = 10u128
             .checked_pow(scale.unsigned_abs())
-            .ok_or("relay fee scale is too small")?;
+            .ok_or("BCH amount scale is too small")?;
         if value % divisor != 0 {
-            return Err("relay fee has precision below one satoshi per kB".into());
+            return Err("BCH amount has precision below one satoshi".into());
         }
         value /= divisor;
     }
-    u64::try_from(value).map_err(|_| "relay fee exceeds u64 satoshis per kB".into())
+    u64::try_from(value).map_err(|_| "BCH amount exceeds u64 satoshis".into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativePhotonBaton {
+    txid: String,
+    vout: u32,
+    height: u32,
+    value_sats: u64,
+    commitment_hex: String,
+    token_amount: u128,
+}
+
+const MAX_NATIVE_PHOTON_MEMPOOL_BOOTSTRAP_CANDIDATES: usize = 2_048;
+const MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH: usize = 64;
+
+/// Reconstruct the PHOTON live state from BCHN's native UTXO/token RPCs.
+///
+/// This provider is intentionally not advertised to the runtime source router
+/// yet. `scantxoutset` bootstraps the confirmed baton, then the mempool is used
+/// only when that baton has already been spent by an unconfirmed successor.
+/// Runtime capability remains fail-closed until the normalized state is proven
+/// equivalent to the canonical Fulcrum path.
+#[allow(dead_code)]
+pub fn fetch_photon_live_job(endpoints: &[String]) -> Result<LiveJob, String> {
+    if endpoints.is_empty() {
+        return Err("no native node endpoints configured for PHOTON state".into());
+    }
+
+    let mut failures = Vec::new();
+    let mut backoff_ms: u64 = 400;
+    for (index, url) in endpoints.iter().enumerate() {
+        if index > 0 {
+            thread::sleep(Duration::from_millis(backoff_ms));
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
+        }
+        match fetch_photon_live_job_one(url) {
+            Ok(job) => return Ok(job),
+            Err(error) => failures.push(format!("{}: {error}", redact_url(url))),
+        }
+    }
+
+    Err(format!(
+        "All native node PHOTON-state RPCs failed (sequential, ban-safe):\n{}",
+        failures.join("\n")
+    ))
+}
+
+fn fetch_photon_live_job_one(url: &str) -> Result<LiveJob, String> {
+    let descriptor = format!("raw({COVENANT_LOCKING_BYTECODE_HEX})");
+    let scan = rpc_call(url, "scantxoutset", json!(["start", [descriptor]]))?;
+    if scan.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err("scantxoutset did not complete successfully".into());
+    }
+
+    let height = scan
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("scantxoutset omitted a valid tip height")?;
+    let bestblock = scan
+        .get("bestblock")
+        .and_then(Value::as_str)
+        .filter(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or("scantxoutset omitted a valid bestblock")?;
+    let unspents = scan
+        .get("unspents")
+        .and_then(Value::as_array)
+        .ok_or("scantxoutset omitted unspents")?;
+
+    let candidates = unspents
+        .iter()
+        .filter(|utxo| native_scan_entry_is_photon_baton(utxo))
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Err(format!(
+            "Expected exactly one confirmed native-node PHOTON baton; found {}",
+            candidates.len()
+        ));
+    }
+
+    let scan_baton = parse_native_scan_baton(candidates[0])?;
+
+    let first = rpc_call(
+        url,
+        "gettxout",
+        json!([scan_baton.txid, scan_baton.vout, true]),
+    )?;
+    let observed_baton = if first.is_null() {
+        resolve_native_mempool_baton(url, &scan_baton)?
+    } else {
+        let baton = parse_native_gettxout_baton(
+            &scan_baton.txid,
+            scan_baton.vout,
+            height,
+            bestblock,
+            &first,
+        )?;
+        if baton != scan_baton {
+            return Err("native PHOTON scantxoutset/gettxout baton mismatch".into());
+        }
+        baton
+    };
+
+    let observed_bestblock = rpc_call(url, "getbestblockhash", json!([]))?;
+    let observed_bestblock = observed_bestblock
+        .as_str()
+        .ok_or("getbestblockhash returned a non-string result")?;
+    if !observed_bestblock.eq_ignore_ascii_case(bestblock) {
+        return Err("native PHOTON scan became stale while reconstructing state".into());
+    }
+
+    let second = rpc_call(
+        url,
+        "gettxout",
+        json!([observed_baton.txid, observed_baton.vout, true]),
+    )?;
+    if second.is_null() {
+        return Err(
+            "PHOTON baton changed in mempool while reconstructing native-node state".into(),
+        );
+    }
+    let second_baton = parse_native_gettxout_baton(
+        &observed_baton.txid,
+        observed_baton.vout,
+        height,
+        bestblock,
+        &second,
+    )?;
+    if observed_baton != second_baton {
+        return Err("native PHOTON baton changed during consistency check".into());
+    }
+
+    let derived = derive_photon_state(
+        &second_baton.commitment_hex,
+        second_baton.token_amount,
+        height,
+        second_baton.height,
+    )?;
+
+    Ok(LiveJob {
+        url: redact_url(url),
+        server_version: json!({"provider": "native-bchn", "snapshot": "scantxoutset+gettxout"}),
+        height,
+        baton_txid: second_baton.txid,
+        baton_vout: second_baton.vout,
+        baton_height: second_baton.height,
+        baton_value_sats: second_baton.value_sats,
+        commitment_hex: second_baton.commitment_hex,
+        token_amount: second_baton.token_amount,
+        age: derived.age,
+        target_le_hex: derived.target_le_hex,
+        reward_raw: derived.reward_raw,
+    })
+}
+
+fn resolve_native_mempool_baton(
+    url: &str,
+    confirmed_baton: &NativePhotonBaton,
+) -> Result<NativePhotonBaton, String> {
+    let mempool = rpc_call(url, "getrawmempool", json!([true]))?;
+    let entries = mempool
+        .as_object()
+        .ok_or("getrawmempool verbose result is not an object")?;
+
+    let mut roots = entries
+        .iter()
+        .filter_map(|(txid, entry)| {
+            let depends = entry.get("depends")?.as_array()?;
+            if !depends.is_empty() {
+                return None;
+            }
+            let time = entry.get("time").and_then(Value::as_u64).unwrap_or(0);
+            Some((time, txid.as_str()))
+        })
+        .collect::<Vec<_>>();
+
+    if roots.len() > MAX_NATIVE_PHOTON_MEMPOOL_BOOTSTRAP_CANDIDATES {
+        return Err(format!(
+            "native PHOTON mempool bootstrap has {} root candidates; bounded limit is {}",
+            roots.len(),
+            MAX_NATIVE_PHOTON_MEMPOOL_BOOTSTRAP_CANDIDATES
+        ));
+    }
+
+    roots.sort_unstable_by(|left, right| right.cmp(left));
+    let mut first_successor = None;
+    for (_, txid) in roots {
+        let transaction = rpc_call(url, "getrawtransaction", json!([txid, 1]))?;
+        if let Some(successor) =
+            parse_native_mempool_successor(txid, &transaction, confirmed_baton)?
+        {
+            first_successor = Some(successor);
+            break;
+        }
+    }
+
+    let mut current = first_successor.ok_or(
+        "confirmed PHOTON baton is spent in mempool, but no canonical successor could be proven",
+    )?;
+
+    for _ in 0..MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH {
+        let entry = entries
+            .get(&current.txid)
+            .ok_or("native PHOTON successor disappeared from mempool snapshot")?;
+        let spent_by = entry
+            .get("spentby")
+            .and_then(Value::as_array)
+            .ok_or("native mempool entry omitted spentby")?;
+        if spent_by.is_empty() {
+            return Ok(current);
+        }
+
+        let mut next_successor = None;
+        for child_txid in spent_by {
+            let child_txid = child_txid
+                .as_str()
+                .ok_or("native mempool spentby entry is not a transaction id")?;
+            let transaction = rpc_call(url, "getrawtransaction", json!([child_txid, 1]))?;
+            if let Some(successor) =
+                parse_native_mempool_successor(child_txid, &transaction, &current)?
+            {
+                if next_successor.replace(successor).is_some() {
+                    return Err(
+                        "multiple mempool transactions spend the PHOTON baton output".into(),
+                    );
+                }
+            }
+        }
+
+        match next_successor {
+            Some(successor) => current = successor,
+            None => return Ok(current),
+        }
+    }
+
+    Err(format!(
+        "native PHOTON mempool baton chain exceeds bounded depth {}",
+        MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH
+    ))
+}
+
+fn parse_native_mempool_successor(
+    expected_txid: &str,
+    transaction: &Value,
+    spent_baton: &NativePhotonBaton,
+) -> Result<Option<NativePhotonBaton>, String> {
+    let transaction_txid = transaction
+        .get("txid")
+        .and_then(Value::as_str)
+        .filter(|txid| txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or("getrawtransaction omitted a valid txid")?;
+    if !transaction_txid.eq_ignore_ascii_case(expected_txid) {
+        return Err("getrawtransaction returned a different transaction id".into());
+    }
+
+    let inputs = transaction
+        .get("vin")
+        .and_then(Value::as_array)
+        .ok_or("getrawtransaction omitted vin")?;
+    let spends_baton = inputs.iter().filter(|input| {
+        input
+            .get("txid")
+            .and_then(Value::as_str)
+            .is_some_and(|txid| txid.eq_ignore_ascii_case(&spent_baton.txid))
+            && input.get("vout").and_then(Value::as_u64) == Some(u64::from(spent_baton.vout))
+    });
+    if spends_baton.count() == 0 {
+        return Ok(None);
+    }
+    if inputs.len() != 1 {
+        return Err("PHOTON baton mempool spend does not use the one-input mining branch".into());
+    }
+
+    let outputs = transaction
+        .get("vout")
+        .and_then(Value::as_array)
+        .ok_or("getrawtransaction omitted vout")?;
+    let successors = outputs
+        .iter()
+        .filter(|output| native_transaction_output_is_photon_baton(output))
+        .collect::<Vec<_>>();
+    if successors.len() != 1 {
+        return Err(format!(
+            "PHOTON mempool spend must contain exactly one mutable baton output; found {}",
+            successors.len()
+        ));
+    }
+
+    parse_native_transaction_output_baton(transaction_txid, successors[0]).map(Some)
+}
+
+fn native_transaction_output_is_photon_baton(output: &Value) -> bool {
+    let script_matches = output
+        .pointer("/scriptPubKey/hex")
+        .and_then(Value::as_str)
+        .is_some_and(|script| script.eq_ignore_ascii_case(COVENANT_LOCKING_BYTECODE_HEX));
+    let category_matches = output
+        .pointer("/tokenData/category")
+        .and_then(Value::as_str)
+        .is_some_and(|category| category.eq_ignore_ascii_case(MAINNET_CATEGORY_HEX));
+    let mutable = output
+        .pointer("/tokenData/nft/capability")
+        .and_then(Value::as_str)
+        == Some("mutable");
+    script_matches && category_matches && mutable
+}
+
+fn parse_native_transaction_output_baton(
+    txid: &str,
+    output: &Value,
+) -> Result<NativePhotonBaton, String> {
+    if !native_transaction_output_is_photon_baton(output) {
+        return Err("native transaction output is not the authoritative PHOTON baton shape".into());
+    }
+    let vout = output
+        .get("n")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("native PHOTON successor missing valid output index")?;
+    let value = output
+        .get("value")
+        .ok_or_else(|| "native PHOTON successor missing BCH value".to_string())?;
+    let value_sats = bch_value_to_sats(value)?;
+    let commitment_hex = output
+        .pointer("/tokenData/nft/commitment")
+        .and_then(Value::as_str)
+        .ok_or("native PHOTON successor missing NFT commitment")?
+        .to_ascii_lowercase();
+    let token_amount_text = output
+        .pointer("/tokenData/amount")
+        .and_then(Value::as_str)
+        .ok_or("native PHOTON successor missing token amount")?;
+    let token_amount = token_amount_text
+        .parse::<u128>()
+        .map_err(|_| format!("bad native PHOTON successor token amount: {token_amount_text}"))?;
+
+    Ok(NativePhotonBaton {
+        txid: txid.to_ascii_lowercase(),
+        vout,
+        height: 0,
+        value_sats,
+        commitment_hex,
+        token_amount,
+    })
+}
+
+fn native_scan_entry_is_photon_baton(utxo: &Value) -> bool {
+    let script_matches = utxo
+        .get("scriptPubKey")
+        .and_then(Value::as_str)
+        .is_some_and(|script| script.eq_ignore_ascii_case(COVENANT_LOCKING_BYTECODE_HEX));
+    let category_matches = utxo
+        .pointer("/tokenData/category")
+        .and_then(Value::as_str)
+        .is_some_and(|category| category.eq_ignore_ascii_case(MAINNET_CATEGORY_HEX));
+    let mutable = utxo
+        .pointer("/tokenData/nft/capability")
+        .and_then(Value::as_str)
+        == Some("mutable");
+    script_matches && category_matches && mutable
+}
+
+fn parse_native_scan_baton(utxo: &Value) -> Result<NativePhotonBaton, String> {
+    if !native_scan_entry_is_photon_baton(utxo) {
+        return Err("native UTXO is not the authoritative PHOTON baton shape".into());
+    }
+    let txid = utxo
+        .get("txid")
+        .and_then(Value::as_str)
+        .filter(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or("native PHOTON baton missing valid txid")?;
+    let vout = utxo
+        .get("vout")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("native PHOTON baton missing valid vout")?;
+    let height = utxo
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("native PHOTON baton missing valid height")?;
+    let amount = utxo
+        .get("amount")
+        .ok_or_else(|| "native PHOTON baton missing BCH amount".to_string())?;
+    let value_sats = bch_value_to_sats(amount)?;
+    let commitment_hex = utxo
+        .pointer("/tokenData/nft/commitment")
+        .and_then(Value::as_str)
+        .ok_or("native PHOTON baton missing NFT commitment")?
+        .to_ascii_lowercase();
+    let token_amount_text = utxo
+        .pointer("/tokenData/amount")
+        .and_then(Value::as_str)
+        .ok_or("native PHOTON baton missing token amount")?;
+    let token_amount = token_amount_text
+        .parse::<u128>()
+        .map_err(|_| format!("bad native PHOTON token amount: {token_amount_text}"))?;
+
+    Ok(NativePhotonBaton {
+        txid: txid.to_ascii_lowercase(),
+        vout,
+        height,
+        value_sats,
+        commitment_hex,
+        token_amount,
+    })
+}
+
+fn parse_native_gettxout_baton(
+    txid: &str,
+    vout: u32,
+    tip_height: u32,
+    expected_bestblock: &str,
+    txout: &Value,
+) -> Result<NativePhotonBaton, String> {
+    let bestblock = txout
+        .get("bestblock")
+        .and_then(Value::as_str)
+        .ok_or("gettxout omitted bestblock")?;
+    if !bestblock.eq_ignore_ascii_case(expected_bestblock) {
+        return Err("gettxout PHOTON snapshot does not match scantxoutset bestblock".into());
+    }
+    let script = txout
+        .pointer("/scriptPubKey/hex")
+        .and_then(Value::as_str)
+        .ok_or("gettxout omitted scriptPubKey.hex")?;
+    if !script.eq_ignore_ascii_case(COVENANT_LOCKING_BYTECODE_HEX) {
+        return Err("native PHOTON baton locking bytecode does not match the covenant".into());
+    }
+
+    let category = txout
+        .pointer("/tokenData/category")
+        .and_then(Value::as_str)
+        .ok_or("gettxout omitted PHOTON token category")?;
+    if !category.eq_ignore_ascii_case(MAINNET_CATEGORY_HEX) {
+        return Err("native PHOTON baton token category mismatch".into());
+    }
+    if txout
+        .pointer("/tokenData/nft/capability")
+        .and_then(Value::as_str)
+        != Some("mutable")
+    {
+        return Err("native PHOTON baton NFT is not mutable".into());
+    }
+
+    let commitment_hex = txout
+        .pointer("/tokenData/nft/commitment")
+        .and_then(Value::as_str)
+        .ok_or("gettxout omitted PHOTON NFT commitment")?
+        .to_ascii_lowercase();
+    let token_amount_text = txout
+        .pointer("/tokenData/amount")
+        .and_then(Value::as_str)
+        .ok_or("gettxout omitted PHOTON token amount")?;
+    let token_amount = token_amount_text
+        .parse::<u128>()
+        .map_err(|_| format!("bad native PHOTON token amount: {token_amount_text}"))?;
+    let value = txout
+        .get("value")
+        .ok_or_else(|| "gettxout omitted PHOTON BCH value".to_string())?;
+    let value_sats = bch_value_to_sats(value)?;
+    let confirmations = txout
+        .get("confirmations")
+        .and_then(Value::as_u64)
+        .ok_or("gettxout omitted PHOTON confirmations")?;
+    let confirmations = u32::try_from(confirmations)
+        .map_err(|_| "PHOTON confirmation count exceeds u32".to_string())?;
+    let baton_height = if confirmations == 0 {
+        0
+    } else {
+        tip_height
+            .checked_add(1)
+            .and_then(|height_plus_one| height_plus_one.checked_sub(confirmations))
+            .ok_or("PHOTON confirmations are inconsistent with node tip height")?
+    };
+
+    Ok(NativePhotonBaton {
+        txid: txid.to_ascii_lowercase(),
+        vout,
+        height: baton_height,
+        value_sats,
+        commitment_hex,
+        token_amount,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,8 +1037,93 @@ fn simple_b64(data: &[u8]) -> String {
 #[cfg(test)]
 mod gbt_tests {
     use super::*;
+    use crate::electrum::live_job_from_fulcrum_values;
     use std::net::TcpListener;
     use std::thread;
+
+    fn serve_json_rpc_sequence(
+        responses: Vec<(&'static str, Value)>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (expected_method, response_value) in responses {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "timed out waiting for JSON-RPC method {expected_method}"
+                            );
+                            thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test JSON-RPC accept failed: {error}"),
+                    }
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(headers_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers_end = headers_end + 4;
+                        let headers = String::from_utf8_lossy(&request[..headers_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= headers_end + content_length {
+                            break;
+                        }
+                    }
+                }
+                let body_start = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                    .unwrap();
+                let request_json: Value = serde_json::from_slice(&request[body_start..]).unwrap();
+                assert_eq!(
+                    request_json.get("method").and_then(Value::as_str),
+                    Some(expected_method)
+                );
+                let body =
+                    json!({"result": response_value, "error": null, "id": "pickaxe"}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn assert_same_photon_state(left: &LiveJob, right: &LiveJob) {
+        assert_eq!(left.height, right.height);
+        assert_eq!(left.baton_txid, right.baton_txid);
+        assert_eq!(left.baton_vout, right.baton_vout);
+        assert_eq!(left.baton_height, right.baton_height);
+        assert_eq!(left.baton_value_sats, right.baton_value_sats);
+        assert_eq!(left.commitment_hex, right.commitment_hex);
+        assert_eq!(left.token_amount, right.token_amount);
+        assert_eq!(left.age, right.age);
+        assert_eq!(left.target_le_hex, right.target_le_hex);
+        assert_eq!(left.reward_raw, right.reward_raw);
+    }
 
     #[test]
     fn bits_genesis_style_nonzero() {
@@ -628,5 +1201,356 @@ mod gbt_tests {
         assert!(!acceptance.allowed);
         assert_eq!(acceptance.reject_reason.as_deref(), Some("dust"));
         assert_eq!(acceptance.reject_details.as_deref(), Some("policy floor"));
+    }
+
+    #[test]
+    fn native_photon_state_matches_canonical_fulcrum_state() {
+        let txid = "11".repeat(32);
+        let bestblock = "22".repeat(32);
+        let target = "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000";
+        let commitment = format!("01000000{target}");
+        let token_amount = "2100000000000000";
+        let token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": token_amount,
+            "nft": {
+                "capability": "mutable",
+                "commitment": commitment,
+            }
+        });
+        let txout = json!({
+            "bestblock": bestblock,
+            "confirmations": 11,
+            "value": 0.15971500,
+            "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+            "tokenData": token_data,
+        });
+        let scan = json!({
+            "success": true,
+            "height": 1000,
+            "bestblock": bestblock,
+            "unspents": [{
+                "txid": txid,
+                "vout": 0,
+                "scriptPubKey": COVENANT_LOCKING_BYTECODE_HEX,
+                "amount": 0.15971500,
+                "height": 990,
+                "tokenData": token_data,
+            }]
+        });
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            ("scantxoutset", scan),
+            ("gettxout", txout.clone()),
+            ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", txout),
+        ]);
+        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint)).unwrap();
+        server.join().unwrap();
+
+        let fulcrum = live_job_from_fulcrum_values(
+            "wss://fixture.invalid",
+            json!(["Fulcrum", "1.5"]),
+            &json!({"height": 1000}),
+            &json!([{
+                "tx_hash": txid,
+                "tx_pos": 0,
+                "height": 990,
+                "value": 15_971_500,
+                "token_data": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": token_amount,
+                    "nft": {
+                        "capability": "mutable",
+                        "commitment": commitment,
+                    }
+                }
+            }]),
+        )
+        .unwrap();
+
+        assert_same_photon_state(&native, &fulcrum);
+        assert_eq!(native.age, 10);
+    }
+
+    #[test]
+    fn native_photon_state_matches_fulcrum_unconfirmed_successor() {
+        let txid = "33".repeat(32);
+        let successor_txid = "55".repeat(32);
+        let bestblock = "44".repeat(32);
+        let confirmed_commitment = format!(
+            "01000000{}",
+            "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+        );
+        let successor_commitment = format!(
+            "02000000{}",
+            "ab9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+        );
+        let successor_token_amount = "2099995000000001";
+        let scan = json!({
+            "success": true,
+            "height": 1000,
+            "bestblock": bestblock,
+            "unspents": [{
+                "txid": txid,
+                "vout": 0,
+                "scriptPubKey": COVENANT_LOCKING_BYTECODE_HEX,
+                "amount": 0.15971500,
+                "height": 990,
+                "tokenData": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": "2100000000000000",
+                    "nft": {"capability": "mutable", "commitment": confirmed_commitment}
+                }
+            }]
+        });
+        let successor_token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": successor_token_amount,
+            "nft": {"capability": "mutable", "commitment": successor_commitment}
+        });
+        let mempool = json!({
+            successor_txid.clone(): {
+                "size": 615,
+                "time": 1234,
+                "depends": [],
+                "spentby": []
+            }
+        });
+        let successor_transaction = json!({
+            "txid": successor_txid,
+            "vin": [{"txid": txid, "vout": 0}],
+            "vout": [{
+                "n": 0,
+                "value": 0.15970885,
+                "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+                "tokenData": successor_token_data
+            }, {
+                "n": 1,
+                "value": 0.00000546,
+                "scriptPubKey": {"hex": "76a914000000000000000000000000000000000000000088ac"}
+            }]
+        });
+        let successor_txout = json!({
+            "bestblock": bestblock,
+            "confirmations": 0,
+            "value": 0.15970885,
+            "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+            "tokenData": successor_token_data,
+        });
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            ("scantxoutset", scan),
+            ("gettxout", Value::Null),
+            ("getrawmempool", mempool),
+            ("getrawtransaction", successor_transaction),
+            ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", successor_txout),
+        ]);
+        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint)).unwrap();
+        server.join().unwrap();
+
+        let fulcrum = live_job_from_fulcrum_values(
+            "wss://fixture.invalid",
+            json!(["Fulcrum", "1.5"]),
+            &json!({"height": 1000}),
+            &json!([{
+                "tx_hash": successor_txid,
+                "tx_pos": 0,
+                "height": 0,
+                "value": 15_970_885,
+                "token_data": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": successor_token_amount,
+                    "nft": {
+                        "capability": "mutable",
+                        "commitment": successor_commitment,
+                    }
+                }
+            }]),
+        )
+        .unwrap();
+
+        assert_same_photon_state(&native, &fulcrum);
+        assert_eq!(native.baton_height, 0);
+        assert_eq!(native.age, 0);
+    }
+
+    #[test]
+    fn native_photon_state_follows_baton_descendant_past_reward_child() {
+        let confirmed_txid = "81".repeat(32);
+        let first_txid = "82".repeat(32);
+        let reward_child_txid = "83".repeat(32);
+        let final_txid = "84".repeat(32);
+        let bestblock = "85".repeat(32);
+        let target = "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000";
+        let confirmed_commitment = format!("01000000{target}");
+        let first_commitment = format!("02000000{target}");
+        let final_commitment = format!("03000000{target}");
+        let first_token_amount = "2099995000000001";
+        let final_token_amount = "2099990000011906";
+
+        let scan = json!({
+            "success": true,
+            "height": 1000,
+            "bestblock": bestblock,
+            "unspents": [{
+                "txid": confirmed_txid,
+                "vout": 0,
+                "scriptPubKey": COVENANT_LOCKING_BYTECODE_HEX,
+                "amount": 0.15971500,
+                "height": 990,
+                "tokenData": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": "2100000000000000",
+                    "nft": {"capability": "mutable", "commitment": confirmed_commitment}
+                }
+            }]
+        });
+        let first_token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": first_token_amount,
+            "nft": {"capability": "mutable", "commitment": first_commitment}
+        });
+        let final_token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": final_token_amount,
+            "nft": {"capability": "mutable", "commitment": final_commitment}
+        });
+        let mempool = json!({
+            first_txid.clone(): {
+                "time": 100,
+                "depends": [],
+                "spentby": [reward_child_txid.clone(), final_txid.clone()]
+            },
+            reward_child_txid.clone(): {
+                "time": 101,
+                "depends": [first_txid.clone()],
+                "spentby": []
+            },
+            final_txid.clone(): {
+                "time": 102,
+                "depends": [first_txid.clone()],
+                "spentby": []
+            }
+        });
+        let first_transaction = json!({
+            "txid": first_txid,
+            "vin": [{"txid": confirmed_txid, "vout": 0}],
+            "vout": [{
+                "n": 0,
+                "value": 0.15970885,
+                "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+                "tokenData": first_token_data
+            }, {
+                "n": 1,
+                "value": 0.00000546,
+                "scriptPubKey": {"hex": "76a914000000000000000000000000000000000000000088ac"}
+            }]
+        });
+        let reward_child = json!({
+            "txid": reward_child_txid,
+            "vin": [{"txid": first_txid, "vout": 1}],
+            "vout": [{
+                "n": 0,
+                "value": 0.00000300,
+                "scriptPubKey": {"hex": "76a914111111111111111111111111111111111111111188ac"}
+            }]
+        });
+        let final_transaction = json!({
+            "txid": final_txid,
+            "vin": [{"txid": first_txid, "vout": 0}],
+            "vout": [{
+                "n": 0,
+                "value": 0.15970270,
+                "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+                "tokenData": final_token_data
+            }, {
+                "n": 1,
+                "value": 0.00000546,
+                "scriptPubKey": {"hex": "76a914222222222222222222222222222222222222222288ac"}
+            }]
+        });
+        let final_txout = json!({
+            "bestblock": bestblock,
+            "confirmations": 0,
+            "value": 0.15970270,
+            "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+            "tokenData": final_token_data,
+        });
+
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            ("scantxoutset", scan),
+            ("gettxout", Value::Null),
+            ("getrawmempool", mempool),
+            ("getrawtransaction", first_transaction),
+            ("getrawtransaction", reward_child),
+            ("getrawtransaction", final_transaction),
+            ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", final_txout),
+        ]);
+        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint)).unwrap();
+        server.join().unwrap();
+
+        let fulcrum = live_job_from_fulcrum_values(
+            "wss://fixture.invalid",
+            json!(["Fulcrum", "1.5"]),
+            &json!({"height": 1000}),
+            &json!([{
+                "tx_hash": final_txid,
+                "tx_pos": 0,
+                "height": 0,
+                "value": 15_970_270,
+                "token_data": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": final_token_amount,
+                    "nft": {
+                        "capability": "mutable",
+                        "commitment": final_commitment,
+                    }
+                }
+            }]),
+        )
+        .unwrap();
+
+        assert_same_photon_state(&native, &fulcrum);
+        assert_eq!(native.baton_txid, final_txid);
+    }
+
+    #[test]
+    fn native_photon_state_fails_closed_when_mempool_successor_cannot_be_proven() {
+        let txid = "66".repeat(32);
+        let bestblock = "77".repeat(32);
+        let commitment = format!(
+            "01000000{}",
+            "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+        );
+        let scan = json!({
+            "success": true,
+            "height": 1000,
+            "bestblock": bestblock,
+            "unspents": [{
+                "txid": txid,
+                "vout": 0,
+                "scriptPubKey": COVENANT_LOCKING_BYTECODE_HEX,
+                "amount": 0.15971500,
+                "height": 990,
+                "tokenData": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": "2100000000000000",
+                    "nft": {"capability": "mutable", "commitment": commitment}
+                }
+            }]
+        });
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            ("scantxoutset", scan),
+            ("gettxout", Value::Null),
+            ("getrawmempool", json!({})),
+        ]);
+        let error = fetch_photon_live_job(std::slice::from_ref(&endpoint)).unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            error.contains("no canonical successor could be proven"),
+            "{error}"
+        );
     }
 }

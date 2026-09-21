@@ -2,9 +2,8 @@
 //! Owned by Dev Assist. Search consumes MiningJob; no keys.
 //! Runtime winner settlement uses this session for ordered parent/settlement broadcast.
 
-use crate::protocol::{EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
+use crate::protocol::{derive_photon_state, EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
 use crate::search::MiningJob;
-use num_bigint::BigUint;
 use serde_json::{json, Value};
 use std::net::TcpStream;
 use std::thread;
@@ -15,7 +14,7 @@ use tungstenite::{connect, Message, WebSocket};
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
 /// Rich live job for CLI / win-tx; converts to search::MiningJob.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveJob {
     pub url: String,
     pub server_version: Value,
@@ -226,136 +225,99 @@ impl ElectrumSession {
 
     pub fn fetch_live_job(&mut self) -> Result<LiveJob, String> {
         let header = self.rpc("blockchain.headers.subscribe", json!([]))?;
-        let height = header
-            .get("height")
-            .and_then(|h| h.as_u64())
-            .ok_or("Invalid live BCH header response")? as u32;
-
         let unspent = self.rpc(
             "blockchain.scripthash.listunspent",
             json!([EXPECTED_SCRIPT_HASH_HEX, "include_tokens"]),
         )?;
-        let arr = unspent
-            .as_array()
-            .ok_or("Invalid live PHOTON UTXO response")?;
-
-        let batons: Vec<&Value> = arr
-            .iter()
-            .filter(|u| {
-                let cat = u
-                    .pointer("/token_data/category")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let cap = u
-                    .pointer("/token_data/nft/capability")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                cat == MAINNET_CATEGORY_HEX && cap == "mutable"
-            })
-            .collect();
-
-        if batons.len() != 1 {
-            return Err(format!(
-                "Expected exactly one live PHOTON baton; found {}",
-                batons.len()
-            ));
-        }
-        let baton = batons[0];
-
-        let baton_txid = baton
-            .get("tx_hash")
-            .and_then(|t| t.as_str())
-            .ok_or("baton missing tx_hash")?
-            .to_string();
-        let baton_vout = baton
-            .get("tx_pos")
-            .and_then(|t| t.as_u64())
-            .ok_or("baton missing tx_pos")? as u32;
-        let baton_height = baton.get("height").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-        let baton_value_sats = baton.get("value").and_then(|t| t.as_u64()).unwrap_or(0);
-        let commitment_hex = baton
-            .pointer("/token_data/nft/commitment")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-        if commitment_hex.len() < 72 {
-            return Err("Live PHOTON baton commitment is missing or too short.".into());
-        }
-
-        let token_amount_str = baton
-            .pointer("/token_data/amount")
-            .and_then(|a| a.as_str())
-            .unwrap_or("0");
-        let token_amount: u128 = token_amount_str
-            .parse()
-            .map_err(|_| format!("bad token amount: {token_amount_str}"))?;
-
-        let age = if baton_height == 0 {
-            0
-        } else {
-            height.saturating_sub(baton_height)
-        };
-
-        let previous_target_hex = &commitment_hex[8..72];
-        let previous_target = le_hex_to_biguint(previous_target_hex)?;
-        let next_target = &previous_target * (BigUint::from(age as u64) + BigUint::from(143u64))
-            / BigUint::from(144u64);
-        let target_le_hex = biguint_to_le_hex32(&next_target)?;
-
-        let reward_raw = token_amount
-            .checked_div(420_000)
-            .and_then(|v| v.checked_sub(1))
-            .ok_or("reward_raw underflow")?;
-
-        Ok(LiveJob {
-            url: self.url.clone(),
-            server_version: self.server_version.clone(),
-            height,
-            baton_txid,
-            baton_vout,
-            baton_height,
-            baton_value_sats,
-            commitment_hex,
-            token_amount,
-            age,
-            target_le_hex,
-            reward_raw,
-        })
+        live_job_from_fulcrum_values(&self.url, self.server_version.clone(), &header, &unspent)
     }
+}
+
+pub(crate) fn live_job_from_fulcrum_values(
+    url: &str,
+    server_version: Value,
+    header: &Value,
+    unspent: &Value,
+) -> Result<LiveJob, String> {
+    let height = header
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("Invalid live BCH header response")?;
+    let arr = unspent
+        .as_array()
+        .ok_or("Invalid live PHOTON UTXO response")?;
+
+    let batons = arr
+        .iter()
+        .filter(|utxo| {
+            let category = utxo
+                .pointer("/token_data/category")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let capability = utxo
+                .pointer("/token_data/nft/capability")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            category == MAINNET_CATEGORY_HEX && capability == "mutable"
+        })
+        .collect::<Vec<_>>();
+
+    if batons.len() != 1 {
+        return Err(format!(
+            "Expected exactly one live PHOTON baton; found {}",
+            batons.len()
+        ));
+    }
+    let baton = batons[0];
+    let baton_txid = baton
+        .get("tx_hash")
+        .and_then(Value::as_str)
+        .ok_or("baton missing tx_hash")?
+        .to_ascii_lowercase();
+    let baton_vout = baton
+        .get("tx_pos")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("baton missing tx_pos")?;
+    let baton_height = baton
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let baton_value_sats = baton.get("value").and_then(Value::as_u64).unwrap_or(0);
+    let commitment_hex = baton
+        .pointer("/token_data/nft/commitment")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let token_amount_str = baton
+        .pointer("/token_data/amount")
+        .and_then(Value::as_str)
+        .unwrap_or("0");
+    let token_amount = token_amount_str
+        .parse::<u128>()
+        .map_err(|_| format!("bad token amount: {token_amount_str}"))?;
+    let derived = derive_photon_state(&commitment_hex, token_amount, height, baton_height)?;
+
+    Ok(LiveJob {
+        url: url.to_string(),
+        server_version,
+        height,
+        baton_txid,
+        baton_vout,
+        baton_height,
+        baton_value_sats,
+        commitment_hex,
+        token_amount,
+        age: derived.age,
+        target_le_hex: derived.target_le_hex,
+        reward_raw: derived.reward_raw,
+    })
 }
 
 fn id_matches(v: &Value, id: u64) -> bool {
     v.get("id").and_then(|x| x.as_u64()) == Some(id)
         || v.get("id").and_then(|x| x.as_i64()).map(|x| x as u64) == Some(id)
-}
-
-fn le_hex_to_biguint(hex_str: &str) -> Result<BigUint, String> {
-    if !hex_str.len().is_multiple_of(2) {
-        return Err("Invalid little-endian hex.".into());
-    }
-    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
-    Ok(BigUint::from_bytes_le(&bytes))
-}
-
-fn biguint_to_le_hex32(v: &BigUint) -> Result<String, String> {
-    let mut bytes = v.to_bytes_le();
-    if bytes.len() > 32 {
-        return Err("Target does not fit in 256 bits.".into());
-    }
-    bytes.resize(32, 0);
-    Ok(hex::encode(bytes))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn le_roundtrip_small() {
-        let h = "0100000000000000000000000000000000000000000000000000000000000000";
-        let n = le_hex_to_biguint(h).unwrap();
-        assert_eq!(n, BigUint::from(1u32));
-        assert_eq!(biguint_to_le_hex32(&n).unwrap(), h);
-    }
 }
