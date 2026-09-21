@@ -1,10 +1,9 @@
 //! Presentation-neutral live PHOTON runtime supervision.
 //!
-//! The authoritative browser reference refreshes BCH height + the mutable
-//! PHOTON baton after every GPU batch. This supervisor owns that boundary for
-//! both future Ratatui and headless frontends: the CUDA worker cannot start the
-//! next supervised batch until fresh Fulcrum state has been checked and any
-//! immutable generation change has been applied.
+//! The authoritative M67.38 browser reference polls BCH height + the mutable
+//! PHOTON baton every 500 ms while GPU batches continue back-to-back. This
+//! supervisor keeps network polling independent of the GPU hot path and applies
+//! an immutable generation change at the worker's next batch boundary.
 
 use crate::backend::BackendKind;
 use crate::config::{JobSource, RuntimeConfig};
@@ -33,6 +32,7 @@ use self::source_pool::{
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
+const PHOTON_STATE_RECHECK: Duration = Duration::from_millis(500);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const SUBMISSION_JOURNAL_VERSION: u8 = 3;
@@ -1653,60 +1653,13 @@ fn run_supervisor(
     let mut last_error = None;
     let mut reconnect_backoff = RECONNECT_MIN;
     let mut next_reconnect = Instant::now();
+    let mut next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
     let mut submission_backoff = RECONNECT_MIN;
     let mut next_submission_retry = Instant::now();
     let mut shutdown_requested = false;
     let mut stop = false;
 
     while !stop {
-        if pending_submission.is_none() && pending_winner.is_none() && search.refresh_required() {
-            for winner in search.drain_winners() {
-                if winner_matches_live(&winner, cfg.generation_id, &live) {
-                    verified_winners = verified_winners.saturating_add(1);
-                    pending_winners = 1;
-                    let _ = search.apply_control(SearchCommand::Pause);
-                    state = SupervisorState::Paused;
-                    emit(&event_tx, RuntimeEvent::VerifiedWinner(winner.clone()));
-                    match prepare_pending_submission(
-                        &winner,
-                        &cfg,
-                        &live,
-                        &reward_secret,
-                        &reward_public_key,
-                        &settlement,
-                        &journal_path,
-                    ) {
-                        Ok(pending) => {
-                            pending_submission = Some(pending);
-                            submission_backoff = RECONNECT_MIN;
-                            next_submission_retry = Instant::now();
-                            last_error = None;
-                        }
-                        Err(error) => {
-                            pending_winner = Some(winner);
-                            last_error = Some(error.clone());
-                            state = SupervisorState::Error;
-                            emit(&event_tx, RuntimeEvent::Error(error));
-                            next_submission_retry = Instant::now() + submission_backoff;
-                            submission_backoff = submission_backoff
-                                .checked_mul(2)
-                                .unwrap_or(RECONNECT_MAX)
-                                .min(RECONNECT_MAX);
-                        }
-                    }
-                    break;
-                }
-                stale_winners = stale_winners.saturating_add(1);
-                emit(
-                    &event_tx,
-                    RuntimeEvent::StaleWinner {
-                        winner_generation: winner.generation_id,
-                        current_generation: cfg.generation_id,
-                    },
-                );
-            }
-        }
-
         loop {
             match command_rx.try_recv() {
                 Ok(SupervisorCommand::SetIntensity(value, reply)) => {
@@ -1865,15 +1818,6 @@ fn run_supervisor(
         if stop {
             break;
         }
-        if wait_for_batch_boundary(
-            pending_winner.is_some(),
-            pending_submission.is_some(),
-            search.batch_in_flight(),
-        ) {
-            thread::sleep(SUPERVISOR_POLL);
-            continue;
-        }
-
         if session.is_none() {
             if Instant::now() >= next_reconnect {
                 match ElectrumSession::connect_failover(&endpoints)
@@ -1901,9 +1845,7 @@ fn run_supervisor(
                                     stale_rebuilds = stale_rebuilds.saturating_add(1);
                                 }
                                 emit(&event_tx, RuntimeEvent::Reconnected(live.url.clone()));
-                                if search.refresh_required() {
-                                    let _ = search.complete_refresh();
-                                }
+                                next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
                                 if !user_paused && pending_winners == 0 {
                                     let _ = search.apply_control(SearchCommand::Resume);
                                     state = SupervisorState::Mining;
@@ -2021,7 +1963,7 @@ fn run_supervisor(
                                         if changed {
                                             stale_rebuilds = stale_rebuilds.saturating_add(1);
                                         }
-                                        let _ = search.complete_refresh();
+                                        next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
                                         if user_paused {
                                             state = SupervisorState::Paused;
                                         } else {
@@ -2077,7 +2019,7 @@ fn run_supervisor(
                                         if changed {
                                             stale_rebuilds = stale_rebuilds.saturating_add(1);
                                         }
-                                        let _ = search.complete_refresh();
+                                        next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
                                         if user_paused {
                                             state = SupervisorState::Paused;
                                         } else {
@@ -2128,14 +2070,15 @@ fn run_supervisor(
                     }
                 }
             }
-        } else if search.refresh_required() {
-            let refreshed = refresh_photon_job_at_boundary(
+        } else if Instant::now() >= next_state_refresh {
+            let refreshed = refresh_photon_job_on_cadence(
                 &cfg,
                 session.as_mut().expect("checked session above"),
                 &mut sources,
                 &mut native_photon_session,
                 source_capability_epoch,
             );
+            next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
             match refreshed {
                 Ok(boundary) => {
                     if let Some(error) = boundary.native_error.as_ref() {
@@ -2226,7 +2169,6 @@ fn run_supervisor(
                                 }
                             }
 
-                            let _ = search.complete_refresh();
                             if pending_winners == 0 && boundary.native_error.is_none() {
                                 last_error = None;
                             }
@@ -2374,7 +2316,7 @@ fn record_native_photon_probe(
     }
 }
 
-fn refresh_photon_job_at_boundary(
+fn refresh_photon_job_on_cadence(
     cfg: &RuntimeConfig,
     canonical: &mut ElectrumSession,
     sources: &mut SourceCatalog,
@@ -2468,6 +2410,12 @@ fn apply_refreshed_job(
     journal_path: &Path,
     next: LiveJob,
 ) -> Result<bool, String> {
+    if live_job_changed(live, &next) {
+        // Once a changed baton/height/target/source is observed, stop launching
+        // the old immutable generation. The worker sees Pause at its next batch
+        // boundary while preflight validates the replacement generation.
+        search.apply_control(SearchCommand::Pause)?;
+    }
     let staged =
         prepare_generation_transition(cfg, live, settlement, &next, |next_cfg, next_live| {
             production_preflight(
@@ -2537,14 +2485,6 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
 
 fn shutdown_can_exit(pending_winner: bool, batch_in_flight: bool) -> bool {
     !pending_winner && !batch_in_flight
-}
-
-fn wait_for_batch_boundary(
-    pending_winner: bool,
-    pending_submission: bool,
-    batch_in_flight: bool,
-) -> bool {
-    !pending_winner && !pending_submission && batch_in_flight
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2978,10 +2918,11 @@ mod tests {
         assert!(!shutdown_can_exit(true, false));
         assert!(!shutdown_can_exit(false, true));
         assert!(!shutdown_can_exit(true, true));
-        assert!(wait_for_batch_boundary(false, false, true));
-        assert!(!wait_for_batch_boundary(true, false, true));
-        assert!(!wait_for_batch_boundary(false, true, true));
-        assert!(!wait_for_batch_boundary(false, false, false));
+    }
+
+    #[test]
+    fn photon_state_recheck_matches_authoritative_m67_cadence() {
+        assert_eq!(PHOTON_STATE_RECHECK, Duration::from_millis(500));
     }
 
     #[test]
