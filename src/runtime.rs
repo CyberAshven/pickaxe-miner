@@ -2099,12 +2099,11 @@ fn run_supervisor(
             );
             match refreshed {
                 Ok(boundary) => {
-                    if let Some(error) = boundary.native_error.as_ref() {
-                        let message = format!(
-                            "native-node PHOTON route fell back to canonical Fulcrum: {error}"
-                        );
-                        last_error = Some(message.clone());
-                        emit(&event_tx, RuntimeEvent::Error(message));
+                    if let Some(warning) = boundary.route_warning.as_ref() {
+                        if last_error.as_deref() != Some(warning.as_str()) {
+                            emit(&event_tx, RuntimeEvent::Error(warning.clone()));
+                        }
+                        last_error = Some(warning.clone());
                     }
                     refreshes = refreshes.saturating_add(1);
                     match apply_refreshed_job(
@@ -2183,7 +2182,7 @@ fn run_supervisor(
                                 }
                             }
 
-                            if pending_winners == 0 && boundary.native_error.is_none() {
+                            if pending_winners == 0 && boundary.route_warning.is_none() {
                                 last_error = None;
                             }
                             if changed && session.is_some() && !user_paused && pending_winners == 0
@@ -2250,7 +2249,7 @@ fn run_supervisor(
 
 struct PhotonBoundaryRefresh {
     job: LiveJob,
-    native_error: Option<String>,
+    route_warning: Option<String>,
 }
 
 fn select_boundary_photon_job(
@@ -2331,6 +2330,42 @@ fn record_native_photon_probe(
     }
 }
 
+fn refresh_native_with_current_proof(
+    sources: &mut SourceCatalog,
+    endpoint: &str,
+    native_result: Result<LiveStateSnapshot, String>,
+    now_ms: u64,
+    latency_ms: u32,
+) -> Result<LiveStateSnapshot, String> {
+    if !sources.supports_at(
+        SourceKind::NativeNode,
+        endpoint,
+        SourceCapability::PhotonState,
+        now_ms,
+    ) {
+        return Err(
+            "native-node PHOTON continuity requires a current canonical equivalence proof".into(),
+        );
+    }
+
+    match native_result {
+        Ok(snapshot) => {
+            // A native-only refresh proves liveness, not canonical equivalence. Keep the
+            // original capability expiry so Fulcrum must be available again before the
+            // proof lease can be renewed.
+            sources.record_success(SourceKind::NativeNode, endpoint, now_ms, latency_ms)?;
+            Ok(snapshot)
+        }
+        Err(error) => {
+            let _ = sources.revoke_native_photon_capability(endpoint);
+            let _ = sources.record_failure(SourceKind::NativeNode, endpoint, now_ms);
+            Err(format!(
+                "proven native-node PHOTON refresh failed during canonical outage: {error}"
+            ))
+        }
+    }
+}
+
 fn refresh_photon_job_on_cadence(
     cfg: &RuntimeConfig,
     canonical: &mut ElectrumSession,
@@ -2338,22 +2373,69 @@ fn refresh_photon_job_on_cadence(
     native_session: &mut Option<crate::node::NativePhotonSession>,
     epoch: Instant,
 ) -> Result<PhotonBoundaryRefresh, String> {
-    let canonical_started = Instant::now();
-    let canonical_snapshot = canonical.fetch_live_snapshot()?;
     let now_ms = source_capability_now_ms(epoch);
+    let canonical_started = Instant::now();
+    let canonical_result = canonical.fetch_live_snapshot();
     let canonical_latency_ms =
         u32::try_from(canonical_started.elapsed().as_millis()).unwrap_or(u32::MAX);
+    let canonical_snapshot = match canonical_result {
+        Ok(snapshot) => snapshot,
+        Err(canonical_error) => {
+            let endpoint = cfg.node_url.as_deref().ok_or_else(|| {
+                format!(
+                    "canonical Fulcrum PHOTON refresh failed and no native node is configured: {canonical_error}"
+                )
+            })?;
+            if !sources.supports_at(
+                SourceKind::NativeNode,
+                endpoint,
+                SourceCapability::PhotonState,
+                now_ms,
+            ) {
+                return Err(format!(
+                    "canonical Fulcrum PHOTON refresh failed and native equivalence proof is unavailable or expired: {canonical_error}"
+                ));
+            }
+
+            let probe_started = Instant::now();
+            let native_result = (|| {
+                if native_session.is_none() {
+                    *native_session = Some(crate::node::NativePhotonSession::connect_failover(&[
+                        endpoint.to_string(),
+                    ])?);
+                }
+                native_session
+                    .as_mut()
+                    .expect("native PHOTON session was initialized above")
+                    .refresh()
+            })();
+            let latency_ms = u32::try_from(probe_started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            let native_snapshot = refresh_native_with_current_proof(
+                sources,
+                endpoint,
+                native_result,
+                now_ms,
+                latency_ms,
+            )?;
+            return Ok(PhotonBoundaryRefresh {
+                job: native_snapshot.job,
+                route_warning: Some(format!(
+                    "canonical Fulcrum PHOTON refresh failed; continuing on current proven native-node lease until re-proof or expiry: {canonical_error}"
+                )),
+            });
+        }
+    };
     record_canonical_fulcrum_probe(sources, &canonical_snapshot, now_ms, canonical_latency_ms)?;
     let Some(endpoint) = cfg.node_url.as_deref() else {
         return Ok(PhotonBoundaryRefresh {
             job: canonical_snapshot.job,
-            native_error: None,
+            route_warning: None,
         });
     };
     if !sources.available_at(SourceKind::NativeNode, endpoint, now_ms) {
         return Ok(PhotonBoundaryRefresh {
             job: canonical_snapshot.job,
-            native_error: None,
+            route_warning: None,
         });
     }
 
@@ -2386,7 +2468,9 @@ fn refresh_photon_job_on_cadence(
             &canonical_snapshot,
             now_ms,
         ),
-        native_error,
+        route_warning: native_error.map(|error| {
+            format!("native-node PHOTON route fell back to canonical Fulcrum: {error}")
+        }),
     })
 }
 
@@ -2787,6 +2871,75 @@ mod tests {
             !live_job_changed(&native.job, &fallback),
             "same-tip equivalent native -> Fulcrum fallback must not rebuild GPU work"
         );
+    }
+
+    #[test]
+    fn native_outage_continuity_is_bounded_by_equivalence_proof() {
+        let endpoint = "http://node.invalid";
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_node_url(endpoint).unwrap();
+        let mut sources = SourceCatalog::configured(&cfg).unwrap();
+        let canonical = live_snapshot("wss://fulcrum.invalid");
+        let native = live_snapshot(endpoint);
+        record_canonical_fulcrum_probe(&mut sources, &canonical, 1_000, 50).unwrap();
+        let (accepted, error) = record_native_photon_probe(
+            &mut sources,
+            endpoint,
+            &canonical,
+            Ok(native.clone()),
+            1_000,
+            2,
+        );
+        assert!(error.is_none());
+        assert!(accepted.is_some());
+
+        let before_expiry = 1_000 + DEFAULT_CAPABILITY_TTL_MS - 1;
+        let continued = refresh_native_with_current_proof(
+            &mut sources,
+            endpoint,
+            Ok(native.clone()),
+            before_expiry,
+            3,
+        )
+        .unwrap();
+        assert_eq!(continued.job, native.job);
+        assert!(!sources.supports_at(
+            SourceKind::NativeNode,
+            endpoint,
+            SourceCapability::PhotonState,
+            1_000 + DEFAULT_CAPABILITY_TTL_MS + 1
+        ));
+
+        let expired = refresh_native_with_current_proof(
+            &mut sources,
+            endpoint,
+            Ok(native.clone()),
+            1_000 + DEFAULT_CAPABILITY_TTL_MS + 1,
+            3,
+        )
+        .unwrap_err();
+        assert!(expired.contains("current canonical equivalence proof"));
+
+        let proof =
+            NativePhotonEquivalenceProof::from_verified_snapshot(endpoint, &native).unwrap();
+        sources
+            .verify_native_photon_capability(&proof, 2_000, DEFAULT_CAPABILITY_TTL_MS)
+            .unwrap();
+        let failure = refresh_native_with_current_proof(
+            &mut sources,
+            endpoint,
+            Err("node disconnected".into()),
+            2_001,
+            4,
+        )
+        .unwrap_err();
+        assert!(failure.contains("node disconnected"));
+        assert!(!sources.supports_at(
+            SourceKind::NativeNode,
+            endpoint,
+            SourceCapability::PhotonState,
+            2_001
+        ));
     }
 
     #[test]
