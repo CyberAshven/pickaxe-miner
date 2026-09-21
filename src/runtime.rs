@@ -2407,9 +2407,11 @@ fn apply_refreshed_job(
     next: LiveJob,
 ) -> Result<bool, String> {
     if live_job_changed(live, &next) {
-        // Once a changed baton/height/target/source is observed, stop launching
-        // the old immutable generation. The worker sees Pause at its next batch
-        // boundary while preflight validates the replacement generation.
+        // Once authoritative PHOTON work changes, stop launching the old
+        // immutable generation. Route metadata such as the verified provider
+        // URL may change without rebuilding identical GPU work.
+        // The worker sees Pause at its next batch boundary while preflight
+        // validates the replacement generation.
         search.apply_control(SearchCommand::Pause)?;
     }
     let staged =
@@ -2469,7 +2471,6 @@ fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
         || current.target_le_hex != next.target_le_hex
         || current.token_amount != next.token_amount
         || current.reward_raw != next.reward_raw
-        || current.url != next.url
 }
 
 fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJob) -> bool {
@@ -2709,11 +2710,19 @@ mod tests {
     }
 
     #[test]
-    fn height_or_baton_change_invalidates_generation() {
+    fn photon_work_change_invalidates_generation_but_route_metadata_does_not() {
         let current = live_job();
         let mut next = current.clone();
         assert!(!live_job_changed(&current, &next));
 
+        next.url = "http://equivalent-node.invalid".into();
+        next.server_version = serde_json::json!(["BCHN", "28.0"]);
+        assert!(
+            !live_job_changed(&current, &next),
+            "verified route metadata must not rebuild identical immutable PHOTON work"
+        );
+
+        next = current.clone();
         next.height += 1;
         next.age += 1;
         assert!(live_job_changed(&current, &next));
@@ -2746,13 +2755,45 @@ mod tests {
         let selected =
             select_boundary_photon_job(&cfg, &sources, accepted.as_ref(), &canonical, 1_000);
         assert_eq!(selected.url, endpoint);
-        assert!(live_job_changed(&canonical.job, &selected));
+        assert!(
+            !live_job_changed(&canonical.job, &selected),
+            "same-tip equivalent Fulcrum -> native routing must not rebuild GPU work"
+        );
 
         let expired = 1_000 + DEFAULT_CAPABILITY_TTL_MS + 1;
         let fallback =
             select_boundary_photon_job(&cfg, &sources, Some(&native), &canonical, expired);
         assert_eq!(fallback.url, canonical.job.url);
-        assert!(live_job_changed(&native.job, &fallback));
+        assert!(
+            !live_job_changed(&native.job, &fallback),
+            "same-tip equivalent native -> Fulcrum fallback must not rebuild GPU work"
+        );
+    }
+
+    #[test]
+    fn route_only_refresh_skips_generation_transition_and_preflight() {
+        let (cfg, job, _secret, _public, _mining_payout, _journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let mut routed = job.clone();
+        routed.url = "http://equivalent-node.invalid".into();
+        routed.server_version = serde_json::json!(["BCHN", "28.0"]);
+        let mut preflight_calls = 0;
+
+        let staged = prepare_generation_transition(
+            &cfg,
+            &job,
+            &settlement,
+            &routed,
+            |_next_cfg, _next_live| {
+                preflight_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(staged.is_none());
+        assert_eq!(preflight_calls, 0);
+        assert_eq!(cfg.generation_id, settlement.generation_id);
     }
 
     #[test]
