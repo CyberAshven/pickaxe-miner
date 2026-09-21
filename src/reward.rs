@@ -17,12 +17,17 @@ pub const TOKEN_OUTPUT_SATS: u64 = 700;
 pub const PHOTON_MULTI_INPUT_MAX_BATON_DECREASE_SATS: u64 = 8_000;
 #[cfg_attr(not(test), allow(dead_code))]
 pub const MIN_RELAY_FEE_SATS_PER_KB: u64 = 1_000;
+#[cfg(test)]
 pub const SPONSOR_SUBSIDY_SATS: u64 = 2_000;
+#[cfg(test)]
 pub const SPONSOR_STANDARD_MAX_LOCKING_BYTES: usize = 201;
+#[cfg(test)]
 pub const SPONSOR_OUTPUT_DUST_SATS: u64 = 1_062;
+#[cfg(test)]
 pub const SPONSOR_MIN_RESERVE_SATS: u64 = SPONSOR_SUBSIDY_SATS + SPONSOR_OUTPUT_DUST_SATS;
 const SIGHASH_ALL_FORKID: u8 = 0x41;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SponsorReserve {
     pub txid: String,
@@ -31,6 +36,7 @@ pub struct SponsorReserve {
     pub locking_script: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedRewardSplit {
     pub parent_txid: String,
@@ -134,6 +140,7 @@ fn push_data(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn script_number_bytes(value: u64) -> Vec<u8> {
     if value == 0 {
         return Vec::new();
@@ -150,6 +157,7 @@ fn script_number_bytes(value: u64) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn push_number(value: u64) -> Result<Vec<u8>, String> {
     match value {
         0 => Ok(vec![0x00]),
@@ -299,6 +307,7 @@ fn encode_input(txid: &str, vout: u32, unlocking: &[u8]) -> Result<Vec<u8>, Stri
     Ok(out)
 }
 
+#[cfg(test)]
 fn p2pkh_sighash(
     parent_txid: &str,
     reward_token_amount: u128,
@@ -596,6 +605,7 @@ pub fn build_self_funded_settlement(
 }
 
 /// Legacy M54 sponsor-covenant research helper. Production mining does not use it.
+#[cfg(test)]
 pub fn build_sponsor_script(expected_baton_txid: &str) -> Result<Vec<u8>, String> {
     let baton = parse_txid_display(expected_baton_txid)?;
     let expected_baton_hash_le = reverse(&baton);
@@ -692,6 +702,7 @@ pub fn build_sponsor_script(expected_baton_txid: &str) -> Result<Vec<u8>, String
     Ok(script)
 }
 
+#[cfg(test)]
 pub fn sponsor_electrum_scripthash(expected_baton_txid: &str) -> Result<String, String> {
     let script = build_sponsor_script(expected_baton_txid)?;
     let digest = Sha256::digest(&script);
@@ -700,6 +711,7 @@ pub fn sponsor_electrum_scripthash(expected_baton_txid: &str) -> Result<String, 
     ))
 }
 
+#[cfg(test)]
 pub fn next_sponsor_locking_script(
     parent_raw: &[u8],
     current_sponsor_script: &[u8],
@@ -715,6 +727,7 @@ pub fn next_sponsor_locking_script(
     Ok(next)
 }
 
+#[cfg(test)]
 pub fn build_reward_split_child(
     parent_raw: &[u8],
     expected_baton_txid: &str,
