@@ -1,8 +1,10 @@
-//! Offline deterministic validation of the production PHOTON CUDA pipeline.
+//! Offline deterministic validation of the production PHOTON native GPU pipeline.
 //! No Fulcrum/node connection or broadcast is used.
 
+use crate::backend::BackendKind;
 use crate::config::{RuntimeConfig, DONATION_BPS};
 use crate::cuda_photon::CudaPhotonEngine;
+use crate::hip_photon::HipPhotonEngine;
 use crate::{crypto, reward, search, tx};
 use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
@@ -193,23 +195,36 @@ fn validate_gpu_winner_and_reward(
         reward_fee_sats: split.fee_sats,
     })
 }
-pub fn run_cuda_self_test(device: u32) -> Result<SelfTestReport, String> {
+pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport, String> {
     let target = [0xffu8; 32];
     let reward_secret = deterministic_secret(1);
     let reward_public_key = public_key(&reward_secret)?;
     let template = build_reference_shaped_template(&target, &reward_public_key)?;
 
-    let mut engine = CudaPhotonEngine::new(device as usize, 1, 1)?;
-    let persistent_device_bytes = engine.persistent_device_bytes();
-    engine.set_job(&template, &target, &reward_secret)?;
-    let batch = engine.search_batch(CONTROLLED_NONCE, 1)?;
+    let (backend_name, persistent_device_bytes, batch) = match backend {
+        BackendKind::Cuda => {
+            let mut engine = CudaPhotonEngine::new(device as usize, 1, 1)?;
+            let bytes = engine.persistent_device_bytes();
+            engine.set_job(&template, &target, &reward_secret)?;
+            let batch = engine.search_batch(CONTROLLED_NONCE, 1)?;
+            ("cuda", bytes, batch)
+        }
+        BackendKind::Hip => {
+            let mut engine = HipPhotonEngine::new(device as usize, 1, 1)?;
+            let bytes = engine.persistent_device_bytes();
+            engine.set_job(&template, &target, &reward_secret)?;
+            let batch = engine.search_batch(CONTROLLED_NONCE, 1)?;
+            ("hip", bytes, batch)
+        }
+        BackendKind::Auto => return Err("self-test requires a resolved native backend".into()),
+    };
     if batch.candidates != 1
         || batch.total_winners != 1
         || batch.winners.len() != 1
         || batch.truncated()
     {
         return Err(format!(
-            "controlled CUDA batch returned candidates={} total_winners={} returned={} truncated={}",
+            "controlled {backend_name} batch returned candidates={} total_winners={} returned={} truncated={}",
             batch.candidates,
             batch.total_winners,
             batch.winners.len(),
@@ -219,7 +234,7 @@ pub fn run_cuda_self_test(device: u32) -> Result<SelfTestReport, String> {
     let winner = &batch.winners[0];
     if winner.nonce != CONTROLLED_NONCE {
         return Err(format!(
-            "controlled CUDA winner nonce {} != expected {}",
+            "controlled {backend_name} winner nonce {} != expected {}",
             winner.nonce, CONTROLLED_NONCE
         ));
     }
@@ -235,7 +250,7 @@ pub fn run_cuda_self_test(device: u32) -> Result<SelfTestReport, String> {
 
     Ok(SelfTestReport {
         status: "PASS",
-        backend: "cuda",
+        backend: backend_name,
         device,
         candidates: batch.candidates,
         nonce: winner.nonce,
@@ -264,7 +279,11 @@ pub fn print_report(report: &SelfTestReport, json: bool) {
     }
 
     println!("Pickaxe PHOTON self-test: {}", report.status);
-    println!("CUDA device: {}", report.device);
+    println!(
+        "{} device: {}",
+        report.backend.to_ascii_uppercase(),
+        report.device
+    );
     println!(
         "GPU A->B->C: {} controlled candidate, winner nonce=0x{:08x}",
         report.candidates, report.nonce
@@ -282,7 +301,8 @@ pub fn print_report(report: &SelfTestReport, json: bool) {
     println!("Parent txid: {}", report.parent_txid);
     println!("Reward child txid: {}", report.child_txid);
     println!(
-        "Persistent CUDA allocation: {} bytes",
+        "Persistent {} allocation: {} bytes",
+        report.backend.to_ascii_uppercase(),
         report.persistent_device_bytes
     );
     println!("Network access: none; broadcast: none");
@@ -354,5 +374,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("GPU/host HASH256 mismatch"));
+    }
+
+    #[test]
+    fn self_test_requires_resolved_native_backend() {
+        let error = run_self_test(BackendKind::Auto, 0).unwrap_err();
+        assert!(error.contains("resolved native backend"));
     }
 }
