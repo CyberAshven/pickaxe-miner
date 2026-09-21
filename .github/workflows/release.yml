@@ -1,0 +1,269 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing semantic tag to build and publish, e.g. v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+
+    steps:
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        env:
+          PUSH_TAG: ${{ github.ref_name }}
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            tag="${PUSH_TAG}"
+          else
+            tag="${MANUAL_TAG}"
+          fi
+
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: ${tag}" >&2
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout tagged source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Require Cargo version to match tag
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+            python3 -c 'import json, os, sys
+d=json.load(sys.stdin)
+root=os.path.abspath("Cargo.toml")
+p=next(p for p in d["packages"] if os.path.abspath(p["manifest_path"]) == root)
+print(p["version"])'
+          )"
+
+          if [[ "v${version}" != "${TAG}" ]]; then
+            echo "Tag ${TAG} does not match Cargo.toml version v${version}" >&2
+            exit 1
+          fi
+
+          echo "Release version: ${version}"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            artifact: release-linux-x86_64
+          - name: Windows x86_64
+            os: windows-latest
+            artifact: release-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Release tests
+        run: cargo test --locked --release --all-features --no-fail-fast
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          bin_name="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+            python3 -c 'import json, os, sys
+d=json.load(sys.stdin)
+root=os.path.abspath("Cargo.toml")
+p=next(p for p in d["packages"] if os.path.abspath(p["manifest_path"]) == root)
+print(next(t["name"] for t in p["targets"] if "bin" in t["kind"]))'
+          )"
+
+          bin="target/release/${bin_name}"
+          test -f "${bin}"
+
+          package="pickaxe-${TAG}-linux-x86_64"
+          mkdir -p "dist/${package}"
+          install -m 0755 "${bin}" "dist/${package}/pickaxe"
+
+          if [[ -f README.md ]]; then
+            cp README.md "dist/${package}/"
+          fi
+          for license in LICENSE LICENSE-*; do
+            if [[ -f "${license}" ]]; then
+              cp "${license}" "dist/${package}/"
+            fi
+          done
+
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          rm -rf "dist/${package}"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $manifest = (Resolve-Path 'Cargo.toml').Path
+          $package = $metadata.packages |
+            Where-Object { [IO.Path]::GetFullPath($_.manifest_path) -eq $manifest } |
+            Select-Object -First 1
+          if (-not $package) {
+            throw 'Could not identify the root Cargo package.'
+          }
+
+          $binTarget = $package.targets |
+            Where-Object { $_.kind -contains 'bin' } |
+            Select-Object -First 1
+          if (-not $binTarget) {
+            throw 'Could not identify the Pickaxe binary target.'
+          }
+
+          $binary = Join-Path 'target\release' ($binTarget.name + '.exe')
+          if (-not (Test-Path -LiteralPath $binary)) {
+            throw "Release binary not found: $binary"
+          }
+
+          $packageName = "pickaxe-$env:TAG-windows-x86_64"
+          $packageDir = Join-Path 'dist' $packageName
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item -LiteralPath $binary -Destination (Join-Path $packageDir 'pickaxe.exe')
+
+          if (Test-Path -LiteralPath 'README.md') {
+            Copy-Item -LiteralPath 'README.md' -Destination $packageDir
+          }
+          Get-ChildItem -File -Filter 'LICENSE*' | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $packageDir
+          }
+
+          $archive = Join-Path 'dist' ($packageName + '.zip')
+          Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $archive -Force
+          Remove-Item -LiteralPath $packageDir -Recurse -Force
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum pickaxe-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate build provenance
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          prerelease_args=()
+          if [[ "${TAG}" == *-* ]]; then
+            prerelease_args+=(--prerelease)
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber
+          else
+            gh release create "${TAG}" \
+              --verify-tag \
+              --generate-notes \
+              --title "Pickaxe ${TAG}" \
+              "${prerelease_args[@]}" \
+              dist/*
+          fi
