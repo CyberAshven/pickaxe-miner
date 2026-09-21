@@ -1,6 +1,7 @@
 //! Shared network endpoint catalog.
 
 pub(crate) const MAX_SOURCES: usize = 64;
+pub(crate) const AUTO_PROBE_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceKind {
@@ -50,32 +51,13 @@ pub(crate) struct SourceEntry {
 }
 
 impl SourceEntry {
-    fn capabilities_for(kind: SourceKind) -> Vec<SourceCapability> {
-        match kind {
-            SourceKind::Fulcrum => vec![
-                SourceCapability::PhotonState,
-                SourceCapability::ChainHeight,
-                SourceCapability::TokenState,
-                SourceCapability::TransactionLookup,
-                SourceCapability::SubmitTransaction,
-            ],
-            SourceKind::NativeNode => vec![
-                SourceCapability::ChainHeight,
-                SourceCapability::TransactionLookup,
-                SourceCapability::SubmitTransaction,
-                SourceCapability::PolicyCheck,
-                SourceCapability::Diagnostics,
-            ],
-        }
-    }
-
     fn new(kind: SourceKind, endpoint: &str, label: String, provenance: SourceProvenance) -> Self {
         Self {
             kind,
             endpoint: endpoint.trim().to_string(),
             label,
             provenance,
-            capabilities: Self::capabilities_for(kind),
+            capabilities: Vec::new(),
             health: SourceHealth::Unknown,
             enabled: true,
             banned: false,
@@ -96,6 +78,12 @@ impl SourceEntry {
 
     pub(crate) fn supports(&self, capability: SourceCapability) -> bool {
         self.capabilities.contains(&capability)
+    }
+
+    pub(crate) fn verify_capability(&mut self, capability: SourceCapability) {
+        if !self.capabilities.contains(&capability) {
+            self.capabilities.push(capability);
+        }
     }
 
     pub(crate) fn record_success(&mut self, now_ms: u64, latency_ms: u32) {
@@ -243,6 +231,19 @@ impl SourceCatalog {
         Ok(())
     }
 
+    pub(crate) fn verify_capability(
+        &mut self,
+        kind: SourceKind,
+        endpoint: &str,
+        capability: SourceCapability,
+    ) -> Result<(), String> {
+        let entry = self
+            .entry_mut(kind, endpoint)
+            .ok_or_else(|| "source not found".to_string())?;
+        entry.verify_capability(capability);
+        Ok(())
+    }
+
     pub(crate) fn record_failure(
         &mut self,
         kind: SourceKind,
@@ -258,6 +259,44 @@ impl SourceCatalog {
 
     pub(crate) fn router(&self) -> SourceRouter<'_> {
         SourceRouter { catalog: self }
+    }
+
+    pub(crate) fn probe_candidates(
+        &self,
+        kind: SourceKind,
+        now_ms: u64,
+        limit: usize,
+        rotation_key: u64,
+    ) -> Vec<&SourceEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut user = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == kind
+                    && entry.provenance == SourceProvenance::User
+                    && entry.available_at(now_ms)
+            })
+            .collect::<Vec<_>>();
+        let mut built_in = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == kind
+                    && entry.provenance == SourceProvenance::BuiltIn
+                    && entry.available_at(now_ms)
+            })
+            .collect::<Vec<_>>();
+        user.sort_by_key(|entry| source_rank(entry));
+        built_in.sort_by_key(|entry| source_rank(entry));
+        if !built_in.is_empty() {
+            let offset = (rotation_key as usize) % built_in.len();
+            built_in.rotate_left(offset);
+        }
+        user.into_iter().chain(built_in).take(limit).collect()
     }
 
     pub(crate) fn reconcile_builtins(&mut self, refreshed: Vec<SourceEntry>) -> Result<(), String> {
@@ -319,7 +358,11 @@ impl SourceRouter<'_> {
             .catalog
             .entries
             .iter()
-            .filter(|entry| entry.supports(capability) && entry.available_at(now_ms))
+            .filter(|entry| {
+                entry.health == SourceHealth::Healthy
+                    && entry.supports(capability)
+                    && entry.available_at(now_ms)
+            })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|entry| source_rank(entry));
         candidates
@@ -381,6 +424,13 @@ mod tests {
         catalog
             .record_success(SourceKind::Fulcrum, "fulcrum-a", 1_000, 50)
             .unwrap();
+        catalog
+            .verify_capability(
+                SourceKind::Fulcrum,
+                "fulcrum-a",
+                SourceCapability::PhotonState,
+            )
+            .unwrap();
 
         let router = catalog.router();
         let selected = router.select(SourceCapability::PhotonState, 1_000).unwrap();
@@ -412,6 +462,78 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_presence_does_not_imply_verified_capability() {
+        let catalog = SourceCatalog::mainnet();
+        assert!(catalog
+            .entries()
+            .iter()
+            .all(|entry| entry.capabilities.is_empty()));
+        assert!(catalog
+            .router()
+            .candidates(SourceCapability::PhotonState, 0)
+            .is_empty());
+    }
+
+    #[test]
+    fn health_without_verified_capability_is_not_routable() {
+        let mut catalog = SourceCatalog::default();
+        add_fulcrum(&mut catalog, "fulcrum-a");
+        catalog
+            .record_success(SourceKind::Fulcrum, "fulcrum-a", 1_000, 5)
+            .unwrap();
+        assert!(catalog
+            .router()
+            .select(SourceCapability::PhotonState, 1_000)
+            .is_none());
+
+        catalog
+            .verify_capability(
+                SourceKind::Fulcrum,
+                "fulcrum-a",
+                SourceCapability::PhotonState,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog
+                .router()
+                .select(SourceCapability::PhotonState, 1_000)
+                .unwrap()
+                .endpoint,
+            "fulcrum-a"
+        );
+    }
+
+    #[test]
+    fn auto_probe_is_bounded_and_rotates_builtins() {
+        let mut catalog = SourceCatalog::default();
+        for endpoint in ["a", "b", "c", "d"] {
+            catalog.entries.push(SourceEntry::built_in(
+                SourceKind::Fulcrum,
+                endpoint,
+                endpoint.into(),
+            ));
+        }
+        let first = catalog.probe_candidates(SourceKind::Fulcrum, 0, 2, 0);
+        let rotated = catalog.probe_candidates(SourceKind::Fulcrum, 0, 2, 1);
+        assert_eq!(first.len(), 2);
+        assert_eq!(rotated.len(), 2);
+        assert_ne!(first[0].endpoint, rotated[0].endpoint);
+    }
+
+    #[test]
+    fn mainnet_auto_probe_does_not_cover_entire_bootstrap_catalog() {
+        let catalog = SourceCatalog::mainnet();
+        let all_fulcrum = catalog
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SourceKind::Fulcrum)
+            .count();
+        let probes = catalog.probe_candidates(SourceKind::Fulcrum, 0, AUTO_PROBE_LIMIT, 0);
+        assert!(probes.len() <= AUTO_PROBE_LIMIT);
+        assert!(probes.len() < all_fulcrum);
+    }
+
+    #[test]
     fn disabled_source_is_not_available() {
         let mut entry = SourceEntry::user(SourceKind::Fulcrum, "a", "a".into());
         entry.enabled = false;
@@ -431,6 +553,14 @@ mod tests {
         add_fulcrum(&mut catalog, "disabled");
         add_fulcrum(&mut catalog, "blocked");
         add_fulcrum(&mut catalog, "eligible");
+        for endpoint in ["disabled", "blocked", "eligible"] {
+            catalog
+                .record_success(SourceKind::Fulcrum, endpoint, 0, 1)
+                .unwrap();
+            catalog
+                .verify_capability(SourceKind::Fulcrum, endpoint, SourceCapability::ChainHeight)
+                .unwrap();
+        }
         catalog
             .set_enabled(SourceKind::Fulcrum, "disabled", false)
             .unwrap();
@@ -502,6 +632,12 @@ mod tests {
         let mut catalog = SourceCatalog::default();
         add_fulcrum(&mut catalog, "a");
         add_fulcrum(&mut catalog, "b");
+        catalog
+            .verify_capability(SourceKind::Fulcrum, "a", SourceCapability::ChainHeight)
+            .unwrap();
+        catalog
+            .verify_capability(SourceKind::Fulcrum, "b", SourceCapability::ChainHeight)
+            .unwrap();
         catalog.entries[0].health = SourceHealth::Unhealthy;
         catalog.entries[0].retry_after_ms = Some(500);
         catalog.entries[1].health = SourceHealth::Healthy;
