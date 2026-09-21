@@ -2,6 +2,7 @@
 
 pub(crate) const MAX_SOURCES: usize = 64;
 pub(crate) const AUTO_PROBE_LIMIT: usize = 2;
+pub(crate) const DEFAULT_CAPABILITY_TTL_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceKind {
@@ -26,6 +27,19 @@ pub(crate) enum SourceCapability {
     Diagnostics,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapabilityEvidence {
+    pub(crate) capability: SourceCapability,
+    pub(crate) verified_at_ms: u64,
+    pub(crate) expires_at_ms: u64,
+}
+
+impl CapabilityEvidence {
+    fn is_current(self, now_ms: u64) -> bool {
+        now_ms <= self.expires_at_ms
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SourceHealth {
     Healthy,
@@ -40,7 +54,7 @@ pub(crate) struct SourceEntry {
     pub(crate) endpoint: String,
     pub(crate) label: String,
     pub(crate) provenance: SourceProvenance,
-    pub(crate) capabilities: Vec<SourceCapability>,
+    pub(crate) capabilities: Vec<CapabilityEvidence>,
     pub(crate) health: SourceHealth,
     pub(crate) enabled: bool,
     pub(crate) banned: bool,
@@ -76,13 +90,31 @@ impl SourceEntry {
         Self::new(kind, endpoint, label, SourceProvenance::User)
     }
 
-    pub(crate) fn supports(&self, capability: SourceCapability) -> bool {
-        self.capabilities.contains(&capability)
+    pub(crate) fn supports_at(&self, capability: SourceCapability, now_ms: u64) -> bool {
+        self.capabilities
+            .iter()
+            .any(|evidence| evidence.capability == capability && evidence.is_current(now_ms))
     }
 
-    pub(crate) fn verify_capability(&mut self, capability: SourceCapability) {
-        if !self.capabilities.contains(&capability) {
-            self.capabilities.push(capability);
+    pub(crate) fn verify_capability(
+        &mut self,
+        capability: SourceCapability,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) {
+        let evidence = CapabilityEvidence {
+            capability,
+            verified_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(ttl_ms),
+        };
+        if let Some(existing) = self
+            .capabilities
+            .iter_mut()
+            .find(|existing| existing.capability == capability)
+        {
+            *existing = evidence;
+        } else {
+            self.capabilities.push(evidence);
         }
     }
 
@@ -236,11 +268,13 @@ impl SourceCatalog {
         kind: SourceKind,
         endpoint: &str,
         capability: SourceCapability,
+        now_ms: u64,
+        ttl_ms: u64,
     ) -> Result<(), String> {
         let entry = self
             .entry_mut(kind, endpoint)
             .ok_or_else(|| "source not found".to_string())?;
-        entry.verify_capability(capability);
+        entry.verify_capability(capability, now_ms, ttl_ms);
         Ok(())
     }
 
@@ -360,7 +394,7 @@ impl SourceRouter<'_> {
             .iter()
             .filter(|entry| {
                 entry.health == SourceHealth::Healthy
-                    && entry.supports(capability)
+                    && entry.supports_at(capability, now_ms)
                     && entry.available_at(now_ms)
             })
             .collect::<Vec<_>>();
@@ -429,6 +463,8 @@ mod tests {
                 SourceKind::Fulcrum,
                 "fulcrum-a",
                 SourceCapability::PhotonState,
+                1_000,
+                DEFAULT_CAPABILITY_TTL_MS,
             )
             .unwrap();
 
@@ -458,7 +494,7 @@ mod tests {
     #[test]
     fn native_node_does_not_claim_photon_state() {
         let entry = SourceEntry::user(SourceKind::NativeNode, "node-a", "node".into());
-        assert!(!entry.supports(SourceCapability::PhotonState));
+        assert!(!entry.supports_at(SourceCapability::PhotonState, 0));
     }
 
     #[test]
@@ -491,6 +527,8 @@ mod tests {
                 SourceKind::Fulcrum,
                 "fulcrum-a",
                 SourceCapability::PhotonState,
+                1_000,
+                DEFAULT_CAPABILITY_TTL_MS,
             )
             .unwrap();
         assert_eq!(
@@ -558,7 +596,13 @@ mod tests {
                 .record_success(SourceKind::Fulcrum, endpoint, 0, 1)
                 .unwrap();
             catalog
-                .verify_capability(SourceKind::Fulcrum, endpoint, SourceCapability::ChainHeight)
+                .verify_capability(
+                    SourceKind::Fulcrum,
+                    endpoint,
+                    SourceCapability::ChainHeight,
+                    0,
+                    DEFAULT_CAPABILITY_TTL_MS,
+                )
                 .unwrap();
         }
         catalog
@@ -633,10 +677,22 @@ mod tests {
         add_fulcrum(&mut catalog, "a");
         add_fulcrum(&mut catalog, "b");
         catalog
-            .verify_capability(SourceKind::Fulcrum, "a", SourceCapability::ChainHeight)
+            .verify_capability(
+                SourceKind::Fulcrum,
+                "a",
+                SourceCapability::ChainHeight,
+                0,
+                DEFAULT_CAPABILITY_TTL_MS,
+            )
             .unwrap();
         catalog
-            .verify_capability(SourceKind::Fulcrum, "b", SourceCapability::ChainHeight)
+            .verify_capability(
+                SourceKind::Fulcrum,
+                "b",
+                SourceCapability::ChainHeight,
+                0,
+                DEFAULT_CAPABILITY_TTL_MS,
+            )
             .unwrap();
         catalog.entries[0].health = SourceHealth::Unhealthy;
         catalog.entries[0].retry_after_ms = Some(500);
@@ -644,5 +700,32 @@ mod tests {
         let router = catalog.router();
         let selected = router.select(SourceCapability::ChainHeight, 100).unwrap();
         assert_eq!(selected.endpoint, "b");
+    }
+
+    #[test]
+    fn verified_capability_expires_and_must_be_refreshed() {
+        let mut catalog = SourceCatalog::default();
+        add_fulcrum(&mut catalog, "a");
+        catalog
+            .record_success(SourceKind::Fulcrum, "a", 1_000, 5)
+            .unwrap();
+        catalog
+            .verify_capability(
+                SourceKind::Fulcrum,
+                "a",
+                SourceCapability::PhotonState,
+                1_000,
+                100,
+            )
+            .unwrap();
+
+        assert!(catalog
+            .router()
+            .select(SourceCapability::PhotonState, 1_100)
+            .is_some());
+        assert!(catalog
+            .router()
+            .select(SourceCapability::PhotonState, 1_101)
+            .is_none());
     }
 }
