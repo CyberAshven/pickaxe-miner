@@ -5,6 +5,7 @@
 use crate::protocol::{derive_photon_state, EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
 use crate::search::MiningJob;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
@@ -28,6 +29,12 @@ pub struct LiveJob {
     pub age: u32,
     pub target_le_hex: String,
     pub reward_raw: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveStateSnapshot {
+    pub tip_hash: String,
+    pub job: LiveJob,
 }
 
 impl LiveJob {
@@ -231,6 +238,66 @@ impl ElectrumSession {
         )?;
         live_job_from_fulcrum_values(&self.url, self.server_version.clone(), &header, &unspent)
     }
+
+    pub fn fetch_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
+        let header_before = self.rpc("blockchain.headers.subscribe", json!([]))?;
+        let unspent = self.rpc(
+            "blockchain.scripthash.listunspent",
+            json!([EXPECTED_SCRIPT_HASH_HEX, "include_tokens"]),
+        )?;
+        let header_after = self.rpc("blockchain.headers.subscribe", json!([]))?;
+
+        let tip_hash = stable_fulcrum_tip_hash(&header_before, &header_after)?;
+
+        let job = live_job_from_fulcrum_values(
+            &self.url,
+            self.server_version.clone(),
+            &header_after,
+            &unspent,
+        )?;
+        Ok(LiveStateSnapshot { tip_hash, job })
+    }
+}
+
+fn fulcrum_header_height(header: &Value) -> Result<u32, String> {
+    header
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "Fulcrum header response omitted a valid height".to_string())
+}
+
+fn stable_fulcrum_tip_hash(before: &Value, after: &Value) -> Result<String, String> {
+    let before_hash = fulcrum_header_hash(before)?;
+    let after_hash = fulcrum_header_hash(after)?;
+    let before_height = fulcrum_header_height(before)?;
+    let after_height = fulcrum_header_height(after)?;
+    if before_height != after_height || !before_hash.eq_ignore_ascii_case(&after_hash) {
+        return Err("Fulcrum PHOTON snapshot changed tip while reading token state".into());
+    }
+    Ok(after_hash)
+}
+
+pub(crate) fn fulcrum_header_hash(header: &Value) -> Result<String, String> {
+    let header_hex = header
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or("Fulcrum header response omitted hex")?;
+    let header_bytes =
+        hex::decode(header_hex).map_err(|error| format!("invalid Fulcrum header hex: {error}"))?;
+    if header_bytes.len() != 80 {
+        return Err(format!(
+            "Fulcrum header must be exactly 80 bytes; got {}",
+            header_bytes.len()
+        ));
+    }
+    let first = Sha256::digest(&header_bytes);
+    let second = Sha256::digest(first);
+    Ok(second
+        .iter()
+        .rev()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub(crate) fn live_job_from_fulcrum_values(
@@ -320,4 +387,45 @@ pub(crate) fn live_job_from_fulcrum_values(
 fn id_matches(v: &Value, id: u64) -> bool {
     v.get("id").and_then(|x| x.as_u64()) == Some(id)
         || v.get("id").and_then(|x| x.as_i64()).map(|x| x as u64) == Some(id)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fulcrum_header_hash_matches_genesis_header() {
+        let header = json!({
+            "height": 0,
+            "hex": "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c"
+        });
+        assert_eq!(
+            fulcrum_header_hash(&header).unwrap(),
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
+    }
+
+    #[test]
+    fn fulcrum_snapshot_requires_stable_height_and_tip_hash() {
+        let before = json!({
+            "height": 0,
+            "hex": "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c"
+        });
+        assert!(stable_fulcrum_tip_hash(&before, &before).is_ok());
+
+        let mut changed_height = before.clone();
+        changed_height["height"] = json!(1);
+        assert!(stable_fulcrum_tip_hash(&before, &changed_height).is_err());
+
+        let mut changed_header = before.clone();
+        let mut header_hex = before["hex"].as_str().unwrap().to_string();
+        header_hex.replace_range(0..2, "02");
+        changed_header["hex"] = json!(header_hex);
+        assert!(stable_fulcrum_tip_hash(&before, &changed_header).is_err());
+    }
+
+    #[test]
+    fn fulcrum_header_hash_rejects_non_header_payloads() {
+        assert!(fulcrum_header_hash(&json!({"height": 1, "hex": "00"})).is_err());
+        assert!(fulcrum_header_hash(&json!({"height": 1})).is_err());
+    }
 }

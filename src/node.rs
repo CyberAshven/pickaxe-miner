@@ -4,7 +4,7 @@
 //! bounded unconfirmed-baton continuation. Runtime routing stays on Fulcrum
 //! until the native capability is explicitly promoted after equivalence review.
 
-use crate::electrum::LiveJob;
+use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::protocol::{derive_photon_state, COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -177,6 +177,17 @@ struct NativePhotonBaton {
 const MAX_NATIVE_PHOTON_MEMPOOL_BOOTSTRAP_CANDIDATES: usize = 2_048;
 const MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH: usize = 64;
 
+struct NativePhotonBootstrap {
+    snapshot: LiveStateSnapshot,
+    baton: NativePhotonBaton,
+}
+
+pub struct NativePhotonSession {
+    url: String,
+    baton: NativePhotonBaton,
+    snapshot: LiveStateSnapshot,
+}
+
 /// Reconstruct the PHOTON live state from BCHN's native UTXO/token RPCs.
 ///
 /// This provider is intentionally not advertised to the runtime source router
@@ -184,32 +195,96 @@ const MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH: usize = 64;
 /// only when that baton has already been spent by an unconfirmed successor.
 /// Runtime capability remains fail-closed until the normalized state is proven
 /// equivalent to the canonical Fulcrum path.
-#[allow(dead_code)]
-pub fn fetch_photon_live_job(endpoints: &[String]) -> Result<LiveJob, String> {
-    if endpoints.is_empty() {
-        return Err("no native node endpoints configured for PHOTON state".into());
+impl NativePhotonSession {
+    pub fn connect_failover(endpoints: &[String]) -> Result<Self, String> {
+        if endpoints.is_empty() {
+            return Err("no native node endpoints configured for PHOTON state".into());
+        }
+
+        let mut failures = Vec::new();
+        let mut backoff_ms: u64 = 400;
+        for (index, url) in endpoints.iter().enumerate() {
+            if index > 0 {
+                thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
+            }
+            match bootstrap_native_photon(url) {
+                Ok(bootstrap) => {
+                    return Ok(Self {
+                        url: url.clone(),
+                        baton: bootstrap.baton,
+                        snapshot: bootstrap.snapshot,
+                    });
+                }
+                Err(error) => failures.push(format!("{}: {error}", redact_url(url))),
+            }
+        }
+
+        Err(format!(
+            "All native node PHOTON-state RPCs failed (sequential, ban-safe):\n{}",
+            failures.join("\n")
+        ))
     }
 
-    let mut failures = Vec::new();
-    let mut backoff_ms: u64 = 400;
-    for (index, url) in endpoints.iter().enumerate() {
-        if index > 0 {
-            thread::sleep(Duration::from_millis(backoff_ms));
-            backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
-        }
-        match fetch_photon_live_job_one(url) {
-            Ok(job) => return Ok(job),
-            Err(error) => failures.push(format!("{}: {error}", redact_url(url))),
-        }
+    pub fn snapshot(&self) -> &LiveStateSnapshot {
+        &self.snapshot
     }
 
-    Err(format!(
-        "All native node PHOTON-state RPCs failed (sequential, ban-safe):\n{}",
-        failures.join("\n")
-    ))
+    /// Refresh from the cached baton without rescanning the full UTXO set.
+    ///
+    /// A full scan is only used for recovery after the cached baton disappears
+    /// and a canonical mempool successor cannot be established.
+    pub fn refresh(&mut self) -> Result<LiveStateSnapshot, String> {
+        let (height, bestblock) = fetch_native_chain_tip(&self.url)?;
+        let txout = rpc_call(
+            &self.url,
+            "gettxout",
+            json!([self.baton.txid.clone(), self.baton.vout, true]),
+        )?;
+
+        let observed_baton = if txout.is_null() {
+            match resolve_native_mempool_baton(&self.url, &self.baton) {
+                Ok(successor) => successor,
+                Err(refresh_error) => {
+                    let bootstrap = bootstrap_native_photon(&self.url).map_err(|bootstrap_error| {
+                        format!(
+                            "cached native PHOTON baton refresh failed: {refresh_error}; rebootstrap failed: {bootstrap_error}"
+                        )
+                    })?;
+                    self.baton = bootstrap.baton;
+                    self.snapshot = bootstrap.snapshot.clone();
+                    return Ok(bootstrap.snapshot);
+                }
+            }
+        } else {
+            parse_native_gettxout_baton(
+                &self.baton.txid,
+                self.baton.vout,
+                height,
+                &bestblock,
+                &txout,
+            )?
+        };
+
+        let snapshot =
+            finalize_native_photon_snapshot(&self.url, height, &bestblock, observed_baton)?;
+        self.baton = baton_from_live_job(&snapshot.job);
+        self.snapshot = snapshot.clone();
+        Ok(snapshot)
+    }
 }
 
-fn fetch_photon_live_job_one(url: &str) -> Result<LiveJob, String> {
+/// Reconstruct the PHOTON live state from BCHN's native UTXO/token RPCs.
+///
+/// This compatibility wrapper performs a single bootstrap. Production callers
+/// that refresh repeatedly should retain NativePhotonSession.
+#[allow(dead_code)]
+pub fn fetch_photon_live_job(endpoints: &[String]) -> Result<LiveJob, String> {
+    let session = NativePhotonSession::connect_failover(endpoints)?;
+    Ok(session.snapshot().job.clone())
+}
+
+fn bootstrap_native_photon(url: &str) -> Result<NativePhotonBootstrap, String> {
     let descriptor = format!("raw({COVENANT_LOCKING_BYTECODE_HEX})");
     let scan = rpc_call(url, "scantxoutset", json!(["start", [descriptor]]))?;
     if scan.get("success").and_then(Value::as_bool) != Some(true) {
@@ -243,11 +318,10 @@ fn fetch_photon_live_job_one(url: &str) -> Result<LiveJob, String> {
     }
 
     let scan_baton = parse_native_scan_baton(candidates[0])?;
-
     let first = rpc_call(
         url,
         "gettxout",
-        json!([scan_baton.txid, scan_baton.vout, true]),
+        json!([scan_baton.txid.clone(), scan_baton.vout, true]),
     )?;
     let observed_baton = if first.is_null() {
         resolve_native_mempool_baton(url, &scan_baton)?
@@ -265,18 +339,45 @@ fn fetch_photon_live_job_one(url: &str) -> Result<LiveJob, String> {
         baton
     };
 
+    let snapshot = finalize_native_photon_snapshot(url, height, bestblock, observed_baton)?;
+    let baton = baton_from_live_job(&snapshot.job);
+    Ok(NativePhotonBootstrap { snapshot, baton })
+}
+
+fn fetch_native_chain_tip(url: &str) -> Result<(u32, String), String> {
+    let info = rpc_call(url, "getblockchaininfo", json!([]))?;
+    let height = info
+        .get("blocks")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("getblockchaininfo omitted a valid blocks height")?;
+    let bestblock = info
+        .get("bestblockhash")
+        .and_then(Value::as_str)
+        .filter(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or("getblockchaininfo omitted a valid bestblockhash")?
+        .to_ascii_lowercase();
+    Ok((height, bestblock))
+}
+
+fn finalize_native_photon_snapshot(
+    url: &str,
+    height: u32,
+    bestblock: &str,
+    observed_baton: NativePhotonBaton,
+) -> Result<LiveStateSnapshot, String> {
     let observed_bestblock = rpc_call(url, "getbestblockhash", json!([]))?;
     let observed_bestblock = observed_bestblock
         .as_str()
         .ok_or("getbestblockhash returned a non-string result")?;
     if !observed_bestblock.eq_ignore_ascii_case(bestblock) {
-        return Err("native PHOTON scan became stale while reconstructing state".into());
+        return Err("native PHOTON snapshot became stale while reconstructing state".into());
     }
 
     let second = rpc_call(
         url,
         "gettxout",
-        json!([observed_baton.txid, observed_baton.vout, true]),
+        json!([observed_baton.txid.clone(), observed_baton.vout, true]),
     )?;
     if second.is_null() {
         return Err(
@@ -300,10 +401,9 @@ fn fetch_photon_live_job_one(url: &str) -> Result<LiveJob, String> {
         height,
         second_baton.height,
     )?;
-
-    Ok(LiveJob {
+    let job = LiveJob {
         url: redact_url(url),
-        server_version: json!({"provider": "native-bchn", "snapshot": "scantxoutset+gettxout"}),
+        server_version: json!({"provider": "native-bchn", "snapshot": "stateful-gettxout"}),
         height,
         baton_txid: second_baton.txid,
         baton_vout: second_baton.vout,
@@ -314,7 +414,69 @@ fn fetch_photon_live_job_one(url: &str) -> Result<LiveJob, String> {
         age: derived.age,
         target_le_hex: derived.target_le_hex,
         reward_raw: derived.reward_raw,
+    };
+    Ok(LiveStateSnapshot {
+        tip_hash: bestblock.to_ascii_lowercase(),
+        job,
     })
+}
+
+fn baton_from_live_job(job: &LiveJob) -> NativePhotonBaton {
+    NativePhotonBaton {
+        txid: job.baton_txid.clone(),
+        vout: job.baton_vout,
+        height: job.baton_height,
+        value_sats: job.baton_value_sats,
+        commitment_hex: job.commitment_hex.clone(),
+        token_amount: job.token_amount,
+    }
+}
+
+pub fn verify_live_photon_equivalence(
+    native: &mut NativePhotonSession,
+    canonical: &mut ElectrumSession,
+) -> Result<LiveStateSnapshot, String> {
+    let canonical_snapshot = canonical.fetch_live_snapshot()?;
+    let native_snapshot = native.refresh()?;
+    verify_photon_state_equivalence(&native_snapshot, &canonical_snapshot)?;
+    Ok(native_snapshot)
+}
+
+pub(crate) fn verify_photon_state_equivalence(
+    native: &LiveStateSnapshot,
+    canonical: &LiveStateSnapshot,
+) -> Result<(), String> {
+    if !native.tip_hash.eq_ignore_ascii_case(&canonical.tip_hash) {
+        return Err(format!(
+            "PHOTON provider tip mismatch: native={} canonical={}",
+            native.tip_hash, canonical.tip_hash
+        ));
+    }
+
+    macro_rules! require_equal {
+        ($field:ident) => {
+            if native.job.$field != canonical.job.$field {
+                return Err(format!(
+                    "PHOTON provider state mismatch for {}: native={:?} canonical={:?}",
+                    stringify!($field),
+                    native.job.$field,
+                    canonical.job.$field
+                ));
+            }
+        };
+    }
+
+    require_equal!(height);
+    require_equal!(baton_txid);
+    require_equal!(baton_vout);
+    require_equal!(baton_height);
+    require_equal!(baton_value_sats);
+    require_equal!(commitment_hex);
+    require_equal!(token_amount);
+    require_equal!(age);
+    require_equal!(target_le_hex);
+    require_equal!(reward_raw);
+    Ok(())
 }
 
 fn resolve_native_mempool_baton(
@@ -1242,9 +1404,19 @@ mod gbt_tests {
             ("scantxoutset", scan),
             ("gettxout", txout.clone()),
             ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", txout.clone()),
+            (
+                "getblockchaininfo",
+                json!({"blocks": 1000, "bestblockhash": bestblock.clone()}),
+            ),
+            ("gettxout", txout.clone()),
+            ("getbestblockhash", json!(bestblock.clone())),
             ("gettxout", txout),
         ]);
-        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint)).unwrap();
+        let mut native_session =
+            NativePhotonSession::connect_failover(std::slice::from_ref(&endpoint)).unwrap();
+        let native = native_session.snapshot().job.clone();
+        let refreshed = native_session.refresh().unwrap();
         server.join().unwrap();
 
         let fulcrum = live_job_from_fulcrum_values(
@@ -1269,6 +1441,29 @@ mod gbt_tests {
         .unwrap();
 
         assert_same_photon_state(&native, &fulcrum);
+        assert_same_photon_state(&refreshed.job, &fulcrum);
+        assert_eq!(refreshed.tip_hash, bestblock);
+
+        let native_snapshot = LiveStateSnapshot {
+            tip_hash: bestblock.clone(),
+            job: native.clone(),
+        };
+        let mut canonical_snapshot = LiveStateSnapshot {
+            tip_hash: bestblock,
+            job: fulcrum.clone(),
+        };
+        verify_photon_state_equivalence(&native_snapshot, &canonical_snapshot).unwrap();
+
+        canonical_snapshot.tip_hash = "23".repeat(32);
+        let tip_error =
+            verify_photon_state_equivalence(&native_snapshot, &canonical_snapshot).unwrap_err();
+        assert!(tip_error.contains("tip mismatch"), "{tip_error}");
+
+        canonical_snapshot = native_snapshot.clone();
+        canonical_snapshot.job.baton_value_sats += 1;
+        let field_error =
+            verify_photon_state_equivalence(&native_snapshot, &canonical_snapshot).unwrap_err();
+        assert!(field_error.contains("baton_value_sats"), "{field_error}");
         assert_eq!(native.age, 10);
     }
 
