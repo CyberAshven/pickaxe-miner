@@ -604,6 +604,9 @@ impl SearchHandle {
                 reply: reply_tx,
             })
             .map_err(|_| "PHOTON CUDA worker is not running".to_string())?;
+        if let Some(worker) = self.worker.as_ref() {
+            worker.thread().unpark();
+        }
         reply_rx
             .recv_timeout(Duration::from_secs(30))
             .map_err(|_| "timed out applying PHOTON job generation".to_string())?
@@ -844,6 +847,54 @@ mod tests {
             source_identity: "test".into(),
             generation_id,
         }
+    }
+
+    #[test]
+    fn generation_replacement_wakes_parked_worker() {
+        let (job_tx, job_rx) = mpsc::sync_channel(1);
+        let (_winner_tx, winner_rx) = mpsc::sync_channel(1);
+        let generation_id = Arc::new(AtomicU64::new(1));
+        let worker_generation = Arc::clone(&generation_id);
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let started = Instant::now();
+            thread::park_timeout(Duration::from_secs(5));
+            let command = job_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("replacement command must be available after wake");
+            match command {
+                WorkerCommand::ReplaceJob { job, reply } => {
+                    worker_generation.store(job.generation_id, Ordering::Release);
+                    let _ = reply.send(Ok(()));
+                }
+            }
+            let _ = wake_tx.send(started.elapsed());
+        });
+
+        let handle = SearchHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            batch_in_flight: Arc::new(AtomicBool::new(false)),
+            intensity: Arc::new(AtomicU8::new(10)),
+            candidates: Arc::new(AtomicU64::new(0)),
+            batches: Arc::new(AtomicU64::new(0)),
+            winners: Arc::new(AtomicU64::new(0)),
+            generation_id,
+            job_tx,
+            winner_rx,
+            worker: Some(worker),
+            started: Instant::now(),
+        };
+
+        handle.replace_job(integration_job(2)).unwrap();
+        let elapsed = wake_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("generation replacement must wake a duty-resting worker");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "worker remained parked after generation replacement: {elapsed:?}"
+        );
+        assert_eq!(handle.generation_id(), 2);
     }
 
     #[test]
