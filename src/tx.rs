@@ -296,10 +296,11 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
         return Err("prev tx hash must be 32 bytes".into());
     }
 
+    let max_baton_decrease_sats = crate::protocol::photon_single_input_max_baton_decrease_sats()?;
     let baton_sats = p
         .contract_value_sats
-        .checked_sub(1500)
-        .ok_or("contract value too small for fee")?;
+        .checked_sub(max_baton_decrease_sats)
+        .ok_or("contract value too small for PHOTON parent covenant budget")?;
 
     let mut tx = Vec::new();
     tx.extend_from_slice(&u32_le(2)); // version
