@@ -1801,10 +1801,12 @@ fn run_supervisor(
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Resume(reply)) => {
+                    let unacknowledged = search.snapshot().winners > observed_search_winners;
                     let result = resume_search_if_safe(
                         &shutdown,
                         session.is_some(),
                         pending_winners,
+                        unacknowledged,
                         &mut user_paused,
                         || search.apply_control(SearchCommand::Resume).map(|_| ()),
                     );
@@ -2333,11 +2335,9 @@ fn run_supervisor(
                                         );
                                     }
                                 }
-                                // The worker is paused at a batch boundary, so
-                                // this snapshot acknowledges every winner
-                                // produced through that boundary, including
-                                // any excess result dropped by the bounded
-                                // winner channel.
+                                // The worker pauses after a verified winning
+                                // batch, so this snapshot acknowledges every
+                                // bounded winner queued through that boundary.
                                 observed_search_winners = search.snapshot().winners;
                                 winner_refresh_pending = false;
                                 if pending_winner.is_none() && pending_submission.is_none() {
@@ -2808,6 +2808,7 @@ fn resume_search_if_safe<F>(
     shutdown: &ShutdownSignal,
     session_connected: bool,
     pending_winners: u64,
+    unacknowledged_winner: bool,
     user_paused: &mut bool,
     mut resume_search: F,
 ) -> Result<(), String>
@@ -2822,6 +2823,9 @@ where
     }
     if pending_winners > 0 {
         return Err("cannot resume while a verified winner is pending handling".into());
+    }
+    if unacknowledged_winner {
+        return Err("cannot resume while a verified winner awaits supervisor refresh".into());
     }
 
     resume_search()?;
@@ -3780,16 +3784,17 @@ mod tests {
         let mut user_paused = true;
         let mut resume_calls = 0;
 
-        let disconnected = resume_search_if_safe(&shutdown, false, 0, &mut user_paused, || {
-            resume_calls += 1;
-            Ok(())
-        })
-        .unwrap_err();
+        let disconnected =
+            resume_search_if_safe(&shutdown, false, 0, false, &mut user_paused, || {
+                resume_calls += 1;
+                Ok(())
+            })
+            .unwrap_err();
         assert!(disconnected.contains("disconnected"));
         assert!(user_paused);
         assert_eq!(resume_calls, 0);
 
-        let pending = resume_search_if_safe(&shutdown, true, 1, &mut user_paused, || {
+        let pending = resume_search_if_safe(&shutdown, true, 1, false, &mut user_paused, || {
             resume_calls += 1;
             Ok(())
         })
@@ -3798,16 +3803,26 @@ mod tests {
         assert!(user_paused);
         assert_eq!(resume_calls, 0);
 
-        let worker_error = resume_search_if_safe(&shutdown, true, 0, &mut user_paused, || {
+        let queued = resume_search_if_safe(&shutdown, true, 0, true, &mut user_paused, || {
             resume_calls += 1;
-            Err("resume worker failure".into())
+            Ok(())
         })
         .unwrap_err();
+        assert!(queued.contains("supervisor refresh"));
+        assert!(user_paused);
+        assert_eq!(resume_calls, 0);
+
+        let worker_error =
+            resume_search_if_safe(&shutdown, true, 0, false, &mut user_paused, || {
+                resume_calls += 1;
+                Err("resume worker failure".into())
+            })
+            .unwrap_err();
         assert_eq!(worker_error, "resume worker failure");
         assert!(user_paused);
         assert_eq!(resume_calls, 1);
 
-        resume_search_if_safe(&shutdown, true, 0, &mut user_paused, || {
+        resume_search_if_safe(&shutdown, true, 0, false, &mut user_paused, || {
             resume_calls += 1;
             Ok(())
         })

@@ -10,7 +10,7 @@ use rand::Rng;
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ pub const REFERENCE_GPU_PIPELINE_READY: bool = true;
 
 pub(crate) const MAX_BATCH_CANDIDATES: u32 = 65_536;
 const WINNER_BUFFER_CAP: u32 = 8;
-const WINNER_CHANNEL_CAP: usize = 8;
+const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const JOB_UPDATE_CHANNEL_CAP: usize = 2;
 const PAUSE_POLL: Duration = Duration::from_millis(25);
 
@@ -299,6 +299,26 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     Duration::from_nanos(rest_ns.min(u128::from(u64::MAX)) as u64)
 }
 
+fn deliver_verified_batch(
+    verified_batch: Vec<VerifiedWinner>,
+    paused: &AtomicBool,
+    winners: &AtomicU64,
+    winner_tx: &SyncSender<VerifiedWinner>,
+) -> bool {
+    if verified_batch.is_empty() {
+        return true;
+    }
+
+    paused.store(true, Ordering::SeqCst);
+    for verified in verified_batch {
+        if winner_tx.send(verified).is_err() {
+            return false;
+        }
+        winners.fetch_add(1, Ordering::Release);
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     mut engine: PhotonEngine,
@@ -364,19 +384,16 @@ fn run_worker(
         candidates.fetch_add(u64::from(result.candidates), Ordering::Relaxed);
         batches.fetch_add(1, Ordering::Release);
 
+        let mut verified_batch = Vec::with_capacity(result.winners.len());
         for gpu_winner in &result.winners {
             let verified = match verify_gpu_winner(&prepared, &sk, &public_key, gpu_winner) {
                 Ok(verified) => verified,
                 Err(_) => continue,
             };
-            winners.fetch_add(1, Ordering::Relaxed);
-            match winner_tx.try_send(verified) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-            }
+            verified_batch.push(verified);
+        }
+        if !deliver_verified_batch(verified_batch, &paused, &winners, &winner_tx) {
+            stop.store(true, Ordering::Relaxed);
         }
         batch_in_flight.store(false, Ordering::SeqCst);
 
@@ -749,6 +766,36 @@ mod tests {
             duty_rest(Duration::from_millis(10), 25),
             Duration::from_millis(30)
         );
+    }
+
+    #[test]
+    fn verified_winning_batch_pauses_and_fits_bounded_delivery_queue() {
+        assert!(WINNER_CHANNEL_CAP >= WINNER_BUFFER_CAP as usize);
+
+        let paused = AtomicBool::new(false);
+        let winners = AtomicU64::new(0);
+        let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
+        let batch = (0..WINNER_BUFFER_CAP)
+            .map(|nonce| VerifiedWinner {
+                generation_id: 1,
+                height: 1_000,
+                baton_txid: "11".repeat(32),
+                baton_vout: 0,
+                nonce,
+                digest: [0u8; 32],
+                public_key: [2u8; 33],
+                signature: [0u8; 64],
+                transaction: vec![0x02],
+            })
+            .collect();
+
+        assert!(deliver_verified_batch(batch, &paused, &winners, &winner_tx));
+        assert!(paused.load(Ordering::SeqCst));
+        assert_eq!(
+            winners.load(Ordering::Acquire),
+            u64::from(WINNER_BUFFER_CAP)
+        );
+        assert_eq!(winner_rx.try_iter().count(), WINNER_BUFFER_CAP as usize);
     }
 
     #[test]
