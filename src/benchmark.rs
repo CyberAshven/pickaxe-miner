@@ -2,10 +2,10 @@
 //! The benchmark never reads live baton state and never broadcasts.
 
 use crate::cuda_photon::CudaPhotonEngine;
+use crate::telemetry::{sample_nvidia_telemetry, GpuTelemetry as NvidiaTelemetry};
 use crate::{reward, search, tui, tx};
 use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,17 +30,6 @@ fn benchmark_intensities(requested: Option<u8>) -> Result<Vec<u8>, String> {
         Some(_) => Err("benchmark intensity must be 10..=100".into()),
         None => Ok(BENCHMARK_INTENSITIES.to_vec()),
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct NvidiaTelemetry {
-    pub samples: u32,
-    pub gpu_utilization_percent: Option<f64>,
-    pub power_watts: Option<f64>,
-    pub temperature_c: Option<f64>,
-    pub vram_used_mib: Option<f64>,
-    pub graphics_clock_mhz: Option<f64>,
-    pub memory_clock_mhz: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,40 +155,6 @@ fn add_metric(value: Option<f64>, sum: &mut f64, count: &mut u32) {
 
 fn average(sum: f64, count: u32) -> Option<f64> {
     (count > 0).then_some(sum / f64::from(count))
-}
-
-fn parse_metric(value: Option<&&str>) -> Option<f64> {
-    value?.trim().parse::<f64>().ok()
-}
-
-fn parse_nvidia_smi_line(line: &str) -> Option<NvidiaTelemetry> {
-    let fields = line.split(',').collect::<Vec<_>>();
-    if fields.len() != 6 {
-        return None;
-    }
-    Some(NvidiaTelemetry {
-        samples: 1,
-        gpu_utilization_percent: parse_metric(fields.first()),
-        power_watts: parse_metric(fields.get(1)),
-        temperature_c: parse_metric(fields.get(2)),
-        vram_used_mib: parse_metric(fields.get(3)),
-        graphics_clock_mhz: parse_metric(fields.get(4)),
-        memory_clock_mhz: parse_metric(fields.get(5)),
-    })
-}
-
-fn sample_nvidia_telemetry(device: u32) -> Option<NvidiaTelemetry> {
-    let output = Command::new("nvidia-smi")
-        .arg(format!("--id={device}"))
-        .arg("--query-gpu=utilization.gpu,power.draw,temperature.gpu,memory.used,clocks.gr,clocks.mem")
-        .arg("--format=csv,noheader,nounits")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_nvidia_smi_line(stdout.lines().next()?)
 }
 
 fn start_telemetry_sampler(
@@ -505,6 +460,7 @@ pub fn print_report(report: &BenchmarkReport, json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::parse_nvidia_smi_line;
 
     #[test]
     fn benchmark_matrix_covers_required_intensities() {

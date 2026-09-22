@@ -38,6 +38,7 @@ mod search;
 mod self_test;
 #[cfg(test)]
 mod stage_b;
+mod telemetry;
 #[allow(dead_code)]
 mod tui;
 mod tx;
@@ -841,6 +842,9 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
 }
 
 fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Value {
+    let efficiency = snapshot
+        .gpu_telemetry
+        .candidates_per_watt(snapshot.search.current_rate);
     serde_json::json!({
         "event": "status",
         "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
@@ -866,15 +870,25 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "verified_winners": snapshot.verified_winners,
         "pending_winners": snapshot.pending_winners,
         "last_error": snapshot.last_error,
+        "gpu_telemetry": &snapshot.gpu_telemetry,
+        "gpu_efficiency_candidates_per_watt": efficiency,
     })
+}
+
+fn runtime_metric(value: Option<f64>, unit: &str) -> String {
+    value
+        .map(|value| format!("{value:.1}{unit}"))
+        .unwrap_or_else(|| "N/A".into())
 }
 
 fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
     if json {
         println!("{}", runtime_snapshot_json(snapshot));
     } else {
+        let telemetry = &snapshot.gpu_telemetry;
+        let efficiency = telemetry.candidates_per_watt(snapshot.search.current_rate);
         println!(
-            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} current={:.0}/s avg={:.0}/s peak={:.0}/s state_checks={} job_changes={} reconnects={} winners={} pending={}",
+            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} current={:.0}/s avg={:.0}/s peak={:.0}/s state_checks={} job_changes={} reconnects={} winners={} pending={} gpu_util={} power={} temp={} vram={} efficiency={}",
             snapshot.state,
             snapshot.gpu_backend,
             snapshot.gpu_device,
@@ -893,6 +907,11 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             snapshot.reconnects,
             snapshot.verified_winners,
             snapshot.pending_winners,
+            runtime_metric(telemetry.gpu_utilization_percent, "%"),
+            runtime_metric(telemetry.power_watts, "W"),
+            runtime_metric(telemetry.temperature_c, "C"),
+            runtime_metric(telemetry.vram_used_mib, "MiB"),
+            runtime_metric(efficiency, " cand/s/W"),
         );
     }
 }
@@ -1200,6 +1219,15 @@ mod tests {
                 peak_rate: 65_536.0,
                 winners: 0,
             },
+            gpu_telemetry: telemetry::GpuTelemetry {
+                samples: 3,
+                gpu_utilization_percent: Some(77.0),
+                power_watts: Some(65.536),
+                temperature_c: Some(71.0),
+                vram_used_mib: Some(512.0),
+                graphics_clock_mhz: Some(2_400.0),
+                memory_clock_mhz: Some(8_000.0),
+            },
         };
 
         let status = runtime_snapshot_json(&snapshot);
@@ -1207,6 +1235,9 @@ mod tests {
         assert_eq!(status["job_changes"], 1);
         assert!(status.get("refreshes").is_none());
         assert!(status.get("stale_rebuilds").is_none());
+        assert_eq!(status["gpu_telemetry"]["samples"], 3);
+        assert_eq!(status["gpu_telemetry"]["gpu_utilization_percent"], 77.0);
+        assert_eq!(status["gpu_efficiency_candidates_per_watt"], 1_000.0);
     }
 
     #[test]
