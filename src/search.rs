@@ -111,6 +111,13 @@ impl PhotonEngine {
     }
 }
 
+pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32 {
+    match backend {
+        BackendKind::Wgpu => crate::wgpu_photon::WGPU_REFERENCE_MAX_BATCH,
+        BackendKind::Auto | BackendKind::Cuda | BackendKind::Hip => MAX_BATCH_CANDIDATES,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MiningJob {
     pub height: u32,
@@ -354,6 +361,18 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     Duration::from_nanos(rest_ns.min(u128::from(u64::MAX)) as u64)
 }
 
+fn throttle_sleep(rest: Duration) {
+    // ponytail: bounded sleep slices keep TUI/rate sampling responsive. Replace
+    // with a hardware paced scheduler only if power-aware throttling becomes a goal.
+    let slice = Duration::from_millis(5);
+    let mut remaining = rest;
+    while remaining > Duration::ZERO {
+        let current = remaining.min(slice);
+        thread::park_timeout(current);
+        remaining = remaining.saturating_sub(current);
+    }
+}
+
 fn deliver_verified_batch(
     verified_batch: Vec<VerifiedWinner>,
     paused: &AtomicBool,
@@ -456,7 +475,7 @@ fn run_worker(
 
         let rest = duty_rest(compute_time, active_intensity);
         if !rest.is_zero() {
-            thread::park_timeout(rest);
+            throttle_sleep(rest);
         }
     }
 }
@@ -588,7 +607,7 @@ impl SearchHandle {
         let mut engine = PhotonEngine::new(
             backend,
             device_ordinal,
-            MAX_BATCH_CANDIDATES,
+            production_max_batch_candidates(backend),
             WINNER_BUFFER_CAP,
         )?;
         engine.set_job(&prepared.template, &prepared.target, &sk)?;
@@ -811,6 +830,16 @@ mod tests {
         assert_eq!(
             duty_rest(Duration::from_millis(10), 25),
             Duration::from_millis(30)
+        );
+    }
+
+    #[test]
+    fn production_batch_envelope_keeps_native_limit_and_reference_wgpu_limit() {
+        assert_eq!(production_max_batch_candidates(BackendKind::Cuda), 65_536);
+        assert_eq!(production_max_batch_candidates(BackendKind::Hip), 65_536);
+        assert_eq!(
+            production_max_batch_candidates(BackendKind::Wgpu),
+            crate::wgpu_photon::WGPU_REFERENCE_MAX_BATCH
         );
     }
 
