@@ -2081,22 +2081,16 @@ fn run_supervisor(
                     let result = if pending_winners != 0 {
                         Err("reconnect unavailable while runtime work is pending".into())
                     } else {
-                        search
-                            .apply_control(SearchCommand::Pause)
-                            .map(|_| ())
-                            .map(|()| {
-                                session = None;
-                                state = SupervisorState::Reconnecting;
-                                last_error = None;
-                                reconnect_backoff = RECONNECT_MIN;
-                                next_reconnect = Instant::now();
-                                emit(
-                                    &event_tx,
-                                    RuntimeEvent::Reconnecting(
-                                        "manual Fulcrum reconnect requested".into(),
-                                    ),
-                                );
-                            })
+                        session = None;
+                        state = SupervisorState::Reconnecting;
+                        last_error = None;
+                        reconnect_backoff = RECONNECT_MIN;
+                        next_reconnect = Instant::now();
+                        emit(
+                            &event_tx,
+                            RuntimeEvent::Reconnecting("manual Fulcrum reconnect requested".into()),
+                        );
+                        Ok(())
                     };
                     let _ = reply.send(result);
                 }
