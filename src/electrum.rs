@@ -2,6 +2,7 @@
 //! Owned by Dev Assist. Search consumes MiningJob; no keys.
 //! Runtime winner settlement uses this session for ordered parent/settlement broadcast.
 
+use crate::config::DONATION_BPS;
 use crate::protocol::{derive_photon_state, EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
 use crate::search::MiningJob;
 use serde_json::{json, Value};
@@ -69,8 +70,13 @@ impl LiveJob {
         println!("token_amount:  {}", self.token_amount);
         println!("reward_raw:    {}", self.reward_raw);
         println!("commitment:    {} bytes", self.commitment_hex.len() / 2);
-        println!("donation:      disabled by two-output covenant");
+        println!("{}", donation_summary_line());
     }
+}
+
+fn donation_summary_line() -> String {
+    debug_assert_eq!(DONATION_BPS % 100, 0);
+    format!("donation:      {}%", DONATION_BPS / 100)
 }
 
 pub struct ElectrumSession {
@@ -391,6 +397,14 @@ fn id_matches(v: &Value, id: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_job_summary_reports_compiled_donation_policy() {
+        assert_eq!(DONATION_BPS, 200);
+        let summary = donation_summary_line();
+        assert_eq!(summary, "donation:      2%");
+        assert!(!summary.contains("disabled"));
+    }
 
     #[test]
     fn fulcrum_header_hash_matches_genesis_header() {
