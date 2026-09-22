@@ -2,6 +2,7 @@
 //! Electrum/win-tx stay in Dev Assist modules — this is search/crypto shared facts only.
 
 use num_bigint::BigUint;
+use sha2::{Digest, Sha256};
 
 /// CashToken category id (hex, 32 bytes).
 pub const MAINNET_CATEGORY_HEX: &str =
@@ -17,6 +18,125 @@ pub const EXPECTED_SCRIPT_HASH_HEX: &str =
 
 /// Redeem script hex (P2SH32 / covenant spend path) — from postcorps miner.js.
 pub const REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_redeem.hex");
+
+fn hash256(data: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(data);
+    let second = Sha256::digest(first);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&second);
+    out
+}
+
+fn decode_positive_script_number(bytes: &[u8]) -> Result<u64, String> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    if bytes.len() > 8 {
+        return Err("PHOTON covenant value rule exceeds u64 ScriptNum range".into());
+    }
+    if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+        return Err("PHOTON covenant value rule must be non-negative".into());
+    }
+    if bytes == [0]
+        || (bytes.len() > 1 && bytes.last() == Some(&0) && bytes[bytes.len() - 2] & 0x80 == 0)
+    {
+        return Err("PHOTON covenant value rule uses a non-minimal ScriptNum".into());
+    }
+
+    let mut value = 0u64;
+    for (index, byte) in bytes.iter().enumerate() {
+        value |= u64::from(*byte) << (index * 8);
+    }
+    Ok(value)
+}
+
+fn authoritative_redeem_script() -> Result<Vec<u8>, String> {
+    let redeem_script = hex::decode(REDEEM_SCRIPT_HEX.trim()).map_err(|error| error.to_string())?;
+    if redeem_script.len() != 259 {
+        return Err(format!(
+            "PHOTON redeem script must be 259 bytes (got {})",
+            redeem_script.len()
+        ));
+    }
+
+    let covenant_lock =
+        hex::decode(COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
+    if covenant_lock.len() != 35
+        || covenant_lock[0] != 0xaa
+        || covenant_lock[1] != 0x20
+        || covenant_lock[34] != 0x87
+    {
+        return Err("PHOTON covenant locking bytecode is not canonical P2SH32".into());
+    }
+    if covenant_lock[2..34] != hash256(&redeem_script) {
+        return Err("PHOTON redeem script does not match the covenant locking bytecode".into());
+    }
+    Ok(redeem_script)
+}
+
+pub fn photon_authoritative_redeem_script() -> Result<Vec<u8>, String> {
+    authoritative_redeem_script()
+}
+
+fn extract_baton_decrease_rule(
+    redeem_script: &[u8],
+    prefix: &[u8],
+    suffix: &[u8],
+    label: &str,
+) -> Result<u64, String> {
+    let mut found = None;
+    for start in 0..redeem_script.len() {
+        if redeem_script.get(start..start + prefix.len()) != Some(prefix) {
+            continue;
+        }
+        let push_len = match redeem_script.get(start + prefix.len()) {
+            Some(1..=8) => usize::from(redeem_script[start + prefix.len()]),
+            _ => continue,
+        };
+        let data_start = start + prefix.len() + 1;
+        let Some(data_end) = data_start.checked_add(push_len) else {
+            continue;
+        };
+        let Some(suffix_end) = data_end.checked_add(suffix.len()) else {
+            continue;
+        };
+        if redeem_script.get(data_end..suffix_end) != Some(suffix) {
+            continue;
+        }
+        let data = redeem_script
+            .get(data_start..data_end)
+            .ok_or("truncated PHOTON covenant value rule")?;
+        let value = decode_positive_script_number(data)?;
+        if found.replace(value).is_some() {
+            return Err(format!(
+                "PHOTON redeem script contains multiple {label} value rules"
+            ));
+        }
+    }
+    found.ok_or_else(|| format!("PHOTON redeem script {label} value rule was not found"))
+}
+
+pub fn photon_single_input_max_baton_decrease_sats() -> Result<u64, String> {
+    let redeem_script = authoritative_redeem_script()?;
+    // output[active].value >= input[active].value - <budget>
+    extract_baton_decrease_rule(
+        &redeem_script,
+        &[0xc0, 0xcc, 0xc0, 0xc6],
+        &[0x94, 0xa2, 0x69],
+        "single-input",
+    )
+}
+
+pub fn photon_multi_input_max_baton_decrease_sats() -> Result<u64, String> {
+    let redeem_script = authoritative_redeem_script()?;
+    // output[active].value + <budget> >= input[active].value
+    extract_baton_decrease_rule(
+        &redeem_script,
+        &[0xc0, 0xcc],
+        &[0x93, 0xc0, 0xc6, 0xa2, 0x69],
+        "multi-input",
+    )
+}
 
 /// Curated Fulcrum/Electrum **WSS** bootstrap (small, redundant).
 /// Custom `fulcrum` URL is tried first. Prefer CA-signed `:50004`.
@@ -111,5 +231,48 @@ mod tests {
             / BigUint::from(144u32);
         assert_eq!(state.target_le_hex, biguint_to_le_hex32(&expected).unwrap());
         assert_eq!(state.reward_raw, 4_999_999_999);
+    }
+
+    #[test]
+    fn covenant_baton_decrease_budgets_come_from_authoritative_redeem_script() {
+        assert_eq!(
+            photon_single_input_max_baton_decrease_sats().unwrap(),
+            1_500
+        );
+        assert_eq!(photon_multi_input_max_baton_decrease_sats().unwrap(), 8_000);
+    }
+
+    #[test]
+    fn covenant_value_rule_extractors_fail_closed_on_script_drift() {
+        let mut redeem_script = authoritative_redeem_script().unwrap();
+
+        let single_rule = [0xc0, 0xcc, 0xc0, 0xc6, 0x02, 0xdc, 0x05, 0x94, 0xa2, 0x69];
+        let single = redeem_script
+            .windows(single_rule.len())
+            .position(|window| window == single_rule)
+            .expect("authoritative single-input value rule");
+        redeem_script[single + 7] = 0x93;
+        assert!(extract_baton_decrease_rule(
+            &redeem_script,
+            &[0xc0, 0xcc, 0xc0, 0xc6],
+            &[0x94, 0xa2, 0x69],
+            "single-input",
+        )
+        .is_err());
+
+        let mut redeem_script = authoritative_redeem_script().unwrap();
+        let multi_rule = [0xc0, 0xcc, 0x02, 0x40, 0x1f, 0x93, 0xc0, 0xc6, 0xa2, 0x69];
+        let multi = redeem_script
+            .windows(multi_rule.len())
+            .position(|window| window == multi_rule)
+            .expect("authoritative multi-input value rule");
+        redeem_script[multi + 5] = 0x94;
+        assert!(extract_baton_decrease_rule(
+            &redeem_script,
+            &[0xc0, 0xcc],
+            &[0x93, 0xc0, 0xc6, 0xa2, 0x69],
+            "multi-input",
+        )
+        .is_err());
     }
 }
