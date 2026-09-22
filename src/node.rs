@@ -408,6 +408,7 @@ fn finalize_native_photon_snapshot(
         url: redact_url(url),
         server_version: json!({"provider": "native-bchn", "snapshot": "stateful-gettxout"}),
         height,
+        tip_hash: bestblock.to_ascii_lowercase(),
         baton_txid: second_baton.txid,
         baton_vout: second_baton.vout,
         baton_height: second_baton.height,
@@ -1230,6 +1231,8 @@ mod gbt_tests {
     use std::net::TcpListener;
     use std::thread;
 
+    const FIXTURE_HEADER_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+
     fn serve_json_rpc_sequence(
         responses: Vec<(&'static str, Value)>,
     ) -> (String, thread::JoinHandle<()>) {
@@ -1486,7 +1489,7 @@ mod gbt_tests {
         let fulcrum = live_job_from_fulcrum_values(
             "wss://fixture.invalid",
             json!(["Fulcrum", "1.5"]),
-            &json!({"height": 1000}),
+            &json!({"height": 1000, "hex": FIXTURE_HEADER_HEX}),
             &json!([{
                 "tx_hash": txid,
                 "tx_pos": 0,
@@ -1610,7 +1613,7 @@ mod gbt_tests {
         let fulcrum = live_job_from_fulcrum_values(
             "wss://fixture.invalid",
             json!(["Fulcrum", "1.5"]),
-            &json!({"height": 1000}),
+            &json!({"height": 1000, "hex": FIXTURE_HEADER_HEX}),
             &json!([{
                 "tx_hash": successor_txid,
                 "tx_pos": 0,
@@ -1752,7 +1755,7 @@ mod gbt_tests {
         let fulcrum = live_job_from_fulcrum_values(
             "wss://fixture.invalid",
             json!(["Fulcrum", "1.5"]),
-            &json!({"height": 1000}),
+            &json!({"height": 1000, "hex": FIXTURE_HEADER_HEX}),
             &json!([{
                 "tx_hash": final_txid,
                 "tx_pos": 0,

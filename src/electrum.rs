@@ -21,6 +21,7 @@ pub struct LiveJob {
     pub url: String,
     pub server_version: Value,
     pub height: u32,
+    pub tip_hash: String,
     pub baton_txid: String,
     pub baton_vout: u32,
     pub baton_height: u32,
@@ -237,12 +238,7 @@ impl ElectrumSession {
     }
 
     pub fn fetch_live_job(&mut self) -> Result<LiveJob, String> {
-        let header = self.rpc("blockchain.headers.subscribe", json!([]))?;
-        let unspent = self.rpc(
-            "blockchain.scripthash.listunspent",
-            json!([EXPECTED_SCRIPT_HASH_HEX, "include_tokens"]),
-        )?;
-        live_job_from_fulcrum_values(&self.url, self.server_version.clone(), &header, &unspent)
+        self.fetch_live_snapshot().map(|snapshot| snapshot.job)
     }
 
     pub fn fetch_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
@@ -261,6 +257,9 @@ impl ElectrumSession {
             &header_after,
             &unspent,
         )?;
+        if !job.tip_hash.eq_ignore_ascii_case(&tip_hash) {
+            return Err("Fulcrum PHOTON snapshot tip identity is inconsistent".into());
+        }
         Ok(LiveStateSnapshot { tip_hash, job })
     }
 }
@@ -317,6 +316,7 @@ pub(crate) fn live_job_from_fulcrum_values(
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or("Invalid live BCH header response")?;
+    let tip_hash = fulcrum_header_hash(header)?;
     let arr = unspent
         .as_array()
         .ok_or("Invalid live PHOTON UTXO response")?;
@@ -378,6 +378,7 @@ pub(crate) fn live_job_from_fulcrum_values(
         url: url.to_string(),
         server_version,
         height,
+        tip_hash,
         baton_txid,
         baton_vout,
         baton_height,
@@ -441,5 +442,17 @@ mod tests {
     fn fulcrum_header_hash_rejects_non_header_payloads() {
         assert!(fulcrum_header_hash(&json!({"height": 1, "hex": "00"})).is_err());
         assert!(fulcrum_header_hash(&json!({"height": 1})).is_err());
+    }
+
+    #[test]
+    fn live_job_requires_a_concrete_bch_tip_identity() {
+        let error = live_job_from_fulcrum_values(
+            "wss://fixture.invalid",
+            json!(["Fulcrum", "1.5"]),
+            &json!({"height": 1}),
+            &json!([]),
+        )
+        .unwrap_err();
+        assert!(error.contains("omitted hex"), "{error}");
     }
 }

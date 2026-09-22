@@ -810,7 +810,7 @@ fn submission_decision(parent_known: bool, live_matches_expected: bool) -> Submi
 
 enum SubmissionAttempt {
     Complete,
-    StaleUnbroadcast(LiveJob),
+    StaleUnbroadcast(Box<LiveJob>),
 }
 
 fn resulting_baton_is_authoritative(pending: &PendingSubmission, fresh: &LiveJob) -> bool {
@@ -1119,13 +1119,13 @@ fn attempt_pending_submission(
     let baton_conflicted = fresh.baton_txid != pending.expected_baton_txid
         || fresh.baton_vout != pending.expected_baton_vout;
     if baton_conflicted {
-        return Ok(SubmissionAttempt::StaleUnbroadcast(fresh));
+        return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
     }
     if !parent_attempted
         && submission_decision(false, pending.matches_live(&fresh))
             == SubmissionDecision::StaleUnbroadcast
     {
-        return Ok(SubmissionAttempt::StaleUnbroadcast(fresh));
+        return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
     }
 
     if !parent_attempted {
@@ -2163,7 +2163,7 @@ fn run_supervisor(
                                     &reward_public_key,
                                     &mining_payout_address,
                                     &journal_path,
-                                    next_job,
+                                    *next_job,
                                 ) {
                                     Ok(changed) => {
                                         if changed {
@@ -2745,7 +2745,8 @@ fn prepare_fulcrum_endpoint_change(
 }
 
 fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
-    current.baton_txid != next.baton_txid
+    !current.tip_hash.eq_ignore_ascii_case(&next.tip_hash)
+        || current.baton_txid != next.baton_txid
         || current.baton_vout != next.baton_vout
         || current.baton_height != next.baton_height
         || current.baton_value_sats != next.baton_value_sats
@@ -3112,6 +3113,7 @@ mod tests {
             url: "wss://one.invalid".into(),
             server_version: serde_json::json!(["Fulcrum", "1.5"]),
             height: 1_000,
+            tip_hash: "22".repeat(32),
             baton_txid: "11".repeat(32),
             baton_vout: 0,
             baton_height: 999,
@@ -3273,6 +3275,13 @@ mod tests {
         );
 
         next = current.clone();
+        next.tip_hash = "33".repeat(32);
+        assert!(
+            live_job_changed(&current, &next),
+            "same-height BCH tip replacement must invalidate the mining generation"
+        );
+
+        next = current.clone();
         next.height += 1;
         next.age += 1;
         assert!(live_job_changed(&current, &next));
@@ -3280,6 +3289,41 @@ mod tests {
         let mut baton = current.clone();
         baton.baton_txid = "22".repeat(32);
         assert!(live_job_changed(&current, &baton));
+    }
+
+    #[test]
+    fn same_height_tip_reorg_stages_one_new_generation() {
+        let (cfg, current, _secret, _public, _mining_payout, _journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &current).unwrap();
+        let mut reorged = current.clone();
+        reorged.tip_hash = "33".repeat(32);
+        let mut preflight_calls = 0;
+
+        let staged = prepare_generation_transition(
+            &cfg,
+            &current,
+            &settlement,
+            &reorged,
+            |_next_cfg, _next_live| {
+                preflight_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(staged.0.generation_id, cfg.generation_id + 1);
+        assert_eq!(preflight_calls, 1);
+
+        let unchanged = prepare_generation_transition(
+            &staged.0,
+            &reorged,
+            &staged.1,
+            &reorged,
+            |_next_cfg, _next_live| Ok(()),
+        )
+        .unwrap();
+        assert!(unchanged.is_none());
     }
 
     #[test]
