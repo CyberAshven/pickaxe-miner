@@ -1136,6 +1136,7 @@ mod tests {
             url: "wss://fulcrum.invalid".into(),
             server_version: serde_json::json!(["Fulcrum", "1.5"]),
             height: 1_000,
+            tip_hash: "22".repeat(32),
             baton_txid: "11".repeat(32),
             baton_vout: 0,
             baton_height: 999,
