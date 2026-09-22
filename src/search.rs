@@ -690,8 +690,13 @@ impl SearchHandle {
         if let Some(worker) = self.worker.as_ref() {
             worker.thread().unpark();
         }
+        // A production GPU batch is allowed to finish before a replacement is
+        // applied. On slower adapters or a large reference batch, the kernel
+        // can legitimately exceed the old fixed 30 second supervisor window.
+        // Keep the bounded failure path, but give the worker enough time to
+        // reach the command boundary without falsely reporting a dead worker.
         reply_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(Duration::from_secs(120))
             .map_err(|_| "timed out applying PHOTON job generation".to_string())?
     }
 
