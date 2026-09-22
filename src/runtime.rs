@@ -1784,16 +1784,13 @@ fn run_supervisor(
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Resume(reply)) => {
-                    user_paused = false;
-                    let result = if shutdown.is_requested() {
-                        Err("cannot resume while shutdown is requested".into())
-                    } else if session.is_none() {
-                        Err("cannot resume while authoritative PHOTON state is disconnected".into())
-                    } else if pending_winners > 0 {
-                        Err("cannot resume while a verified winner is pending handling".into())
-                    } else {
-                        search.apply_control(SearchCommand::Resume).map(|_| ())
-                    };
+                    let result = resume_search_if_safe(
+                        &shutdown,
+                        session.is_some(),
+                        pending_winners,
+                        &mut user_paused,
+                        || search.apply_control(SearchCommand::Resume).map(|_| ()),
+                    );
                     if result.is_ok() {
                         state = SupervisorState::Mining;
                     }
@@ -2720,6 +2717,31 @@ fn search_resume_allowed(
     !shutdown.is_requested() && !user_paused && pending_winners == 0
 }
 
+fn resume_search_if_safe<F>(
+    shutdown: &ShutdownSignal,
+    session_connected: bool,
+    pending_winners: u64,
+    user_paused: &mut bool,
+    mut resume_search: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
+    if shutdown.is_requested() {
+        return Err("cannot resume while shutdown is requested".into());
+    }
+    if !session_connected {
+        return Err("cannot resume while authoritative PHOTON state is disconnected".into());
+    }
+    if pending_winners > 0 {
+        return Err("cannot resume while a verified winner is pending handling".into());
+    }
+
+    resume_search()?;
+    *user_paused = false;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_snapshot(
     shared: &Arc<Mutex<RuntimeSnapshot>>,
@@ -3406,6 +3428,49 @@ mod tests {
         assert!(shutdown.is_requested());
         assert!(paused.load(Ordering::SeqCst));
         assert!(!search_resume_allowed(&shutdown, false, 0));
+    }
+
+    #[test]
+    fn rejected_manual_resume_preserves_user_pause_intent() {
+        let paused = Arc::new(AtomicBool::new(false));
+        let shutdown = ShutdownSignal::new(SearchPauseHandle::from_shared(paused));
+        let mut user_paused = true;
+        let mut resume_calls = 0;
+
+        let disconnected = resume_search_if_safe(&shutdown, false, 0, &mut user_paused, || {
+            resume_calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(disconnected.contains("disconnected"));
+        assert!(user_paused);
+        assert_eq!(resume_calls, 0);
+
+        let pending = resume_search_if_safe(&shutdown, true, 1, &mut user_paused, || {
+            resume_calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(pending.contains("winner"));
+        assert!(user_paused);
+        assert_eq!(resume_calls, 0);
+
+        let worker_error = resume_search_if_safe(&shutdown, true, 0, &mut user_paused, || {
+            resume_calls += 1;
+            Err("resume worker failure".into())
+        })
+        .unwrap_err();
+        assert_eq!(worker_error, "resume worker failure");
+        assert!(user_paused);
+        assert_eq!(resume_calls, 1);
+
+        resume_search_if_safe(&shutdown, true, 0, &mut user_paused, || {
+            resume_calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!user_paused);
+        assert_eq!(resume_calls, 2);
     }
 
     #[test]
