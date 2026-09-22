@@ -1066,7 +1066,13 @@ fn main() {
                 args.intensity,
                 ui_compare,
             ) {
-                Ok(report) => benchmark::print_report(&report, args.json),
+                Ok(report) => {
+                    let passed = report.passed();
+                    benchmark::print_report(&report, args.json);
+                    if !passed {
+                        std::process::exit(1);
+                    }
+                }
                 Err(error) => {
                     eprintln!("error: benchmark failed: {error}");
                     std::process::exit(1);
