@@ -1761,6 +1761,11 @@ fn run_supervisor(
     let mut next_submission_retry = Instant::now();
     let mut stop = false;
     let initial_search_stats = search.snapshot();
+    // This SearchHandle is new for this supervisor. Start at zero so a GPU
+    // winner produced after SearchHandle::start but before this supervisor
+    // thread is scheduled still triggers the authoritative freshness gate.
+    let mut observed_search_winners = 0;
+    let mut winner_refresh_pending = false;
     let mut throughput = ThroughputTracker::new(
         Instant::now(),
         initial_search_stats.candidates,
@@ -1922,13 +1927,42 @@ fn run_supervisor(
                 Err(TryRecvError::Empty) => break,
             }
         }
+        if should_begin_winner_refresh(
+            winner_refresh_pending,
+            pending_winner.is_some(),
+            pending_submission.is_some(),
+            observed_search_winners,
+            search.snapshot().winners,
+        ) {
+            // Stop new launches as soon as a host-verified GPU winner is
+            // queued. Any batch already in flight is allowed to finish before
+            // the authoritative live-state check below.
+            winner_refresh_pending = true;
+            pending_winners = 1;
+            let _ = search.apply_control(SearchCommand::Pause);
+            state = SupervisorState::Paused;
+        }
         if shutdown.is_requested()
-            && shutdown_can_exit(pending_winner.is_some(), search.batch_in_flight())
+            && shutdown_can_exit(
+                pending_winner.is_some() || winner_refresh_pending,
+                search.batch_in_flight(),
+            )
         {
             stop = true;
         }
         if stop {
             break;
+        }
+        let force_winner_refresh = winner_refresh_ready(
+            winner_refresh_pending,
+            search.batch_in_flight(),
+            session.is_some(),
+        );
+        if force_winner_refresh {
+            // The worker is now at a safe boundary. Run the existing
+            // authoritative refresh immediately rather than waiting for the
+            // next 500 ms periodic deadline.
+            next_state_refresh = Instant::now();
         }
         if session.is_none() {
             if Instant::now() >= next_reconnect {
@@ -2236,63 +2270,79 @@ fn run_supervisor(
                                 &live,
                             );
 
-                            for winner in search.drain_winners() {
-                                if winner_matches_live(&winner, cfg.generation_id, &live) {
-                                    verified_winners = verified_winners.saturating_add(1);
-                                    pending_winners = 1;
-                                    let _ = search.apply_control(SearchCommand::Pause);
-                                    state = SupervisorState::Paused;
-                                    emit(&event_tx, RuntimeEvent::VerifiedWinner(winner.clone()));
-                                    match prepare_pending_submission(
-                                        &winner,
-                                        &cfg,
-                                        &live,
-                                        &reward_secret,
-                                        &reward_public_key,
-                                        &settlement,
-                                        &journal_path,
-                                    ) {
-                                        Ok(pending) => {
-                                            pending_submission = Some(pending);
-                                            submission_backoff = RECONNECT_MIN;
-                                            next_submission_retry = Instant::now();
-                                            last_error = None;
+                            if force_winner_refresh {
+                                for winner in search.drain_winners() {
+                                    if winner_matches_live(&winner, cfg.generation_id, &live) {
+                                        verified_winners = verified_winners.saturating_add(1);
+                                        pending_winners = 1;
+                                        let _ = search.apply_control(SearchCommand::Pause);
+                                        state = SupervisorState::Paused;
+                                        emit(
+                                            &event_tx,
+                                            RuntimeEvent::VerifiedWinner(winner.clone()),
+                                        );
+                                        match prepare_pending_submission(
+                                            &winner,
+                                            &cfg,
+                                            &live,
+                                            &reward_secret,
+                                            &reward_public_key,
+                                            &settlement,
+                                            &journal_path,
+                                        ) {
+                                            Ok(pending) => {
+                                                pending_submission = Some(pending);
+                                                submission_backoff = RECONNECT_MIN;
+                                                next_submission_retry = Instant::now();
+                                                last_error = None;
+                                            }
+                                            Err(error) => {
+                                                pending_winner = Some(winner);
+                                                last_error = Some(error.clone());
+                                                state = SupervisorState::Reconnecting;
+                                                emit(
+                                                    &event_tx,
+                                                    RuntimeEvent::Reconnecting(format!(
+                                                        "settlement preparation retry: {error}"
+                                                    )),
+                                                );
+                                                session = None;
+                                                next_reconnect =
+                                                    Instant::now() + submission_backoff;
+                                                submission_backoff = submission_backoff
+                                                    .checked_mul(2)
+                                                    .unwrap_or(RECONNECT_MAX)
+                                                    .min(RECONNECT_MAX);
+                                            }
                                         }
-                                        Err(error) => {
-                                            pending_winner = Some(winner);
-                                            last_error = Some(error.clone());
-                                            state = SupervisorState::Reconnecting;
-                                            emit(
-                                                &event_tx,
-                                                RuntimeEvent::Reconnecting(format!(
-                                                    "settlement preparation retry: {error}"
-                                                )),
-                                            );
-                                            session = None;
-                                            next_reconnect = Instant::now() + submission_backoff;
-                                            submission_backoff = submission_backoff
-                                                .checked_mul(2)
-                                                .unwrap_or(RECONNECT_MAX)
-                                                .min(RECONNECT_MAX);
-                                        }
+                                        break;
+                                    } else {
+                                        stale_winners = stale_winners.saturating_add(1);
+                                        emit(
+                                            &event_tx,
+                                            RuntimeEvent::StaleWinner {
+                                                winner_generation: winner.generation_id,
+                                                current_generation: cfg.generation_id,
+                                            },
+                                        );
                                     }
-                                    break;
-                                } else {
-                                    stale_winners = stale_winners.saturating_add(1);
-                                    emit(
-                                        &event_tx,
-                                        RuntimeEvent::StaleWinner {
-                                            winner_generation: winner.generation_id,
-                                            current_generation: cfg.generation_id,
-                                        },
-                                    );
+                                }
+                                // The worker is paused at a batch boundary, so
+                                // this snapshot acknowledges every winner
+                                // produced through that boundary, including
+                                // any excess result dropped by the bounded
+                                // winner channel.
+                                observed_search_winners = search.snapshot().winners;
+                                winner_refresh_pending = false;
+                                if pending_winner.is_none() && pending_submission.is_none() {
+                                    pending_winners = 0;
                                 }
                             }
 
                             if pending_winners == 0 && boundary.route_warning.is_none() {
                                 last_error = None;
                             }
-                            if changed
+                            if (changed || force_winner_refresh)
                                 && session.is_some()
                                 && search_resume_allowed(&shutdown, user_paused, pending_winners)
                             {
@@ -2712,6 +2762,27 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
         && winner.height == live.height
         && winner.baton_txid == live.baton_txid
         && winner.baton_vout == live.baton_vout
+}
+
+fn winner_refresh_ready(
+    winner_refresh_pending: bool,
+    batch_in_flight: bool,
+    session_connected: bool,
+) -> bool {
+    winner_refresh_pending && !batch_in_flight && session_connected
+}
+
+fn should_begin_winner_refresh(
+    winner_refresh_pending: bool,
+    has_pending_winner: bool,
+    has_pending_submission: bool,
+    observed_winners: u64,
+    current_winners: u64,
+) -> bool {
+    !winner_refresh_pending
+        && !has_pending_winner
+        && !has_pending_submission
+        && current_winners > observed_winners
 }
 
 fn shutdown_can_exit(pending_winner: bool, batch_in_flight: bool) -> bool {
@@ -3714,6 +3785,20 @@ mod tests {
         let next_future_deadline =
             next_periodic_deadline(second_deadline, slow_request_finished, PHOTON_STATE_RECHECK);
         assert_eq!(next_future_deadline, start + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn queued_gpu_winner_requires_an_immediate_authoritative_refresh() {
+        assert!(!should_begin_winner_refresh(false, false, false, 0, 0));
+        assert!(should_begin_winner_refresh(false, false, false, 0, 1));
+        assert!(should_begin_winner_refresh(false, false, false, 5, 6));
+        assert!(!should_begin_winner_refresh(true, false, false, 0, 1));
+        assert!(!should_begin_winner_refresh(false, true, false, 0, 1));
+        assert!(!should_begin_winner_refresh(false, false, true, 0, 1));
+        assert!(!winner_refresh_ready(false, false, true));
+        assert!(!winner_refresh_ready(true, true, true));
+        assert!(!winner_refresh_ready(true, false, false));
+        assert!(winner_refresh_ready(true, false, true));
     }
 
     #[test]
