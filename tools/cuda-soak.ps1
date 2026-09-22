@@ -153,6 +153,99 @@ function Get-SoakEvidenceCompleteness {
     }
 }
 
+function Get-GrowthSummary {
+    param(
+        [object[]]$Values,
+        [double]$ToleranceMiB
+    )
+
+    $numeric = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ })
+    if ($numeric.Count -lt 3) {
+        return [ordered]@{
+            samples = $numeric.Count
+            first_mib = $null
+            final_mib = $null
+            peak_mib = $null
+            delta_mib = $null
+            early_average_mib = $null
+            late_average_mib = $null
+            sustained_delta_mib = $null
+            projected_trend_delta_mib = $null
+            monotonic_growth = $null
+            sustained_growth = $null
+            growth_detected = $null
+        }
+    }
+
+    $warmupIndex = [Math]::Min(
+        $numeric.Count - 1,
+        [Math]::Max(1, [Math]::Floor($numeric.Count * 0.1))
+    )
+    $steady = @($numeric[$warmupIndex..($numeric.Count - 1)])
+
+    $monotonic = $true
+    for ($i = 1; $i -lt $steady.Count; $i++) {
+        if ($steady[$i] + $ToleranceMiB -lt $steady[$i - 1]) {
+            $monotonic = $false
+            break
+        }
+    }
+    $delta = $steady[-1] - $steady[0]
+    $monotonicGrowth = ($monotonic -and $delta -gt $ToleranceMiB)
+
+    # A leak can still trend upward while occasionally dropping by more than the
+    # per-sample tolerance. Compare stable endpoint windows and require the
+    # least-squares trend to agree before calling that sustained growth.
+    $windowSize = [Math]::Max(1, [Math]::Floor($steady.Count * 0.1))
+    $early = @($steady[0..($windowSize - 1)])
+    $lateStart = $steady.Count - $windowSize
+    $late = @($steady[$lateStart..($steady.Count - 1)])
+    $earlyAverage = [double](($early | Measure-Object -Average).Average)
+    $lateAverage = [double](($late | Measure-Object -Average).Average)
+    $sustainedDelta = $lateAverage - $earlyAverage
+
+    $count = [double]$steady.Count
+    $sumX = 0.0
+    $sumY = 0.0
+    $sumXY = 0.0
+    $sumXX = 0.0
+    for ($i = 0; $i -lt $steady.Count; $i++) {
+        $x = [double]$i
+        $y = [double]$steady[$i]
+        $sumX += $x
+        $sumY += $y
+        $sumXY += $x * $y
+        $sumXX += $x * $x
+    }
+    $denominator = ($count * $sumXX) - ($sumX * $sumX)
+    $slopePerSample = if ([Math]::Abs($denominator) -gt [double]::Epsilon) {
+        (($count * $sumXY) - ($sumX * $sumY)) / $denominator
+    } else {
+        0.0
+    }
+    $projectedTrendDelta = $slopePerSample * [Math]::Max(0, $steady.Count - 1)
+    $sustainedGrowth = (
+        $sustainedDelta -gt $ToleranceMiB -and
+        $projectedTrendDelta -gt $ToleranceMiB
+    )
+
+    return [ordered]@{
+        samples = $numeric.Count
+        warmup_discarded_samples = $warmupIndex
+        first_mib = [Math]::Round($steady[0], 3)
+        final_mib = [Math]::Round($steady[-1], 3)
+        peak_mib = [Math]::Round(($steady | Measure-Object -Maximum).Maximum, 3)
+        delta_mib = [Math]::Round($delta, 3)
+        early_average_mib = [Math]::Round($earlyAverage, 3)
+        late_average_mib = [Math]::Round($lateAverage, 3)
+        sustained_delta_mib = [Math]::Round($sustainedDelta, 3)
+        projected_trend_delta_mib = [Math]::Round($projectedTrendDelta, 3)
+        monotonic_growth = $monotonicGrowth
+        sustained_growth = $sustainedGrowth
+        growth_detected = ($monotonicGrowth -or $sustainedGrowth)
+    }
+}
+
 if ($SelfTest) {
     $synthetic = @(
         0..9 | ForEach-Object {
@@ -192,6 +285,24 @@ if ($SelfTest) {
     })
     if ((Get-SoakEvidenceCompleteness -Samples $missingClock -ObservedRuntimeSeconds 10.0 -ExpectedMatrixSeconds 10 -SampleIntervalSeconds 1 -MinimumTelemetryCoverage 0.80 -RuntimeToleranceSeconds 1.0).telemetry_complete) {
         throw "Self-test failed: missing GPU clock telemetry was accepted."
+    }
+
+    $stableMemory = @(0..29 | ForEach-Object { 200.0 + (($_ % 3) - 1) * 4.0 })
+    if ((Get-GrowthSummary -Values $stableMemory -ToleranceMiB 32).growth_detected) {
+        throw "Self-test failed: bounded memory noise was classified as growth."
+    }
+
+    $sawtoothLeak = @(0..29 | ForEach-Object { 100.0 + ($_ * 4.0) })
+    $sawtoothLeak[15] = 120.0
+    $growth = Get-GrowthSummary -Values $sawtoothLeak -ToleranceMiB 32
+    if (!$growth.growth_detected -or $growth.monotonic_growth -or !$growth.sustained_growth) {
+        throw "Self-test failed: sustained sawtooth growth escaped the leak detector."
+    }
+
+    $transientSpike = @(0..29 | ForEach-Object { 220.0 })
+    $transientSpike[20] = 280.0
+    if ((Get-GrowthSummary -Values $transientSpike -ToleranceMiB 32).growth_detected) {
+        throw "Self-test failed: one transient memory spike was classified as sustained growth."
     }
 
     Write-Output "cuda-soak evidence self-test: PASS"
@@ -322,46 +433,6 @@ try {
         throw "Benchmark report does not contain the required 10/25/50/75/100 intensity matrix."
     }
 
-    function Get-GrowthSummary {
-        param(
-            [object[]]$Values,
-            [double]$ToleranceMiB
-        )
-
-        $numeric = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ })
-        if ($numeric.Count -lt 3) {
-            return [ordered]@{
-                samples = $numeric.Count
-                first_mib = $null
-                final_mib = $null
-                peak_mib = $null
-                delta_mib = $null
-                monotonic_growth = $null
-            }
-        }
-
-        $warmupIndex = [Math]::Min($numeric.Count - 1, [Math]::Max(1, [Math]::Floor($numeric.Count * 0.1)))
-        $steady = @($numeric[$warmupIndex..($numeric.Count - 1)])
-        $monotonic = $true
-        for ($i = 1; $i -lt $steady.Count; $i++) {
-            if ($steady[$i] + $ToleranceMiB -lt $steady[$i - 1]) {
-                $monotonic = $false
-                break
-            }
-        }
-        $delta = $steady[-1] - $steady[0]
-
-        return [ordered]@{
-            samples = $numeric.Count
-            warmup_discarded_samples = $warmupIndex
-            first_mib = [Math]::Round($steady[0], 3)
-            final_mib = [Math]::Round($steady[-1], 3)
-            peak_mib = [Math]::Round(($steady | Measure-Object -Maximum).Maximum, 3)
-            delta_mib = [Math]::Round($delta, 3)
-            monotonic_growth = ($monotonic -and $delta -gt $ToleranceMiB)
-        }
-    }
-
     function Get-MetricSummary {
         param([object[]]$Values)
 
@@ -385,6 +456,11 @@ try {
     $evidence = Get-SoakEvidenceCompleteness -Samples $samples -ObservedRuntimeSeconds $observedRuntimeSeconds -ExpectedMatrixSeconds $expectedMatrixSeconds -SampleIntervalSeconds $SampleIntervalSeconds -MinimumTelemetryCoverage $minimumTelemetryCoverage -RuntimeToleranceSeconds $runtimeToleranceSeconds
     $durationComplete = $evidence.duration_complete
     $telemetryComplete = $evidence.telemetry_complete
+    $growthDetected = (
+        $workingSetSummary.growth_detected -eq $true -or
+        $privateSummary.growth_detected -eq $true -or
+        $vramSummary.growth_detected -eq $true
+    )
     $monotonicGrowthDetected = (
         $workingSetSummary.monotonic_growth -eq $true -or
         $privateSummary.monotonic_growth -eq $true -or
@@ -392,7 +468,7 @@ try {
     )
     $status = if (
         $exitCode -eq 0 -and
-        !$monotonicGrowthDetected -and
+        !$growthDetected -and
         $durationComplete -and
         $telemetryComplete
     ) { "PASS" } else { "FAIL" }
@@ -433,6 +509,7 @@ try {
                 candidates_per_watt = $_.candidates_per_watt
             }
         })
+        growth_detected = $growthDetected
         monotonic_growth_detected = $monotonicGrowthDetected
         benchmark_json = $benchmarkPath
         samples_csv = $csvPath
@@ -451,8 +528,8 @@ try {
     if (!$telemetryComplete) {
         throw "CUDA soak telemetry coverage is incomplete. See $summaryPath"
     }
-    if ($summary.monotonic_growth_detected) {
-        throw "Possible monotonic RAM/VRAM growth detected after warm-up. See $summaryPath"
+    if ($summary.growth_detected) {
+        throw "Possible sustained RAM/VRAM growth detected after warm-up. See $summaryPath"
     }
 } finally {
     $env:CARGO_TARGET_DIR = $previousTargetDirectory
