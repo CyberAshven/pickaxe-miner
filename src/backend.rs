@@ -99,8 +99,13 @@ pub fn resolve_mining_device(
                     return Ok(device);
                 }
             }
+            if let Ok(wgpu) = list_wgpu_devices() {
+                if let Some(device) = wgpu.into_iter().find(|device| device.index == wanted) {
+                    return Ok(device);
+                }
+            }
             Err(format!(
-                "no native GPU device at backend-local ordinal {wanted}; run `pickaxe devices`"
+                "no GPU device at backend-local ordinal {wanted}; run `pickaxe devices`"
             ))
         }
     }
@@ -108,12 +113,10 @@ pub fn resolve_mining_device(
 
 pub fn require_production_mining_backend(backend: BackendKind) -> Result<(), String> {
     match backend {
-        BackendKind::Cuda | BackendKind::Hip => Ok(()),
-        BackendKind::Wgpu => Err(
-            "wgpu adapter discovery is available, but reference-correct PHOTON WGPU mining is not wired and validated yet"
-                .into(),
-        ),
-        BackendKind::Auto => Err("auto backend must be resolved before production mining starts".into()),
+        BackendKind::Cuda | BackendKind::Hip | BackendKind::Wgpu => Ok(()),
+        BackendKind::Auto => {
+            Err("auto backend must be resolved before production mining starts".into())
+        }
     }
 }
 
@@ -154,8 +157,12 @@ fn wgpu_vendor_name(vendor: u32) -> String {
     }
 }
 
+pub(crate) fn production_wgpu_backends() -> wgpu::Backends {
+    wgpu::Backends::VULKAN
+}
+
 fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
-    let backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+    let backends = production_wgpu_backends();
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = backends;
     let instance = wgpu::Instance::new(descriptor);
@@ -189,7 +196,7 @@ fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
     }
 
     if out.is_empty() {
-        Err("WGPU found no hardware DX12/Vulkan GPU adapters".into())
+        Err("WGPU found no hardware Vulkan GPU adapters".into())
     } else {
         Ok(out)
     }
@@ -468,11 +475,16 @@ mod tests {
     }
 
     #[test]
-    fn wgpu_mining_fails_closed_until_reference_engine_is_validated() {
-        let error = require_production_mining_backend(BackendKind::Wgpu).unwrap_err();
-        assert!(error.contains("reference-correct PHOTON WGPU mining is not wired"));
+    fn production_wgpu_surface_is_vulkan_only() {
+        assert_eq!(production_wgpu_backends(), wgpu::Backends::VULKAN);
+    }
+
+    #[test]
+    fn production_backend_gate_accepts_validated_gpu_engines() {
+        assert!(require_production_mining_backend(BackendKind::Wgpu).is_ok());
         assert!(require_production_mining_backend(BackendKind::Cuda).is_ok());
         assert!(require_production_mining_backend(BackendKind::Hip).is_ok());
+        assert!(require_production_mining_backend(BackendKind::Auto).is_err());
     }
 
     #[test]

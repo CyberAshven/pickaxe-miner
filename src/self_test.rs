@@ -5,6 +5,7 @@ use crate::backend::BackendKind;
 use crate::config::{RuntimeConfig, DONATION_BPS};
 use crate::cuda_photon::CudaPhotonEngine;
 use crate::hip_photon::HipPhotonEngine;
+use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, reward, search, tx};
 use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
@@ -134,7 +135,7 @@ fn validate_gpu_winner_and_reward(
     expected[390..394].copy_from_slice(&nonce.to_le_bytes());
     expected[426..490].copy_from_slice(&signature);
     if completed.as_slice() != expected.as_slice() {
-        return Err("host reconstructed transaction differs from CUDA template completion".into());
+        return Err("host reconstructed transaction differs from GPU template completion".into());
     }
 
     let host_digest = search::hash256(&completed);
@@ -207,10 +208,11 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
             ("hip", bytes, batch)
         }
         BackendKind::Wgpu => {
-            return Err(
-                "wgpu adapter discovery is available, but reference-correct PHOTON WGPU mining is not wired and validated yet"
-                    .into(),
-            )
+            let mut engine = WgpuPhotonEngine::new(device as usize, 1, 1)?;
+            let bytes = engine.persistent_device_bytes();
+            engine.set_job(&template, &target, &reward_secret)?;
+            let batch = engine.search_batch(CONTROLLED_NONCE, 1)?;
+            ("wgpu", bytes, batch)
         }
         BackendKind::Auto => return Err("self-test requires a resolved native backend".into()),
     };

@@ -42,6 +42,7 @@ mod telemetry;
 #[allow(dead_code)]
 mod tui;
 mod tx;
+mod wgpu_photon;
 
 use config::RuntimeConfig;
 use electrum::{ElectrumSession, LiveJob};
