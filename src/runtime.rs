@@ -2567,7 +2567,6 @@ fn run_supervisor(
                         Err(error) => {
                             last_error = Some(error.clone());
                             state = SupervisorState::Reconnecting;
-                            let _ = search.apply_control(SearchCommand::Pause);
                             emit(
                                 &event_tx,
                                 RuntimeEvent::Reconnecting(format!(
@@ -2604,7 +2603,6 @@ fn run_supervisor(
                                 now_ms,
                             );
                             state = SupervisorState::Reconnecting;
-                            let _ = search.apply_control(SearchCommand::Pause);
                             let reason = match failure_kind {
                                 RefreshFailureKind::Transport => {
                                     format!("Fulcrum transport lost; reconnecting: {error}")
