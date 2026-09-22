@@ -166,7 +166,7 @@ pub(crate) fn sample_amd_telemetry(device: u32) -> Option<GpuTelemetry> {
     parse_amd_smi_json(&stdout)
 }
 
-fn sample_gpu_telemetry(backend: BackendKind, device: u32) -> Option<GpuTelemetry> {
+pub(crate) fn sample_gpu_telemetry(backend: BackendKind, device: u32) -> Option<GpuTelemetry> {
     match backend {
         BackendKind::Cuda => sample_nvidia_telemetry(device),
         BackendKind::Hip => sample_amd_telemetry(device),

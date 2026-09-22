@@ -1,5 +1,5 @@
 //! GPU candidate search (PERFORMANCE CONTRACT).
-//! Production hot path = persistent reference-correct CudaPhotonEngine.
+//! Production hot path = persistent reference-correct native GPU engine.
 //! CPU cryptography is limited to job setup and rare returned-winner verification.
 
 use crate::backend::BackendKind;
@@ -22,19 +22,47 @@ use std::time::{Duration, Instant};
 pub const REFERENCE_GPU_PIPELINE_READY: bool = true;
 
 pub(crate) const MAX_BATCH_CANDIDATES: u32 = 65_536;
-const WINNER_BUFFER_CAP: u32 = 8;
+pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const JOB_UPDATE_CHANNEL_CAP: usize = 2;
 const PAUSE_POLL: Duration = Duration::from_millis(25);
 
-enum PhotonEngine {
+pub(crate) enum PhotonEngine {
     Cuda(Box<CudaPhotonEngine>),
     Hip(Box<HipPhotonEngine>),
     Wgpu(Box<WgpuPhotonEngine>),
 }
 
 impl PhotonEngine {
-    fn set_job(
+    pub(crate) fn new(
+        backend: BackendKind,
+        device_ordinal: usize,
+        max_batch_candidates: u32,
+        winner_buffer_cap: u32,
+    ) -> Result<Self, String> {
+        match backend {
+            BackendKind::Cuda => Ok(Self::Cuda(Box::new(CudaPhotonEngine::new(
+                device_ordinal,
+                max_batch_candidates,
+                winner_buffer_cap,
+            )?))),
+            BackendKind::Hip => Ok(Self::Hip(Box::new(HipPhotonEngine::new(
+                device_ordinal,
+                max_batch_candidates,
+                winner_buffer_cap,
+            )?))),
+            BackendKind::Wgpu => Ok(Self::Wgpu(Box::new(WgpuPhotonEngine::new(
+                device_ordinal,
+                max_batch_candidates,
+                winner_buffer_cap,
+            )?))),
+            BackendKind::Auto => {
+                Err("auto backend must be resolved before GPU engine initialization".into())
+            }
+        }
+    }
+
+    pub(crate) fn set_job(
         &mut self,
         template: &[u8; 615],
         target: &[u8; 32],
@@ -47,7 +75,7 @@ impl PhotonEngine {
         }
     }
 
-    fn search_batch(
+    pub(crate) fn search_batch(
         &mut self,
         nonce_base: u32,
         candidate_count: u32,
@@ -56,6 +84,29 @@ impl PhotonEngine {
             Self::Cuda(engine) => engine.search_batch(nonce_base, candidate_count),
             Self::Hip(engine) => engine.search_batch(nonce_base, candidate_count),
             Self::Wgpu(engine) => engine.search_batch(nonce_base, candidate_count),
+        }
+    }
+
+    pub(crate) fn persistent_device_bytes(&self) -> usize {
+        match self {
+            Self::Cuda(engine) => engine.persistent_device_bytes(),
+            Self::Hip(engine) => engine.persistent_device_bytes(),
+            Self::Wgpu(engine) => engine.persistent_device_bytes(),
+        }
+    }
+
+    pub(crate) fn table_source(&self) -> String {
+        match self {
+            Self::Cuda(engine) => format!("{:?}", engine.table_source()),
+            Self::Hip(engine) => format!("{:?}", engine.table_source()),
+            Self::Wgpu(engine) => format!("{:?}", engine.table_source()),
+        }
+    }
+
+    pub(crate) fn scheduled_batch_candidates(&self) -> u32 {
+        match self {
+            Self::Cuda(_) | Self::Hip(_) => scheduled_batch_candidates(),
+            Self::Wgpu(engine) => engine.recommended_batch_candidates(),
         }
     }
 }
@@ -374,7 +425,7 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
-        let batch_size = scheduled_batch_candidates();
+        let batch_size = engine.scheduled_batch_candidates();
         let batch_started = Instant::now();
         let result = match engine.search_batch(nonce_base, batch_size) {
             Ok(result) => result,
@@ -534,26 +585,12 @@ impl SearchHandle {
 
         // Fail fast and create exactly one native GPU context. The configured
         // engine is moved into the worker and remains resident across controls.
-        let mut engine = match backend {
-            BackendKind::Cuda => PhotonEngine::Cuda(Box::new(CudaPhotonEngine::new(
-                device_ordinal,
-                MAX_BATCH_CANDIDATES,
-                WINNER_BUFFER_CAP,
-            )?)),
-            BackendKind::Hip => PhotonEngine::Hip(Box::new(HipPhotonEngine::new(
-                device_ordinal,
-                MAX_BATCH_CANDIDATES,
-                WINNER_BUFFER_CAP,
-            )?)),
-            BackendKind::Wgpu => PhotonEngine::Wgpu(Box::new(WgpuPhotonEngine::new(
-                device_ordinal,
-                MAX_BATCH_CANDIDATES,
-                WINNER_BUFFER_CAP,
-            )?)),
-            BackendKind::Auto => {
-                return Err("auto backend must be resolved before GPU search starts".into())
-            }
-        };
+        let mut engine = PhotonEngine::new(
+            backend,
+            device_ordinal,
+            MAX_BATCH_CANDIDATES,
+            WINNER_BUFFER_CAP,
+        )?;
         engine.set_job(&prepared.template, &prepared.target, &sk)?;
 
         let stop = Arc::new(AtomicBool::new(false));

@@ -1,8 +1,8 @@
-//! Offline throughput benchmark for the production PHOTON CUDA pipeline.
+//! Offline throughput benchmark for the selected production PHOTON GPU pipeline.
 //! The benchmark never reads live baton state and never broadcasts.
 
-use crate::cuda_photon::CudaPhotonEngine;
-use crate::telemetry::{sample_nvidia_telemetry, GpuTelemetry as NvidiaTelemetry};
+use crate::backend::{BackendKind, GpuDevice};
+use crate::telemetry::{sample_gpu_telemetry, GpuTelemetry};
 use crate::{reward, search, tui, tx};
 use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
@@ -15,7 +15,6 @@ const TX_BYTES: usize = 615;
 const TARGET_OFFSET: usize = 394;
 const BENCHMARK_INTENSITIES: [u8; 5] = [10, 25, 50, 75, 100];
 const MAX_BENCHMARK_WINDOW_SECONDS: u64 = 12 * 60;
-const WINNER_BUFFER_CAP: u32 = 8;
 const VECTOR_BATON_TXID: &str = "000000124712ae4765fe9789372faebca19c99cc1d59f43df2508bf5c42ea042";
 const VECTOR_TARGET_LE: &str = "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000";
 const VECTOR_AGE: u32 = 10;
@@ -44,7 +43,7 @@ pub struct BenchmarkSample {
     pub candidates_per_second: f64,
     pub candidates_per_watt: Option<f64>,
     pub gpu_winners: u64,
-    pub telemetry: NvidiaTelemetry,
+    pub telemetry: GpuTelemetry,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,7 +126,7 @@ struct TelemetryAccumulator {
 }
 
 impl TelemetryAccumulator {
-    fn add(&mut self, sample: &NvidiaTelemetry) {
+    fn add(&mut self, sample: &GpuTelemetry) {
         self.samples = self.samples.saturating_add(1);
         add_metric(
             sample.gpu_utilization_percent,
@@ -161,8 +160,8 @@ impl TelemetryAccumulator {
         );
     }
 
-    fn finish(self) -> NvidiaTelemetry {
-        NvidiaTelemetry {
+    fn finish(self) -> GpuTelemetry {
+        GpuTelemetry {
             samples: self.samples,
             gpu_utilization_percent: average(self.utilization_sum, self.utilization_count),
             power_watts: average(self.power_sum, self.power_count),
@@ -241,6 +240,7 @@ fn validate_intensity_matrix(samples: &[BenchmarkSample]) -> BenchmarkMatrixVali
 }
 
 fn start_telemetry_sampler(
+    backend: BackendKind,
     device: u32,
 ) -> (
     Arc<AtomicBool>,
@@ -253,7 +253,7 @@ fn start_telemetry_sampler(
     let worker_samples = Arc::clone(&samples);
     let handle = thread::spawn(move || {
         while !worker_stop.load(Ordering::Relaxed) {
-            if let Some(sample) = sample_nvidia_telemetry(device) {
+            if let Some(sample) = sample_gpu_telemetry(backend, device) {
                 if let Ok(mut accumulator) = worker_samples.lock() {
                     accumulator.add(&sample);
                 }
@@ -268,7 +268,7 @@ fn finish_telemetry_sampler(
     stop: Arc<AtomicBool>,
     samples: Arc<Mutex<TelemetryAccumulator>>,
     handle: thread::JoinHandle<()>,
-) -> NvidiaTelemetry {
+) -> GpuTelemetry {
     stop.store(true, Ordering::Relaxed);
     let _ = handle.join();
     match Arc::try_unwrap(samples) {
@@ -325,7 +325,8 @@ fn benchmark_fixture() -> Result<BenchmarkFixture, String> {
 }
 
 fn run_intensity_window(
-    engine: &mut CudaPhotonEngine,
+    engine: &mut search::PhotonEngine,
+    backend: BackendKind,
     device: u32,
     intensity: u8,
     seconds: u64,
@@ -333,8 +334,8 @@ fn run_intensity_window(
     render_tui: bool,
 ) -> Result<BenchmarkWindow, String> {
     let requested = Duration::from_secs(seconds);
-    let batch_candidates = search::scheduled_batch_candidates();
-    let (telemetry_stop, telemetry_samples, telemetry_worker) = start_telemetry_sampler(device);
+    let (telemetry_stop, telemetry_samples, telemetry_worker) =
+        start_telemetry_sampler(backend, device);
     let tui_worker = render_tui.then(|| {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
@@ -347,6 +348,7 @@ fn run_intensity_window(
     let mut winners = 0u64;
 
     while started.elapsed() < requested {
+        let batch_candidates = engine.scheduled_batch_candidates();
         let batch_started = Instant::now();
         let result = match engine.search_batch(*nonce_base, batch_candidates) {
             Ok(result) => result,
@@ -404,9 +406,8 @@ fn run_intensity_window(
     })
 }
 
-pub fn run_cuda_benchmark(
-    device: u32,
-    device_name: String,
+pub fn run_gpu_benchmark(
+    device: &GpuDevice,
     seconds: u64,
     requested_intensity: Option<u8>,
     ui_compare: bool,
@@ -421,18 +422,19 @@ pub fn run_cuda_benchmark(
     }
     let intensities = benchmark_intensities(requested_intensity)?;
     let fixture = benchmark_fixture()?;
-    let mut engine = CudaPhotonEngine::new(
-        device as usize,
+    let mut engine = search::PhotonEngine::new(
+        device.backend,
+        device.index as usize,
         search::MAX_BATCH_CANDIDATES,
-        WINNER_BUFFER_CAP,
+        search::WINNER_BUFFER_CAP,
     )?;
     let persistent_device_bytes = engine.persistent_device_bytes();
-    let table_source = format!("{:?}", engine.table_source());
+    let table_source = engine.table_source();
     engine.set_job(&fixture.template, &fixture.target, &fixture.private_key)?;
 
     // Prime kernels and page residency before measuring any intensity window.
     let mut nonce_base = 0u32;
-    let warmup = engine.search_batch(nonce_base, search::scheduled_batch_candidates())?;
+    let warmup = engine.search_batch(nonce_base, engine.scheduled_batch_candidates())?;
     nonce_base = nonce_base.wrapping_add(warmup.candidates);
 
     let mut samples = Vec::with_capacity(intensities.len());
@@ -440,7 +442,8 @@ pub fn run_cuda_benchmark(
         samples.push(
             run_intensity_window(
                 &mut engine,
-                device,
+                device.backend,
+                device.index,
                 intensity,
                 seconds,
                 &mut nonce_base,
@@ -462,9 +465,24 @@ pub fn run_cuda_benchmark(
     };
 
     let ui_comparison = if ui_compare {
-        let headless =
-            run_intensity_window(&mut engine, device, 100, seconds, &mut nonce_base, false)?;
-        let tui = run_intensity_window(&mut engine, device, 100, seconds, &mut nonce_base, true)?;
+        let headless = run_intensity_window(
+            &mut engine,
+            device.backend,
+            device.index,
+            100,
+            seconds,
+            &mut nonce_base,
+            false,
+        )?;
+        let tui = run_intensity_window(
+            &mut engine,
+            device.backend,
+            device.index,
+            100,
+            seconds,
+            &mut nonce_base,
+            true,
+        )?;
         let throughput_delta_percent = if headless.sample.candidates_per_second > 0.0 {
             (tui.sample.candidates_per_second / headless.sample.candidates_per_second - 1.0) * 100.0
         } else {
@@ -485,9 +503,9 @@ pub fn run_cuda_benchmark(
 
     Ok(BenchmarkReport {
         status,
-        backend: "cuda",
-        device,
-        device_name,
+        backend: device.backend.as_str(),
+        device: device.index,
+        device_name: device.name.clone(),
         table_source,
         persistent_device_bytes,
         samples,
@@ -514,10 +532,11 @@ pub fn print_report(report: &BenchmarkReport, json: bool) {
     }
 
     println!("Pickaxe PHOTON benchmark: {}", report.status);
-    println!("CUDA device {}: {}", report.device, report.device_name);
+    println!("GPU backend: {}", report.backend);
+    println!("Device {}: {}", report.device, report.device_name);
     println!("Generator table: {}", report.table_source);
     println!(
-        "Persistent CUDA allocation: {} bytes",
+        "Persistent GPU allocation: {} bytes",
         report.persistent_device_bytes
     );
     println!("Network access: none; broadcast: none");
@@ -586,7 +605,18 @@ mod tests {
             candidates_per_second,
             candidates_per_watt: None,
             gpu_winners: 0,
-            telemetry: NvidiaTelemetry::default(),
+            telemetry: GpuTelemetry::default(),
+        }
+    }
+
+    fn benchmark_device(backend: BackendKind) -> GpuDevice {
+        GpuDevice {
+            index: 0,
+            name: "unused".into(),
+            vendor: "unused".into(),
+            vram_bytes: None,
+            backend,
+            detail: String::new(),
         }
     }
 
@@ -667,31 +697,33 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn benchmark_refuses_debug_measurements_before_gpu_initialization() {
-        let error = run_cuda_benchmark(0, "unused".into(), 1, None, false).unwrap_err();
+        let error =
+            run_gpu_benchmark(&benchmark_device(BackendKind::Cuda), 1, None, false).unwrap_err();
         assert!(error.contains("release build"));
     }
 
     #[cfg(debug_assertions)]
     #[test]
+    fn benchmark_accepts_all_production_backends_before_gpu_initialization() {
+        for backend in [BackendKind::Cuda, BackendKind::Hip, BackendKind::Wgpu] {
+            let error = run_gpu_benchmark(&benchmark_device(backend), 1, None, false).unwrap_err();
+            assert!(
+                error.contains("release build"),
+                "{backend:?} failed before the release-build gate: {error}"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
     fn benchmark_accepts_one_hour_matrix_window_without_initializing_gpu() {
-        let accepted = run_cuda_benchmark(
-            0,
-            "unused".into(),
-            MAX_BENCHMARK_WINDOW_SECONDS,
-            None,
-            false,
-        )
-        .unwrap_err();
+        let device = benchmark_device(BackendKind::Cuda);
+        let accepted =
+            run_gpu_benchmark(&device, MAX_BENCHMARK_WINDOW_SECONDS, None, false).unwrap_err();
         assert!(accepted.contains("release build"));
 
-        let rejected = run_cuda_benchmark(
-            0,
-            "unused".into(),
-            MAX_BENCHMARK_WINDOW_SECONDS + 1,
-            None,
-            false,
-        )
-        .unwrap_err();
+        let rejected =
+            run_gpu_benchmark(&device, MAX_BENCHMARK_WINDOW_SECONDS + 1, None, false).unwrap_err();
         assert!(rejected.contains("1..=720"));
     }
 }

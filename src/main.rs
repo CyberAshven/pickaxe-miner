@@ -1091,19 +1091,7 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            if !matches!(selected.backend, backend::BackendKind::Cuda) {
-                eprintln!(
-                    "error: benchmark currently requires the validated native CUDA PHOTON backend"
-                );
-                std::process::exit(2);
-            }
-            match benchmark::run_cuda_benchmark(
-                selected.index,
-                selected.name,
-                seconds,
-                args.intensity,
-                ui_compare,
-            ) {
+            match benchmark::run_gpu_benchmark(&selected, seconds, args.intensity, ui_compare) {
                 Ok(report) => {
                     let passed = report.passed();
                     benchmark::print_report(&report, args.json);
