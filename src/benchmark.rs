@@ -425,7 +425,7 @@ pub fn run_gpu_benchmark(
     let mut engine = search::PhotonEngine::new(
         device.backend,
         device.index as usize,
-        search::MAX_BATCH_CANDIDATES,
+        search::production_max_batch_candidates(device.backend),
         search::WINNER_BUFFER_CAP,
     )?;
     let persistent_device_bytes = engine.persistent_device_bytes();
