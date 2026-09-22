@@ -65,11 +65,20 @@ struct RefreshFailureTracker {
     transient_total: u64,
     transport_total: u64,
     consecutive: u8,
+    same_source_timeout_reconnect_pending: bool,
 }
 
 impl RefreshFailureTracker {
-    fn success(&mut self) {
+    fn refresh_success(&mut self) {
         self.consecutive = 0;
+        self.same_source_timeout_reconnect_pending = false;
+    }
+
+    fn reconnect_success(&mut self, rotated: bool) {
+        self.consecutive = 0;
+        if rotated {
+            self.same_source_timeout_reconnect_pending = false;
+        }
     }
 
     fn failure(&mut self, kind: RefreshFailureKind) -> RefreshFailureAction {
@@ -81,7 +90,12 @@ impl RefreshFailureTracker {
                     .saturating_add(1)
                     .min(REFRESH_RECONNECT_THRESHOLD);
                 if self.consecutive >= REFRESH_RECONNECT_THRESHOLD {
-                    RefreshFailureAction::ReconnectCurrent
+                    if self.same_source_timeout_reconnect_pending {
+                        RefreshFailureAction::RotateSource
+                    } else {
+                        self.same_source_timeout_reconnect_pending = true;
+                        RefreshFailureAction::ReconnectCurrent
+                    }
                 } else {
                     RefreshFailureAction::RetainGeneration
                 }
@@ -2190,7 +2204,9 @@ fn run_supervisor(
                 match reconnect_result {
                     Ok((next_session, next_job)) => {
                         let connected_endpoint = next_session.url.clone();
-                        if !connected_endpoint.eq_ignore_ascii_case(&active_fulcrum_endpoint) {
+                        let rotated =
+                            !connected_endpoint.eq_ignore_ascii_case(&active_fulcrum_endpoint);
+                        if rotated {
                             endpoint_rotations = endpoint_rotations.saturating_add(1);
                             emit(
                                 &event_tx,
@@ -2202,7 +2218,7 @@ fn run_supervisor(
                         }
                         active_fulcrum_endpoint = connected_endpoint;
                         reconnects = reconnects.saturating_add(1);
-                        refresh_failures.success();
+                        refresh_failures.reconnect_success(rotated);
                         reconnect_backoff = RECONNECT_MIN;
                         last_error = None;
                         session = Some(next_session);
@@ -2476,7 +2492,7 @@ fn run_supervisor(
             );
             match refreshed {
                 Ok(boundary) => {
-                    refresh_failures.success();
+                    refresh_failures.refresh_success();
                     if let Some(warning) = boundary.route_warning.as_ref() {
                         if last_error.as_deref() != Some(warning.as_str()) {
                             emit(&event_tx, RuntimeEvent::Error(warning.clone()));
@@ -2645,12 +2661,15 @@ fn run_supervisor(
                             );
                             state = SupervisorState::Reconnecting;
                             reconnect_preference = ReconnectPreference::RotateAway;
-                            emit(
-                                &event_tx,
-                                RuntimeEvent::Reconnecting(format!(
+                            let reconnect_reason = match failure_kind {
+                                RefreshFailureKind::Transient => format!(
+                                    "Fulcrum PHOTON refresh timed out repeatedly after a same-source reconnect; rotating source while current generation keeps mining: {error}"
+                                ),
+                                RefreshFailureKind::Transport => format!(
                                     "Fulcrum transport lost; rotating source while current generation keeps mining: {error}"
-                                )),
-                            );
+                                ),
+                            };
+                            emit(&event_tx, RuntimeEvent::Reconnecting(reconnect_reason));
                             session = None;
                             next_reconnect = Instant::now() + reconnect_backoff;
                             reconnect_backoff = reconnect_backoff
@@ -4157,11 +4176,61 @@ mod tests {
         );
         assert_eq!(failures.consecutive, REFRESH_RECONNECT_THRESHOLD);
         assert_eq!(failures.transient_total, 3);
+        assert!(failures.same_source_timeout_reconnect_pending);
 
-        failures.success();
+        failures.reconnect_success(false);
         assert_eq!(failures.consecutive, 0);
-        assert_eq!(failures.transient_total, 3);
+        assert!(failures.same_source_timeout_reconnect_pending);
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transient),
+            RefreshFailureAction::RetainGeneration
+        );
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transient),
+            RefreshFailureAction::RetainGeneration
+        );
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transient),
+            RefreshFailureAction::RotateSource
+        );
+        assert_eq!(failures.transient_total, 6);
+
+        failures.reconnect_success(true);
+        assert!(!failures.same_source_timeout_reconnect_pending);
+        failures.refresh_success();
+        assert_eq!(failures.consecutive, 0);
+        assert_eq!(failures.transient_total, 6);
         assert!(!failures.degraded());
+    }
+
+    #[test]
+    fn stable_refresh_after_same_source_reconnect_clears_rotation_escalation() {
+        let mut failures = RefreshFailureTracker::default();
+        for _ in 0..REFRESH_RECONNECT_THRESHOLD - 1 {
+            assert_eq!(
+                failures.failure(RefreshFailureKind::Transient),
+                RefreshFailureAction::RetainGeneration
+            );
+        }
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transient),
+            RefreshFailureAction::ReconnectCurrent
+        );
+        failures.reconnect_success(false);
+        assert!(failures.same_source_timeout_reconnect_pending);
+
+        failures.refresh_success();
+        assert!(!failures.same_source_timeout_reconnect_pending);
+        for _ in 0..REFRESH_RECONNECT_THRESHOLD - 1 {
+            assert_eq!(
+                failures.failure(RefreshFailureKind::Transient),
+                RefreshFailureAction::RetainGeneration
+            );
+        }
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transient),
+            RefreshFailureAction::ReconnectCurrent
+        );
     }
 
     #[test]
