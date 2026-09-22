@@ -201,8 +201,7 @@ fn m27_precomputed_words(private_key: &[u8; 32]) -> [u32; 16] {
 
 fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
     let mut state = SHA256_IV;
-    for chunk in template[..384].chunks_exact(64) {
-        let block: &[u8; 64] = chunk.try_into().expect("64-byte SHA-256 block");
+    for block in template[..384].as_chunks::<64>().0 {
         compress_block(&mut state, block);
     }
     state
