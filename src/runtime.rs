@@ -13,6 +13,7 @@ use crate::search::VerifiedWinner;
 use crate::search::{
     MiningState, RuntimeCommand as SearchCommand, SearchHandle, SearchPauseHandle, SearchStats,
 };
+use crate::telemetry::{GpuTelemetry, LiveTelemetrySampler};
 use crate::tx;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -1447,6 +1448,7 @@ pub struct RuntimeSnapshot {
     pub pending_winners: u64,
     pub last_error: Option<String>,
     pub search: SearchStats,
+    pub gpu_telemetry: GpuTelemetry,
 }
 
 #[derive(Debug, Clone)]
@@ -1512,6 +1514,7 @@ pub struct RuntimeSupervisor {
     snapshot: Arc<Mutex<RuntimeSnapshot>>,
     shutdown: ShutdownSignal,
     worker: Option<JoinHandle<()>>,
+    telemetry: LiveTelemetrySampler,
 }
 
 impl RuntimeSupervisor {
@@ -1571,6 +1574,7 @@ impl RuntimeSupervisor {
             initial_job,
         )?;
         let initial_search = search.snapshot();
+        let telemetry = LiveTelemetrySampler::start(backend, device_ordinal);
         let shutdown = ShutdownSignal::new(search.pause_handle());
         let initial_snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,
@@ -1590,6 +1594,7 @@ impl RuntimeSupervisor {
             pending_winners: 0,
             last_error: None,
             search: initial_search,
+            gpu_telemetry: telemetry.snapshot(),
         };
 
         let snapshot = Arc::new(Mutex::new(initial_snapshot));
@@ -1630,14 +1635,18 @@ impl RuntimeSupervisor {
             snapshot,
             shutdown,
             worker: Some(worker),
+            telemetry,
         })
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
-        self.snapshot
+        let mut snapshot = self
+            .snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .clone();
+        snapshot.gpu_telemetry = self.telemetry.snapshot();
+        snapshot
     }
 
     pub fn drain_events(&self) -> Vec<RuntimeEvent> {
@@ -1698,7 +1707,9 @@ impl RuntimeSupervisor {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        self.snapshot()
+        let final_snapshot = self.snapshot();
+        self.telemetry.stop();
+        final_snapshot
     }
 }
 
@@ -1709,6 +1720,7 @@ impl Drop for RuntimeSupervisor {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.telemetry.stop();
     }
 }
 

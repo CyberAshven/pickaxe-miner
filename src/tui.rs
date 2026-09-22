@@ -459,6 +459,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         pending_winners: 0,
         last_error: None,
         search: Default::default(),
+        gpu_telemetry: Default::default(),
     };
     snapshot.search.intensity = 100;
     snapshot.search.rate = 500_000.0;
@@ -1017,6 +1018,8 @@ fn render_intensity(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
 fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let endpoint = redact_endpoint(&snapshot.endpoint);
     let last_error = snapshot.last_error.as_deref().unwrap_or("none");
+    let telemetry = &snapshot.gpu_telemetry;
+    let efficiency = telemetry.candidates_per_watt(snapshot.search.current_rate);
     let lines = vec![
         Line::from(format!(
             "rate: current {:>10.0}/s   average {:>10.0}/s   peak {:>10.0}/s",
@@ -1045,7 +1048,19 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             snapshot.reconnects, snapshot.job_changes
         )),
         Line::from(format!("payout: {}", shorten(&snapshot.payout_address, 66))),
-        Line::from("GPU telemetry: runtime provider unavailable"),
+        Line::from(format!(
+            "GPU: util {}   temp {}   power {}   VRAM {}",
+            format_metric(telemetry.gpu_utilization_percent, "%"),
+            format_metric(telemetry.temperature_c, "C"),
+            format_metric(telemetry.power_watts, "W"),
+            format_metric(telemetry.vram_used_mib, "MiB"),
+        )),
+        Line::from(format!(
+            "clocks: {}/{}   efficiency {}",
+            format_metric(telemetry.graphics_clock_mhz, "MHz"),
+            format_metric(telemetry.memory_clock_mhz, "MHz"),
+            format_metric(efficiency, " cand/s/W"),
+        )),
         Line::from(format!("last error: {}", shorten(last_error, 70))),
     ];
     frame.render_widget(
@@ -1054,6 +1069,12 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn format_metric(value: Option<f64>, unit: &str) -> String {
+    value
+        .map(|value| format!("{value:.1}{unit}"))
+        .unwrap_or_else(|| "N/A".into())
 }
 
 fn render_events(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -1317,6 +1338,7 @@ mod tests {
             pending_winners: 0,
             last_error: None,
             search: Default::default(),
+            gpu_telemetry: Default::default(),
         }
     }
 
@@ -1497,6 +1519,38 @@ mod tests {
     }
 
     #[test]
+    fn runtime_view_renders_shared_gpu_telemetry_and_efficiency() {
+        let mut snapshot = test_snapshot();
+        snapshot.search.current_rate = 500_000.0;
+        snapshot.gpu_telemetry = crate::telemetry::GpuTelemetry {
+            samples: 2,
+            gpu_utilization_percent: Some(88.0),
+            power_watts: Some(100.0),
+            temperature_c: Some(72.0),
+            vram_used_mib: Some(640.0),
+            graphics_clock_mhz: Some(2_500.0),
+            memory_clock_mhz: Some(8_100.0),
+        };
+        let state = TuiState::new(&snapshot);
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &snapshot, &state))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("util 88.0%"));
+        assert!(rendered.contains("temp 72.0C"));
+        assert!(rendered.contains("power 100.0W"));
+        assert!(rendered.contains("efficiency 5000.0 cand/s/W"));
+    }
+
+    #[test]
     fn palette_rejects_invalid_intensity_without_touching_runtime() {
         assert!(parse_palette_command("intensity 9").is_err());
         assert!(parse_palette_command("intensity 101").is_err());
@@ -1535,6 +1589,7 @@ mod tests {
             pending_winners: 0,
             last_error: None,
             search: Default::default(),
+            gpu_telemetry: Default::default(),
         };
         let mut state = TuiState::new(&snapshot);
         for i in 0..(EVENT_HISTORY_CAP + 20) {
