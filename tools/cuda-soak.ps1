@@ -11,11 +11,15 @@ param(
 
     [string]$OutputDirectory = "artifacts\cuda-soak",
 
-    [string]$TargetDirectory = ""
+    [string]$TargetDirectory = "",
+
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
 $intensityCount = 5
+$minimumTelemetryCoverage = 0.80
+$runtimeToleranceSeconds = 1.0
 $totalSeconds = $TotalMinutes * 60
 $windowSeconds = [Math]::Floor($totalSeconds / $intensityCount)
 if ($windowSeconds -lt 1) {
@@ -58,6 +62,140 @@ function Convert-GpuMetric {
         return $number
     }
     return $null
+}
+
+function Get-CoverageSummary {
+    param(
+        [object[]]$Values,
+        [int]$ExpectedSamples,
+        [double]$MinimumCoverage
+    )
+
+    $observed = @($Values | Where-Object { $null -ne $_ }).Count
+    $required = [Math]::Max(1, [Math]::Ceiling($ExpectedSamples * $MinimumCoverage))
+    return [ordered]@{
+        samples = $observed
+        expected_samples = $ExpectedSamples
+        required_samples = $required
+        coverage_percent = if ($ExpectedSamples -gt 0) {
+            [Math]::Round(100.0 * $observed / $ExpectedSamples, 3)
+        } else {
+            0.0
+        }
+        complete = ($observed -ge $required)
+    }
+}
+
+function Get-SoakEvidenceCompleteness {
+    param(
+        [object[]]$Samples,
+        [double]$ObservedRuntimeSeconds,
+        [int]$ExpectedMatrixSeconds,
+        [int]$SampleIntervalSeconds,
+        [double]$MinimumTelemetryCoverage,
+        [double]$RuntimeToleranceSeconds
+    )
+
+    $expectedSampleCount = [Math]::Max(
+        1,
+        [Math]::Floor($ExpectedMatrixSeconds / $SampleIntervalSeconds)
+    )
+    $minimumSampleCount = [Math]::Max(
+        3,
+        [Math]::Ceiling($expectedSampleCount * $MinimumTelemetryCoverage)
+    )
+    $minimumObservedSeconds = [Math]::Max(
+        0.0,
+        $ExpectedMatrixSeconds - $RuntimeToleranceSeconds
+    )
+    $durationComplete = $ObservedRuntimeSeconds -ge $minimumObservedSeconds
+    $sampleCountComplete = $Samples.Count -ge $minimumSampleCount
+    $workingSetCoverage = Get-CoverageSummary -Values $Samples.working_set_mib -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $privateCoverage = Get-CoverageSummary -Values $Samples.private_mib -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $cpuCoverage = Get-CoverageSummary -Values $Samples.cpu_utilization_percent -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $vramCoverage = Get-CoverageSummary -Values $Samples.gpu_vram_mib -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $gpuUtilCoverage = Get-CoverageSummary -Values $Samples.gpu_utilization_percent -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $gpuPowerCoverage = Get-CoverageSummary -Values $Samples.gpu_power_watts -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $gpuTemperatureCoverage = Get-CoverageSummary -Values $Samples.gpu_temperature_c -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $gpuGraphicsClockCoverage = Get-CoverageSummary -Values $Samples.gpu_graphics_clock_mhz -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $gpuMemoryClockCoverage = Get-CoverageSummary -Values $Samples.gpu_memory_clock_mhz -ExpectedSamples $expectedSampleCount -MinimumCoverage $MinimumTelemetryCoverage
+    $telemetryComplete = (
+        $sampleCountComplete -and
+        $workingSetCoverage.complete -and
+        $privateCoverage.complete -and
+        $cpuCoverage.complete -and
+        $vramCoverage.complete -and
+        $gpuUtilCoverage.complete -and
+        $gpuPowerCoverage.complete -and
+        $gpuTemperatureCoverage.complete -and
+        $gpuGraphicsClockCoverage.complete -and
+        $gpuMemoryClockCoverage.complete
+    )
+
+    return [ordered]@{
+        duration_complete = $durationComplete
+        minimum_observed_seconds = $minimumObservedSeconds
+        expected_sample_count = $expectedSampleCount
+        minimum_sample_count = $minimumSampleCount
+        sample_count_complete = $sampleCountComplete
+        telemetry_complete = $telemetryComplete
+        telemetry_coverage = [ordered]@{
+            working_set = $workingSetCoverage
+            private_memory = $privateCoverage
+            cpu_utilization = $cpuCoverage
+            gpu_vram = $vramCoverage
+            gpu_utilization = $gpuUtilCoverage
+            gpu_power = $gpuPowerCoverage
+            gpu_temperature = $gpuTemperatureCoverage
+            gpu_graphics_clock = $gpuGraphicsClockCoverage
+            gpu_memory_clock = $gpuMemoryClockCoverage
+        }
+    }
+}
+
+if ($SelfTest) {
+    $synthetic = @(
+        0..9 | ForEach-Object {
+            [pscustomobject]@{
+                working_set_mib = 100.0
+                private_mib = 200.0
+                cpu_utilization_percent = if ($_ -eq 0) { $null } else { 1.0 }
+                gpu_vram_mib = 600.0
+                gpu_utilization_percent = 80.0
+                gpu_power_watts = 100.0
+                gpu_temperature_c = 70.0
+                gpu_graphics_clock_mhz = 2500.0
+                gpu_memory_clock_mhz = 14000.0
+            }
+        }
+    )
+    $complete = Get-SoakEvidenceCompleteness -Samples $synthetic -ObservedRuntimeSeconds 10.0 -ExpectedMatrixSeconds 10 -SampleIntervalSeconds 1 -MinimumTelemetryCoverage 0.80 -RuntimeToleranceSeconds 1.0
+    if (!$complete.duration_complete -or !$complete.telemetry_complete) {
+        throw "Self-test failed: complete evidence was rejected."
+    }
+
+    $early = Get-SoakEvidenceCompleteness -Samples $synthetic -ObservedRuntimeSeconds 8.9 -ExpectedMatrixSeconds 10 -SampleIntervalSeconds 1 -MinimumTelemetryCoverage 0.80 -RuntimeToleranceSeconds 1.0
+    if ($early.duration_complete) {
+        throw "Self-test failed: truncated runtime was accepted."
+    }
+
+    $sparse = @($synthetic[0..7] | ForEach-Object { $_.PSObject.Copy() })
+    $sparse[0].gpu_power_watts = $null
+    if ((Get-SoakEvidenceCompleteness -Samples $sparse -ObservedRuntimeSeconds 10.0 -ExpectedMatrixSeconds 10 -SampleIntervalSeconds 1 -MinimumTelemetryCoverage 0.80 -RuntimeToleranceSeconds 1.0).telemetry_complete) {
+        throw "Self-test failed: sparse per-metric telemetry was accepted."
+    }
+
+    $missingClock = @($synthetic | ForEach-Object {
+        $copy = $_.PSObject.Copy()
+        $copy.gpu_graphics_clock_mhz = $null
+        $copy
+    })
+    if ((Get-SoakEvidenceCompleteness -Samples $missingClock -ObservedRuntimeSeconds 10.0 -ExpectedMatrixSeconds 10 -SampleIntervalSeconds 1 -MinimumTelemetryCoverage 0.80 -RuntimeToleranceSeconds 1.0).telemetry_complete) {
+        throw "Self-test failed: missing GPU clock telemetry was accepted."
+    }
+
+    Write-Output "cuda-soak evidence self-test: PASS"
+    return
 }
 
 Push-Location $repoRoot
@@ -162,6 +300,8 @@ try {
     }
 
     $process.WaitForExit()
+    $finished = Get-Date
+    $observedRuntimeSeconds = ($finished - $started).TotalSeconds
     $benchmarkStdout = $process.StandardOutput.ReadToEnd()
     $benchmarkStderr = $process.StandardError.ReadToEnd()
     $benchmarkStdout | Set-Content -Encoding utf8 $benchmarkPath
@@ -241,23 +381,39 @@ try {
     $workingSetSummary = Get-GrowthSummary -Values $samples.working_set_mib -ToleranceMiB 32
     $privateSummary = Get-GrowthSummary -Values $samples.private_mib -ToleranceMiB 32
     $vramSummary = Get-GrowthSummary -Values $samples.gpu_vram_mib -ToleranceMiB 32
+    $expectedMatrixSeconds = $windowSeconds * $intensityCount
+    $evidence = Get-SoakEvidenceCompleteness -Samples $samples -ObservedRuntimeSeconds $observedRuntimeSeconds -ExpectedMatrixSeconds $expectedMatrixSeconds -SampleIntervalSeconds $SampleIntervalSeconds -MinimumTelemetryCoverage $minimumTelemetryCoverage -RuntimeToleranceSeconds $runtimeToleranceSeconds
+    $durationComplete = $evidence.duration_complete
+    $telemetryComplete = $evidence.telemetry_complete
     $monotonicGrowthDetected = (
         $workingSetSummary.monotonic_growth -eq $true -or
         $privateSummary.monotonic_growth -eq $true -or
         $vramSummary.monotonic_growth -eq $true
     )
-    $status = if ($exitCode -eq 0 -and !$monotonicGrowthDetected) { "PASS" } else { "FAIL" }
+    $status = if (
+        $exitCode -eq 0 -and
+        !$monotonicGrowthDetected -and
+        $durationComplete -and
+        $telemetryComplete
+    ) { "PASS" } else { "FAIL" }
 
     $summary = [ordered]@{
         status = $status
         exit_code = $exitCode
         requested_total_minutes = $TotalMinutes
         benchmark_window_seconds = $windowSeconds
-        expected_matrix_seconds = $windowSeconds * $intensityCount
+        expected_matrix_seconds = $expectedMatrixSeconds
+        observed_runtime_seconds = [Math]::Round($observedRuntimeSeconds, 3)
+        duration_complete = $durationComplete
+        minimum_observed_seconds = $evidence.minimum_observed_seconds
         sample_interval_seconds = $SampleIntervalSeconds
         sample_count = $samples.Count
+        expected_sample_count = $evidence.expected_sample_count
+        minimum_sample_count = $evidence.minimum_sample_count
         device = $Device
         target_directory = $TargetDirectory
+        telemetry_complete = $telemetryComplete
+        telemetry_coverage = $evidence.telemetry_coverage
         working_set = $workingSetSummary
         private_memory = $privateSummary
         gpu_vram = $vramSummary
@@ -288,6 +444,12 @@ try {
 
     if ($exitCode -ne 0) {
         throw "CUDA benchmark exited with code $exitCode. See $stderrPath"
+    }
+    if (!$durationComplete) {
+        throw "CUDA soak ended before the required benchmark duration. See $summaryPath"
+    }
+    if (!$telemetryComplete) {
+        throw "CUDA soak telemetry coverage is incomplete. See $summaryPath"
     }
     if ($summary.monotonic_growth_detected) {
         throw "Possible monotonic RAM/VRAM growth detected after warm-up. See $summaryPath"
