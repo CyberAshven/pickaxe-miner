@@ -64,6 +64,55 @@ function Convert-GpuMetric {
     return $null
 }
 
+function Get-CompetingPickaxeGpuProcesses {
+    param(
+        [int]$Device,
+        [int[]]$ExcludeProcessId = @(),
+        [string[]]$QueryLines = $null
+    )
+
+    if ($null -eq $QueryLines) {
+        $QueryLines = @(
+            & nvidia-smi "--id=$Device" "--query-compute-apps=pid,process_name" "--format=csv,noheader" 2>$null
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to query GPU $Device compute processes with nvidia-smi."
+        }
+    }
+
+    $excluded = @{}
+    foreach ($processId in $ExcludeProcessId) {
+        $excluded[[int]$processId] = $true
+    }
+
+    $competitors = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in $QueryLines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        $parts = $line.Split(",", 2)
+        if ($parts.Count -ne 2) {
+            continue
+        }
+        $processId = 0
+        if (![int]::TryParse($parts[0].Trim(), [ref]$processId)) {
+            continue
+        }
+        if ($excluded.ContainsKey($processId)) {
+            continue
+        }
+        $processName = $parts[1].Trim()
+        $executableName = [System.IO.Path]::GetFileNameWithoutExtension($processName)
+        if ($executableName -ieq "pickaxe_miner") {
+            $competitors.Add([pscustomobject]@{
+                pid = $processId
+                process_name = $processName
+            })
+        }
+    }
+    return @($competitors)
+}
+
 function Get-CoverageSummary {
     param(
         [object[]]$Values,
@@ -247,6 +296,23 @@ function Get-GrowthSummary {
 }
 
 if ($SelfTest) {
+    $syntheticGpuProcesses = @(
+        "61300, C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "35388, D:\Qubes\pickaxe-live-latest\release\pickaxe_miner.exe"
+    )
+    $syntheticCompetitors = @(
+        Get-CompetingPickaxeGpuProcesses -Device 0 -QueryLines $syntheticGpuProcesses
+    )
+    if ($syntheticCompetitors.Count -ne 1 -or $syntheticCompetitors[0].pid -ne 35388) {
+        throw "Self-test failed: competing Pickaxe GPU process was not detected."
+    }
+    $syntheticExcluded = @(
+        Get-CompetingPickaxeGpuProcesses -Device 0 -ExcludeProcessId @(35388) -QueryLines $syntheticGpuProcesses
+    )
+    if ($syntheticExcluded.Count -ne 0) {
+        throw "Self-test failed: owned Pickaxe GPU process exclusion did not work."
+    }
+
     $synthetic = @(
         0..9 | ForEach-Object {
             [pscustomobject]@{
@@ -307,6 +373,12 @@ if ($SelfTest) {
 
     Write-Output "cuda-soak evidence self-test: PASS"
     return
+}
+
+$preexistingPickaxe = @(Get-CompetingPickaxeGpuProcesses -Device $Device)
+if ($preexistingPickaxe.Count -gt 0) {
+    $details = ($preexistingPickaxe | ForEach-Object { "PID $($_.pid): $($_.process_name)" }) -join "; "
+    throw "CUDA soak requires exclusive Pickaxe access to GPU $Device. Stop the competing Pickaxe process before collecting evidence: $details"
 }
 
 Push-Location $repoRoot
