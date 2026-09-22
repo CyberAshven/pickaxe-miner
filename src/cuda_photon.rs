@@ -401,6 +401,24 @@ mod tests {
     use super::*;
     use crate::{crypto, search, tx};
 
+    #[test]
+    fn cuda_source_tree_contains_no_placeholder_kernel() {
+        let cuda_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cuda");
+        let placeholders = std::fs::read_dir(&cuda_dir)
+            .unwrap_or_else(|error| {
+                panic!("read CUDA source directory {}: {error}", cuda_dir.display())
+            })
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.to_ascii_lowercase().contains("placeholder"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            placeholders.is_empty(),
+            "production CUDA source tree must not contain placeholder kernels: {placeholders:?}"
+        );
+    }
+
     fn should_skip_cuda_error(error: &str) -> bool {
         let lower = error.to_lowercase();
         lower.contains("cuda")
