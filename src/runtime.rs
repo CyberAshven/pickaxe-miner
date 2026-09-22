@@ -1445,8 +1445,8 @@ pub struct RuntimeSnapshot {
     pub height: u32,
     pub baton_txid: String,
     pub baton_vout: u32,
-    pub refreshes: u64,
-    pub stale_rebuilds: u64,
+    pub state_checks: u64,
+    pub job_changes: u64,
     pub reconnects: u64,
     pub stale_winners: u64,
     pub verified_winners: u64,
@@ -1588,8 +1588,8 @@ impl RuntimeSupervisor {
             height: initial.height,
             baton_txid: initial.baton_txid.clone(),
             baton_vout: initial.baton_vout,
-            refreshes: 0,
-            stale_rebuilds: 0,
+            state_checks: 0,
+            job_changes: 0,
             reconnects: 0,
             stale_winners: 0,
             verified_winners: 0,
@@ -1747,8 +1747,8 @@ fn run_supervisor(
     };
     let mut user_paused = false;
     let mut pending_winner: Option<VerifiedWinner> = None;
-    let mut refreshes = 0u64;
-    let mut stale_rebuilds = 0u64;
+    let mut state_checks = 0u64;
+    let mut job_changes = 0u64;
     let mut reconnects = 0u64;
     let mut stale_winners = 0u64;
     let mut verified_winners = 0u64;
@@ -1835,7 +1835,7 @@ fn run_supervisor(
                         )?;
                         cfg = next_cfg;
                         settlement = next_settlement;
-                        stale_rebuilds = stale_rebuilds.saturating_add(1);
+                        job_changes = job_changes.saturating_add(1);
                         Ok(())
                     });
                     let _ = reply.send(result);
@@ -1876,7 +1876,7 @@ fn run_supervisor(
                                 cfg = next_cfg;
                                 settlement = next_settlement;
                                 endpoints = next_endpoints;
-                                stale_rebuilds = stale_rebuilds.saturating_add(1);
+                                job_changes = job_changes.saturating_add(1);
                                 session = None;
                                 state = SupervisorState::Reconnecting;
                                 last_error = None;
@@ -1988,7 +1988,7 @@ fn run_supervisor(
                         ) {
                             Ok(changed) => {
                                 if changed {
-                                    stale_rebuilds = stale_rebuilds.saturating_add(1);
+                                    job_changes = job_changes.saturating_add(1);
                                 }
                                 emit(&event_tx, RuntimeEvent::Reconnected(live.url.clone()));
                                 next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
@@ -2107,7 +2107,7 @@ fn run_supervisor(
                                 }) {
                                     Ok(changed) => {
                                         if changed {
-                                            stale_rebuilds = stale_rebuilds.saturating_add(1);
+                                            job_changes = job_changes.saturating_add(1);
                                         }
                                         next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
                                         if !search_resume_allowed(
@@ -2167,7 +2167,7 @@ fn run_supervisor(
                                 ) {
                                     Ok(changed) => {
                                         if changed {
-                                            stale_rebuilds = stale_rebuilds.saturating_add(1);
+                                            job_changes = job_changes.saturating_add(1);
                                         }
                                         next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
                                         if !search_resume_allowed(
@@ -2246,7 +2246,7 @@ fn run_supervisor(
                         }
                         last_error = Some(warning.clone());
                     }
-                    refreshes = refreshes.saturating_add(1);
+                    state_checks = state_checks.saturating_add(1);
                     match apply_refreshed_job(
                         session.as_mut().expect("checked session above"),
                         &mut cfg,
@@ -2261,7 +2261,7 @@ fn run_supervisor(
                     ) {
                         Ok(changed) => {
                             if changed {
-                                stale_rebuilds = stale_rebuilds.saturating_add(1);
+                                job_changes = job_changes.saturating_add(1);
                             }
                             emit_job_change_if_changed(
                                 &event_tx,
@@ -2386,8 +2386,8 @@ fn run_supervisor(
             &cfg,
             &live,
             &search,
-            refreshes,
-            stale_rebuilds,
+            state_checks,
+            job_changes,
             reconnects,
             stale_winners,
             verified_winners,
@@ -2924,8 +2924,8 @@ fn write_snapshot(
     cfg: &RuntimeConfig,
     live: &LiveJob,
     search: &SearchHandle,
-    refreshes: u64,
-    stale_rebuilds: u64,
+    state_checks: u64,
+    job_changes: u64,
     reconnects: u64,
     stale_winners: u64,
     verified_winners: u64,
@@ -2945,8 +2945,8 @@ fn write_snapshot(
     snapshot.height = live.height;
     snapshot.baton_txid.clone_from(&live.baton_txid);
     snapshot.baton_vout = live.baton_vout;
-    snapshot.refreshes = refreshes;
-    snapshot.stale_rebuilds = stale_rebuilds;
+    snapshot.state_checks = state_checks;
+    snapshot.job_changes = job_changes;
     snapshot.reconnects = reconnects;
     snapshot.stale_winners = stale_winners;
     snapshot.verified_winners = verified_winners;
