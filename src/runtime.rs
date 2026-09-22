@@ -640,6 +640,26 @@ impl ResolvedSubmission {
         })
     }
 
+    fn from_confirmed(pending: &PendingSubmission, fresh: &LiveJob) -> Result<Self, String> {
+        pending.validate()?;
+        Ok(Self {
+            version: SUBMISSION_RESOLUTION_VERSION,
+            journal_version: pending.version,
+            generation_id: pending.generation_id,
+            expected_height: pending.expected_height,
+            expected_baton_txid: pending.expected_baton_txid.clone(),
+            expected_baton_vout: pending.expected_baton_vout,
+            parent_txid: pending.parent_txid.clone(),
+            settlement_txid: pending.settlement_txid.clone(),
+            parent_attempted: true,
+            parent_accepted: true,
+            observed_height: fresh.height,
+            observed_baton_txid: fresh.baton_txid.clone(),
+            observed_baton_vout: fresh.baton_vout,
+            reason: "confirmed".into(),
+        })
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.version != SUBMISSION_RESOLUTION_VERSION {
             return Err(format!(
@@ -653,9 +673,6 @@ impl ResolvedSubmission {
                 self.journal_version
             ));
         }
-        if self.parent_accepted {
-            return Err("resolved stale submission cannot have an accepted parent".into());
-        }
         for (label, txid) in [
             ("expected baton", self.expected_baton_txid.as_str()),
             ("parent", self.parent_txid.as_str()),
@@ -666,8 +683,20 @@ impl ResolvedSubmission {
                 return Err(format!("resolved submission has invalid {label} txid"));
             }
         }
-        if self.reason != "stale-unbroadcast" {
-            return Err("resolved submission has an unsupported resolution reason".into());
+        match self.reason.as_str() {
+            "stale-unbroadcast" => {
+                if self.parent_accepted {
+                    return Err("resolved stale submission cannot have an accepted parent".into());
+                }
+            }
+            "confirmed" => {
+                if !self.parent_attempted || !self.parent_accepted {
+                    return Err(
+                        "confirmed submission must record an attempted and accepted parent".into(),
+                    );
+                }
+            }
+            _ => return Err("resolved submission has an unsupported resolution reason".into()),
         }
         Ok(())
     }
@@ -769,6 +798,16 @@ fn resolve_stale_submission(
     PendingSubmission::remove(journal_path)
 }
 
+fn resolve_confirmed_submission(
+    pending: &PendingSubmission,
+    fresh: &LiveJob,
+    journal_path: &Path,
+) -> Result<(), String> {
+    let resolved = ResolvedSubmission::from_confirmed(pending, fresh)?;
+    resolved.persist_latest(journal_path)?;
+    PendingSubmission::remove(journal_path)
+}
+
 fn submission_journal_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
@@ -823,7 +862,7 @@ fn submission_decision(
 }
 
 enum SubmissionAttempt {
-    Complete,
+    Complete(Box<LiveJob>),
     StaleUnbroadcast(Box<LiveJob>),
 }
 
@@ -1087,7 +1126,7 @@ fn broadcast_settlement(
     ensure_broadcast_txid("PHOTON settlement", &pending.settlement_txid, &returned)?;
     let fresh = session.fetch_live_job()?;
     if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
-        Ok(SubmissionAttempt::Complete)
+        Ok(SubmissionAttempt::Complete(Box::new(fresh)))
     } else {
         Err(
             "settlement broadcast is known but the resulting PHOTON baton is neither authoritative nor a proven ancestor of the live baton".into(),
@@ -1107,7 +1146,7 @@ fn attempt_pending_submission(
     if settlement_known {
         let fresh = session.fetch_live_job()?;
         if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
-            return Ok(SubmissionAttempt::Complete);
+            return Ok(SubmissionAttempt::Complete(Box::new(fresh)));
         }
         return Err(
             "settlement transaction is known but the journaled resulting PHOTON baton is neither authoritative nor a proven ancestor of the live baton".into(),
@@ -1204,9 +1243,8 @@ fn resolve_pending_before_search(
     };
 
     match attempt_pending_submission(session, cfg, &pending, journal_path)? {
-        SubmissionAttempt::Complete => {
-            PendingSubmission::remove(journal_path)?;
-            Ok(())
+        SubmissionAttempt::Complete(fresh) => {
+            resolve_confirmed_submission(&pending, &fresh, journal_path)
         }
         SubmissionAttempt::StaleUnbroadcast(fresh) => {
             resolve_stale_submission(&pending, &fresh, journal_path)
@@ -2106,8 +2144,8 @@ fn run_supervisor(
                     &journal_path,
                 );
                 match attempt {
-                    Ok(SubmissionAttempt::Complete) => {
-                        match PendingSubmission::remove(&journal_path) {
+                    Ok(SubmissionAttempt::Complete(fresh)) => {
+                        match resolve_confirmed_submission(&pending, &fresh, &journal_path) {
                             Ok(()) => {
                                 emit(
                                     &event_tx,
@@ -4466,6 +4504,48 @@ mod tests {
         assert_eq!(resolved.observed_height, conflicting.height);
         assert_eq!(resolved.observed_baton_txid, conflicting.baton_txid);
         assert_eq!(resolved.reason, "stale-unbroadcast");
+
+        fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
+    }
+
+    #[test]
+    fn confirmed_submission_keeps_durable_resolution_evidence_before_journal_cleanup() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let winner = signed_winner(cfg.generation_id, &job, &mining_payout);
+        let pending = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+        pending.mark_parent_accepted(&journal).unwrap();
+
+        let mut confirmed = job.clone();
+        confirmed.height += 1;
+        confirmed.baton_txid = pending.resulting_baton_txid.clone();
+        confirmed.baton_vout = pending.resulting_baton_vout;
+        resolve_confirmed_submission(&pending, &confirmed, &journal).unwrap();
+
+        assert!(!journal.exists());
+        assert!(!PendingSubmission::parent_attempted_path(&journal).exists());
+        assert!(!PendingSubmission::parent_accepted_path(&journal).exists());
+        let resolved = ResolvedSubmission::load(&journal).unwrap().unwrap();
+        assert_eq!(resolved.generation_id, cfg.generation_id);
+        assert_eq!(resolved.expected_height, job.height);
+        assert_eq!(resolved.expected_baton_txid, job.baton_txid);
+        assert_eq!(resolved.parent_txid, pending.parent_txid);
+        assert_eq!(resolved.settlement_txid, pending.settlement_txid);
+        assert!(resolved.parent_attempted);
+        assert!(resolved.parent_accepted);
+        assert_eq!(resolved.observed_height, confirmed.height);
+        assert_eq!(resolved.observed_baton_txid, confirmed.baton_txid);
+        assert_eq!(resolved.observed_baton_vout, confirmed.baton_vout);
+        assert_eq!(resolved.reason, "confirmed");
 
         fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
     }
