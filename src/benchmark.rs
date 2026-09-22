@@ -23,6 +23,8 @@ const VECTOR_CONTRACT_VALUE_SATS: u64 = 15_971_500;
 const VECTOR_TOKEN_AMOUNT: u128 = 2_099_905_002_035_715;
 const VECTOR_REWARD_RAW: u128 = 4_999_773_813;
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
+const MATRIX_MONOTONIC_TOLERANCE_PERCENT: f64 = 12.5;
+const MIN_MATRIX_100_TO_10_THROUGHPUT_RATIO: f64 = 2.0;
 
 fn benchmark_intensities(requested: Option<u8>) -> Result<Vec<u8>, String> {
     match requested {
@@ -54,9 +56,35 @@ pub struct BenchmarkReport {
     pub table_source: String,
     pub persistent_device_bytes: usize,
     pub samples: Vec<BenchmarkSample>,
+    pub matrix_validation: Option<BenchmarkMatrixValidation>,
     pub ui_comparison: Option<UiComparison>,
     pub network_access: bool,
     pub broadcast: bool,
+}
+
+impl BenchmarkReport {
+    pub fn passed(&self) -> bool {
+        self.status == "PASS"
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkMatrixValidation {
+    pub required_intensities_present: bool,
+    pub approximately_monotonic_throughput: bool,
+    pub monotonic_tolerance_percent: f64,
+    pub minimum_100_to_10_throughput_ratio: f64,
+    pub observed_100_to_10_throughput_ratio: Option<f64>,
+    pub real_scaling_observed: bool,
+    pub telemetry_load_increase_observed: Option<bool>,
+}
+
+impl BenchmarkMatrixValidation {
+    fn passed(&self) -> bool {
+        self.required_intensities_present
+            && self.approximately_monotonic_throughput
+            && self.real_scaling_observed
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +183,61 @@ fn add_metric(value: Option<f64>, sum: &mut f64, count: &mut u32) {
 
 fn average(sum: f64, count: u32) -> Option<f64> {
     (count > 0).then_some(sum / f64::from(count))
+}
+
+fn validate_intensity_matrix(samples: &[BenchmarkSample]) -> BenchmarkMatrixValidation {
+    let required_intensities_present = samples.len() == BENCHMARK_INTENSITIES.len()
+        && samples
+            .iter()
+            .map(|sample| sample.intensity)
+            .eq(BENCHMARK_INTENSITIES);
+    let tolerance_multiplier = 1.0 - MATRIX_MONOTONIC_TOLERANCE_PERCENT / 100.0;
+    let approximately_monotonic_throughput = required_intensities_present
+        && samples.windows(2).all(|pair| {
+            pair[1].candidates_per_second >= pair[0].candidates_per_second * tolerance_multiplier
+        });
+
+    let observed_100_to_10_throughput_ratio = match (samples.first(), samples.last()) {
+        (Some(low), Some(high)) if low.candidates_per_second > 0.0 => {
+            Some(high.candidates_per_second / low.candidates_per_second)
+        }
+        _ => None,
+    };
+    let real_scaling_observed = required_intensities_present
+        && observed_100_to_10_throughput_ratio
+            .is_some_and(|ratio| ratio >= MIN_MATRIX_100_TO_10_THROUGHPUT_RATIO);
+
+    let telemetry_load_increase_observed = match (samples.first(), samples.last()) {
+        (Some(low), Some(high)) => {
+            let utilization_increased = match (
+                low.telemetry.gpu_utilization_percent,
+                high.telemetry.gpu_utilization_percent,
+            ) {
+                (Some(low), Some(high)) => Some(high > low),
+                _ => None,
+            };
+            let power_increased = match (low.telemetry.power_watts, high.telemetry.power_watts) {
+                (Some(low), Some(high)) => Some(high > low),
+                _ => None,
+            };
+            match (utilization_increased, power_increased) {
+                (Some(utilization), Some(power)) => Some(utilization || power),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            }
+        }
+        _ => None,
+    };
+
+    BenchmarkMatrixValidation {
+        required_intensities_present,
+        approximately_monotonic_throughput,
+        monotonic_tolerance_percent: MATRIX_MONOTONIC_TOLERANCE_PERCENT,
+        minimum_100_to_10_throughput_ratio: MIN_MATRIX_100_TO_10_THROUGHPUT_RATIO,
+        observed_100_to_10_throughput_ratio,
+        real_scaling_observed,
+        telemetry_load_increase_observed,
+    }
 }
 
 fn start_telemetry_sampler(
@@ -366,6 +449,17 @@ pub fn run_cuda_benchmark(
             .sample,
         );
     }
+    let matrix_validation = requested_intensity
+        .is_none()
+        .then(|| validate_intensity_matrix(&samples));
+    let status = if matrix_validation
+        .as_ref()
+        .is_none_or(BenchmarkMatrixValidation::passed)
+    {
+        "PASS"
+    } else {
+        "FAIL"
+    };
 
     let ui_comparison = if ui_compare {
         let headless =
@@ -390,13 +484,14 @@ pub fn run_cuda_benchmark(
     };
 
     Ok(BenchmarkReport {
-        status: "PASS",
+        status,
         backend: "cuda",
         device,
         device_name,
         table_source,
         persistent_device_bytes,
         samples,
+        matrix_validation,
         ui_comparison,
         network_access: false,
         broadcast: false,
@@ -444,6 +539,25 @@ pub fn print_report(report: &BenchmarkReport, json: bool) {
             fmt_metric(sample.telemetry.vram_used_mib, "MiB"),
         );
     }
+    if let Some(validation) = &report.matrix_validation {
+        let span = validation
+            .observed_100_to_10_throughput_ratio
+            .map(|value| format!("{value:.2}x"))
+            .unwrap_or_else(|| "n/a".into());
+        let telemetry = validation
+            .telemetry_load_increase_observed
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("n/a");
+        println!(
+            "Intensity validation: required={} monotonic={} (tolerance {:.1}%) 100/10={} (min {:.1}x) telemetry-load-increase={}",
+            validation.required_intensities_present,
+            validation.approximately_monotonic_throughput,
+            validation.monotonic_tolerance_percent,
+            span,
+            validation.minimum_100_to_10_throughput_ratio,
+            telemetry,
+        );
+    }
     if let Some(comparison) = &report.ui_comparison {
         println!(
             "Ratatui render comparison @100%: headless {:.0}/s, TUI {:.0}/s ({:+.2}%), {} draws every {} ms [{}]",
@@ -462,6 +576,20 @@ mod tests {
     use super::*;
     use crate::telemetry::parse_nvidia_smi_line;
 
+    fn benchmark_sample(intensity: u8, candidates_per_second: f64) -> BenchmarkSample {
+        BenchmarkSample {
+            intensity,
+            requested_seconds: 1,
+            elapsed_seconds: 1.0,
+            candidates: candidates_per_second as u64,
+            batches: 1,
+            candidates_per_second,
+            candidates_per_watt: None,
+            gpu_winners: 0,
+            telemetry: NvidiaTelemetry::default(),
+        }
+    }
+
     #[test]
     fn benchmark_matrix_covers_required_intensities() {
         assert_eq!(benchmark_intensities(None).unwrap(), [10, 25, 50, 75, 100]);
@@ -474,6 +602,44 @@ mod tests {
     #[test]
     fn benchmark_explicit_intensity_selects_one_window() {
         assert_eq!(benchmark_intensities(Some(30)).unwrap(), [30]);
+    }
+
+    #[test]
+    fn intensity_matrix_validation_accepts_real_monotonic_scaling() {
+        let samples = [
+            benchmark_sample(10, 20_000.0),
+            benchmark_sample(25, 49_000.0),
+            benchmark_sample(50, 96_000.0),
+            benchmark_sample(75, 145_000.0),
+            benchmark_sample(100, 190_000.0),
+        ];
+        let validation = validate_intensity_matrix(&samples);
+        assert!(validation.passed());
+        assert_eq!(validation.observed_100_to_10_throughput_ratio, Some(9.5));
+    }
+
+    #[test]
+    fn intensity_matrix_validation_rejects_display_only_intensity() {
+        let samples = BENCHMARK_INTENSITIES.map(|intensity| benchmark_sample(intensity, 100_000.0));
+        let validation = validate_intensity_matrix(&samples);
+        assert!(validation.required_intensities_present);
+        assert!(validation.approximately_monotonic_throughput);
+        assert!(!validation.real_scaling_observed);
+        assert!(!validation.passed());
+    }
+
+    #[test]
+    fn intensity_matrix_validation_tolerates_small_measurement_noise() {
+        let samples = [
+            benchmark_sample(10, 20_000.0),
+            benchmark_sample(25, 51_000.0),
+            benchmark_sample(50, 48_000.0),
+            benchmark_sample(75, 138_000.0),
+            benchmark_sample(100, 191_000.0),
+        ];
+        let validation = validate_intensity_matrix(&samples);
+        assert!(validation.approximately_monotonic_throughput);
+        assert!(validation.passed());
     }
 
     #[test]
