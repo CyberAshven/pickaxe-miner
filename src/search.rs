@@ -5,6 +5,7 @@
 use crate::backend::BackendKind;
 use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::hip_photon::HipPhotonEngine;
+use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, tx};
 use rand::Rng;
 use secp256k1::{PublicKey, SecretKey};
@@ -29,6 +30,7 @@ const PAUSE_POLL: Duration = Duration::from_millis(25);
 enum PhotonEngine {
     Cuda(Box<CudaPhotonEngine>),
     Hip(Box<HipPhotonEngine>),
+    Wgpu(Box<WgpuPhotonEngine>),
 }
 
 impl PhotonEngine {
@@ -41,6 +43,7 @@ impl PhotonEngine {
         match self {
             Self::Cuda(engine) => engine.set_job(template, target, private_key),
             Self::Hip(engine) => engine.set_job(template, target, private_key),
+            Self::Wgpu(engine) => engine.set_job(template, target, private_key),
         }
     }
 
@@ -52,6 +55,7 @@ impl PhotonEngine {
         match self {
             Self::Cuda(engine) => engine.search_batch(nonce_base, candidate_count),
             Self::Hip(engine) => engine.search_batch(nonce_base, candidate_count),
+            Self::Wgpu(engine) => engine.search_batch(nonce_base, candidate_count),
         }
     }
 }
@@ -541,12 +545,11 @@ impl SearchHandle {
                 MAX_BATCH_CANDIDATES,
                 WINNER_BUFFER_CAP,
             )?)),
-            BackendKind::Wgpu => {
-                return Err(
-                    "wgpu adapter discovery is available, but reference-correct PHOTON WGPU mining is not wired and validated yet"
-                        .into(),
-                )
-            }
+            BackendKind::Wgpu => PhotonEngine::Wgpu(Box::new(WgpuPhotonEngine::new(
+                device_ordinal,
+                MAX_BATCH_CANDIDATES,
+                WINNER_BUFFER_CAP,
+            )?)),
             BackendKind::Auto => {
                 return Err("auto backend must be resolved before GPU search starts".into())
             }
