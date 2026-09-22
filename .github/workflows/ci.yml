@@ -83,6 +83,7 @@ jobs:
           export PATH="/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/opt/rocm/llvm/bin:${PATH}"
           hipcc --version
           python3 tools/build_hip.py --arch gfx1036 --check-reproducible
+          python3 -m unittest tools.test_verify_hip_artifacts -v
           (cd hip/build/gfx1036 && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
           cat hip/build/gfx1036/SHA256SUMS.txt
 
