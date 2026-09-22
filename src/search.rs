@@ -541,6 +541,12 @@ impl SearchHandle {
                 MAX_BATCH_CANDIDATES,
                 WINNER_BUFFER_CAP,
             )?)),
+            BackendKind::Wgpu => {
+                return Err(
+                    "wgpu adapter discovery is available, but reference-correct PHOTON WGPU mining is not wired and validated yet"
+                        .into(),
+                )
+            }
             BackendKind::Auto => {
                 return Err("auto backend must be resolved before GPU search starts".into())
             }

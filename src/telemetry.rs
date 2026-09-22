@@ -170,7 +170,7 @@ fn sample_gpu_telemetry(backend: BackendKind, device: u32) -> Option<GpuTelemetr
     match backend {
         BackendKind::Cuda => sample_nvidia_telemetry(device),
         BackendKind::Hip => sample_amd_telemetry(device),
-        BackendKind::Auto => None,
+        BackendKind::Auto | BackendKind::Wgpu => None,
     }
 }
 

@@ -1,4 +1,4 @@
-//! Native production GPU backend selection: auto | cuda | hip.
+//! GPU backend selection and discovery: auto | cuda | hip | wgpu.
 //! No CPU mining fallback.
 
 use cudarc::driver::{sys, CudaContext};
@@ -11,6 +11,7 @@ pub enum BackendKind {
     Auto,
     Cuda,
     Hip,
+    Wgpu,
 }
 
 impl BackendKind {
@@ -19,7 +20,8 @@ impl BackendKind {
             "auto" => Ok(Self::Auto),
             "cuda" => Ok(Self::Cuda),
             "hip" | "rocm" => Ok(Self::Hip),
-            other => Err(format!("unknown backend `{other}` (auto|cuda|hip)")),
+            "wgpu" => Ok(Self::Wgpu),
+            other => Err(format!("unknown backend `{other}` (auto|cuda|hip|wgpu)")),
         }
     }
 
@@ -28,6 +30,7 @@ impl BackendKind {
             Self::Auto => "auto",
             Self::Cuda => "cuda",
             Self::Hip => "hip",
+            Self::Wgpu => "wgpu",
         }
     }
 }
@@ -46,9 +49,11 @@ pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
     match prefer {
         BackendKind::Cuda => list_cuda_devices(),
         BackendKind::Hip => list_hip_devices(),
+        BackendKind::Wgpu => list_wgpu_devices(),
         BackendKind::Auto => {
             let cuda = list_cuda_devices();
             let hip = list_hip_devices();
+            let wgpu = list_wgpu_devices();
             let mut devices = Vec::new();
             let mut errors = Vec::new();
 
@@ -60,12 +65,13 @@ pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
                 Ok(mut found) => devices.append(&mut found),
                 Err(error) => errors.push(error),
             }
+            match wgpu {
+                Ok(mut found) => devices.append(&mut found),
+                Err(error) => errors.push(error),
+            }
 
             if devices.is_empty() {
-                Err(format!(
-                    "no validated native GPU device found ({})",
-                    errors.join("; ")
-                ))
+                Err(format!("no GPU device found ({})", errors.join("; ")))
             } else {
                 Ok(devices)
             }
@@ -81,6 +87,7 @@ pub fn resolve_mining_device(
     match prefer {
         BackendKind::Cuda => find_device(list_cuda_devices()?, wanted, BackendKind::Cuda),
         BackendKind::Hip => find_device(list_hip_devices()?, wanted, BackendKind::Hip),
+        BackendKind::Wgpu => find_device(list_wgpu_devices()?, wanted, BackendKind::Wgpu),
         BackendKind::Auto => {
             if let Ok(cuda) = list_cuda_devices() {
                 if let Some(device) = cuda.into_iter().find(|device| device.index == wanted) {
@@ -99,6 +106,17 @@ pub fn resolve_mining_device(
     }
 }
 
+pub fn require_production_mining_backend(backend: BackendKind) -> Result<(), String> {
+    match backend {
+        BackendKind::Cuda | BackendKind::Hip => Ok(()),
+        BackendKind::Wgpu => Err(
+            "wgpu adapter discovery is available, but reference-correct PHOTON WGPU mining is not wired and validated yet"
+                .into(),
+        ),
+        BackendKind::Auto => Err("auto backend must be resolved before production mining starts".into()),
+    }
+}
+
 fn find_device(
     devices: Vec<GpuDevice>,
     wanted: u32,
@@ -114,6 +132,67 @@ fn find_device(
                 backend.as_str()
             )
         })
+}
+
+fn is_hardware_wgpu_device_type(device_type: wgpu::DeviceType) -> bool {
+    matches!(
+        device_type,
+        wgpu::DeviceType::DiscreteGpu
+            | wgpu::DeviceType::IntegratedGpu
+            | wgpu::DeviceType::VirtualGpu
+    )
+}
+
+fn wgpu_vendor_name(vendor: u32) -> String {
+    match vendor {
+        0x10de => "NVIDIA".into(),
+        0x1002 | 0x1022 => "AMD".into(),
+        0x8086 => "Intel".into(),
+        0x106b => "Apple".into(),
+        other if other != 0 => format!("PCI vendor 0x{other:04x}"),
+        _ => "Unknown".into(),
+    }
+}
+
+fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
+    let backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = backends;
+    let instance = wgpu::Instance::new(descriptor);
+    let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+    let mut out = Vec::new();
+
+    for adapter in adapters {
+        let info = adapter.get_info();
+        if !is_hardware_wgpu_device_type(info.device_type) {
+            continue;
+        }
+
+        let index = out.len() as u32;
+        let vendor = wgpu_vendor_name(info.vendor);
+        let detail = format!(
+            "wgpu ordinal={index}; backend={:?}; type={:?}; pci_device=0x{:04x}; driver={}; driver_info={}",
+            info.backend,
+            info.device_type,
+            info.device,
+            info.driver,
+            info.driver_info
+        );
+        out.push(GpuDevice {
+            index,
+            name: info.name,
+            vendor,
+            vram_bytes: None,
+            backend: BackendKind::Wgpu,
+            detail,
+        });
+    }
+
+    if out.is_empty() {
+        Err("WGPU found no hardware DX12/Vulkan GPU adapters".into())
+    } else {
+        Ok(out)
+    }
 }
 
 fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
@@ -369,14 +448,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_backend_parser_rejects_detached_wgpu() {
+    fn production_backend_parser_accepts_wgpu_surface() {
         assert_eq!(BackendKind::parse("auto").unwrap(), BackendKind::Auto);
         assert_eq!(BackendKind::parse("cuda").unwrap(), BackendKind::Cuda);
         assert_eq!(BackendKind::parse("hip").unwrap(), BackendKind::Hip);
         assert_eq!(BackendKind::parse("rocm").unwrap(), BackendKind::Hip);
+        assert_eq!(BackendKind::parse("wgpu").unwrap(), BackendKind::Wgpu);
+    }
 
-        let error = BackendKind::parse("wgpu").unwrap_err();
-        assert_eq!(error, "unknown backend `wgpu` (auto|cuda|hip)");
+    #[test]
+    fn wgpu_discovery_excludes_cpu_and_other_adapters() {
+        assert!(is_hardware_wgpu_device_type(wgpu::DeviceType::DiscreteGpu));
+        assert!(is_hardware_wgpu_device_type(
+            wgpu::DeviceType::IntegratedGpu
+        ));
+        assert!(is_hardware_wgpu_device_type(wgpu::DeviceType::VirtualGpu));
+        assert!(!is_hardware_wgpu_device_type(wgpu::DeviceType::Cpu));
+        assert!(!is_hardware_wgpu_device_type(wgpu::DeviceType::Other));
+    }
+
+    #[test]
+    fn wgpu_mining_fails_closed_until_reference_engine_is_validated() {
+        let error = require_production_mining_backend(BackendKind::Wgpu).unwrap_err();
+        assert!(error.contains("reference-correct PHOTON WGPU mining is not wired"));
+        assert!(require_production_mining_backend(BackendKind::Cuda).is_ok());
+        assert!(require_production_mining_backend(BackendKind::Hip).is_ok());
     }
 
     #[test]

@@ -206,6 +206,12 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
             let batch = engine.search_batch(CONTROLLED_NONCE, 1)?;
             ("hip", bytes, batch)
         }
+        BackendKind::Wgpu => {
+            return Err(
+                "wgpu adapter discovery is available, but reference-correct PHOTON WGPU mining is not wired and validated yet"
+                    .into(),
+            )
+        }
         BackendKind::Auto => return Err("self-test requires a resolved native backend".into()),
     };
     if batch.candidates != 1
