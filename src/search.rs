@@ -372,12 +372,10 @@ pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> 
     if capacity == 0 {
         return 0;
     }
-    if intensity >= 100 {
-        capacity
-    } else if capacity < THROTTLED_BATCH_CANDIDATES {
-        capacity
-    } else {
+    if intensity < 100 && capacity > THROTTLED_BATCH_CANDIDATES {
         THROTTLED_BATCH_CANDIDATES
+    } else {
+        capacity
     }
 }
 
