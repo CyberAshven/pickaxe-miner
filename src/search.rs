@@ -638,6 +638,9 @@ impl SearchHandle {
             RuntimeCommand::Pause => self.paused.store(true, Ordering::SeqCst),
             RuntimeCommand::Resume => self.paused.store(false, Ordering::SeqCst),
         }
+        if let Some(worker) = self.worker.as_ref() {
+            worker.thread().unpark();
+        }
         Ok(self.snapshot())
     }
 
@@ -742,6 +745,44 @@ mod tests {
         assert_eq!(
             duty_rest(Duration::from_millis(10), 25),
             Duration::from_millis(30)
+        );
+    }
+
+    #[test]
+    fn runtime_intensity_change_wakes_parked_worker() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let started = Instant::now();
+            thread::park_timeout(Duration::from_secs(5));
+            let _ = wake_tx.send(started.elapsed());
+        });
+
+        let (job_tx, _job_rx) = mpsc::sync_channel(1);
+        let (_winner_tx, winner_rx) = mpsc::sync_channel(1);
+        let handle = SearchHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            batch_in_flight: Arc::new(AtomicBool::new(false)),
+            intensity: Arc::new(AtomicU8::new(10)),
+            candidates: Arc::new(AtomicU64::new(0)),
+            batches: Arc::new(AtomicU64::new(0)),
+            winners: Arc::new(AtomicU64::new(0)),
+            generation_id: Arc::new(AtomicU64::new(1)),
+            job_tx,
+            winner_rx,
+            worker: Some(worker),
+            started: Instant::now(),
+        };
+
+        handle
+            .apply_control(RuntimeCommand::SetIntensity(100))
+            .unwrap();
+        let elapsed = wake_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("intensity control must wake a worker parked for duty throttling");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "worker remained parked after live intensity change: {elapsed:?}"
         );
     }
 
