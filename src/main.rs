@@ -820,7 +820,7 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             );
         }
         runtime::RuntimeEvent::Reconnecting(error) => {
-            eprintln!("PHOTON state refresh failed; GPU held at batch boundary: {error}");
+            eprintln!("PHOTON state refresh failed; live supervisor is retrying without recreating GPU state: {error}");
         }
         runtime::RuntimeEvent::Reconnected(endpoint) => {
             eprintln!("PHOTON state source reconnected: {}", redact_url(&endpoint));
