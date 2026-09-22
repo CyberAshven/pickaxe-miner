@@ -5,6 +5,7 @@
 
 use crate::backend::BackendKind;
 use serde::Serialize;
+use serde_json::Value;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,10 +68,109 @@ pub(crate) fn sample_nvidia_telemetry(device: u32) -> Option<GpuTelemetry> {
     parse_nvidia_smi_line(stdout.lines().next()?)
 }
 
+fn normalized_metric_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn metric_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text
+            .split_whitespace()
+            .next()
+            .and_then(|number| number.parse::<f64>().ok()),
+        Value::Object(object) => object
+            .get("value")
+            .and_then(metric_number)
+            .or_else(|| object.get("current").and_then(metric_number)),
+        _ => None,
+    }
+}
+
+fn find_metric(value: &Value, aliases: &[&str]) -> Option<f64> {
+    match value {
+        Value::Object(object) => {
+            for alias in aliases {
+                let alias = normalized_metric_key(alias);
+                if let Some(metric) = object.iter().find_map(|(key, value)| {
+                    (normalized_metric_key(key) == alias)
+                        .then(|| metric_number(value))
+                        .flatten()
+                }) {
+                    return Some(metric);
+                }
+            }
+            object
+                .values()
+                .find_map(|nested| find_metric(nested, aliases))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|nested| find_metric(nested, aliases)),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_amd_smi_json(stdout: &str) -> Option<GpuTelemetry> {
+    let value: Value = serde_json::from_str(stdout).ok()?;
+    let telemetry = GpuTelemetry {
+        samples: 1,
+        gpu_utilization_percent: find_metric(
+            &value,
+            &["gfx_util", "gfx_usage", "gfx_activity", "gpu_utilization"],
+        ),
+        power_watts: find_metric(&value, &["socket_power", "power_usage", "power"]),
+        temperature_c: find_metric(
+            &value,
+            &["gpu_temp", "edge_temperature", "temperature_edge"],
+        ),
+        vram_used_mib: find_metric(&value, &["vram_used", "used_vram"]),
+        graphics_clock_mhz: find_metric(&value, &["gfx_clock", "graphics_clock", "gfxclk"]),
+        memory_clock_mhz: find_metric(&value, &["mem_clock", "memory_clock", "mclk"]),
+    };
+    [
+        telemetry.gpu_utilization_percent,
+        telemetry.power_watts,
+        telemetry.temperature_c,
+        telemetry.vram_used_mib,
+        telemetry.graphics_clock_mhz,
+        telemetry.memory_clock_mhz,
+    ]
+    .iter()
+    .any(Option::is_some)
+    .then_some(telemetry)
+}
+
+pub(crate) fn sample_amd_telemetry(device: u32) -> Option<GpuTelemetry> {
+    let output = Command::new("amd-smi")
+        .arg("monitor")
+        .arg("--gpu")
+        .arg(device.to_string())
+        .args([
+            "--power-usage",
+            "--temperature",
+            "--gfx",
+            "--mem",
+            "--vram-usage",
+            "--json",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_amd_smi_json(&stdout)
+}
+
 fn sample_gpu_telemetry(backend: BackendKind, device: u32) -> Option<GpuTelemetry> {
     match backend {
         BackendKind::Cuda => sample_nvidia_telemetry(device),
-        BackendKind::Auto | BackendKind::Hip => None,
+        BackendKind::Hip => sample_amd_telemetry(device),
+        BackendKind::Auto => None,
     }
 }
 
@@ -151,6 +251,56 @@ mod tests {
         assert_eq!(parsed.vram_used_mib, Some(2048.0));
         assert_eq!(parsed.graphics_clock_mhz, Some(2450.0));
         assert_eq!(parsed.memory_clock_mhz, None);
+    }
+
+    #[test]
+    fn amd_telemetry_parser_handles_unit_wrapped_metrics() {
+        let parsed = parse_amd_smi_json(
+            r#"[
+                {
+                    "gpu": 0,
+                    "power": {"socket_power": {"value": 171, "unit": "W"}},
+                    "temperature": {"gpu_temp": {"value": 48, "unit": "C"}},
+                    "usage": {"gfx_activity": {"value": 87, "unit": "%"}},
+                    "clock": {
+                        "gfx_clock": {"value": 2450, "unit": "MHz"},
+                        "mem_clock": {"value": 1100, "unit": "MHz"}
+                    },
+                    "memory": {"vram_used": {"value": 2048, "unit": "MB"}}
+                }
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.samples, 1);
+        assert_eq!(parsed.gpu_utilization_percent, Some(87.0));
+        assert_eq!(parsed.power_watts, Some(171.0));
+        assert_eq!(parsed.temperature_c, Some(48.0));
+        assert_eq!(parsed.vram_used_mib, Some(2048.0));
+        assert_eq!(parsed.graphics_clock_mhz, Some(2450.0));
+        assert_eq!(parsed.memory_clock_mhz, Some(1100.0));
+    }
+
+    #[test]
+    fn amd_telemetry_parser_handles_flat_legacy_json_and_rejects_empty_metrics() {
+        let parsed = parse_amd_smi_json(
+            r#"{
+                "GPU": 0,
+                "GFX_UTIL": "63 %",
+                "POWER_USAGE": "92.5 W",
+                "GPU_TEMP": "71 C",
+                "VRAM_USED": "4096 MB",
+                "GFX_CLOCK": "2300 MHz",
+                "MEM_CLOCK": "1000 MHz"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.gpu_utilization_percent, Some(63.0));
+        assert_eq!(parsed.power_watts, Some(92.5));
+        assert_eq!(parsed.temperature_c, Some(71.0));
+        assert_eq!(parsed.vram_used_mib, Some(4096.0));
+        assert_eq!(parsed.graphics_clock_mhz, Some(2300.0));
+        assert_eq!(parsed.memory_clock_mhz, Some(1000.0));
+        assert!(parse_amd_smi_json(r#"[{"gpu": 0, "note": "N/A"}]"#).is_none());
     }
 
     #[test]
