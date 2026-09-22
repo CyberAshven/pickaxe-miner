@@ -27,6 +27,7 @@ const CONTROL_BYTES: usize = 16;
 const WINNER_RECORD_WORDS: usize = 9;
 const WINNER_RECORD_BYTES: usize = WINNER_RECORD_WORDS * 4;
 const WGPU_MIN_LADDER_BATCH: u32 = 1_024;
+pub(crate) const WGPU_REFERENCE_MAX_BATCH: u32 = 524_288;
 const WGPU_TARGET_BATCH: Duration = Duration::from_millis(350);
 const WGPU_ESCALATE_BATCH: Duration = Duration::from_millis(175);
 
@@ -109,6 +110,29 @@ fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
 
 fn storage_candidates(max_candidates: u32) -> u32 {
     max_candidates.div_ceil(128) * 128
+}
+
+fn largest_power_of_two_at_most(value: u32) -> u32 {
+    1u32 << (31 - value.leading_zeros())
+}
+
+fn device_limited_wgpu_max_candidates(
+    requested: u32,
+    max_storage_buffer_binding_size: u64,
+    max_buffer_size: u64,
+) -> u32 {
+    let requested = requested.min(WGPU_REFERENCE_MAX_BATCH);
+    let byte_limit = max_storage_buffer_binding_size.min(max_buffer_size);
+    let device_capacity = (byte_limit / M38_RECORD_BYTES as u64).min(u64::from(u32::MAX)) as u32;
+    let bounded = requested.min(device_capacity);
+
+    if requested < WGPU_MIN_LADDER_BATCH {
+        return bounded;
+    }
+    if bounded < WGPU_MIN_LADDER_BATCH {
+        return 0;
+    }
+    largest_power_of_two_at_most(bounded)
 }
 
 fn initial_wgpu_batch_size(max_candidates: u32) -> u32 {
@@ -325,6 +349,17 @@ impl WgpuPhotonEngine {
                 adapter_info.name,
                 limits.max_buffer_size,
                 m29_table::M29_G16_BYTES
+            ));
+        }
+        let max_candidates = device_limited_wgpu_max_candidates(
+            max_candidates,
+            limits.max_storage_buffer_binding_size,
+            limits.max_buffer_size,
+        );
+        if max_candidates == 0 {
+            return Err(format!(
+                "WGPU adapter {} cannot allocate the minimum {}-candidate PHOTON batch within its storage-buffer limits",
+                adapter_info.name, WGPU_MIN_LADDER_BATCH
             ));
         }
 
@@ -856,23 +891,56 @@ mod tests {
 
     #[test]
     fn adaptive_batching_matches_authoritative_m67_cadence() {
-        assert_eq!(initial_wgpu_batch_size(65_536), 1_024);
+        assert_eq!(initial_wgpu_batch_size(WGPU_REFERENCE_MAX_BATCH), 1_024);
         assert_eq!(initial_wgpu_batch_size(128), 128);
         assert_eq!(
-            next_wgpu_batch_size(1_024, Duration::from_millis(175), 65_536),
+            next_wgpu_batch_size(1_024, Duration::from_millis(175), WGPU_REFERENCE_MAX_BATCH,),
             2_048
         );
         assert_eq!(
-            next_wgpu_batch_size(2_048, Duration::from_millis(350), 65_536),
+            next_wgpu_batch_size(
+                262_144,
+                Duration::from_millis(175),
+                WGPU_REFERENCE_MAX_BATCH,
+            ),
+            WGPU_REFERENCE_MAX_BATCH
+        );
+        assert_eq!(
+            next_wgpu_batch_size(2_048, Duration::from_millis(350), WGPU_REFERENCE_MAX_BATCH,),
             2_048
         );
         assert_eq!(
-            next_wgpu_batch_size(2_048, Duration::from_millis(351), 65_536),
+            next_wgpu_batch_size(2_048, Duration::from_millis(351), WGPU_REFERENCE_MAX_BATCH,),
             1_024
         );
         assert_eq!(
-            next_wgpu_batch_size(1_024, Duration::from_secs(2), 65_536),
+            next_wgpu_batch_size(1_024, Duration::from_secs(2), WGPU_REFERENCE_MAX_BATCH,),
             1_024
+        );
+    }
+
+    #[test]
+    fn wgpu_reference_batch_envelope_is_capped_by_real_buffer_limits() {
+        let mib = 1024u32 * 1024;
+        assert_eq!(
+            device_limited_wgpu_max_candidates(
+                WGPU_REFERENCE_MAX_BATCH,
+                u64::from(128 * mib),
+                u64::from(128 * mib),
+            ),
+            WGPU_REFERENCE_MAX_BATCH
+        );
+        assert_eq!(
+            device_limited_wgpu_max_candidates(
+                WGPU_REFERENCE_MAX_BATCH,
+                u64::from(64 * mib),
+                u64::from(64 * mib),
+            ),
+            262_144
+        );
+        assert_eq!(
+            device_limited_wgpu_max_candidates(128, u64::from(64 * mib), u64::from(64 * mib)),
+            128
         );
     }
 
