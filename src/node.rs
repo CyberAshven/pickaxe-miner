@@ -6,6 +6,7 @@
 
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::protocol::{derive_photon_state, COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
+use native_tls::TlsConnector;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -1121,35 +1122,112 @@ pub fn submit_block(
     ))
 }
 
-fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeRpcScheme {
+    Http,
+    Https,
+}
+
+struct NodeRpcTarget {
+    scheme: NodeRpcScheme,
+    url_auth: Option<String>,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_node_rpc_target(url: &str) -> Result<NodeRpcTarget, String> {
     let lower = url.to_ascii_lowercase();
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
         return Err("node URL must be http(s)".into());
     }
-    if lower.starts_with("https://") {
-        return Err(
-            "https node RPC not wired yet Ã¢â‚¬â€ use http:// on LAN/Tailscale for now".into(),
-        );
-    }
-    let rest = &url["http://".len()..];
-    let (url_auth, hostport_path) = if let Some(at) = rest.find('@') {
-        (Some(&rest[..at]), &rest[at + 1..])
+    let (scheme, rest, default_port) = if lower.starts_with("https://") {
+        (NodeRpcScheme::Https, &url["https://".len()..], 443u16)
     } else {
-        (None, rest)
-    };
-    let auth = node_rpc_basic_auth(url_auth)?;
-    let (hostport, path) = match hostport_path.split_once('/') {
-        Some((hp, p)) => (hp, format!("/{p}")),
-        None => (hostport_path, "/".to_string()),
-    };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().map_err(|_| "bad node port")?),
-        None => (hostport, 8332u16),
+        (NodeRpcScheme::Http, &url["http://".len()..], 8332u16)
     };
 
+    let path_start = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..path_start];
+    let path = match rest.get(path_start..) {
+        Some("") | None => "/".to_string(),
+        Some(suffix) if suffix.starts_with('?') => format!("/{suffix}"),
+        Some(suffix) => suffix.to_string(),
+    };
+    let (url_auth, hostport) = if let Some((auth, hostport)) = authority.rsplit_once('@') {
+        if auth.is_empty() {
+            return Err("node URL has empty userinfo".into());
+        }
+        (Some(auth.to_string()), hostport)
+    } else {
+        (None, authority)
+    };
+    if hostport.is_empty() {
+        return Err("node URL is missing host".into());
+    }
+
+    let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
+        let Some(close) = bracketed.find(']') else {
+            return Err("node URL has malformed IPv6 host".into());
+        };
+        let host = &bracketed[..close];
+        if host.is_empty() {
+            return Err("node URL is missing host".into());
+        }
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else if let Some(port) = suffix.strip_prefix(':') {
+            port.parse::<u16>().map_err(|_| "bad node port")?
+        } else {
+            return Err("node URL has malformed host/port".into());
+        };
+        (host.to_string(), port)
+    } else {
+        if hostport.matches(':').count() > 1 {
+            return Err("IPv6 node hosts must use brackets".into());
+        }
+        match hostport.rsplit_once(':') {
+            Some((host, port)) => {
+                if host.is_empty() {
+                    return Err("node URL is missing host".into());
+                }
+                (
+                    host.to_string(),
+                    port.parse::<u16>().map_err(|_| "bad node port")?,
+                )
+            }
+            None => (hostport.to_string(), default_port),
+        }
+    };
+
+    Ok(NodeRpcTarget {
+        scheme,
+        url_auth,
+        host,
+        port,
+        path,
+    })
+}
+
+trait NodeRpcStream: Read + Write {}
+impl<T: Read + Write> NodeRpcStream for T {}
+
+fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
+    let target = parse_node_rpc_target(url)?;
+    let auth = node_rpc_basic_auth(target.url_auth.as_deref())?;
+    let host = &target.host;
+    let port = target.port;
+    let path = &target.path;
+
     let body = json!({"jsonrpc":"1.0","id":"pickaxe","method":method,"params":params}).to_string();
+    let host_header = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
     let mut req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {host_header}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
     if let Some(a) = auth.as_deref() {
@@ -1159,15 +1237,25 @@ fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     req.push_str("\r\n");
     req.push_str(&body);
 
-    let addr = format!("{host}:{port}")
+    let addr = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(|e| format!("resolve: {e}"))?
         .next()
         .ok_or_else(|| "resolve: no addrs".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(8))
+    let tcp_stream = TcpStream::connect_timeout(&addr, Duration::from_secs(8))
         .map_err(|e| format!("connect: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(12)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
+    let _ = tcp_stream.set_read_timeout(Some(Duration::from_secs(12)));
+    let _ = tcp_stream.set_write_timeout(Some(Duration::from_secs(8)));
+    let mut stream: Box<dyn NodeRpcStream> = match target.scheme {
+        NodeRpcScheme::Http => Box::new(tcp_stream),
+        NodeRpcScheme::Https => {
+            let connector = TlsConnector::new().map_err(|e| format!("tls setup: {e}"))?;
+            let tls_stream = connector
+                .connect(host.as_str(), tcp_stream)
+                .map_err(|e| format!("tls handshake: {e}"))?;
+            Box::new(tls_stream)
+        }
+    };
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
@@ -1354,6 +1442,87 @@ mod gbt_tests {
         assert!(select_node_rpc_basic_auth(None, Some("rpc-user"), None).is_err());
         assert!(select_node_rpc_basic_auth(None, None, Some("rpc-password")).is_err());
         assert_eq!(select_node_rpc_basic_auth(None, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn node_rpc_url_parsing_supports_https_defaults_auth_paths_and_ipv6() {
+        let https =
+            parse_node_rpc_target("https://rpc-user:rpc-password@node.example/rpc?mode=wallet")
+                .unwrap();
+        assert_eq!(https.scheme, NodeRpcScheme::Https);
+        assert_eq!(https.url_auth.as_deref(), Some("rpc-user:rpc-password"));
+        assert_eq!(https.host, "node.example");
+        assert_eq!(https.port, 443);
+        assert_eq!(https.path, "/rpc?mode=wallet");
+
+        let http = parse_node_rpc_target("http://127.0.0.1").unwrap();
+        assert_eq!(http.scheme, NodeRpcScheme::Http);
+        assert_eq!(http.port, 8332);
+        assert_eq!(http.path, "/");
+
+        let explicit = parse_node_rpc_target("https://[::1]:18443/wallet/main").unwrap();
+        assert_eq!(explicit.scheme, NodeRpcScheme::Https);
+        assert_eq!(explicit.host, "::1");
+        assert_eq!(explicit.port, 18443);
+        assert_eq!(explicit.path, "/wallet/main");
+    }
+
+    #[test]
+    fn node_rpc_request_preserves_http_path_host_and_basic_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /wallet/main HTTP/1.1\r\n"));
+            assert!(request.contains(&format!("\r\nHost: {address}\r\n")));
+            assert!(request.contains("\r\nAuthorization: Basic dTpw\r\n"));
+            assert!(request.contains("\"method\":\"getblockchaininfo\""));
+
+            let body = r#"{"result":{"chain":"main"},"error":null,"id":"pickaxe"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let endpoint = format!("http://u:p@{address}/wallet/main");
+        let result = rpc_call(&endpoint, "getblockchaininfo", json!([])).unwrap();
+        server.join().unwrap();
+        assert_eq!(result.get("chain").and_then(Value::as_str), Some("main"));
+    }
+
+    #[test]
+    fn https_rpc_enters_verified_tls_path_without_leaking_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+
+        let endpoint = format!("https://rpc-user:rpc-password@{address}/rpc");
+        let error = rpc_call(&endpoint, "getblockchaininfo", json!([])).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error.starts_with("tls handshake:"),
+            "unexpected error: {error}"
+        );
+        assert!(!error.contains("rpc-user"));
+        assert!(!error.contains("rpc-password"));
+        assert_eq!(redact_url(&endpoint), format!("https://***@{address}/rpc"));
     }
 
     #[test]
