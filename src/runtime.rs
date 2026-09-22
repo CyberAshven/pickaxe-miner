@@ -2051,7 +2051,6 @@ fn run_supervisor(
                                 });
                             next_settlement.and_then(|next_settlement| {
                                 let next_sources = SourceCatalog::configured(&next_cfg)?;
-                                search.apply_control(SearchCommand::Pause)?;
                                 search.replace_job(live.to_mining_job(
                                     next_cfg.generation_id,
                                     &mining_payout_address,
@@ -2937,14 +2936,6 @@ fn apply_refreshed_job(
     journal_path: &Path,
     next: LiveJob,
 ) -> Result<bool, String> {
-    if live_job_changed(live, &next) {
-        // Once authoritative PHOTON work changes, stop launching the old
-        // immutable generation. Route metadata such as the verified provider
-        // URL may change without rebuilding identical GPU work.
-        // The worker sees Pause at its next batch boundary while preflight
-        // validates the replacement generation.
-        search.apply_control(SearchCommand::Pause)?;
-    }
     let staged =
         prepare_generation_transition(cfg, live, settlement, &next, |next_cfg, next_live| {
             production_preflight(
