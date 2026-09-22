@@ -603,6 +603,12 @@ impl ResolvedSubmission {
                 "refusing to resolve a PHOTON winner as stale after parent acceptance".into(),
             );
         }
+        if parent_attempted {
+            return Err(
+                "refusing to resolve a PHOTON winner as stale after a parent broadcast attempt; the durable journal must be retained until the parent outcome is proven"
+                    .into(),
+            );
+        }
         if fresh.baton_txid.eq_ignore_ascii_case(&pending.parent_txid) && fresh.baton_vout == 0 {
             return Err(
                 "refusing to resolve a PHOTON winner as stale while its parent baton is live"
@@ -796,14 +802,21 @@ fn submission_journal_path() -> PathBuf {
 enum SubmissionDecision {
     BroadcastSettlement,
     BroadcastParentThenSettlement,
+    AwaitParentResolution,
     StaleUnbroadcast,
 }
 
-fn submission_decision(parent_known: bool, live_matches_expected: bool) -> SubmissionDecision {
+fn submission_decision(
+    parent_known: bool,
+    parent_attempted: bool,
+    live_matches_expected: bool,
+) -> SubmissionDecision {
     if parent_known {
         SubmissionDecision::BroadcastSettlement
     } else if live_matches_expected {
         SubmissionDecision::BroadcastParentThenSettlement
+    } else if parent_attempted {
+        SubmissionDecision::AwaitParentResolution
     } else {
         SubmissionDecision::StaleUnbroadcast
     }
@@ -1117,10 +1130,24 @@ fn attempt_pending_submission(
         pending.mark_parent_accepted(journal_path)?;
         return broadcast_settlement(session, cfg, pending);
     }
-    if submission_decision(false, pending.expected_baton_is_current(&fresh))
-        == SubmissionDecision::StaleUnbroadcast
-    {
-        return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
+    match submission_decision(
+        false,
+        parent_attempted,
+        pending.expected_baton_is_current(&fresh),
+    ) {
+        SubmissionDecision::StaleUnbroadcast => {
+            return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
+        }
+        SubmissionDecision::AwaitParentResolution => {
+            return Err(
+                "PHOTON parent broadcast was previously attempted but its acceptance is not yet proven; retaining the durable pending submission for retry"
+                    .into(),
+            );
+        }
+        SubmissionDecision::BroadcastParentThenSettlement => {}
+        SubmissionDecision::BroadcastSettlement => {
+            unreachable!("parent-known submissions are handled before live-state refresh")
+        }
     }
 
     if !parent_attempted {
@@ -3869,16 +3896,20 @@ mod tests {
     #[test]
     fn submission_retry_never_rebroadcasts_parent_after_it_is_known() {
         assert_eq!(
-            submission_decision(true, false),
+            submission_decision(true, false, false),
             SubmissionDecision::BroadcastSettlement
         );
         assert_eq!(
-            submission_decision(false, true),
+            submission_decision(false, false, true),
             SubmissionDecision::BroadcastParentThenSettlement
         );
         assert_eq!(
-            submission_decision(false, false),
+            submission_decision(false, false, false),
             SubmissionDecision::StaleUnbroadcast
+        );
+        assert_eq!(
+            submission_decision(false, true, false),
+            SubmissionDecision::AwaitParentResolution
         );
     }
 
@@ -4415,7 +4446,6 @@ mod tests {
             &journal,
         )
         .unwrap();
-        pending.mark_parent_attempted(&journal).unwrap();
 
         let mut conflicting = job.clone();
         conflicting.height += 1;
@@ -4431,13 +4461,47 @@ mod tests {
         assert_eq!(resolved.expected_baton_txid, job.baton_txid);
         assert_eq!(resolved.parent_txid, pending.parent_txid);
         assert_eq!(resolved.settlement_txid, pending.settlement_txid);
-        assert!(resolved.parent_attempted);
+        assert!(!resolved.parent_attempted);
         assert!(!resolved.parent_accepted);
         assert_eq!(resolved.observed_height, conflicting.height);
         assert_eq!(resolved.observed_baton_txid, conflicting.baton_txid);
         assert_eq!(resolved.reason, "stale-unbroadcast");
 
         fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
+    }
+
+    #[test]
+    fn attempted_parent_cannot_be_resolved_as_stale_on_ambiguous_network_evidence() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let winner = signed_winner(cfg.generation_id, &job, &mining_payout);
+        let pending = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+        pending.mark_parent_attempted(&journal).unwrap();
+
+        let mut conflicting = job;
+        conflicting.height += 1;
+        conflicting.baton_txid = "44".repeat(32);
+        let error = resolve_stale_submission(&pending, &conflicting, &journal).unwrap_err();
+
+        assert!(
+            error.contains("after a parent broadcast attempt"),
+            "{error}"
+        );
+        assert!(journal.exists());
+        assert!(pending.parent_attempted(&journal).unwrap());
+        assert!(!pending.parent_accepted(&journal).unwrap());
+        assert!(ResolvedSubmission::load(&journal).unwrap().is_none());
+
+        PendingSubmission::remove(&journal).unwrap();
     }
 
     #[test]
@@ -4514,7 +4578,11 @@ mod tests {
         next_height.height += 1;
         assert!(pending.expected_baton_is_current(&next_height));
         assert_eq!(
-            submission_decision(false, pending.expected_baton_is_current(&next_height)),
+            submission_decision(
+                false,
+                false,
+                pending.expected_baton_is_current(&next_height)
+            ),
             SubmissionDecision::BroadcastParentThenSettlement
         );
 
@@ -4522,7 +4590,11 @@ mod tests {
         uppercase_baton.baton_txid = uppercase_baton.baton_txid.to_uppercase();
         assert!(pending.expected_baton_is_current(&uppercase_baton));
         assert_eq!(
-            submission_decision(false, pending.expected_baton_is_current(&uppercase_baton)),
+            submission_decision(
+                false,
+                false,
+                pending.expected_baton_is_current(&uppercase_baton)
+            ),
             SubmissionDecision::BroadcastParentThenSettlement
         );
 
@@ -4530,8 +4602,12 @@ mod tests {
         next_baton.baton_txid = "22".repeat(32);
         assert!(!pending.expected_baton_is_current(&next_baton));
         assert_eq!(
-            submission_decision(false, pending.expected_baton_is_current(&next_baton)),
+            submission_decision(false, false, pending.expected_baton_is_current(&next_baton)),
             SubmissionDecision::StaleUnbroadcast
+        );
+        assert_eq!(
+            submission_decision(false, true, pending.expected_baton_is_current(&next_baton)),
+            SubmissionDecision::AwaitParentResolution
         );
     }
 
