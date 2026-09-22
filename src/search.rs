@@ -93,6 +93,8 @@ pub struct SearchStats {
     pub state: MiningState,
     pub elapsed_secs: u64,
     pub rate: f64,
+    pub current_rate: f64,
+    pub peak_rate: f64,
     pub winners: u64,
 }
 
@@ -668,6 +670,8 @@ impl SearchHandle {
             state: self.state(),
             elapsed_secs: elapsed as u64,
             rate: candidates as f64 / elapsed,
+            current_rate: 0.0,
+            peak_rate: 0.0,
             winners: self.winners.load(Ordering::Relaxed),
         }
     }
