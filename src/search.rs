@@ -388,7 +388,10 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
         .as_nanos()
         .saturating_mul(u128::from(100 - intensity))
         / u128::from(intensity);
-    Duration::from_nanos(rest_ns.min(u128::from(u64::MAX)) as u64)
+    // Keep reduced intensity from creating visible GPU idle cliffs. The worker
+    // already uses smaller batches at reduced intensity; long sleeps here make
+    // utilization oscillate and hurt steady throughput.
+    Duration::from_nanos(rest_ns.min(2_000_000).min(u128::from(u64::MAX)) as u64)
 }
 
 fn deliver_verified_batch(
@@ -854,11 +857,11 @@ mod tests {
         assert_eq!(duty_rest(Duration::from_millis(10), 100), Duration::ZERO);
         assert_eq!(
             duty_rest(Duration::from_millis(10), 50),
-            Duration::from_millis(10)
+            Duration::from_millis(2)
         );
         assert_eq!(
             duty_rest(Duration::from_millis(10), 25),
-            Duration::from_millis(30)
+            Duration::from_millis(2)
         );
     }
 
