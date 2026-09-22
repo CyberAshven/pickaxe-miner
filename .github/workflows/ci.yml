@@ -56,6 +56,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test HIP artifact validation
+        run: python3 -m unittest discover -s tools -p 'test_hip_*.py' -v
+
       - name: Install pinned ROCm HIP compiler
         shell: bash
         run: |
@@ -86,6 +89,14 @@ jobs:
           python3 -m unittest tools.test_verify_hip_artifacts -v
           (cd hip/build/gfx1036 && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
           cat hip/build/gfx1036/SHA256SUMS.txt
+
+      - name: Upload verified gfx1036 code objects
+        uses: actions/upload-artifact@v7
+        with:
+          name: hip-gfx1036-${{ github.sha }}
+          path: hip/build/gfx1036/
+          if-no-files-found: error
+          retention-days: 14
 
   rust:
     name: ${{ matrix.name }}
