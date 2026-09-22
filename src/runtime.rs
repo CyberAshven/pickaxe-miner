@@ -1760,6 +1760,12 @@ fn run_supervisor(
     let mut submission_backoff = RECONNECT_MIN;
     let mut next_submission_retry = Instant::now();
     let mut stop = false;
+    let initial_search_stats = search.snapshot();
+    let mut throughput = ThroughputTracker::new(
+        Instant::now(),
+        initial_search_stats.candidates,
+        initial_search_stats.state == MiningState::Mining,
+    );
 
     while !stop {
         if shutdown.is_requested() {
@@ -2337,15 +2343,18 @@ fn run_supervisor(
             verified_winners,
             pending_winners,
             last_error.clone(),
+            &mut throughput,
         );
         thread::sleep(SUPERVISOR_POLL);
     }
 
-    let final_stats = search.stop();
+    let mut final_stats = search.stop();
     reward_secret.fill(0);
     let mut snapshot = shared_snapshot
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    final_stats.current_rate = 0.0;
+    final_stats.peak_rate = snapshot.search.peak_rate;
     snapshot.state = SupervisorState::Stopped;
     snapshot.search = final_stats;
 }
@@ -2742,6 +2751,83 @@ where
     Ok(())
 }
 
+const THROUGHPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const THROUGHPUT_CURRENT_WINDOW: Duration = Duration::from_secs(2);
+const THROUGHPUT_MIN_HISTORY: Duration = Duration::from_millis(750);
+const THROUGHPUT_HISTORY_CAP: usize = 16;
+
+struct ThroughputTracker {
+    last_sample: Instant,
+    samples: std::collections::VecDeque<(Instant, u64)>,
+    current_rate: f64,
+    peak_rate: f64,
+    was_mining: bool,
+}
+
+impl ThroughputTracker {
+    fn new(now: Instant, candidates: u64, mining: bool) -> Self {
+        let mut samples = std::collections::VecDeque::with_capacity(THROUGHPUT_HISTORY_CAP);
+        samples.push_back((now, candidates));
+        Self {
+            last_sample: now,
+            samples,
+            current_rate: 0.0,
+            peak_rate: 0.0,
+            was_mining: mining,
+        }
+    }
+
+    fn observe(&mut self, stats: &mut SearchStats, now: Instant) {
+        let mining = stats.state == MiningState::Mining;
+        if !mining {
+            self.samples.clear();
+            self.samples.push_back((now, stats.candidates));
+            self.last_sample = now;
+            self.current_rate = 0.0;
+            self.was_mining = false;
+            stats.current_rate = 0.0;
+            stats.peak_rate = self.peak_rate;
+            return;
+        }
+
+        if !self.was_mining {
+            self.samples.clear();
+            self.samples.push_back((now, stats.candidates));
+            self.last_sample = now;
+            self.current_rate = 0.0;
+            self.was_mining = true;
+        } else if now.saturating_duration_since(self.last_sample) >= THROUGHPUT_SAMPLE_INTERVAL {
+            if self.samples.len() == THROUGHPUT_HISTORY_CAP {
+                self.samples.pop_front();
+            }
+            self.samples.push_back((now, stats.candidates));
+
+            while self.samples.len() > 2 {
+                let Some((sample_time, _)) = self.samples.front() else {
+                    break;
+                };
+                if now.saturating_duration_since(*sample_time) <= THROUGHPUT_CURRENT_WINDOW {
+                    break;
+                }
+                self.samples.pop_front();
+            }
+
+            if let Some((sample_time, sample_candidates)) = self.samples.front() {
+                let elapsed = now.saturating_duration_since(*sample_time);
+                if elapsed >= THROUGHPUT_MIN_HISTORY {
+                    let completed = stats.candidates.saturating_sub(*sample_candidates);
+                    self.current_rate = completed as f64 / elapsed.as_secs_f64();
+                    self.peak_rate = self.peak_rate.max(self.current_rate);
+                }
+            }
+            self.last_sample = now;
+        }
+
+        stats.current_rate = self.current_rate;
+        stats.peak_rate = self.peak_rate;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_snapshot(
     shared: &Arc<Mutex<RuntimeSnapshot>>,
@@ -2756,7 +2842,10 @@ fn write_snapshot(
     verified_winners: u64,
     pending_winners: u64,
     last_error: Option<String>,
+    throughput: &mut ThroughputTracker,
 ) {
+    let mut search_stats = search.snapshot();
+    throughput.observe(&mut search_stats, Instant::now());
     let mut snapshot = shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2774,7 +2863,7 @@ fn write_snapshot(
     snapshot.verified_winners = verified_winners;
     snapshot.pending_winners = pending_winners;
     snapshot.last_error = last_error;
-    snapshot.search = search.snapshot();
+    snapshot.search = search_stats;
     if snapshot.state == SupervisorState::Mining && snapshot.search.state == MiningState::Paused {
         snapshot.state = SupervisorState::Paused;
     }
@@ -2813,6 +2902,51 @@ mod tests {
 
     const TEST_PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
     static PREFLIGHT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn throughput_stats(candidates: u64, state: MiningState, average_rate: f64) -> SearchStats {
+        SearchStats {
+            candidates,
+            batches: 0,
+            intensity: 100,
+            state,
+            elapsed_secs: 0,
+            rate: average_rate,
+            current_rate: 0.0,
+            peak_rate: 0.0,
+            winners: 0,
+        }
+    }
+
+    #[test]
+    fn shared_throughput_tracks_current_average_peak_and_resets_after_pause() {
+        let start = Instant::now();
+        let mut tracker = ThroughputTracker::new(start, 0, true);
+
+        let mut first = throughput_stats(1_000, MiningState::Mining, 900.0);
+        tracker.observe(&mut first, start + Duration::from_secs(1));
+        assert!((first.current_rate - 1_000.0).abs() < 0.01);
+        assert_eq!(first.rate, 900.0);
+        assert!((first.peak_rate - 1_000.0).abs() < 0.01);
+
+        let mut faster = throughput_stats(3_000, MiningState::Mining, 1_400.0);
+        tracker.observe(&mut faster, start + Duration::from_secs(2));
+        assert!((faster.current_rate - 1_500.0).abs() < 0.01);
+        assert!((faster.peak_rate - 1_500.0).abs() < 0.01);
+
+        let mut paused = throughput_stats(3_000, MiningState::Paused, 1_200.0);
+        tracker.observe(&mut paused, start + Duration::from_millis(2_100));
+        assert_eq!(paused.current_rate, 0.0);
+        assert!((paused.peak_rate - 1_500.0).abs() < 0.01);
+
+        let mut resumed = throughput_stats(3_000, MiningState::Mining, 1_100.0);
+        tracker.observe(&mut resumed, start + Duration::from_secs(3));
+        assert_eq!(resumed.current_rate, 0.0);
+
+        resumed.candidates = 4_000;
+        tracker.observe(&mut resumed, start + Duration::from_secs(4));
+        assert!((resumed.current_rate - 1_000.0).abs() < 0.01);
+        assert!((resumed.peak_rate - 1_500.0).abs() < 0.01);
+    }
 
     fn live_job() -> LiveJob {
         LiveJob {

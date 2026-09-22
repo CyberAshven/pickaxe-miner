@@ -857,6 +857,9 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
                 "candidates": snapshot.search.candidates,
                 "batches": snapshot.search.batches,
                 "rate": snapshot.search.rate,
+                "current_rate": snapshot.search.current_rate,
+                "average_rate": snapshot.search.rate,
+                "peak_rate": snapshot.search.peak_rate,
                 "refreshes": snapshot.refreshes,
                 "stale_rebuilds": snapshot.stale_rebuilds,
                 "reconnects": snapshot.reconnects,
@@ -868,7 +871,7 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
         );
     } else {
         println!(
-            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} rate={:.0}/s refreshes={} stale_rebuilds={} reconnects={} winners={} pending={}",
+            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} current={:.0}/s avg={:.0}/s peak={:.0}/s refreshes={} stale_rebuilds={} reconnects={} winners={} pending={}",
             snapshot.state,
             snapshot.gpu_backend,
             snapshot.gpu_device,
@@ -879,7 +882,9 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             snapshot.search.intensity,
             snapshot.search.candidates,
             snapshot.search.batches,
+            snapshot.search.current_rate,
             snapshot.search.rate,
+            snapshot.search.peak_rate,
             snapshot.refreshes,
             snapshot.stale_rebuilds,
             snapshot.reconnects,
