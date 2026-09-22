@@ -24,6 +24,14 @@ const VECTOR_TOKEN_AMOUNT: u128 = 2_099_905_002_035_715;
 const VECTOR_REWARD_RAW: u128 = 4_999_773_813;
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 
+fn benchmark_intensities(requested: Option<u8>) -> Result<Vec<u8>, String> {
+    match requested {
+        Some(intensity) if (10..=100).contains(&intensity) => Ok(vec![intensity]),
+        Some(_) => Err("benchmark intensity must be 10..=100".into()),
+        None => Ok(BENCHMARK_INTENSITIES.to_vec()),
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NvidiaTelemetry {
     pub samples: u32,
@@ -362,6 +370,7 @@ pub fn run_cuda_benchmark(
     device: u32,
     device_name: String,
     seconds: u64,
+    requested_intensity: Option<u8>,
     ui_compare: bool,
 ) -> Result<BenchmarkReport, String> {
     if !(1..=MAX_BENCHMARK_WINDOW_SECONDS).contains(&seconds) {
@@ -372,6 +381,7 @@ pub fn run_cuda_benchmark(
     if cfg!(debug_assertions) {
         return Err("benchmark requires an optimized release build".into());
     }
+    let intensities = benchmark_intensities(requested_intensity)?;
     let fixture = benchmark_fixture()?;
     let mut engine = CudaPhotonEngine::new(
         device as usize,
@@ -387,8 +397,8 @@ pub fn run_cuda_benchmark(
     let warmup = engine.search_batch(nonce_base, search::scheduled_batch_candidates())?;
     nonce_base = nonce_base.wrapping_add(warmup.candidates);
 
-    let mut samples = Vec::with_capacity(BENCHMARK_INTENSITIES.len());
-    for intensity in BENCHMARK_INTENSITIES {
+    let mut samples = Vec::with_capacity(intensities.len());
+    for intensity in intensities {
         samples.push(
             run_intensity_window(
                 &mut engine,
@@ -498,11 +508,16 @@ mod tests {
 
     #[test]
     fn benchmark_matrix_covers_required_intensities() {
-        assert_eq!(BENCHMARK_INTENSITIES, [10, 25, 50, 75, 100]);
+        assert_eq!(benchmark_intensities(None).unwrap(), [10, 25, 50, 75, 100]);
         assert_eq!(
             BENCHMARK_INTENSITIES.len() as u64 * MAX_BENCHMARK_WINDOW_SECONDS,
             60 * 60
         );
+    }
+
+    #[test]
+    fn benchmark_explicit_intensity_selects_one_window() {
+        assert_eq!(benchmark_intensities(Some(30)).unwrap(), [30]);
     }
 
     #[test]
@@ -530,20 +545,31 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn benchmark_refuses_debug_measurements_before_gpu_initialization() {
-        let error = run_cuda_benchmark(0, "unused".into(), 1, false).unwrap_err();
+        let error = run_cuda_benchmark(0, "unused".into(), 1, None, false).unwrap_err();
         assert!(error.contains("release build"));
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn benchmark_accepts_one_hour_matrix_window_without_initializing_gpu() {
-        let accepted = run_cuda_benchmark(0, "unused".into(), MAX_BENCHMARK_WINDOW_SECONDS, false)
-            .unwrap_err();
+        let accepted = run_cuda_benchmark(
+            0,
+            "unused".into(),
+            MAX_BENCHMARK_WINDOW_SECONDS,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(accepted.contains("release build"));
 
-        let rejected =
-            run_cuda_benchmark(0, "unused".into(), MAX_BENCHMARK_WINDOW_SECONDS + 1, false)
-                .unwrap_err();
+        let rejected = run_cuda_benchmark(
+            0,
+            "unused".into(),
+            MAX_BENCHMARK_WINDOW_SECONDS + 1,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(rejected.contains("1..=720"));
     }
 }

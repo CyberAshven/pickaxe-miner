@@ -713,7 +713,9 @@ fn handle_line(
 
 fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
     let mut cfg = RuntimeConfig::default();
-    cfg.set_intensity(args.intensity)?;
+    if let Some(intensity) = args.intensity {
+        cfg.set_intensity(intensity)?;
+    }
     if let Some(address) = &args.address {
         cfg.set_payout(address.clone())?;
     }
@@ -996,8 +998,13 @@ fn main() {
                 );
                 std::process::exit(2);
             }
-            match benchmark::run_cuda_benchmark(selected.index, selected.name, seconds, ui_compare)
-            {
+            match benchmark::run_cuda_benchmark(
+                selected.index,
+                selected.name,
+                seconds,
+                args.intensity,
+                ui_compare,
+            ) {
                 Ok(report) => benchmark::print_report(&report, args.json),
                 Err(error) => {
                     eprintln!("error: benchmark failed: {error}");
@@ -1245,6 +1252,14 @@ mod tests {
         assert!(c.set_intensity(9).is_err());
         assert!(c.set_intensity(100).is_ok());
         assert!(c.set_intensity(101).is_err());
+    }
+
+    #[test]
+    fn omitted_cli_intensity_keeps_mining_default_at_100() {
+        let args = cli::Cli::try_parse_from(["pickaxe", "mine"]).unwrap();
+        assert_eq!(args.intensity, None);
+        let cfg = runtime_config_from_cli(&args).unwrap();
+        assert_eq!(cfg.intensity, 100);
     }
 
     #[test]

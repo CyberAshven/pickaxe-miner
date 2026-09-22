@@ -11,8 +11,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub device: Option<u32>,
 
-    #[arg(long, global = true, default_value_t = 100, value_parser = clap::value_parser!(u8).range(10..=100))]
-    pub intensity: u8,
+    #[arg(
+        long,
+        global = true,
+        value_parser = clap::value_parser!(u8).range(10..=100),
+        help = "GPU intensity 10..=100 (mine defaults to 100; benchmark without this flag runs 10/25/50/75/100)"
+    )]
+    pub intensity: Option<u8>,
 
     #[arg(long, global = true)]
     pub address: Option<String>,
@@ -86,7 +91,7 @@ mod tests {
         assert!(matches!(cli.command, Some(Commands::Mine)));
         assert_eq!(cli.backend, "cuda");
         assert_eq!(cli.device, Some(0));
-        assert_eq!(cli.intensity, 75);
+        assert_eq!(cli.intensity, Some(75));
         assert!(cli.no_tui);
 
         let show = Cli::try_parse_from(["pickaxe", "config", "show"]).unwrap();
@@ -135,6 +140,20 @@ mod tests {
             })
         ));
         assert_eq!(cli.backend, "cuda");
+        assert_eq!(cli.intensity, None);
+
+        let selected = Cli::try_parse_from([
+            "pickaxe",
+            "benchmark",
+            "--backend",
+            "cuda",
+            "--seconds",
+            "3",
+            "--intensity",
+            "30",
+        ])
+        .unwrap();
+        assert_eq!(selected.intensity, Some(30));
 
         let ui = Cli::try_parse_from([
             "pickaxe",
