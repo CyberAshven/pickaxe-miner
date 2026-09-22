@@ -20,6 +20,7 @@ pub(crate) enum SourceProvenance {
 pub(crate) enum SourceTransport {
     Wss,
     ElectrumTls,
+    ElectrumTcp,
     NodeHttp,
 }
 
@@ -28,7 +29,6 @@ pub(crate) enum SourceOrigin {
     Pickaxe,
     ElectronCash,
     Selene,
-    ElectronCashAndSelene,
     User,
 }
 
@@ -164,6 +164,19 @@ impl SourceEntry {
             .any(|evidence| evidence.capability == capability && evidence.is_current(now_ms))
     }
 
+    fn routable_for_at(&self, capability: SourceCapability, now_ms: u64) -> bool {
+        if capability != SourceCapability::PhotonState {
+            return self.supports_at(capability, now_ms);
+        }
+        [
+            SourceCapability::ChainHeight,
+            SourceCapability::TokenState,
+            SourceCapability::PhotonState,
+        ]
+        .into_iter()
+        .all(|required| self.supports_at(required, now_ms))
+    }
+
     pub(crate) fn verify_capability(
         &mut self,
         capability: SourceCapability,
@@ -237,20 +250,10 @@ impl SourceCatalog {
         let mut catalog = Self::default();
         for endpoint in crate::protocol::FULCRUM_WSS_BOOTSTRAP {
             let host = endpoint_host(endpoint).unwrap_or(endpoint);
-            let in_electron_cash = crate::protocol::ELECTRON_CASH_TLS_BOOTSTRAP
-                .iter()
-                .any(|(candidate, _)| candidate.eq_ignore_ascii_case(host));
-            let in_selene = !matches!(
-                *endpoint,
-                "wss://electrum.imaginary.cash:50004"
-                    | "wss://electroncash.dk:50004"
-                    | "wss://fulcrum.greyh.at:50004"
-            );
-            let origin = match (in_electron_cash, in_selene) {
-                (true, true) => SourceOrigin::ElectronCashAndSelene,
-                (true, false) => SourceOrigin::ElectronCash,
-                (false, true) => SourceOrigin::Selene,
-                (false, false) => SourceOrigin::Pickaxe,
+            let origin = if crate::protocol::SELENE_WSS_BOOTSTRAP.contains(endpoint) {
+                SourceOrigin::Selene
+            } else {
+                SourceOrigin::Pickaxe
             };
             catalog.entries.push(SourceEntry::published(
                 SourceKind::Fulcrum,
@@ -261,18 +264,20 @@ impl SourceCatalog {
             ));
         }
         for (host, port) in crate::protocol::ELECTRON_CASH_TLS_BOOTSTRAP {
-            if catalog.entries.iter().any(|entry| {
-                entry.kind == SourceKind::Fulcrum
-                    && endpoint_host(&entry.endpoint)
-                        .is_some_and(|known| known.eq_ignore_ascii_case(host))
-            }) {
-                continue;
-            }
             catalog.entries.push(SourceEntry::published(
                 SourceKind::Fulcrum,
                 &format!("tls://{host}:{port}"),
                 format!("{host} Electron Cash TLS"),
                 SourceTransport::ElectrumTls,
+                SourceOrigin::ElectronCash,
+            ));
+        }
+        for (host, port) in crate::protocol::ELECTRON_CASH_TCP_BOOTSTRAP {
+            catalog.entries.push(SourceEntry::published(
+                SourceKind::Fulcrum,
+                &format!("tcp://{host}:{port}"),
+                format!("{host} Electron Cash TCP"),
+                SourceTransport::ElectrumTcp,
                 SourceOrigin::ElectronCash,
             ));
         }
@@ -420,6 +425,8 @@ impl SourceCatalog {
             .ok_or_else(|| {
                 "native PHOTON proof endpoint is not present in the source catalog".to_string()
             })?;
+        entry.verify_capability(SourceCapability::ChainHeight, now_ms, ttl_ms);
+        entry.verify_capability(SourceCapability::TokenState, now_ms, ttl_ms);
         entry.verify_capability(SourceCapability::PhotonState, now_ms, ttl_ms);
         entry.native_photon_proof = Some(proof.clone());
         Ok(())
@@ -443,7 +450,7 @@ impl SourceCatalog {
             .find(|entry| {
                 entry.kind == SourceKind::NativeNode
                     && entry.endpoint == endpoint.trim()
-                    && entry.supports_at(SourceCapability::PhotonState, now_ms)
+                    && entry.routable_for_at(SourceCapability::PhotonState, now_ms)
             })
             .and_then(|entry| entry.native_photon_proof.as_ref())
     }
@@ -472,7 +479,7 @@ impl SourceCatalog {
             .iter()
             .find(|entry| entry.kind == kind && entry.endpoint == endpoint.trim())
             .is_some_and(|entry| {
-                entry.supports_at(capability, now_ms) && entry.available_at(now_ms)
+                entry.routable_for_at(capability, now_ms) && entry.available_at(now_ms)
             })
     }
 
@@ -589,7 +596,7 @@ impl SourceRouter<'_> {
             .filter(|entry| {
                 entry.health == SourceHealth::Healthy
                     && entry.supported_by_current_client()
-                    && entry.supports_at(capability, now_ms)
+                    && entry.routable_for_at(capability, now_ms)
                     && entry.available_at(now_ms)
             })
             .collect::<Vec<_>>();
@@ -653,6 +660,23 @@ mod tests {
             .unwrap();
     }
 
+    fn verify_fulcrum_photon_snapshot(
+        catalog: &mut SourceCatalog,
+        endpoint: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) {
+        for capability in [
+            SourceCapability::ChainHeight,
+            SourceCapability::TokenState,
+            SourceCapability::PhotonState,
+        ] {
+            catalog
+                .verify_capability(SourceKind::Fulcrum, endpoint, capability, now_ms, ttl_ms)
+                .unwrap();
+        }
+    }
+
     #[test]
     fn mixed_pool_routes_only_to_proven_capabilities() {
         let mut catalog = SourceCatalog::default();
@@ -664,15 +688,7 @@ mod tests {
         catalog
             .record_success(SourceKind::Fulcrum, "fulcrum-a", 1_000, 50)
             .unwrap();
-        catalog
-            .verify_capability(
-                SourceKind::Fulcrum,
-                "fulcrum-a",
-                SourceCapability::PhotonState,
-                1_000,
-                DEFAULT_CAPABILITY_TTL_MS,
-            )
-            .unwrap();
+        verify_fulcrum_photon_snapshot(&mut catalog, "fulcrum-a", 1_000, DEFAULT_CAPABILITY_TTL_MS);
 
         let router = catalog.router();
         let selected = router.select(SourceCapability::PhotonState, 1_000).unwrap();
@@ -796,6 +812,21 @@ mod tests {
                 DEFAULT_CAPABILITY_TTL_MS,
             )
             .unwrap();
+        assert!(catalog
+            .router()
+            .select(SourceCapability::PhotonState, 1_000)
+            .is_none());
+        for capability in [SourceCapability::ChainHeight, SourceCapability::TokenState] {
+            catalog
+                .verify_capability(
+                    SourceKind::Fulcrum,
+                    "fulcrum-a",
+                    capability,
+                    1_000,
+                    DEFAULT_CAPABILITY_TTL_MS,
+                )
+                .unwrap();
+        }
         assert_eq!(
             catalog
                 .router()
@@ -837,18 +868,24 @@ mod tests {
     }
 
     #[test]
-    fn published_mainnet_catalog_deduplicates_hosts_and_keeps_tls_only_sources() {
+    fn published_mainnet_catalog_keeps_each_published_transport_once() {
         let catalog = SourceCatalog::mainnet();
-        let mut hosts = catalog
+        let mut endpoints = catalog
             .entries()
             .iter()
             .filter(|entry| entry.kind == SourceKind::Fulcrum)
-            .map(|entry| endpoint_host(&entry.endpoint).unwrap().to_ascii_lowercase())
+            .map(|entry| entry.endpoint.to_ascii_lowercase())
             .collect::<Vec<_>>();
-        let before = hosts.len();
-        hosts.sort();
-        hosts.dedup();
-        assert_eq!(hosts.len(), before);
+        let before = endpoints.len();
+        endpoints.sort();
+        endpoints.dedup();
+        assert_eq!(endpoints.len(), before);
+        assert_eq!(
+            before,
+            crate::protocol::FULCRUM_WSS_BOOTSTRAP.len()
+                + crate::protocol::ELECTRON_CASH_TLS_BOOTSTRAP.len()
+                + crate::protocol::ELECTRON_CASH_TCP_BOOTSTRAP.len()
+        );
 
         let tls_only = catalog
             .entries()
@@ -864,11 +901,25 @@ mod tests {
             .find(|entry| entry.endpoint == "wss://cashnode.bch.ninja:50004")
             .expect("Selene WSS server is cataloged");
         assert_eq!(wss.transport, SourceTransport::Wss);
-        assert_eq!(wss.origin, SourceOrigin::ElectronCashAndSelene);
+        assert_eq!(wss.origin, SourceOrigin::Selene);
+
+        let same_host_tls = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.endpoint == "tls://cashnode.bch.ninja:50002")
+            .expect("Electron Cash TLS endpoint is distinct from Selene WSS");
+        assert_eq!(same_host_tls.origin, SourceOrigin::ElectronCash);
+
+        let tcp = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.endpoint == "tcp://cashnode.bch.ninja:50001")
+            .expect("Electron Cash TCP endpoint is cataloged");
+        assert_eq!(tcp.transport, SourceTransport::ElectrumTcp);
     }
 
     #[test]
-    fn tls_only_published_sources_are_never_wss_probe_candidates() {
+    fn non_websocket_published_sources_are_never_wss_probe_candidates() {
         let catalog = SourceCatalog::mainnet();
         let candidates = catalog.probe_candidates(SourceKind::Fulcrum, 0, MAX_SOURCES, 0);
         assert!(candidates
@@ -876,7 +927,8 @@ mod tests {
             .all(|entry| entry.transport == SourceTransport::Wss));
         assert!(candidates
             .iter()
-            .all(|entry| !entry.endpoint.starts_with("tls://")));
+            .all(|entry| !entry.endpoint.starts_with("tls://")
+                && !entry.endpoint.starts_with("tcp://")));
     }
 
     #[test]
@@ -1017,15 +1069,7 @@ mod tests {
         catalog
             .record_success(SourceKind::Fulcrum, "a", 1_000, 5)
             .unwrap();
-        catalog
-            .verify_capability(
-                SourceKind::Fulcrum,
-                "a",
-                SourceCapability::PhotonState,
-                1_000,
-                100,
-            )
-            .unwrap();
+        verify_fulcrum_photon_snapshot(&mut catalog, "a", 1_000, 100);
 
         assert!(catalog
             .router()

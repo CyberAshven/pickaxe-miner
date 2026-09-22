@@ -138,9 +138,21 @@ pub fn photon_multi_input_max_baton_decrease_sats() -> Result<u64, String> {
     )
 }
 
-/// Published BCH mainnet **WSS** endpoints. Selene explicitly publishes these
-/// as WebSocket endpoints; the final three are existing Pickaxe curated WSS
-/// endpoints retained for compatibility. Do not infer WSS from a TLS port.
+/// Selene's published BCH mainnet WebSocket endpoints.
+pub const SELENE_WSS_BOOTSTRAP: &[&str] = &[
+    "wss://cashnode.bch.ninja:50004",
+    "wss://bch.imaginary.cash:50004",
+    "wss://bitcoincash.network:50004",
+    "wss://blackie.c3-soft.com:50004",
+    "wss://bch.loping.net:50004",
+    "wss://bch.soul-dev.com:50004",
+    "wss://bitcoincash.stackwallet.com:50004",
+    "wss://node.minisatoshi.cash:50004",
+    "wss://fulcrum.criptolayer.net:50004",
+];
+
+/// Published/curated BCH mainnet **WSS** endpoints used by the current client.
+/// Do not infer WSS support from Electron Cash's TLS/TCP ports.
 pub const FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://cashnode.bch.ninja:50004",
     "wss://bch.imaginary.cash:50004",
@@ -156,15 +168,17 @@ pub const FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://fulcrum.greyh.at:50004",
 ];
 
-/// Electron Cash publishes these clearnet mainnet servers as Electrum TLS,
-/// usually on 50002 (one server uses 51002). They stay in Pickaxe's source
-/// catalog for provenance/policy, but the current WSS client must not probe
-/// them unless that same host has an independently published WSS endpoint.
+/// Electron Cash mainnet servers published with the `s` (TLS) transport.
+/// These are catalog metadata until Pickaxe grows a native Electrum TLS client.
 pub const ELECTRON_CASH_TLS_BOOTSTRAP: &[(&str, u16)] = &[
     ("bch.crypto.mldlabs.com", 50002),
     ("bch.cyberbits.eu", 50002),
     ("bch.imaginary.cash", 50002),
     ("bch.loping.net", 50002),
+    (
+        "j2tjfxntnsqpojaamnndgmfrc6lh3thattnlpc2xx53h2ojoi7agccid.onion",
+        50002,
+    ),
     ("bch.soul-dev.com", 50002),
     ("bch0.kister.net", 50002),
     ("bch2.electroncash.dk", 50002),
@@ -176,10 +190,43 @@ pub const ELECTRON_CASH_TLS_BOOTSTRAP: &[(&str, u16)] = &[
     ("electrs.bitcoinunlimited.info", 50002),
     ("electrum.bitcoinverde.org", 50002),
     ("electrum.imaginary.cash", 50002),
+    (
+        "jh3jgcrwweh6yvmprtjnp72u2hqn34nlftlg3msrr4vmlapft4yvt2id.onion",
+        50002,
+    ),
     ("fulcrum.aglauck.com", 50002),
     ("fulcrum.criptolayer.net", 50002),
     ("fulcrum.jettscythe.xyz", 50002),
     ("node.minisatoshi.cash", 50002),
+];
+
+/// Electron Cash mainnet servers published with the `t` (plain TCP) transport.
+/// They remain catalog-only while the runtime transport is WebSocket-only.
+pub const ELECTRON_CASH_TCP_BOOTSTRAP: &[(&str, u16)] = &[
+    ("bch.crypto.mldlabs.com", 50001),
+    ("bch.imaginary.cash", 50001),
+    ("bch0.kister.net", 50001),
+    ("bch.loping.net", 50001),
+    (
+        "j2tjfxntnsqpojaamnndgmfrc6lh3thattnlpc2xx53h2ojoi7agccid.onion",
+        50001,
+    ),
+    ("blackie.c3-soft.com", 50001),
+    ("electron.jochen-hoenicke.de", 51001),
+    ("electroncash.dk", 50001),
+    ("bch2.electroncash.dk", 50001),
+    ("electrum.imaginary.cash", 50001),
+    (
+        "kisternet5tgeekwidrj7r7yd3n2l5j7y72b74y6xu3q2b6xdjrte6id.onion",
+        50001,
+    ),
+    (
+        "jh3jgcrwweh6yvmprtjnp72u2hqn34nlftlg3msrr4vmlapft4yvt2id.onion",
+        50001,
+    ),
+    ("electrum.bitcoinverde.org", 50001),
+    ("cashnode.bch.ninja", 50001),
+    ("fulcrum.criptolayer.net", 50001),
 ];
 
 /// Curated native **node** JSON-RPC bootstrap (BCHN/bitcoind-style HTTP).
