@@ -838,40 +838,41 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
     }
 }
 
+fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "event": "status",
+        "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
+        "backend": snapshot.gpu_backend,
+        "device": snapshot.gpu_device,
+        "generation_id": snapshot.generation_id,
+        "endpoint": redact_url(&snapshot.endpoint),
+        "height": snapshot.height,
+        "baton_txid": snapshot.baton_txid,
+        "baton_vout": snapshot.baton_vout,
+        "payout_address": snapshot.payout_address,
+        "intensity": snapshot.search.intensity,
+        "candidates": snapshot.search.candidates,
+        "batches": snapshot.search.batches,
+        "rate": snapshot.search.rate,
+        "current_rate": snapshot.search.current_rate,
+        "average_rate": snapshot.search.rate,
+        "peak_rate": snapshot.search.peak_rate,
+        "state_checks": snapshot.state_checks,
+        "job_changes": snapshot.job_changes,
+        "reconnects": snapshot.reconnects,
+        "stale_winners": snapshot.stale_winners,
+        "verified_winners": snapshot.verified_winners,
+        "pending_winners": snapshot.pending_winners,
+        "last_error": snapshot.last_error,
+    })
+}
+
 fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "event": "status",
-                "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
-                "backend": snapshot.gpu_backend,
-                "device": snapshot.gpu_device,
-                "generation_id": snapshot.generation_id,
-                "endpoint": redact_url(&snapshot.endpoint),
-                "height": snapshot.height,
-                "baton_txid": snapshot.baton_txid,
-                "baton_vout": snapshot.baton_vout,
-                "payout_address": snapshot.payout_address,
-                "intensity": snapshot.search.intensity,
-                "candidates": snapshot.search.candidates,
-                "batches": snapshot.search.batches,
-                "rate": snapshot.search.rate,
-                "current_rate": snapshot.search.current_rate,
-                "average_rate": snapshot.search.rate,
-                "peak_rate": snapshot.search.peak_rate,
-                "refreshes": snapshot.refreshes,
-                "stale_rebuilds": snapshot.stale_rebuilds,
-                "reconnects": snapshot.reconnects,
-                "stale_winners": snapshot.stale_winners,
-                "verified_winners": snapshot.verified_winners,
-                "pending_winners": snapshot.pending_winners,
-                "last_error": snapshot.last_error,
-            })
-        );
+        println!("{}", runtime_snapshot_json(snapshot));
     } else {
         println!(
-            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} current={:.0}/s avg={:.0}/s peak={:.0}/s refreshes={} stale_rebuilds={} reconnects={} winners={} pending={}",
+            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} current={:.0}/s avg={:.0}/s peak={:.0}/s state_checks={} job_changes={} reconnects={} winners={} pending={}",
             snapshot.state,
             snapshot.gpu_backend,
             snapshot.gpu_device,
@@ -885,8 +886,8 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             snapshot.search.current_rate,
             snapshot.search.rate,
             snapshot.search.peak_rate,
-            snapshot.refreshes,
-            snapshot.stale_rebuilds,
+            snapshot.state_checks,
+            snapshot.job_changes,
             snapshot.reconnects,
             snapshot.verified_winners,
             snapshot.pending_winners,
@@ -1159,6 +1160,45 @@ mod tests {
         let args = cli::Cli::try_parse_from(["pickaxe", "mine", "--no-tui"]).unwrap();
         let cfg = runtime_config_from_cli(&args).unwrap();
         assert_eq!(mine_startup(&args, &cfg), MineStartup::Direct);
+    }
+
+    #[test]
+    fn headless_status_distinguishes_state_checks_from_job_changes() {
+        let snapshot = runtime::RuntimeSnapshot {
+            state: runtime::SupervisorState::Mining,
+            gpu_backend: "cuda".into(),
+            gpu_device: 0,
+            generation_id: 2,
+            payout_address: crate::config::DONATION_ADDRESS.into(),
+            endpoint: "wss://fulcrum.invalid".into(),
+            height: 1_000,
+            baton_txid: "11".repeat(32),
+            baton_vout: 0,
+            state_checks: 7,
+            job_changes: 1,
+            reconnects: 0,
+            stale_winners: 0,
+            verified_winners: 0,
+            pending_winners: 0,
+            last_error: None,
+            search: search::SearchStats {
+                candidates: 65_536,
+                batches: 1,
+                intensity: 30,
+                state: search::MiningState::Mining,
+                elapsed_secs: 1,
+                rate: 65_536.0,
+                current_rate: 65_536.0,
+                peak_rate: 65_536.0,
+                winners: 0,
+            },
+        };
+
+        let status = runtime_snapshot_json(&snapshot);
+        assert_eq!(status["state_checks"], 7);
+        assert_eq!(status["job_changes"], 1);
+        assert!(status.get("refreshes").is_none());
+        assert!(status.get("stale_rebuilds").is_none());
     }
 
     #[test]
