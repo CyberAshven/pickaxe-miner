@@ -9,9 +9,12 @@ GPU-only product. No CPU mining fallback.
 - Linux + AMD
 
 ## Backends
-`--backend auto|cuda|hip` (default auto). Production mining uses native GPU backends only.
-wgpu/WebGPU is detached reference/experimental work and is not an auto fallback,
-normal release dependency, or Definition-of-Done requirement.
+`--backend auto|cuda|hip|wgpu` (default auto). CUDA and HIP are the validated
+production mining engines. WGPU hardware adapter discovery is part of the CLI
+surface and must exclude CPU/software adapters. Production `--backend wgpu`
+mining remains fail-closed until the authoritative PHOTON WGSL path is wired,
+verified against the reference vectors, and validated on supported hardware.
+That validated WGPU mining path remains a Definition-of-Done blocker.
 
 ## Intensity
 10–100% (default 100). Must scale **real GPU work** live. Pause separate (Space/P ≠ 10%).
@@ -23,7 +26,7 @@ Ratatui + Crossterm product TUI. Commands: devices, mine, benchmark, etc.
 Bandar mining live end-to-end, committed/pushed to CyberAshven/pickaxe-miner.
 
 ## Owners
-- Lead Dev: native CUDA/HIP search, backends, intensity, devices
+- Lead Dev: native CUDA/HIP search, WGPU portability path, backends, intensity, devices
 - Dev Assist: Electrum/node, win-tx, arm/applysig/broadcast
 
 ## Mining source (locked 2026-09-21)

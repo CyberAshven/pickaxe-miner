@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "pickaxe", about = "Pickaxe Miner - GPU-only PHOTON miner")]
 pub struct Cli {
-    #[arg(long, global = true, value_parser = ["auto", "cuda", "hip"])]
+    #[arg(long, global = true, value_parser = ["auto", "cuda", "hip", "wgpu"])]
     pub backend: Option<String>,
 
     #[arg(long, global = true)]
@@ -125,8 +125,10 @@ mod tests {
     }
 
     #[test]
-    fn clap_rejects_detached_wgpu_backend() {
-        assert!(Cli::try_parse_from(["pickaxe", "mine", "--backend", "wgpu"]).is_err());
+    fn clap_accepts_wgpu_backend_surface() {
+        let cli = Cli::try_parse_from(["pickaxe", "devices", "--backend", "wgpu"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Devices)));
+        assert_eq!(cli.backend.as_deref(), Some("wgpu"));
     }
 
     #[test]

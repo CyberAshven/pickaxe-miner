@@ -6,11 +6,15 @@ Researchy brief + CoS product lock.
 
 1. **CUDA first** — `cudarc` host + `.cu`/PTX kernels (peak hashrate on NVIDIA).
 2. **Native AMD path** — HIP/ROCm where validated, otherwise an appropriate native GPU API.
-3. **FPGA** — later optional; do not block GPU ship.
+3. **WGPU portability path** — DX12/Vulkan GPU discovery is exposed now; mining
+   stays fail-closed until the authoritative PHOTON WGSL engine is wired and
+   passes the same reference/equivalence gates as CUDA/HIP.
+4. **FPGA** — later optional; do not block GPU ship.
 
-wgpu/WebGPU is detached from the production backend stack. The authoritative
-WGSL implementation remains useful for correctness comparison and portability
-research, but the production binary does not select or fall back to it.
+`--backend wgpu` is a real backend selection for hardware discovery. It never
+falls back to CPU/software adapters or CPU mining. Auto mining continues to
+resolve only validated native CUDA/HIP engines until the WGPU mining engine is
+reference-correct and hardware-validated.
 
 ## Sequence after Electrum/job
 

@@ -22,3 +22,5 @@ ctrlc = "3.4"
 ratatui = "0.29"
 crossterm = "0.28"
 libloading = "0.9"
+pollster = "0.4"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }

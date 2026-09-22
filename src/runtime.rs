@@ -1601,6 +1601,7 @@ impl RuntimeSupervisor {
         backend: BackendKind,
         device_ordinal: u32,
     ) -> Result<Self, String> {
+        crate::backend::require_production_mining_backend(backend)?;
         if cfg.payout_address.trim().is_empty() {
             return Err("mining payout address is required".into());
         }
