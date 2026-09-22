@@ -433,9 +433,9 @@ impl PendingSubmission {
         Ok(())
     }
 
-    fn matches_live(&self, live: &LiveJob) -> bool {
-        self.expected_height == live.height
-            && self.expected_baton_txid == live.baton_txid
+    fn expected_baton_is_current(&self, live: &LiveJob) -> bool {
+        self.expected_baton_txid
+            .eq_ignore_ascii_case(&live.baton_txid)
             && self.expected_baton_vout == live.baton_vout
     }
 
@@ -608,9 +608,9 @@ impl ResolvedSubmission {
                     .into(),
             );
         }
-        if pending.matches_live(fresh) {
+        if pending.expected_baton_is_current(fresh) {
             return Err(
-                "refusing to resolve a PHOTON winner as stale while its expected job is live"
+                "refusing to resolve a PHOTON winner as stale while its expected baton is live"
                     .into(),
             );
         }
@@ -1116,14 +1116,8 @@ fn attempt_pending_submission(
         pending.mark_parent_accepted(journal_path)?;
         return broadcast_settlement(session, cfg, pending);
     }
-    let baton_conflicted = fresh.baton_txid != pending.expected_baton_txid
-        || fresh.baton_vout != pending.expected_baton_vout;
-    if baton_conflicted {
-        return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
-    }
-    if !parent_attempted
-        && submission_decision(false, pending.matches_live(&fresh))
-            == SubmissionDecision::StaleUnbroadcast
+    if submission_decision(false, pending.expected_baton_is_current(&fresh))
+        == SubmissionDecision::StaleUnbroadcast
     {
         return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
     }
@@ -4353,6 +4347,33 @@ mod tests {
     }
 
     #[test]
+    fn height_only_advance_cannot_resolve_a_journaled_winner_as_stale() {
+        let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let winner = signed_winner(cfg.generation_id, &job, &mining_payout);
+        let pending = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+
+        let mut next_height = job.clone();
+        next_height.height += 1;
+        let error = resolve_stale_submission(&pending, &next_height, &journal).unwrap_err();
+
+        assert!(error.contains("expected baton is live"), "{error}");
+        assert!(journal.exists());
+        assert!(ResolvedSubmission::load(&journal).unwrap().is_none());
+
+        PendingSubmission::remove(&journal).unwrap();
+    }
+
+    #[test]
     fn stale_unbroadcast_winner_keeps_durable_resolution_evidence() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -4441,7 +4462,7 @@ mod tests {
     }
 
     #[test]
-    fn unbroadcast_pending_pair_requires_exact_height_and_baton() {
+    fn journaled_unbroadcast_pair_survives_height_advance_while_baton_is_current() {
         let job = live_job();
         let settlement_txid = reward::transaction_id(&[2]);
         let pending = PendingSubmission {
@@ -4460,15 +4481,31 @@ mod tests {
             miner_token_amount: 98,
             donation_token_amount: 2,
         };
-        assert!(pending.matches_live(&job));
+        assert!(pending.expected_baton_is_current(&job));
 
         let mut next_height = job.clone();
         next_height.height += 1;
-        assert!(!pending.matches_live(&next_height));
+        assert!(pending.expected_baton_is_current(&next_height));
+        assert_eq!(
+            submission_decision(false, pending.expected_baton_is_current(&next_height)),
+            SubmissionDecision::BroadcastParentThenSettlement
+        );
+
+        let mut uppercase_baton = next_height.clone();
+        uppercase_baton.baton_txid = uppercase_baton.baton_txid.to_uppercase();
+        assert!(pending.expected_baton_is_current(&uppercase_baton));
+        assert_eq!(
+            submission_decision(false, pending.expected_baton_is_current(&uppercase_baton)),
+            SubmissionDecision::BroadcastParentThenSettlement
+        );
 
         let mut next_baton = job;
         next_baton.baton_txid = "22".repeat(32);
-        assert!(!pending.matches_live(&next_baton));
+        assert!(!pending.expected_baton_is_current(&next_baton));
+        assert_eq!(
+            submission_decision(false, pending.expected_baton_is_current(&next_baton)),
+            SubmissionDecision::StaleUnbroadcast
+        );
     }
 
     #[test]
