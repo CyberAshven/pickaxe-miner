@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 pub const REFERENCE_GPU_PIPELINE_READY: bool = true;
 
 pub(crate) const MAX_BATCH_CANDIDATES: u32 = 65_536;
+const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 524_288;
+const THROTTLED_BATCH_CANDIDATES: u32 = 4_096;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const JOB_UPDATE_CHANNEL_CAP: usize = 2;
@@ -134,7 +136,7 @@ impl PhotonEngine {
 
 pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32 {
     match backend {
-        BackendKind::Wgpu => crate::wgpu_photon::WGPU_REFERENCE_MAX_BATCH,
+        BackendKind::Wgpu => PORTABLE_WGPU_MAX_BATCH_CANDIDATES,
         BackendKind::Auto | BackendKind::Cuda | BackendKind::Hip => MAX_BATCH_CANDIDATES,
     }
 }
@@ -361,10 +363,7 @@ fn verify_gpu_winner(
     })
 }
 
-/// Keep production GPU launches at the tuned full batch size.
-///
-/// Native backends keep launching work continuously; intensity changes the
-/// amount of GPU work in each launch rather than inserting host-side idle gaps.
+/// Keep unthrottled production launches at the tuned full batch size.
 pub(crate) const fn scheduled_batch_candidates() -> u32 {
     MAX_BATCH_CANDIDATES
 }
@@ -373,19 +372,25 @@ pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> 
     if capacity == 0 {
         return 0;
     }
-    let percent = if intensity < 10 {
-        10
-    } else if intensity > 100 {
-        100
+    if intensity >= 100 {
+        capacity
+    } else if capacity < THROTTLED_BATCH_CANDIDATES {
+        capacity
     } else {
-        intensity
-    } as u32;
-    let scaled = capacity.saturating_mul(percent) / 100;
-    if scaled == 0 {
-        1
-    } else {
-        scaled
+        THROTTLED_BATCH_CANDIDATES
     }
+}
+
+pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
+    let intensity = intensity.clamp(10, 100);
+    if intensity >= 100 || compute_time.is_zero() {
+        return Duration::ZERO;
+    }
+    let rest_ns = compute_time
+        .as_nanos()
+        .saturating_mul(u128::from(100 - intensity))
+        / u128::from(intensity);
+    Duration::from_nanos(rest_ns.min(u128::from(u64::MAX)) as u64)
 }
 
 fn deliver_verified_batch(
@@ -460,6 +465,7 @@ fn run_worker(
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
         let batch_size = engine.scheduled_batch_candidates(active_intensity);
+        let batch_started = Instant::now();
         let result = match engine.search_batch(nonce_base, batch_size) {
             Ok(result) => result,
             Err(_) => {
@@ -468,6 +474,7 @@ fn run_worker(
                 break;
             }
         };
+        let compute_time = batch_started.elapsed();
         candidates.fetch_add(u64::from(result.candidates), Ordering::Relaxed);
         batches.fetch_add(1, Ordering::Release);
 
@@ -485,6 +492,10 @@ fn run_worker(
         batch_in_flight.store(false, Ordering::SeqCst);
 
         nonce_base = nonce_base.wrapping_add(result.candidates);
+        let rest = duty_rest(compute_time, active_intensity);
+        if !rest.is_zero() {
+            thread::park_timeout(rest);
+        }
     }
 }
 
@@ -833,15 +844,24 @@ mod tests {
     }
 
     #[test]
-    fn intensity_scales_continuous_gpu_launches_without_idle_periods() {
+    fn intensity_uses_short_paced_gpu_batches() {
         assert_eq!(scheduled_batch_candidates(), MAX_BATCH_CANDIDATES);
         assert_eq!(
             intensity_batch_candidates(MAX_BATCH_CANDIDATES, 100),
             65_536
         );
-        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 50), 32_768);
-        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 25), 16_384);
-        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 10), 6_553);
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 50), 4_096);
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 25), 4_096);
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 10), 4_096);
+        assert_eq!(duty_rest(Duration::from_millis(10), 100), Duration::ZERO);
+        assert_eq!(
+            duty_rest(Duration::from_millis(10), 50),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            duty_rest(Duration::from_millis(10), 25),
+            Duration::from_millis(30)
+        );
     }
 
     #[test]
@@ -850,7 +870,7 @@ mod tests {
         assert_eq!(production_max_batch_candidates(BackendKind::Hip), 65_536);
         assert_eq!(
             production_max_batch_candidates(BackendKind::Wgpu),
-            crate::wgpu_photon::WGPU_REFERENCE_MAX_BATCH
+            PORTABLE_WGPU_MAX_BATCH_CANDIDATES
         );
     }
 
@@ -1106,10 +1126,11 @@ mod tests {
         let after = handle.snapshot();
         assert!(after.batches > before.batches);
         assert!(after.candidates > before.candidates);
+        let expected_batch = u64::from(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 30));
         assert_eq!(
             after.candidates,
-            after.batches * u64::from(MAX_BATCH_CANDIDATES),
-            "30% intensity must throttle between full GPU batches, not shrink each batch as well"
+            after.batches * expected_batch,
+            "30% intensity must use bounded work quanta for fine-grained pacing"
         );
         let _ = handle.stop();
     }
