@@ -1,17 +1,18 @@
 ﻿# CUDA kernels (Pickaxe)
 
-## Stage A — HASH256
+## Diagnostic Stage A — HASH256
 - Source: `stage_a_hash256.cu`
 - PTX: `build/stage_a_hash256.ptx` (`sm_120`)
 - Launcher: `src/cuda_stage_a.rs`
 - Status: GPU == host verified on RTX 5070 Ti
+- Scope: reference/diagnostic coverage only; production mining uses the persistent PHOTON pipeline below.
 
 ## Stage B — k*G (secp256k1)
 - Source: `stage_b_kg.cu` (Jacobian double-and-add, 8×u32 limbs, MSVC-safe)
 - PTX: `build/stage_b_kg.ptx` (`sm_120`, `-maxrregcount=128`, 1-thread blocks for register budget)
 - Launcher: `src/cuda_stage_b.rs`
 - Status: GPU == host (`secp256k1`) verified on RTX 5070 Ti
-- Next: 16-bit fixed-base table for hashrate; Stage C Schnorr/HASH256 tail
+- Scope: reference/diagnostic coverage only; production fixed-base multiplication uses `photon_stage_b16.cu`.
 
 ## Stage C — completed PHOTON transaction HASH256 + target filter
 - Source: `stage_c_hash.cu`
@@ -30,7 +31,7 @@
 - C2/C3: existing exact completed-transaction HASH256 and strict little-endian target filter
 - Host boundary: only winner count and a configured bounded winner nonce/HASH256 array; no per-candidate message, RFC6979 scalar, point, signature, or digest readback
 - Resources: one CUDA context/stream plus persistent table and candidate buffers per engine; host table bytes are dropped after the one-time upload
-- Production integration remains fail-closed until this engine is connected to immutable live job generations and fresh-winner revalidation/submission.
+- Production integration: connected to immutable live job generations, CPU reconstruction/verification of returned winners, authoritative freshness recheck, durable submission journaling, and self-funded settlement. Real-mainnet natural-winner evidence remains an external validation item.
 
 ## Build (Windows)
 ```bat
