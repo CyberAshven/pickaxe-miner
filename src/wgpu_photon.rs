@@ -12,6 +12,7 @@ use sha2::compress256;
 use sha2::digest::generic_array::GenericArray;
 use std::borrow::Cow;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const TX_BYTES: usize = 615;
 const TARGET_OFFSET: usize = 394;
@@ -25,6 +26,9 @@ const RESULT_BYTES: usize = 16;
 const CONTROL_BYTES: usize = 16;
 const WINNER_RECORD_WORDS: usize = 9;
 const WINNER_RECORD_BYTES: usize = WINNER_RECORD_WORDS * 4;
+const WGPU_MIN_LADDER_BATCH: u32 = 1_024;
+const WGPU_TARGET_BATCH: Duration = Duration::from_millis(350);
+const WGPU_ESCALATE_BATCH: Duration = Duration::from_millis(175);
 
 const SHA256_IV: [u32; 8] = [
     0x6a09_e667,
@@ -105,6 +109,21 @@ fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
 
 fn storage_candidates(max_candidates: u32) -> u32 {
     max_candidates.div_ceil(128) * 128
+}
+
+fn initial_wgpu_batch_size(max_candidates: u32) -> u32 {
+    max_candidates.clamp(1, WGPU_MIN_LADDER_BATCH)
+}
+
+fn next_wgpu_batch_size(current: u32, elapsed: Duration, max_candidates: u32) -> u32 {
+    let minimum = initial_wgpu_batch_size(max_candidates);
+    if elapsed <= WGPU_ESCALATE_BATCH && current < max_candidates {
+        current.saturating_mul(2).min(max_candidates)
+    } else if elapsed > WGPU_TARGET_BATCH && current > minimum {
+        (current / 2).max(minimum)
+    } else {
+        current.clamp(minimum, max_candidates)
+    }
 }
 
 fn pack_big_endian_words(bytes: &[u8], word_count: usize) -> Vec<u8> {
@@ -259,7 +278,8 @@ pub struct WgpuPhotonEngine {
     storage_candidates: u32,
     winner_cap: u32,
     readback_bytes: usize,
-    _table_source: M29TableSource,
+    table_source: M29TableSource,
+    recommended_candidates: u32,
     _adapter_name: String,
     job_ready: bool,
 }
@@ -549,10 +569,15 @@ impl WgpuPhotonEngine {
             storage_candidates,
             winner_cap,
             readback_bytes,
-            _table_source: table_source,
+            table_source,
+            recommended_candidates: initial_wgpu_batch_size(max_candidates),
             _adapter_name: adapter_info.name,
             job_ready: false,
         })
+    }
+
+    pub fn table_source(&self) -> M29TableSource {
+        self.table_source
     }
 
     pub fn persistent_device_bytes(&self) -> usize {
@@ -568,6 +593,10 @@ impl WgpuPhotonEngine {
             + RESULT_BYTES
             + self.winner_cap as usize * WINNER_RECORD_BYTES
             + self.readback_bytes
+    }
+
+    pub fn recommended_batch_candidates(&self) -> u32 {
+        self.recommended_candidates
     }
 
     pub fn set_job(
@@ -615,6 +644,8 @@ impl WgpuPhotonEngine {
                 self.max_candidates
             ));
         }
+        let adapt_batch = candidate_count == self.recommended_candidates;
+        let batch_started = Instant::now();
 
         let active_candidates = candidate_count.div_ceil(128) * 128;
         let groups_a = active_candidates / 128;
@@ -746,6 +777,13 @@ impl WgpuPhotonEngine {
         }
         drop(view);
         self.readback_gpu.unmap();
+        if adapt_batch {
+            self.recommended_candidates = next_wgpu_batch_size(
+                candidate_count,
+                batch_started.elapsed(),
+                self.max_candidates,
+            );
+        }
 
         Ok(PhotonCudaBatchResult {
             candidates: candidate_count,
@@ -817,6 +855,28 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_batching_matches_authoritative_m67_cadence() {
+        assert_eq!(initial_wgpu_batch_size(65_536), 1_024);
+        assert_eq!(initial_wgpu_batch_size(128), 128);
+        assert_eq!(
+            next_wgpu_batch_size(1_024, Duration::from_millis(175), 65_536),
+            2_048
+        );
+        assert_eq!(
+            next_wgpu_batch_size(2_048, Duration::from_millis(350), 65_536),
+            2_048
+        );
+        assert_eq!(
+            next_wgpu_batch_size(2_048, Duration::from_millis(351), 65_536),
+            1_024
+        );
+        assert_eq!(
+            next_wgpu_batch_size(1_024, Duration::from_secs(2), 65_536),
+            1_024
+        );
+    }
+
+    #[test]
     fn bounded_c3_reuses_authoritative_strict_target_comparator() {
         assert!(BOUNDED_C3_WGSL.contains("m10_hash_is_below_target(finalHash)"));
         assert!(BOUNDED_C3_WGSL.contains("atomicAdd(&benchmarkOutput.winners, 1u)"));
@@ -862,7 +922,7 @@ mod tests {
             elapsed.as_secs_f64(),
             candidate_count as f64 / elapsed.as_secs_f64(),
             engine.persistent_device_bytes(),
-            engine._table_source,
+            engine.table_source,
         );
         assert_eq!(batch.candidates, candidate_count);
         assert_eq!(batch.total_winners, candidate_count);
