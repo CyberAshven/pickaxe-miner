@@ -138,12 +138,48 @@ pub fn photon_multi_input_max_baton_decrease_sats() -> Result<u64, String> {
     )
 }
 
-/// Curated Fulcrum/Electrum **WSS** bootstrap (small, redundant).
-/// Custom `fulcrum` URL is tried first. Prefer CA-signed `:50004`.
+/// Published BCH mainnet **WSS** endpoints. Selene explicitly publishes these
+/// as WebSocket endpoints; the final three are existing Pickaxe curated WSS
+/// endpoints retained for compatibility. Do not infer WSS from a TLS port.
 pub const FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
+    "wss://cashnode.bch.ninja:50004",
+    "wss://bch.imaginary.cash:50004",
+    "wss://bitcoincash.network:50004",
+    "wss://blackie.c3-soft.com:50004",
+    "wss://bch.loping.net:50004",
+    "wss://bch.soul-dev.com:50004",
+    "wss://bitcoincash.stackwallet.com:50004",
+    "wss://node.minisatoshi.cash:50004",
+    "wss://fulcrum.criptolayer.net:50004",
     "wss://electrum.imaginary.cash:50004",
     "wss://electroncash.dk:50004",
     "wss://fulcrum.greyh.at:50004",
+];
+
+/// Electron Cash publishes these clearnet mainnet servers as Electrum TLS,
+/// usually on 50002 (one server uses 51002). They stay in Pickaxe's source
+/// catalog for provenance/policy, but the current WSS client must not probe
+/// them unless that same host has an independently published WSS endpoint.
+pub const ELECTRON_CASH_TLS_BOOTSTRAP: &[(&str, u16)] = &[
+    ("bch.crypto.mldlabs.com", 50002),
+    ("bch.cyberbits.eu", 50002),
+    ("bch.imaginary.cash", 50002),
+    ("bch.loping.net", 50002),
+    ("bch.soul-dev.com", 50002),
+    ("bch0.kister.net", 50002),
+    ("bch2.electroncash.dk", 50002),
+    ("bitcoincash.network", 50002),
+    ("blackie.c3-soft.com", 50002),
+    ("cashnode.bch.ninja", 50002),
+    ("electron.jochen-hoenicke.de", 51002),
+    ("electroncash.dk", 50002),
+    ("electrs.bitcoinunlimited.info", 50002),
+    ("electrum.bitcoinverde.org", 50002),
+    ("electrum.imaginary.cash", 50002),
+    ("fulcrum.aglauck.com", 50002),
+    ("fulcrum.criptolayer.net", 50002),
+    ("fulcrum.jettscythe.xyz", 50002),
+    ("node.minisatoshi.cash", 50002),
 ];
 
 /// Curated native **node** JSON-RPC bootstrap (BCHN/bitcoind-style HTTP).

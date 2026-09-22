@@ -348,8 +348,7 @@ fn run_intensity_window(
     let mut winners = 0u64;
 
     while started.elapsed() < requested {
-        let batch_candidates = engine.scheduled_batch_candidates();
-        let batch_started = Instant::now();
+        let batch_candidates = engine.scheduled_batch_candidates(intensity);
         let result = match engine.search_batch(*nonce_base, batch_candidates) {
             Ok(result) => result,
             Err(error) => {
@@ -362,17 +361,10 @@ fn run_intensity_window(
                 return Err(error);
             }
         };
-        let compute_time = batch_started.elapsed();
         candidates = candidates.saturating_add(u64::from(result.candidates));
         winners = winners.saturating_add(u64::from(result.total_winners));
         batches = batches.saturating_add(1);
         *nonce_base = (*nonce_base).wrapping_add(result.candidates);
-
-        let remaining = requested.saturating_sub(started.elapsed());
-        let rest = search::duty_rest(compute_time, intensity).min(remaining);
-        if !rest.is_zero() {
-            thread::sleep(rest);
-        }
     }
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
@@ -434,7 +426,7 @@ pub fn run_gpu_benchmark(
 
     // Prime kernels and page residency before measuring any intensity window.
     let mut nonce_base = 0u32;
-    let warmup = engine.search_batch(nonce_base, engine.scheduled_batch_candidates())?;
+    let warmup = engine.search_batch(nonce_base, engine.scheduled_batch_candidates(100))?;
     nonce_base = nonce_base.wrapping_add(warmup.candidates);
 
     let mut samples = Vec::with_capacity(intensities.len());

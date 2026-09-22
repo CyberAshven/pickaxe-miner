@@ -177,38 +177,8 @@ impl ElectrumSession {
             let msg = self.ws.read().map_err(websocket_read_error)?;
             match msg {
                 Message::Text(t) => {
-                    self.buf.push_str(&t);
-                    while let Some(pos) = self.buf.find('\n') {
-                        let line = self.buf[..pos].trim().to_string();
-                        self.buf = self.buf[pos + 1..].to_string();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let v: Value = serde_json::from_str(&line).map_err(|e| {
-                            format!("transport: json: {e}: {}", &line[..line.len().min(160)])
-                        })?;
-                        if id_matches(&v, id) {
-                            if let Some(err) = v.get("error") {
-                                if !err.is_null() {
-                                    return Err(format!("rpc error: {err}"));
-                                }
-                            }
-                            return Ok(v.get("result").cloned().unwrap_or(Value::Null));
-                        }
-                    }
-                    let trimmed = self.buf.trim().to_string();
-                    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-                        if let Ok(v) = serde_json::from_str::<Value>(&trimmed) {
-                            if id_matches(&v, id) {
-                                self.buf.clear();
-                                if let Some(err) = v.get("error") {
-                                    if !err.is_null() {
-                                        return Err(format!("rpc error: {err}"));
-                                    }
-                                }
-                                return Ok(v.get("result").cloned().unwrap_or(Value::Null));
-                            }
-                        }
+                    if let Some(result) = consume_rpc_text(&mut self.buf, &t, id)? {
+                        return Ok(result);
                     }
                 }
                 Message::Ping(p) => {
@@ -284,6 +254,49 @@ impl ElectrumSession {
         }
         Ok(LiveStateSnapshot { tip_hash, job })
     }
+}
+
+fn rpc_value_for_id(value: &Value, id: u64) -> Option<Result<Value, String>> {
+    if !id_matches(value, id) {
+        return None;
+    }
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        return Some(Err(format!("rpc error: {error}")));
+    }
+    Some(Ok(value.get("result").cloned().unwrap_or(Value::Null)))
+}
+
+fn consume_rpc_text(buf: &mut String, text: &str, id: u64) -> Result<Option<Value>, String> {
+    buf.push_str(text);
+    while let Some(pos) = buf.find('\n') {
+        let line = buf[..pos].trim().to_string();
+        buf.drain(..=pos);
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line).map_err(|error| {
+            format!("transport: json: {error}: {}", &line[..line.len().min(160)])
+        })?;
+        if let Some(result) = rpc_value_for_id(&value, id) {
+            return result.map(Some);
+        }
+    }
+
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        // A WebSocket message may contain a complete Electrum notification
+        // without a trailing newline. Consume it so the next RPC response is
+        // never concatenated onto stale notification bytes.
+        let matched = rpc_value_for_id(&value, id);
+        buf.clear();
+        if let Some(result) = matched {
+            return result.map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn fulcrum_header_height(header: &Value) -> Result<u32, String> {
@@ -491,5 +504,34 @@ mod tests {
             "peer reset",
         )));
         assert!(reset.starts_with("transport:"), "{reset}");
+    }
+
+    #[test]
+    fn rpc_consumes_notification_without_newline_before_response() {
+        let mut buf = String::new();
+        let notification =
+            r#"{"jsonrpc":"2.0","method":"blockchain.headers.subscribe","params":[{"height":1}]}"#;
+        assert_eq!(consume_rpc_text(&mut buf, notification, 7).unwrap(), None);
+        assert!(buf.is_empty());
+
+        let response = r#"{"jsonrpc":"2.0","id":7,"result":{"height":1}}"#;
+        assert_eq!(
+            consume_rpc_text(&mut buf, response, 7).unwrap(),
+            Some(json!({"height": 1}))
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn rpc_ignores_interleaved_notification_and_returns_matching_response() {
+        let mut buf = String::new();
+        let payload = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"blockchain.headers.subscribe\",\"params\":[{\"height\":2}]}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":[\"ok\"]}\n"
+        );
+        assert_eq!(
+            consume_rpc_text(&mut buf, payload, 9).unwrap(),
+            Some(json!(["ok"]))
+        );
     }
 }

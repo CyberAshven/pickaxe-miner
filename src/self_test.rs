@@ -5,6 +5,7 @@ use crate::backend::BackendKind;
 use crate::config::{RuntimeConfig, DONATION_BPS};
 use crate::cuda_photon::CudaPhotonEngine;
 use crate::hip_photon::HipPhotonEngine;
+#[cfg(feature = "portable-wgpu")]
 use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, reward, search, tx};
 use secp256k1::{PublicKey, SecretKey};
@@ -208,11 +209,20 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
             ("hip", bytes, batch)
         }
         BackendKind::Wgpu => {
-            let mut engine = WgpuPhotonEngine::new(device as usize, 1, 1)?;
-            let bytes = engine.persistent_device_bytes();
-            engine.set_job(&template, &target, &reward_secret)?;
-            let batch = engine.search_batch(CONTROLLED_NONCE, 1)?;
-            ("wgpu", bytes, batch)
+            #[cfg(feature = "portable-wgpu")]
+            {
+                let mut engine = WgpuPhotonEngine::new(device as usize, 1, 1)?;
+                let bytes = engine.persistent_device_bytes();
+                engine.set_job(&template, &target, &reward_secret)?;
+                let batch = engine.search_batch(CONTROLLED_NONCE, 1)?;
+                ("wgpu", bytes, batch)
+            }
+            #[cfg(not(feature = "portable-wgpu"))]
+            {
+                return Err(
+                    "wgpu fallback is not compiled; rebuild with --features portable-wgpu".into(),
+                );
+            }
         }
         BackendKind::Auto => return Err("self-test requires a resolved native backend".into()),
     };

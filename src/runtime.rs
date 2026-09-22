@@ -50,7 +50,14 @@ enum RefreshFailureKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshFailureAction {
     RetainGeneration,
-    Reconnect,
+    ReconnectCurrent,
+    RotateSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectPreference {
+    PreferActive,
+    RotateAway,
 }
 
 #[derive(Debug, Default)]
@@ -74,14 +81,14 @@ impl RefreshFailureTracker {
                     .saturating_add(1)
                     .min(REFRESH_RECONNECT_THRESHOLD);
                 if self.consecutive >= REFRESH_RECONNECT_THRESHOLD {
-                    RefreshFailureAction::Reconnect
+                    RefreshFailureAction::ReconnectCurrent
                 } else {
                     RefreshFailureAction::RetainGeneration
                 }
             }
             RefreshFailureKind::Transport => {
                 self.transport_total = self.transport_total.saturating_add(1);
-                RefreshFailureAction::Reconnect
+                RefreshFailureAction::RotateSource
             }
         }
     }
@@ -226,7 +233,8 @@ fn eligible_fulcrum_endpoints(
     sources: &SourceCatalog,
     now_ms: u64,
     rotation_key: u64,
-    avoid_endpoint: Option<&str>,
+    active_endpoint: Option<&str>,
+    preference: ReconnectPreference,
 ) -> Vec<String> {
     let mut endpoints = sources
         .probe_candidates(SourceKind::Fulcrum, now_ms, AUTO_PROBE_LIMIT, rotation_key)
@@ -234,8 +242,14 @@ fn eligible_fulcrum_endpoints(
         .map(|entry| entry.endpoint.clone())
         .collect::<Vec<_>>();
     if endpoints.len() > 1 {
-        if let Some(avoid) = avoid_endpoint {
-            endpoints.sort_by_key(|endpoint| endpoint.eq_ignore_ascii_case(avoid));
+        if let Some(active) = active_endpoint {
+            endpoints.sort_by_key(|endpoint| {
+                let is_active = endpoint.eq_ignore_ascii_case(active);
+                match preference {
+                    ReconnectPreference::PreferActive => !is_active,
+                    ReconnectPreference::RotateAway => is_active,
+                }
+            });
         }
     }
     endpoints
@@ -1712,7 +1726,13 @@ impl RuntimeSupervisor {
 
         let sources = SourceCatalog::configured(&cfg)?;
         let rotation_key = u64::from(std::process::id()).wrapping_add(cfg.generation_id);
-        let endpoints = eligible_fulcrum_endpoints(&sources, 0, rotation_key, None);
+        let endpoints = eligible_fulcrum_endpoints(
+            &sources,
+            0,
+            rotation_key,
+            None,
+            ReconnectPreference::RotateAway,
+        );
         let mut session = ElectrumSession::connect_failover(&endpoints)?;
         let journal_path = submission_journal_path();
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
@@ -1936,6 +1956,7 @@ fn run_supervisor(
     let mut last_error = None;
     let mut reconnect_backoff = RECONNECT_MIN;
     let mut next_reconnect = Instant::now();
+    let mut reconnect_preference = ReconnectPreference::PreferActive;
     let mut next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
     let mut submission_backoff = RECONNECT_MIN;
     let mut next_submission_retry = Instant::now();
@@ -2061,6 +2082,7 @@ fn run_supervisor(
                                 endpoints = next_endpoints;
                                 job_changes = job_changes.saturating_add(1);
                                 session = None;
+                                reconnect_preference = ReconnectPreference::PreferActive;
                                 state = SupervisorState::Reconnecting;
                                 last_error = None;
                                 reconnect_backoff = RECONNECT_MIN;
@@ -2082,6 +2104,7 @@ fn run_supervisor(
                         Err("reconnect unavailable while runtime work is pending".into())
                     } else {
                         session = None;
+                        reconnect_preference = ReconnectPreference::PreferActive;
                         state = SupervisorState::Reconnecting;
                         last_error = None;
                         reconnect_backoff = RECONNECT_MIN;
@@ -2153,6 +2176,7 @@ fn run_supervisor(
                     now_ms,
                     rotation_key,
                     Some(&active_fulcrum_endpoint),
+                    reconnect_preference,
                 );
                 let reconnect_result = if endpoints.is_empty() {
                     Err(
@@ -2217,6 +2241,7 @@ fn run_supervisor(
                                     )),
                                 );
                                 session = None;
+                                reconnect_preference = ReconnectPreference::PreferActive;
                                 next_reconnect = Instant::now() + reconnect_backoff;
                                 reconnect_backoff = reconnect_backoff
                                     .checked_mul(2)
@@ -2334,6 +2359,7 @@ fn run_supervisor(
                                         state = SupervisorState::Reconnecting;
                                         emit(&event_tx, RuntimeEvent::Reconnecting(error));
                                         session = None;
+                                        reconnect_preference = ReconnectPreference::PreferActive;
                                         next_reconnect = Instant::now() + reconnect_backoff;
                                         reconnect_backoff = reconnect_backoff
                                             .checked_mul(2)
@@ -2399,6 +2425,7 @@ fn run_supervisor(
                                             )),
                                         );
                                         session = None;
+                                        reconnect_preference = ReconnectPreference::PreferActive;
                                         next_reconnect = Instant::now() + reconnect_backoff;
                                         reconnect_backoff = reconnect_backoff
                                             .checked_mul(2)
@@ -2424,6 +2451,7 @@ fn run_supervisor(
                         );
                         let _ = search.apply_control(SearchCommand::Pause);
                         session = None;
+                        reconnect_preference = ReconnectPreference::PreferActive;
                         next_reconnect = Instant::now() + submission_backoff;
                         submission_backoff = submission_backoff
                             .checked_mul(2)
@@ -2516,6 +2544,8 @@ fn run_supervisor(
                                                     )),
                                                 );
                                                 session = None;
+                                                reconnect_preference =
+                                                    ReconnectPreference::PreferActive;
                                                 next_reconnect =
                                                     Instant::now() + submission_backoff;
                                                 submission_backoff = submission_backoff
@@ -2567,6 +2597,7 @@ fn run_supervisor(
                                 )),
                             );
                             session = None;
+                            reconnect_preference = ReconnectPreference::PreferActive;
                             next_reconnect = Instant::now() + reconnect_backoff;
                             reconnect_backoff = reconnect_backoff
                                 .checked_mul(2)
@@ -2588,7 +2619,24 @@ fn run_supervisor(
                                 },
                             );
                         }
-                        RefreshFailureAction::Reconnect => {
+                        RefreshFailureAction::ReconnectCurrent => {
+                            state = SupervisorState::Reconnecting;
+                            reconnect_preference = ReconnectPreference::PreferActive;
+                            emit(
+                                &event_tx,
+                                RuntimeEvent::Reconnecting(format!(
+                                    "Fulcrum PHOTON refresh timed out {} consecutive times; reconnecting same source while current generation keeps mining: {error}",
+                                    refresh_failures.consecutive
+                                )),
+                            );
+                            session = None;
+                            next_reconnect = Instant::now() + reconnect_backoff;
+                            reconnect_backoff = reconnect_backoff
+                                .checked_mul(2)
+                                .unwrap_or(RECONNECT_MAX)
+                                .min(RECONNECT_MAX);
+                        }
+                        RefreshFailureAction::RotateSource => {
                             let now_ms = source_capability_now_ms(source_capability_epoch);
                             let _ = sources.record_failure(
                                 SourceKind::Fulcrum,
@@ -2596,16 +2644,13 @@ fn run_supervisor(
                                 now_ms,
                             );
                             state = SupervisorState::Reconnecting;
-                            let reason = match failure_kind {
-                                RefreshFailureKind::Transport => {
-                                    format!("Fulcrum transport lost; reconnecting: {error}")
-                                }
-                                RefreshFailureKind::Transient => format!(
-                                    "Fulcrum PHOTON refresh failed {} consecutive times; reconnecting: {error}",
-                                    refresh_failures.consecutive
-                                ),
-                            };
-                            emit(&event_tx, RuntimeEvent::Reconnecting(reason));
+                            reconnect_preference = ReconnectPreference::RotateAway;
+                            emit(
+                                &event_tx,
+                                RuntimeEvent::Reconnecting(format!(
+                                    "Fulcrum transport lost; rotating source while current generation keeps mining: {error}"
+                                )),
+                            );
                             session = None;
                             next_reconnect = Instant::now() + reconnect_backoff;
                             reconnect_backoff = reconnect_backoff
@@ -4101,7 +4146,7 @@ mod tests {
         assert_eq!(failures.consecutive, 2);
         assert_eq!(
             failures.failure(RefreshFailureKind::Transient),
-            RefreshFailureAction::Reconnect
+            RefreshFailureAction::ReconnectCurrent
         );
         assert_eq!(failures.consecutive, REFRESH_RECONNECT_THRESHOLD);
         assert_eq!(failures.transient_total, 3);
@@ -4127,7 +4172,7 @@ mod tests {
         );
         assert_eq!(
             failures.failure(RefreshFailureKind::Transport),
-            RefreshFailureAction::Reconnect
+            RefreshFailureAction::RotateSource
         );
         assert_eq!(failures.transport_total, 1);
         assert_eq!(failures.consecutive, 0);
@@ -4153,17 +4198,33 @@ mod tests {
             .record_failure(SourceKind::Fulcrum, "wss://a.invalid", 0)
             .unwrap();
         assert_eq!(
-            eligible_fulcrum_endpoints(&sources, 0, 0, Some("wss://a.invalid")),
+            eligible_fulcrum_endpoints(
+                &sources,
+                0,
+                0,
+                Some("wss://a.invalid"),
+                ReconnectPreference::RotateAway,
+            ),
             vec!["wss://b.invalid".to_string()]
         );
 
         sources
             .set_banned(SourceKind::Fulcrum, "wss://b.invalid", true)
             .unwrap();
-        assert!(eligible_fulcrum_endpoints(&sources, 0, 0, None).is_empty());
-        assert!(eligible_fulcrum_endpoints(&sources, 399, 0, None).is_empty());
+        assert!(
+            eligible_fulcrum_endpoints(&sources, 0, 0, None, ReconnectPreference::RotateAway,)
+                .is_empty()
+        );
+        assert!(eligible_fulcrum_endpoints(
+            &sources,
+            399,
+            0,
+            None,
+            ReconnectPreference::RotateAway,
+        )
+        .is_empty());
         assert_eq!(
-            eligible_fulcrum_endpoints(&sources, 400, 0, None),
+            eligible_fulcrum_endpoints(&sources, 400, 0, None, ReconnectPreference::RotateAway,),
             vec!["wss://a.invalid".to_string()]
         );
     }
@@ -4176,10 +4237,36 @@ mod tests {
                 .add_user(SourceKind::Fulcrum, endpoint, endpoint)
                 .unwrap();
         }
-        let endpoints = eligible_fulcrum_endpoints(&sources, 0, 0, Some("wss://a.invalid"));
+        let endpoints = eligible_fulcrum_endpoints(
+            &sources,
+            0,
+            0,
+            Some("wss://a.invalid"),
+            ReconnectPreference::RotateAway,
+        );
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0], "wss://b.invalid");
         assert_eq!(endpoints[1], "wss://a.invalid");
+    }
+
+    #[test]
+    fn timeout_reconnect_prefers_current_healthy_source() {
+        let mut sources = SourceCatalog::default();
+        for endpoint in ["wss://a.invalid", "wss://b.invalid"] {
+            sources
+                .add_user(SourceKind::Fulcrum, endpoint, endpoint)
+                .unwrap();
+        }
+        let endpoints = eligible_fulcrum_endpoints(
+            &sources,
+            0,
+            0,
+            Some("wss://a.invalid"),
+            ReconnectPreference::PreferActive,
+        );
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0], "wss://a.invalid");
+        assert_eq!(endpoints[1], "wss://b.invalid");
     }
 
     #[test]
