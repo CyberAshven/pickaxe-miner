@@ -2753,11 +2753,13 @@ where
 
 const THROUGHPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const THROUGHPUT_CURRENT_WINDOW: Duration = Duration::from_secs(2);
-const THROUGHPUT_MIN_HISTORY: Duration = Duration::from_millis(750);
+const THROUGHPUT_MIN_HISTORY: Duration = Duration::from_secs(1);
 const THROUGHPUT_HISTORY_CAP: usize = 16;
 
 struct ThroughputTracker {
     last_sample: Instant,
+    last_progress_at: Instant,
+    last_progress_candidates: u64,
     samples: std::collections::VecDeque<(Instant, u64)>,
     current_rate: f64,
     peak_rate: f64,
@@ -2770,6 +2772,8 @@ impl ThroughputTracker {
         samples.push_back((now, candidates));
         Self {
             last_sample: now,
+            last_progress_at: now,
+            last_progress_candidates: candidates,
             samples,
             current_rate: 0.0,
             peak_rate: 0.0,
@@ -2783,6 +2787,8 @@ impl ThroughputTracker {
             self.samples.clear();
             self.samples.push_back((now, stats.candidates));
             self.last_sample = now;
+            self.last_progress_at = now;
+            self.last_progress_candidates = stats.candidates;
             self.current_rate = 0.0;
             self.was_mining = false;
             stats.current_rate = 0.0;
@@ -2794,9 +2800,17 @@ impl ThroughputTracker {
             self.samples.clear();
             self.samples.push_back((now, stats.candidates));
             self.last_sample = now;
+            self.last_progress_at = now;
+            self.last_progress_candidates = stats.candidates;
             self.current_rate = 0.0;
             self.was_mining = true;
         } else if now.saturating_duration_since(self.last_sample) >= THROUGHPUT_SAMPLE_INTERVAL {
+            let made_progress = stats.candidates > self.last_progress_candidates;
+            if made_progress {
+                self.last_progress_at = now;
+                self.last_progress_candidates = stats.candidates;
+            }
+
             if self.samples.len() == THROUGHPUT_HISTORY_CAP {
                 self.samples.pop_front();
             }
@@ -2814,10 +2828,14 @@ impl ThroughputTracker {
 
             if let Some((sample_time, sample_candidates)) = self.samples.front() {
                 let elapsed = now.saturating_duration_since(*sample_time);
-                if elapsed >= THROUGHPUT_MIN_HISTORY {
+                if made_progress && elapsed >= THROUGHPUT_MIN_HISTORY {
                     let completed = stats.candidates.saturating_sub(*sample_candidates);
                     self.current_rate = completed as f64 / elapsed.as_secs_f64();
                     self.peak_rate = self.peak_rate.max(self.current_rate);
+                } else if now.saturating_duration_since(self.last_progress_at)
+                    >= THROUGHPUT_CURRENT_WINDOW
+                {
+                    self.current_rate = 0.0;
                 }
             }
             self.last_sample = now;
@@ -2946,6 +2964,76 @@ mod tests {
         tracker.observe(&mut resumed, start + Duration::from_secs(4));
         assert!((resumed.current_rate - 1_000.0).abs() < 0.01);
         assert!((resumed.peak_rate - 1_500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn shared_throughput_rejects_short_batch_spikes_and_holds_between_batches() {
+        let start = Instant::now();
+        let mut tracker = ThroughputTracker::new(start, 0, true);
+
+        let mut stats = throughput_stats(20_000, MiningState::Mining, 0.0);
+        tracker.observe(&mut stats, start + Duration::from_millis(250));
+        assert_eq!(stats.current_rate, 0.0);
+        assert_eq!(stats.peak_rate, 0.0);
+
+        tracker.observe(&mut stats, start + Duration::from_millis(750));
+        assert_eq!(stats.current_rate, 0.0);
+        assert_eq!(stats.peak_rate, 0.0);
+
+        stats.candidates = 40_000;
+        tracker.observe(&mut stats, start + Duration::from_secs(1));
+        assert!((stats.current_rate - 40_000.0).abs() < 0.01);
+        assert!((stats.peak_rate - 40_000.0).abs() < 0.01);
+
+        tracker.observe(&mut stats, start + Duration::from_millis(1_250));
+        assert!((stats.current_rate - 40_000.0).abs() < 0.01);
+        assert!((stats.peak_rate - 40_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn shared_throughput_history_is_bounded_and_real_sustained_rate_updates_peak() {
+        let start = Instant::now();
+        let mut tracker = ThroughputTracker::new(start, 0, true);
+        let mut stats = throughput_stats(0, MiningState::Mining, 0.0);
+
+        for tick in 1..=40_u64 {
+            stats.candidates = tick * 250;
+            tracker.observe(
+                &mut stats,
+                start + Duration::from_millis(tick.saturating_mul(250)),
+            );
+            assert!(tracker.samples.len() <= THROUGHPUT_HISTORY_CAP);
+        }
+        let baseline_peak = stats.peak_rate;
+        assert!(baseline_peak >= 1_000.0);
+
+        for tick in 41..=52_u64 {
+            stats.candidates = 10_000 + (tick - 40) * 500;
+            tracker.observe(
+                &mut stats,
+                start + Duration::from_millis(tick.saturating_mul(250)),
+            );
+            assert!(tracker.samples.len() <= THROUGHPUT_HISTORY_CAP);
+        }
+        assert!(stats.peak_rate > baseline_peak);
+        assert!(stats.current_rate > 1_000.0);
+    }
+
+    #[test]
+    fn shared_throughput_reports_zero_after_a_real_no_progress_stall() {
+        let start = Instant::now();
+        let mut tracker = ThroughputTracker::new(start, 0, true);
+        let mut stats = throughput_stats(1_000, MiningState::Mining, 0.0);
+
+        tracker.observe(&mut stats, start + Duration::from_secs(1));
+        assert!((stats.current_rate - 1_000.0).abs() < 0.01);
+
+        tracker.observe(&mut stats, start + Duration::from_secs(2));
+        assert!((stats.current_rate - 1_000.0).abs() < 0.01);
+
+        tracker.observe(&mut stats, start + Duration::from_secs(3));
+        assert_eq!(stats.current_rate, 0.0);
+        assert!((stats.peak_rate - 1_000.0).abs() < 0.01);
     }
 
     fn live_job() -> LiveJob {
