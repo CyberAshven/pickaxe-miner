@@ -712,8 +712,10 @@ fn handle_line(
     true
 }
 
-fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
-    let mut cfg = RuntimeConfig::default();
+fn runtime_config_from_cli_with_base(
+    args: &cli::Cli,
+    mut cfg: RuntimeConfig,
+) -> Result<RuntimeConfig, String> {
     if let Some(intensity) = args.intensity {
         cfg.set_intensity(intensity)?;
     }
@@ -730,6 +732,11 @@ fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
         cfg.set_source(source)?;
     }
     Ok(cfg)
+}
+
+#[cfg(test)]
+fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
+    runtime_config_from_cli_with_base(args, RuntimeConfig::default())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -962,14 +969,49 @@ fn run_headless_mining(
 
 fn main() {
     let args = cli::parse();
-    let backend_kind = match backend::BackendKind::parse(&args.backend) {
+    let config_path = match config::config_path(args.config.as_deref()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+    let saved_config = match config::SavedConfig::load_optional(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+    let mut effective_backend = "auto".to_string();
+    let mut effective_device = None;
+    if let Some(config) = &saved_config {
+        if let Some(value) = &config.backend {
+            effective_backend = value.clone();
+        }
+        effective_device = config.device;
+    }
+    if let Some(value) = &args.backend {
+        effective_backend = value.clone();
+    }
+    if let Some(value) = args.device {
+        effective_device = Some(value);
+    }
+    let backend_kind = match backend::BackendKind::parse(&effective_backend) {
         Ok(kind) => kind,
         Err(error) => {
             eprintln!("error: {error}");
             std::process::exit(2);
         }
     };
-    let cfg = match runtime_config_from_cli(&args) {
+    let mut base_cfg = RuntimeConfig::default();
+    if let Some(config) = &saved_config {
+        if let Err(error) = config.apply_to_runtime(&mut base_cfg) {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    }
+    let cfg = match runtime_config_from_cli_with_base(&args, base_cfg) {
         Ok(cfg) => cfg,
         Err(error) => {
             eprintln!("error: {error}");
@@ -985,7 +1027,7 @@ fn main() {
             }
         }
         cli::Commands::SelfTest => {
-            let selected = match backend::resolve_mining_device(backend_kind, args.device) {
+            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
@@ -1004,7 +1046,7 @@ fn main() {
             seconds,
             ui_compare,
         } => {
-            let selected = match backend::resolve_mining_device(backend_kind, args.device) {
+            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
@@ -1037,8 +1079,8 @@ fn main() {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "backend": args.backend,
-                            "device": args.device,
+                            "backend": effective_backend,
+                            "device": effective_device,
                             "intensity": cfg.intensity,
                             "address": cfg.payout_address,
                             "fulcrum": cfg.fulcrum_url,
@@ -1049,8 +1091,8 @@ fn main() {
                         })
                     );
                 } else {
-                    println!("backend: {}", args.backend);
-                    println!("device: {:?}", args.device);
+                    println!("backend: {}", effective_backend);
+                    println!("device: {:?}", effective_device);
                     println!("intensity: {}%", cfg.intensity);
                     println!("address: {}", cfg.payout_address);
                     println!("source: {}", cfg.source.as_str());
@@ -1064,6 +1106,25 @@ fn main() {
                     println!("configuration syntax and CashAddr validation: OK");
                 }
             }
+            cli::ConfigCommand::Save => {
+                let saved =
+                    config::SavedConfig::from_effective(&effective_backend, effective_device, &cfg);
+                if let Err(error) = saved.save(&config_path) {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "saved": true,
+                            "path": config_path,
+                        })
+                    );
+                } else {
+                    println!("saved configuration: {}", config_path.display());
+                }
+            }
         },
         cli::Commands::Mine => {
             let startup = mine_startup(&args, &cfg);
@@ -1074,7 +1135,7 @@ fn main() {
                 eprintln!("error: --address is required with --no-tui or --json");
                 std::process::exit(2);
             }
-            let selected = match backend::resolve_mining_device(backend_kind, args.device) {
+            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
@@ -1258,6 +1319,24 @@ mod tests {
         let cfg = runtime_config_from_cli(&args).unwrap();
         assert_eq!(mine_startup(&args, &cfg), MineStartup::Direct);
         assert_eq!(args.device, Some(0));
+        assert_eq!(cfg.intensity, 60);
+        assert_eq!(cfg.payout_address, crate::config::DONATION_ADDRESS);
+    }
+
+    #[test]
+    fn explicit_cli_values_override_saved_runtime_defaults() {
+        let args = cli::Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--intensity",
+            "60",
+            "--address",
+            crate::config::DONATION_ADDRESS,
+        ])
+        .unwrap();
+        let mut saved = RuntimeConfig::default();
+        saved.set_intensity(40).unwrap();
+        let cfg = runtime_config_from_cli_with_base(&args, saved).unwrap();
         assert_eq!(cfg.intensity, 60);
         assert_eq!(cfg.payout_address, crate::config::DONATION_ADDRESS);
     }

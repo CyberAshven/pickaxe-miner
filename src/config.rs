@@ -2,6 +2,10 @@
 //! protocol-valid reward child path; the PHOTON mining transaction remains the
 //! authoritative two-output covenant transaction.
 
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
 /// Donation share in basis points (200 = 2%). Never call this a "dev fee".
 pub const DONATION_BPS: u16 = 200;
 
@@ -201,6 +205,126 @@ impl RuntimeConfig {
         let donation = reward_raw.saturating_mul(DONATION_BPS as u128) / 10_000;
         let miner = reward_raw.saturating_sub(donation);
         (miner, donation)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SavedConfig {
+    pub backend: Option<String>,
+    pub device: Option<u32>,
+    pub intensity: Option<u8>,
+    pub address: Option<String>,
+    pub fulcrum: Option<String>,
+    pub node_rpc: Option<String>,
+    pub source: Option<String>,
+}
+
+impl SavedConfig {
+    pub fn apply_to_runtime(&self, cfg: &mut RuntimeConfig) -> Result<(), String> {
+        if let Some(value) = self.intensity {
+            cfg.set_intensity(value)?;
+        }
+        if let Some(value) = &self.address {
+            cfg.set_payout(value.clone())?;
+        }
+        if let Some(value) = &self.fulcrum {
+            cfg.set_fulcrum_url(value)?;
+        }
+        if let Some(value) = &self.node_rpc {
+            cfg.set_node_url(value)?;
+        }
+        if let Some(value) = &self.source {
+            cfg.set_source(value)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(value) = &self.backend {
+            crate::backend::BackendKind::parse(value)?;
+        }
+        let mut runtime = RuntimeConfig::default();
+        self.apply_to_runtime(&mut runtime)
+    }
+
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let bytes =
+            fs::read(path).map_err(|error| format!("read config {}: {error}", path.display()))?;
+        let config: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse config {}: {error}", path.display()))?;
+        config
+            .validate()
+            .map_err(|error| format!("validate config {}: {error}", path.display()))?;
+        Ok(config)
+    }
+
+    pub fn load_optional(path: &Path) -> Result<Option<Self>, String> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        Self::load(path).map(Some)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("create config directory {}: {error}", parent.display())
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize config: {error}"))?;
+        fs::write(path, bytes).map_err(|error| format!("write config {}: {error}", path.display()))
+    }
+
+    pub fn from_effective(backend: &str, device: Option<u32>, runtime: &RuntimeConfig) -> Self {
+        let address = if runtime.payout_address.is_empty() {
+            None
+        } else {
+            Some(runtime.payout_address.clone())
+        };
+        Self {
+            backend: Some(backend.to_string()),
+            device,
+            intensity: Some(runtime.intensity),
+            address,
+            fulcrum: runtime.fulcrum_url.clone(),
+            node_rpc: runtime.node_url.clone(),
+            source: Some(runtime.source.as_str().to_string()),
+        }
+    }
+}
+
+pub fn config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PICKAXE_CONFIG").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("APPDATA")
+            .ok_or_else(|| "APPDATA is unavailable; pass --config <path>".to_string())?;
+        Ok(PathBuf::from(base).join("Pickaxe").join("config.json"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(base).join("pickaxe").join("config.json"));
+        }
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| "HOME is unavailable; pass --config <path>".to_string())?;
+        Ok(PathBuf::from(home)
+            .join(".config")
+            .join("pickaxe")
+            .join("config.json"))
     }
 }
 

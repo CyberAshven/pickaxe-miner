@@ -1,12 +1,13 @@
 //! Single Clap startup parser for Pickaxe.
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "pickaxe", about = "Pickaxe Miner - GPU-only PHOTON miner")]
 pub struct Cli {
-    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "cuda", "hip"])]
-    pub backend: String,
+    #[arg(long, global = true, value_parser = ["auto", "cuda", "hip"])]
+    pub backend: Option<String>,
 
     #[arg(long, global = true)]
     pub device: Option<u32>,
@@ -37,6 +38,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -64,6 +68,7 @@ pub enum Commands {
 pub enum ConfigCommand {
     Show,
     Validate,
+    Save,
 }
 
 pub fn parse() -> Cli {
@@ -89,7 +94,7 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Some(Commands::Mine)));
-        assert_eq!(cli.backend, "cuda");
+        assert_eq!(cli.backend.as_deref(), Some("cuda"));
         assert_eq!(cli.device, Some(0));
         assert_eq!(cli.intensity, Some(75));
         assert!(cli.no_tui);
@@ -101,6 +106,16 @@ mod tests {
                 command: ConfigCommand::Show
             })
         ));
+
+        let save =
+            Cli::try_parse_from(["pickaxe", "config", "save", "--config", "pickaxe.json"]).unwrap();
+        assert!(matches!(
+            save.command,
+            Some(Commands::Config {
+                command: ConfigCommand::Save
+            })
+        ));
+        assert_eq!(save.config, Some(PathBuf::from("pickaxe.json")));
     }
 
     #[test]
@@ -118,7 +133,7 @@ mod tests {
     fn clap_parses_offline_self_test() {
         let cli = Cli::try_parse_from(["pickaxe", "self-test", "--backend", "cuda"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::SelfTest)));
-        assert_eq!(cli.backend, "cuda");
+        assert_eq!(cli.backend.as_deref(), Some("cuda"));
     }
 
     #[test]
@@ -139,7 +154,7 @@ mod tests {
                 ui_compare: false
             })
         ));
-        assert_eq!(cli.backend, "cuda");
+        assert_eq!(cli.backend.as_deref(), Some("cuda"));
         assert_eq!(cli.intensity, None);
 
         let selected = Cli::try_parse_from([
