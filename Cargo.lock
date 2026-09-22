@@ -762,6 +762,7 @@ dependencies = [
  "hex",
  "hmac",
  "libloading",
+ "native-tls",
  "num-bigint",
  "num-traits",
  "rand 0.9.5",
