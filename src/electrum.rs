@@ -11,9 +11,28 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tungstenite::{connect, Error as WebSocketError, Message, WebSocket};
 
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
+
+fn websocket_read_error(error: WebSocketError) -> String {
+    match &error {
+        WebSocketError::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            format!("timeout: read: {error}")
+        }
+        WebSocketError::ConnectionClosed
+        | WebSocketError::AlreadyClosed
+        | WebSocketError::Io(_)
+        | WebSocketError::Tls(_)
+        | WebSocketError::Protocol(_) => format!("transport: read: {error}"),
+        _ => format!("read: {error}"),
+    }
+}
 
 /// Rich live job for CLI / win-tx; converts to search::MiningJob.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,14 +167,14 @@ impl ElectrumSession {
         let line = format!("{req}\n");
         self.ws
             .send(Message::Text(line))
-            .map_err(|e| format!("send: {e}"))?;
+            .map_err(|e| format!("transport: send: {e}"))?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             if std::time::Instant::now() > deadline {
-                return Err(format!("rpc timeout waiting for id={id} ({method})"));
+                return Err(format!("timeout: rpc waiting for id={id} ({method})"));
             }
-            let msg = self.ws.read().map_err(|e| format!("read: {e}"))?;
+            let msg = self.ws.read().map_err(websocket_read_error)?;
             match msg {
                 Message::Text(t) => {
                     self.buf.push_str(&t);
@@ -165,8 +184,9 @@ impl ElectrumSession {
                         if line.is_empty() {
                             continue;
                         }
-                        let v: Value = serde_json::from_str(&line)
-                            .map_err(|e| format!("json: {e}: {}", &line[..line.len().min(160)]))?;
+                        let v: Value = serde_json::from_str(&line).map_err(|e| {
+                            format!("transport: json: {e}: {}", &line[..line.len().min(160)])
+                        })?;
                         if id_matches(&v, id) {
                             if let Some(err) = v.get("error") {
                                 if !err.is_null() {
@@ -192,9 +212,11 @@ impl ElectrumSession {
                     }
                 }
                 Message::Ping(p) => {
-                    let _ = self.ws.send(Message::Pong(p));
+                    self.ws
+                        .send(Message::Pong(p))
+                        .map_err(|e| format!("transport: pong send: {e}"))?;
                 }
-                Message::Close(_) => return Err("socket closed".into()),
+                Message::Close(_) => return Err("transport: socket closed".into()),
                 _ => {}
             }
         }
@@ -454,5 +476,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("omitted hex"), "{error}");
+    }
+
+    #[test]
+    fn websocket_read_timeout_is_distinct_from_transport_loss() {
+        let timeout = websocket_read_error(WebSocketError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "slow server",
+        )));
+        assert!(timeout.starts_with("timeout:"), "{timeout}");
+
+        let reset = websocket_read_error(WebSocketError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "peer reset",
+        )));
+        assert!(reset.starts_with("transport:"), "{reset}");
     }
 }

@@ -769,11 +769,26 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
                 "baton_vout": baton_vout,
                 "changed": true,
             }),
+            runtime::RuntimeEvent::StateRefreshFailed { error, consecutive } => {
+                serde_json::json!({
+                    "event": "state_refresh_failed",
+                    "error": error,
+                    "consecutive": consecutive,
+                    "reconnecting": false,
+                })
+            }
             runtime::RuntimeEvent::Reconnecting(error) => {
                 serde_json::json!({"event": "reconnecting", "error": error})
             }
             runtime::RuntimeEvent::Reconnected(endpoint) => {
                 serde_json::json!({"event": "reconnected", "endpoint": endpoint})
+            }
+            runtime::RuntimeEvent::EndpointRotated { from, to } => {
+                serde_json::json!({
+                    "event": "endpoint_rotated",
+                    "from": redact_url(&from),
+                    "to": redact_url(&to),
+                })
             }
             runtime::RuntimeEvent::StaleWinner {
                 winner_generation,
@@ -819,11 +834,23 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
                 "live PHOTON work updated: generation={generation_id} height={height} baton={baton_txid}:{baton_vout}"
             );
         }
+        runtime::RuntimeEvent::StateRefreshFailed { error, consecutive } => {
+            eprintln!(
+                "PHOTON state check failed; retaining current generation (consecutive={consecutive}): {error}"
+            );
+        }
         runtime::RuntimeEvent::Reconnecting(error) => {
-            eprintln!("PHOTON state refresh failed; live supervisor is retrying without recreating GPU state: {error}");
+            eprintln!("Fulcrum reconnect: {error}");
         }
         runtime::RuntimeEvent::Reconnected(endpoint) => {
             eprintln!("PHOTON state source reconnected: {}", redact_url(&endpoint));
+        }
+        runtime::RuntimeEvent::EndpointRotated { from, to } => {
+            eprintln!(
+                "PHOTON state source changed: {} -> {}",
+                redact_url(&from),
+                redact_url(&to)
+            );
         }
         runtime::RuntimeEvent::StaleWinner {
             winner_generation,
@@ -871,8 +898,13 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "average_rate": snapshot.search.rate,
         "peak_rate": snapshot.search.peak_rate,
         "state_checks": snapshot.state_checks,
+        "transient_refresh_failures": snapshot.transient_refresh_failures,
+        "transport_failures": snapshot.transport_failures,
+        "consecutive_refresh_failures": snapshot.consecutive_refresh_failures,
+        "source_degraded": snapshot.source_degraded,
         "job_changes": snapshot.job_changes,
         "reconnects": snapshot.reconnects,
+        "endpoint_rotations": snapshot.endpoint_rotations,
         "stale_winners": snapshot.stale_winners,
         "verified_winners": snapshot.verified_winners,
         "pending_winners": snapshot.pending_winners,
@@ -895,7 +927,7 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
         let telemetry = &snapshot.gpu_telemetry;
         let efficiency = telemetry.candidates_per_watt(snapshot.search.current_rate);
         println!(
-            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} current={:.0}/s avg={:.0}/s peak={:.0}/s state_checks={} job_changes={} reconnects={} winners={} pending={} gpu_util={} power={} temp={} vram={} efficiency={}",
+            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} current={:.0}/s avg={:.0}/s peak={:.0}/s state_checks={} refresh_failures={} transport_failures={} consecutive_refresh_failures={} source_degraded={} job_changes={} reconnects={} rotations={} winners={} pending={} gpu_util={} power={} temp={} vram={} efficiency={}",
             snapshot.state,
             snapshot.gpu_backend,
             snapshot.gpu_device,
@@ -910,8 +942,13 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             snapshot.search.rate,
             snapshot.search.peak_rate,
             snapshot.state_checks,
+            snapshot.transient_refresh_failures,
+            snapshot.transport_failures,
+            snapshot.consecutive_refresh_failures,
+            snapshot.source_degraded,
             snapshot.job_changes,
             snapshot.reconnects,
+            snapshot.endpoint_rotations,
             snapshot.verified_winners,
             snapshot.pending_winners,
             runtime_metric(telemetry.gpu_utilization_percent, "%"),
@@ -1269,8 +1306,13 @@ mod tests {
             baton_txid: "11".repeat(32),
             baton_vout: 0,
             state_checks: 7,
+            transient_refresh_failures: 2,
+            transport_failures: 1,
+            consecutive_refresh_failures: 1,
+            source_degraded: true,
             job_changes: 1,
             reconnects: 0,
+            endpoint_rotations: 1,
             stale_winners: 0,
             verified_winners: 0,
             pending_winners: 0,
@@ -1299,7 +1341,13 @@ mod tests {
 
         let status = runtime_snapshot_json(&snapshot);
         assert_eq!(status["state_checks"], 7);
+        assert_eq!(status["transient_refresh_failures"], 2);
+        assert_eq!(status["transport_failures"], 1);
+        assert_eq!(status["consecutive_refresh_failures"], 1);
+        assert_eq!(status["source_degraded"], true);
         assert_eq!(status["job_changes"], 1);
+        assert_eq!(status["reconnects"], 0);
+        assert_eq!(status["endpoint_rotations"], 1);
         assert!(status.get("refreshes").is_none());
         assert!(status.get("stale_rebuilds").is_none());
         assert_eq!(status["gpu_telemetry"]["samples"], 3);
