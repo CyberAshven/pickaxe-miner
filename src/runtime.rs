@@ -39,6 +39,77 @@ const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const PHOTON_STATE_RECHECK: Duration = Duration::from_millis(500);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
+const REFRESH_RECONNECT_THRESHOLD: u8 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshFailureKind {
+    Transient,
+    Transport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshFailureAction {
+    RetainGeneration,
+    Reconnect,
+}
+
+#[derive(Debug, Default)]
+struct RefreshFailureTracker {
+    transient_total: u64,
+    transport_total: u64,
+    consecutive: u8,
+}
+
+impl RefreshFailureTracker {
+    fn success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    fn failure(&mut self, kind: RefreshFailureKind) -> RefreshFailureAction {
+        match kind {
+            RefreshFailureKind::Transient => {
+                self.transient_total = self.transient_total.saturating_add(1);
+                self.consecutive = self
+                    .consecutive
+                    .saturating_add(1)
+                    .min(REFRESH_RECONNECT_THRESHOLD);
+                if self.consecutive >= REFRESH_RECONNECT_THRESHOLD {
+                    RefreshFailureAction::Reconnect
+                } else {
+                    RefreshFailureAction::RetainGeneration
+                }
+            }
+            RefreshFailureKind::Transport => {
+                self.transport_total = self.transport_total.saturating_add(1);
+                RefreshFailureAction::Reconnect
+            }
+        }
+    }
+
+    fn degraded(&self) -> bool {
+        self.consecutive != 0
+    }
+}
+
+fn classify_refresh_failure(error: &str) -> RefreshFailureKind {
+    let error = error.to_ascii_lowercase();
+    let transport_failure = error.contains("transport:")
+        || error.contains("send:")
+        || error.contains("json:")
+        || error.contains("socket closed")
+        || error.contains("connection closed")
+        || error.contains("connection reset")
+        || error.contains("forcibly closed")
+        || error.contains("broken pipe")
+        || error.contains("unexpected eof")
+        || error.contains("tls error")
+        || error.contains("protocol error");
+    if transport_failure {
+        RefreshFailureKind::Transport
+    } else {
+        RefreshFailureKind::Transient
+    }
+}
 
 fn next_periodic_deadline(previous_deadline: Instant, now: Instant, interval: Duration) -> Instant {
     debug_assert!(!interval.is_zero());
@@ -149,6 +220,25 @@ impl NativePhotonEquivalenceProof {
 
 fn source_capability_now_ms(epoch: Instant) -> u64 {
     u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn eligible_fulcrum_endpoints(
+    sources: &SourceCatalog,
+    now_ms: u64,
+    rotation_key: u64,
+    avoid_endpoint: Option<&str>,
+) -> Vec<String> {
+    let mut endpoints = sources
+        .probe_candidates(SourceKind::Fulcrum, now_ms, AUTO_PROBE_LIMIT, rotation_key)
+        .into_iter()
+        .map(|entry| entry.endpoint.clone())
+        .collect::<Vec<_>>();
+    if endpoints.len() > 1 {
+        if let Some(avoid) = avoid_endpoint {
+            endpoints.sort_by_key(|endpoint| endpoint.eq_ignore_ascii_case(avoid));
+        }
+    }
+    endpoints
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1506,8 +1596,13 @@ pub struct RuntimeSnapshot {
     pub baton_txid: String,
     pub baton_vout: u32,
     pub state_checks: u64,
+    pub transient_refresh_failures: u64,
+    pub transport_failures: u64,
+    pub consecutive_refresh_failures: u8,
+    pub source_degraded: bool,
     pub job_changes: u64,
     pub reconnects: u64,
+    pub endpoint_rotations: u64,
     pub stale_winners: u64,
     pub verified_winners: u64,
     pub pending_winners: u64,
@@ -1524,8 +1619,16 @@ pub enum RuntimeEvent {
         baton_txid: String,
         baton_vout: u32,
     },
+    StateRefreshFailed {
+        error: String,
+        consecutive: u8,
+    },
     Reconnecting(String),
     Reconnected(String),
+    EndpointRotated {
+        from: String,
+        to: String,
+    },
     StaleWinner {
         winner_generation: u64,
         current_generation: u64,
@@ -1609,11 +1712,7 @@ impl RuntimeSupervisor {
 
         let sources = SourceCatalog::configured(&cfg)?;
         let rotation_key = u64::from(std::process::id()).wrapping_add(cfg.generation_id);
-        let endpoints = sources
-            .probe_candidates(SourceKind::Fulcrum, 0, AUTO_PROBE_LIMIT, rotation_key)
-            .into_iter()
-            .map(|entry| entry.endpoint.clone())
-            .collect::<Vec<_>>();
+        let endpoints = eligible_fulcrum_endpoints(&sources, 0, rotation_key, None);
         let mut session = ElectrumSession::connect_failover(&endpoints)?;
         let journal_path = submission_journal_path();
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
@@ -1653,8 +1752,13 @@ impl RuntimeSupervisor {
             baton_txid: initial.baton_txid.clone(),
             baton_vout: initial.baton_vout,
             state_checks: 0,
+            transient_refresh_failures: 0,
+            transport_failures: 0,
+            consecutive_refresh_failures: 0,
+            source_degraded: false,
             job_changes: 0,
             reconnects: 0,
+            endpoint_rotations: 0,
             stale_winners: 0,
             verified_winners: 0,
             pending_winners: 0,
@@ -1811,6 +1915,7 @@ fn run_supervisor(
     shared_snapshot: Arc<Mutex<RuntimeSnapshot>>,
     shutdown: ShutdownSignal,
 ) {
+    let mut active_fulcrum_endpoint = initial_session.url.clone();
     let mut session = Some(initial_session);
     let mut state = if pending_submission.is_some() {
         SupervisorState::Paused
@@ -1820,8 +1925,11 @@ fn run_supervisor(
     let mut user_paused = false;
     let mut pending_winner: Option<VerifiedWinner> = None;
     let mut state_checks = 0u64;
+    let mut refresh_failures = RefreshFailureTracker::default();
     let mut job_changes = 0u64;
     let mut reconnects = 0u64;
+    let mut endpoint_rotations = 0u64;
+    let mut reconnect_attempts = 0u64;
     let mut stale_winners = 0u64;
     let mut verified_winners = 0u64;
     let mut pending_winners = u64::from(pending_submission.is_some());
@@ -1942,12 +2050,14 @@ fn run_supervisor(
                                     Ok(next_settlement)
                                 });
                             next_settlement.and_then(|next_settlement| {
+                                let next_sources = SourceCatalog::configured(&next_cfg)?;
                                 search.apply_control(SearchCommand::Pause)?;
                                 search.replace_job(live.to_mining_job(
                                     next_cfg.generation_id,
                                     &mining_payout_address,
                                 ))?;
                                 cfg = next_cfg;
+                                sources = next_sources;
                                 settlement = next_settlement;
                                 endpoints = next_endpoints;
                                 job_changes = job_changes.saturating_add(1);
@@ -2040,11 +2150,42 @@ fn run_supervisor(
         }
         if session.is_none() {
             if Instant::now() >= next_reconnect {
-                match ElectrumSession::connect_failover(&endpoints)
-                    .and_then(|mut next| next.fetch_live_job().map(|job| (next, job)))
-                {
+                let now_ms = source_capability_now_ms(source_capability_epoch);
+                let rotation_key = u64::from(std::process::id())
+                    .wrapping_add(cfg.generation_id)
+                    .wrapping_add(reconnect_attempts);
+                reconnect_attempts = reconnect_attempts.saturating_add(1);
+                endpoints = eligible_fulcrum_endpoints(
+                    &sources,
+                    now_ms,
+                    rotation_key,
+                    Some(&active_fulcrum_endpoint),
+                );
+                let reconnect_result = if endpoints.is_empty() {
+                    Err(
+                        "no eligible Fulcrum source is currently available under source policy"
+                            .to_string(),
+                    )
+                } else {
+                    ElectrumSession::connect_failover(&endpoints)
+                        .and_then(|mut next| next.fetch_live_job().map(|job| (next, job)))
+                };
+                match reconnect_result {
                     Ok((next_session, next_job)) => {
+                        let connected_endpoint = next_session.url.clone();
+                        if !connected_endpoint.eq_ignore_ascii_case(&active_fulcrum_endpoint) {
+                            endpoint_rotations = endpoint_rotations.saturating_add(1);
+                            emit(
+                                &event_tx,
+                                RuntimeEvent::EndpointRotated {
+                                    from: active_fulcrum_endpoint.clone(),
+                                    to: connected_endpoint.clone(),
+                                },
+                            );
+                        }
+                        active_fulcrum_endpoint = connected_endpoint;
                         reconnects = reconnects.saturating_add(1);
+                        refresh_failures.success();
                         reconnect_backoff = RECONNECT_MIN;
                         last_error = None;
                         session = Some(next_session);
@@ -2314,6 +2455,7 @@ fn run_supervisor(
             );
             match refreshed {
                 Ok(boundary) => {
+                    refresh_failures.success();
                     if let Some(warning) = boundary.route_warning.as_ref() {
                         if last_error.as_deref() != Some(warning.as_str()) {
                             emit(&event_tx, RuntimeEvent::Error(warning.clone()));
@@ -2443,11 +2585,44 @@ fn run_supervisor(
                 }
                 Err(error) => {
                     last_error = Some(error.clone());
-                    state = SupervisorState::Reconnecting;
-                    let _ = search.apply_control(SearchCommand::Pause);
-                    emit(&event_tx, RuntimeEvent::Reconnecting(error));
-                    session = None;
-                    next_reconnect = Instant::now() + reconnect_backoff;
+                    let failure_kind = classify_refresh_failure(&error);
+                    match refresh_failures.failure(failure_kind) {
+                        RefreshFailureAction::RetainGeneration => {
+                            emit(
+                                &event_tx,
+                                RuntimeEvent::StateRefreshFailed {
+                                    error,
+                                    consecutive: refresh_failures.consecutive,
+                                },
+                            );
+                        }
+                        RefreshFailureAction::Reconnect => {
+                            let now_ms = source_capability_now_ms(source_capability_epoch);
+                            let _ = sources.record_failure(
+                                SourceKind::Fulcrum,
+                                &active_fulcrum_endpoint,
+                                now_ms,
+                            );
+                            state = SupervisorState::Reconnecting;
+                            let _ = search.apply_control(SearchCommand::Pause);
+                            let reason = match failure_kind {
+                                RefreshFailureKind::Transport => {
+                                    format!("Fulcrum transport lost; reconnecting: {error}")
+                                }
+                                RefreshFailureKind::Transient => format!(
+                                    "Fulcrum PHOTON refresh failed {} consecutive times; reconnecting: {error}",
+                                    refresh_failures.consecutive
+                                ),
+                            };
+                            emit(&event_tx, RuntimeEvent::Reconnecting(reason));
+                            session = None;
+                            next_reconnect = Instant::now() + reconnect_backoff;
+                            reconnect_backoff = reconnect_backoff
+                                .checked_mul(2)
+                                .unwrap_or(RECONNECT_MAX)
+                                .min(RECONNECT_MAX);
+                        }
+                    }
                 }
             }
         }
@@ -2459,8 +2634,10 @@ fn run_supervisor(
             &live,
             &search,
             state_checks,
+            &refresh_failures,
             job_changes,
             reconnects,
+            endpoint_rotations,
             stale_winners,
             verified_winners,
             pending_winners,
@@ -3002,8 +3179,10 @@ fn write_snapshot(
     live: &LiveJob,
     search: &SearchHandle,
     state_checks: u64,
+    refresh_failures: &RefreshFailureTracker,
     job_changes: u64,
     reconnects: u64,
+    endpoint_rotations: u64,
     stale_winners: u64,
     verified_winners: u64,
     pending_winners: u64,
@@ -3023,8 +3202,13 @@ fn write_snapshot(
     snapshot.baton_txid.clone_from(&live.baton_txid);
     snapshot.baton_vout = live.baton_vout;
     snapshot.state_checks = state_checks;
+    snapshot.transient_refresh_failures = refresh_failures.transient_total;
+    snapshot.transport_failures = refresh_failures.transport_total;
+    snapshot.consecutive_refresh_failures = refresh_failures.consecutive;
+    snapshot.source_degraded = refresh_failures.degraded();
     snapshot.job_changes = job_changes;
     snapshot.reconnects = reconnects;
+    snapshot.endpoint_rotations = endpoint_rotations;
     snapshot.stale_winners = stale_winners;
     snapshot.verified_winners = verified_winners;
     snapshot.pending_winners = pending_winners;
@@ -3916,6 +4100,103 @@ mod tests {
         let next_future_deadline =
             next_periodic_deadline(second_deadline, slow_request_finished, PHOTON_STATE_RECHECK);
         assert_eq!(next_future_deadline, start + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn transient_refresh_failures_use_hysteresis_and_recover() {
+        let mut failures = RefreshFailureTracker::default();
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transient),
+            RefreshFailureAction::RetainGeneration
+        );
+        assert_eq!(failures.consecutive, 1);
+        assert!(failures.degraded());
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transient),
+            RefreshFailureAction::RetainGeneration
+        );
+        assert_eq!(failures.consecutive, 2);
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transient),
+            RefreshFailureAction::Reconnect
+        );
+        assert_eq!(failures.consecutive, REFRESH_RECONNECT_THRESHOLD);
+        assert_eq!(failures.transient_total, 3);
+
+        failures.success();
+        assert_eq!(failures.consecutive, 0);
+        assert_eq!(failures.transient_total, 3);
+        assert!(!failures.degraded());
+    }
+
+    #[test]
+    fn transport_failure_reconnects_immediately_and_classification_is_conservative() {
+        let mut failures = RefreshFailureTracker::default();
+        assert_eq!(
+            classify_refresh_failure("timeout: rpc waiting for id=4"),
+            RefreshFailureKind::Transient
+        );
+        assert_eq!(
+            classify_refresh_failure(
+                "canonical Fulcrum PHOTON refresh failed: read: connection reset by peer"
+            ),
+            RefreshFailureKind::Transport
+        );
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transport),
+            RefreshFailureAction::Reconnect
+        );
+        assert_eq!(failures.transport_total, 1);
+        assert_eq!(failures.consecutive, 0);
+    }
+
+    #[test]
+    fn reconnect_candidates_respect_retry_and_ban_policy() {
+        let mut sources = SourceCatalog::default();
+        sources
+            .add_user(SourceKind::Fulcrum, "wss://a.invalid", "a")
+            .unwrap();
+        sources
+            .add_user(SourceKind::Fulcrum, "wss://b.invalid", "b")
+            .unwrap();
+        sources
+            .record_success(SourceKind::Fulcrum, "wss://a.invalid", 0, 5)
+            .unwrap();
+        sources
+            .record_success(SourceKind::Fulcrum, "wss://b.invalid", 0, 5)
+            .unwrap();
+
+        sources
+            .record_failure(SourceKind::Fulcrum, "wss://a.invalid", 0)
+            .unwrap();
+        assert_eq!(
+            eligible_fulcrum_endpoints(&sources, 0, 0, Some("wss://a.invalid")),
+            vec!["wss://b.invalid".to_string()]
+        );
+
+        sources
+            .set_banned(SourceKind::Fulcrum, "wss://b.invalid", true)
+            .unwrap();
+        assert!(eligible_fulcrum_endpoints(&sources, 0, 0, None).is_empty());
+        assert!(eligible_fulcrum_endpoints(&sources, 399, 0, None).is_empty());
+        assert_eq!(
+            eligible_fulcrum_endpoints(&sources, 400, 0, None),
+            vec!["wss://a.invalid".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconnect_prefers_an_alternate_eligible_source() {
+        let mut sources = SourceCatalog::default();
+        for endpoint in ["wss://a.invalid", "wss://b.invalid"] {
+            sources
+                .add_user(SourceKind::Fulcrum, endpoint, endpoint)
+                .unwrap();
+        }
+        let endpoints = eligible_fulcrum_endpoints(&sources, 0, 0, Some("wss://a.invalid"));
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0], "wss://b.invalid");
+        assert_eq!(endpoints[1], "wss://a.invalid");
     }
 
     #[test]

@@ -452,8 +452,13 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         baton_txid: "00".repeat(32),
         baton_vout: 0,
         state_checks: 1,
+        transient_refresh_failures: 0,
+        transport_failures: 0,
+        consecutive_refresh_failures: 0,
+        source_degraded: false,
         job_changes: 0,
         reconnects: 0,
+        endpoint_rotations: 0,
         stale_winners: 0,
         verified_winners: 0,
         pending_winners: 0,
@@ -1030,8 +1035,12 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             snapshot.search.candidates, snapshot.search.batches, snapshot.search.elapsed_secs
         )),
         Line::from(format!(
-            "generation: {}   height: {}   state checks: {}",
-            snapshot.generation_id, snapshot.height, snapshot.state_checks
+            "generation: {}   height: {}   state checks: {}   refresh failures: {}   consecutive: {}",
+            snapshot.generation_id,
+            snapshot.height,
+            snapshot.state_checks,
+            snapshot.transient_refresh_failures,
+            snapshot.consecutive_refresh_failures
         )),
         Line::from(format!(
             "baton: {}:{}",
@@ -1044,8 +1053,12 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             snapshot.verified_winners, snapshot.stale_winners, snapshot.pending_winners
         )),
         Line::from(format!(
-            "reconnects: {}   job changes: {}",
-            snapshot.reconnects, snapshot.job_changes
+            "source: {}   transport failures: {}   reconnects: {}   rotations: {}   job changes: {}",
+            if snapshot.source_degraded { "degraded" } else { "healthy" },
+            snapshot.transport_failures,
+            snapshot.reconnects,
+            snapshot.endpoint_rotations,
+            snapshot.job_changes
         )),
         Line::from(format!("payout: {}", shorten(&snapshot.payout_address, 66))),
         Line::from(format!(
@@ -1230,10 +1243,20 @@ fn format_event(event: RuntimeEvent) -> String {
             shorten(&baton_txid, 18),
             baton_vout
         ),
+        RuntimeEvent::StateRefreshFailed { error, consecutive } => {
+            format!(
+                "PHOTON state check failed; retaining generation (consecutive={consecutive}): {error}"
+            )
+        }
         RuntimeEvent::Reconnecting(error) => format!("reconnecting: {error}"),
         RuntimeEvent::Reconnected(endpoint) => {
             format!("reconnected: {}", redact_endpoint(&endpoint))
         }
+        RuntimeEvent::EndpointRotated { from, to } => format!(
+            "source changed: {} -> {}",
+            redact_endpoint(&from),
+            redact_endpoint(&to)
+        ),
         RuntimeEvent::StaleWinner {
             winner_generation,
             current_generation,
@@ -1331,8 +1354,13 @@ mod tests {
             baton_txid: "00".repeat(32),
             baton_vout: 0,
             state_checks: 0,
+            transient_refresh_failures: 0,
+            transport_failures: 0,
+            consecutive_refresh_failures: 0,
+            source_degraded: false,
             job_changes: 0,
             reconnects: 0,
+            endpoint_rotations: 0,
             stale_winners: 0,
             verified_winners: 0,
             pending_winners: 0,
@@ -1582,8 +1610,13 @@ mod tests {
             baton_txid: "00".repeat(32),
             baton_vout: 0,
             state_checks: 0,
+            transient_refresh_failures: 0,
+            transport_failures: 0,
+            consecutive_refresh_failures: 0,
+            source_degraded: false,
             job_changes: 0,
             reconnects: 0,
+            endpoint_rotations: 0,
             stale_winners: 0,
             verified_winners: 0,
             pending_winners: 0,
