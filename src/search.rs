@@ -362,9 +362,10 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
 }
 
 fn throttle_sleep(rest: Duration) {
-    // ponytail: bounded sleep slices keep TUI/rate sampling responsive. Replace
-    // with a hardware paced scheduler only if power-aware throttling becomes a goal.
-    let slice = Duration::from_millis(5);
+    // ponytail: keep the scheduler responsive at reduced intensity. A long
+    // sleep makes the GPU look disconnected to telemetry even though the
+    // requested duty cycle is active.
+    let slice = Duration::from_micros(250);
     let mut remaining = rest;
     while remaining > Duration::ZERO {
         let current = remaining.min(slice);
