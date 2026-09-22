@@ -2739,13 +2739,20 @@ fn record_canonical_fulcrum_probe(
         sources.add_user(SourceKind::Fulcrum, endpoint, "Active Fulcrum")?;
     }
     sources.record_success(SourceKind::Fulcrum, endpoint, now_ms, latency_ms)?;
-    sources.verify_capability(
-        SourceKind::Fulcrum,
-        endpoint,
+    for capability in [
+        SourceCapability::ChainHeight,
+        SourceCapability::TokenState,
         SourceCapability::PhotonState,
-        now_ms,
-        DEFAULT_CAPABILITY_TTL_MS,
-    )
+    ] {
+        sources.verify_capability(
+            SourceKind::Fulcrum,
+            endpoint,
+            capability,
+            now_ms,
+            DEFAULT_CAPABILITY_TTL_MS,
+        )?;
+    }
+    Ok(())
 }
 
 fn record_native_photon_probe(
