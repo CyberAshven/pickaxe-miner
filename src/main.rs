@@ -42,6 +42,7 @@ mod telemetry;
 #[allow(dead_code)]
 mod tui;
 mod tx;
+#[cfg(feature = "portable-wgpu")]
 mod wgpu_photon;
 
 use config::RuntimeConfig;

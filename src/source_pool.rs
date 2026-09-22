@@ -16,6 +16,22 @@ pub(crate) enum SourceProvenance {
     User,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceTransport {
+    Wss,
+    ElectrumTls,
+    NodeHttp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceOrigin {
+    Pickaxe,
+    ElectronCash,
+    Selene,
+    ElectronCashAndSelene,
+    User,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceCapability {
     PhotonState,
@@ -54,6 +70,8 @@ pub(crate) struct SourceEntry {
     pub(crate) endpoint: String,
     pub(crate) label: String,
     pub(crate) provenance: SourceProvenance,
+    pub(crate) transport: SourceTransport,
+    pub(crate) origin: SourceOrigin,
     pub(crate) capabilities: Vec<CapabilityEvidence>,
     pub(crate) health: SourceHealth,
     pub(crate) enabled: bool,
@@ -66,12 +84,21 @@ pub(crate) struct SourceEntry {
 }
 
 impl SourceEntry {
-    fn new(kind: SourceKind, endpoint: &str, label: String, provenance: SourceProvenance) -> Self {
+    fn new(
+        kind: SourceKind,
+        endpoint: &str,
+        label: String,
+        provenance: SourceProvenance,
+        transport: SourceTransport,
+        origin: SourceOrigin,
+    ) -> Self {
         Self {
             kind,
             endpoint: endpoint.trim().to_string(),
             label,
             provenance,
+            transport,
+            origin,
             capabilities: Vec::new(),
             health: SourceHealth::Unknown,
             enabled: true,
@@ -85,11 +112,50 @@ impl SourceEntry {
     }
 
     pub(crate) fn built_in(kind: SourceKind, endpoint: &str, label: String) -> Self {
-        Self::new(kind, endpoint, label, SourceProvenance::BuiltIn)
+        let transport = match kind {
+            SourceKind::Fulcrum => SourceTransport::Wss,
+            SourceKind::NativeNode => SourceTransport::NodeHttp,
+        };
+        Self::new(
+            kind,
+            endpoint,
+            label,
+            SourceProvenance::BuiltIn,
+            transport,
+            SourceOrigin::Pickaxe,
+        )
+    }
+
+    fn published(
+        kind: SourceKind,
+        endpoint: &str,
+        label: String,
+        transport: SourceTransport,
+        origin: SourceOrigin,
+    ) -> Self {
+        Self::new(
+            kind,
+            endpoint,
+            label,
+            SourceProvenance::BuiltIn,
+            transport,
+            origin,
+        )
     }
 
     pub(crate) fn user(kind: SourceKind, endpoint: &str, label: String) -> Self {
-        Self::new(kind, endpoint, label, SourceProvenance::User)
+        let transport = match kind {
+            SourceKind::Fulcrum => SourceTransport::Wss,
+            SourceKind::NativeNode => SourceTransport::NodeHttp,
+        };
+        Self::new(
+            kind,
+            endpoint,
+            label,
+            SourceProvenance::User,
+            transport,
+            SourceOrigin::User,
+        )
     }
 
     pub(crate) fn supports_at(&self, capability: SourceCapability, now_ms: u64) -> bool {
@@ -151,6 +217,14 @@ impl SourceEntry {
                 .retry_after_ms
                 .is_none_or(|retry_after| retry_after <= now_ms)
     }
+
+    fn supported_by_current_client(&self) -> bool {
+        matches!(
+            (self.kind, self.transport),
+            (SourceKind::Fulcrum, SourceTransport::Wss)
+                | (SourceKind::NativeNode, SourceTransport::NodeHttp)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,11 +235,45 @@ pub(crate) struct SourceCatalog {
 impl SourceCatalog {
     pub(crate) fn mainnet() -> Self {
         let mut catalog = Self::default();
-        for (index, endpoint) in crate::protocol::FULCRUM_WSS_BOOTSTRAP.iter().enumerate() {
-            catalog.entries.push(SourceEntry::built_in(
+        for endpoint in crate::protocol::FULCRUM_WSS_BOOTSTRAP {
+            let host = endpoint_host(endpoint).unwrap_or(endpoint);
+            let in_electron_cash = crate::protocol::ELECTRON_CASH_TLS_BOOTSTRAP
+                .iter()
+                .any(|(candidate, _)| candidate.eq_ignore_ascii_case(host));
+            let in_selene = !matches!(
+                *endpoint,
+                "wss://electrum.imaginary.cash:50004"
+                    | "wss://electroncash.dk:50004"
+                    | "wss://fulcrum.greyh.at:50004"
+            );
+            let origin = match (in_electron_cash, in_selene) {
+                (true, true) => SourceOrigin::ElectronCashAndSelene,
+                (true, false) => SourceOrigin::ElectronCash,
+                (false, true) => SourceOrigin::Selene,
+                (false, false) => SourceOrigin::Pickaxe,
+            };
+            catalog.entries.push(SourceEntry::published(
                 SourceKind::Fulcrum,
                 endpoint,
-                format!("Fulcrum bootstrap {}", index + 1),
+                format!("{host} WSS"),
+                SourceTransport::Wss,
+                origin,
+            ));
+        }
+        for (host, port) in crate::protocol::ELECTRON_CASH_TLS_BOOTSTRAP {
+            if catalog.entries.iter().any(|entry| {
+                entry.kind == SourceKind::Fulcrum
+                    && endpoint_host(&entry.endpoint)
+                        .is_some_and(|known| known.eq_ignore_ascii_case(host))
+            }) {
+                continue;
+            }
+            catalog.entries.push(SourceEntry::published(
+                SourceKind::Fulcrum,
+                &format!("tls://{host}:{port}"),
+                format!("{host} Electron Cash TLS"),
+                SourceTransport::ElectrumTls,
+                SourceOrigin::ElectronCash,
             ));
         }
         for (index, endpoint) in crate::protocol::NODE_RPC_BOOTSTRAP.iter().enumerate() {
@@ -396,6 +504,7 @@ impl SourceCatalog {
             .filter(|entry| {
                 entry.kind == kind
                     && entry.provenance == SourceProvenance::User
+                    && entry.supported_by_current_client()
                     && entry.available_at(now_ms)
             })
             .collect::<Vec<_>>();
@@ -405,6 +514,7 @@ impl SourceCatalog {
             .filter(|entry| {
                 entry.kind == kind
                     && entry.provenance == SourceProvenance::BuiltIn
+                    && entry.supported_by_current_client()
                     && entry.available_at(now_ms)
             })
             .collect::<Vec<_>>();
@@ -478,6 +588,7 @@ impl SourceRouter<'_> {
             .iter()
             .filter(|entry| {
                 entry.health == SourceHealth::Healthy
+                    && entry.supported_by_current_client()
                     && entry.supports_at(capability, now_ms)
                     && entry.available_at(now_ms)
             })
@@ -485,6 +596,17 @@ impl SourceRouter<'_> {
         candidates.sort_by_key(|entry| source_rank(entry));
         candidates
     }
+}
+
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let authority = after_scheme.split('/').next()?;
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    (!host.is_empty()).then_some(host)
 }
 
 fn source_rank(entry: &SourceEntry) -> (u8, u8, u8, u32) {
@@ -712,6 +834,49 @@ mod tests {
         let probes = catalog.probe_candidates(SourceKind::Fulcrum, 0, AUTO_PROBE_LIMIT, 0);
         assert!(probes.len() <= AUTO_PROBE_LIMIT);
         assert!(probes.len() < all_fulcrum);
+    }
+
+    #[test]
+    fn published_mainnet_catalog_deduplicates_hosts_and_keeps_tls_only_sources() {
+        let catalog = SourceCatalog::mainnet();
+        let mut hosts = catalog
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SourceKind::Fulcrum)
+            .map(|entry| endpoint_host(&entry.endpoint).unwrap().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let before = hosts.len();
+        hosts.sort();
+        hosts.dedup();
+        assert_eq!(hosts.len(), before);
+
+        let tls_only = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.endpoint == "tls://bch.crypto.mldlabs.com:50002")
+            .expect("Electron Cash TLS-only server remains cataloged");
+        assert_eq!(tls_only.transport, SourceTransport::ElectrumTls);
+        assert_eq!(tls_only.origin, SourceOrigin::ElectronCash);
+
+        let wss = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.endpoint == "wss://cashnode.bch.ninja:50004")
+            .expect("Selene WSS server is cataloged");
+        assert_eq!(wss.transport, SourceTransport::Wss);
+        assert_eq!(wss.origin, SourceOrigin::ElectronCashAndSelene);
+    }
+
+    #[test]
+    fn tls_only_published_sources_are_never_wss_probe_candidates() {
+        let catalog = SourceCatalog::mainnet();
+        let candidates = catalog.probe_candidates(SourceKind::Fulcrum, 0, MAX_SOURCES, 0);
+        assert!(candidates
+            .iter()
+            .all(|entry| entry.transport == SourceTransport::Wss));
+        assert!(candidates
+            .iter()
+            .all(|entry| !entry.endpoint.starts_with("tls://")));
     }
 
     #[test]

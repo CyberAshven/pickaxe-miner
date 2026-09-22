@@ -89,31 +89,38 @@ pub fn resolve_mining_device(
         BackendKind::Hip => find_device(list_hip_devices()?, wanted, BackendKind::Hip),
         BackendKind::Wgpu => find_device(list_wgpu_devices()?, wanted, BackendKind::Wgpu),
         BackendKind::Auto => {
-            if let Ok(cuda) = list_cuda_devices() {
-                if let Some(device) = cuda.into_iter().find(|device| device.index == wanted) {
-                    return Ok(device);
-                }
-            }
-            if let Ok(hip) = list_hip_devices() {
-                if let Some(device) = hip.into_iter().find(|device| device.index == wanted) {
-                    return Ok(device);
-                }
-            }
-            if let Ok(wgpu) = list_wgpu_devices() {
-                if let Some(device) = wgpu.into_iter().find(|device| device.index == wanted) {
-                    return Ok(device);
-                }
-            }
-            Err(format!(
-                "no GPU device at backend-local ordinal {wanted}; run `pickaxe devices`"
-            ))
+            let cuda = list_cuda_devices().unwrap_or_default();
+            let hip = list_hip_devices().unwrap_or_default();
+            let wgpu = list_wgpu_devices().unwrap_or_default();
+            select_auto_device(cuda, hip, wgpu, wanted).ok_or_else(|| {
+                format!("no GPU device at backend-local ordinal {wanted}; run `pickaxe devices`")
+            })
         }
     }
 }
 
+fn select_auto_device(
+    cuda: Vec<GpuDevice>,
+    hip: Vec<GpuDevice>,
+    wgpu: Vec<GpuDevice>,
+    wanted: u32,
+) -> Option<GpuDevice> {
+    cuda.into_iter()
+        .chain(hip)
+        .chain(wgpu)
+        .find(|device| device.index == wanted)
+}
+
 pub fn require_production_mining_backend(backend: BackendKind) -> Result<(), String> {
     match backend {
-        BackendKind::Cuda | BackendKind::Hip | BackendKind::Wgpu => Ok(()),
+        BackendKind::Cuda | BackendKind::Hip => Ok(()),
+        BackendKind::Wgpu => {
+            if cfg!(feature = "portable-wgpu") {
+                Ok(())
+            } else {
+                Err("wgpu fallback is not compiled; rebuild with --features portable-wgpu".into())
+            }
+        }
         BackendKind::Auto => {
             Err("auto backend must be resolved before production mining starts".into())
         }
@@ -137,6 +144,7 @@ fn find_device(
         })
 }
 
+#[cfg(feature = "portable-wgpu")]
 fn is_hardware_wgpu_device_type(device_type: wgpu::DeviceType) -> bool {
     matches!(
         device_type,
@@ -146,6 +154,7 @@ fn is_hardware_wgpu_device_type(device_type: wgpu::DeviceType) -> bool {
     )
 }
 
+#[cfg(feature = "portable-wgpu")]
 fn wgpu_vendor_name(vendor: u32) -> String {
     match vendor {
         0x10de => "NVIDIA".into(),
@@ -157,10 +166,12 @@ fn wgpu_vendor_name(vendor: u32) -> String {
     }
 }
 
+#[cfg(feature = "portable-wgpu")]
 pub(crate) fn production_wgpu_backends() -> wgpu::Backends {
     wgpu::Backends::VULKAN
 }
 
+#[cfg(feature = "portable-wgpu")]
 fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
     let backends = production_wgpu_backends();
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -200,6 +211,11 @@ fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
     } else {
         Ok(out)
     }
+}
+
+#[cfg(not(feature = "portable-wgpu"))]
+fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
+    Err("wgpu fallback is not compiled; rebuild with --features portable-wgpu".into())
 }
 
 fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
@@ -463,6 +479,7 @@ mod tests {
         assert_eq!(BackendKind::parse("wgpu").unwrap(), BackendKind::Wgpu);
     }
 
+    #[cfg(feature = "portable-wgpu")]
     #[test]
     fn wgpu_discovery_excludes_cpu_and_other_adapters() {
         assert!(is_hardware_wgpu_device_type(wgpu::DeviceType::DiscreteGpu));
@@ -474,6 +491,7 @@ mod tests {
         assert!(!is_hardware_wgpu_device_type(wgpu::DeviceType::Other));
     }
 
+    #[cfg(feature = "portable-wgpu")]
     #[test]
     fn production_wgpu_surface_is_vulkan_only() {
         assert_eq!(production_wgpu_backends(), wgpu::Backends::VULKAN);
@@ -481,9 +499,12 @@ mod tests {
 
     #[test]
     fn production_backend_gate_accepts_validated_gpu_engines() {
-        assert!(require_production_mining_backend(BackendKind::Wgpu).is_ok());
         assert!(require_production_mining_backend(BackendKind::Cuda).is_ok());
         assert!(require_production_mining_backend(BackendKind::Hip).is_ok());
+        assert_eq!(
+            require_production_mining_backend(BackendKind::Wgpu).is_ok(),
+            cfg!(feature = "portable-wgpu")
+        );
         assert!(require_production_mining_backend(BackendKind::Auto).is_err());
     }
 
@@ -500,5 +521,40 @@ mod tests {
         let selected = find_device(devices, 2, BackendKind::Hip).unwrap();
         assert_eq!(selected.backend, BackendKind::Hip);
         assert_eq!(selected.index, 2);
+    }
+
+    fn fixture_device(index: u32, vendor: &str, backend: BackendKind) -> GpuDevice {
+        GpuDevice {
+            index,
+            name: format!("{vendor} fixture"),
+            vendor: vendor.into(),
+            vram_bytes: None,
+            backend,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn auto_selection_prefers_cuda_over_wgpu_for_nvidia() {
+        let selected = select_auto_device(
+            vec![fixture_device(0, "NVIDIA", BackendKind::Cuda)],
+            Vec::new(),
+            vec![fixture_device(0, "NVIDIA", BackendKind::Wgpu)],
+            0,
+        )
+        .unwrap();
+        assert_eq!(selected.backend, BackendKind::Cuda);
+    }
+
+    #[test]
+    fn auto_selection_prefers_hip_over_wgpu_for_amd() {
+        let selected = select_auto_device(
+            Vec::new(),
+            vec![fixture_device(0, "AMD", BackendKind::Hip)],
+            vec![fixture_device(0, "AMD", BackendKind::Wgpu)],
+            0,
+        )
+        .unwrap();
+        assert_eq!(selected.backend, BackendKind::Hip);
     }
 }

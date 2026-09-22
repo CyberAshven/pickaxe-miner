@@ -5,6 +5,7 @@
 use crate::backend::BackendKind;
 use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::hip_photon::HipPhotonEngine;
+#[cfg(feature = "portable-wgpu")]
 use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, tx};
 use rand::Rng;
@@ -30,6 +31,7 @@ const PAUSE_POLL: Duration = Duration::from_millis(25);
 pub(crate) enum PhotonEngine {
     Cuda(Box<CudaPhotonEngine>),
     Hip(Box<HipPhotonEngine>),
+    #[cfg(feature = "portable-wgpu")]
     Wgpu(Box<WgpuPhotonEngine>),
 }
 
@@ -51,11 +53,24 @@ impl PhotonEngine {
                 max_batch_candidates,
                 winner_buffer_cap,
             )?))),
-            BackendKind::Wgpu => Ok(Self::Wgpu(Box::new(WgpuPhotonEngine::new(
-                device_ordinal,
-                max_batch_candidates,
-                winner_buffer_cap,
-            )?))),
+            BackendKind::Wgpu => {
+                #[cfg(feature = "portable-wgpu")]
+                {
+                    Ok(Self::Wgpu(Box::new(WgpuPhotonEngine::new(
+                        device_ordinal,
+                        max_batch_candidates,
+                        winner_buffer_cap,
+                    )?)))
+                }
+                #[cfg(not(feature = "portable-wgpu"))]
+                {
+                    let _ = (device_ordinal, max_batch_candidates, winner_buffer_cap);
+                    Err(
+                        "wgpu fallback is not compiled; rebuild with --features portable-wgpu"
+                            .into(),
+                    )
+                }
+            }
             BackendKind::Auto => {
                 Err("auto backend must be resolved before GPU engine initialization".into())
             }
@@ -71,6 +86,7 @@ impl PhotonEngine {
         match self {
             Self::Cuda(engine) => engine.set_job(template, target, private_key),
             Self::Hip(engine) => engine.set_job(template, target, private_key),
+            #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.set_job(template, target, private_key),
         }
     }
@@ -83,6 +99,7 @@ impl PhotonEngine {
         match self {
             Self::Cuda(engine) => engine.search_batch(nonce_base, candidate_count),
             Self::Hip(engine) => engine.search_batch(nonce_base, candidate_count),
+            #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.search_batch(nonce_base, candidate_count),
         }
     }
@@ -91,6 +108,7 @@ impl PhotonEngine {
         match self {
             Self::Cuda(engine) => engine.persistent_device_bytes(),
             Self::Hip(engine) => engine.persistent_device_bytes(),
+            #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.persistent_device_bytes(),
         }
     }
@@ -99,15 +117,18 @@ impl PhotonEngine {
         match self {
             Self::Cuda(engine) => format!("{:?}", engine.table_source()),
             Self::Hip(engine) => format!("{:?}", engine.table_source()),
+            #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => format!("{:?}", engine.table_source()),
         }
     }
 
-    pub(crate) fn scheduled_batch_candidates(&self) -> u32 {
-        match self {
+    pub(crate) fn scheduled_batch_candidates(&self, intensity: u8) -> u32 {
+        let capacity = match self {
             Self::Cuda(_) | Self::Hip(_) => scheduled_batch_candidates(),
+            #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.recommended_batch_candidates(),
-        }
+        };
+        intensity_batch_candidates(capacity, intensity)
     }
 }
 
@@ -342,35 +363,28 @@ fn verify_gpu_winner(
 
 /// Keep production GPU launches at the tuned full batch size.
 ///
-/// Runtime intensity is applied exactly once by [`duty_rest`]. Shrinking the
-/// batch as well would square the requested throttle (for example, 30% work
-/// followed by a 30% duty cycle yields roughly 9% throughput) and increases
-/// kernel-launch overhead.
+/// Native backends keep launching work continuously; intensity changes the
+/// amount of GPU work in each launch rather than inserting host-side idle gaps.
 pub(crate) const fn scheduled_batch_candidates() -> u32 {
     MAX_BATCH_CANDIDATES
 }
 
-pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
-    if intensity >= 100 || compute_time.is_zero() {
-        return Duration::ZERO;
+pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> u32 {
+    if capacity == 0 {
+        return 0;
     }
-    let rest_ns = compute_time
-        .as_nanos()
-        .saturating_mul(u128::from(100 - intensity))
-        / u128::from(intensity);
-    Duration::from_nanos(rest_ns.min(u128::from(u64::MAX)) as u64)
-}
-
-fn throttle_sleep(rest: Duration) {
-    // ponytail: keep the scheduler responsive at reduced intensity. A long
-    // sleep makes the GPU look disconnected to telemetry even though the
-    // requested duty cycle is active.
-    let slice = Duration::from_micros(250);
-    let mut remaining = rest;
-    while remaining > Duration::ZERO {
-        let current = remaining.min(slice);
-        thread::park_timeout(current);
-        remaining = remaining.saturating_sub(current);
+    let percent = if intensity < 10 {
+        10
+    } else if intensity > 100 {
+        100
+    } else {
+        intensity
+    } as u32;
+    let scaled = capacity.saturating_mul(percent) / 100;
+    if scaled == 0 {
+        1
+    } else {
+        scaled
     }
 }
 
@@ -445,8 +459,7 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
-        let batch_size = engine.scheduled_batch_candidates();
-        let batch_started = Instant::now();
+        let batch_size = engine.scheduled_batch_candidates(active_intensity);
         let result = match engine.search_batch(nonce_base, batch_size) {
             Ok(result) => result,
             Err(_) => {
@@ -455,7 +468,6 @@ fn run_worker(
                 break;
             }
         };
-        let compute_time = batch_started.elapsed();
         candidates.fetch_add(u64::from(result.candidates), Ordering::Relaxed);
         batches.fetch_add(1, Ordering::Release);
 
@@ -472,12 +484,7 @@ fn run_worker(
         }
         batch_in_flight.store(false, Ordering::SeqCst);
 
-        nonce_base = nonce_base.wrapping_add(batch_size);
-
-        let rest = duty_rest(compute_time, active_intensity);
-        if !rest.is_zero() {
-            throttle_sleep(rest);
-        }
+        nonce_base = nonce_base.wrapping_add(result.candidates);
     }
 }
 
@@ -826,17 +833,15 @@ mod tests {
     }
 
     #[test]
-    fn intensity_uses_one_duty_cycle_throttle_with_full_gpu_batches() {
+    fn intensity_scales_continuous_gpu_launches_without_idle_periods() {
         assert_eq!(scheduled_batch_candidates(), MAX_BATCH_CANDIDATES);
-        assert_eq!(duty_rest(Duration::from_millis(10), 100), Duration::ZERO);
         assert_eq!(
-            duty_rest(Duration::from_millis(10), 50),
-            Duration::from_millis(10)
+            intensity_batch_candidates(MAX_BATCH_CANDIDATES, 100),
+            65_536
         );
-        assert_eq!(
-            duty_rest(Duration::from_millis(10), 25),
-            Duration::from_millis(30)
-        );
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 50), 32_768);
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 25), 16_384);
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 10), 6_553);
     }
 
     #[test]

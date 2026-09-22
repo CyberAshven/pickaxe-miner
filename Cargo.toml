@@ -3,6 +3,10 @@ name = "pickaxe_miner"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+portable-wgpu = ["dep:pollster", "dep:wgpu"]
+
 [dependencies]
 sha2 = { version = "0.10", features = ["compress"] }
 ripemd = "0.1"
@@ -22,5 +26,5 @@ ctrlc = "3.4"
 ratatui = "0.29"
 crossterm = "0.28"
 libloading = "0.9"
-pollster = "0.4"
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"], optional = true }
