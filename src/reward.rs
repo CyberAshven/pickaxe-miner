@@ -261,6 +261,78 @@ fn read_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
     Ok(u64::from_le_bytes(padded))
 }
 
+fn read_canonical_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let start = *cursor;
+    let value = read_compact_uint(bytes, cursor)?;
+    if bytes.get(start..*cursor) != Some(compact_uint(value).as_slice()) {
+        return Err("non-canonical CompactSize encoding in PHOTON baton".into());
+    }
+    Ok(value)
+}
+
+fn validate_authoritative_baton_token(token_and_locking_bytecode: &[u8]) -> Result<(), String> {
+    const TOKEN_PREFIX_MARKER: u8 = 0xef;
+    const MUTABLE_NFT_WITH_COMMITMENT_AND_AMOUNT: u8 = 0x71;
+    const MIN_REFERENCE_COMMITMENT_BYTES: usize = 36;
+
+    let category = hex::decode(MAINNET_CATEGORY_HEX).map_err(|error| error.to_string())?;
+    if category.len() != 32 {
+        return Err("PHOTON category must be 32 bytes".into());
+    }
+    let category_le = reverse(&category);
+    let covenant_lock =
+        hex::decode(COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
+
+    let marker = token_and_locking_bytecode
+        .first()
+        .copied()
+        .ok_or("parent output 0 is missing its CashToken prefix")?;
+    if marker != TOKEN_PREFIX_MARKER {
+        return Err("parent output 0 is missing the CashToken prefix marker".into());
+    }
+
+    let category_end = 1usize
+        .checked_add(category_le.len())
+        .ok_or("PHOTON baton category cursor overflow")?;
+    if token_and_locking_bytecode.get(1..category_end) != Some(category_le.as_slice()) {
+        return Err("parent output 0 has the wrong PHOTON token category".into());
+    }
+
+    let capability = token_and_locking_bytecode
+        .get(category_end)
+        .copied()
+        .ok_or("parent output 0 is missing its CashToken capability byte")?;
+    if capability != MUTABLE_NFT_WITH_COMMITMENT_AND_AMOUNT {
+        return Err(
+            "parent output 0 is not a mutable PHOTON NFT with commitment and amount".into(),
+        );
+    }
+
+    let mut cursor = category_end + 1;
+    let commitment_len = usize::try_from(read_canonical_compact_uint(
+        token_and_locking_bytecode,
+        &mut cursor,
+    )?)
+    .map_err(|_| "PHOTON baton commitment length exceeds usize")?;
+    if commitment_len < MIN_REFERENCE_COMMITMENT_BYTES {
+        return Err("parent output 0 PHOTON commitment is missing or too short".into());
+    }
+    let commitment_end = cursor
+        .checked_add(commitment_len)
+        .ok_or("PHOTON baton commitment cursor overflow")?;
+    token_and_locking_bytecode
+        .get(cursor..commitment_end)
+        .ok_or("parent output 0 PHOTON commitment is truncated")?;
+    cursor = commitment_end;
+
+    read_canonical_compact_uint(token_and_locking_bytecode, &mut cursor)?;
+    if token_and_locking_bytecode.get(cursor..) != Some(covenant_lock.as_slice()) {
+        return Err("parent output 0 does not end in the authoritative PHOTON covenant".into());
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_parent_outputs(parent_raw: &[u8]) -> Result<[ParsedOutput; 2], String> {
     if parent_raw.len() < 10 {
@@ -582,13 +654,7 @@ pub fn build_self_funded_settlement_with_relay_fee(
     }
 
     let [baton, reward] = parse_parent_outputs(parent_raw)?;
-    let covenant_lock =
-        hex::decode(COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
-    if baton.token_and_locking_bytecode.first() != Some(&0xef)
-        || !baton.token_and_locking_bytecode.ends_with(&covenant_lock)
-    {
-        return Err("parent output 0 is not the authoritative PHOTON baton".into());
-    }
+    validate_authoritative_baton_token(&baton.token_and_locking_bytecode)?;
     if reward.value_sats != TOKEN_OUTPUT_SATS {
         return Err(format!(
             "parent reward BCH value must be the proven {TOKEN_OUTPUT_SATS} sats (got {})",
@@ -900,5 +966,103 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("reward output does not match"));
+    }
+
+    #[test]
+    fn self_funded_settlement_rejects_wrong_baton_category() {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let mut parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let category_le = reverse(&hex::decode(MAINNET_CATEGORY_HEX).unwrap());
+        let prefix = [vec![0xef], category_le.clone(), vec![0x71]].concat();
+        let offset = parent
+            .windows(prefix.len())
+            .position(|window| window == prefix)
+            .expect("authoritative baton token prefix");
+        parent[offset + 1] ^= 1;
+        let miner_payout = p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+
+        let error = build_self_funded_settlement(
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("wrong PHOTON token category"));
+    }
+
+    #[test]
+    fn self_funded_settlement_rejects_non_mutable_baton_capability() {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let mut parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let category_le = reverse(&hex::decode(MAINNET_CATEGORY_HEX).unwrap());
+        let prefix = [vec![0xef], category_le, vec![0x71]].concat();
+        let offset = parent
+            .windows(prefix.len())
+            .position(|window| window == prefix)
+            .expect("authoritative baton token prefix");
+        parent[offset + 33] = 0x70;
+        let miner_payout = p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+
+        let error = build_self_funded_settlement(
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("not a mutable PHOTON NFT"));
+    }
+
+    #[test]
+    fn authoritative_baton_parser_rejects_noncanonical_commitment_length() {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let [baton, _] = parse_parent_outputs(&parent).unwrap();
+        validate_authoritative_baton_token(&baton.token_and_locking_bytecode).unwrap();
+
+        let mut malformed = baton.token_and_locking_bytecode;
+        let commitment_len_offset = 1 + 32 + 1;
+        assert_eq!(malformed[commitment_len_offset], 100);
+        malformed.splice(
+            commitment_len_offset..=commitment_len_offset,
+            [0xfd, 100, 0],
+        );
+
+        let error = validate_authoritative_baton_token(&malformed).unwrap_err();
+        assert!(error.contains("non-canonical CompactSize"));
+    }
+
+    #[test]
+    fn authoritative_baton_parser_rejects_short_reference_commitment() {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let [baton, _] = parse_parent_outputs(&parent).unwrap();
+        let mut malformed = baton.token_and_locking_bytecode;
+        let commitment_len_offset = 1 + 32 + 1;
+        malformed[commitment_len_offset] = 35;
+
+        let error = validate_authoritative_baton_token(&malformed).unwrap_err();
+        assert!(error.contains("commitment is missing or too short"));
     }
 }
