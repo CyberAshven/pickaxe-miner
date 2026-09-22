@@ -7,10 +7,16 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
 import sys
+
+if __package__:
+    from .verify_hip_artifacts import validate_code_object_header
+else:
+    from verify_hip_artifacts import validate_code_object_header
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = (
@@ -25,6 +31,7 @@ CLANG_OFFLOAD_BUNDLE_MAGIC = b"__CLANG_OFFLOAD_BUNDLE__"
 def normalize_code_object(path: Path, arch: str) -> None:
     payload = path.read_bytes()
     if payload.startswith(b"\x7fELF"):
+        validate_code_object_header(payload, path)
         return
     if not payload.startswith(CLANG_OFFLOAD_BUNDLE_MAGIC):
         raise RuntimeError(f"{path}: HIP compiler output is neither ELF nor a Clang offload bundle")
@@ -34,9 +41,9 @@ def normalize_code_object(path: Path, arch: str) -> None:
         raise RuntimeError(f"{path}: truncated Clang offload bundle header")
     bundle_count = struct.unpack_from("<Q", payload, cursor)[0]
     cursor += 8
-    selected: bytes | None = None
-    selected_target = ""
-    expected_target = f"amdgcn-amd-amdhsa--{arch}"
+    if bundle_count > (len(payload) - cursor) // 24:
+        raise RuntimeError(f"{path}: invalid Clang offload bundle entry count")
+    entries: list[tuple[str, int, int]] = []
     for _ in range(bundle_count):
         if cursor + 24 > len(payload):
             raise RuntimeError(f"{path}: truncated Clang offload bundle descriptor")
@@ -44,21 +51,40 @@ def normalize_code_object(path: Path, arch: str) -> None:
         cursor += 24
         if cursor + target_size > len(payload):
             raise RuntimeError(f"{path}: truncated Clang offload bundle target")
-        target = payload[cursor : cursor + target_size].decode("utf-8", errors="strict")
+        try:
+            target = payload[cursor : cursor + target_size].decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise RuntimeError(f"{path}: invalid UTF-8 Clang offload bundle target") from error
         cursor += target_size
         end = offset + size
         if end > len(payload):
             raise RuntimeError(f"{path}: Clang offload bundle entry exceeds file bounds")
-        if expected_target in target:
-            if selected is not None:
-                raise RuntimeError(f"{path}: multiple device images match {arch}")
-            selected = payload[offset:end]
-            selected_target = target
+        entries.append((target, offset, size))
 
-    if selected is None:
+    # Check all descriptors before modifying the compiler output. Empty host
+    # entries are valid, but non-empty images cannot overlap the header/each other.
+    previous_end = cursor
+    for _, offset, size in sorted(entries, key=lambda entry: entry[1]):
+        if size:
+            if offset < previous_end:
+                raise RuntimeError(f"{path}: overlapping Clang offload bundle payloads")
+            previous_end = offset + size
+    matches = [
+        (target, offset, size)
+        for target, offset, size in entries
+        if re.fullmatch(
+            rf"(?:hip|hipv4)-amdgcn-amd-amdhsa--{re.escape(arch)}"
+            r"(?::[A-Za-z0-9_]+[+-])*",
+            target,
+        )
+    ]
+    if not matches:
         raise RuntimeError(f"{path}: Clang offload bundle has no {arch} device image")
-    if not selected.startswith(b"\x7fELF"):
-        raise RuntimeError(f"{path}: {selected_target} device image is not ELF")
+    if len(matches) != 1:
+        raise RuntimeError(f"{path}: multiple device images match {arch}")
+    selected_target, offset, size = matches[0]
+    selected = payload[offset : offset + size]
+    validate_code_object_header(selected, f"{path}: {selected_target}")
 
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_bytes(selected)
@@ -161,7 +187,7 @@ def main() -> int:
         help="skip metadata/symbol/ABI validation (intended only for toolchain debugging)",
     )
     args = parser.parse_args()
-    if not args.arch.startswith("gfx"):
+    if re.fullmatch(r"gfx[0-9a-f]{3,}", args.arch) is None:
         parser.error("--arch must be a gfx target such as gfx1036")
     try:
         compiler, is_hipcc = find_compiler()

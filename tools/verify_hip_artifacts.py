@@ -18,6 +18,69 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "hip" / "kernel_contract.json"
 
 
+def validate_code_object_header(
+    payload: bytes, label: object, architecture: str | None = None
+) -> None:
+    """Reject non-loadable files before invoking LLVM or the HIP loader."""
+    if len(payload) < 64 or payload[:4] != b"\x7fELF":
+        raise RuntimeError(f"{label}: truncated or invalid ELF64 code-object header")
+    if payload[4:7] != bytes((2, 1, 1)):
+        raise RuntimeError(f"{label}: expected ELF64, little-endian, current ELF version")
+    if payload[7] != 64 or payload[8] not in (1, 2, 3, 4):
+        raise RuntimeError(f"{label}: expected AMDGPU/HSA code-object ABI V3 through V6")
+
+    file_type, machine, version = struct.unpack_from("<HHI", payload, 16)
+    if file_type != 3 or machine != 224 or version != 1:
+        raise RuntimeError(f"{label}: expected linked AMDGPU/HSA ET_DYN code object")
+    phoff, shoff = struct.unpack_from("<QQ", payload, 32)
+    flags, ehsize, phentsize, phnum, shentsize, shnum = struct.unpack_from(
+        "<IHHHHH", payload, 48
+    )
+    if ehsize != 64:
+        raise RuntimeError(f"{label}: invalid ELF64 header size {ehsize}")
+    for table_name, offset, entry_size, count, expected_size in (
+        ("program", phoff, phentsize, phnum, 56),
+        ("section", shoff, shentsize, shnum, 64),
+    ):
+        if (
+            count == 0
+            or offset < 64
+            or entry_size != expected_size
+            or offset + count * entry_size > len(payload)
+        ):
+            raise RuntimeError(
+                f"{label}: missing, truncated, or invalid ELF {table_name} table"
+            )
+
+    # LLVM AMDGPUUsage: EF_AMDGPU_MACH mask=0xff, GFX1036=0x45.
+    # Keep this in sync with the architecture supported by kernel_contract.json.
+    if architecture is not None:
+        machine_ids = {"gfx1036": 0x45}
+        expected = machine_ids.get(architecture)
+        if expected is not None and flags & 0xFF != expected:
+            raise RuntimeError(
+                f"{label}: ELF processor 0x{flags & 0xFF:x} does not match {architecture}"
+            )
+
+
+def defined_symbols(symbol_output: str) -> set[tuple[str, str]]:
+    """Read defined, non-empty symbols from llvm-readelf --symbols output."""
+    result: set[tuple[str, str]] = set()
+    for line in symbol_output.splitlines():
+        fields = line.split()
+        if len(fields) != 8 or not re.fullmatch(r"\d+:", fields[0]):
+            continue
+        if not fields[6].isdigit() or int(fields[6]) == 0:
+            continue
+        try:
+            size = int(fields[2], 16 if fields[2].startswith("0x") else 10)
+        except ValueError:
+            continue
+        if size > 0:
+            result.add((fields[7], fields[3]))
+    return result
+
+
 def find_llvm_tool(name: str) -> str | None:
     explicit = os.environ.get(name.upper().replace("-", "_"))
     if explicit:
@@ -88,13 +151,10 @@ def scalar(line: str) -> str:
 
 def parse_metadata(yaml_text: str) -> tuple[str, dict[str, dict[str, object]]]:
     lines = yaml_text.splitlines()
-    target = ""
-    for line in lines:
-        if re.match(r"^amdhsa\.target\s*:", line):
-            target = scalar(line)
-            break
-    if not target:
-        raise RuntimeError("AMDGPU metadata is missing amdhsa.target")
+    targets = [scalar(line) for line in lines if re.match(r"^amdhsa\.target\s*:", line)]
+    if len(targets) != 1 or not targets[0]:
+        raise RuntimeError("AMDGPU metadata requires exactly one non-empty amdhsa.target")
+    target = targets[0]
 
     kernels_start = next(
         (index for index, line in enumerate(lines) if line.strip() == "amdhsa.kernels:"),
@@ -166,6 +226,8 @@ def parse_metadata(yaml_text: str) -> tuple[str, dict[str, dict[str, object]]]:
         if current_arg is not None:
             args.append(current_arg)
         if name:
+            if name in parsed:
+                raise RuntimeError(f"duplicate AMDGPU kernel metadata for {name}")
             parsed[name] = {
                 "kernarg_segment_size": kernarg_segment_size,
                 "args": args,
@@ -363,6 +425,8 @@ def metadata_from_msgpack(value: object) -> tuple[str, dict[str, dict[str, objec
         name = kernel.get(".name")
         if not isinstance(name, str) or not name:
             raise RuntimeError("AMDGPU kernel metadata entry is missing .name")
+        if name in parsed:
+            raise RuntimeError(f"duplicate AMDGPU kernel metadata for {name}")
         raw_args = kernel.get(".args", [])
         if not isinstance(raw_args, list):
             raise RuntimeError(f"AMDGPU kernel {name} has invalid .args metadata")
@@ -386,7 +450,9 @@ def metadata_from_msgpack(value: object) -> tuple[str, dict[str, dict[str, objec
     return target, parsed
 
 
-def inspect_elf_metadata(path: Path) -> tuple[str, dict[str, dict[str, object]], set[str]]:
+def inspect_elf_metadata(
+    path: Path,
+) -> tuple[str, dict[str, dict[str, object]], set[tuple[str, str]]]:
     payload = path.read_bytes()
     sections = elf_sections(payload)
     metadata: tuple[str, dict[str, dict[str, object]]] | None = None
@@ -413,14 +479,13 @@ def inspect_elf_metadata(path: Path) -> tuple[str, dict[str, dict[str, object]],
             if owner != b"AMDGPU" or b"amdhsa.kernels" not in descriptor:
                 continue
             decoded = decode_msgpack(descriptor)
+            if metadata is not None:
+                raise RuntimeError(f"{path}: multiple AMDGPU kernel metadata notes found")
             metadata = metadata_from_msgpack(decoded)
-            break
-        if metadata is not None:
-            break
     if metadata is None:
         raise RuntimeError(f"{path}: no AMDGPU MessagePack kernel metadata note found")
 
-    symbols: set[str] = set()
+    symbols: set[tuple[str, str]] = set()
     for section in sections:
         if section["type"] not in {2, 11}:  # SHT_SYMTAB / SHT_DYNSYM
             continue
@@ -436,13 +501,18 @@ def inspect_elf_metadata(path: Path) -> tuple[str, dict[str, dict[str, object]],
             raise RuntimeError(f"{path}: invalid ELF64 symbol entry size {entry_size}")
         start = int(section["offset"])
         end = start + int(section["size"])
+        if (end - start) % entry_size != 0:
+            raise RuntimeError(f"{path}: truncated ELF symbol table entry")
         for cursor in range(start, end, entry_size):
-            if cursor + 24 > end:
-                break
-            name_offset = struct.unpack_from("<I", payload, cursor)[0]
+            name_offset, info, _other, section_index, _value, size = struct.unpack_from(
+                "<IBBHQQ", payload, cursor
+            )
             name = c_string(strings, name_offset)
-            if name:
-                symbols.add(name)
+            if not name or section_index == 0 or section_index >= 0xFF00 or size == 0:
+                continue
+            symbol_type = {1: "OBJECT", 2: "FUNC"}.get(info & 0x0F)
+            if symbol_type is not None:
+                symbols.add((name, symbol_type))
 
     target, kernels = metadata
     return target, kernels, symbols
@@ -459,24 +529,18 @@ def verify_artifact(
     if not path.is_file():
         raise RuntimeError(f"missing HIP code object: {path}")
     payload = path.read_bytes()
-    if len(payload) < 4 or payload[:4] != b"\x7fELF":
-        raise RuntimeError(f"{path}: not an ELF HIP code object")
+    validate_code_object_header(payload, path, architecture)
 
     if readelf is None:
         target, kernels, symbols = inspect_elf_metadata(path)
         inspector = "python-elf"
     else:
         target, kernels = parse_metadata(metadata_yaml(readelf, path))
-        symbol_output = run_text([readelf, "--symbols", str(path)])
-        symbols = {
-            token
-            for line in symbol_output.splitlines()
-            for token in line.split()
-            if token and not token.isdigit()
-        }
+        symbol_output = run_text([readelf, "--wide", "--symbols", str(path)])
+        symbols = defined_symbols(symbol_output)
         inspector = "llvm-readelf"
     target_match = re.fullmatch(
-        rf"amdgcn-amd-amdhsa--{re.escape(architecture)}(?::[A-Za-z0-9_+:-]+)?",
+        rf"amdgcn-amd-amdhsa--{re.escape(architecture)}(?::[A-Za-z0-9_]+[+-])*",
         target,
     )
     if target_match is None:
@@ -489,8 +553,10 @@ def verify_artifact(
         actual = kernels.get(symbol)
         if actual is None:
             raise RuntimeError(f"{path}: missing production kernel metadata for {symbol}")
-        if symbol not in symbols and f"{symbol}.kd" not in symbols:
-            raise RuntimeError(f"{path}: missing production ELF symbol {symbol}")
+        if (symbol, "FUNC") not in symbols or (f"{symbol}.kd", "OBJECT") not in symbols:
+            raise RuntimeError(
+                f"{path}: missing defined production kernel entry/descriptor for {symbol}"
+            )
 
         expected_args = [
             {
