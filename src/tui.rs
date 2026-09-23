@@ -264,7 +264,7 @@ struct TuiState {
 impl TuiState {
     fn new(_snapshot: &RuntimeSnapshot) -> Self {
         let mut events = VecDeque::with_capacity(EVENT_HISTORY_CAP);
-        events.push_back("Runtime started; authoritative PHOTON state is supervised.".into());
+        events.push_back("started; supervising PHOTON state".into());
         Self {
             command_mode: false,
             command_input: String::new(),
@@ -1645,6 +1645,11 @@ mod tests {
             "reconnect and rotation counts must share one 120-column row: {rows:?}"
         );
         assert!(rows.iter().any(|row| row.contains("jobs 1")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("supervising PHOTON state")),
+            "startup event must fit on one events row"
+        );
         assert!(
             rows.iter()
                 .any(|row| row.contains("switch ") && row.contains("->")),
