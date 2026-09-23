@@ -102,7 +102,18 @@ impl RefreshFailureTracker {
             }
             RefreshFailureKind::Transport => {
                 self.transport_total = self.transport_total.saturating_add(1);
-                RefreshFailureAction::RotateSource
+                self.consecutive = self
+                    .consecutive
+                    .saturating_add(1)
+                    .min(REFRESH_RECONNECT_THRESHOLD);
+                // A dead socket has to be replaced, but the first replacement
+                // stays on the same peer. Rotate only if that peer fails again.
+                if self.same_source_timeout_reconnect_pending {
+                    RefreshFailureAction::RotateSource
+                } else {
+                    self.same_source_timeout_reconnect_pending = true;
+                    RefreshFailureAction::ReconnectCurrent
+                }
             }
         }
     }
@@ -255,16 +266,20 @@ fn eligible_fulcrum_endpoints(
         .into_iter()
         .map(|entry| entry.endpoint.clone())
         .collect::<Vec<_>>();
-    if endpoints.len() > 1 {
-        if let Some(active) = active_endpoint {
-            endpoints.sort_by_key(|endpoint| {
-                let is_active = endpoint.eq_ignore_ascii_case(active);
-                match preference {
-                    ReconnectPreference::PreferActive => !is_active,
-                    ReconnectPreference::RotateAway => is_active,
-                }
-            });
+    let Some(active) = active_endpoint else {
+        return endpoints;
+    };
+    let active_available = sources.available_at(SourceKind::Fulcrum, active, now_ms);
+    match preference {
+        ReconnectPreference::PreferActive if active_available => {
+            endpoints.retain(|endpoint| !endpoint.eq_ignore_ascii_case(active));
+            endpoints.insert(0, active.to_string());
+            endpoints.truncate(AUTO_PROBE_LIMIT.max(1));
         }
+        ReconnectPreference::RotateAway => {
+            endpoints.sort_by_key(|endpoint| endpoint.eq_ignore_ascii_case(active));
+        }
+        ReconnectPreference::PreferActive => {}
     }
     endpoints
 }
@@ -2193,9 +2208,11 @@ fn run_supervisor(
         if session.is_none() {
             if Instant::now() >= next_reconnect {
                 let now_ms = source_capability_now_ms(source_capability_epoch);
-                let rotation_key = u64::from(std::process::id())
-                    .wrapping_add(cfg.generation_id)
-                    .wrapping_add(reconnect_attempts);
+                let mut rotation_key =
+                    u64::from(std::process::id()).wrapping_add(cfg.generation_id);
+                if reconnect_preference == ReconnectPreference::RotateAway {
+                    rotation_key = rotation_key.wrapping_add(reconnect_attempts);
+                }
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 endpoints = eligible_fulcrum_endpoints(
                     &sources,
@@ -4291,10 +4308,47 @@ mod tests {
         );
         assert_eq!(
             failures.failure(RefreshFailureKind::Transport),
-            RefreshFailureAction::RotateSource
+            RefreshFailureAction::ReconnectCurrent
         );
         assert_eq!(failures.transport_total, 1);
-        assert_eq!(failures.consecutive, 0);
+        assert_eq!(failures.consecutive, 1);
+        assert!(failures.same_source_timeout_reconnect_pending);
+        failures.reconnect_success(false);
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transport),
+            RefreshFailureAction::RotateSource
+        );
+        assert_eq!(failures.transport_total, 2);
+
+        failures.reconnect_success(true);
+        failures.refresh_success();
+        assert_eq!(
+            failures.failure(RefreshFailureKind::Transport),
+            RefreshFailureAction::ReconnectCurrent
+        );
+    }
+
+    #[test]
+    fn prefer_active_keeps_healthy_peer_outside_the_probe_window() {
+        let mut sources = SourceCatalog::mainnet();
+        let active = crate::protocol::FULCRUM_WSS_BOOTSTRAP
+            .last()
+            .copied()
+            .expect("fulcrum bootstrap");
+        sources
+            .record_success(SourceKind::Fulcrum, active, 0, 30)
+            .unwrap();
+        for rotation_key in 0..crate::protocol::FULCRUM_WSS_BOOTSTRAP.len() as u64 {
+            let endpoints = eligible_fulcrum_endpoints(
+                &sources,
+                0,
+                rotation_key,
+                Some(active),
+                ReconnectPreference::PreferActive,
+            );
+            assert_eq!(endpoints.first().map(String::as_str), Some(active));
+            assert!(endpoints.len() <= AUTO_PROBE_LIMIT.max(1));
+        }
     }
 
     #[test]

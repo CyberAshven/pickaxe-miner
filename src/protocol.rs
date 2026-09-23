@@ -166,6 +166,8 @@ pub const FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://electrum.imaginary.cash:50004",
     "wss://electroncash.dk:50004",
     "wss://fulcrum.greyh.at:50004",
+    "wss://electron.jochen-hoenicke.de:51004",
+    "wss://fulcrum.jettscythe.xyz:50004",
 ];
 
 /// Electron Cash mainnet servers published with the `s` (TLS) transport.
@@ -230,13 +232,10 @@ pub const ELECTRON_CASH_TCP_BOOTSTRAP: &[(&str, u16)] = &[
 ];
 
 /// Curated native **node** JSON-RPC bootstrap (BCHN/bitcoind-style HTTP).
-/// Public RPC is rare — keep this list tiny; custom `node` URL is the usual path
-/// (Start9 `bitcoincashd` etc.). Runtime PHOTON routing stays on Fulcrum until
-/// the native provider is explicitly promoted after canonical equivalence proof.
-pub const NODE_RPC_BOOTSTRAP: &[&str] = &[
-    // Intentionally empty of third-party public RPC (ban risk / auth required).
-    // Add only endpoints the operator explicitly curates later.
-];
+/// Unauthenticated `getblockchaininfo` on public host:8332 endpoints did not
+/// answer, so this list stays empty instead of shipping dead RPC URLs.
+/// A configured node is used when it is healthy and its PHOTON proof is current.
+pub const NODE_RPC_BOOTSTRAP: &[&str] = &[];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotonDerivedState {
