@@ -393,6 +393,33 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
     }
 }
 
+fn mirror_tui_status(snapshot: &RuntimeSnapshot) {
+    let Ok(path) = std::env::var("PICKAXE_TUI_LOG") else {
+        return;
+    };
+    let line = format!(
+        "state={:?} intensity={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} height={} endpoint={} last_error={}\n",
+        snapshot.state,
+        snapshot.search.intensity,
+        snapshot.reconnects,
+        snapshot.endpoint_rotations,
+        snapshot.job_changes,
+        snapshot.state_checks,
+        snapshot.search.batches,
+        snapshot.search.candidates,
+        snapshot.height,
+        redact_endpoint(&snapshot.endpoint),
+        snapshot.last_error.as_deref().unwrap_or("none"),
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
+}
+
 pub fn run(
     supervisor: RuntimeSupervisor,
     devices: Vec<GpuDevice>,
@@ -416,6 +443,7 @@ pub fn run(
                 .terminal
                 .draw(|frame| render(frame, &snapshot, &state))
                 .map_err(|error| format!("draw terminal UI: {error}"))?;
+            mirror_tui_status(&snapshot);
             last_draw = Instant::now();
         }
 

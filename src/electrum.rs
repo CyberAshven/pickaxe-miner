@@ -234,6 +234,18 @@ impl ElectrumSession {
     }
 
     pub fn fetch_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
+        let mut last_error = String::new();
+        for _ in 0..4 {
+            match self.read_live_snapshot() {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) if snapshot_reread(&error) => last_error = error,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error)
+    }
+
+    fn read_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
         let header_before = self.rpc("blockchain.headers.subscribe", json!([]))?;
         let unspent = self.rpc(
             "blockchain.scripthash.listunspent",
@@ -305,6 +317,11 @@ fn fulcrum_header_height(header: &Value) -> Result<u32, String> {
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| "Fulcrum header response omitted a valid height".to_string())
+}
+
+fn snapshot_reread(error: &str) -> bool {
+    error.contains("changed tip while reading token state")
+        || error.contains("snapshot tip identity is inconsistent")
 }
 
 fn stable_fulcrum_tip_hash(before: &Value, after: &Value) -> Result<String, String> {
@@ -513,7 +530,8 @@ mod tests {
         let mut header_hex = before["hex"].as_str().unwrap().to_string();
         header_hex.replace_range(0..2, "02");
         changed_header["hex"] = json!(header_hex);
-        assert!(stable_fulcrum_tip_hash(&before, &changed_header).is_err());
+        let moved = stable_fulcrum_tip_hash(&before, &changed_header).unwrap_err();
+        assert!(snapshot_reread(&moved));
     }
 
     #[test]
