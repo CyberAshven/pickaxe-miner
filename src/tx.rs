@@ -344,19 +344,38 @@ pub fn build_photon_template_donation_split(
     Err(DONATION_SPLIT_BLOCKER.into())
 }
 
+/// Lines for the unsigned two-output parent and the settlement child `mine` pays.
+pub fn win_tx_preview_lines(
+    job_reward_raw: u128,
+    miner_payout: &str,
+) -> Result<Vec<String>, String> {
+    let miner_lock = cashaddr_to_p2pkh_locking(miner_payout)?;
+    let (miner_tokens, donation_tokens) =
+        crate::config::RuntimeConfig::split_reward(job_reward_raw);
+    let donation_percent = crate::config::DONATION_BPS / 100;
+    Ok(vec![
+        "win-tx preview (unsigned two-output parent; no mining or broadcast):".into(),
+        format!(
+            "  parent reward output FT={job_reward_raw} lock={}B -> {miner_payout}",
+            miner_lock.len()
+        ),
+        "  this template has no donation output".into(),
+        format!(
+            "  mine settlement pays FT={miner_tokens} -> {miner_payout} and FT={donation_tokens} ({donation_percent}%) -> {}",
+            crate::config::DONATION_ADDRESS
+        ),
+    ])
+}
+
 /// Offline-style preview of the unsigned two-output PHOTON parent template.
 pub fn print_win_tx_preview(
     job_reward_raw: u128,
     miner_payout: &str,
     template_hex: Option<&str>,
 ) -> Result<(), String> {
-    let miner_lock = cashaddr_to_p2pkh_locking(miner_payout)?;
-    println!("win-tx preview (unsigned; no mining or broadcast):");
-    println!(
-        "  out reward   10000 bps FT={job_reward_raw} lock={}B -> {miner_payout}",
-        miner_lock.len()
-    );
-    println!("Donation: 2%");
+    for line in win_tx_preview_lines(job_reward_raw, miner_payout)? {
+        println!("{line}");
+    }
     if let Some(h) = template_hex {
         println!("  template: {} bytes", h.len() / 2);
         let show = h.len().min(80);
@@ -547,5 +566,25 @@ mod tests {
         let error = build_photon_template_donation_split(&p, &donation)
             .expect_err("unproven 3-output split must be blocked");
         assert_eq!(error, DONATION_SPLIT_BLOCKER);
+    }
+
+    #[test]
+    fn preview_names_the_settlement_split_instead_of_a_parent_donation_output() {
+        let payout = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
+        let reward = 4_999_773_813u128;
+        let lines = win_tx_preview_lines(reward, payout).expect("preview");
+        let text = lines.join("\n");
+        let (miner_tokens, donation_tokens) = crate::config::RuntimeConfig::split_reward(reward);
+        assert_ne!(miner_tokens, reward);
+        assert!(text.contains(&format!("FT={reward}")));
+        assert!(text.contains(&format!("FT={miner_tokens} -> {payout}")));
+        assert!(text.contains(&format!(
+            "FT={donation_tokens} ({}%) -> {}",
+            crate::config::DONATION_BPS / 100,
+            crate::config::DONATION_ADDRESS
+        )));
+        assert!(text.contains("this template has no donation output"));
+        assert!(!text.contains("10000 bps"));
+        print_win_tx_preview(reward, payout, None).expect("preview prints the same report");
     }
 }
