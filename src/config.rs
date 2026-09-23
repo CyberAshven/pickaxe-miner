@@ -293,7 +293,7 @@ impl SavedConfig {
         }
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| format!("serialize config: {error}"))?;
-        fs::write(path, bytes).map_err(|error| format!("write config {}: {error}", path.display()))
+        write_private_config(path, &bytes)
     }
 
     /// Captures the effective runtime settings for persistence.
@@ -313,6 +313,65 @@ impl SavedConfig {
             source: Some(runtime.source.as_str().to_string()),
         }
     }
+}
+
+fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("write config {}: {error}", path.display()))?;
+    std::io::Write::write_all(&mut file, bytes)
+        .map_err(|error| format!("write config {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("write config {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    restrict_config_to_current_user(path)?;
+    Ok(())
+}
+
+/// Saved node URLs may contain RPC credentials. Keep the file owner-only so
+/// other local users cannot read `user:pass@host` out of the config.
+#[cfg(windows)]
+fn restrict_config_to_current_user(path: &Path) -> Result<(), String> {
+    let whoami = std::process::Command::new("whoami")
+        .output()
+        .map_err(|error| format!("identify config owner for {}: {error}", path.display()))?;
+    if !whoami.status.success() {
+        return Err(format!(
+            "identify config owner for {}: whoami failed",
+            path.display()
+        ));
+    }
+    let owner = String::from_utf8_lossy(&whoami.stdout).trim().to_string();
+    if owner.is_empty() {
+        return Err(format!(
+            "identify config owner for {}: whoami returned an empty account",
+            path.display()
+        ));
+    }
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{owner}:(F)"))
+        .output()
+        .map_err(|error| format!("restrict config {}: {error}", path.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!(
+        "restrict config {}: icacls exited with {} {}",
+        path.display(),
+        output.status,
+        detail
+    ))
 }
 
 /// Returns the location of the miner configuration file.
@@ -350,6 +409,71 @@ mod tests {
     use super::*;
 
     const PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
+
+    #[test]
+    fn saved_config_node_credentials_are_owner_only() {
+        let dir = std::env::temp_dir().join(format!("pickaxe-config-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        expose_config_directory(&dir);
+        let path = dir.join("config.json");
+        let mut runtime = RuntimeConfig::default();
+        runtime
+            .set_node_url("http://user:secret-pass@127.0.0.1:8332")
+            .unwrap();
+        let saved = SavedConfig::from_effective("cuda", Some(0), &runtime);
+        saved.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("secret-pass"), "{text}");
+        assert_config_file_is_owner_only(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    fn expose_config_directory(dir: &Path) {
+        let output = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "icacls grant failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(not(windows))]
+    fn expose_config_directory(_dir: &Path) {}
+
+    #[cfg(windows)]
+    fn assert_config_file_is_owner_only(path: &Path) {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "icacls query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        let lower = text.to_ascii_lowercase();
+        assert!(!lower.contains("everyone"), "{text}");
+        assert!(!lower.contains("builtin\\users"), "{text}");
+        assert!(!lower.contains("authenticated users"), "{text}");
+        assert!(
+            lower.contains(":(f)"),
+            "config ACL has no owner full-control entry: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_config_file_is_owner_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o077, 0, "config mode {mode:o} is not owner-only");
+    }
 
     #[test]
     fn payout_requires_valid_cashaddr_checksum() {

@@ -295,6 +295,79 @@ function Get-GrowthSummary {
     }
 }
 
+function Start-RedirectedProcessCapture {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Process]$Process
+    )
+
+    if (-not $Process.Start()) {
+        throw "Failed to start redirected process."
+    }
+
+    # Drain both pipes while the child is still running. Reading only after
+    # WaitForExit deadlocks once the report exceeds the anonymous pipe buffer.
+    [pscustomobject]@{
+        Process = $Process
+        StdoutTask = $Process.StandardOutput.ReadToEndAsync()
+        StderrTask = $Process.StandardError.ReadToEndAsync()
+    }
+}
+
+function Complete-RedirectedProcessCapture {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Capture
+    )
+
+    $Capture.Process.WaitForExit() | Out-Null
+    [pscustomobject]@{
+        ExitCode = $Capture.Process.ExitCode
+        Stdout = $Capture.StdoutTask.GetAwaiter().GetResult()
+        Stderr = $Capture.StderrTask.GetAwaiter().GetResult()
+    }
+}
+
+function Test-RedirectedProcessCaptureDoesNotDeadlock {
+    $payloadBytes = 65536
+    $childScript = Join-Path ([System.IO.Path]::GetTempPath()) ("pickaxe-pipe-child-{0}.ps1" -f $PID)
+    @"
+`$bytes = New-Object byte[] $payloadBytes
+for (`$i = 0; `$i -lt `$bytes.Length; `$i++) { `$bytes[`$i] = 88 }
+[Console]::OpenStandardOutput().Write(`$bytes, 0, `$bytes.Length)
+[Console]::OpenStandardOutput().Flush()
+[Console]::Error.WriteLine('err-side')
+"@ | Set-Content -LiteralPath $childScript -Encoding ascii
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = "powershell.exe"
+    $startInfo.WorkingDirectory = [System.IO.Path]::GetTempPath()
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Arguments = "-NoProfile -File `"$childScript`""
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        $capture = Start-RedirectedProcessCapture -Process $process
+        if (-not $capture.Process.WaitForExit(10000)) {
+            try { $capture.Process.Kill() } catch {}
+            throw "Redirected process capture deadlocked on the stdout pipe."
+        }
+        $completed = Complete-RedirectedProcessCapture -Capture $capture
+        if ($completed.Stdout.Length -ne $payloadBytes) {
+            throw "Redirected process capture read $($completed.Stdout.Length) stdout bytes; expected $payloadBytes."
+        }
+        if ($completed.Stderr -notmatch "err-side") {
+            throw "Redirected process capture dropped stderr: $($completed.Stderr)"
+        }
+    } finally {
+        Remove-Item -LiteralPath $childScript -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($SelfTest) {
     $syntheticGpuProcesses = @(
         "61300, C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
@@ -371,6 +444,8 @@ if ($SelfTest) {
         throw "Self-test failed: one transient memory spike was classified as sustained growth."
     }
 
+    Test-RedirectedProcessCaptureDoesNotDeadlock
+
     Write-Output "cuda-soak evidence self-test: PASS"
     return
 }
@@ -414,9 +489,7 @@ try {
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
-    if (!$process.Start()) {
-        throw "Failed to start CUDA benchmark process."
-    }
+    $capture = Start-RedirectedProcessCapture -Process $process
 
     $samples = [System.Collections.Generic.List[object]]::new()
     $started = Get-Date
@@ -424,10 +497,10 @@ try {
     $previousCpuSeconds = $null
     $previousCpuSample = $null
 
-    while (!$process.HasExited) {
+    while (!$capture.Process.HasExited) {
         $now = Get-Date
         $elapsed = ($now - $started).TotalSeconds
-        $proc = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+        $proc = Get-Process -Id $capture.Process.Id -ErrorAction SilentlyContinue
 
         $gpu = $null
         try {
@@ -479,17 +552,17 @@ try {
         }
 
         Start-Sleep -Seconds $SampleIntervalSeconds
-        $process.Refresh()
+        $capture.Process.Refresh()
     }
 
-    $process.WaitForExit()
     $finished = Get-Date
     $observedRuntimeSeconds = ($finished - $started).TotalSeconds
-    $benchmarkStdout = $process.StandardOutput.ReadToEnd()
-    $benchmarkStderr = $process.StandardError.ReadToEnd()
+    $completedCapture = Complete-RedirectedProcessCapture -Capture $capture
+    $benchmarkStdout = $completedCapture.Stdout
+    $benchmarkStderr = $completedCapture.Stderr
     $benchmarkStdout | Set-Content -Encoding utf8 $benchmarkPath
     $benchmarkStderr | Set-Content -Encoding utf8 $stderrPath
-    $exitCode = $process.ExitCode
+    $exitCode = $completedCapture.ExitCode
     $samples | Export-Csv -NoTypeInformation -Path $csvPath
 
     $benchmarkReport = $null

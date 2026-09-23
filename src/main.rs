@@ -637,7 +637,7 @@ fn handle_line(
                     Ok(n) => n,
                     Err(_) => {
                         println!("bad nonce");
-                        return false;
+                        return true;
                     }
                 };
                 match live.as_ref() {
@@ -937,6 +937,7 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "stale_winners": snapshot.stale_winners,
         "verified_winners": snapshot.verified_winners,
         "pending_winners": snapshot.pending_winners,
+        "rejected_winners": snapshot.search.rejected_winners,
         "last_error": snapshot.last_error,
         "gpu_telemetry": &snapshot.gpu_telemetry,
         "gpu_efficiency_candidates_per_watt": efficiency,
@@ -958,7 +959,7 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
         let telemetry = &snapshot.gpu_telemetry;
         let efficiency = telemetry.candidates_per_watt(snapshot.search.current_rate);
         println!(
-            "state={:?} backend={} device={} generation={} height={} baton={}:{} target={} intensity={} candidates={} batches={} current={} avg={} peak={} state_checks={} refresh_failures={} transport_failures={} consecutive_refresh_failures={} source_degraded={} job_changes={} reconnects={} rotations={} winners={} pending={} gpu_util={} power={} temp={} vram={} efficiency={}",
+            "state={:?} backend={} device={} generation={} height={} baton={}:{} target={} intensity={} candidates={} batches={} current={} avg={} peak={} state_checks={} refresh_failures={} transport_failures={} consecutive_refresh_failures={} source_degraded={} job_changes={} reconnects={} rotations={} winners={} rejected={} pending={} gpu_util={} power={} temp={} vram={} efficiency={}",
             snapshot.state,
             snapshot.gpu_backend,
             snapshot.gpu_device,
@@ -982,6 +983,7 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             snapshot.reconnects,
             snapshot.endpoint_rotations,
             snapshot.verified_winners,
+            snapshot.search.rejected_winners,
             snapshot.pending_winners,
             runtime_metric(telemetry.gpu_utilization_percent, "%"),
             runtime_metric(telemetry.power_watts, "W"),
@@ -1345,6 +1347,84 @@ mod tests {
     }
 
     #[test]
+    fn bad_applysig_nonce_keeps_the_repl_running() {
+        let mut cfg = config::RuntimeConfig::default();
+        cfg.set_payout(config::DONATION_ADDRESS.into()).unwrap();
+        let mut handle = None;
+        let mut live = Some(live_job());
+        let mut armed = None;
+        let mut last_template = None;
+        let keep_running = handle_line(
+            &mut cfg,
+            &mut handle,
+            &mut live,
+            &mut armed,
+            &mut last_template,
+            "applysig 12x 00 00",
+        );
+        assert!(keep_running);
+        assert!(live.is_some());
+        assert!(armed.is_none());
+        assert!(!handle_line(
+            &mut cfg,
+            &mut handle,
+            &mut live,
+            &mut armed,
+            &mut last_template,
+            "quit",
+        ));
+    }
+
+    #[test]
+    fn release_workflow_prepares_pickaxe_miner_v0_1_0() {
+        let workflow = include_str!("../.github/workflows/release.yml");
+        let version = cargo_package_version(include_str!("../Cargo.toml"));
+        assert_eq!(version, "0.1.0");
+
+        let pattern = release_tag_pattern(workflow);
+        assert!(
+            release_tag_matches(&pattern, "pickaxe-miner-v0.1.0"),
+            "{pattern}"
+        );
+        assert!(!release_tag_matches(&pattern, "v0.1.0"), "{pattern}");
+        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.1.0-rc.1"));
+        assert!(workflow.contains("pickaxe-miner-v*.*.*"));
+        assert!(!workflow.lines().any(|line| line.trim() == "- \"v*.*.*\""));
+        assert!(workflow.contains("if [[ \"pickaxe-miner-v${version}\" != \"${TAG}\" ]]; then"));
+        let tag = format!("pickaxe-miner-v{version}");
+        assert_eq!(tag, "pickaxe-miner-v0.1.0");
+        assert_ne!(tag, format!("v{version}"));
+
+        assert!(workflow.contains("release_title=\"Pickaxe Miner v${version}\""));
+        assert!(workflow.contains("--title \"${release_title}\""));
+        let title = format!("Pickaxe Miner v{version}");
+        assert_eq!(title, "Pickaxe Miner v0.1.0");
+
+        assert!(workflow.contains("pickaxe-miner-v${version}-linux-x86_64"));
+        assert!(workflow.contains("pickaxe-miner-v$version-windows-x86_64"));
+        assert!(workflow.contains("\"${TAG}-linux-x86_64.tar.gz\""));
+        assert!(workflow.contains("\"${TAG}-windows-x86_64.zip\""));
+        assert!(!workflow.contains("pickaxe-${TAG}"));
+        assert!(!workflow.contains("pickaxe-$env:TAG"));
+        assert!(!workflow.contains("pickaxe-pickaxe-miner"));
+
+        let linux = format!("pickaxe-miner-v{version}-linux-x86_64");
+        let windows = format!("pickaxe-miner-v{version}-windows-x86_64");
+        assert!(linux.starts_with(&tag));
+        assert!(windows.starts_with(&tag));
+        assert_eq!(
+            linux.trim_end_matches("-linux-x86_64"),
+            windows.trim_end_matches("-windows-x86_64")
+        );
+
+        assert!(!workflow.to_ascii_lowercase().contains("aarch64"));
+        assert!(!workflow.contains("apple-darwin"));
+        assert!(!workflow.contains("-arm64"));
+        assert!(workflow.contains("GH_REPO: ${{ github.repository }}"));
+        assert!(workflow.contains("--repo \"${GH_REPO}\""));
+    }
+
+    #[test]
     fn startup_enters_setup_by_default() {
         let args = cli::Cli::try_parse_from(["pickaxe", "mine"]).unwrap();
         let cfg = runtime_config_from_cli(&args).unwrap();
@@ -1393,6 +1473,10 @@ mod tests {
                 current_rate: 65_536.0,
                 peak_rate: 65_536.0,
                 winners: 0,
+                rejected_winners: 2,
+                last_error: Some(
+                    "GPU winner rejected by host verification: HASH256 mismatch".into(),
+                ),
             },
             gpu_telemetry: telemetry::GpuTelemetry {
                 samples: 3,
@@ -1414,6 +1498,7 @@ mod tests {
         assert_eq!(status["job_changes"], 1);
         assert_eq!(status["reconnects"], 0);
         assert_eq!(status["endpoint_rotations"], 1);
+        assert_eq!(status["rejected_winners"], 2);
         assert_eq!(status["photon_target_le"], "ff".repeat(32));
         assert!(status.get("refreshes").is_none());
         assert!(status.get("stale_rebuilds").is_none());
@@ -1562,5 +1647,65 @@ mod tests {
         let mut stale_baton = job;
         stale_baton.baton_txid = "22".repeat(32);
         assert!(validate_verified_winner_current(&winner, &cfg, Some(&stale_baton)).is_err());
+    }
+
+    fn cargo_package_version(cargo_toml: &str) -> String {
+        cargo_toml
+            .lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix("version = \"")?;
+                rest.strip_suffix('"').map(str::to_string)
+            })
+            .expect("Cargo.toml version")
+    }
+
+    fn release_tag_pattern(workflow: &str) -> String {
+        let marker = "=~ ";
+        let start = workflow.find(marker).expect("release workflow tag matcher") + marker.len();
+        let rest = &workflow[start..];
+        let end = rest.find(" ]];").expect("release workflow tag matcher end");
+        rest[..end].trim().to_string()
+    }
+
+    fn release_tag_matches(pattern: &str, tag: &str) -> bool {
+        assert_eq!(
+            pattern,
+            "^pickaxe-miner-v[0-9]+\\.[0-9]+\\.[0-9]+([.-][0-9A-Za-z.-]+)?$"
+        );
+        let Some(rest) = tag.strip_prefix("pickaxe-miner-v") else {
+            return false;
+        };
+        let mut index = 0;
+        let bytes = rest.as_bytes();
+        for part in 0..3 {
+            if index >= bytes.len() || !bytes[index].is_ascii_digit() {
+                return false;
+            }
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if part < 2 {
+                if index >= bytes.len() || bytes[index] != b'.' {
+                    return false;
+                }
+                index += 1;
+            }
+        }
+        if index == bytes.len() {
+            return true;
+        }
+        let suffix = &rest[index..];
+        let mut chars = suffix.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if first != '.' && first != '-' {
+            return false;
+        }
+        let tail = chars.as_str();
+        !tail.is_empty()
+            && tail
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     }
 }

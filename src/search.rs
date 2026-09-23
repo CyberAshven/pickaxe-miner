@@ -13,7 +13,7 @@ use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -188,6 +188,8 @@ pub struct SearchStats {
     pub current_rate: f64,
     pub peak_rate: f64,
     pub winners: u64,
+    pub rejected_winners: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -429,6 +431,80 @@ fn deliver_verified_batch(
     true
 }
 
+struct WorkerDiagnostics {
+    last_error: Mutex<Option<String>>,
+    rejected_winners: AtomicU64,
+}
+
+impl WorkerDiagnostics {
+    fn new() -> Self {
+        Self {
+            last_error: Mutex::new(None),
+            rejected_winners: AtomicU64::new(0),
+        }
+    }
+
+    fn record_batch_error(&self, error: String) {
+        self.store_error(error);
+    }
+
+    fn record_rejected_winner(&self, error: String) {
+        self.rejected_winners.fetch_add(1, Ordering::Relaxed);
+        self.store_error(format!("GPU winner rejected by host verification: {error}"));
+    }
+
+    fn store_error(&self, error: String) {
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+    }
+
+    fn publish(&self, stats: &mut SearchStats) {
+        stats.rejected_winners = self.rejected_winners.load(Ordering::Relaxed);
+        stats.last_error = self
+            .last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+    }
+}
+
+struct AcceptedBatch {
+    candidates: u32,
+    verified: Vec<VerifiedWinner>,
+}
+
+enum BatchControl {
+    Continue(AcceptedBatch),
+    Stop,
+}
+
+fn absorb_search_batch(
+    diagnostics: &WorkerDiagnostics,
+    batch: Result<PhotonCudaBatchResult, String>,
+    mut verify: impl FnMut(&PhotonCudaWinner) -> Result<VerifiedWinner, String>,
+) -> BatchControl {
+    let result = match batch {
+        Ok(result) => result,
+        Err(error) => {
+            diagnostics.record_batch_error(error);
+            return BatchControl::Stop;
+        }
+    };
+    let mut verified = Vec::with_capacity(result.winners.len());
+    for winner in &result.winners {
+        match verify(winner) {
+            Ok(accepted) => verified.push(accepted),
+            Err(error) => diagnostics.record_rejected_winner(error),
+        }
+    }
+    BatchControl::Continue(AcceptedBatch {
+        candidates: result.candidates,
+        verified,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Runs the GPU worker, processing commands between batches.
 fn run_worker(
@@ -444,6 +520,7 @@ fn run_worker(
     batches: Arc<AtomicU64>,
     winners: Arc<AtomicU64>,
     generation_id: Arc<AtomicU64>,
+    diagnostics: Arc<WorkerDiagnostics>,
     job_rx: Receiver<WorkerCommand>,
     winner_tx: SyncSender<VerifiedWinner>,
 ) {
@@ -483,32 +560,28 @@ fn run_worker(
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
         let batch_size = engine.scheduled_batch_candidates(active_intensity);
         let batch_started = Instant::now();
-        let result = match engine.search_batch(nonce_base, batch_size) {
-            Ok(result) => result,
-            Err(_) => {
+        let batch = engine.search_batch(nonce_base, batch_size);
+        let control = absorb_search_batch(&diagnostics, batch, |gpu_winner| {
+            verify_gpu_winner(&prepared, &sk, &public_key, gpu_winner)
+        });
+        let accepted = match control {
+            BatchControl::Stop => {
                 batch_in_flight.store(false, Ordering::SeqCst);
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
+            BatchControl::Continue(accepted) => accepted,
         };
         let compute_time = batch_started.elapsed();
-        candidates.fetch_add(u64::from(result.candidates), Ordering::Relaxed);
+        candidates.fetch_add(u64::from(accepted.candidates), Ordering::Relaxed);
         batches.fetch_add(1, Ordering::Release);
 
-        let mut verified_batch = Vec::with_capacity(result.winners.len());
-        for gpu_winner in &result.winners {
-            let verified = match verify_gpu_winner(&prepared, &sk, &public_key, gpu_winner) {
-                Ok(verified) => verified,
-                Err(_) => continue,
-            };
-            verified_batch.push(verified);
-        }
-        if !deliver_verified_batch(verified_batch, &paused, &winners, &winner_tx) {
+        if !deliver_verified_batch(accepted.verified, &paused, &winners, &winner_tx) {
             stop.store(true, Ordering::Relaxed);
         }
         batch_in_flight.store(false, Ordering::SeqCst);
 
-        nonce_base = nonce_base.wrapping_add(result.candidates);
+        nonce_base = nonce_base.wrapping_add(accepted.candidates);
         let rest = duty_rest(compute_time, active_intensity);
         if !rest.is_zero() {
             thread::park_timeout(rest);
@@ -525,6 +598,7 @@ pub struct SearchHandle {
     batches: Arc<AtomicU64>,
     winners: Arc<AtomicU64>,
     generation_id: Arc<AtomicU64>,
+    diagnostics: Arc<WorkerDiagnostics>,
     job_tx: SyncSender<WorkerCommand>,
     winner_rx: Receiver<VerifiedWinner>,
     worker: Option<JoinHandle<()>>,
@@ -666,6 +740,7 @@ impl SearchHandle {
         let batches = Arc::new(AtomicU64::new(0));
         let winners = Arc::new(AtomicU64::new(0));
         let generation_id = Arc::new(AtomicU64::new(prepared.job.generation_id));
+        let diagnostics = Arc::new(WorkerDiagnostics::new());
         let (job_tx, job_rx) = mpsc::sync_channel(JOB_UPDATE_CHANNEL_CAP);
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
 
@@ -683,6 +758,7 @@ impl SearchHandle {
                 let worker_batches = Arc::clone(&batches);
                 let worker_winners = Arc::clone(&winners);
                 let worker_generation = Arc::clone(&generation_id);
+                let worker_diagnostics = Arc::clone(&diagnostics);
                 move || {
                     run_worker(
                         engine,
@@ -697,6 +773,7 @@ impl SearchHandle {
                         worker_batches,
                         worker_winners,
                         worker_generation,
+                        worker_diagnostics,
                         job_rx,
                         winner_tx,
                     )
@@ -713,6 +790,7 @@ impl SearchHandle {
             batches,
             winners,
             generation_id,
+            diagnostics,
             job_tx,
             winner_rx,
             worker: Some(worker),
@@ -811,7 +889,7 @@ impl SearchHandle {
     fn snapshot_final(&self) -> SearchStats {
         let candidates = self.candidates.load(Ordering::Relaxed);
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
-        SearchStats {
+        let mut stats = SearchStats {
             candidates,
             batches: self.batches.load(Ordering::Acquire),
             intensity: self.intensity.load(Ordering::Relaxed),
@@ -821,7 +899,11 @@ impl SearchHandle {
             current_rate: 0.0,
             peak_rate: 0.0,
             winners: self.winners.load(Ordering::Relaxed),
-        }
+            rejected_winners: 0,
+            last_error: None,
+        };
+        self.diagnostics.publish(&mut stats);
+        stats
     }
 
     /// Captures the current GPU search rates and state.
@@ -860,6 +942,53 @@ impl Drop for SearchHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
+
+    #[test]
+    fn search_batch_error_is_retained_and_stops_the_worker() {
+        let diagnostics = WorkerDiagnostics::new();
+        let control = absorb_search_batch(&diagnostics, Err("HIP launch failed".into()), |_| {
+            unreachable!("a failed batch has no winner to verify")
+        });
+        assert!(matches!(control, BatchControl::Stop));
+        let mut stats = SearchStats::default();
+        diagnostics.publish(&mut stats);
+        assert_eq!(stats.last_error.as_deref(), Some("HIP launch failed"));
+        assert_eq!(stats.rejected_winners, 0);
+    }
+
+    #[test]
+    fn rejected_gpu_winner_is_counted_and_reported() {
+        let diagnostics = WorkerDiagnostics::new();
+        let batch = PhotonCudaBatchResult {
+            candidates: 4,
+            total_winners: 1,
+            winners: vec![PhotonCudaWinner {
+                nonce: 7,
+                digest: [9; 32],
+            }],
+        };
+        let control =
+            absorb_search_batch(&diagnostics, Ok(batch), |_| Err("HASH256 mismatch".into()));
+        match control {
+            BatchControl::Continue(accepted) => {
+                assert_eq!(accepted.candidates, 4);
+                assert!(accepted.verified.is_empty());
+            }
+            BatchControl::Stop => {
+                panic!("host rejection must stay visible without stopping search")
+            }
+        }
+        let mut stats = SearchStats::default();
+        diagnostics.publish(&mut stats);
+        assert_eq!(stats.rejected_winners, 1);
+        let error = stats.last_error.expect("rejection reason");
+        assert!(
+            error.contains("GPU winner rejected by host verification"),
+            "{error}"
+        );
+        assert!(error.contains("HASH256 mismatch"), "{error}");
+    }
 
     #[test]
     fn hash256_empty() {
@@ -979,6 +1108,7 @@ mod tests {
             batches: Arc::new(AtomicU64::new(0)),
             winners: Arc::new(AtomicU64::new(0)),
             generation_id: Arc::new(AtomicU64::new(1)),
+            diagnostics: Arc::new(WorkerDiagnostics::new()),
             job_tx,
             winner_rx,
             worker: Some(worker),
@@ -1088,6 +1218,7 @@ mod tests {
             batches: Arc::new(AtomicU64::new(0)),
             winners: Arc::new(AtomicU64::new(0)),
             generation_id,
+            diagnostics: Arc::new(WorkerDiagnostics::new()),
             job_tx,
             winner_rx,
             worker: Some(worker),
