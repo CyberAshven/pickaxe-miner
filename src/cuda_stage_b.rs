@@ -99,11 +99,7 @@ mod tests {
             }
             Err(e) => {
                 let el = e.to_lowercase();
-                if el.contains("cuda")
-                    || el.contains("ptx")
-                    || el.contains("no device")
-                    || el.contains("not initialized")
-                {
+                if crate::cuda_photon::cuda_unavailable_for_tests(&el) {
                     eprintln!("skip Stage B GPU test: {e}");
                 } else {
                     panic!("unexpected Stage B error: {e}");

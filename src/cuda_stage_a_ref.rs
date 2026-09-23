@@ -108,11 +108,7 @@ mod tests {
     use crate::{crypto, cuda_stage_b, stage_b, tx};
 
     fn should_skip_cuda_error(error: &str) -> bool {
-        let lower = error.to_lowercase();
-        lower.contains("cuda")
-            || lower.contains("ptx")
-            || lower.contains("no device")
-            || lower.contains("not initialized")
+        crate::cuda_photon::cuda_unavailable_for_tests(error)
     }
 
     #[test]

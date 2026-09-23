@@ -323,11 +323,7 @@ mod tests {
     use crate::search;
 
     fn should_skip_cuda_error(error: &str) -> bool {
-        let lower = error.to_lowercase();
-        lower.contains("cuda")
-            || lower.contains("ptx")
-            || lower.contains("no device")
-            || lower.contains("not initialized")
+        crate::cuda_photon::cuda_unavailable_for_tests(error)
     }
 
     fn vector_parts() -> ([u8; TX_BYTES], u32, [u8; 32], [u8; SIGNATURE_BYTES]) {
