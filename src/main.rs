@@ -996,6 +996,7 @@ fn run_headless_mining(
         let snapshot = supervisor.snapshot();
         if last_status.elapsed() >= Duration::from_secs(1) {
             print_runtime_snapshot(&snapshot, json);
+            let _ = std::io::stdout().flush();
             last_status = Instant::now();
         }
         thread::sleep(Duration::from_millis(50));
@@ -1003,6 +1004,7 @@ fn run_headless_mining(
 
     let final_snapshot = supervisor.stop();
     print_runtime_snapshot(&final_snapshot, json);
+    let _ = std::io::stdout().flush();
     Ok(())
 }
 
