@@ -118,7 +118,10 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
         println!("active intensity: {}%", s.intensity);
         println!("winners:       {}", s.winners);
         println!("elapsed:       {}s", s.elapsed_secs);
-        println!("rate:          {:.0} work/s", s.rate);
+        println!(
+            "rate:          {}",
+            crate::telemetry::format_hash_rate(s.rate)
+        );
     }
     println!("Donation: 2%");
     match &cfg.fulcrum_url {
@@ -368,8 +371,9 @@ fn handle_line(
                 let s = h.stop();
                 cfg.mining = false;
                 println!(
-                    "stopped. candidates={} rate={:.0} H/s",
-                    s.candidates, s.rate
+                    "stopped. candidates={} rate={}",
+                    s.candidates,
+                    crate::telemetry::format_hash_rate(s.rate)
                 );
             }
             println!("bye.");
@@ -702,8 +706,10 @@ fn handle_line(
                 let s = h.stop();
                 cfg.mining = false;
                 println!(
-                    "stopped. candidates={} elapsed={}s rate={:.0} H/s",
-                    s.candidates, s.elapsed_secs, s.rate
+                    "stopped. candidates={} elapsed={}s rate={}",
+                    s.candidates,
+                    s.elapsed_secs,
+                    crate::telemetry::format_hash_rate(s.rate)
                 );
             } else {
                 println!("not mining");
@@ -891,6 +897,8 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "height": snapshot.height,
         "baton_txid": snapshot.baton_txid,
         "baton_vout": snapshot.baton_vout,
+        "photon_target_le": (!snapshot.photon_target_le.is_empty())
+            .then_some(snapshot.photon_target_le.as_str()),
         "payout_address": snapshot.payout_address,
         "intensity": snapshot.search.intensity,
         "candidates": snapshot.search.candidates,
@@ -929,7 +937,7 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
         let telemetry = &snapshot.gpu_telemetry;
         let efficiency = telemetry.candidates_per_watt(snapshot.search.current_rate);
         println!(
-            "state={:?} backend={} device={} generation={} height={} baton={}:{} intensity={} candidates={} batches={} current={:.0}/s avg={:.0}/s peak={:.0}/s state_checks={} refresh_failures={} transport_failures={} consecutive_refresh_failures={} source_degraded={} job_changes={} reconnects={} rotations={} winners={} pending={} gpu_util={} power={} temp={} vram={} efficiency={}",
+            "state={:?} backend={} device={} generation={} height={} baton={}:{} target={} intensity={} candidates={} batches={} current={} avg={} peak={} state_checks={} refresh_failures={} transport_failures={} consecutive_refresh_failures={} source_degraded={} job_changes={} reconnects={} rotations={} winners={} pending={} gpu_util={} power={} temp={} vram={} efficiency={}",
             snapshot.state,
             snapshot.gpu_backend,
             snapshot.gpu_device,
@@ -937,12 +945,13 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             snapshot.height,
             snapshot.baton_txid,
             snapshot.baton_vout,
+            crate::telemetry::format_photon_target(&snapshot.photon_target_le),
             snapshot.search.intensity,
             snapshot.search.candidates,
             snapshot.search.batches,
-            snapshot.search.current_rate,
-            snapshot.search.rate,
-            snapshot.search.peak_rate,
+            crate::telemetry::format_hash_rate(snapshot.search.current_rate),
+            crate::telemetry::format_hash_rate(snapshot.search.rate),
+            crate::telemetry::format_hash_rate(snapshot.search.peak_rate),
             snapshot.state_checks,
             snapshot.transient_refresh_failures,
             snapshot.transport_failures,
@@ -1336,6 +1345,7 @@ mod tests {
             height: 1_000,
             baton_txid: "11".repeat(32),
             baton_vout: 0,
+            photon_target_le: "ff".repeat(32),
             state_checks: 7,
             transient_refresh_failures: 2,
             transport_failures: 1,
@@ -1379,6 +1389,7 @@ mod tests {
         assert_eq!(status["job_changes"], 1);
         assert_eq!(status["reconnects"], 0);
         assert_eq!(status["endpoint_rotations"], 1);
+        assert_eq!(status["photon_target_le"], "ff".repeat(32));
         assert!(status.get("refreshes").is_none());
         assert!(status.get("stale_rebuilds").is_none());
         assert_eq!(status["gpu_telemetry"]["samples"], 3);
