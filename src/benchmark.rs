@@ -24,6 +24,12 @@ const VECTOR_REWARD_RAW: u128 = 4_999_773_813;
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 const MATRIX_MONOTONIC_TOLERANCE_PERCENT: f64 = 12.5;
 const MIN_MATRIX_100_TO_10_THROUGHPUT_RATIO: f64 = 2.0;
+/// Each throttled window must reach at least this share of its requested
+/// fraction of the 100% window's GPU utilization (the duty intensity sets).
+const MIN_MATRIX_DUTY_SHARE_PERCENT: f64 = 50.0;
+/// Without utilization telemetry, a looser floor on the throughput share.
+/// Throughput at light load also depends on the clocks the driver picks.
+const MIN_MATRIX_THROUGHPUT_SHARE_PERCENT: f64 = 20.0;
 
 /// Selects the configured GPU intensity samples for a benchmark.
 fn benchmark_intensities(requested: Option<u8>) -> Result<Vec<u8>, String> {
@@ -72,11 +78,15 @@ impl BenchmarkReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkMatrixValidation {
     pub required_intensities_present: bool,
-    pub approximately_monotonic_throughput: bool,
+    pub approximately_monotonic: bool,
     pub monotonic_tolerance_percent: f64,
     pub minimum_100_to_10_throughput_ratio: f64,
     pub observed_100_to_10_throughput_ratio: Option<f64>,
     pub real_scaling_observed: bool,
+    pub share_basis: &'static str,
+    pub minimum_requested_share_percent: f64,
+    pub lowest_observed_share_percent: Option<f64>,
+    pub proportional_intensity: bool,
     pub telemetry_load_increase_observed: Option<bool>,
 }
 
@@ -84,8 +94,9 @@ impl BenchmarkMatrixValidation {
     /// Reports whether the GPU benchmark checks passed.
     fn passed(&self) -> bool {
         self.required_intensities_present
-            && self.approximately_monotonic_throughput
+            && self.approximately_monotonic
             && self.real_scaling_observed
+            && self.proportional_intensity
     }
 }
 
@@ -191,18 +202,37 @@ fn average(sum: f64, count: u32) -> Option<f64> {
     (count > 0).then_some(sum / f64::from(count))
 }
 
-/// Checks the measured GPU throughput across all intensity levels.
+/// Checks measured duty and throughput across all intensity levels.
 fn validate_intensity_matrix(samples: &[BenchmarkSample]) -> BenchmarkMatrixValidation {
     let required_intensities_present = samples.len() == BENCHMARK_INTENSITIES.len()
         && samples
             .iter()
             .map(|sample| sample.intensity)
             .eq(BENCHMARK_INTENSITIES);
+    // Share of the requested fraction each throttled window achieved, as a
+    // percentage: 50% intensity at half of the 100% value is 100%. GPU
+    // utilization measures the duty intensity controls; use it when every
+    // window has it, otherwise fall back to throughput with a looser floor.
+    let utilization = samples
+        .iter()
+        .map(|sample| sample.telemetry.gpu_utilization_percent)
+        .collect::<Option<Vec<f64>>>();
+    let (share_basis, minimum_requested_share_percent, values) = match utilization {
+        Some(values) => ("gpu_utilization", MIN_MATRIX_DUTY_SHARE_PERCENT, values),
+        None => (
+            "throughput",
+            MIN_MATRIX_THROUGHPUT_SHARE_PERCENT,
+            samples
+                .iter()
+                .map(|sample| sample.candidates_per_second)
+                .collect(),
+        ),
+    };
     let tolerance_multiplier = 1.0 - MATRIX_MONOTONIC_TOLERANCE_PERCENT / 100.0;
-    let approximately_monotonic_throughput = required_intensities_present
-        && samples.windows(2).all(|pair| {
-            pair[1].candidates_per_second >= pair[0].candidates_per_second * tolerance_multiplier
-        });
+    let approximately_monotonic = required_intensities_present
+        && values
+            .windows(2)
+            .all(|pair| pair[1] >= pair[0] * tolerance_multiplier);
 
     let observed_100_to_10_throughput_ratio = match (samples.first(), samples.last()) {
         (Some(low), Some(high)) if low.candidates_per_second > 0.0 => {
@@ -213,6 +243,23 @@ fn validate_intensity_matrix(samples: &[BenchmarkSample]) -> BenchmarkMatrixVali
     let real_scaling_observed = required_intensities_present
         && observed_100_to_10_throughput_ratio
             .is_some_and(|ratio| ratio >= MIN_MATRIX_100_TO_10_THROUGHPUT_RATIO);
+
+    let lowest_observed_share_percent = values.last().copied().and_then(|full| {
+        (full > 0.0).then(|| {
+            samples
+                .iter()
+                .zip(&values)
+                .take(samples.len() - 1)
+                .map(|(sample, value)| {
+                    let requested = f64::from(sample.intensity) / 100.0;
+                    value / (full * requested) * 100.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        })
+    });
+    let proportional_intensity = required_intensities_present
+        && lowest_observed_share_percent
+            .is_some_and(|share| share >= minimum_requested_share_percent);
 
     let telemetry_load_increase_observed = match (samples.first(), samples.last()) {
         (Some(low), Some(high)) => {
@@ -238,11 +285,15 @@ fn validate_intensity_matrix(samples: &[BenchmarkSample]) -> BenchmarkMatrixVali
 
     BenchmarkMatrixValidation {
         required_intensities_present,
-        approximately_monotonic_throughput,
+        approximately_monotonic,
         monotonic_tolerance_percent: MATRIX_MONOTONIC_TOLERANCE_PERCENT,
         minimum_100_to_10_throughput_ratio: MIN_MATRIX_100_TO_10_THROUGHPUT_RATIO,
         observed_100_to_10_throughput_ratio,
         real_scaling_observed,
+        share_basis,
+        minimum_requested_share_percent,
+        lowest_observed_share_percent,
+        proportional_intensity,
         telemetry_load_increase_observed,
     }
 }
@@ -359,6 +410,7 @@ fn run_intensity_window(
     let mut candidates = 0u64;
     let mut batches = 0u64;
     let mut winners = 0u64;
+    let mut pacer = search::DutyPacer::new(started);
 
     while started.elapsed() < requested {
         let batch_candidates = engine.scheduled_batch_candidates(intensity);
@@ -381,7 +433,9 @@ fn run_intensity_window(
         batches = batches.saturating_add(1);
         *nonce_base = (*nonce_base).wrapping_add(result.candidates);
         let remaining = requested.saturating_sub(started.elapsed());
-        let rest = search::duty_rest(compute_time, intensity).min(remaining);
+        let rest = pacer
+            .record_batch(intensity, compute_time, Instant::now())
+            .min(remaining);
         if !rest.is_zero() {
             thread::park_timeout(rest);
         }
@@ -583,12 +637,18 @@ pub fn print_report(report: &BenchmarkReport, json: bool) {
             .map(|value| if value { "yes" } else { "no" })
             .unwrap_or("n/a");
         println!(
-            "Intensity validation: required={} monotonic={} (tolerance {:.1}%) 100/10={} (min {:.1}x) telemetry-load-increase={}",
+            "Intensity validation: required={} monotonic={} (tolerance {:.1}%) 100/10={} (min {:.1}x) lowest-{}-share={} (min {:.0}%) telemetry-load-increase={}",
             validation.required_intensities_present,
-            validation.approximately_monotonic_throughput,
+            validation.approximately_monotonic,
             validation.monotonic_tolerance_percent,
             span,
             validation.minimum_100_to_10_throughput_ratio,
+            validation.share_basis,
+            validation
+                .lowest_observed_share_percent
+                .map(|value| format!("{value:.0}%"))
+                .unwrap_or_else(|| "n/a".into()),
+            validation.minimum_requested_share_percent,
             telemetry,
         );
     }
@@ -674,9 +734,72 @@ mod tests {
         let samples = BENCHMARK_INTENSITIES.map(|intensity| benchmark_sample(intensity, 100_000.0));
         let validation = validate_intensity_matrix(&samples);
         assert!(validation.required_intensities_present);
-        assert!(validation.approximately_monotonic_throughput);
+        assert!(validation.approximately_monotonic);
         assert!(!validation.real_scaling_observed);
         assert!(!validation.passed());
+    }
+
+    #[test]
+    /// Checks that a throttled curve collapsed by sleep granularity fails,
+    /// even though it is monotonic and 100/10 exceeds the minimum ratio.
+    fn intensity_matrix_validation_rejects_collapsed_throttled_windows() {
+        // Measured on the RTX 5070 Ti before duty pacing: every throttled
+        // window ran one small batch per 15.6 ms timer tick.
+        let samples = [
+            benchmark_sample(10, 238_160.0),
+            benchmark_sample(25, 237_521.0),
+            benchmark_sample(50, 259_175.0),
+            benchmark_sample(75, 259_314.0),
+            benchmark_sample(100, 18_168_271.0),
+        ];
+        let validation = validate_intensity_matrix(&samples);
+        assert!(validation.approximately_monotonic);
+        assert!(validation.real_scaling_observed);
+        assert!(!validation.proportional_intensity);
+        assert_eq!(validation.share_basis, "throughput");
+        assert!(!validation.passed());
+        let share = validation.lowest_observed_share_percent.unwrap();
+        assert!(share < 5.0, "75% window delivered {share:.1}% of its share");
+    }
+
+    #[test]
+    /// Checks the duty-based proportionality check against RTX 5070 Ti
+    /// matrices measured before and after duty pacing.
+    fn intensity_matrix_validation_uses_gpu_utilization_for_duty() {
+        let measured = |rows: [(u8, f64, f64); 5]| {
+            rows.map(|(intensity, rate, utilization)| {
+                let mut sample = benchmark_sample(intensity, rate);
+                sample.telemetry.gpu_utilization_percent = Some(utilization);
+                sample
+            })
+        };
+        // Per-batch sleeps: every throttled window near 4% busy.
+        let collapsed = measured([
+            (10, 238_160.0, 3.0),
+            (25, 237_521.0, 4.0),
+            (50, 259_175.0, 4.3),
+            (75, 259_314.0, 4.4),
+            (100, 18_168_271.0, 93.8),
+        ]);
+        let validation = validate_intensity_matrix(&collapsed);
+        assert_eq!(validation.share_basis, "gpu_utilization");
+        assert!(!validation.proportional_intensity);
+        assert!(!validation.passed());
+
+        // Duty pacing: busy share follows intensity. The 25% window ran in a
+        // low memory-clock power state after the 10% window, so its
+        // throughput was low, but the duty was right.
+        let paced = measured([
+            (10, 1_060_629.0, 9.5),
+            (25, 918_806.0, 23.2),
+            (50, 7_490_215.0, 42.7),
+            (75, 11_885_598.0, 71.4),
+            (100, 18_216_809.0, 98.0),
+        ]);
+        let validation = validate_intensity_matrix(&paced);
+        assert!(validation.proportional_intensity);
+        assert!(validation.lowest_observed_share_percent.unwrap() > 85.0);
+        assert!(validation.passed());
     }
 
     #[test]
@@ -690,7 +813,7 @@ mod tests {
             benchmark_sample(100, 191_000.0),
         ];
         let validation = validate_intensity_matrix(&samples);
-        assert!(validation.approximately_monotonic_throughput);
+        assert!(validation.approximately_monotonic);
         assert!(validation.passed());
     }
 
