@@ -8,7 +8,6 @@ Local mirrors / cites for protocol work. **Not** product code.
 - Mirrored here: `reference/index.html`, `miner.js`, `photon-miner.wgsl`, `test-vectors.js`, `generator-table.bin`
 - Extracted constants: `photon_*.hex`, `SOURCE.md`
 - Product DoD / mining contract: `docs/DEFINITION_OF_DONE.md`
-- Codex PERFORMANCE CONTRACT (private bridge): `.agent-bridge/user-directive.md` (not for public git)
 
 PHOTON is the PoW / CashToken baton mining path Pickaxe implements.
 
