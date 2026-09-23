@@ -1,9 +1,27 @@
 name: Release
 
+# Release modes:
+# - push to master: tag pickaxe-miner-v<Cargo.toml version> on the pushed
+#   commit and publish it, unless that tag already exists (no version bump).
+# - pull_request to master: dry run of the same build and packaging; nothing
+#   is tagged or published.
+# - push of a pickaxe-miner-v* tag, or manual dispatch with an existing tag:
+#   build and publish that tag.
 on:
   push:
+    branches:
+      - master
     tags:
       - "pickaxe-miner-v*.*.*"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "cuda/build/**"
+      - "tools/build_hip.py"
   workflow_dispatch:
     inputs:
       tag:
@@ -16,7 +34,7 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref_name }}-${{ inputs.tag }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,35 +46,70 @@ jobs:
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+      mode: ${{ steps.release.outputs.mode }}
 
     steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || (github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha) }}
+          persist-credentials: false
+
       - name: Resolve release tag
         id: release
         shell: bash
         env:
+          PUSH_REF_TYPE: ${{ github.ref_type }}
           PUSH_TAG: ${{ github.ref_name }}
           MANUAL_TAG: ${{ inputs.tag }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            tag="${PUSH_TAG}"
-          else
-            tag="${MANUAL_TAG}"
-          fi
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+
+          # mode: publish (existing tag), create (new tag on this commit),
+          # dry-run (pull request), skip (master push without a new version).
+          case "${GITHUB_EVENT_NAME}:${PUSH_REF_TYPE}" in
+            push:tag)
+              tag="${PUSH_TAG}"
+              mode="publish"
+              ;;
+            workflow_dispatch:*)
+              tag="${MANUAL_TAG}"
+              mode="publish"
+              ;;
+            push:branch)
+              tag="pickaxe-miner-v${version}"
+              if git ls-remote --exit-code --tags "${REPO_URL}" "refs/tags/${tag}" >/dev/null; then
+                mode="skip"
+                echo "::notice::${tag} already exists; bump Cargo.toml version to publish a new release."
+              else
+                mode="create"
+              fi
+              ;;
+            pull_request:*)
+              tag="pickaxe-miner-v${version}"
+              mode="dry-run"
+              ;;
+            *)
+              echo "Unsupported release trigger ${GITHUB_EVENT_NAME}:${PUSH_REF_TYPE}" >&2
+              exit 1
+              ;;
+          esac
 
           if [[ ! "${tag}" =~ ^pickaxe-miner-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release tag: ${tag}" >&2
             exit 1
           fi
 
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-
-      - name: Checkout tagged source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ steps.release.outputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
+          sha="$(git rev-parse HEAD)"
+          echo "Release ${tag} from ${sha} (${mode})"
+          {
+            echo "tag=${tag}"
+            echo "sha=${sha}"
+            echo "mode=${mode}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Install Rust stable
         run: |
@@ -84,16 +137,17 @@ jobs:
   hip-gfx1036:
     name: Build HIP gfx1036 code objects
     needs: validate
+    if: needs.validate.outputs.mode != 'skip'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
 
     steps:
-      - name: Checkout tagged source
+      - name: Checkout release source
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
 
       - name: Install pinned ROCm HIP compiler
@@ -156,10 +210,10 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout tagged source
+      - name: Checkout release source
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
 
       - name: Install Rust stable
@@ -384,18 +438,15 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  release:
-    name: Publish GitHub Release
+  checksums:
+    name: Checksum release assets
     needs:
       - validate
       - build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
-      artifact-metadata: write
+      contents: read
 
     steps:
       - name: Download release artifacts
@@ -409,6 +460,7 @@ jobs:
         shell: bash
         env:
           TAG: ${{ needs.validate.outputs.tag }}
+          MODE: ${{ needs.validate.outputs.mode }}
         run: |
           set -euo pipefail
           version="${TAG#pickaxe-miner-v}"
@@ -417,10 +469,7 @@ jobs:
             exit 1
           fi
           cd dist
-          sha256sum \
-            "${TAG}-linux-x86_64.tar.gz" \
-            "${TAG}-windows-x86_64.zip" \
-            > SHA256SUMS.txt
+          sha256sum             "${TAG}-linux-x86_64.tar.gz"             "${TAG}-windows-x86_64.zip"             > SHA256SUMS.txt
           cat SHA256SUMS.txt
           {
             echo "Pickaxe Miner v${version}"
@@ -435,6 +484,38 @@ jobs:
             echo "SHA-256"
             cat SHA256SUMS.txt
           } > RELEASE_NOTES.md
+          if [[ "${MODE}" == "dry-run" ]]; then
+            echo "Dry run: ${TAG} would be tagged and published on merge to master."
+          fi
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-bundle
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - checksums
+    if: needs.validate.outputs.mode == 'publish' || needs.validate.outputs.mode == 'create'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: release-bundle
+          path: dist
 
       - name: Generate build provenance
         uses: actions/attest@v4
@@ -447,6 +528,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          MODE: ${{ needs.validate.outputs.mode }}
         run: |
           set -euo pipefail
 
@@ -462,6 +545,20 @@ jobs:
             prerelease_args+=(--prerelease)
           fi
 
+          # A new tag is created by the release itself, on the exact commit
+          # that was built. An existing tag must already name that commit.
+          tag_args=(--verify-tag)
+          if [[ "${MODE}" == "create" ]]; then
+            if tagged="$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq .sha 2>/dev/null)"; then
+              if [[ "${tagged}" != "${SHA}" ]]; then
+                echo "${TAG} already exists on ${tagged}, not ${SHA}" >&2
+                exit 1
+              fi
+            else
+              tag_args=(--target "${SHA}")
+            fi
+          fi
+
           assets=(
             "dist/${TAG}-linux-x86_64.tar.gz"
             "dist/${TAG}-windows-x86_64.zip"
@@ -471,11 +568,5 @@ jobs:
           if gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
             gh release upload "${TAG}" --repo "${GH_REPO}" "${assets[@]}" --clobber
           else
-            gh release create "${TAG}" \
-              --repo "${GH_REPO}" \
-              --verify-tag \
-              --title "${release_title}" \
-              --notes-file dist/RELEASE_NOTES.md \
-              "${prerelease_args[@]}" \
-              "${assets[@]}"
+            gh release create "${TAG}"               --repo "${GH_REPO}"               "${tag_args[@]}"               --title "${release_title}"               --notes-file dist/RELEASE_NOTES.md               "${prerelease_args[@]}"               "${assets[@]}"
           fi

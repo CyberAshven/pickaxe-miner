@@ -26,7 +26,7 @@ The prepared v0.1.0 archives are:
 - Linux: `pickaxe-miner-v0.1.0-linux-x86_64.tar.gz`
 - Windows: `pickaxe-miner-v0.1.0-windows-x86_64.zip`
 
-The release also publishes `SHA256SUMS.txt` for those two archives. The GitHub Release for tag `pickaxe-miner-v0.1.0` is not published until a maintainer merges this branch and the tag is created from that merged commit. Until then, build from source.
+The release also publishes `SHA256SUMS.txt` for those two archives. Merging to `master` runs the Release workflow, which tags the merged commit `pickaxe-miner-v<Cargo.toml version>` and publishes these archives. A merge that does not bump the version publishes nothing. Pull requests run the same build and packaging as a dry run. Until the v0.1.0 release exists, build from source.
 
 Linux:
 
@@ -91,7 +91,7 @@ cargo run --release -- benchmark
 - There is no CPU mining fallback.
 - `wgpu` is not a verified production backend. Production mining is CUDA or HIP.
 - The donation is hard-coded at 2%.
-- Tag `pickaxe-miner-v0.1.0` and its GitHub Release are not published until a maintainer merges and publication runs on the merged commit.
+- Tag `pickaxe-miner-v0.1.0` and its GitHub Release are created automatically when this work is merged to `master`; they do not exist before that.
 
 ## Features
 
