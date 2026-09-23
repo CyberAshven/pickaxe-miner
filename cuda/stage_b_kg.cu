@@ -33,6 +33,169 @@ __device__ __forceinline__ int fecmp(const Fe* a, const Fe* b) {
     return 0;
 }
 
+// CUDA-only multiply path. Consumer NVIDIA GPUs issue 32-bit multiply-add
+// with carry at full rate; the portable path below builds each column in
+// u64 halves, which costs several more instructions per partial product.
+// HIP and host builds use the portable path.
+#if defined(__CUDA_ARCH__)
+#define PICKAXE_FE_PTX 1
+
+// (acc2:acc1:acc0) += x * y, using the PTX carry flag inside one statement.
+__device__ __forceinline__ void fe_mac_ptx(
+    uint32_t& acc0, uint32_t& acc1, uint32_t& acc2, uint32_t x, uint32_t y
+) {
+    asm("mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+        "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+        "addc.u32 %2, %2, 0;"
+        : "+r"(acc0), "+r"(acc1), "+r"(acc2)
+        : "r"(x), "r"(y));
+}
+
+// t = a * b as 16 little-endian words, one product column at a time. A
+// column holds at most 8 products plus the incoming carry, below 2^68, so
+// three accumulator words suffice.
+__device__ __forceinline__ void fe_mul_wide_ptx(uint32_t t[16], const Fe* a, const Fe* b) {
+    uint32_t acc0 = 0, acc1 = 0, acc2 = 0;
+#pragma unroll
+    for (int k = 0; k < 15; ++k) {
+#pragma unroll
+        for (int i = (k < 8 ? 0 : k - 7); i <= (k < 8 ? k : 7); ++i) {
+            fe_mac_ptx(acc0, acc1, acc2, a->d[i], b->d[k - i]);
+        }
+        t[k] = acc0;
+        acc0 = acc1;
+        acc1 = acc2;
+        acc2 = 0;
+    }
+    t[15] = acc0;
+}
+
+// r = t mod p, the same fold as fe_reduce512 below written as carry chains:
+// hi * 2^256 = hi * 977 + (hi << 32) (mod p), then the remaining word above
+// 2^256 is folded the same way, then one conditional subtraction of p.
+__device__ __forceinline__ void fe_reduce_wide_ptx(Fe* r, const uint32_t t[16]) {
+    // m = hi * 977, nine words (each hi word times 977 is below 2^42).
+    uint32_t m0, m1, m2, m3, m4, m5, m6, m7, m8;
+    asm("mul.lo.u32 %0, %9, 977;\n\t"
+        "mul.hi.u32 %1, %9, 977;\n\t"
+        "mad.lo.cc.u32 %1, %10, 977, %1;\n\t"
+        "madc.hi.u32 %2, %10, 977, 0;\n\t"
+        "mad.lo.cc.u32 %2, %11, 977, %2;\n\t"
+        "madc.hi.u32 %3, %11, 977, 0;\n\t"
+        "mad.lo.cc.u32 %3, %12, 977, %3;\n\t"
+        "madc.hi.u32 %4, %12, 977, 0;\n\t"
+        "mad.lo.cc.u32 %4, %13, 977, %4;\n\t"
+        "madc.hi.u32 %5, %13, 977, 0;\n\t"
+        "mad.lo.cc.u32 %5, %14, 977, %5;\n\t"
+        "madc.hi.u32 %6, %14, 977, 0;\n\t"
+        "mad.lo.cc.u32 %6, %15, 977, %6;\n\t"
+        "madc.hi.u32 %7, %15, 977, 0;\n\t"
+        "mad.lo.cc.u32 %7, %16, 977, %7;\n\t"
+        "madc.hi.u32 %8, %16, 977, 0;"
+        : "=r"(m0), "=r"(m1), "=r"(m2), "=r"(m3), "=r"(m4),
+          "=r"(m5), "=r"(m6), "=r"(m7), "=r"(m8)
+        : "r"(t[8]), "r"(t[9]), "r"(t[10]), "r"(t[11]),
+          "r"(t[12]), "r"(t[13]), "r"(t[14]), "r"(t[15]));
+
+    // lo + m + (hi << 32): r0..r7 and the words above 2^256 in (m8, m9).
+    uint32_t r0 = t[0], r1 = t[1], r2 = t[2], r3 = t[3];
+    uint32_t r4 = t[4], r5 = t[5], r6 = t[6], r7 = t[7];
+    uint32_t m9;
+    asm("add.cc.u32 %0, %0, %10;\n\t"
+        "addc.cc.u32 %1, %1, %11;\n\t"
+        "addc.cc.u32 %2, %2, %12;\n\t"
+        "addc.cc.u32 %3, %3, %13;\n\t"
+        "addc.cc.u32 %4, %4, %14;\n\t"
+        "addc.cc.u32 %5, %5, %15;\n\t"
+        "addc.cc.u32 %6, %6, %16;\n\t"
+        "addc.cc.u32 %7, %7, %17;\n\t"
+        "addc.cc.u32 %8, %8, 0;\n\t"
+        "addc.u32 %9, 0, 0;"
+        : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r4),
+          "+r"(r5), "+r"(r6), "+r"(r7), "+r"(m8), "=r"(m9)
+        : "r"(m0), "r"(m1), "r"(m2), "r"(m3),
+          "r"(m4), "r"(m5), "r"(m6), "r"(m7));
+    // hi << 32: t8..t14 land on r1..r7 and t15 on m8; the carry goes to m9.
+    asm("add.cc.u32 %0, %0, %9;\n\t"
+        "addc.cc.u32 %1, %1, %10;\n\t"
+        "addc.cc.u32 %2, %2, %11;\n\t"
+        "addc.cc.u32 %3, %3, %12;\n\t"
+        "addc.cc.u32 %4, %4, %13;\n\t"
+        "addc.cc.u32 %5, %5, %14;\n\t"
+        "addc.cc.u32 %6, %6, %15;\n\t"
+        "addc.cc.u32 %7, %7, %16;\n\t"
+        "addc.u32 %8, %8, 0;"
+        : "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r4), "+r"(r5),
+          "+r"(r6), "+r"(r7), "+r"(m8), "+r"(m9)
+        : "r"(t[8]), "r"(t[9]), "r"(t[10]), "r"(t[11]),
+          "r"(t[12]), "r"(t[13]), "r"(t[14]), "r"(t[15]));
+
+    // top = m9:m8 (below 2^35). Add top * 977 + (top << 32).
+    uint32_t f0, f1, f2;
+    asm("mul.lo.u32 %0, %3, 977;\n\t"
+        "mul.hi.u32 %1, %3, 977;\n\t"
+        "mad.lo.cc.u32 %1, %4, 977, %1;\n\t"
+        "madc.hi.u32 %2, %4, 977, 0;\n\t"
+        "add.cc.u32 %1, %1, %3;\n\t"
+        "addc.u32 %2, %2, %4;"
+        : "=r"(f0), "=r"(f1), "=r"(f2)
+        : "r"(m8), "r"(m9));
+    uint32_t overflow;
+    asm("add.cc.u32 %0, %0, %9;\n\t"
+        "addc.cc.u32 %1, %1, %10;\n\t"
+        "addc.cc.u32 %2, %2, %11;\n\t"
+        "addc.cc.u32 %3, %3, 0;\n\t"
+        "addc.cc.u32 %4, %4, 0;\n\t"
+        "addc.cc.u32 %5, %5, 0;\n\t"
+        "addc.cc.u32 %6, %6, 0;\n\t"
+        "addc.cc.u32 %7, %7, 0;\n\t"
+        "addc.u32 %8, 0, 0;"
+        : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3),
+          "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7), "=r"(overflow)
+        : "r"(f0), "r"(f1), "r"(f2));
+    // A carry here leaves a low part below 2^67; adding 2^32 + 977 for it
+    // cannot carry again.
+    asm("add.cc.u32 %0, %0, %8;\n\t"
+        "addc.cc.u32 %1, %1, %9;\n\t"
+        "addc.cc.u32 %2, %2, 0;\n\t"
+        "addc.cc.u32 %3, %3, 0;\n\t"
+        "addc.cc.u32 %4, %4, 0;\n\t"
+        "addc.cc.u32 %5, %5, 0;\n\t"
+        "addc.cc.u32 %6, %6, 0;\n\t"
+        "addc.u32 %7, %7, 0;"
+        : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3),
+          "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7)
+        : "r"(overflow * 977u), "r"(overflow));
+
+    // Subtract p when the value is at least p.
+    uint32_t s0, s1, s2, s3, s4, s5, s6, s7, below;
+    asm("sub.cc.u32 %0, %9, 0xFFFFFC2F;\n\t"
+        "subc.cc.u32 %1, %10, 0xFFFFFFFE;\n\t"
+        "subc.cc.u32 %2, %11, 0xFFFFFFFF;\n\t"
+        "subc.cc.u32 %3, %12, 0xFFFFFFFF;\n\t"
+        "subc.cc.u32 %4, %13, 0xFFFFFFFF;\n\t"
+        "subc.cc.u32 %5, %14, 0xFFFFFFFF;\n\t"
+        "subc.cc.u32 %6, %15, 0xFFFFFFFF;\n\t"
+        "subc.cc.u32 %7, %16, 0xFFFFFFFF;\n\t"
+        "subc.u32 %8, 0, 0;"
+        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3),
+          "=r"(s4), "=r"(s5), "=r"(s6), "=r"(s7), "=r"(below)
+        : "r"(r0), "r"(r1), "r"(r2), "r"(r3),
+          "r"(r4), "r"(r5), "r"(r6), "r"(r7));
+    // below is all ones when the value was already under p.
+    r->d[0] = (r0 & below) | (s0 & ~below);
+    r->d[1] = (r1 & below) | (s1 & ~below);
+    r->d[2] = (r2 & below) | (s2 & ~below);
+    r->d[3] = (r3 & below) | (s3 & ~below);
+    r->d[4] = (r4 & below) | (s4 & ~below);
+    r->d[5] = (r5 & below) | (s5 & ~below);
+    r->d[6] = (r6 & below) | (s6 & ~below);
+    r->d[7] = (r7 & below) | (s7 & ~below);
+}
+#else
+#define PICKAXE_FE_PTX 0
+#endif
+
 // Field arithmetic mod p = 2^256 - 2^32 - 977. Results are fully reduced
 // (< p). feadd/fesub expect reduced inputs; femul/fesqr accept any 256-bit
 // inputs. Everything is straight-line register code: no carry loops, no
@@ -141,6 +304,11 @@ __device__ __forceinline__ void fe_reduce512(Fe* r, const uint32_t t[16]) {
 }
 
 __device__ __forceinline__ void femul(Fe* r, const Fe* a, const Fe* b) {
+#if PICKAXE_FE_PTX
+    uint32_t product[16];
+    fe_mul_wide_ptx(product, a, b);
+    fe_reduce_wide_ptx(r, product);
+#else
     // Column-wise schoolbook product. Each column sums the low and high
     // halves of its partial products separately, so nothing overflows u64.
     uint32_t t[16];
@@ -160,9 +328,16 @@ __device__ __forceinline__ void femul(Fe* r, const Fe* a, const Fe* b) {
     }
     t[15] = (uint32_t)carry;
     fe_reduce512(r, t);
+#endif
 }
 
 __device__ __forceinline__ void fesqr(Fe* r, const Fe* a) {
+#if PICKAXE_FE_PTX
+    // Squares with the PTX multiply.
+    uint32_t product[16];
+    fe_mul_wide_ptx(product, a, a);
+    fe_reduce_wide_ptx(r, product);
+#else
     // As femul, but each cross product a[i]*a[j] (i < j) is computed once
     // and doubled.
     uint32_t t[16];
@@ -190,6 +365,7 @@ __device__ __forceinline__ void fesqr(Fe* r, const Fe* a) {
     }
     t[15] = (uint32_t)carry;
     fe_reduce512(r, t);
+#endif
 }
 
 __device__ __forceinline__ void fesqr_n(Fe* r, int n) {
