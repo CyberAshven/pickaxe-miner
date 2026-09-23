@@ -23,6 +23,8 @@ const TARGET_OFFSET: usize = 394;
 const SIGNATURE_BYTES: usize = 64;
 const POINT_WORDS: usize = 24;
 const FIXED_D_WORDS: usize = 32 * 256 * 8;
+/// Candidates per C1 thread that share one field inversion.
+const C1_CANDIDATES_PER_THREAD: u32 = 8;
 /// Transaction bytes before the nonce's SHA-256 block; fixed for a job.
 const MIDSTATE_BYTES: usize = 384;
 const SHA256_INITIAL_STATE: [u32; 8] = [
@@ -140,6 +142,20 @@ fn load_function(
         .map_err(|error| format!("load {function_name}: {error}"))
 }
 
+/// Reports whether a CUDA test error means no usable CUDA device or driver,
+/// the only case in which GPU tests may skip. A missing kernel symbol or
+/// PTX file, or a launch failure, is a real failure.
+#[cfg(test)]
+pub(crate) fn cuda_unavailable_for_tests(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("cuda context")
+        || lower.contains("no_device")
+        || lower.contains("no device")
+        || lower.contains("not initialized")
+        || lower.contains("not_initialized")
+        || lower.contains("dynamically load")
+}
+
 /// SHA-256 state after the job-fixed transaction bytes 0..384.
 fn transaction_midstate(template: &[u8; TX_BYTES]) -> [u32; 8] {
     let mut state = SHA256_INITIAL_STATE;
@@ -201,7 +217,7 @@ impl CudaPhotonEngine {
         let stage_c1 = load_function(
             &ctx,
             "photon_c1_schnorr.ptx",
-            "pickaxe_photon_c1_schnorr_dual",
+            "pickaxe_photon_c1_schnorr_dual_batched",
         )?;
         let stage_c3 = load_function(&ctx, "photon_c3_dual.ptx", "pickaxe_stage_c_dual_filter")?;
 
@@ -404,8 +420,9 @@ impl CudaPhotonEngine {
             }
         }
 
+        let c1_per_thread = C1_CANDIDATES_PER_THREAD;
         let c1_cfg = LaunchConfig {
-            grid_dim: (candidate_count.div_ceil(64), 1, 1),
+            grid_dim: (candidate_count.div_ceil(c1_per_thread).div_ceil(64), 1, 1),
             block_dim: (64, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -418,7 +435,8 @@ impl CudaPhotonEngine {
                 .arg(&self.fixed_d_gpu)
                 .arg(&mut self.signatures_gpu)
                 .arg(&mut self.negated_nonce_s_gpu)
-                .arg(&candidate_count);
+                .arg(&candidate_count)
+                .arg(&c1_per_thread);
             c1.launch(c1_cfg)
                 .map_err(|error| format!("launch PHOTON Stage C1: {error}"))?;
         }
@@ -561,11 +579,7 @@ mod tests {
     }
 
     fn should_skip_cuda_error(error: &str) -> bool {
-        let lower = error.to_lowercase();
-        lower.contains("cuda")
-            || lower.contains("ptx")
-            || lower.contains("no device")
-            || lower.contains("not initialized")
+        crate::cuda_photon::cuda_unavailable_for_tests(error)
     }
 
     fn reference_template_with_target(target: [u8; 32]) -> [u8; TX_BYTES] {
@@ -763,7 +777,9 @@ mod tests {
         let mut private_key = [0u8; 32];
         private_key[31] = 1;
         let nonce_base = 0x2718_0000;
-        let candidate_count = 256;
+        // Not a multiple of the C1 per-thread count or block size, so the last
+        // thread and block are partial.
+        let candidate_count = 1_000;
 
         let mut engine = match CudaPhotonEngine::new(0, candidate_count, candidate_count) {
             Ok(engine) => engine,

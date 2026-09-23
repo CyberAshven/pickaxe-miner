@@ -23,8 +23,14 @@ use std::time::{Duration, Instant};
 pub const REFERENCE_GPU_PIPELINE_READY: bool = true;
 
 pub(crate) const MAX_BATCH_CANDIDATES: u32 = 65_536;
+/// CUDA batches are larger: C1 gives each thread 8 candidates that share
+/// one inversion, so a 256K batch keeps every SM busy (35.0M/s against
+/// 29.8M/s at 64K on the RTX 5070 Ti).
+pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 262_144;
 const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 524_288;
-const THROTTLED_BATCH_CANDIDATES: u32 = 16_384;
+/// Throttled batches are a quarter of the full batch: small enough for
+/// fine duty pacing, large enough to keep the GPU busy during a burst.
+const THROTTLED_BATCH_DIVISOR: u32 = 4;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const JOB_UPDATE_CHANNEL_CAP: usize = 2;
@@ -132,7 +138,8 @@ impl PhotonEngine {
     /// Calculates a bounded batch size for the selected intensity.
     pub(crate) fn scheduled_batch_candidates(&self, intensity: u8) -> u32 {
         let capacity = match self {
-            Self::Cuda(_) | Self::Hip(_) => scheduled_batch_candidates(),
+            Self::Cuda(_) => production_max_batch_candidates(BackendKind::Cuda),
+            Self::Hip(_) => production_max_batch_candidates(BackendKind::Hip),
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.recommended_batch_candidates(),
         };
@@ -144,7 +151,8 @@ impl PhotonEngine {
 pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32 {
     match backend {
         BackendKind::Wgpu => PORTABLE_WGPU_MAX_BATCH_CANDIDATES,
-        BackendKind::Auto | BackendKind::Cuda | BackendKind::Hip => MAX_BATCH_CANDIDATES,
+        BackendKind::Cuda => CUDA_MAX_BATCH_CANDIDATES,
+        BackendKind::Auto | BackendKind::Hip => MAX_BATCH_CANDIDATES,
     }
 }
 
@@ -378,18 +386,18 @@ fn verify_gpu_winner(
     })
 }
 
-/// Keep unthrottled production launches at the tuned full batch size.
-pub(crate) const fn scheduled_batch_candidates() -> u32 {
-    MAX_BATCH_CANDIDATES
-}
-
 /// Scales GPU batch candidates with requested intensity.
 pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> u32 {
     if capacity == 0 {
         return 0;
     }
-    if intensity < 100 && capacity > THROTTLED_BATCH_CANDIDATES {
-        THROTTLED_BATCH_CANDIDATES
+    if intensity < 100 {
+        let throttled = capacity / THROTTLED_BATCH_DIVISOR;
+        if throttled == 0 {
+            1
+        } else {
+            throttled
+        }
     } else {
         capacity
     }
@@ -1115,7 +1123,7 @@ mod tests {
 
     #[test]
     fn duty_pacer_holds_intensity_despite_coarse_sleep_ticks() {
-        // A 16,384-candidate batch is about 1 ms on the RTX 5070 Ti, and
+        // A throttled CUDA batch is 1-2 ms on the RTX 5070 Ti, and
         // Windows sleeps round up to about 15.6 ms.
         let compute = Duration::from_micros(1_000);
         let tick = Duration::from_micros(15_625);
@@ -1192,14 +1200,21 @@ mod tests {
 
     #[test]
     fn intensity_scales_real_gpu_duty() {
-        assert_eq!(scheduled_batch_candidates(), MAX_BATCH_CANDIDATES);
+        assert_eq!(
+            intensity_batch_candidates(CUDA_MAX_BATCH_CANDIDATES, 100),
+            262_144
+        );
+        assert_eq!(
+            intensity_batch_candidates(CUDA_MAX_BATCH_CANDIDATES, 50),
+            65_536
+        );
         assert_eq!(
             intensity_batch_candidates(MAX_BATCH_CANDIDATES, 100),
             65_536
         );
-        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 50), 16_384);
         assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 25), 16_384);
         assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 10), 16_384);
+        assert_eq!(intensity_batch_candidates(3, 10), 1);
         let compute = Duration::from_millis(10);
         assert_eq!(duty_rest(compute, 100), Duration::ZERO);
         assert_eq!(duty_rest(compute, 50), Duration::from_millis(10));
@@ -1228,7 +1243,7 @@ mod tests {
 
     #[test]
     fn production_batch_envelope_keeps_native_limit_and_reference_wgpu_limit() {
-        assert_eq!(production_max_batch_candidates(BackendKind::Cuda), 65_536);
+        assert_eq!(production_max_batch_candidates(BackendKind::Cuda), 262_144);
         assert_eq!(production_max_batch_candidates(BackendKind::Hip), 65_536);
         assert_eq!(
             production_max_batch_candidates(BackendKind::Wgpu),
@@ -1418,12 +1433,7 @@ mod tests {
     fn gpu_search_handle_replaces_generation_and_keeps_runtime_controls_if_cuda_present() {
         let handle = match SearchHandle::start(10, integration_job(1)) {
             Ok(handle) => handle,
-            Err(error)
-                if error.to_ascii_lowercase().contains("cuda context")
-                    || error.to_ascii_lowercase().contains("missing cuda ptx")
-                    || error.to_ascii_lowercase().contains("no device")
-                    || error.to_ascii_lowercase().contains("not initialized") =>
-            {
+            Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => {
                 eprintln!("skip integrated PHOTON CUDA SearchHandle test: {error}");
                 return;
             }
@@ -1461,12 +1471,7 @@ mod tests {
     fn supervised_search_runs_full_back_to_back_batches_if_cuda_present() {
         let handle = match SearchHandle::start_supervised(30, integration_job(1)) {
             Ok(handle) => handle,
-            Err(error)
-                if error.to_ascii_lowercase().contains("cuda context")
-                    || error.to_ascii_lowercase().contains("missing cuda ptx")
-                    || error.to_ascii_lowercase().contains("no device")
-                    || error.to_ascii_lowercase().contains("not initialized") =>
-            {
+            Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => {
                 eprintln!("skip supervised PHOTON CUDA continuous-batch test: {error}");
                 return;
             }
@@ -1490,7 +1495,7 @@ mod tests {
         let after = handle.snapshot();
         assert!(after.batches > before.batches);
         assert!(after.candidates > before.candidates);
-        let expected_batch = u64::from(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 30));
+        let expected_batch = u64::from(intensity_batch_candidates(CUDA_MAX_BATCH_CANDIDATES, 30));
         assert_eq!(
             after.candidates,
             after.batches * expected_batch,

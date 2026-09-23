@@ -297,26 +297,20 @@ extern "C" __global__ void pickaxe_photon_c1_schnorr(
 // same either way. This writes R||s for s = k + e*d and, separately, the
 // other candidate s = (n - k) + e*d. The dual C3 filter hashes both and
 // tests the residue only for a candidate that meets the target.
-extern "C" __global__ void pickaxe_photon_c1_schnorr_dual(
+__device__ __forceinline__ void c1_dual_sign(
+    uint32_t candidate,
+    const Fe* x,
+    const Fe* z_inv,
     const uint8_t* __restrict__ message_hashes,
     const uint8_t* __restrict__ rfc6979_scalars,
-    const uint32_t* __restrict__ points,
     const uint8_t* __restrict__ public_key33,
     const uint32_t* __restrict__ fixed_d_table,
     uint8_t* __restrict__ signatures,
-    uint8_t* __restrict__ negated_nonce_s,
-    uint32_t candidate_count
+    uint8_t* __restrict__ negated_nonce_s
 ) {
-    const uint32_t candidate = blockIdx.x * blockDim.x + threadIdx.x;
-    if (candidate >= candidate_count) return;
-
-    const JPoint point = c1_load_point(points, candidate);
-    if (point.infinity) return;
-
-    Fe z_inv, z2, rx;
-    feinv(&z_inv, &point.z);
-    fesqr(&z2, &z_inv);
-    femul(&rx, &point.x, &z2);
+    Fe z2, rx;
+    fesqr(&z2, z_inv);
+    femul(&rx, x, &z2);
 
     uint8_t r_bytes[32];
     fe_to_be(&rx, r_bytes);
@@ -342,4 +336,63 @@ extern "C" __global__ void pickaxe_photon_c1_schnorr_dual(
     c1_copy(signature, r_bytes, 32u);
     scalar_to_be(&s_plus, signature + 32u);
     scalar_to_be(&s_minus, negated_nonce_s + (size_t)candidate * 32u);
+}
+
+constexpr uint32_t C1_MAX_CANDIDATES_PER_THREAD = 16u;
+
+__device__ __forceinline__ Fe c1_load_z(const uint32_t* points, uint32_t candidate) {
+    const size_t base = (size_t)candidate * POINT_WORDS + 16u;
+    Fe z;
+    for (int limb = 0; limb < 8; ++limb) z.d[limb] = points[base + (size_t)limb];
+    return z;
+}
+
+// C1 dual with one shared inversion per thread (Montgomery's trick). Thread
+// t handles candidates t, t + stride, ... (up to per_thread of them), so a
+// warp still reads neighbouring candidates. Each candidate then costs three
+// multiplications instead of a full inversion. A point at infinity (Z = 0)
+// joins the product as 1 and is skipped, as in the single-candidate kernel.
+extern "C" __global__ void pickaxe_photon_c1_schnorr_dual_batched(
+    const uint8_t* __restrict__ message_hashes,
+    const uint8_t* __restrict__ rfc6979_scalars,
+    const uint32_t* __restrict__ points,
+    const uint8_t* __restrict__ public_key33,
+    const uint32_t* __restrict__ fixed_d_table,
+    uint8_t* __restrict__ signatures,
+    uint8_t* __restrict__ negated_nonce_s,
+    uint32_t candidate_count,
+    uint32_t per_thread
+) {
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    if (per_thread > C1_MAX_CANDIDATES_PER_THREAD) per_thread = C1_MAX_CANDIDATES_PER_THREAD;
+
+    // prefix[j] = product of the Z values before candidate j.
+    Fe prefix[C1_MAX_CANDIDATES_PER_THREAD];
+    Fe product = fe1();
+    uint32_t count = 0u;
+    for (uint32_t j = 0u; j < per_thread; ++j) {
+        const uint32_t candidate = thread + j * stride;
+        if (candidate >= candidate_count) break;
+        prefix[j] = product;
+        Fe z = c1_load_z(points, candidate);
+        if (feeqz(&z)) z = fe1();
+        femul(&product, &product, &z);
+        count = j + 1u;
+    }
+    if (count == 0u) return;
+
+    Fe inverse;
+    feinv(&inverse, &product);
+    for (uint32_t j = count; j-- > 0u;) {
+        const uint32_t candidate = thread + j * stride;
+        const JPoint point = c1_load_point(points, candidate);
+        const Fe z = point.infinity ? fe1() : point.z;
+        Fe z_inv;
+        femul(&z_inv, &inverse, &prefix[j]);
+        femul(&inverse, &inverse, &z);
+        if (point.infinity) continue;
+        c1_dual_sign(candidate, &point.x, &z_inv, message_hashes, rfc6979_scalars,
+                     public_key33, fixed_d_table, signatures, negated_nonce_s);
+    }
 }
