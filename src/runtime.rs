@@ -1762,6 +1762,18 @@ impl RuntimeSupervisor {
             &mining_payout_address,
             &journal_path,
         )?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "preflight",
+                "ok": true,
+                "job_source": "photon-baton",
+                "height": initial.height,
+                "baton_txid": initial.baton_txid,
+                "baton_vout": initial.baton_vout,
+            })
+        );
+        let _ = std::io::stdout().flush();
         cfg.bump_generation();
         let initial_settlement = SettlementState::new(cfg.generation_id, &initial)?;
 
