@@ -939,6 +939,14 @@ mod tests {
             .find(|entry| entry.endpoint == "wss://cashnode.bch.ninja:50004")
             .expect("Selene WSS server is cataloged");
         assert_eq!(wss.transport, SourceTransport::Wss);
+
+        let kronbit = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.endpoint == "wss://fulcrum.kronbit.com:50004")
+            .expect("handshake-proven Fulcrum WSS server is cataloged");
+        assert_eq!(kronbit.transport, SourceTransport::Wss);
+        assert!(catalog.entries().len() <= MAX_SOURCES);
         assert_eq!(wss.origin, SourceOrigin::Selene);
 
         let same_host_tls = catalog
