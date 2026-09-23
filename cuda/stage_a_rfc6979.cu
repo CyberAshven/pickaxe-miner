@@ -105,25 +105,72 @@ __device__ void sha256_small(const uint8_t* data, uint32_t len, uint8_t out[32])
     sha256_store(state, out);
 }
 
-__device__ void hmac_sha256_32(
-    const uint8_t key32[32],
-    const uint8_t* data,
-    uint32_t len,
-    uint8_t out[32]
-) {
-    uint8_t inner_input[177];
-    uint8_t outer_input[96];
-    uint8_t inner_hash[32];
+// HMAC-SHA256 with a 32-byte key. The key's inner and outer pad blocks are
+// absorbed once into saved SHA-256 states, so every HMAC under the same key
+// skips two compressions. RFC6979 uses each key for two HMACs in a row.
+struct HmacKey {
+    uint32_t inner[8];
+    uint32_t outer[8];
+};
 
-    for (uint32_t i = 0; i < 64u; ++i) {
-        const uint8_t key = i < 32u ? key32[i] : 0u;
-        inner_input[i] = key ^ 0x36u;
-        outer_input[i] = key ^ 0x5cu;
+__device__ void hmac_key_states(const uint8_t key32[32], HmacKey* key) {
+    uint8_t block[64];
+    for (uint32_t i = 0; i < 64u; ++i) block[i] = (i < 32u ? key32[i] : 0u) ^ 0x36u;
+    sha256_init(key->inner);
+    sha256_transform(key->inner, block);
+    for (uint32_t i = 0; i < 64u; ++i) block[i] = (i < 32u ? key32[i] : 0u) ^ 0x5cu;
+    sha256_init(key->outer);
+    sha256_transform(key->outer, block);
+}
+
+// Pad states of the all-zero key RFC6979 starts with: SHA-256 after one
+// block of 0x36 bytes and after one block of 0x5c bytes.
+__device__ __forceinline__ void hmac_zero_key_states(HmacKey* key) {
+    const uint32_t inner[8] = {
+        0xf454deadu, 0x9725214fu, 0x90daf2a0u, 0xdf1228eau,
+        0x64e5750fu, 0xa3924181u, 0x824a932bu, 0xf8e04e32u
+    };
+    const uint32_t outer[8] = {
+        0xd385480fu, 0x7abb6477u, 0x37c9c538u, 0x5dd82467u,
+        0x8e043a72u, 0x753434b0u, 0xdeb82818u, 0x361d45a6u
+    };
+    for (int i = 0; i < 8; ++i) {
+        key->inner[i] = inner[i];
+        key->outer[i] = outer[i];
     }
-    copy_bytes(inner_input + 64u, data, len);
-    sha256_small(inner_input, 64u + len, inner_hash);
-    copy_bytes(outer_input + 64u, inner_hash, 32u);
-    sha256_small(outer_input, 96u, out);
+}
+
+// Finishes SHA-256 of (64 bytes already absorbed into state) || data.
+__device__ void sha256_after_block(const uint32_t absorbed[8], const uint8_t* data, uint32_t len, uint8_t out[32]) {
+    uint32_t state[8];
+    for (int i = 0; i < 8; ++i) state[i] = absorbed[i];
+    uint32_t offset = 0;
+    while (len - offset >= 64u) {
+        uint8_t block[64];
+        copy_bytes(block, data + offset, 64u);
+        sha256_transform(state, block);
+        offset += 64u;
+    }
+    const uint32_t rem = len - offset;
+    uint8_t tail[128];
+    zero_bytes(tail, 128u);
+    copy_bytes(tail, data + offset, rem);
+    tail[rem] = 0x80u;
+    const uint32_t blocks = (rem <= 55u) ? 1u : 2u;
+    const uint64_t bit_len = (uint64_t)(64u + len) * 8ull;
+    const uint32_t end = blocks * 64u;
+    for (uint32_t i = 0; i < 8u; ++i) {
+        tail[end - 1u - i] = (uint8_t)(bit_len >> (i * 8u));
+    }
+    sha256_transform(state, tail);
+    if (blocks == 2u) sha256_transform(state, tail + 64u);
+    sha256_store(state, out);
+}
+
+__device__ void hmac_sha256_keyed(const HmacKey* key, const uint8_t* data, uint32_t len, uint8_t out[32]) {
+    uint8_t inner_hash[32];
+    sha256_after_block(key->inner, data, len, inner_hash);
+    sha256_after_block(key->outer, inner_hash, 32u, out);
 }
 
 __device__ __forceinline__ int cmp_be32(const uint8_t a[32], const uint8_t b[32]) {
@@ -188,33 +235,29 @@ __device__ void bch_rfc6979(
 
     copy_bytes(reduced, message_hash, 32u);
     reduce_mod_n(reduced);
-    for (int i = 0; i < 32; ++i) {
-        v[i] = 0x01u;
-        k[i] = 0x00u;
-    }
+    for (int i = 0; i < 32; ++i) v[i] = 0x01u;
 
+    HmacKey key;
+    hmac_zero_key_states(&key);
     copy_bytes(data113, v, 32u);
     data113[32] = 0x00u;
     copy_bytes(data113 + 33u, private_key, 32u);
     copy_bytes(data113 + 65u, reduced, 32u);
     copy_bytes(data113 + 97u, algo, 16u);
-    hmac_sha256_32(k, data113, 113u, tmp);
-    copy_bytes(k, tmp, 32u);
-    hmac_sha256_32(k, v, 32u, tmp);
+    hmac_sha256_keyed(&key, data113, 113u, k);
+    hmac_key_states(k, &key);
+    hmac_sha256_keyed(&key, v, 32u, tmp);
     copy_bytes(v, tmp, 32u);
 
     copy_bytes(data113, v, 32u);
     data113[32] = 0x01u;
-    copy_bytes(data113 + 33u, private_key, 32u);
-    copy_bytes(data113 + 65u, reduced, 32u);
-    copy_bytes(data113 + 97u, algo, 16u);
-    hmac_sha256_32(k, data113, 113u, tmp);
-    copy_bytes(k, tmp, 32u);
-    hmac_sha256_32(k, v, 32u, tmp);
+    hmac_sha256_keyed(&key, data113, 113u, k);
+    hmac_key_states(k, &key);
+    hmac_sha256_keyed(&key, v, 32u, tmp);
     copy_bytes(v, tmp, 32u);
 
     for (;;) {
-        hmac_sha256_32(k, v, 32u, tmp);
+        hmac_sha256_keyed(&key, v, 32u, tmp);
         copy_bytes(v, tmp, 32u);
         if (scalar_is_valid(v)) {
             copy_bytes(out_nonce, v, 32u);
@@ -222,9 +265,9 @@ __device__ void bch_rfc6979(
         }
         copy_bytes(data33, v, 32u);
         data33[32] = 0x00u;
-        hmac_sha256_32(k, data33, 33u, tmp);
-        copy_bytes(k, tmp, 32u);
-        hmac_sha256_32(k, v, 32u, tmp);
+        hmac_sha256_keyed(&key, data33, 33u, k);
+        hmac_key_states(k, &key);
+        hmac_sha256_keyed(&key, v, 32u, tmp);
         copy_bytes(v, tmp, 32u);
     }
 }
