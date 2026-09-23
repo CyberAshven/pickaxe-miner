@@ -326,12 +326,18 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = options
         .open(path)
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("restrict config {}: {error}", path.display()))?;
+    }
+    #[cfg(windows)]
+    restrict_config_to_current_user(path)?;
     std::io::Write::write_all(&mut file, bytes)
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
     file.sync_all()
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
-    #[cfg(windows)]
-    restrict_config_to_current_user(path)?;
     Ok(())
 }
 
@@ -426,6 +432,18 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("secret-pass"), "{text}");
         assert_config_file_is_owner_only(&path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+            saved.save(&path).unwrap();
+            assert_config_file_is_owner_only(&path);
+            assert!(fs::read_to_string(&path).unwrap().contains("secret-pass"));
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
