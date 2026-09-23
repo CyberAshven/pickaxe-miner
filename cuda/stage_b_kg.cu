@@ -70,6 +70,59 @@ __device__ __forceinline__ void fe_mul_wide_ptx(uint32_t t[16], const Fe* a, con
     t[15] = acc0;
 }
 
+// t = a * a: each cross product a[i]*a[j] (i < j) once, the sum doubled,
+// then the diagonal squares added. The cross sum is below 2^511, so doubling
+// cannot overflow 512 bits.
+__device__ __forceinline__ void fe_sqr_wide_ptx(uint32_t t[16], const Fe* a) {
+    uint32_t acc0 = 0, acc1 = 0, acc2 = 0;
+    t[0] = 0;
+#pragma unroll
+    for (int k = 1; k < 15; ++k) {
+#pragma unroll
+        for (int i = (k < 8 ? 0 : k - 7); i < k - i; ++i) {
+            fe_mac_ptx(acc0, acc1, acc2, a->d[i], a->d[k - i]);
+        }
+        t[k] = acc0;
+        acc0 = acc1;
+        acc1 = acc2;
+        acc2 = 0;
+    }
+    t[15] = acc0;
+    uint64_t w[8], s[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        w[i] = ((uint64_t)t[2 * i + 1] << 32) | t[2 * i];
+        s[i] = (uint64_t)a->d[i] * a->d[i];
+    }
+    asm("add.cc.u64 %0, %0, %0;\n\t"
+        "addc.cc.u64 %1, %1, %1;\n\t"
+        "addc.cc.u64 %2, %2, %2;\n\t"
+        "addc.cc.u64 %3, %3, %3;\n\t"
+        "addc.cc.u64 %4, %4, %4;\n\t"
+        "addc.cc.u64 %5, %5, %5;\n\t"
+        "addc.cc.u64 %6, %6, %6;\n\t"
+        "addc.u64 %7, %7, %7;"
+        : "+l"(w[0]), "+l"(w[1]), "+l"(w[2]), "+l"(w[3]),
+          "+l"(w[4]), "+l"(w[5]), "+l"(w[6]), "+l"(w[7]));
+    asm("add.cc.u64 %0, %0, %8;\n\t"
+        "addc.cc.u64 %1, %1, %9;\n\t"
+        "addc.cc.u64 %2, %2, %10;\n\t"
+        "addc.cc.u64 %3, %3, %11;\n\t"
+        "addc.cc.u64 %4, %4, %12;\n\t"
+        "addc.cc.u64 %5, %5, %13;\n\t"
+        "addc.cc.u64 %6, %6, %14;\n\t"
+        "addc.u64 %7, %7, %15;"
+        : "+l"(w[0]), "+l"(w[1]), "+l"(w[2]), "+l"(w[3]),
+          "+l"(w[4]), "+l"(w[5]), "+l"(w[6]), "+l"(w[7])
+        : "l"(s[0]), "l"(s[1]), "l"(s[2]), "l"(s[3]),
+          "l"(s[4]), "l"(s[5]), "l"(s[6]), "l"(s[7]));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        t[2 * i] = (uint32_t)w[i];
+        t[2 * i + 1] = (uint32_t)(w[i] >> 32);
+    }
+}
+
 // r = t mod p, the same fold as fe_reduce512 below written as carry chains:
 // hi * 2^256 = hi * 977 + (hi << 32) (mod p), then the remaining word above
 // 2^256 is folded the same way, then one conditional subtraction of p.
@@ -333,9 +386,8 @@ __device__ __forceinline__ void femul(Fe* r, const Fe* a, const Fe* b) {
 
 __device__ __forceinline__ void fesqr(Fe* r, const Fe* a) {
 #if PICKAXE_FE_PTX
-    // Squares with the PTX multiply.
     uint32_t product[16];
-    fe_mul_wide_ptx(product, a, a);
+    fe_sqr_wide_ptx(product, a);
     fe_reduce_wide_ptx(r, product);
 #else
     // As femul, but each cross product a[i]*a[j] (i < j) is computed once
