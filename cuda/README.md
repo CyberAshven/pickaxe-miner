@@ -36,6 +36,7 @@
 ## Build (Windows)
 ```bat
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+nvcc -ptx -O3 -arch=sm_120 -o cuda\build\stage_a_rfc6979.ptx cuda\stage_a_rfc6979.cu
 nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -o cuda\build\stage_b_kg.ptx cuda\stage_b_kg.cu
 nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -o cuda\build\photon_stage_b16.ptx cuda\photon_stage_b16.cu
 nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -o cuda\build\photon_c1_schnorr.ptx cuda\photon_c1_schnorr.cu

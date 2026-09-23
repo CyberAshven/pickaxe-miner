@@ -384,14 +384,13 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     if intensity >= 100 || compute_time.is_zero() {
         return Duration::ZERO;
     }
+    // Occupancy is intensity/100. A fixed short cap leaves 10% nearly as busy
+    // as a full batch and collapses the 100%-to-10% candidate ratio.
     let rest_ns = compute_time
         .as_nanos()
         .saturating_mul(u128::from(100 - intensity))
         / u128::from(intensity);
-    // Keep reduced intensity from creating visible GPU idle cliffs. The worker
-    // already uses smaller batches at reduced intensity; long sleeps here make
-    // utilization oscillate and hurt steady throughput.
-    Duration::from_nanos(rest_ns.min(2_000_000).min(u128::from(u64::MAX)) as u64)
+    Duration::from_nanos(u64::try_from(rest_ns).unwrap_or(u64::MAX))
 }
 
 fn deliver_verified_batch(
@@ -845,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn intensity_uses_short_paced_gpu_batches() {
+    fn intensity_scales_real_gpu_duty() {
         assert_eq!(scheduled_batch_candidates(), MAX_BATCH_CANDIDATES);
         assert_eq!(
             intensity_batch_candidates(MAX_BATCH_CANDIDATES, 100),
@@ -854,15 +853,30 @@ mod tests {
         assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 50), 4_096);
         assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 25), 4_096);
         assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 10), 4_096);
-        assert_eq!(duty_rest(Duration::from_millis(10), 100), Duration::ZERO);
-        assert_eq!(
-            duty_rest(Duration::from_millis(10), 50),
-            Duration::from_millis(2)
-        );
-        assert_eq!(
-            duty_rest(Duration::from_millis(10), 25),
-            Duration::from_millis(2)
-        );
+        let compute = Duration::from_millis(10);
+        assert_eq!(duty_rest(compute, 100), Duration::ZERO);
+        assert_eq!(duty_rest(compute, 50), Duration::from_millis(10));
+        assert_eq!(duty_rest(compute, 25), Duration::from_millis(30));
+        assert_eq!(duty_rest(compute, 10), Duration::from_millis(90));
+
+        let mut previous_rest = Duration::MAX;
+        for intensity in [10_u8, 25, 50, 75] {
+            let rest = duty_rest(compute, intensity);
+            assert!(rest < previous_rest);
+            previous_rest = rest;
+            let active_ns = compute.as_nanos();
+            let period_ns = active_ns + rest.as_nanos();
+            let occupancy = active_ns as f64 / period_ns as f64;
+            let expected = f64::from(intensity) / 100.0;
+            assert!(
+                (occupancy - expected).abs() < 0.001,
+                "intensity {intensity} occupancy {occupancy} != {expected}"
+            );
+        }
+        // Equal batch speed would make 100% at least 10× the 10% candidate rate.
+        let low_period = compute + duty_rest(compute, 10);
+        let ratio = low_period.as_secs_f64() / compute.as_secs_f64();
+        assert!(ratio >= 2.0);
     }
 
     #[test]
