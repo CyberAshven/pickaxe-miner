@@ -160,7 +160,9 @@ pub(crate) fn cuda_unavailable_for_tests(error: &str) -> bool {
 fn transaction_midstate(template: &[u8; TX_BYTES]) -> [u32; 8] {
     let mut state = SHA256_INITIAL_STATE;
     let blocks = template[..MIDSTATE_BYTES]
-        .chunks_exact(64)
+        .as_chunks::<64>()
+        .0
+        .iter()
         .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
         .collect::<Vec<_>>();
     sha2::compress256(&mut state, &blocks);
@@ -536,7 +538,9 @@ mod tests {
         }
         tail.extend_from_slice(&((TX_BYTES as u64) * 8).to_be_bytes());
         let blocks = tail
-            .chunks_exact(64)
+            .as_chunks::<64>()
+            .0
+            .iter()
             .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
             .collect::<Vec<_>>();
         sha2::compress256(&mut state, &blocks);
