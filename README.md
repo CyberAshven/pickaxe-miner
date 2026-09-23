@@ -2,9 +2,9 @@
 
 Rust-first, GPU-only miner for PHOTON on Bitcoin Cash.
 
-- **NVIDIA:** native CUDA/PTX
-- **AMD:** native HIP/ROCm
-- **Platforms:** Windows and Linux
+- **NVIDIA:** native CUDA/PTX. Published PTX is `sm_120` only.
+- **AMD:** native HIP/ROCm. Published code objects are `gfx1036` only.
+- **Platforms:** Windows x86_64 and Linux x86_64. No ARM asset is published.
 - **CPU mining fallback:** none
 - **Donation:** 2%
 

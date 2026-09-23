@@ -141,3 +141,20 @@ jobs:
 
       - name: Release build
         run: cargo build --locked --release
+
+      - name: Verify interactive TUI binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            bin="target/release/pickaxe_miner.exe"
+          else
+            bin="target/release/pickaxe_miner"
+          fi
+          test -f "${bin}"
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          help="$(${bin} --help)"
+          printf '%s\n' "${help}" | grep -q -- '--no-tui'
+          printf '%s\n' "${help}" | grep -q -- '--intensity'
+          printf '%s\n' "${help}" | grep -q 'mine'
+          test "$(${bin} --version)" = "pickaxe ${version}"
