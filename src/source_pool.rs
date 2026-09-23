@@ -310,7 +310,14 @@ impl SourceCatalog {
     pub(crate) fn configured(cfg: &crate::config::RuntimeConfig) -> Result<Self, String> {
         let mut catalog = Self::mainnet();
         if let Some(endpoint) = cfg.fulcrum_url.as_deref() {
-            catalog.add_user(SourceKind::Fulcrum, endpoint, "Configured Fulcrum")?;
+            let built_in = catalog
+                .find_index(SourceKind::Fulcrum, endpoint)
+                .is_some_and(|index| {
+                    catalog.entries[index].provenance == SourceProvenance::BuiltIn
+                });
+            if !built_in {
+                catalog.add_user(SourceKind::Fulcrum, endpoint, "Configured Fulcrum")?;
+            }
         }
         if let Some(endpoint) = cfg.node_url.as_deref() {
             catalog.add_user(
@@ -766,6 +773,24 @@ mod tests {
         let selected = router.select(SourceCapability::PhotonState, 1_000).unwrap();
         assert_eq!(selected.kind, SourceKind::Fulcrum);
         assert_eq!(selected.endpoint, "fulcrum-a");
+    }
+
+    #[test]
+    fn configured_builtin_fulcrum_url_keeps_the_builtin_entry() {
+        let endpoint = crate::protocol::FULCRUM_WSS_BOOTSTRAP[0];
+        let cfg = crate::config::RuntimeConfig {
+            fulcrum_url: Some(endpoint.to_string()),
+            ..crate::config::RuntimeConfig::default()
+        };
+        let catalog =
+            SourceCatalog::configured(&cfg).expect("built-in Fulcrum URL is configurable");
+        let matches = catalog
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SourceKind::Fulcrum && entry.endpoint == endpoint)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].provenance, SourceProvenance::BuiltIn);
     }
 
     #[test]

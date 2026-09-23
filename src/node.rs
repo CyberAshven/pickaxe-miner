@@ -493,6 +493,14 @@ pub(crate) fn verify_photon_state_equivalence(
     Ok(())
 }
 
+fn mempool_entry<'a>(entries: &'a serde_json::Map<String, Value>, txid: &str) -> Option<&'a Value> {
+    entries.get(txid).or_else(|| {
+        entries
+            .iter()
+            .find_map(|(key, value)| key.eq_ignore_ascii_case(txid).then_some(value))
+    })
+}
+
 /// Finds the current baton successor in the native mempool.
 fn resolve_native_mempool_baton(
     url: &str,
@@ -503,6 +511,39 @@ fn resolve_native_mempool_baton(
         .as_object()
         .ok_or("getrawmempool verbose result is not an object")?;
 
+    // A cached baton that is itself still in the mempool is not found by a root
+    // scan: the transaction that spends it has a non-empty `depends` list.
+    let first_successor = if let Some(parent_entry) = mempool_entry(entries, &confirmed_baton.txid)
+    {
+        unique_spentby_successor(url, parent_entry, confirmed_baton)?
+    } else {
+        first_confirmed_root_successor(url, entries, confirmed_baton)?
+    };
+
+    let mut current = first_successor.ok_or(
+        "confirmed PHOTON baton is spent in mempool, but no canonical successor could be proven",
+    )?;
+
+    for _ in 0..MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH {
+        let entry = mempool_entry(entries, &current.txid)
+            .ok_or("native PHOTON successor disappeared from mempool snapshot")?;
+        match unique_spentby_successor(url, entry, &current)? {
+            Some(successor) => current = successor,
+            None => return Ok(current),
+        }
+    }
+
+    Err(format!(
+        "native PHOTON mempool baton chain exceeds bounded depth {}",
+        MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH
+    ))
+}
+
+fn first_confirmed_root_successor(
+    url: &str,
+    entries: &serde_json::Map<String, Value>,
+    confirmed_baton: &NativePhotonBaton,
+) -> Result<Option<NativePhotonBaton>, String> {
     let mut roots = entries
         .iter()
         .filter_map(|(txid, entry)| {
@@ -524,60 +565,43 @@ fn resolve_native_mempool_baton(
     }
 
     roots.sort_unstable_by(|left, right| right.cmp(left));
-    let mut first_successor = None;
     for (_, txid) in roots {
         let transaction = rpc_call(url, "getrawtransaction", json!([txid, 1]))?;
         if let Some(successor) =
             parse_native_mempool_successor(txid, &transaction, confirmed_baton)?
         {
-            first_successor = Some(successor);
-            break;
+            return Ok(Some(successor));
         }
     }
+    Ok(None)
+}
 
-    let mut current = first_successor.ok_or(
-        "confirmed PHOTON baton is spent in mempool, but no canonical successor could be proven",
-    )?;
+fn unique_spentby_successor(
+    url: &str,
+    entry: &Value,
+    spent_baton: &NativePhotonBaton,
+) -> Result<Option<NativePhotonBaton>, String> {
+    let spent_by = entry
+        .get("spentby")
+        .and_then(Value::as_array)
+        .ok_or("native mempool entry omitted spentby")?;
+    if spent_by.is_empty() {
+        return Ok(None);
+    }
 
-    for _ in 0..MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH {
-        let entry = entries
-            .get(&current.txid)
-            .ok_or("native PHOTON successor disappeared from mempool snapshot")?;
-        let spent_by = entry
-            .get("spentby")
-            .and_then(Value::as_array)
-            .ok_or("native mempool entry omitted spentby")?;
-        if spent_by.is_empty() {
-            return Ok(current);
-        }
-
-        let mut next_successor = None;
-        for child_txid in spent_by {
-            let child_txid = child_txid
-                .as_str()
-                .ok_or("native mempool spentby entry is not a transaction id")?;
-            let transaction = rpc_call(url, "getrawtransaction", json!([child_txid, 1]))?;
-            if let Some(successor) =
-                parse_native_mempool_successor(child_txid, &transaction, &current)?
-            {
-                if next_successor.replace(successor).is_some() {
-                    return Err(
-                        "multiple mempool transactions spend the PHOTON baton output".into(),
-                    );
-                }
+    let mut successor = None;
+    for child_txid in spent_by {
+        let child_txid = child_txid
+            .as_str()
+            .ok_or("native mempool spentby entry is not a transaction id")?;
+        let transaction = rpc_call(url, "getrawtransaction", json!([child_txid, 1]))?;
+        if let Some(next) = parse_native_mempool_successor(child_txid, &transaction, spent_baton)? {
+            if successor.replace(next).is_some() {
+                return Err("multiple mempool transactions spend the PHOTON baton output".into());
             }
         }
-
-        match next_successor {
-            Some(successor) => current = successor,
-            None => return Ok(current),
-        }
     }
-
-    Err(format!(
-        "native PHOTON mempool baton chain exceeds bounded depth {}",
-        MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH
-    ))
+    Ok(successor)
 }
 
 /// Parses a baton successor from native mempool transaction data.
@@ -608,9 +632,6 @@ fn parse_native_mempool_successor(
     });
     if spends_baton.count() == 0 {
         return Ok(None);
-    }
-    if inputs.len() != 1 {
-        return Err("PHOTON baton mempool spend does not use the one-input mining branch".into());
     }
 
     let outputs = transaction
@@ -1236,6 +1257,17 @@ fn parse_node_rpc_target(url: &str) -> Result<NodeRpcTarget, String> {
 trait NodeRpcStream: Read + Write {}
 impl<T: Read + Write> NodeRpcStream for T {}
 
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(12);
+const SCAN_TXOUTSET_READ_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn rpc_read_timeout(method: &str) -> Duration {
+    if method == "scantxoutset" {
+        SCAN_TXOUTSET_READ_TIMEOUT
+    } else {
+        RPC_READ_TIMEOUT
+    }
+}
+
 /// Sends a JSON-RPC request and validates its response.
 fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     let target = parse_node_rpc_target(url)?;
@@ -1268,7 +1300,7 @@ fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
         .ok_or_else(|| "resolve: no addrs".to_string())?;
     let tcp_stream = TcpStream::connect_timeout(&addr, Duration::from_secs(8))
         .map_err(|e| format!("connect: {e}"))?;
-    let _ = tcp_stream.set_read_timeout(Some(Duration::from_secs(12)));
+    let _ = tcp_stream.set_read_timeout(Some(rpc_read_timeout(method)));
     let _ = tcp_stream.set_write_timeout(Some(Duration::from_secs(8)));
     let mut stream: Box<dyn NodeRpcStream> = match target.scheme {
         NodeRpcScheme::Http => Box::new(tcp_stream),
@@ -1343,6 +1375,7 @@ mod gbt_tests {
     use crate::electrum::live_job_from_fulcrum_values;
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     const FIXTURE_HEADER_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
 
@@ -1368,6 +1401,9 @@ mod gbt_tests {
                         Err(error) => panic!("test JSON-RPC accept failed: {error}"),
                     }
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("accepted JSON-RPC test socket must block until the request arrives");
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
                 loop {
@@ -2007,6 +2043,263 @@ mod gbt_tests {
         assert!(
             error.contains("no canonical successor could be proven"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn native_photon_state_accepts_two_input_settlement_successor() {
+        let confirmed_txid = "a1".repeat(32);
+        let settlement_txid = "a2".repeat(32);
+        let funding_txid = "a3".repeat(32);
+        let bestblock = "a4".repeat(32);
+        let target = "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000";
+        let confirmed_commitment = format!("01000000{target}");
+        let settlement_commitment = format!("02000000{target}");
+        let settlement_token_amount = "2099990000011906";
+        let scan = json!({
+            "success": true,
+            "height": 1000,
+            "bestblock": bestblock,
+            "unspents": [{
+                "txid": confirmed_txid,
+                "vout": 0,
+                "scriptPubKey": COVENANT_LOCKING_BYTECODE_HEX,
+                "amount": 0.15971500,
+                "height": 990,
+                "tokenData": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": "2100000000000000",
+                    "nft": {"capability": "mutable", "commitment": confirmed_commitment}
+                }
+            }]
+        });
+        let settlement_token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": settlement_token_amount,
+            "nft": {"capability": "mutable", "commitment": settlement_commitment}
+        });
+        let mempool = json!({
+            settlement_txid.clone(): {
+                "time": 200,
+                "depends": [],
+                "spentby": []
+            }
+        });
+        let settlement = json!({
+            "txid": settlement_txid,
+            "vin": [
+                {"txid": confirmed_txid, "vout": 0},
+                {"txid": funding_txid, "vout": 1}
+            ],
+            "vout": [{
+                "n": 0,
+                "value": 0.15970270,
+                "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+                "tokenData": settlement_token_data
+            }, {
+                "n": 1,
+                "value": 0.00000546,
+                "scriptPubKey": {"hex": "76a914000000000000000000000000000000000000000088ac"}
+            }]
+        });
+        let settlement_txout = json!({
+            "bestblock": bestblock,
+            "confirmations": 0,
+            "value": 0.15970270,
+            "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+            "tokenData": settlement_token_data,
+        });
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            ("scantxoutset", scan),
+            ("gettxout", Value::Null),
+            ("getrawmempool", mempool),
+            ("getrawtransaction", settlement),
+            ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", settlement_txout),
+        ]);
+        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint));
+        server.join().expect("json-rpc fixture server");
+        let native = native.expect("two-input settlement must be a canonical baton successor");
+        assert_eq!(native.baton_txid, settlement_txid);
+        assert_eq!(native.baton_height, 0);
+    }
+
+    #[test]
+    fn native_photon_refresh_follows_spender_of_unconfirmed_baton() {
+        let confirmed_txid = "b1".repeat(32);
+        let unconfirmed_txid = "b2".repeat(32);
+        let child_txid = "b3".repeat(32);
+        let bestblock = "b4".repeat(32);
+        let target = "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000";
+        let confirmed_commitment = format!("01000000{target}");
+        let unconfirmed_commitment = format!("02000000{target}");
+        let child_commitment = format!("03000000{target}");
+        let unconfirmed_token_amount = "2099995000000001";
+        let child_token_amount = "2099990000011906";
+        let scan = json!({
+            "success": true,
+            "height": 1000,
+            "bestblock": bestblock,
+            "unspents": [{
+                "txid": confirmed_txid,
+                "vout": 0,
+                "scriptPubKey": COVENANT_LOCKING_BYTECODE_HEX,
+                "amount": 0.15971500,
+                "height": 990,
+                "tokenData": {
+                    "category": MAINNET_CATEGORY_HEX,
+                    "amount": "2100000000000000",
+                    "nft": {"capability": "mutable", "commitment": confirmed_commitment}
+                }
+            }]
+        });
+        let unconfirmed_token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": unconfirmed_token_amount,
+            "nft": {"capability": "mutable", "commitment": unconfirmed_commitment}
+        });
+        let child_token_data = json!({
+            "category": MAINNET_CATEGORY_HEX,
+            "amount": child_token_amount,
+            "nft": {"capability": "mutable", "commitment": child_commitment}
+        });
+        let connect_mempool = json!({
+            unconfirmed_txid.clone(): {
+                "time": 100,
+                "depends": [],
+                "spentby": []
+            }
+        });
+        let unconfirmed_transaction = json!({
+            "txid": unconfirmed_txid,
+            "vin": [{"txid": confirmed_txid, "vout": 0}],
+            "vout": [{
+                "n": 0,
+                "value": 0.15970885,
+                "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+                "tokenData": unconfirmed_token_data
+            }]
+        });
+        let unconfirmed_txout = json!({
+            "bestblock": bestblock,
+            "confirmations": 0,
+            "value": 0.15970885,
+            "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+            "tokenData": unconfirmed_token_data,
+        });
+        let refresh_mempool = json!({
+            unconfirmed_txid.clone(): {
+                "time": 100,
+                "depends": [],
+                "spentby": [child_txid.clone()]
+            },
+            child_txid.clone(): {
+                "time": 101,
+                "depends": [unconfirmed_txid.clone()],
+                "spentby": []
+            }
+        });
+        let child_transaction = json!({
+            "txid": child_txid,
+            "vin": [{"txid": unconfirmed_txid, "vout": 0}],
+            "vout": [{
+                "n": 0,
+                "value": 0.15970270,
+                "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+                "tokenData": child_token_data
+            }]
+        });
+        let child_txout = json!({
+            "bestblock": bestblock,
+            "confirmations": 0,
+            "value": 0.15970270,
+            "scriptPubKey": {"hex": COVENANT_LOCKING_BYTECODE_HEX},
+            "tokenData": child_token_data,
+        });
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            ("scantxoutset", scan),
+            ("gettxout", Value::Null),
+            ("getrawmempool", connect_mempool),
+            ("getrawtransaction", unconfirmed_transaction),
+            ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", unconfirmed_txout),
+            (
+                "getblockchaininfo",
+                json!({"blocks": 1000, "bestblockhash": bestblock.clone()}),
+            ),
+            ("gettxout", Value::Null),
+            ("getrawmempool", refresh_mempool),
+            ("getrawtransaction", child_transaction),
+            ("getbestblockhash", json!(bestblock.clone())),
+            ("gettxout", child_txout),
+        ]);
+        let mut session =
+            NativePhotonSession::connect_failover(std::slice::from_ref(&endpoint)).unwrap();
+        assert_eq!(session.snapshot().job.baton_txid, unconfirmed_txid);
+        let refreshed = session.refresh();
+        server.join().expect("json-rpc fixture server");
+        let refreshed = refreshed.expect("refresh must follow the spender of an unconfirmed baton");
+        assert_eq!(refreshed.job.baton_txid, child_txid);
+        assert_eq!(refreshed.job.baton_height, 0);
+    }
+
+    #[test]
+    fn json_rpc_sequence_reads_a_request_that_arrives_after_accept() {
+        let bestblock = "c1".repeat(32);
+        let (endpoint, server) = serve_json_rpc_sequence(vec![(
+            "getblockchaininfo",
+            json!({"blocks": 1, "bestblockhash": bestblock}),
+        )]);
+        let address = endpoint.trim_start_matches("http://");
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let body = "{\"jsonrpc\":\"1.0\",\"id\":\"pickaxe\",\"method\":\"getblockchaininfo\",\"params\":[]}";
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        std::io::Write::write_all(&mut stream, request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut response).unwrap();
+        server.join().expect("json-rpc fixture server");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("\"blocks\":1"), "{text}");
+    }
+
+    #[test]
+    fn scantxoutset_read_waits_past_the_default_rpc_timeout() {
+        assert_eq!(rpc_read_timeout("gettxout"), Duration::from_secs(12));
+        assert!(rpc_read_timeout("scantxoutset") >= Duration::from_secs(180));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            thread::sleep(Duration::from_secs(13));
+            let body = r#"{"result":{"success":false},"error":null,"id":"pickaxe"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let result = rpc_call(
+            &format!("http://{address}"),
+            "scantxoutset",
+            json!(["start", ["raw(51)"]]),
+        );
+        let elapsed = started.elapsed();
+        server.join().expect("slow scantxoutset fixture");
+        assert!(
+            elapsed >= Duration::from_secs(12),
+            "scantxoutset returned before the default RPC read timeout: {elapsed:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "scantxoutset read timed out after {elapsed:?}: {result:?}"
         );
     }
 }

@@ -3412,6 +3412,12 @@ fn write_snapshot(
 ) {
     let mut search_stats = search.snapshot();
     throughput.observe(&mut search_stats, Instant::now());
+    let (state, last_error) = present_runtime_status(
+        state,
+        search_stats.state,
+        last_error,
+        search_stats.last_error.clone(),
+    );
     let mut snapshot = shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3436,9 +3442,20 @@ fn write_snapshot(
     snapshot.pending_winners = pending_winners;
     snapshot.last_error = last_error;
     snapshot.search = search_stats;
-    if snapshot.state == SupervisorState::Mining && snapshot.search.state == MiningState::Paused {
-        snapshot.state = SupervisorState::Paused;
-    }
+}
+
+fn present_runtime_status(
+    supervisor: SupervisorState,
+    search_state: MiningState,
+    supervisor_error: Option<String>,
+    search_error: Option<String>,
+) -> (SupervisorState, Option<String>) {
+    let state = match (supervisor, search_state) {
+        (SupervisorState::Mining, MiningState::Paused) => SupervisorState::Paused,
+        (SupervisorState::Mining, MiningState::Stopped) => SupervisorState::Error,
+        (supervisor, _) => supervisor,
+    };
+    (state, supervisor_error.or(search_error))
 }
 
 /// Sends a runtime event to the status channel.
@@ -3489,7 +3506,41 @@ mod tests {
             current_rate: 0.0,
             peak_rate: 0.0,
             winners: 0,
+            rejected_winners: 0,
+            last_error: None,
         }
+    }
+
+    #[test]
+    fn search_failure_is_visible_when_the_supervisor_has_no_error() {
+        let (state, error) = present_runtime_status(
+            SupervisorState::Mining,
+            MiningState::Stopped,
+            None,
+            Some("HIP launch failed".into()),
+        );
+        assert_eq!(state, SupervisorState::Error);
+        assert_eq!(error.as_deref(), Some("HIP launch failed"));
+    }
+
+    #[test]
+    fn supervisor_error_remains_ahead_of_a_search_error() {
+        let (state, error) = present_runtime_status(
+            SupervisorState::Reconnecting,
+            MiningState::Stopped,
+            Some("refresh failed".into()),
+            Some("HIP launch failed".into()),
+        );
+        assert_eq!(state, SupervisorState::Reconnecting);
+        assert_eq!(error.as_deref(), Some("refresh failed"));
+    }
+
+    #[test]
+    fn paused_search_presents_paused_while_the_supervisor_is_mining() {
+        let (state, error) =
+            present_runtime_status(SupervisorState::Mining, MiningState::Paused, None, None);
+        assert_eq!(state, SupervisorState::Paused);
+        assert!(error.is_none());
     }
 
     #[test]

@@ -1,12 +1,97 @@
 # Pickaxe Miner
 
-Rust-first, GPU-only miner for PHOTON on Bitcoin Cash.
+![Pickaxe Miner](docs/assets/pickaxe-miner-logo.png)
 
-- **NVIDIA:** native CUDA/PTX. Published PTX is `sm_120` only.
-- **AMD:** native HIP/ROCm. Published code objects are `gfx1036` only.
-- **Platforms:** Windows x86_64 and Linux x86_64. No ARM asset is published.
-- **CPU mining fallback:** none
-- **Donation:** 2%
+Rust-first, GPU-only miner for the PHOTON CashToken on Bitcoin Cash.
+
+The logo above is the teal/mint mark. Navy/cyan and black/white alternatives are `docs/assets/pickaxe-miner-logo-navy-cyan.png` and `docs/assets/pickaxe-miner-logo-black-white.png`.
+
+## Scope
+
+PHOTON work is the live covenant and CashToken baton: the baton outpoint, NFT commitment, token amount, and PHOTON target. BCH `getblocktemplate` and `getblocktemplatelight` are not a mining job source.
+
+Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
+
+## Supported platforms
+
+- Operating systems: Windows x86_64 and Linux x86_64
+- NVIDIA: CUDA PTX `sm_120`
+- AMD: HIP `gfx1036`
+- No ARM, ARM64, or macOS build
+
+## Install a release archive
+
+The prepared v0.1.0 archives are:
+
+- Linux: `pickaxe-miner-v0.1.0-linux-x86_64.tar.gz`
+- Windows: `pickaxe-miner-v0.1.0-windows-x86_64.zip`
+
+The release also publishes `SHA256SUMS.txt` for those two archives. The GitHub Release for tag `pickaxe-miner-v0.1.0` is not published until a maintainer merges this branch and the tag is created from that merged commit. Until then, build from source.
+
+Linux:
+
+```bash
+tar -xzf pickaxe-miner-v0.1.0-linux-x86_64.tar.gz
+cd pickaxe-miner-v0.1.0-linux-x86_64
+./pickaxe mine
+```
+
+Windows PowerShell:
+
+```powershell
+Expand-Archive pickaxe-miner-v0.1.0-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.1.0-windows-x86_64
+cd pickaxe-miner-v0.1.0-windows-x86_64
+.\pickaxe.exe mine
+```
+
+Headless, from the same directory:
+
+```bash
+./pickaxe mine --no-tui
+```
+
+```powershell
+.\pickaxe.exe mine --no-tui
+```
+
+## Build
+
+```bash
+cargo build --release
+```
+
+The cargo binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.1.0`.
+
+Interactive TUI:
+
+```bash
+cargo run --release -- mine
+```
+
+Headless:
+
+```bash
+cargo run --release -- mine --no-tui
+```
+
+List GPUs:
+
+```bash
+cargo run --release -- devices
+```
+
+Benchmark:
+
+```bash
+cargo run --release -- benchmark
+```
+
+## Limitations
+
+- There is no CPU mining fallback.
+- `wgpu` is not a verified production backend. Production mining is CUDA or HIP.
+- The donation is hard-coded at 2%.
+- Tag `pickaxe-miner-v0.1.0` and its GitHub Release are not published until a maintainer merges and publication runs on the merged commit.
 
 ## Features
 
@@ -22,41 +107,5 @@ Rust-first, GPU-only miner for PHOTON on Bitcoin Cash.
 - Persistent, bounded GPU memory architecture
 - Stale-job and generation protection
 - Device discovery and benchmark tools
-
-## PHOTON
-
-PHOTON mining work is derived from the live covenant and CashToken baton state through Fulcrum/Electrum.
-
-BCH `getblocktemplate` is not used as a PHOTON mining job source. Native BCH node RPC is used for chain validation and raw transaction broadcast.
-
-## Build
-
-```bash
-cargo build --release
-```
-
-## Run
-
-```bash
-pickaxe mine
-```
-
-Headless:
-
-```bash
-pickaxe mine --no-tui
-```
-
-List available GPUs:
-
-```bash
-pickaxe devices
-```
-
-Benchmark:
-
-```bash
-pickaxe benchmark
-```
 
 The `reference/` directory contains PHOTON reference material used for implementation and correctness testing.

@@ -3,11 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "pickaxe-miner-v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing semantic tag to build and publish, e.g. v0.1.0"
+        description: "Existing semantic tag to build and publish, e.g. pickaxe-miner-v0.1.0"
         required: true
         type: string
 
@@ -44,7 +44,7 @@ jobs:
             tag="${MANUAL_TAG}"
           fi
 
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+          if [[ ! "${tag}" =~ ^pickaxe-miner-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release tag: ${tag}" >&2
             exit 1
           fi
@@ -74,8 +74,8 @@ jobs:
             python3 -c 'import json, os, sys; d=json.load(sys.stdin); root=os.path.abspath("Cargo.toml"); p=next(p for p in d["packages"] if os.path.abspath(p["manifest_path"]) == root); print(p["version"])'
           )"
 
-          if [[ "v${version}" != "${TAG}" ]]; then
-            echo "Tag ${TAG} does not match Cargo.toml version v${version}" >&2
+          if [[ "pickaxe-miner-v${version}" != "${TAG}" ]]; then
+            echo "Tag ${TAG} does not match Cargo.toml version pickaxe-miner-v${version}" >&2
             exit 1
           fi
 
@@ -227,7 +227,12 @@ jobs:
           bin="target/release/${bin_name}"
           test -f "${bin}"
 
-          package="pickaxe-${TAG}-linux-x86_64"
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          if [[ "pickaxe-miner-v${version}" != "${TAG}" ]]; then
+            echo "Tag ${TAG} does not match archive stem pickaxe-miner-v${version}" >&2
+            exit 1
+          fi
+          package="pickaxe-miner-v${version}-linux-x86_64"
           mkdir -p "dist/${package}"
           install -m 0755 "${bin}" "dist/${package}/pickaxe"
 
@@ -253,7 +258,7 @@ jobs:
           cp -R hip/build "dist/${package}/hip/"
 
           {
-            echo "Pickaxe ${TAG}"
+            echo "Pickaxe Miner v${version}"
             echo "Platform: Linux x86_64. This archive is not ARM, ARM64, or macOS."
             echo "Interactive TUI: ./pickaxe mine. Headless: ./pickaxe mine --no-tui."
             echo "NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required."
@@ -302,7 +307,15 @@ jobs:
             throw "Release binary not found: $binary"
           }
 
-          $packageName = "pickaxe-$env:TAG-windows-x86_64"
+          $versionLine = Select-String -LiteralPath 'Cargo.toml' -Pattern '^version = "(?<version>[^"]+)"' | Select-Object -First 1
+          if (-not $versionLine) {
+            throw 'Cargo.toml is missing a version.'
+          }
+          $version = $versionLine.Matches[0].Groups['version'].Value
+          if ($env:TAG -ne "pickaxe-miner-v$version") {
+            throw "Tag $env:TAG does not match archive stem pickaxe-miner-v$version"
+          }
+          $packageName = "pickaxe-miner-v$version-windows-x86_64"
           $packageDir = Join-Path 'dist' $packageName
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item -LiteralPath $binary -Destination (Join-Path $packageDir 'pickaxe.exe')
@@ -344,7 +357,7 @@ jobs:
           Copy-Item -LiteralPath 'hip\build' -Destination $hipDir -Recurse
 
           @(
-            "Pickaxe $env:TAG"
+            "Pickaxe Miner v$version"
             'Platform: Windows x86_64. This archive is not ARM, ARM64, or macOS.'
             'Interactive TUI: .\pickaxe.exe mine. Headless: .\pickaxe.exe mine --no-tui.'
             'NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required.'
@@ -398,11 +411,19 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
+          version="${TAG#pickaxe-miner-v}"
+          if [[ "pickaxe-miner-v${version}" != "${TAG}" || -z "${version}" ]]; then
+            echo "Refusing to checksum unexpected tag ${TAG}" >&2
+            exit 1
+          fi
           cd dist
-          sha256sum pickaxe-* > SHA256SUMS.txt
+          sha256sum \
+            "${TAG}-linux-x86_64.tar.gz" \
+            "${TAG}-windows-x86_64.zip" \
+            > SHA256SUMS.txt
           cat SHA256SUMS.txt
           {
-            echo "Pickaxe ${TAG}"
+            echo "Pickaxe Miner v${version}"
             echo
             echo "Verified assets are Windows x86_64 and Linux x86_64 only."
             echo "No ARM or ARM64 binary is published."
@@ -424,23 +445,37 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
 
+          version="${TAG#pickaxe-miner-v}"
+          if [[ "pickaxe-miner-v${version}" != "${TAG}" || -z "${version}" ]]; then
+            echo "Refusing to publish unexpected tag ${TAG}" >&2
+            exit 1
+          fi
+          release_title="Pickaxe Miner v${version}"
+
           prerelease_args=()
-          if [[ "${TAG}" == *-* ]]; then
+          if [[ "${version}" == *-* ]]; then
             prerelease_args+=(--prerelease)
           fi
 
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" dist/pickaxe-* dist/SHA256SUMS.txt --clobber
+          assets=(
+            "dist/${TAG}-linux-x86_64.tar.gz"
+            "dist/${TAG}-windows-x86_64.zip"
+            "dist/SHA256SUMS.txt"
+          )
+
+          if gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" --repo "${GH_REPO}" "${assets[@]}" --clobber
           else
             gh release create "${TAG}" \
+              --repo "${GH_REPO}" \
               --verify-tag \
-              --title "Pickaxe ${TAG}" \
+              --title "${release_title}" \
               --notes-file dist/RELEASE_NOTES.md \
               "${prerelease_args[@]}" \
-              dist/pickaxe-* \
-              dist/SHA256SUMS.txt
+              "${assets[@]}"
           fi
