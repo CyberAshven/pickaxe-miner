@@ -603,6 +603,14 @@ impl PendingSubmission {
     }
 
     /// Checks whether the pending submission still targets the live baton.
+    /// Reports whether the live baton is still the one this winner spends or
+    /// the parent's own output: the source has not caught up with the
+    /// settlement yet, and no lineage walk can prove anything from there.
+    fn live_baton_precedes_settlement(&self, live: &LiveJob) -> bool {
+        self.expected_baton_is_current(live)
+            || (live.baton_vout == 0 && live.baton_txid.eq_ignore_ascii_case(&self.parent_txid))
+    }
+
     fn expected_baton_is_current(&self, live: &LiveJob) -> bool {
         self.expected_baton_txid
             .eq_ignore_ascii_case(&live.baton_txid)
@@ -1124,11 +1132,17 @@ fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
 }
 
 /// Follows transaction ancestry to prove descent from the expected baton.
+///
+/// `boundaries` are batons older than the ancestor on its own lineage (the
+/// winner's parent and the baton that parent spent). Reaching one without
+/// passing through the ancestor proves a different lineage, so the walk
+/// stops there instead of searching further back through history.
 fn prove_baton_descends_from<F>(
     current_txid: &str,
     current_vout: u32,
     ancestor_txid: &str,
     ancestor_vout: u32,
+    boundaries: &[&str],
     mut fetch_raw: F,
 ) -> Result<bool, String>
 where
@@ -1159,6 +1173,12 @@ where
         if previous_txid.eq_ignore_ascii_case(ancestor_txid) {
             return Ok(previous_vout == ancestor_vout);
         }
+        if boundaries
+            .iter()
+            .any(|boundary| previous_txid.eq_ignore_ascii_case(boundary))
+        {
+            return Ok(false);
+        }
         if previous_txid.eq_ignore_ascii_case(&cursor) {
             return Err("PHOTON baton lineage contains a transaction cycle".into());
         }
@@ -1184,6 +1204,7 @@ fn resulting_baton_is_authoritative_or_descendant(
         fresh.baton_vout,
         &pending.resulting_baton_txid,
         pending.resulting_baton_vout,
+        &[&pending.parent_txid, &pending.expected_baton_txid],
         |txid| {
             match session.rpc(
                 "blockchain.transaction.get",
@@ -1346,6 +1367,12 @@ fn attempt_pending_submission(
     let settlement_known = session.transaction_known(&pending.settlement_txid)?;
     if settlement_known {
         let fresh = session.fetch_live_job()?;
+        if pending.live_baton_precedes_settlement(&fresh) {
+            return Err(
+                "settlement transaction is known; waiting for the live PHOTON baton to advance past this winner"
+                    .into(),
+            );
+        }
         if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
             return Ok(SubmissionAttempt::Complete(Box::new(fresh)));
         }
@@ -2359,47 +2386,64 @@ fn run_supervisor(
                         reconnect_backoff = RECONNECT_MIN;
                         last_error = None;
                         session = Some(next_session);
-                        match apply_refreshed_job(
-                            session.as_mut().expect("session was just installed"),
-                            &mut cfg,
-                            &mut live,
-                            &mut settlement,
-                            &search,
-                            &reward_secret,
-                            &reward_public_key,
-                            &mining_payout_address,
-                            &journal_path,
-                            next_job,
-                        ) {
-                            Ok(changed) => {
-                                if changed {
-                                    job_changes = job_changes.saturating_add(1);
+                        if pending_submission.is_some() {
+                            // Finish or resolve the journaled winner on this
+                            // session first. The next job's preflight refuses
+                            // to start while that journal exists, so applying
+                            // it here would drop the session again, forever.
+                            emit(
+                                &event_tx,
+                                RuntimeEvent::Reconnected(active_fulcrum_endpoint.clone()),
+                            );
+                            next_submission_retry = Instant::now();
+                            state = SupervisorState::Paused;
+                        } else {
+                            match apply_refreshed_job(
+                                session.as_mut().expect("session was just installed"),
+                                &mut cfg,
+                                &mut live,
+                                &mut settlement,
+                                &search,
+                                &reward_secret,
+                                &reward_public_key,
+                                &mining_payout_address,
+                                &journal_path,
+                                next_job,
+                            ) {
+                                Ok(changed) => {
+                                    if changed {
+                                        job_changes = job_changes.saturating_add(1);
+                                    }
+                                    emit(&event_tx, RuntimeEvent::Reconnected(live.url.clone()));
+                                    next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
+                                    if search_resume_allowed(
+                                        &shutdown,
+                                        user_paused,
+                                        pending_winners,
+                                    ) {
+                                        let _ = search.apply_control(SearchCommand::Resume);
+                                        state = SupervisorState::Mining;
+                                    } else {
+                                        state = SupervisorState::Paused;
+                                    }
                                 }
-                                emit(&event_tx, RuntimeEvent::Reconnected(live.url.clone()));
-                                next_state_refresh = Instant::now() + PHOTON_STATE_RECHECK;
-                                if search_resume_allowed(&shutdown, user_paused, pending_winners) {
-                                    let _ = search.apply_control(SearchCommand::Resume);
-                                    state = SupervisorState::Mining;
-                                } else {
-                                    state = SupervisorState::Paused;
+                                Err(error) => {
+                                    last_error = Some(error.clone());
+                                    state = SupervisorState::Reconnecting;
+                                    emit(
+                                        &event_tx,
+                                        RuntimeEvent::Reconnecting(format!(
+                                            "generation settlement preflight retry: {error}"
+                                        )),
+                                    );
+                                    session = None;
+                                    reconnect_preference = ReconnectPreference::PreferActive;
+                                    next_reconnect = Instant::now() + reconnect_backoff;
+                                    reconnect_backoff = reconnect_backoff
+                                        .checked_mul(2)
+                                        .unwrap_or(RECONNECT_MAX)
+                                        .min(RECONNECT_MAX);
                                 }
-                            }
-                            Err(error) => {
-                                last_error = Some(error.clone());
-                                state = SupervisorState::Reconnecting;
-                                emit(
-                                    &event_tx,
-                                    RuntimeEvent::Reconnecting(format!(
-                                        "generation settlement preflight retry: {error}"
-                                    )),
-                                );
-                                session = None;
-                                reconnect_preference = ReconnectPreference::PreferActive;
-                                next_reconnect = Instant::now() + reconnect_backoff;
-                                reconnect_backoff = reconnect_backoff
-                                    .checked_mul(2)
-                                    .unwrap_or(RECONNECT_MAX)
-                                    .min(RECONNECT_MAX);
                             }
                         }
                     }
@@ -4867,7 +4911,7 @@ mod tests {
         let live_raw = transaction_spending(&child, 0);
         let live = reward::transaction_id(&hex::decode(&live_raw).unwrap());
 
-        let proven = prove_baton_descends_from(&live, 0, &settlement, 0, |txid| {
+        let proven = prove_baton_descends_from(&live, 0, &settlement, 0, &[], |txid| {
             if txid.eq_ignore_ascii_case(&live) {
                 Ok(live_raw.clone())
             } else if txid.eq_ignore_ascii_case(&child) {
@@ -4882,22 +4926,100 @@ mod tests {
         let wrong_link = transaction_spending(&settlement, 1);
         let wrong_live = reward::transaction_id(&hex::decode(&wrong_link).unwrap());
         assert!(
-            !prove_baton_descends_from(&wrong_live, 0, &settlement, 0, |_| {
+            !prove_baton_descends_from(&wrong_live, 0, &settlement, 0, &[], |_| {
                 Ok(wrong_link.clone())
             })
             .unwrap()
         );
-        assert!(!prove_baton_descends_from(&live, 1, &settlement, 0, |_| {
-            panic!("wrong live baton output must fail before network lookup")
-        })
-        .unwrap());
+        assert!(
+            !prove_baton_descends_from(&live, 1, &settlement, 0, &[], |_| {
+                panic!("wrong live baton output must fail before network lookup")
+            })
+            .unwrap()
+        );
 
         let mismatched_claim = "dd".repeat(32);
-        let mismatch = prove_baton_descends_from(&mismatched_claim, 0, &settlement, 0, |_| {
+        let mismatch = prove_baton_descends_from(&mismatched_claim, 0, &settlement, 0, &[], |_| {
             Ok(live_raw.clone())
         })
         .unwrap_err();
         assert!(mismatch.contains("do not match requested txid"));
+    }
+
+    #[test]
+    /// Checks that a competing lineage stops at the winner's own boundary
+    /// batons instead of walking back through the whole recovery window.
+    fn baton_lineage_walk_stops_at_the_winners_boundary_batons() {
+        let expected = "11".repeat(32);
+        let parent = "22".repeat(32);
+        let settlement = "33".repeat(32);
+
+        // A competitor spent the same pre-winner baton, then one more mint.
+        let competitor_raw = transaction_spending(&expected, 0);
+        let competitor = reward::transaction_id(&hex::decode(&competitor_raw).unwrap());
+        let next_raw = transaction_spending(&competitor, 0);
+        let next = reward::transaction_id(&hex::decode(&next_raw).unwrap());
+        let mut fetches = 0;
+        let proven =
+            prove_baton_descends_from(&next, 0, &settlement, 0, &[&parent, &expected], |txid| {
+                fetches += 1;
+                if txid.eq_ignore_ascii_case(&next) {
+                    Ok(next_raw.clone())
+                } else if txid.eq_ignore_ascii_case(&competitor) {
+                    Ok(competitor_raw.clone())
+                } else {
+                    Err(format!("walked past the boundary to {txid}"))
+                }
+            })
+            .unwrap();
+        assert!(!proven);
+        assert_eq!(fetches, 2);
+
+        // A conflicting spend of the winner's own parent output also stops.
+        let conflict_raw = transaction_spending(&parent, 0);
+        let conflict = reward::transaction_id(&hex::decode(&conflict_raw).unwrap());
+        assert!(!prove_baton_descends_from(
+            &conflict,
+            0,
+            &settlement,
+            0,
+            &[&parent, &expected],
+            |_| Ok(conflict_raw.clone()),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    /// Checks the not-yet-caught-up states after a settlement is known.
+    fn live_baton_precedes_settlement_only_before_the_settlement_output() {
+        let job = live_job();
+        let pending = PendingSubmission {
+            version: SUBMISSION_JOURNAL_VERSION,
+            generation_id: 1,
+            expected_height: job.height,
+            expected_baton_txid: "11".repeat(32),
+            expected_baton_vout: 0,
+            parent_txid: "22".repeat(32),
+            parent_hex: String::new(),
+            settlement_txid: "33".repeat(32),
+            settlement_hex: String::new(),
+            resulting_baton_txid: "33".repeat(32),
+            resulting_baton_vout: 0,
+            resulting_baton_value_sats: 1,
+            miner_token_amount: 98,
+            donation_token_amount: 2,
+        };
+        let at = |txid: &str, vout: u32| {
+            let mut live = job.clone();
+            live.baton_txid = txid.to_uppercase();
+            live.baton_vout = vout;
+            live
+        };
+        assert!(pending.live_baton_precedes_settlement(&at(&"11".repeat(32), 0)));
+        assert!(pending.live_baton_precedes_settlement(&at(&"22".repeat(32), 0)));
+        assert!(!pending.live_baton_precedes_settlement(&at(&"22".repeat(32), 1)));
+        assert!(!pending.live_baton_precedes_settlement(&at(&"33".repeat(32), 0)));
+        assert!(!pending.live_baton_precedes_settlement(&at(&"44".repeat(32), 0)));
     }
 
     #[test]
