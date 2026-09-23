@@ -295,6 +295,7 @@ jobs:
             stage_a_rfc6979.ptx \
             photon_stage_b16.ptx \
             photon_c1_schnorr.ptx \
+            photon_c3_dual.ptx \
             stage_c_hash.ptx; do
             test -s "cuda/build/${artifact}"
             grep -q '^\.target sm_120$' "cuda/build/${artifact}"
@@ -380,6 +381,7 @@ jobs:
             'stage_a_rfc6979.ptx',
             'photon_stage_b16.ptx',
             'photon_c1_schnorr.ptx',
+            'photon_c3_dual.ptx',
             'stage_c_hash.ptx'
           )
           foreach ($artifact in $requiredPtx) {

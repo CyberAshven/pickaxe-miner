@@ -427,15 +427,35 @@ fn append_tui_log(line: &str) {
     }
 }
 
+/// Expected seconds between winners at `rate` candidates/s for a
+/// little-endian hex PHOTON target, if both are known.
+fn expected_winner_seconds(target_le_hex: &str, rate: f64) -> Option<f64> {
+    let bytes = hex::decode(target_le_hex).ok()?;
+    if bytes.len() != 32 || rate <= 0.0 {
+        return None;
+    }
+    // P(hash < target) = target / 2^256.
+    let probability = bytes
+        .iter()
+        .rev()
+        .fold(0.0_f64, |value, byte| value * 256.0 + f64::from(*byte))
+        / 2f64.powi(256);
+    (probability > 0.0).then(|| 1.0 / (probability * rate))
+}
+
 /// Formats the periodic status line for the TUI observation log.
 fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
+    let expected = expected_winner_seconds(&snapshot.photon_target_le, snapshot.search.rate)
+        .map(|seconds| format!("{seconds:.0}"))
+        .unwrap_or_else(|| "n/a".into());
     format!(
-        "status state={:?} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} endpoint={} last_error={}",
+        "status state={:?} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} expected_winner_s={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} target_le={} endpoint={} last_error={}",
         snapshot.state,
         snapshot.search.intensity,
         snapshot.search.current_rate,
         snapshot.search.rate,
         snapshot.search.peak_rate,
+        expected,
         snapshot.reconnects,
         snapshot.endpoint_rotations,
         snapshot.job_changes,
@@ -447,6 +467,11 @@ fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
         snapshot.search.rejected_winners,
         snapshot.pending_winners,
         snapshot.height,
+        if snapshot.photon_target_le.is_empty() {
+            "n/a"
+        } else {
+            snapshot.photon_target_le.as_str()
+        },
         redact_endpoint(&snapshot.endpoint),
         snapshot.last_error.as_deref().unwrap_or("none"),
     )
@@ -1701,6 +1726,20 @@ mod tests {
         }
         assert!(line.starts_with("status "));
         assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    /// Checks the expected time between winners from the live target.
+    fn expected_winner_seconds_follows_target_and_rate() {
+        // Target 2^224 (LE byte 28 = 1): one winner per 2^32 candidates.
+        let mut target = [0u8; 32];
+        target[28] = 1;
+        let target = hex::encode(target);
+        let seconds = expected_winner_seconds(&target, 2f64.powi(32) / 100.0).unwrap();
+        assert!((seconds - 100.0).abs() < 1e-6, "{seconds}");
+        assert!(expected_winner_seconds(&target, 0.0).is_none());
+        assert!(expected_winner_seconds("", 1.0).is_none());
+        assert!(expected_winner_seconds(&"00".repeat(32), 1.0).is_none());
     }
 
     #[test]
