@@ -2758,9 +2758,7 @@ fn select_boundary_photon_job(
     if let (Some(endpoint), Some(native), Some(selected)) = (
         node_endpoint.as_deref(),
         native_snapshot,
-        sources
-            .router()
-            .select(SourceCapability::PhotonState, now_ms),
+        sources.router().select_photon_route(now_ms),
     ) {
         if selected.kind == SourceKind::NativeNode
             && selected.endpoint == endpoint
@@ -3729,6 +3727,36 @@ mod tests {
 
         let selected = select_boundary_photon_job(&cfg, &sources, Some(&native), &canonical, 1_000);
         assert_eq!(selected.url, endpoint_identity);
+    }
+
+    #[test]
+    fn healthy_node_is_preferred_even_when_fulcrum_is_faster() {
+        let endpoint = "http://node.invalid";
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_node_url(endpoint).unwrap();
+        let mut sources = SourceCatalog::configured(&cfg).unwrap();
+        let canonical = live_snapshot("wss://fulcrum.invalid");
+        let native = live_snapshot(endpoint);
+        record_canonical_fulcrum_probe(&mut sources, &canonical, 1_000, 4).unwrap();
+        let (accepted, error) = record_native_photon_probe(
+            &mut sources,
+            endpoint,
+            &canonical,
+            Ok(native.clone()),
+            1_000,
+            80,
+        );
+        assert!(error.is_none());
+        assert!(accepted.is_some());
+
+        let selected = select_boundary_photon_job(&cfg, &sources, Some(&native), &canonical, 1_000);
+        assert_eq!(selected.url, endpoint);
+
+        sources
+            .record_failure(SourceKind::NativeNode, endpoint, 1_000)
+            .unwrap();
+        let fallback = select_boundary_photon_job(&cfg, &sources, None, &canonical, 1_000);
+        assert_eq!(fallback.url, canonical.job.url);
     }
 
     #[test]

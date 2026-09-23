@@ -600,6 +600,18 @@ impl SourceRouter<'_> {
         self.candidates(capability, now_ms).into_iter().next()
     }
 
+    /// PHOTON route among peers that are already healthy and capable.
+    /// A native node that can do the job wins over a Fulcrum peer. An
+    /// unhealthy or unproven node is not in this set, so Fulcrum remains.
+    pub(crate) fn select_photon_route(&self, now_ms: u64) -> Option<&SourceEntry> {
+        let candidates = self.candidates(SourceCapability::PhotonState, now_ms);
+        candidates
+            .iter()
+            .copied()
+            .find(|entry| entry.kind == SourceKind::NativeNode)
+            .or_else(|| candidates.into_iter().next())
+    }
+
     pub(crate) fn candidates(
         &self,
         capability: SourceCapability,
