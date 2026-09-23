@@ -56,7 +56,10 @@ enum RefreshFailureAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReconnectPreference {
+    /// Keep the current peer first, but still allow one backup in the same dial.
     PreferActive,
+    /// Dial only the current peer. A backup inside this attempt is a rotation.
+    SamePeer,
     RotateAway,
 }
 
@@ -275,6 +278,13 @@ fn eligible_fulcrum_endpoints(
             endpoints.retain(|endpoint| !endpoint.eq_ignore_ascii_case(active));
             endpoints.insert(0, active.to_string());
             endpoints.truncate(AUTO_PROBE_LIMIT.max(1));
+        }
+        ReconnectPreference::SamePeer if active_available => {
+            return vec![active.to_string()];
+        }
+        ReconnectPreference::SamePeer => {
+            // In backoff or unknown. Do not quietly substitute another peer.
+            return Vec::new();
         }
         ReconnectPreference::RotateAway => {
             endpoints.sort_by_key(|endpoint| endpoint.eq_ignore_ascii_case(active));
@@ -1236,6 +1246,12 @@ fn preflight_pending_transaction(
     expected_txid: &str,
     raw_tx_hex: &str,
 ) -> Result<(), String> {
+    // Bootstrap node RPCs stay off this gate. A public node that lacks
+    // testmempoolaccept, or rejects a valid PHOTON tx, must not block the
+    // Fulcrum broadcast the miner already uses.
+    if cfg.node_url.is_none() {
+        return Ok(());
+    }
     let endpoints = cfg.node_endpoints();
     if endpoints.is_empty() {
         return Ok(());
@@ -1394,9 +1410,19 @@ fn production_relay_fee_sats_per_kb(cfg: &RuntimeConfig) -> Result<u64, String> 
             Ok(reward::MIN_RELAY_FEE_SATS_PER_KB)
         };
     }
-    let (_, policy) = crate::node::fetch_relay_policy(&endpoints)
-        .map_err(|error| format!("native-node relay-policy preflight failed: {error}"))?;
-    Ok(reward::MIN_RELAY_FEE_SATS_PER_KB.max(policy.mempool_min_fee_sats_per_kb))
+    match crate::node::fetch_relay_policy(&endpoints) {
+        Ok((_, policy)) => {
+            Ok(reward::MIN_RELAY_FEE_SATS_PER_KB.max(policy.mempool_min_fee_sats_per_kb))
+        }
+        // A configured node is authoritative. Bootstrap-only RPC is optional:
+        // a dead public endpoint must not stop Fulcrum mining.
+        Err(_) if cfg.node_url.is_none() && cfg.source != JobSource::Node => {
+            Ok(reward::MIN_RELAY_FEE_SATS_PER_KB)
+        }
+        Err(error) => Err(format!(
+            "native-node relay-policy preflight failed: {error}"
+        )),
+    }
 }
 
 fn probe_submission_journal(journal_path: &Path) -> Result<(), String> {
@@ -2298,6 +2324,15 @@ fn run_supervisor(
                     Err(error) => {
                         last_error = Some(error.clone());
                         state = SupervisorState::Reconnecting;
+                        if reconnect_preference == ReconnectPreference::SamePeer {
+                            let now_ms = source_capability_now_ms(source_capability_epoch);
+                            let _ = sources.record_failure(
+                                SourceKind::Fulcrum,
+                                &active_fulcrum_endpoint,
+                                now_ms,
+                            );
+                            reconnect_preference = ReconnectPreference::RotateAway;
+                        }
                         emit(&event_tx, RuntimeEvent::Reconnecting(error));
                         next_reconnect = Instant::now() + reconnect_backoff;
                         reconnect_backoff = reconnect_backoff
@@ -2666,14 +2701,17 @@ fn run_supervisor(
                         }
                         RefreshFailureAction::ReconnectCurrent => {
                             state = SupervisorState::Reconnecting;
-                            reconnect_preference = ReconnectPreference::PreferActive;
-                            emit(
-                                &event_tx,
-                                RuntimeEvent::Reconnecting(format!(
-                                    "Fulcrum PHOTON refresh timed out {} consecutive times; reconnecting same source while current generation keeps mining: {error}",
-                                    refresh_failures.consecutive
-                                )),
-                            );
+                            reconnect_preference = ReconnectPreference::SamePeer;
+                            let reconnect_reason = match failure_kind {
+                                RefreshFailureKind::Transient => format!(
+                                    "PHOTON refresh failed {consecutive} times; reconnecting the same source while this generation keeps mining: {error}",
+                                    consecutive = refresh_failures.consecutive
+                                ),
+                                RefreshFailureKind::Transport => format!(
+                                    "source transport failed; reconnecting the same peer before any rotation: {error}"
+                                ),
+                            };
+                            emit(&event_tx, RuntimeEvent::Reconnecting(reconnect_reason));
                             session = None;
                             next_reconnect = Instant::now() + reconnect_backoff;
                             reconnect_backoff = reconnect_backoff
@@ -2692,7 +2730,7 @@ fn run_supervisor(
                             reconnect_preference = ReconnectPreference::RotateAway;
                             let reconnect_reason = match failure_kind {
                                 RefreshFailureKind::Transient => format!(
-                                    "Fulcrum PHOTON refresh timed out repeatedly after a same-source reconnect; rotating source while current generation keeps mining: {error}"
+                                    "PHOTON refresh kept failing after a same-source reconnect; rotating source while this generation keeps mining: {error}"
                                 ),
                                 RefreshFailureKind::Transport => format!(
                                     "Fulcrum transport lost; rotating source while current generation keeps mining: {error}"
@@ -3760,6 +3798,51 @@ mod tests {
     }
 
     #[test]
+    fn chain_healthy_node_without_photon_proof_stays_off_the_photon_route() {
+        let endpoint = "http://node.invalid";
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_node_url(endpoint).unwrap();
+        let mut sources = SourceCatalog::configured(&cfg).unwrap();
+        let canonical = live_snapshot("wss://fulcrum.invalid");
+        record_canonical_fulcrum_probe(&mut sources, &canonical, 1_000, 4).unwrap();
+        sources
+            .record_success(SourceKind::NativeNode, endpoint, 1_000, 5)
+            .unwrap();
+
+        let router = sources.router();
+        let selected = router.select_photon_route(1_000).unwrap();
+        assert_eq!(selected.kind, SourceKind::Fulcrum);
+        assert_eq!(selected.endpoint, "wss://fulcrum.invalid");
+    }
+
+    #[test]
+    fn stabler_healthy_node_beats_a_slower_node_and_fulcrum() {
+        let slow = "http://node-slow.invalid";
+        let fast = "http://node-fast.invalid";
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_node_url(slow).unwrap();
+        let mut sources = SourceCatalog::configured(&cfg).unwrap();
+        sources
+            .add_user(SourceKind::NativeNode, fast, "fast node")
+            .unwrap();
+        let canonical = live_snapshot("wss://fulcrum.invalid");
+        record_canonical_fulcrum_probe(&mut sources, &canonical, 1_000, 4).unwrap();
+        let slow_native = live_snapshot(slow);
+        let fast_native = live_snapshot(fast);
+        let (slow_accepted, slow_error) =
+            record_native_photon_probe(&mut sources, slow, &canonical, Ok(slow_native), 1_000, 80);
+        let (fast_accepted, fast_error) =
+            record_native_photon_probe(&mut sources, fast, &canonical, Ok(fast_native), 1_000, 10);
+        assert!(slow_error.is_none() && slow_accepted.is_some());
+        assert!(fast_error.is_none() && fast_accepted.is_some());
+
+        let router = sources.router();
+        let selected = router.select_photon_route(1_000).unwrap();
+        assert_eq!(selected.kind, SourceKind::NativeNode);
+        assert_eq!(selected.endpoint, fast);
+    }
+
+    #[test]
     fn native_outage_continuity_is_bounded_by_equivalence_proof() {
         let endpoint = "http://node.invalid";
         let mut cfg = RuntimeConfig::default();
@@ -4468,6 +4551,42 @@ mod tests {
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0], "wss://a.invalid");
         assert_eq!(endpoints[1], "wss://b.invalid");
+    }
+
+    #[test]
+    fn same_peer_reconnect_does_not_offer_a_failover_target() {
+        let mut sources = SourceCatalog::default();
+        for endpoint in ["wss://a.invalid", "wss://b.invalid"] {
+            sources
+                .add_user(SourceKind::Fulcrum, endpoint, endpoint)
+                .unwrap();
+            sources
+                .record_success(SourceKind::Fulcrum, endpoint, 0, 5)
+                .unwrap();
+        }
+        let endpoints = eligible_fulcrum_endpoints(
+            &sources,
+            0,
+            99,
+            Some("wss://a.invalid"),
+            ReconnectPreference::SamePeer,
+        );
+        assert_eq!(endpoints, vec!["wss://a.invalid".to_string()]);
+
+        sources
+            .record_failure(SourceKind::Fulcrum, "wss://a.invalid", 0)
+            .unwrap();
+        let during_backoff = eligible_fulcrum_endpoints(
+            &sources,
+            0,
+            99,
+            Some("wss://a.invalid"),
+            ReconnectPreference::SamePeer,
+        );
+        assert!(
+            during_backoff.is_empty(),
+            "a same-peer retry must not substitute the backup while the peer is in backoff"
+        );
     }
 
     #[test]

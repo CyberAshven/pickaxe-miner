@@ -1055,38 +1055,47 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let efficiency = telemetry.candidates_per_watt(snapshot.search.current_rate);
     let lines = vec![
         Line::from(format!(
-            "rate: current {:>10.0}/s   average {:>10.0}/s   peak {:>10.0}/s",
-            snapshot.search.current_rate, snapshot.search.rate, snapshot.search.peak_rate
+            "reconnects {}   rotations {}   jobs {}",
+            snapshot.reconnects, snapshot.endpoint_rotations, snapshot.job_changes
         )),
         Line::from(format!(
-            "candidates: {}   batches: {}   uptime: {}s",
-            snapshot.search.candidates, snapshot.search.batches, snapshot.search.elapsed_secs
+            "source {}   transport {}",
+            if snapshot.source_degraded {
+                "degraded"
+            } else {
+                "healthy"
+            },
+            snapshot.transport_failures
         )),
         Line::from(format!(
-            "generation: {}   height: {}   state checks: {}   refresh failures: {}   consecutive: {}",
-            snapshot.generation_id,
-            snapshot.height,
-            snapshot.state_checks,
-            snapshot.transient_refresh_failures,
-            snapshot.consecutive_refresh_failures
+            "refresh {}   consecutive {}",
+            snapshot.transient_refresh_failures, snapshot.consecutive_refresh_failures
         )),
         Line::from(format!(
-            "baton: {}:{}",
-            shorten(&snapshot.baton_txid, 22),
+            "rate {:>8.0}/s   avg {:>8.0}/s",
+            snapshot.search.current_rate, snapshot.search.rate
+        )),
+        Line::from(format!(
+            "peak {:>8.0}/s   uptime {}s",
+            snapshot.search.peak_rate, snapshot.search.elapsed_secs
+        )),
+        Line::from(format!(
+            "candidates {}   batches {}",
+            snapshot.search.candidates, snapshot.search.batches
+        )),
+        Line::from(format!(
+            "gen {}   height {}   checks {}",
+            snapshot.generation_id, snapshot.height, snapshot.state_checks
+        )),
+        Line::from(format!("endpoint {}", shorten(&endpoint, 40))),
+        Line::from(format!(
+            "baton {}:{}",
+            shorten(&snapshot.baton_txid, 16),
             snapshot.baton_vout
         )),
-        Line::from(format!("endpoint: {}", shorten(&endpoint, 64))),
         Line::from(format!(
-            "winners: verified {}   stale {}   pending {}",
+            "winners {}   stale {}   pending {}",
             snapshot.verified_winners, snapshot.stale_winners, snapshot.pending_winners
-        )),
-        Line::from(format!(
-            "source: {}   transport failures: {}   reconnects: {}   rotations: {}   job changes: {}",
-            if snapshot.source_degraded { "degraded" } else { "healthy" },
-            snapshot.transport_failures,
-            snapshot.reconnects,
-            snapshot.endpoint_rotations,
-            snapshot.job_changes
         )),
         Line::from(format!("payout: {}", shorten(&snapshot.payout_address, 66))),
         Line::from(format!(
@@ -1102,7 +1111,7 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             format_metric(telemetry.memory_clock_mhz, "MHz"),
             format_metric(efficiency, " cand/s/W"),
         )),
-        Line::from(format!("last error: {}", shorten(last_error, 70))),
+        Line::from(format!("last error: {}", shorten(last_error, 42))),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -1202,7 +1211,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("- / [        decrease intensity 10%"),
         Line::from("arrows       adjust intensity 5%"),
         Line::from("Space / P    pause or resume"),
-        Line::from("R            reconnect authoritative Fulcrum source"),
+        Line::from("R            reconnect the current source"),
         Line::from("S            settings"),
         Line::from("/ (: or C)   command bar"),
         Line::from("?            close/open help"),
@@ -1267,23 +1276,21 @@ fn format_event(event: RuntimeEvent) -> String {
             baton_txid,
             baton_vout,
         } => format!(
-            "job updated: gen={generation_id} height={height} baton={}:{}",
-            shorten(&baton_txid, 18),
+            "job g={generation_id} h={height} {}:{}",
+            shorten(&baton_txid, 10),
             baton_vout
         ),
         RuntimeEvent::StateRefreshFailed { error, consecutive } => {
-            format!(
-                "PHOTON state check failed; retaining generation (consecutive={consecutive}): {error}"
-            )
+            format!("refresh failed x{consecutive}: {}", shorten(&error, 24))
         }
-        RuntimeEvent::Reconnecting(error) => format!("reconnecting: {error}"),
+        RuntimeEvent::Reconnecting(error) => format!("reconnecting {}", shorten(&error, 28)),
         RuntimeEvent::Reconnected(endpoint) => {
-            format!("reconnected: {}", redact_endpoint(&endpoint))
+            format!("reconnected {}", shorten(&redact_endpoint(&endpoint), 30))
         }
         RuntimeEvent::EndpointRotated { from, to } => format!(
-            "source changed: {} -> {}",
-            redact_endpoint(&from),
-            redact_endpoint(&to)
+            "switch {} -> {}",
+            shorten(&redact_endpoint(&from), 16),
+            shorten(&redact_endpoint(&to), 16)
         ),
         RuntimeEvent::StaleWinner {
             winner_generation,
@@ -1613,23 +1620,36 @@ mod tests {
         snapshot.reconnects = 4;
         snapshot.endpoint_rotations = 2;
         snapshot.job_changes = 1;
-        let state = TuiState::new(&snapshot);
-        let backend = ratatui::backend::TestBackend::new(200, 40);
+        let mut state = TuiState::new(&snapshot);
+        state.push_event(format_event(RuntimeEvent::EndpointRotated {
+            from: "wss://blackie.c3-soft.com:50004".into(),
+            to: "wss://bch.soul-dev.com:50004".into(),
+        }));
+        let backend = ratatui::backend::TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| render(frame, &snapshot, &state))
             .unwrap();
-        let rendered = terminal
+        let width = 120usize;
+        let rows = terminal
             .backend()
             .buffer()
             .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("30%"));
-        assert!(rendered.contains("reconnects: 4"));
-        assert!(rendered.contains("rotations: 2"));
-        assert!(rendered.contains("job changes: 1"));
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.contains("30%")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("reconnects 4") && row.contains("rotations 2")),
+            "reconnect and rotation counts must share one 120-column row: {rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.contains("jobs 1")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("switch ") && row.contains("->")),
+            "peer switch must be visible on one events row: {rows:?}"
+        );
     }
 
     #[test]
