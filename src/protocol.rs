@@ -168,6 +168,7 @@ pub const FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://fulcrum.greyh.at:50004",
     "wss://electron.jochen-hoenicke.de:51004",
     "wss://fulcrum.jettscythe.xyz:50004",
+    "wss://fulcrum.kronbit.com:50004",
 ];
 
 /// Electron Cash mainnet servers published with the `s` (TLS) transport.
@@ -232,8 +233,9 @@ pub const ELECTRON_CASH_TCP_BOOTSTRAP: &[(&str, u16)] = &[
 ];
 
 /// Curated native **node** JSON-RPC bootstrap (BCHN/bitcoind-style HTTP).
-/// Unauthenticated `getblockchaininfo` on public host:8332 endpoints did not
-/// answer, so this list stays empty instead of shipping dead RPC URLs.
+/// Unauthenticated `getblockchaininfo` did not answer on public host:8332
+/// (timeout or connection refused) or on common HTTPS RPC hostnames (404 or
+/// DNS failure). This list stays empty instead of shipping dead RPC URLs.
 /// A configured node is used when it is healthy and its PHOTON proof is current.
 pub const NODE_RPC_BOOTSTRAP: &[&str] = &[];
 
