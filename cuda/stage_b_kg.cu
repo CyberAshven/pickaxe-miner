@@ -33,157 +33,220 @@ __device__ __forceinline__ int fecmp(const Fe* a, const Fe* b) {
     return 0;
 }
 
-__device__ __noinline__ void fesubp_if_ge(Fe* r) {
-    Fe p = fep();
-    for (int k = 0; k < 3; ++k) {
-        if (fecmp(r, &p) < 0) break;
-        uint32_t br = 0;
-        for (int i = 0; i < 8; ++i) {
-            uint64_t ai = r->d[i];
-            uint64_t sub = (uint64_t)p.d[i] + br;
-            uint64_t t = ai - sub;
-            r->d[i] = (uint32_t)t;
-            br = (ai < sub) ? 1u : 0u;
-        }
+// Field arithmetic mod p = 2^256 - 2^32 - 977. Results are fully reduced
+// (< p). feadd/fesub expect reduced inputs; femul/fesqr accept any 256-bit
+// inputs. Everything is straight-line register code: no carry loops, no
+// local-memory temporaries, and the same C++ builds for CUDA and HIP.
+
+// r = a + 2^32 + 977 (mod 2^256). Returns the carry out of bit 256, which is
+// set exactly when a + 2^256 - p >= 2^256, i.e. when a >= p.
+__device__ __forceinline__ uint32_t fe_add_pc(Fe* r, const Fe* a) {
+    uint64_t c = (uint64_t)a->d[0] + 977u;
+    r->d[0] = (uint32_t)c; c >>= 32;
+    c += (uint64_t)a->d[1] + 1u;
+    r->d[1] = (uint32_t)c; c >>= 32;
+#pragma unroll
+    for (int i = 2; i < 8; ++i) {
+        c += a->d[i];
+        r->d[i] = (uint32_t)c; c >>= 32;
     }
+    return (uint32_t)c;
 }
 
-__device__ __noinline__ void feadd(Fe* r, const Fe* a, const Fe* b) {
+__device__ __forceinline__ void fe_select(Fe* r, uint32_t take_b, const Fe* a, const Fe* b) {
+    const uint32_t mask = 0u - (take_b & 1u);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) r->d[i] = (b->d[i] & mask) | (a->d[i] & ~mask);
+}
+
+// Subtracts p once when r >= p. Valid for any r < 2^256.
+__device__ __forceinline__ void fesubp_if_ge(Fe* r) {
+    Fe t;
+    const uint32_t ge = fe_add_pc(&t, r);
+    fe_select(r, ge, r, &t);
+}
+
+__device__ __forceinline__ void feadd(Fe* r, const Fe* a, const Fe* b) {
+    Fe s;
     uint64_t c = 0;
+#pragma unroll
     for (int i = 0; i < 8; ++i) {
         c += (uint64_t)a->d[i] + b->d[i];
-        r->d[i] = (uint32_t)c;
-        c >>= 32;
+        s.d[i] = (uint32_t)c; c >>= 32;
     }
-    if (c) {
-        // 2^256 â‰¡ 2^32 + 977 (mod p)
-        Fe corr = fe0();
-        corr.d[0] = 977u;
-        corr.d[1] = 1u; // 2^32
-        c = 0;
-        for (int i = 0; i < 8; ++i) {
-            c += (uint64_t)r->d[i] + corr.d[i];
-            r->d[i] = (uint32_t)c;
-            c >>= 32;
-        }
-        if (c) {
-            c = 0;
-            for (int i = 0; i < 8; ++i) {
-                c += (uint64_t)r->d[i] + corr.d[i];
-                r->d[i] = (uint32_t)c;
-                c >>= 32;
-            }
-        }
+    // a + b < 2p, so one subtraction of p is enough. With a carry out of
+    // bit 256 the true sum minus p is s + 2^256 - p, which fe_add_pc gives.
+    Fe t;
+    const uint32_t ge = fe_add_pc(&t, &s);
+    fe_select(r, (uint32_t)c | ge, &s, &t);
+}
+
+__device__ __forceinline__ void fesub(Fe* r, const Fe* a, const Fe* b) {
+    Fe s;
+    uint32_t borrow = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint64_t t = (uint64_t)a->d[i] - b->d[i] - borrow;
+        s.d[i] = (uint32_t)t;
+        borrow = (uint32_t)(t >> 63);
+    }
+    // On borrow add p, i.e. subtract 2^32 + 977 modulo 2^256.
+    Fe t;
+    uint64_t w = (uint64_t)s.d[0] - 977u;
+    t.d[0] = (uint32_t)w;
+    w = (uint64_t)s.d[1] - 1u - (uint32_t)(w >> 63);
+    t.d[1] = (uint32_t)w;
+#pragma unroll
+    for (int i = 2; i < 8; ++i) {
+        w = (uint64_t)s.d[i] - (uint32_t)(w >> 63);
+        t.d[i] = (uint32_t)w;
+    }
+    fe_select(r, borrow, &s, &t);
+}
+
+// Reduces a 512-bit little-endian product t modulo p.
+__device__ __forceinline__ void fe_reduce512(Fe* r, const uint32_t t[16]) {
+    // 2^256 = 2^32 + 977 (mod p): fold the high half as hi*977 + (hi << 32).
+    uint64_t c = (uint64_t)t[0] + (uint64_t)t[8] * 977u;
+    r->d[0] = (uint32_t)c; c >>= 32;
+#pragma unroll
+    for (int i = 1; i < 8; ++i) {
+        c += (uint64_t)t[i] + (uint64_t)t[8 + i] * 977u + t[7 + i];
+        r->d[i] = (uint32_t)c; c >>= 32;
+    }
+    // Remaining weight at 2^256 is below 2^34; fold it the same way.
+    const uint64_t top = c + t[15];
+    c = (uint64_t)r->d[0] + top * 977u;
+    r->d[0] = (uint32_t)c; c >>= 32;
+    c += (uint64_t)r->d[1] + top;
+    r->d[1] = (uint32_t)c; c >>= 32;
+#pragma unroll
+    for (int i = 2; i < 8; ++i) {
+        c += r->d[i];
+        r->d[i] = (uint32_t)c; c >>= 32;
+    }
+    // A carry here leaves a low part below 2^67, so adding 2^32 + 977 for it
+    // cannot carry again. Then at most one subtraction of p remains.
+    const uint32_t extra = (uint32_t)c;
+    c = (uint64_t)r->d[0] + (uint64_t)extra * 977u;
+    r->d[0] = (uint32_t)c; c >>= 32;
+    c += (uint64_t)r->d[1] + extra;
+    r->d[1] = (uint32_t)c; c >>= 32;
+#pragma unroll
+    for (int i = 2; i < 8; ++i) {
+        c += r->d[i];
+        r->d[i] = (uint32_t)c; c >>= 32;
     }
     fesubp_if_ge(r);
 }
 
-__device__ __noinline__ void fesub(Fe* r, const Fe* a, const Fe* b) {
-    uint32_t br = 0;
-    for (int i = 0; i < 8; ++i) {
-        uint64_t ai = a->d[i];
-        uint64_t sub = (uint64_t)b->d[i] + br;
-        uint64_t t = ai - sub;
-        r->d[i] = (uint32_t)t;
-        br = (ai < sub) ? 1u : 0u;
-    }
-    if (br) {
-        Fe p = fep();
-        uint64_t c = 0;
-        for (int i = 0; i < 8; ++i) {
-            c += (uint64_t)r->d[i] + p.d[i];
-            r->d[i] = (uint32_t)c;
-            c >>= 32;
+__device__ __forceinline__ void femul(Fe* r, const Fe* a, const Fe* b) {
+    // Column-wise schoolbook product. Each column sums the low and high
+    // halves of its partial products separately, so nothing overflows u64.
+    uint32_t t[16];
+    uint64_t carry = 0;
+#pragma unroll
+    for (int k = 0; k < 15; ++k) {
+        uint64_t lo = carry;
+        uint64_t hi = 0;
+#pragma unroll
+        for (int i = (k < 8 ? 0 : k - 7); i <= (k < 8 ? k : 7); ++i) {
+            const uint64_t prod = (uint64_t)a->d[i] * b->d[k - i];
+            lo += (uint32_t)prod;
+            hi += prod >> 32;
         }
+        t[k] = (uint32_t)lo;
+        carry = (lo >> 32) + hi;
     }
+    t[15] = (uint32_t)carry;
+    fe_reduce512(r, t);
 }
 
-__device__ __noinline__ void femul(Fe* r, const Fe* a, const Fe* b) {
-    uint64_t acc[16];
-    for (int i = 0; i < 16; ++i) acc[i] = 0;
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 8; ++j) {
-            uint64_t prod = (uint64_t)a->d[i] * b->d[j];
-            uint64_t s = acc[i + j] + (prod & 0xFFFFFFFFu);
-            acc[i + j] = s & 0xFFFFFFFFu;
-            uint64_t carry = (s >> 32) + (prod >> 32);
-            uint64_t k = (uint64_t)(i + j + 1);
-            while (carry) {
-                uint64_t s2 = acc[k] + (carry & 0xFFFFFFFFu);
-                acc[k] = s2 & 0xFFFFFFFFu;
-                carry = (s2 >> 32) + (carry >> 32);
-                ++k;
-            }
+__device__ __forceinline__ void fesqr(Fe* r, const Fe* a) {
+    // As femul, but each cross product a[i]*a[j] (i < j) is computed once
+    // and doubled.
+    uint32_t t[16];
+    uint64_t carry = 0;
+#pragma unroll
+    for (int k = 0; k < 15; ++k) {
+        uint64_t lo = 0;
+        uint64_t hi = 0;
+#pragma unroll
+        for (int i = (k < 8 ? 0 : k - 7); i < k - i; ++i) {
+            const uint64_t prod = (uint64_t)a->d[i] * a->d[k - i];
+            lo += (uint32_t)prod;
+            hi += prod >> 32;
         }
+        lo <<= 1;
+        hi <<= 1;
+        if ((k & 1) == 0) {
+            const uint64_t prod = (uint64_t)a->d[k >> 1] * a->d[k >> 1];
+            lo += (uint32_t)prod;
+            hi += prod >> 32;
+        }
+        lo += carry;
+        t[k] = (uint32_t)lo;
+        carry = (lo >> 32) + hi;
     }
-    // lo = acc[0..7], hi = acc[8..15]
-    Fe lo, hi;
-    for (int i = 0; i < 8; ++i) { lo.d[i] = (uint32_t)acc[i]; hi.d[i] = (uint32_t)acc[i + 8]; }
-
-    // r = lo + hi * (2^32 + 977)
-    Fe hi977 = fe0();
-    {
-        uint64_t c = 0;
-        for (int i = 0; i < 8; ++i) {
-            c += (uint64_t)hi.d[i] * 977u;
-            hi977.d[i] = (uint32_t)c;
-            c >>= 32;
-        }
-        if (c) {
-            // fold c * (2^32+977)
-            Fe f = fe0();
-            uint64_t x = c * 977u;
-            f.d[0] = (uint32_t)x;
-            f.d[1] = (uint32_t)(x >> 32);
-            uint64_t y = c; // * 2^32 -> limb1
-            uint64_t s = (uint64_t)f.d[1] + y;
-            f.d[1] = (uint32_t)s;
-            if (s >> 32) f.d[2] = (uint32_t)(s >> 32);
-            Fe tmp; feadd(&tmp, &hi977, &f); fecpy(&hi977, &tmp);
-        }
-    }
-    Fe hi32 = fe0();
-    {
-        // shift hi left by 32 bits (= one limb)
-        for (int i = 7; i >= 1; --i) hi32.d[i] = hi.d[i - 1];
-        hi32.d[0] = 0;
-        uint32_t top = hi.d[7]; // overflow limb beyond 256
-        Fe sum; feadd(&sum, &lo, &hi977);
-        feadd(r, &sum, &hi32);
-        if (top) {
-            Fe fold = fe0();
-            uint64_t x = (uint64_t)top * 977u;
-            fold.d[0] = (uint32_t)x;
-            fold.d[1] = (uint32_t)(x >> 32) + top; // + top<<32 into limb1
-            // if limb1 overflow:
-            if (fold.d[1] < top) fold.d[2] = 1;
-            Fe tmp; feadd(&tmp, r, &fold); fecpy(r, &tmp);
-        }
-    }
-    fesubp_if_ge(r);
+    t[15] = (uint32_t)carry;
+    fe_reduce512(r, t);
 }
 
-__device__ __noinline__ void fesqr(Fe* r, const Fe* a) { femul(r, a, a); }
-__device__ __forceinline__ void fedbl(Fe* r, const Fe* a) { feadd(r, a, a); }
+__device__ __forceinline__ void fesqr_n(Fe* r, int n) {
+    for (int i = 0; i < n; ++i) fesqr(r, r);
+}
 
+// Shared prefix of the inversion and square-root addition chains
+// (the libsecp256k1 chain): x2 = a^(2^2-1), x22 = a^(2^22-1),
+// x223 = a^(2^223-1).
+__device__ __noinline__ void fe_pow_chain223(Fe* x2, Fe* x22, Fe* x223, const Fe* a) {
+    Fe x3, x6, x9, x11, x44, x88, x176, x220;
+    fesqr(x2, a);          femul(x2, x2, a);
+    fesqr(&x3, x2);        femul(&x3, &x3, a);
+    x6 = x3;     fesqr_n(&x6, 3);    femul(&x6, &x6, &x3);
+    x9 = x6;     fesqr_n(&x9, 3);    femul(&x9, &x9, &x3);
+    x11 = x9;    fesqr_n(&x11, 2);   femul(&x11, &x11, x2);
+    *x22 = x11;  fesqr_n(x22, 11);   femul(x22, x22, &x11);
+    x44 = *x22;  fesqr_n(&x44, 22);  femul(&x44, &x44, x22);
+    x88 = x44;   fesqr_n(&x88, 44);  femul(&x88, &x88, &x44);
+    x176 = x88;  fesqr_n(&x176, 88); femul(&x176, &x176, &x88);
+    x220 = x176; fesqr_n(&x220, 44); femul(&x220, &x220, &x44);
+    *x223 = x220; fesqr_n(x223, 3);  femul(x223, x223, &x3);
+}
+
+// r = a^(p-2) = a^-1 (and 0 for a = 0): 255 squarings, 15 multiplications.
 __device__ __noinline__ void feinv(Fe* r, const Fe* a) {
-    Fe base; fecpy(&base, a);
-    Fe res = fe1();
-    // exponent p-2 LE limbs
-    const uint32_t e[8] = {
-        0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu
-    };
-    for (int limb = 0; limb < 8; ++limb) {
-        uint32_t w = e[limb];
-        for (int bit = 0; bit < 32; ++bit) {
-            if (w & 1u) { Fe t; femul(&t, &res, &base); fecpy(&res, &t); }
-            Fe sq; fesqr(&sq, &base); fecpy(&base, &sq);
-            w >>= 1;
-        }
-    }
-    fecpy(r, &res);
+    Fe x2, x22, t;
+    fe_pow_chain223(&x2, &x22, &t, a);
+    fesqr_n(&t, 23); femul(&t, &t, &x22);
+    fesqr_n(&t, 5);  femul(&t, &t, a);
+    fesqr_n(&t, 3);  femul(&t, &t, &x2);
+    fesqr_n(&t, 2);  femul(r, &t, a);
 }
+
+// r = a^((p+1)/4). When a is a square mod p, r is a square root of a.
+__device__ __noinline__ void fe_pow_sqrt(Fe* r, const Fe* a) {
+    Fe x2, x22, t;
+    fe_pow_chain223(&x2, &x22, &t, a);
+    fesqr_n(&t, 23); femul(&t, &t, &x22);
+    fesqr_n(&t, 6);  femul(&t, &t, &x2);
+    fesqr_n(&t, 2);
+    *r = t;
+}
+
+// Quadratic-residue test: a is a square mod p iff (a^((p+1)/4))^2 == a.
+// Zero counts as a square, matching the previous Euler-criterion check.
+__device__ __forceinline__ bool fe_is_square(const Fe* a) {
+    Fe root, check;
+    fe_pow_sqrt(&root, a);
+    fesqr(&check, &root);
+    uint32_t diff = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) diff |= check.d[i] ^ a->d[i];
+    return diff == 0u;
+}
+
+__device__ __forceinline__ void fedbl(Fe* r, const Fe* a) { feadd(r, a, a); }
 
 __device__ __forceinline__ Fe secp_gx() {
     // 79BE667E F9DCBBAC 55A06295 CE870B07 029BFCDB 2DCE28D9 59F2815B 16F81798

@@ -117,35 +117,8 @@ __device__ __forceinline__ JPoint c1_load_point(const uint32_t* points, uint32_t
     return point;
 }
 
-__device__ __forceinline__ bool fe_is_one(const Fe* a) {
-    if (a->d[0] != 1u) return false;
-    for (int i = 1; i < 8; ++i) if (a->d[i] != 0u) return false;
-    return true;
-}
-
-__device__ bool c1_y_is_quadratic_residue(const Fe* y) {
-    if (feeqz(y)) return true;
-    const uint32_t exponent[8] = {
-        0x7ffffe17u, 0xffffffffu, 0xffffffffu, 0xffffffffu,
-        0xffffffffu, 0xffffffffu, 0xffffffffu, 0x7fffffffu
-    };
-    Fe base = *y;
-    Fe result = fe1();
-    for (int limb = 0; limb < 8; ++limb) {
-        uint32_t word = exponent[limb];
-        for (int bit = 0; bit < 32; ++bit) {
-            if ((word & 1u) != 0u) {
-                Fe next;
-                femul(&next, &result, &base);
-                result = next;
-            }
-            Fe squared;
-            fesqr(&squared, &base);
-            base = squared;
-            word >>= 1u;
-        }
-    }
-    return fe_is_one(&result);
+__device__ __forceinline__ bool c1_y_is_quadratic_residue(const Fe* y) {
+    return fe_is_square(y);
 }
 
 __device__ __forceinline__ Scalar256 scalar_n() {
