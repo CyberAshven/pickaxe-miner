@@ -205,11 +205,11 @@ jobs:
           fi
           test -f "${bin}"
           version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
-          help="$(${bin} --help)"
+          help="$(${bin} --help | tr -d '\r')"
           printf '%s\n' "${help}" | grep -q -- '--no-tui'
           printf '%s\n' "${help}" | grep -q -- '--intensity'
           printf '%s\n' "${help}" | grep -q 'mine'
-          test "$(${bin} --version)" = "pickaxe ${version}"
+          test "$(${bin} --version | tr -d '\r')" = "pickaxe ${version}"
 
       - name: Package Linux
         if: runner.os == 'Linux'
