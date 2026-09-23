@@ -316,6 +316,12 @@ impl SavedConfig {
 }
 
 fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    // An existing file is restricted before it is truncated. A failed
+    // permission change must leave the previous payout and node URL in place.
+    let replacing = path.exists();
+    if replacing {
+        restrict_private_config(path)?;
+    }
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -326,18 +332,29 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = options
         .open(path)
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("restrict config {}: {error}", path.display()))?;
+    if !replacing {
+        if let Err(error) = restrict_private_config(path) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
     }
-    #[cfg(windows)]
-    restrict_config_to_current_user(path)?;
     std::io::Write::write_all(&mut file, bytes)
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
     file.sync_all()
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn restrict_private_config(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("restrict config {}: {error}", path.display()))?;
+    }
+    #[cfg(windows)]
+    restrict_config_to_current_user(path)?;
     Ok(())
 }
 
@@ -431,6 +448,15 @@ mod tests {
         saved.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("secret-pass"), "{text}");
+        assert_config_file_is_owner_only(&path);
+        runtime
+            .set_node_url("http://user:second-secret@127.0.0.1:8332")
+            .unwrap();
+        let replaced = SavedConfig::from_effective("cuda", Some(0), &runtime);
+        replaced.save(&path).unwrap();
+        let replaced_text = fs::read_to_string(&path).unwrap();
+        assert!(replaced_text.contains("second-secret"), "{replaced_text}");
+        assert!(!replaced_text.contains("secret-pass"), "{replaced_text}");
         assert_config_file_is_owner_only(&path);
         #[cfg(unix)]
         {
