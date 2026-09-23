@@ -28,6 +28,7 @@ use std::{
 };
 
 const DRAW_INTERVAL: Duration = Duration::from_millis(200);
+const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EVENT_HISTORY_CAP: usize = 96;
 const COMMAND_HISTORY_CAP: usize = 32;
@@ -408,32 +409,47 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
     }
 }
 
-/// Mirrors runtime status updates to the terminal view.
-fn mirror_tui_status(snapshot: &RuntimeSnapshot) {
+/// Appends one Unix-timestamped line to the optional `PICKAXE_TUI_LOG` file.
+fn append_tui_log(line: &str) {
     let Ok(path) = std::env::var("PICKAXE_TUI_LOG") else {
         return;
     };
-    let line = format!(
-        "state={:?} intensity={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} height={} endpoint={} last_error={}\n",
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, format!("{seconds} {line}\n").as_bytes());
+    }
+}
+
+/// Formats the periodic status line for the TUI observation log.
+fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
+    format!(
+        "status state={:?} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} endpoint={} last_error={}",
         snapshot.state,
         snapshot.search.intensity,
+        snapshot.search.current_rate,
+        snapshot.search.rate,
+        snapshot.search.peak_rate,
         snapshot.reconnects,
         snapshot.endpoint_rotations,
         snapshot.job_changes,
         snapshot.state_checks,
         snapshot.search.batches,
         snapshot.search.candidates,
+        snapshot.verified_winners,
+        snapshot.stale_winners,
+        snapshot.search.rejected_winners,
+        snapshot.pending_winners,
         snapshot.height,
         redact_endpoint(&snapshot.endpoint),
         snapshot.last_error.as_deref().unwrap_or("none"),
-    );
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
-    }
+    )
 }
 
 /// Runs the mining terminal event loop until exit.
@@ -448,11 +464,14 @@ pub fn run(
     let mut quit = false;
     let mut last_draw = Instant::now() - DRAW_INTERVAL;
 
+    let mut last_status_log: Option<Instant> = None;
     while !quit {
         let snapshot = supervisor.snapshot();
 
         for event in supervisor.drain_events() {
-            state.push_event(format_event(event));
+            let message = format_event(event);
+            append_tui_log(&format!("event {message}"));
+            state.push_event(message);
         }
 
         if last_draw.elapsed() >= DRAW_INTERVAL {
@@ -460,8 +479,12 @@ pub fn run(
                 .terminal
                 .draw(|frame| render(frame, &snapshot, &state))
                 .map_err(|error| format!("draw terminal UI: {error}"))?;
-            mirror_tui_status(&snapshot);
             last_draw = Instant::now();
+        }
+
+        if last_status_log.is_none_or(|logged| logged.elapsed() >= STATUS_LOG_INTERVAL) {
+            append_tui_log(&tui_status_line(&snapshot));
+            last_status_log = Some(Instant::now());
         }
 
         if event::poll(EVENT_POLL_INTERVAL)
@@ -1649,6 +1672,35 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("[/] command"));
+    }
+
+    #[test]
+    /// Checks that the observation log line carries rates, churn, and winners.
+    fn tui_status_line_reports_rates_churn_and_winners() {
+        let mut snapshot = test_snapshot();
+        snapshot.search.current_rate = 16_900_000.4;
+        snapshot.search.rate = 16_800_000.0;
+        snapshot.search.peak_rate = 17_000_000.0;
+        snapshot.reconnects = 3;
+        snapshot.endpoint_rotations = 1;
+        snapshot.verified_winners = 5;
+        snapshot.stale_winners = 2;
+        snapshot.search.rejected_winners = 1;
+        let line = tui_status_line(&snapshot);
+        for field in [
+            "rate=16900000 ",
+            "avg_rate=16800000 ",
+            "peak_rate=17000000 ",
+            "reconnects=3 ",
+            "rotations=1 ",
+            "verified_winners=5 ",
+            "stale_winners=2 ",
+            "rejected_winners=1 ",
+        ] {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
+        assert!(line.starts_with("status "));
+        assert!(!line.contains('\n'));
     }
 
     #[test]
