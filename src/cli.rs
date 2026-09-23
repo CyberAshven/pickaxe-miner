@@ -4,7 +4,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "pickaxe", about = "Pickaxe Miner - GPU-only PHOTON miner")]
+#[command(
+    name = "pickaxe",
+    version,
+    about = "Pickaxe Miner - GPU-only PHOTON miner"
+)]
 pub struct Cli {
     #[arg(long, global = true, value_parser = ["auto", "cuda", "hip", "wgpu"])]
     pub backend: Option<String>,

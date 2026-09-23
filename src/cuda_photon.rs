@@ -13,7 +13,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 use num_bigint::BigUint;
 use secp256k1::{PublicKey, SecretKey};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const TX_BYTES: usize = 615;
@@ -67,11 +67,40 @@ pub struct CudaPhotonEngine {
     job_ready: bool,
 }
 
-fn ptx_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("cuda")
-        .join("build")
-        .join(name)
+fn cuda_ptx_search_dirs(executable_dir: Option<&Path>, manifest_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(executable_dir) = executable_dir {
+        dirs.push(executable_dir.join("cuda").join("build"));
+    }
+    dirs.push(manifest_dir.join("cuda").join("build"));
+    dirs
+}
+
+fn resolve_ptx_path_in(
+    name: &str,
+    executable_dir: Option<&Path>,
+    manifest_dir: &Path,
+) -> Result<PathBuf, String> {
+    let dirs = cuda_ptx_search_dirs(executable_dir, manifest_dir);
+    if let Some(path) = dirs
+        .iter()
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+    {
+        return Ok(path);
+    }
+    let searched = dirs
+        .iter()
+        .map(|dir| dir.join(name).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!("missing CUDA PTX {name}; searched: {searched}"))
+}
+
+fn resolve_ptx_path(name: &str) -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().ok();
+    let executable_dir = executable.as_deref().and_then(Path::parent);
+    resolve_ptx_path_in(name, executable_dir, Path::new(env!("CARGO_MANIFEST_DIR")))
 }
 
 fn load_function(
@@ -79,10 +108,7 @@ fn load_function(
     ptx_name: &str,
     function_name: &str,
 ) -> Result<CudaFunction, String> {
-    let path = ptx_path(ptx_name);
-    if !path.is_file() {
-        return Err(format!("missing CUDA PTX at {}", path.display()));
-    }
+    let path = resolve_ptx_path(ptx_name)?;
     let source = std::fs::read_to_string(&path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     let module = ctx
@@ -417,6 +443,34 @@ mod tests {
             placeholders.is_empty(),
             "production CUDA source tree must not contain placeholder kernels: {placeholders:?}"
         );
+    }
+
+    #[test]
+    fn release_layout_finds_ptx_beside_the_executable_before_the_manifest() {
+        let root = std::env::temp_dir().join(format!("pickaxe-ptx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let executable_dir = root.join("exe");
+        let manifest_dir = root.join("manifest");
+        let executable_ptx = executable_dir.join("cuda").join("build");
+        let manifest_ptx = manifest_dir.join("cuda").join("build");
+        std::fs::create_dir_all(&executable_ptx).unwrap();
+        std::fs::create_dir_all(&manifest_ptx).unwrap();
+        std::fs::write(executable_ptx.join("stage_a_rfc6979.ptx"), b"beside-exe").unwrap();
+        std::fs::write(manifest_ptx.join("stage_a_rfc6979.ptx"), b"manifest").unwrap();
+
+        let found =
+            resolve_ptx_path_in("stage_a_rfc6979.ptx", Some(&executable_dir), &manifest_dir)
+                .unwrap();
+        assert_eq!(std::fs::read_to_string(&found).unwrap(), "beside-exe");
+
+        let missing =
+            resolve_ptx_path_in("photon_stage_b16.ptx", Some(&executable_dir), &manifest_dir)
+                .expect_err("missing ptx");
+        assert!(missing.contains("photon_stage_b16.ptx"));
+        assert!(missing.contains(&executable_ptx.display().to_string()));
+        assert!(missing.contains(&manifest_ptx.display().to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn should_skip_cuda_error(error: &str) -> bool {
