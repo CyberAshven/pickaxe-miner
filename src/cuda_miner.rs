@@ -31,6 +31,7 @@ pub struct CudaMiner {
 }
 
 impl CudaMiner {
+    /// Initializes the CUDA mining engine and persistent GPU buffers.
     pub fn new(device_ordinal: usize, batch: u32) -> Result<Self, String> {
         let ptx_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cuda/build/stage_a_mine.ptx");
@@ -80,6 +81,7 @@ impl CudaMiner {
         })
     }
 
+    /// Uploads the search target to the CUDA miner.
     pub fn set_target(&mut self, target32: &[u8; 32]) -> Result<(), String> {
         let mut target_be = [0u32; 8];
         for i in 0..8 {
@@ -167,6 +169,7 @@ impl CudaMiner {
         Ok((hashes, winners))
     }
 
+    /// Sets the number of candidates per CUDA batch.
     pub fn set_batch(&mut self, batch: u32) {
         self.batch = batch.max(256);
     }

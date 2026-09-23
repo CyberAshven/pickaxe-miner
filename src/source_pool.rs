@@ -51,6 +51,7 @@ pub(crate) struct CapabilityEvidence {
 }
 
 impl CapabilityEvidence {
+    /// Checks whether a capability proof is still valid at the given time.
     fn is_current(self, now_ms: u64) -> bool {
         now_ms <= self.expires_at_ms
     }
@@ -84,6 +85,7 @@ pub(crate) struct SourceEntry {
 }
 
 impl SourceEntry {
+    /// Creates a SourceEntry for the source catalog.
     fn new(
         kind: SourceKind,
         endpoint: &str,
@@ -111,6 +113,7 @@ impl SourceEntry {
         }
     }
 
+    /// Creates an entry for a built-in bootstrap endpoint.
     pub(crate) fn built_in(kind: SourceKind, endpoint: &str, label: String) -> Self {
         let transport = match kind {
             SourceKind::Fulcrum => SourceTransport::Wss,
@@ -126,6 +129,7 @@ impl SourceEntry {
         )
     }
 
+    /// Creates an entry for a published network endpoint.
     fn published(
         kind: SourceKind,
         endpoint: &str,
@@ -143,6 +147,7 @@ impl SourceEntry {
         )
     }
 
+    /// Creates a user-configured endpoint entry.
     pub(crate) fn user(kind: SourceKind, endpoint: &str, label: String) -> Self {
         let transport = match kind {
             SourceKind::Fulcrum => SourceTransport::Wss,
@@ -158,12 +163,14 @@ impl SourceEntry {
         )
     }
 
+    /// Checks whether this source has a current proof of PHOTON support.
     pub(crate) fn supports_at(&self, capability: SourceCapability, now_ms: u64) -> bool {
         self.capabilities
             .iter()
             .any(|evidence| evidence.capability == capability && evidence.is_current(now_ms))
     }
 
+    /// Checks both availability and verified capability for routing.
     fn routable_for_at(&self, capability: SourceCapability, now_ms: u64) -> bool {
         if capability != SourceCapability::PhotonState {
             return self.supports_at(capability, now_ms);
@@ -177,6 +184,7 @@ impl SourceEntry {
         .all(|required| self.supports_at(required, now_ms))
     }
 
+    /// Records a time-bounded verified PHOTON capability.
     pub(crate) fn verify_capability(
         &mut self,
         capability: SourceCapability,
@@ -199,6 +207,7 @@ impl SourceEntry {
         }
     }
 
+    /// Revokes the entry’s PHOTON capability proof.
     fn revoke_capability(&mut self, capability: SourceCapability) {
         self.capabilities
             .retain(|evidence| evidence.capability != capability);
@@ -207,6 +216,7 @@ impl SourceEntry {
         }
     }
 
+    /// Updates endpoint health after a successful probe.
     pub(crate) fn record_success(&mut self, now_ms: u64, latency_ms: u32) {
         self.health = SourceHealth::Healthy;
         self.last_success_ms = Some(now_ms);
@@ -215,6 +225,7 @@ impl SourceEntry {
         self.latency_ms = Some(latency_ms);
     }
 
+    /// Applies bounded retry backoff after an endpoint failure.
     pub(crate) fn record_failure(&mut self, now_ms: u64) {
         self.health = SourceHealth::Unhealthy;
         self.failure_count = self.failure_count.saturating_add(1).min(16);
@@ -223,6 +234,7 @@ impl SourceEntry {
         self.retry_after_ms = Some(now_ms.saturating_add(delay));
     }
 
+    /// Checks whether policy and retry timing permit using this endpoint.
     fn available_at(&self, now_ms: u64) -> bool {
         self.enabled
             && !self.banned
@@ -231,6 +243,7 @@ impl SourceEntry {
                 .is_none_or(|retry_after| retry_after <= now_ms)
     }
 
+    /// Checks whether the client can speak the endpoint transport.
     fn supported_by_current_client(&self) -> bool {
         matches!(
             (self.kind, self.transport),
@@ -246,6 +259,7 @@ pub(crate) struct SourceCatalog {
 }
 
 impl SourceCatalog {
+    /// Builds the published and built-in mainnet source catalog.
     pub(crate) fn mainnet() -> Self {
         let mut catalog = Self::default();
         for endpoint in crate::protocol::FULCRUM_WSS_BOOTSTRAP {
@@ -292,6 +306,7 @@ impl SourceCatalog {
         catalog
     }
 
+    /// Adds configured endpoints to the built-in source catalog.
     pub(crate) fn configured(cfg: &crate::config::RuntimeConfig) -> Result<Self, String> {
         let mut catalog = Self::mainnet();
         if let Some(endpoint) = cfg.fulcrum_url.as_deref() {
@@ -307,10 +322,12 @@ impl SourceCatalog {
         Ok(catalog)
     }
 
+    /// Returns the current source catalog entries.
     pub(crate) fn entries(&self) -> &[SourceEntry] {
         &self.entries
     }
 
+    /// Adds a user endpoint without exceeding the catalog size limit.
     pub(crate) fn add_user(
         &mut self,
         kind: SourceKind,
@@ -339,6 +356,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Removes a user entry while preserving built-in endpoints.
     pub(crate) fn remove(&mut self, kind: SourceKind, endpoint: &str) -> Result<(), String> {
         let Some(index) = self.find_index(kind, endpoint) else {
             return Err("source not found".into());
@@ -350,6 +368,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Changes whether an endpoint is enabled for routing.
     pub(crate) fn set_enabled(
         &mut self,
         kind: SourceKind,
@@ -363,6 +382,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Changes whether policy bans an endpoint from routing.
     pub(crate) fn set_banned(
         &mut self,
         kind: SourceKind,
@@ -376,6 +396,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Updates endpoint health after a successful probe.
     pub(crate) fn record_success(
         &mut self,
         kind: SourceKind,
@@ -390,6 +411,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Records a time-bounded verified PHOTON capability.
     pub(crate) fn verify_capability(
         &mut self,
         kind: SourceKind,
@@ -411,6 +433,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Records a native node proof tied to canonical PHOTON state.
     pub(crate) fn verify_native_photon_capability(
         &mut self,
         proof: &super::NativePhotonEquivalenceProof,
@@ -432,6 +455,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Invalidates a native node’s PHOTON proof.
     pub(crate) fn revoke_native_photon_capability(&mut self, endpoint: &str) -> Result<(), String> {
         let entry = self
             .entry_mut(SourceKind::NativeNode, endpoint)
@@ -440,6 +464,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Returns a native node proof only while it remains current.
     pub(crate) fn native_photon_proof_at(
         &self,
         endpoint: &str,
@@ -455,6 +480,7 @@ impl SourceCatalog {
             .and_then(|entry| entry.native_photon_proof.as_ref())
     }
 
+    /// Applies bounded retry backoff after an endpoint failure.
     pub(crate) fn record_failure(
         &mut self,
         kind: SourceKind,
@@ -468,6 +494,7 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Checks whether this source has a current proof of PHOTON support.
     pub(crate) fn supports_at(
         &self,
         kind: SourceKind,
@@ -483,6 +510,7 @@ impl SourceCatalog {
             })
     }
 
+    /// Checks whether policy and retry timing permit using this endpoint.
     pub(crate) fn available_at(&self, kind: SourceKind, endpoint: &str, now_ms: u64) -> bool {
         self.entries
             .iter()
@@ -490,10 +518,12 @@ impl SourceCatalog {
             .is_some_and(|entry| entry.available_at(now_ms))
     }
 
+    /// Creates a routing view over currently eligible endpoints.
     pub(crate) fn router(&self) -> SourceRouter<'_> {
         SourceRouter { catalog: self }
     }
 
+    /// Selects a bounded set of endpoints for capability probes.
     pub(crate) fn probe_candidates(
         &self,
         kind: SourceKind,
@@ -550,6 +580,7 @@ impl SourceCatalog {
             .collect()
     }
 
+    /// Refreshes built-in entries without discarding runtime policy state.
     pub(crate) fn reconcile_builtins(&mut self, refreshed: Vec<SourceEntry>) -> Result<(), String> {
         let mut next = self
             .entries
@@ -579,12 +610,14 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// Finds the catalog index of a source with the requested identity.
     fn find_index(&self, kind: SourceKind, endpoint: &str) -> Option<usize> {
         self.entries
             .iter()
             .position(|entry| entry.kind == kind && entry.endpoint == endpoint.trim())
     }
 
+    /// Returns a mutable catalog entry for the requested identity.
     fn entry_mut(&mut self, kind: SourceKind, endpoint: &str) -> Option<&mut SourceEntry> {
         let index = self.find_index(kind, endpoint)?;
         self.entries.get_mut(index)
@@ -596,6 +629,7 @@ pub(crate) struct SourceRouter<'a> {
 }
 
 impl SourceRouter<'_> {
+    /// Selects the highest-priority available endpoint.
     pub(crate) fn select(&self, capability: SourceCapability, now_ms: u64) -> Option<&SourceEntry> {
         self.candidates(capability, now_ms).into_iter().next()
     }
@@ -614,6 +648,7 @@ impl SourceRouter<'_> {
             .or_else(|| candidates.into_iter().next())
     }
 
+    /// Orders eligible source candidates for a connection attempt.
     pub(crate) fn candidates(
         &self,
         capability: SourceCapability,
@@ -635,6 +670,7 @@ impl SourceRouter<'_> {
     }
 }
 
+/// Extracts the host portion of an endpoint URL.
 fn endpoint_host(endpoint: &str) -> Option<&str> {
     let after_scheme = endpoint
         .split_once("://")
@@ -646,6 +682,7 @@ fn endpoint_host(endpoint: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
+/// Computes the preferred order of a source entry.
 fn source_rank(entry: &SourceEntry) -> (u8, u8, u8, u32) {
     let health = match entry.health {
         SourceHealth::Healthy => 0,
@@ -664,6 +701,7 @@ fn source_rank(entry: &SourceEntry) -> (u8, u8, u8, u32) {
     )
 }
 
+/// Carries health and policy state into a refreshed catalog entry.
 fn preserve_runtime_state(candidate: &mut SourceEntry, existing: &SourceEntry) {
     candidate.enabled = existing.enabled;
     candidate.banned = existing.banned;
@@ -678,18 +716,21 @@ fn preserve_runtime_state(candidate: &mut SourceEntry, existing: &SourceEntry) {
 mod tests {
     use super::*;
 
+    /// Inserts a test Fulcrum endpoint into the catalog.
     fn add_fulcrum(catalog: &mut SourceCatalog, endpoint: &str) {
         catalog
             .add_user(SourceKind::Fulcrum, endpoint, endpoint)
             .unwrap();
     }
 
+    /// Inserts a test native node endpoint into the catalog.
     fn add_node(catalog: &mut SourceCatalog, endpoint: &str) {
         catalog
             .add_user(SourceKind::NativeNode, endpoint, endpoint)
             .unwrap();
     }
 
+    /// Records a verified PHOTON snapshot for a test Fulcrum endpoint.
     fn verify_fulcrum_photon_snapshot(
         catalog: &mut SourceCatalog,
         endpoint: &str,
@@ -708,6 +749,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that mixed pool routes only to proven capabilities.
     fn mixed_pool_routes_only_to_proven_capabilities() {
         let mut catalog = SourceCatalog::default();
         add_node(&mut catalog, "node-a");
@@ -727,6 +769,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that configured catalog can contain both source kinds.
     fn configured_catalog_can_contain_both_source_kinds() {
         let cfg = crate::config::RuntimeConfig {
             node_url: Some("http://node.invalid".into()),
@@ -744,12 +787,14 @@ mod tests {
     }
 
     #[test]
+    /// Checks that native node does not claim photon state.
     fn native_node_does_not_claim_photon_state() {
         let entry = SourceEntry::user(SourceKind::NativeNode, "node-a", "node".into());
         assert!(!entry.supports_at(SourceCapability::PhotonState, 0));
     }
 
     #[test]
+    /// Checks that native photon capability requires typed equivalence proof and expires.
     fn native_photon_capability_requires_typed_equivalence_proof_and_expires() {
         let mut catalog = SourceCatalog::default();
         add_node(&mut catalog, "node-a");
@@ -809,6 +854,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that bootstrap presence does not imply verified capability.
     fn bootstrap_presence_does_not_imply_verified_capability() {
         let catalog = SourceCatalog::mainnet();
         assert!(catalog
@@ -822,6 +868,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that health without verified capability is not routable.
     fn health_without_verified_capability_is_not_routable() {
         let mut catalog = SourceCatalog::default();
         add_fulcrum(&mut catalog, "fulcrum-a");
@@ -868,6 +915,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that auto probe is bounded and rotates builtins.
     fn auto_probe_is_bounded_and_rotates_builtins() {
         let mut catalog = SourceCatalog::default();
         for endpoint in ["a", "b", "c", "d"] {
@@ -893,6 +941,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that mainnet auto probe does not cover entire bootstrap catalog.
     fn mainnet_auto_probe_does_not_cover_entire_bootstrap_catalog() {
         let catalog = SourceCatalog::mainnet();
         let all_fulcrum = catalog
@@ -906,6 +955,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that published mainnet catalog keeps each published transport once.
     fn published_mainnet_catalog_keeps_each_published_transport_once() {
         let catalog = SourceCatalog::mainnet();
         let mut endpoints = catalog
@@ -965,6 +1015,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that non websocket published sources are never wss probe candidates.
     fn non_websocket_published_sources_are_never_wss_probe_candidates() {
         let catalog = SourceCatalog::mainnet();
         let candidates = catalog.probe_candidates(SourceKind::Fulcrum, 0, MAX_SOURCES, 0);
@@ -978,6 +1029,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that disabled source is not available.
     fn disabled_source_is_not_available() {
         let mut entry = SourceEntry::user(SourceKind::Fulcrum, "a", "a".into());
         entry.enabled = false;
@@ -985,6 +1037,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that policy blocked entry is not available.
     fn policy_blocked_entry_is_not_available() {
         let mut entry = SourceEntry::user(SourceKind::Fulcrum, "a", "a".into());
         entry.banned = true;
@@ -992,6 +1045,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that router excludes disabled and policy blocked entries.
     fn router_excludes_disabled_and_policy_blocked_entries() {
         let mut catalog = SourceCatalog::default();
         add_fulcrum(&mut catalog, "disabled");
@@ -1023,6 +1077,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that built in cannot be removed but user entry can.
     fn built_in_cannot_be_removed_but_user_entry_can() {
         let mut catalog = SourceCatalog::default();
         catalog.entries.push(SourceEntry::built_in(
@@ -1037,6 +1092,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that catalog refresh preserves existing policy.
     fn catalog_refresh_preserves_existing_policy() {
         let mut catalog = SourceCatalog::default();
         catalog.entries.push(SourceEntry::built_in(
@@ -1052,6 +1108,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that retry delay and failure counter are bounded.
     fn retry_delay_and_failure_counter_are_bounded() {
         let mut entry = SourceEntry::user(SourceKind::Fulcrum, "a", "a".into());
         for now_ms in 0..32 {
@@ -1066,6 +1123,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that catalog size is bounded.
     fn catalog_size_is_bounded() {
         let mut catalog = SourceCatalog::default();
         for index in 0..MAX_SOURCES {
@@ -1078,6 +1136,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that router prefers healthy available candidate.
     fn router_prefers_healthy_available_candidate() {
         let mut catalog = SourceCatalog::default();
         add_fulcrum(&mut catalog, "a");
@@ -1109,6 +1168,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that verified capability expires and must be refreshed.
     fn verified_capability_expires_and_must_be_refreshed() {
         let mut catalog = SourceCatalog::default();
         add_fulcrum(&mut catalog, "a");

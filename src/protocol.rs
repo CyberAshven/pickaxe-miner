@@ -19,6 +19,7 @@ pub const EXPECTED_SCRIPT_HASH_HEX: &str =
 /// Redeem script hex (P2SH32 / covenant spend path) — from postcorps miner.js.
 pub const REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_redeem.hex");
 
+/// Computes double SHA-256 over the protocol bytes.
 fn hash256(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
     let second = Sha256::digest(first);
@@ -27,6 +28,7 @@ fn hash256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Decodes a minimally encoded positive BCH script number.
 fn decode_positive_script_number(bytes: &[u8]) -> Result<u64, String> {
     if bytes.is_empty() {
         return Ok(0);
@@ -50,6 +52,7 @@ fn decode_positive_script_number(bytes: &[u8]) -> Result<u64, String> {
     Ok(value)
 }
 
+/// Returns the authoritative PHOTON baton redeem script.
 fn authoritative_redeem_script() -> Result<Vec<u8>, String> {
     let redeem_script = hex::decode(REDEEM_SCRIPT_HEX.trim()).map_err(|error| error.to_string())?;
     if redeem_script.len() != 259 {
@@ -74,10 +77,12 @@ fn authoritative_redeem_script() -> Result<Vec<u8>, String> {
     Ok(redeem_script)
 }
 
+/// Constructs the exact PHOTON baton redeem script.
 pub fn photon_authoritative_redeem_script() -> Result<Vec<u8>, String> {
     authoritative_redeem_script()
 }
 
+/// Reads the maximum baton decrease from the redeem script.
 fn extract_baton_decrease_rule(
     redeem_script: &[u8],
     prefix: &[u8],
@@ -116,6 +121,7 @@ fn extract_baton_decrease_rule(
     found.ok_or_else(|| format!("PHOTON redeem script {label} value rule was not found"))
 }
 
+/// Returns the authorized single-input baton decrease in satoshis.
 pub fn photon_single_input_max_baton_decrease_sats() -> Result<u64, String> {
     let redeem_script = authoritative_redeem_script()?;
     // output[active].value >= input[active].value - <budget>
@@ -127,6 +133,7 @@ pub fn photon_single_input_max_baton_decrease_sats() -> Result<u64, String> {
     )
 }
 
+/// Returns the authorized multi-input baton decrease in satoshis.
 pub fn photon_multi_input_max_baton_decrease_sats() -> Result<u64, String> {
     let redeem_script = authoritative_redeem_script()?;
     // output[active].value + <budget> >= input[active].value
@@ -282,6 +289,7 @@ pub fn derive_photon_state(
     })
 }
 
+/// Decodes little-endian hexadecimal bytes into an integer.
 fn le_hex_to_biguint(hex_str: &str) -> Result<BigUint, String> {
     if !hex_str.len().is_multiple_of(2) {
         return Err("Invalid little-endian hex.".into());
@@ -290,6 +298,7 @@ fn le_hex_to_biguint(hex_str: &str) -> Result<BigUint, String> {
     Ok(BigUint::from_bytes_le(&bytes))
 }
 
+/// Encodes an integer as a 32-byte little-endian hex string.
 fn biguint_to_le_hex32(value: &BigUint) -> Result<String, String> {
     let mut bytes = value.to_bytes_le();
     if bytes.len() > 32 {

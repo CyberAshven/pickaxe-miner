@@ -6,6 +6,7 @@ use cudarc::nvrtc::Ptx;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Returns the compiled stage A CUDA PTX path.
 fn ptx_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cuda/build/stage_a_hash256.ptx")
 }

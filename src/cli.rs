@@ -75,6 +75,7 @@ pub enum ConfigCommand {
     Save,
 }
 
+/// Parses command-line arguments into the supported miner commands.
 pub fn parse() -> Cli {
     Cli::parse()
 }

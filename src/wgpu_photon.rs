@@ -48,6 +48,7 @@ var<storage, read_write> pickaxeWinnerRecords: array<u32>;
 
 @compute
 @workgroup_size(64)
+/// Provides the bounded workgroup-size PHOTON C3 compute shader.
 fn pickaxe_photon_c3_bounded_wg64(
     @builtin(global_invocation_id) gid: vec3<u32>
 ) {
@@ -79,6 +80,7 @@ fn pickaxe_photon_c3_bounded_wg64(
 }
 "#;
 
+/// Constructs the reference WGSL shader for portable GPU search.
 fn reference_shader_source_for_wgpu() -> Result<String, String> {
     let mut source = include_str!("../reference/photon-miner.wgsl").replace("\r\n", "\n");
 
@@ -99,6 +101,7 @@ fn reference_shader_source_for_wgpu() -> Result<String, String> {
     Ok(source)
 }
 
+/// Rejects non-hardware WGPU adapters for mining.
 fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
     matches!(
         info.device_type,
@@ -108,14 +111,17 @@ fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
     )
 }
 
+/// Computes candidate capacity from a GPU storage-buffer limit.
 fn storage_candidates(max_candidates: u32) -> u32 {
     max_candidates.div_ceil(128) * 128
 }
 
+/// Finds the largest power of two not exceeding the input.
 fn largest_power_of_two_at_most(value: u32) -> u32 {
     1u32 << (31 - value.leading_zeros())
 }
 
+/// Caps candidate capacity by available GPU buffer limits.
 fn device_limited_wgpu_max_candidates(
     requested: u32,
     max_storage_buffer_binding_size: u64,
@@ -135,10 +141,12 @@ fn device_limited_wgpu_max_candidates(
     largest_power_of_two_at_most(bounded)
 }
 
+/// Selects an initial bounded WGPU batch size.
 fn initial_wgpu_batch_size(max_candidates: u32) -> u32 {
     max_candidates.clamp(1, WGPU_MIN_LADDER_BATCH)
 }
 
+/// Adapts batch size to the previous GPU execution duration.
 fn next_wgpu_batch_size(current: u32, elapsed: Duration, max_candidates: u32) -> u32 {
     let minimum = initial_wgpu_batch_size(max_candidates);
     if elapsed <= WGPU_ESCALATE_BATCH && current < max_candidates {
@@ -150,6 +158,7 @@ fn next_wgpu_batch_size(current: u32, elapsed: Duration, max_candidates: u32) ->
     }
 }
 
+/// Packs message bytes into big-endian 32-bit shader words.
 fn pack_big_endian_words(bytes: &[u8], word_count: usize) -> Vec<u8> {
     let mut packed = vec![0u8; word_count * 4];
     for word_index in 0..word_count {
@@ -165,15 +174,18 @@ fn pack_big_endian_words(bytes: &[u8], word_count: usize) -> Vec<u8> {
     packed
 }
 
+/// Serializes shader words as little-endian bytes.
 fn u32_words_to_le_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+/// Computes SHA-256 compression for one message block.
 fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
     let block = GenericArray::clone_from_slice(block);
     compress256(state, std::slice::from_ref(&block));
 }
 
+/// Precomputes the PHOTON M27 message words.
 fn m27_precomputed_words(private_key: &[u8; 32]) -> [u32; 16] {
     let mut ipad = [0x36u8; 64];
     let mut opad = [0x5cu8; 64];
@@ -199,6 +211,7 @@ fn m27_precomputed_words(private_key: &[u8; 32]) -> [u32; 16] {
     out
 }
 
+/// Builds the reusable PHOTON M30 message prefix.
 fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
     let mut state = SHA256_IV;
     for block in template[..384].as_chunks::<64>().0 {
@@ -207,6 +220,7 @@ fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
     state
 }
 
+/// Checks GPU job material against authoritative PHOTON fields.
 fn validate_job_material(
     template: &[u8; TX_BYTES],
     target: &[u8; 32],
@@ -220,6 +234,7 @@ fn validate_job_material(
     Ok(())
 }
 
+/// Allocates a WGPU buffer with the required usage flags.
 fn create_buffer(
     device: &wgpu::Device,
     label: &'static str,
@@ -235,6 +250,7 @@ fn create_buffer(
     })
 }
 
+/// Compiles a WGPU compute pipeline for a PHOTON shader.
 fn create_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -250,6 +266,7 @@ fn create_pipeline(
     })
 }
 
+/// Binds WGPU job and result buffers for compute dispatch.
 fn create_bind_group(
     device: &wgpu::Device,
     pipeline: &wgpu::ComputePipeline,
@@ -308,6 +325,7 @@ pub struct WgpuPhotonEngine {
 }
 
 impl WgpuPhotonEngine {
+    /// Creates a WgpuPhotonEngine for the portable GPU pipeline.
     pub fn new(
         device_ordinal: usize,
         max_candidates: u32,
@@ -610,10 +628,12 @@ impl WgpuPhotonEngine {
         })
     }
 
+    /// Returns the source of the portable GPU lookup table.
     pub fn table_source(&self) -> M29TableSource {
         self.table_source
     }
 
+    /// Returns the bytes allocated for persistent WGPU buffers.
     pub fn persistent_device_bytes(&self) -> usize {
         m29_table::M29_G16_BYTES
             + INPUT_BYTES
@@ -629,10 +649,12 @@ impl WgpuPhotonEngine {
             + self.readback_bytes
     }
 
+    /// Suggests a batch size within device and workgroup limits.
     pub fn recommended_batch_candidates(&self) -> u32 {
         self.recommended_candidates
     }
 
+    /// Writes validated PHOTON job data to WGPU buffers.
     pub fn set_job(
         &mut self,
         template: &[u8; TX_BYTES],
@@ -657,6 +679,7 @@ impl WgpuPhotonEngine {
         Ok(())
     }
 
+    /// Dispatches a bounded portable GPU candidate search.
     pub fn search_batch(
         &mut self,
         nonce_base: u32,

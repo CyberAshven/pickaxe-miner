@@ -15,6 +15,7 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+    /// Parses a requested GPU backend by name.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
@@ -25,6 +26,7 @@ impl BackendKind {
         }
     }
 
+    /// Returns the canonical CLI name of the GPU backend.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -45,6 +47,7 @@ pub struct GpuDevice {
     pub detail: String,
 }
 
+/// Enumerates devices available to each mining backend.
 pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
     match prefer {
         BackendKind::Cuda => list_cuda_devices(),
@@ -79,6 +82,7 @@ pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
     }
 }
 
+/// Resolves the selected backend and GPU ordinal.
 pub fn resolve_mining_device(
     prefer: BackendKind,
     requested_index: Option<u32>,
@@ -99,6 +103,7 @@ pub fn resolve_mining_device(
     }
 }
 
+/// Chooses the preferred supported GPU automatically.
 fn select_auto_device(
     cuda: Vec<GpuDevice>,
     hip: Vec<GpuDevice>,
@@ -111,6 +116,7 @@ fn select_auto_device(
         .find(|device| device.index == wanted)
 }
 
+/// Rejects GPU backends that are not production-ready.
 pub fn require_production_mining_backend(backend: BackendKind) -> Result<(), String> {
     match backend {
         BackendKind::Cuda | BackendKind::Hip => Ok(()),
@@ -127,6 +133,7 @@ pub fn require_production_mining_backend(backend: BackendKind) -> Result<(), Str
     }
 }
 
+/// Finds the GPU matching a backend and device ordinal.
 fn find_device(
     devices: Vec<GpuDevice>,
     wanted: u32,
@@ -145,6 +152,7 @@ fn find_device(
 }
 
 #[cfg(feature = "portable-wgpu")]
+/// Checks whether a WGPU adapter is backed by hardware.
 fn is_hardware_wgpu_device_type(device_type: wgpu::DeviceType) -> bool {
     matches!(
         device_type,
@@ -155,6 +163,7 @@ fn is_hardware_wgpu_device_type(device_type: wgpu::DeviceType) -> bool {
 }
 
 #[cfg(feature = "portable-wgpu")]
+/// Maps a WGPU vendor ID to a display name.
 fn wgpu_vendor_name(vendor: u32) -> String {
     match vendor {
         0x10de => "NVIDIA".into(),
@@ -167,11 +176,13 @@ fn wgpu_vendor_name(vendor: u32) -> String {
 }
 
 #[cfg(feature = "portable-wgpu")]
+/// Limits WGPU discovery to production-capable APIs.
 pub(crate) fn production_wgpu_backends() -> wgpu::Backends {
     wgpu::Backends::VULKAN
 }
 
 #[cfg(feature = "portable-wgpu")]
+/// Enumerates supported WGPU hardware adapters.
 fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
     let backends = production_wgpu_backends();
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -214,10 +225,12 @@ fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
 }
 
 #[cfg(not(feature = "portable-wgpu"))]
+/// Enumerates supported WGPU hardware adapters.
 fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
     Err("wgpu fallback is not compiled; rebuild with --features portable-wgpu".into())
 }
 
+/// Enumerates CUDA devices usable for mining.
 fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
     // Driver must be initialized before get_count (same path CudaContext::new uses).
     cudarc::driver::result::init()
@@ -259,6 +272,7 @@ const HIP_LIBRARY_CANDIDATES: &[&str] = &["amdhip64.dll", "amdhip64_6.dll"];
 #[cfg(not(target_os = "windows"))]
 const HIP_LIBRARY_CANDIDATES: &[&str] = &["libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"];
 
+/// Loads an available HIP runtime shared library.
 fn load_hip_library() -> Result<Library, String> {
     let mut errors = Vec::new();
     for candidate in HIP_LIBRARY_CANDIDATES {
@@ -274,6 +288,7 @@ fn load_hip_library() -> Result<Library, String> {
     ))
 }
 
+/// Formats a HIP runtime error code for display.
 fn hip_error(library: &Library, code: HipError, operation: &str) -> String {
     let detail = unsafe {
         library
@@ -290,6 +305,7 @@ fn hip_error(library: &Library, code: HipError, operation: &str) -> String {
     }
 }
 
+/// Enumerates HIP GPUs available to the miner.
 fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
     let library = load_hip_library()?;
     unsafe {
@@ -389,6 +405,7 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
     }
 }
 
+/// Reads CUDA device details for selection and display.
 fn cuda_device_info(index: u32, ctx: &CudaContext) -> (String, String, Option<u64>) {
     // Best-effort via driver sys; fall back to ordinal if attrs fail.
     let mut name_buf = [0i8; 256];
@@ -445,6 +462,7 @@ fn cuda_device_info(index: u32, ctx: &CudaContext) -> (String, String, Option<u6
     (name, detail, vram)
 }
 
+/// Prints available backend and GPU device information.
 pub fn print_devices(prefer: BackendKind) -> Result<(), String> {
     let devices = list_devices(prefer)?;
     println!("backend preference: {}", prefer.as_str());

@@ -15,6 +15,7 @@ use tungstenite::{connect, Error as WebSocketError, Message, WebSocket};
 
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
+/// Converts a WebSocket read failure into a connection error.
 fn websocket_read_error(error: WebSocketError) -> String {
     match &error {
         WebSocketError::Io(io_error)
@@ -59,6 +60,7 @@ pub struct LiveStateSnapshot {
 }
 
 impl LiveJob {
+    /// Converts a verified Fulcrum snapshot into a mining job.
     pub fn to_mining_job(&self, generation_id: u64, payout_address: &str) -> MiningJob {
         MiningJob {
             height: self.height,
@@ -76,6 +78,7 @@ impl LiveJob {
         }
     }
 
+    /// Prints the connected Fulcrum source without exposing secrets.
     pub fn print_summary(&self) {
         println!("electrum:      {}", self.url);
         println!("server.version: {}", self.server_version);
@@ -94,6 +97,7 @@ impl LiveJob {
     }
 }
 
+/// Formats the compiled donation policy for display.
 fn donation_summary_line() -> String {
     debug_assert_eq!(DONATION_BPS % 100, 0);
     format!("donation:      {}%", DONATION_BPS / 100)
@@ -132,6 +136,7 @@ impl ElectrumSession {
         ))
     }
 
+    /// Connects to one Fulcrum endpoint and verifies its response.
     fn connect_one(url_str: &str) -> Result<Self, String> {
         let (ws, _resp) = connect(url_str).map_err(|e| format!("connect: {e}"))?;
 
@@ -160,6 +165,7 @@ impl ElectrumSession {
         Ok(session)
     }
 
+    /// Sends an Electrum JSON-RPC request over the WebSocket.
     pub fn rpc(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -229,10 +235,12 @@ impl ElectrumSession {
         }
     }
 
+    /// Fetches a PHOTON mining job from the active Fulcrum source.
     pub fn fetch_live_job(&mut self) -> Result<LiveJob, String> {
         self.fetch_live_snapshot().map(|snapshot| snapshot.job)
     }
 
+    /// Fetches the authoritative live PHOTON baton snapshot.
     pub fn fetch_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
         let mut last_error = String::new();
         for _ in 0..4 {
@@ -245,6 +253,7 @@ impl ElectrumSession {
         Err(last_error)
     }
 
+    /// Reads a consistent snapshot from the active Fulcrum session.
     fn read_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
         let header_before = self.rpc("blockchain.headers.subscribe", json!([]))?;
         let unspent = self.rpc(
@@ -268,6 +277,7 @@ impl ElectrumSession {
     }
 }
 
+/// Matches an RPC response to its request identifier.
 fn rpc_value_for_id(value: &Value, id: u64) -> Option<Result<Value, String>> {
     if !id_matches(value, id) {
         return None;
@@ -278,6 +288,7 @@ fn rpc_value_for_id(value: &Value, id: u64) -> Option<Result<Value, String>> {
     Some(Ok(value.get("result").cloned().unwrap_or(Value::Null)))
 }
 
+/// Decodes a text frame into an Electrum RPC result.
 fn consume_rpc_text(buf: &mut String, text: &str, id: u64) -> Result<Option<Value>, String> {
     buf.push_str(text);
     while let Some(pos) = buf.find('\n') {
@@ -311,6 +322,7 @@ fn consume_rpc_text(buf: &mut String, text: &str, id: u64) -> Result<Option<Valu
     Ok(None)
 }
 
+/// Extracts block height from a Fulcrum header response.
 fn fulcrum_header_height(header: &Value) -> Result<u32, String> {
     header
         .get("height")
@@ -319,11 +331,13 @@ fn fulcrum_header_height(header: &Value) -> Result<u32, String> {
         .ok_or_else(|| "Fulcrum header response omitted a valid height".to_string())
 }
 
+/// Repeats a snapshot read to detect chain changes.
 fn snapshot_reread(error: &str) -> bool {
     error.contains("changed tip while reading token state")
         || error.contains("snapshot tip identity is inconsistent")
 }
 
+/// Verifies that repeated tip hashes still match.
 fn stable_fulcrum_tip_hash(before: &Value, after: &Value) -> Result<String, String> {
     let before_hash = fulcrum_header_hash(before)?;
     let after_hash = fulcrum_header_hash(after)?;
@@ -335,6 +349,7 @@ fn stable_fulcrum_tip_hash(before: &Value, after: &Value) -> Result<String, Stri
     Ok(after_hash)
 }
 
+/// Computes the hash of a validated Fulcrum block header.
 pub(crate) fn fulcrum_header_hash(header: &Value) -> Result<String, String> {
     let header_hex = header
         .get("hex")
@@ -357,6 +372,7 @@ pub(crate) fn fulcrum_header_hash(header: &Value) -> Result<String, String> {
         .collect())
 }
 
+/// Constructs a PHOTON job from verified Fulcrum values.
 pub(crate) fn live_job_from_fulcrum_values(
     url: &str,
     server_version: Value,
@@ -443,6 +459,7 @@ pub(crate) fn live_job_from_fulcrum_values(
     })
 }
 
+/// Checks whether an Electrum response ID matches the request.
 fn id_matches(v: &Value, id: u64) -> bool {
     v.get("id").and_then(|x| x.as_u64()) == Some(id)
         || v.get("id").and_then(|x| x.as_i64()).map(|x| x as u64) == Some(id)

@@ -17,10 +17,12 @@ pub struct StageARecord {
     pub rfc6979_nonce: [u8; 32],
 }
 
+/// Returns the reference stage A CUDA PTX path.
 fn ptx_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cuda/build/stage_a_rfc6979.ptx")
 }
 
+/// Runs the reference stage A kernel over a candidate batch.
 pub fn stage_a_reference_batch(
     nonce_base: u32,
     target32: &[u8; 32],

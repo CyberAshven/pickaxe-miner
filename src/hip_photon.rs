@@ -132,6 +132,7 @@ struct HipApi {
 }
 
 impl HipApi {
+    /// Loads HipApi state needed by the HIP GPU pipeline.
     fn load() -> Result<Arc<Self>, String> {
         let mut failures = Vec::new();
         for candidate in HIP_LIBRARY_CANDIDATES {
@@ -150,7 +151,9 @@ impl HipApi {
         ))
     }
 
+    /// Resolves the required HIP runtime symbols from a loaded library.
     unsafe fn from_library(library: Library) -> Result<Self, String> {
+        /// Loads a typed symbol from the HIP runtime library.
         unsafe fn symbol<T: Copy>(library: &Library, name: &'static [u8]) -> Result<T, String> {
             unsafe { library.get::<T>(name) }
                 .map(|symbol| *symbol)
@@ -194,6 +197,7 @@ impl HipApi {
         })
     }
 
+    /// Formats the last HIP runtime error for reporting.
     fn error(&self, code: HipError, operation: &str) -> String {
         let detail = unsafe {
             let pointer = (self.get_error_string)(code);
@@ -205,6 +209,7 @@ impl HipApi {
         }
     }
 
+    /// Converts a HIP return code into a descriptive result.
     fn check(&self, code: HipError, operation: &str) -> Result<(), String> {
         if code == HIP_SUCCESS {
             Ok(())
@@ -221,6 +226,7 @@ struct HipBuffer {
 }
 
 impl HipBuffer {
+    /// Allocates a persistent HIP device buffer.
     fn allocate(api: &Arc<HipApi>, bytes: usize, label: &str) -> Result<Self, String> {
         let mut raw = ptr::null_mut();
         api.check(
@@ -234,6 +240,7 @@ impl HipBuffer {
         })
     }
 
+    /// Copies host bytes into a HIP device buffer.
     fn copy_from<T>(&self, source: &[T], label: &str) -> Result<(), String> {
         let bytes = std::mem::size_of_val(source);
         if bytes > self.bytes {
@@ -255,6 +262,7 @@ impl HipBuffer {
         )
     }
 
+    /// Copies bytes from a HIP device buffer to the host.
     fn copy_to<T>(&self, destination: &mut [T], label: &str) -> Result<(), String> {
         let bytes = std::mem::size_of_val(destination);
         if bytes > self.bytes {
@@ -278,6 +286,7 @@ impl HipBuffer {
 }
 
 impl Drop for HipBuffer {
+    /// Releases resources owned by HipBuffer.
     fn drop(&mut self) {
         if self.ptr != 0 {
             unsafe {
@@ -293,6 +302,7 @@ struct HipStream {
 }
 
 impl HipStream {
+    /// Creates a HIP stream for ordered GPU work.
     fn create(api: &Arc<HipApi>) -> Result<Self, String> {
         let mut raw = ptr::null_mut();
         api.check(
@@ -305,6 +315,7 @@ impl HipStream {
         })
     }
 
+    /// Waits for queued HIP stream operations to finish.
     fn synchronize(&self) -> Result<(), String> {
         self.api.check(
             unsafe { (self.api.stream_synchronize)(self.raw as *mut c_void) },
@@ -314,6 +325,7 @@ impl HipStream {
 }
 
 impl Drop for HipStream {
+    /// Releases resources owned by HipStream.
     fn drop(&mut self) {
         if self.raw != 0 {
             unsafe {
@@ -329,6 +341,7 @@ struct HipModule {
 }
 
 impl HipModule {
+    /// Loads HipModule state needed by the HIP GPU pipeline.
     fn load(api: &Arc<HipApi>, path: &Path) -> Result<Self, String> {
         let c_path = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| format!("HIP code-object path contains NUL: {}", path.display()))?;
@@ -343,6 +356,7 @@ impl HipModule {
         })
     }
 
+    /// Resolves a kernel function from a loaded HIP module.
     fn function(&self, name: &str) -> Result<usize, String> {
         let name = CString::new(name).map_err(|_| "HIP kernel name contains NUL".to_string())?;
         let mut raw = ptr::null_mut();
@@ -357,6 +371,7 @@ impl HipModule {
 }
 
 impl Drop for HipModule {
+    /// Releases resources owned by HipModule.
     fn drop(&mut self) {
         if self.raw != 0 {
             unsafe {
@@ -402,6 +417,7 @@ pub struct HipPhotonEngine {
 #[repr(C, align(64))]
 struct HipDevicePropertiesStorage([u8; 8192]);
 
+/// Extracts the AMD GPU architecture from device properties.
 fn parse_gfx_arch(properties: &[u8]) -> Option<String> {
     let start = properties.windows(3).position(|window| window == b"gfx")?;
     let tail = &properties[start..];
@@ -412,6 +428,7 @@ fn parse_gfx_arch(properties: &[u8]) -> Option<String> {
     (len > 3).then(|| String::from_utf8_lossy(&tail[..len]).into_owned())
 }
 
+/// Reads the architecture supported by a HIP device.
 fn device_architecture(api: &HipApi, device_ordinal: usize) -> Result<String, String> {
     let mut properties = HipDevicePropertiesStorage([0u8; 8192]);
     api.check(
@@ -427,11 +444,13 @@ fn device_architecture(api: &HipApi, device_ordinal: usize) -> Result<String, St
     })
 }
 
+/// Identifies the current HIP GPU architecture.
 pub fn detected_architecture(device_ordinal: usize) -> Result<String, String> {
     let api = HipApi::load()?;
     device_architecture(&api, device_ordinal)
 }
 
+/// Lists candidate locations for HIP code objects.
 fn code_object_candidate_dirs(
     architecture: &str,
     override_dir: Option<PathBuf>,
@@ -452,6 +471,7 @@ fn code_object_candidate_dirs(
     candidates
 }
 
+/// Lists runtime and executable-relative code object directories.
 fn code_object_candidate_dirs_for_runtime(architecture: &str) -> Vec<PathBuf> {
     let override_dir = std::env::var_os("PICKAXE_HIP_CODE_OBJECT_DIR").map(PathBuf::from);
     let executable = std::env::current_exe().ok();
@@ -464,12 +484,14 @@ fn code_object_candidate_dirs_for_runtime(architecture: &str) -> Vec<PathBuf> {
     )
 }
 
+/// Checks that all required kernel code objects are present.
 fn directory_has_complete_code_objects(directory: &Path) -> bool {
     HIP_CODE_OBJECT_NAMES
         .iter()
         .all(|name| directory.join(name).is_file())
 }
 
+/// Finds a complete HIP code object directory for the device.
 fn resolve_code_object_dir(architecture: &str) -> Result<PathBuf, String> {
     let candidates = code_object_candidate_dirs_for_runtime(architecture);
     if let Some(directory) = candidates
@@ -489,6 +511,7 @@ fn resolve_code_object_dir(architecture: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// Rejects a code object built for the wrong GPU architecture.
 fn verify_code_object_architecture(path: &Path, architecture: &str) -> Result<(), String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("read HIP code object {}: {error}", path.display()))?;
@@ -533,6 +556,7 @@ fn verify_code_object_architecture(path: &Path, architecture: &str) -> Result<()
     ))
 }
 
+/// Builds the fixed scalar lookup table used by PHOTON kernels.
 fn fixed_d_table(private_key: &[u8; 32]) -> Vec<u32> {
     let order = BigUint::from_bytes_be(
         &hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
@@ -555,6 +579,7 @@ fn fixed_d_table(private_key: &[u8; 32]) -> Vec<u32> {
     table
 }
 
+/// Launches a HIP kernel with the given arguments and grid size.
 fn launch(
     api: &HipApi,
     stream: &HipStream,
@@ -608,6 +633,7 @@ struct HipKernelArg {
     kind: HipArgKind,
 }
 
+/// Packs a device pointer as a HIP kernel argument.
 fn ptr_arg(value: &mut usize) -> HipKernelArg {
     HipKernelArg {
         raw: (value as *mut usize).cast(),
@@ -615,6 +641,7 @@ fn ptr_arg(value: &mut usize) -> HipKernelArg {
     }
 }
 
+/// Packs a 32-bit value as a HIP kernel argument.
 fn u32_arg(value: &mut u32) -> HipKernelArg {
     HipKernelArg {
         raw: (value as *mut u32).cast(),
@@ -623,6 +650,7 @@ fn u32_arg(value: &mut u32) -> HipKernelArg {
 }
 
 impl HipPhotonEngine {
+    /// Creates a HipPhotonEngine for the HIP GPU pipeline.
     pub fn new(
         device_ordinal: usize,
         max_candidates: u32,
@@ -716,15 +744,18 @@ impl HipPhotonEngine {
     }
 
     #[allow(dead_code)]
+    /// Returns the origin of the precomputed GPU lookup table.
     pub fn table_source(&self) -> M29TableSource {
         self.table_source
     }
     #[allow(dead_code)]
+    /// Returns the architecture of the selected HIP GPU.
     pub fn architecture(&self) -> &str {
         &self.architecture
     }
 
     #[allow(dead_code)]
+    /// Returns the size of persistent HIP device allocations.
     pub fn persistent_device_bytes(&self) -> usize {
         self.table_gpu.bytes
             + self.target_gpu.bytes
@@ -741,6 +772,7 @@ impl HipPhotonEngine {
             + self.winner_hashes_gpu.bytes
     }
 
+    /// Uploads validated PHOTON job material to HIP device buffers.
     pub fn set_job(
         &mut self,
         template: &[u8; TX_BYTES],
@@ -767,6 +799,7 @@ impl HipPhotonEngine {
         Ok(())
     }
 
+    /// Runs a bounded PHOTON candidate batch on the HIP GPU.
     pub fn search_batch(
         &mut self,
         nonce_base: u32,
@@ -827,6 +860,7 @@ impl HipPhotonEngine {
         self.search_batch_finish(nonce_base, candidate_count)
     }
 
+    /// Reads back and verifies a completed HIP search batch.
     fn search_batch_finish(
         &mut self,
         nonce_base: u32,
@@ -837,6 +871,7 @@ impl HipPhotonEngine {
         self.search_stage_c23(nonce_base, candidate_count)
     }
 
+    /// Runs the HIP stage B candidate-point kernel.
     fn search_stage_b(&mut self, candidate_count: u32) -> Result<(), String> {
         for (part, function) in self.stage_b.iter().copied().enumerate() {
             let mut rfc6979 = self.rfc6979_gpu.ptr;
@@ -862,6 +897,7 @@ impl HipPhotonEngine {
         Ok(())
     }
 
+    /// Runs the HIP stage C1 Schnorr candidate filter.
     fn search_stage_c1(&mut self, candidate_count: u32) -> Result<(), String> {
         let mut message_hashes = self.message_hashes_gpu.ptr;
         let mut rfc6979 = self.rfc6979_gpu.ptr;
@@ -890,6 +926,7 @@ impl HipPhotonEngine {
         )
     }
 
+    /// Runs the remaining HIP stage C hash and target filters.
     fn search_stage_c23(
         &mut self,
         nonce_base: u32,
@@ -960,6 +997,7 @@ impl HipPhotonEngine {
 mod tests {
     use super::*;
 
+    /// Converts HIP argument kinds to the kernel contract's ABI names.
     fn abi_kinds(abi: &[HipArgKind]) -> Vec<&'static str> {
         abi.iter()
             .map(|kind| match kind {
@@ -970,6 +1008,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that rust launch contract matches hip artifact contract.
     fn rust_launch_contract_matches_hip_artifact_contract() {
         assert_eq!(
             std::mem::size_of::<usize>(),
@@ -1020,6 +1059,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that gfx architecture is extracted without binding to property layout.
     fn gfx_architecture_is_extracted_without_binding_to_property_layout() {
         let mut properties = [0u8; 256];
         properties[37..45].copy_from_slice(b"gfx1036\0");
@@ -1031,6 +1071,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that code object search prefers portable release layout.
     fn code_object_search_prefers_portable_release_layout() {
         let executable_dir = Path::new("release-root");
         let manifest_dir = Path::new("source-root");
@@ -1047,6 +1088,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that code object override disables implicit search paths.
     fn code_object_override_disables_implicit_search_paths() {
         let override_dir = PathBuf::from("custom-hip-artifacts");
         let candidates = code_object_candidate_dirs(
@@ -1059,6 +1101,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that code object set requires every production stage.
     fn code_object_set_requires_every_production_stage() {
         let directory =
             std::env::temp_dir().join(format!("pickaxe-hip-complete-set-{}", std::process::id()));
@@ -1076,6 +1119,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that hip code object must match detected architecture.
     fn hip_code_object_must_match_detected_architecture() {
         let directory =
             std::env::temp_dir().join(format!("pickaxe-hip-arch-{}", std::process::id()));
@@ -1111,6 +1155,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that native hip missing code objects fail closed if runtime is present.
     fn native_hip_missing_code_objects_fail_closed_if_runtime_is_present() {
         let api = match HipApi::load() {
             Ok(api) => api,

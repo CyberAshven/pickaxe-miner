@@ -73,6 +73,7 @@ pub fn cashaddr_to_p2pkh_locking(address: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Computes the CashAddr checksum polynomial.
 fn cashaddr_polymod(values: &[u8]) -> u64 {
     let mut c: u64 = 1;
     for &v in values {
@@ -111,6 +112,7 @@ pub fn p2pkh_hash_to_cashaddr(hash: &[u8; 20]) -> Result<String, String> {
     Ok(format!("{prefix}:{encoded}"))
 }
 
+/// Converts CashAddr payload groups between bit widths.
 fn convert_bits(data: &[u8], from_bits: u32, to_bits: u32, pad: bool) -> Result<Vec<u8>, String> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
@@ -138,6 +140,7 @@ fn convert_bits(data: &[u8], from_bits: u32, to_bits: u32, pad: bool) -> Result<
     Ok(result)
 }
 
+/// Concatenates serialized transaction byte fragments.
 fn concat(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     for p in parts {
@@ -146,14 +149,17 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Serializes a 32-bit integer in little-endian order.
 fn u32_le(v: u32) -> [u8; 4] {
     v.to_le_bytes()
 }
 
+/// Serializes a 64-bit integer in little-endian order.
 fn u64_le(v: u64) -> [u8; 8] {
     v.to_le_bytes()
 }
 
+/// Encodes a Bitcoin compact-size integer.
 fn compact_uint(v: u64) -> Vec<u8> {
     if v < 0xfd {
         vec![v as u8]
@@ -172,10 +178,12 @@ fn compact_uint(v: u64) -> Vec<u8> {
     }
 }
 
+/// Reverses hash bytes between wire and display order.
 fn reverse_bytes(b: &[u8]) -> Vec<u8> {
     b.iter().rev().copied().collect()
 }
 
+/// Encodes a positive script number as a push operation.
 fn encode_positive_script_number_push(age: u32) -> Result<Vec<u8>, String> {
     if age == 0 {
         return Ok(vec![0x00]);

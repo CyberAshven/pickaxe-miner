@@ -36,6 +36,7 @@ pub struct PhotonCudaBatchResult {
 }
 
 impl PhotonCudaBatchResult {
+    /// Checks whether a reported GPU result exceeds the readback limit.
     pub fn truncated(&self) -> bool {
         self.total_winners as usize > self.winners.len()
     }
@@ -67,6 +68,7 @@ pub struct CudaPhotonEngine {
     job_ready: bool,
 }
 
+/// Lists locations searched for compiled CUDA PTX kernels.
 fn cuda_ptx_search_dirs(executable_dir: Option<&Path>, manifest_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(executable_dir) = executable_dir {
@@ -76,6 +78,7 @@ fn cuda_ptx_search_dirs(executable_dir: Option<&Path>, manifest_dir: &Path) -> V
     dirs
 }
 
+/// Locates a PTX kernel within candidate directories.
 fn resolve_ptx_path_in(
     name: &str,
     executable_dir: Option<&Path>,
@@ -97,12 +100,14 @@ fn resolve_ptx_path_in(
     Err(format!("missing CUDA PTX {name}; searched: {searched}"))
 }
 
+/// Finds the deployed PTX kernel for CUDA mining.
 fn resolve_ptx_path(name: &str) -> Result<PathBuf, String> {
     let executable = std::env::current_exe().ok();
     let executable_dir = executable.as_deref().and_then(Path::parent);
     resolve_ptx_path_in(name, executable_dir, Path::new(env!("CARGO_MANIFEST_DIR")))
 }
 
+/// Loads a CUDA kernel function from its PTX module.
 fn load_function(
     ctx: &Arc<CudaContext>,
     ptx_name: &str,
@@ -119,6 +124,7 @@ fn load_function(
         .map_err(|error| format!("load {function_name}: {error}"))
 }
 
+/// Builds the fixed scalar lookup table used by CUDA kernels.
 fn fixed_d_table(private_key: &[u8; 32]) -> Vec<u32> {
     let order = BigUint::from_bytes_be(
         &hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
@@ -142,6 +148,7 @@ fn fixed_d_table(private_key: &[u8; 32]) -> Vec<u32> {
 }
 
 impl CudaPhotonEngine {
+    /// Allocates CUDA buffers and loads the PHOTON pipeline kernels.
     pub fn new(
         device_ordinal: usize,
         max_candidates: u32,
@@ -237,10 +244,12 @@ impl CudaPhotonEngine {
         })
     }
 
+    /// Returns the source of the CUDA lookup table.
     pub fn table_source(&self) -> M29TableSource {
         self.table_source
     }
 
+    /// Returns the size of persistent CUDA device allocations.
     pub fn persistent_device_bytes(&self) -> usize {
         m29_table::M29_G16_BYTES
             + 32
@@ -253,6 +262,7 @@ impl CudaPhotonEngine {
             + (self.winner_cap as usize) * (4 + 32)
     }
 
+    /// Uploads validated PHOTON job bytes and target to CUDA.
     pub fn set_job(
         &mut self,
         template: &[u8; TX_BYTES],
@@ -286,6 +296,7 @@ impl CudaPhotonEngine {
         Ok(())
     }
 
+    /// Searches a bounded batch with the persistent CUDA pipeline.
     pub fn search_batch(
         &mut self,
         nonce_base: u32,

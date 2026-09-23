@@ -5,6 +5,7 @@ use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use std::path::PathBuf;
 
+/// Returns the compiled stage B CUDA PTX path.
 fn ptx_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cuda/build/stage_b_kg.ptx")
 }

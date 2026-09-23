@@ -42,6 +42,7 @@ struct ParsedOutput {
     token_and_locking_bytecode: Vec<u8>,
 }
 
+/// Computes a double SHA-256 transaction hash.
 fn hash256(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
     let second = Sha256::digest(first);
@@ -50,14 +51,17 @@ fn hash256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Returns the authorized maximum baton decrease for multi-input settlements.
 pub fn photon_multi_input_max_baton_decrease_sats() -> Result<u64, String> {
     crate::protocol::photon_multi_input_max_baton_decrease_sats()
 }
 
+/// Reverses transaction hash bytes between display and wire order.
 fn reverse(bytes: &[u8]) -> Vec<u8> {
     bytes.iter().rev().copied().collect()
 }
 
+/// Decodes a displayed transaction ID into 32 bytes.
 fn parse_txid_display(txid: &str) -> Result<[u8; 32], String> {
     let txid = txid.trim();
     if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -69,10 +73,12 @@ fn parse_txid_display(txid: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Computes the displayed ID of a serialized transaction.
 pub fn transaction_id(raw: &[u8]) -> String {
     hex::encode(reverse(&hash256(raw)))
 }
 
+/// Encodes a length as a Bitcoin compact-size integer.
 fn compact_uint(value: u64) -> Vec<u8> {
     if value < 0xfd {
         vec![value as u8]
@@ -91,11 +97,13 @@ fn compact_uint(value: u64) -> Vec<u8> {
     }
 }
 
+/// Encodes a CashToken amount as a compact integer.
 fn compact_token_amount(value: u128) -> Result<Vec<u8>, String> {
     let value = u64::try_from(value).map_err(|_| "token amount exceeds u64")?;
     Ok(compact_uint(value))
 }
 
+/// Encodes data as a script push operation.
 fn push_data(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(data.len() + 3);
     match data.len() {
@@ -114,6 +122,7 @@ fn push_data(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Serializes a CashToken prefix for a transaction output.
 fn token_prefix(amount: u128) -> Result<Vec<u8>, String> {
     let category = hex::decode(MAINNET_CATEGORY_HEX).map_err(|error| error.to_string())?;
     if category.len() != 32 {
@@ -127,6 +136,7 @@ fn token_prefix(amount: u128) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Serializes a transaction output with CashToken data.
 fn encode_output(value_sats: u64, token: Option<u128>, locking: &[u8]) -> Result<Vec<u8>, String> {
     let mut bytecode = Vec::new();
     if let Some(amount) = token {
@@ -142,6 +152,7 @@ fn encode_output(value_sats: u64, token: Option<u128>, locking: &[u8]) -> Result
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Serializes a transaction output from raw locking bytecode.
 fn encode_raw_output(value_sats: u64, bytecode: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&value_sats.to_le_bytes());
@@ -151,6 +162,7 @@ fn encode_raw_output(value_sats: u64, bytecode: &[u8]) -> Vec<u8> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Decodes a compact-size integer from transaction bytes.
 fn read_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
     let first = *bytes.get(*cursor).ok_or("truncated CompactSize prefix")?;
     *cursor += 1;
@@ -172,6 +184,7 @@ fn read_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
     Ok(u64::from_le_bytes(padded))
 }
 
+/// Rejects noncanonical compact-size encodings.
 fn read_canonical_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
     let start = *cursor;
     let value = read_compact_uint(bytes, cursor)?;
@@ -181,6 +194,7 @@ fn read_canonical_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, 
     Ok(value)
 }
 
+/// Checks a parent token against the authoritative PHOTON baton.
 fn validate_authoritative_baton_token(token_and_locking_bytecode: &[u8]) -> Result<(), String> {
     const TOKEN_PREFIX_MARKER: u8 = 0xef;
     const MUTABLE_NFT_WITH_COMMITMENT_AND_AMOUNT: u8 = 0x71;
@@ -245,6 +259,7 @@ fn validate_authoritative_baton_token(token_and_locking_bytecode: &[u8]) -> Resu
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Extracts and validates the parent transaction outputs.
 fn parse_parent_outputs(parent_raw: &[u8]) -> Result<[ParsedOutput; 2], String> {
     if parent_raw.len() < 10 {
         return Err("winning PHOTON parent transaction is truncated".into());
@@ -312,6 +327,7 @@ fn parse_parent_outputs(parent_raw: &[u8]) -> Result<[ParsedOutput; 2], String> 
         .map_err(|_| "internal parent output count error".into())
 }
 
+/// Encodes a transaction outpoint in wire byte order.
 fn serialized_outpoint(txid: &str, vout: u32) -> Result<Vec<u8>, String> {
     let hash = parse_txid_display(txid)?;
     let mut out = reverse(&hash);
@@ -319,6 +335,7 @@ fn serialized_outpoint(txid: &str, vout: u32) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Serializes a signed transaction input.
 fn encode_input(txid: &str, vout: u32, unlocking: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = serialized_outpoint(txid, vout)?;
     out.extend_from_slice(&compact_uint(unlocking.len() as u64));
@@ -328,6 +345,7 @@ fn encode_input(txid: &str, vout: u32, unlocking: &[u8]) -> Result<Vec<u8>, Stri
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Builds the BCH signature hash for a self-funded input.
 fn self_funded_p2pkh_sighash(
     parent_txid: &str,
     reward_token_amount: u128,
@@ -357,6 +375,7 @@ fn self_funded_p2pkh_sighash(
     Ok(hash256(&preimage))
 }
 
+/// Builds P2PKH locking bytecode from a public key.
 pub fn p2pkh_locking_from_public_key(public_key: &[u8; 33]) -> Vec<u8> {
     let sha = Sha256::digest(public_key);
     let hash = Ripemd160::digest(sha);
@@ -367,6 +386,7 @@ pub fn p2pkh_locking_from_public_key(public_key: &[u8; 33]) -> Vec<u8> {
     out
 }
 
+/// Derives a CashAddr from a public key.
 pub fn p2pkh_cashaddr_from_public_key(public_key: &[u8; 33]) -> Result<String, String> {
     let locking = p2pkh_locking_from_public_key(public_key);
     let hash: [u8; 20] = locking[3..23]
@@ -375,6 +395,7 @@ pub fn p2pkh_cashaddr_from_public_key(public_key: &[u8; 33]) -> Result<String, S
     tx::p2pkh_hash_to_cashaddr(&hash)
 }
 
+/// Creates an ephemeral identity for the self-funded settlement.
 pub fn new_intermediate_identity() -> Result<([u8; 32], [u8; 33], String), String> {
     let secret = SecretKey::new(&mut rand::rng());
     let secret_bytes = secret.to_secret_bytes();
@@ -384,6 +405,7 @@ pub fn new_intermediate_identity() -> Result<([u8; 32], [u8; 33], String), Strin
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Calculates the relay fee required for the serialized transaction.
 fn required_relay_fee_sats(
     serialized_bytes: usize,
     relay_fee_sats_per_kb: u64,
@@ -398,6 +420,7 @@ fn required_relay_fee_sats(
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
+/// Builds miner and donation outputs with the required token split.
 fn build_self_funded_outputs(
     baton_output_value_sats: u64,
     baton_token_and_locking_bytecode: &[u8],
@@ -427,6 +450,7 @@ fn build_self_funded_outputs(
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
+/// Measures the size of a signed self-funded settlement.
 fn self_funded_serialized_len(
     parent_txid: &str,
     baton_output_value_sats: u64,
@@ -470,6 +494,7 @@ fn self_funded_serialized_len(
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
+/// Signs and serializes the self-funded settlement transaction.
 fn build_self_funded_raw(
     parent_txid: &str,
     baton_output_value_sats: u64,
@@ -524,6 +549,7 @@ fn build_self_funded_raw(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Builds a settlement with the default relay fee policy.
 pub fn build_self_funded_settlement(
     parent_raw: &[u8],
     reward_secret: &[u8; 32],
@@ -542,6 +568,7 @@ pub fn build_self_funded_settlement(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Builds a settlement at the supplied live relay fee.
 pub fn build_self_funded_settlement_with_relay_fee(
     parent_raw: &[u8],
     reward_secret: &[u8; 32],
@@ -671,6 +698,7 @@ mod tests {
 
     const VECTOR_BATON_TXID: &str =
         "000000124712ae4765fe9789372faebca19c99cc1d59f43df2508bf5c42ea042";
+    /// Builds the reference parent transaction with the given reward lock.
     fn vector_parent(reward_lock: Vec<u8>) -> Vec<u8> {
         tx::build_photon_template_bytes(&tx::TemplateParams {
             prev_tx_hash_hex: VECTOR_BATON_TXID.into(),
@@ -695,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that runtime intermediate key matches standard p2pkh vector.
     fn runtime_intermediate_key_matches_standard_p2pkh_vector() {
         let mut secret = [0u8; 32];
         secret[31] = 1;
@@ -712,6 +741,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks reward rounding at token amounts near the donation split boundary.
     fn reward_split_rounding_regression() {
         assert_eq!(RuntimeConfig::split_reward(0), (0, 0));
         assert_eq!(RuntimeConfig::split_reward(49), (49, 0));
@@ -720,6 +750,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that self funded settlement derives budget from authoritative redeem script.
     fn self_funded_settlement_derives_budget_from_authoritative_redeem_script() {
         assert_eq!(
             photon_multi_input_max_baton_decrease_sats().unwrap(),
@@ -728,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that self funded settlement matches vm fixture accounting.
     fn self_funded_settlement_matches_vm_fixture_accounting() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;
@@ -785,6 +817,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that self funded settlement uses supplied relay fee floor.
     fn self_funded_settlement_uses_supplied_relay_fee_floor() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;
@@ -815,6 +848,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that self funded settlement rejects relay floor above covenant budget.
     fn self_funded_settlement_rejects_relay_floor_above_covenant_budget() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;
@@ -837,6 +871,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that self funded settlement rejects reward state mismatch.
     fn self_funded_settlement_rejects_reward_state_mismatch() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;
@@ -857,6 +892,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that self funded settlement rejects wrong baton category.
     fn self_funded_settlement_rejects_wrong_baton_category() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;
@@ -886,6 +922,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that self funded settlement rejects non mutable baton capability.
     fn self_funded_settlement_rejects_non_mutable_baton_capability() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;
@@ -915,6 +952,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that authoritative baton parser rejects noncanonical commitment length.
     fn authoritative_baton_parser_rejects_noncanonical_commitment_length() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;
@@ -938,6 +976,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that authoritative baton parser rejects short reference commitment.
     fn authoritative_baton_parser_rejects_short_reference_commitment() {
         let mut reward_secret = [0u8; 32];
         reward_secret[31] = 1;

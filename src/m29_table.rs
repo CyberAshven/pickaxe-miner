@@ -20,6 +20,7 @@ pub enum M29TableSource {
     Generated,
 }
 
+/// Returns the path for the precomputed M29 point table cache.
 fn cache_path() -> PathBuf {
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(base)
@@ -43,14 +44,17 @@ fn cache_path() -> PathBuf {
         .join("photon-generator-table-m29-16-v1.bin")
 }
 
+/// Computes the digest used to verify a cached point table.
 fn table_hash_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Checks the shape and checksum of a cached M29 table.
 fn valid_table(bytes: &[u8]) -> bool {
     bytes.len() == M29_G16_BYTES && table_hash_hex(bytes) == M29_G16_SHA256
 }
 
+/// Writes a point coordinate into little-endian table words.
 fn store_coordinate_words(dst: &mut [u8], coordinate_be: &[u8]) {
     debug_assert_eq!(dst.len(), 32);
     debug_assert_eq!(coordinate_be.len(), 32);
@@ -61,6 +65,7 @@ fn store_coordinate_words(dst: &mut [u8], coordinate_be: &[u8]) {
     }
 }
 
+/// Stores a curve point in the M29 lookup table.
 fn store_point(table: &mut [u8], window: usize, digit: usize, point: &PublicKey) {
     let offset = (window * M29_G16_ENTRIES + digit) * M29_G16_POINT_BYTES;
     let uncompressed = point.serialize_uncompressed();
@@ -68,6 +73,7 @@ fn store_point(table: &mut [u8], window: usize, digit: usize, point: &PublicKey)
     store_coordinate_words(&mut table[offset + 32..offset + 64], &uncompressed[33..65]);
 }
 
+/// Generates the precomputed M29 G16 point table.
 pub fn generate_m29_g16() -> Result<Vec<u8>, String> {
     let one = SecretKey::from_secret_bytes({
         let mut key = [0u8; 32];
@@ -106,6 +112,7 @@ pub fn generate_m29_g16() -> Result<Vec<u8>, String> {
     Ok(table)
 }
 
+/// Loads a valid M29 table or regenerates its cache.
 pub fn load_or_generate_m29_g16() -> Result<(Vec<u8>, M29TableSource), String> {
     let path = cache_path();
     if let Ok(bytes) = std::fs::read(&path) {

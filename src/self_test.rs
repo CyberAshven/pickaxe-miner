@@ -50,18 +50,21 @@ struct ValidatedWinner {
     donation_token_amount: u128,
     settlement_fee_sats: u64,
 }
+/// Derives the repeatable signing key for offline self-tests.
 fn deterministic_secret(last_byte: u8) -> [u8; 32] {
     let mut secret = [0u8; 32];
     secret[31] = last_byte;
     secret
 }
 
+/// Derives the compressed public key for a test identity.
 fn public_key(secret: &[u8; 32]) -> Result<[u8; 33], String> {
     let secret =
         SecretKey::from_secret_bytes(*secret).map_err(|error| format!("test key: {error}"))?;
     Ok(PublicKey::from_secret_key(&secret).serialize())
 }
 
+/// Builds the reference PHOTON transaction context.
 fn reference_context(target: &[u8; 32]) -> tx::ReferenceJobContext {
     tx::ReferenceJobContext {
         prev_txid: VECTOR_BATON_TXID.into(),
@@ -74,6 +77,7 @@ fn reference_context(target: &[u8; 32]) -> tx::ReferenceJobContext {
     }
 }
 
+/// Creates a reference-shaped PHOTON job without network access.
 fn build_reference_shaped_template(
     target: &[u8; 32],
     reward_public_key: &[u8; 33],
@@ -102,6 +106,7 @@ fn build_reference_shaped_template(
         )
     })
 }
+/// Checks a GPU winner and its expected reward against the reference.
 fn validate_gpu_winner_and_reward(
     template: &[u8; TX_BYTES],
     target: &[u8; 32],
@@ -187,6 +192,7 @@ fn validate_gpu_winner_and_reward(
         settlement_fee_sats: settlement.fee_sats,
     })
 }
+/// Runs offline PHOTON GPU correctness checks on a selected backend.
 pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport, String> {
     let target = [0xffu8; 32];
     let reward_secret = deterministic_secret(1);
@@ -277,6 +283,7 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
         broadcast: false,
     })
 }
+/// Prints the results of the offline GPU self-test.
 pub fn print_report(report: &SelfTestReport, json: bool) {
     if json {
         match serde_json::to_string_pretty(report) {

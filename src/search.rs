@@ -38,6 +38,7 @@ pub(crate) enum PhotonEngine {
 }
 
 impl PhotonEngine {
+    /// Creates a PhotonEngine for the GPU search worker.
     pub(crate) fn new(
         backend: BackendKind,
         device_ordinal: usize,
@@ -79,6 +80,7 @@ impl PhotonEngine {
         }
     }
 
+    /// Installs validated PHOTON job data into the GPU search worker.
     pub(crate) fn set_job(
         &mut self,
         template: &[u8; 615],
@@ -93,6 +95,7 @@ impl PhotonEngine {
         }
     }
 
+    /// Searches a bounded batch of PHOTON candidates with the GPU search worker.
     pub(crate) fn search_batch(
         &mut self,
         nonce_base: u32,
@@ -106,6 +109,7 @@ impl PhotonEngine {
         }
     }
 
+    /// Returns the size of persistent allocations on the selected GPU.
     pub(crate) fn persistent_device_bytes(&self) -> usize {
         match self {
             Self::Cuda(engine) => engine.persistent_device_bytes(),
@@ -115,6 +119,7 @@ impl PhotonEngine {
         }
     }
 
+    /// Returns the origin of the GPU lookup table.
     pub(crate) fn table_source(&self) -> String {
         match self {
             Self::Cuda(engine) => format!("{:?}", engine.table_source()),
@@ -124,6 +129,7 @@ impl PhotonEngine {
         }
     }
 
+    /// Calculates a bounded batch size for the selected intensity.
     pub(crate) fn scheduled_batch_candidates(&self, intensity: u8) -> u32 {
         let capacity = match self {
             Self::Cuda(_) | Self::Hip(_) => scheduled_batch_candidates(),
@@ -134,6 +140,7 @@ impl PhotonEngine {
     }
 }
 
+/// Returns the production cap on candidates per GPU batch.
 pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32 {
     match backend {
         BackendKind::Wgpu => PORTABLE_WGPU_MAX_BATCH_CANDIDATES,
@@ -208,6 +215,7 @@ pub fn hash256(data: &[u8]) -> [u8; 32] {
 }
 
 #[cfg(test)]
+/// Builds the PHOTON M1 signing message for a candidate.
 pub fn photon_m1_message(nonce: u32, target32: &[u8; 32]) -> [u8; 36] {
     let mut msg = [0u8; 36];
     msg[0..4].copy_from_slice(&nonce.to_le_bytes());
@@ -215,6 +223,7 @@ pub fn photon_m1_message(nonce: u32, target32: &[u8; 32]) -> [u8; 36] {
     msg
 }
 
+/// Decodes an exactly 32-byte hexadecimal value.
 pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
     let h = hex.trim();
     if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -228,6 +237,7 @@ pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Compares a candidate hash against a little-endian target.
 pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
     // PHOTON / Codex audit: strict hash < target (equality is NOT a win).
     for i in (0..32).rev() {
@@ -254,6 +264,7 @@ enum WorkerCommand {
     },
 }
 
+/// Rejects incomplete or invalid PHOTON search material.
 fn validate_job(job: &MiningJob) -> Result<[u8; 32], String> {
     if job.generation_id == 0 {
         return Err("mining job generation_id must be nonzero".into());
@@ -270,6 +281,7 @@ fn validate_job(job: &MiningJob) -> Result<[u8; 32], String> {
     parse_hex32(&job.target_le_hex)
 }
 
+/// Prepares validated job bytes and target for GPU search.
 fn prepare_job(
     job: MiningJob,
     sk: &[u8; 32],
@@ -312,6 +324,7 @@ fn prepare_job(
     })
 }
 
+/// Reconstructs a GPU winner and checks its PHOTON proof.
 fn verify_gpu_winner(
     prepared: &PreparedJob,
     sk: &[u8; 32],
@@ -368,6 +381,7 @@ pub(crate) const fn scheduled_batch_candidates() -> u32 {
     MAX_BATCH_CANDIDATES
 }
 
+/// Scales GPU batch candidates with requested intensity.
 pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> u32 {
     if capacity == 0 {
         return 0;
@@ -379,6 +393,7 @@ pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> 
     }
 }
 
+/// Calculates the pause needed to honor GPU intensity.
 pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     let intensity = intensity.clamp(10, 100);
     if intensity >= 100 || compute_time.is_zero() {
@@ -393,6 +408,7 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     Duration::from_nanos(u64::try_from(rest_ns).unwrap_or(u64::MAX))
 }
 
+/// Publishes only GPU batches that pass host verification.
 fn deliver_verified_batch(
     verified_batch: Vec<VerifiedWinner>,
     paused: &AtomicBool,
@@ -414,6 +430,7 @@ fn deliver_verified_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Runs the GPU worker, processing commands between batches.
 fn run_worker(
     mut engine: PhotonEngine,
     mut prepared: PreparedJob,
@@ -520,21 +537,25 @@ pub(crate) struct SearchPauseHandle {
 }
 
 impl SearchPauseHandle {
+    /// Pauses the GPU search worker at a safe boundary.
     pub(crate) fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
+    /// Builds a pause handle over shared search state.
     pub(crate) fn from_shared(paused: Arc<AtomicBool>) -> Self {
         Self { paused }
     }
 }
 
 impl SearchHandle {
+    /// Starts GPU search using the configured backend.
     pub fn start(intensity: u8, job: MiningJob) -> Result<Self, String> {
         Self::start_on_device(0, intensity, job)
     }
 
+    /// Starts GPU search on the selected device ordinal.
     pub fn start_on_device(
         device_ordinal: usize,
         intensity: u8,
@@ -543,6 +564,7 @@ impl SearchHandle {
         Self::start_on_backend_device(BackendKind::Cuda, device_ordinal, intensity, job)
     }
 
+    /// Starts GPU search on an explicit backend and device.
     pub fn start_on_backend_device(
         backend: BackendKind,
         device_ordinal: usize,
@@ -560,6 +582,7 @@ impl SearchHandle {
         Self::start_supervised_on_device(0, intensity, job)
     }
 
+    /// Starts supervised search on a specific GPU device.
     pub fn start_supervised_on_device(
         device_ordinal: usize,
         intensity: u8,
@@ -568,6 +591,7 @@ impl SearchHandle {
         Self::start_supervised_on_backend_device(BackendKind::Cuda, device_ordinal, intensity, job)
     }
 
+    /// Starts supervised search on an explicit GPU backend.
     pub fn start_supervised_on_backend_device(
         backend: BackendKind,
         device_ordinal: usize,
@@ -584,6 +608,7 @@ impl SearchHandle {
         Self::start_supervised_paused_on_device(0, intensity, job)
     }
 
+    /// Starts supervised, paused search on a specific GPU.
     pub fn start_supervised_paused_on_device(
         device_ordinal: usize,
         intensity: u8,
@@ -597,6 +622,7 @@ impl SearchHandle {
         )
     }
 
+    /// Starts supervised, paused search on an explicit backend.
     pub fn start_supervised_paused_on_backend_device(
         backend: BackendKind,
         device_ordinal: usize,
@@ -606,6 +632,7 @@ impl SearchHandle {
         Self::start_inner(backend, device_ordinal, intensity, job, true)
     }
 
+    /// Creates the shared GPU worker and its control channels.
     fn start_inner(
         backend: BackendKind,
         device_ordinal: usize,
@@ -693,6 +720,7 @@ impl SearchHandle {
         })
     }
 
+    /// Replaces search material with a verified new generation.
     pub fn replace_job(&self, job: MiningJob) -> Result<(), String> {
         validate_job(&job)?;
         if job.generation_id == self.generation_id() {
@@ -718,24 +746,29 @@ impl SearchHandle {
             .map_err(|_| "timed out applying PHOTON job generation".to_string())?
     }
 
+    /// Returns the current search generation identifier.
     pub fn generation_id(&self) -> u64 {
         self.generation_id.load(Ordering::Acquire)
     }
 
+    /// Drains host-verified GPU winners for settlement.
     pub fn drain_winners(&self) -> Vec<VerifiedWinner> {
         self.winner_rx.try_iter().collect()
     }
 
+    /// Reports whether the GPU is currently processing a batch.
     pub fn batch_in_flight(&self) -> bool {
         self.batch_in_flight.load(Ordering::SeqCst)
     }
 
+    /// Returns a handle for pausing the GPU search worker.
     pub(crate) fn pause_handle(&self) -> SearchPauseHandle {
         SearchPauseHandle {
             paused: Arc::clone(&self.paused),
         }
     }
 
+    /// Applies a worker intensity or pause control message.
     pub fn apply_control(&self, command: RuntimeCommand) -> Result<SearchStats, String> {
         match command {
             RuntimeCommand::SetIntensity(value) => {
@@ -753,6 +786,7 @@ impl SearchHandle {
         Ok(self.snapshot())
     }
 
+    /// Returns the current GPU worker state.
     fn state(&self) -> MiningState {
         if self.stop.load(Ordering::Relaxed) {
             MiningState::Stopped
@@ -763,6 +797,7 @@ impl SearchHandle {
         }
     }
 
+    /// Stops the GPU search worker and waits for outstanding work.
     pub fn stop(mut self) -> SearchStats {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
@@ -772,6 +807,7 @@ impl SearchHandle {
         self.snapshot_final()
     }
 
+    /// Captures a final GPU search snapshot after stopping.
     fn snapshot_final(&self) -> SearchStats {
         let candidates = self.candidates.load(Ordering::Relaxed);
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
@@ -788,14 +824,17 @@ impl SearchHandle {
         }
     }
 
+    /// Captures the current GPU search rates and state.
     pub fn snapshot(&self) -> SearchStats {
         self.snapshot_final()
     }
+    /// Updates the intensity used to schedule GPU batches.
     pub fn set_intensity(&self, value: u8) -> Result<(), String> {
         self.apply_control(RuntimeCommand::SetIntensity(value))?;
         Ok(())
     }
 
+    /// Switches GPU search between paused and running states.
     pub fn toggle_pause(&self) -> bool {
         let next = !self.paused.load(Ordering::Relaxed);
         if next {
@@ -808,6 +847,7 @@ impl SearchHandle {
 }
 
 impl Drop for SearchHandle {
+    /// Releases resources owned by SearchHandle.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
