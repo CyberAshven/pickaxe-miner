@@ -48,7 +48,7 @@ mod wgpu_photon;
 use config::RuntimeConfig;
 use electrum::{ElectrumSession, LiveJob};
 use search::SearchHandle;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -962,6 +962,29 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
     }
 }
 
+fn spawn_intensity_commands() -> std::sync::mpsc::Receiver<u8> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            let Some(raw) = line.trim().strip_prefix("intensity") else {
+                continue;
+            };
+            let Ok(value) = raw.trim().parse::<u8>() else {
+                continue;
+            };
+            if !(10..=100).contains(&value) {
+                continue;
+            }
+            if tx.send(value).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 fn run_headless_mining(
     cfg: RuntimeConfig,
     backend: backend::BackendKind,
@@ -983,6 +1006,7 @@ fn run_headless_mining(
         print_runtime_snapshot(&final_snapshot, false);
         return Ok(());
     }
+    let intensity_rx = spawn_intensity_commands();
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
     ctrlc::set_handler(move || signal_stop.store(true, Ordering::Relaxed))
@@ -990,6 +1014,21 @@ fn run_headless_mining(
 
     let mut last_status = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
+        while let Ok(value) = intensity_rx.try_recv() {
+            match supervisor.set_intensity(value) {
+                Ok(()) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "intensity",
+                            "intensity": value,
+                        })
+                    );
+                    let _ = io::stdout().flush();
+                }
+                Err(error) => eprintln!("intensity change rejected: {error}"),
+            }
+        }
         for event in supervisor.drain_events() {
             print_runtime_event(event, json);
         }

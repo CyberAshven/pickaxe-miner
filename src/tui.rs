@@ -1579,6 +1579,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_view_shows_live_intensity_and_reconnect_counts() {
+        let mut snapshot = test_snapshot();
+        snapshot.search.intensity = 30;
+        snapshot.reconnects = 4;
+        snapshot.endpoint_rotations = 2;
+        snapshot.job_changes = 1;
+        let state = TuiState::new(&snapshot);
+        let backend = ratatui::backend::TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &snapshot, &state))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("30%"));
+        assert!(rendered.contains("reconnects: 4"));
+        assert!(rendered.contains("rotations: 2"));
+        assert!(rendered.contains("job changes: 1"));
+    }
+
+    #[test]
     fn palette_rejects_invalid_intensity_without_touching_runtime() {
         assert!(parse_palette_command("intensity 9").is_err());
         assert!(parse_palette_command("intensity 101").is_err());

@@ -527,11 +527,27 @@ impl SourceCatalog {
             .collect::<Vec<_>>();
         user.sort_by_key(|entry| source_rank(entry));
         built_in.sort_by_key(|entry| source_rank(entry));
-        if !built_in.is_empty() {
-            let offset = (rotation_key as usize) % built_in.len();
-            built_in.rotate_left(offset);
+        // Healthy peers stay at the front. Rotation is only for peers that
+        // have not earned a healthy measurement, so cold start still spreads
+        // load and a proven peer is not shuffled out of the probe window.
+        let mut sticky = Vec::new();
+        let mut rotatable = Vec::new();
+        for entry in built_in {
+            if entry.health == SourceHealth::Healthy {
+                sticky.push(entry);
+            } else {
+                rotatable.push(entry);
+            }
         }
-        user.into_iter().chain(built_in).take(limit).collect()
+        if !rotatable.is_empty() {
+            let offset = (rotation_key as usize) % rotatable.len();
+            rotatable.rotate_left(offset);
+        }
+        user.into_iter()
+            .chain(sticky)
+            .chain(rotatable)
+            .take(limit)
+            .collect()
     }
 
     pub(crate) fn reconcile_builtins(&mut self, refreshed: Vec<SourceEntry>) -> Result<(), String> {
@@ -852,6 +868,14 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert_eq!(rotated.len(), 2);
         assert_ne!(first[0].endpoint, rotated[0].endpoint);
+
+        catalog
+            .record_success(SourceKind::Fulcrum, "d", 0, 10)
+            .unwrap();
+        for key in [0_u64, 1, 2, 3] {
+            let probes = catalog.probe_candidates(SourceKind::Fulcrum, 0, 2, key);
+            assert_eq!(probes[0].endpoint, "d");
+        }
     }
 
     #[test]
