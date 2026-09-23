@@ -494,9 +494,8 @@ pub fn run(
         let snapshot = supervisor.snapshot();
 
         for event in supervisor.drain_events() {
-            let message = format_event(event);
-            append_tui_log(&format!("event {message}"));
-            state.push_event(message);
+            append_tui_log(&format!("event {}", event_log_text(&event)));
+            state.push_event(format_event(event));
         }
 
         if last_draw.elapsed() >= DRAW_INTERVAL {
@@ -1415,6 +1414,49 @@ fn format_event(event: RuntimeEvent) -> String {
             shorten(&parent_txid, 18),
             shorten(&child_txid, 18)
         ),
+        RuntimeEvent::Error(error) => format!("error: {error}"),
+    }
+}
+
+/// Formats a runtime event for the observation log: the same facts as the
+/// TUI event line, but with full error text, txids, and hashes instead of
+/// width-truncated ones. Endpoints are still redacted.
+fn event_log_text(event: &RuntimeEvent) -> String {
+    match event {
+        RuntimeEvent::JobRefreshed {
+            generation_id,
+            height,
+            baton_txid,
+            baton_vout,
+        } => format!("job g={generation_id} h={height} {baton_txid}:{baton_vout}"),
+        RuntimeEvent::StateRefreshFailed { error, consecutive } => {
+            format!("refresh failed x{consecutive}: {error}")
+        }
+        RuntimeEvent::Reconnecting(error) => format!("reconnecting {error}"),
+        RuntimeEvent::Reconnected(endpoint) => {
+            format!("reconnected {}", redact_endpoint(endpoint))
+        }
+        RuntimeEvent::EndpointRotated { from, to } => format!(
+            "switch {} -> {}",
+            redact_endpoint(from),
+            redact_endpoint(to)
+        ),
+        RuntimeEvent::StaleWinner {
+            winner_generation,
+            current_generation,
+        } => format!(
+            "stale winner discarded: generation {winner_generation} -> {current_generation}"
+        ),
+        RuntimeEvent::VerifiedWinner(winner) => format!(
+            "winner verified: gen={} nonce={} hash={}",
+            winner.generation_id,
+            winner.nonce,
+            hex::encode(winner.digest)
+        ),
+        RuntimeEvent::SubmissionAccepted {
+            parent_txid,
+            child_txid,
+        } => format!("submission accepted: parent={parent_txid} reward={child_txid}"),
         RuntimeEvent::Error(error) => format!("error: {error}"),
     }
 }
