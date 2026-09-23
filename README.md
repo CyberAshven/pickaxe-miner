@@ -24,7 +24,7 @@ The prepared v0.1.0 archives are:
 - Linux: `pickaxe-miner-v0.1.0-linux-x86_64.tar.gz`
 - Windows: `pickaxe-miner-v0.1.0-windows-x86_64.zip`
 
-The release also publishes `SHA256SUMS.txt` for those two archives. Merging to `master` runs the Release workflow, which tags the merged commit `pickaxe-miner-v<Cargo.toml version>` and publishes these archives. A merge that does not bump the version publishes nothing. Pull requests run the same build and packaging as a dry run. Until the v0.1.0 release exists, build from source.
+The release also publishes `SHA256SUMS.txt` for those two archives. Merging to `master` runs the Release workflow, which tags the merged commit `pickaxe-miner-v<Cargo.toml version>` and publishes these archives. A merge that does not bump the version publishes nothing, and a push that only changes Markdown files or `docs/` never starts a release. Pull requests run the same build and packaging as a dry run. Until the v0.1.0 release exists, build from source.
 
 Linux:
 

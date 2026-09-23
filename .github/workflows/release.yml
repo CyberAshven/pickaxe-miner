@@ -3,6 +3,8 @@ name: Release
 # Release modes:
 # - push to master: tag pickaxe-miner-v<Cargo.toml version> on the pushed
 #   commit and publish it, unless that tag already exists (no version bump).
+#   A push that only changes Markdown files or docs/ never starts a release
+#   (paths-ignore below; GitHub does not apply path filters to tag pushes).
 # - pull_request to master: dry run of the same build and packaging; nothing
 #   is tagged or published.
 # - push of a pickaxe-miner-v* tag, or manual dispatch with an existing tag:
@@ -13,6 +15,9 @@ on:
       - master
     tags:
       - "pickaxe-miner-v*.*.*"
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   pull_request:
     branches:
       - master
