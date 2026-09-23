@@ -443,6 +443,49 @@ mod tests {
     }
 
     #[test]
+    fn block_template_payload_cannot_become_a_photon_job() {
+        let header = json!({
+            "height": 0,
+            "hex": "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c"
+        });
+        let gbt = json!({
+            "previousblockhash": "00".repeat(32),
+            "bits": "1d00ffff",
+            "target": "00000000ffff0000000000000000000000000000000000000000000000000000",
+            "height": 1,
+            "coinbasevalue": 312500000
+        });
+        let error = live_job_from_fulcrum_values(
+            "http://node.invalid",
+            json!(["BCHN", "28.0"]),
+            &header,
+            &gbt,
+        )
+        .expect_err("getblocktemplate object is not a PHOTON baton");
+        assert!(
+            error.contains("UTXO") || error.contains("PHOTON baton"),
+            "{error}"
+        );
+
+        let gbt_shaped_utxo = json!([{
+            "tx_hash": "11".repeat(32),
+            "tx_pos": 0,
+            "height": 0,
+            "value": 312500000,
+            "bits": "1d00ffff",
+            "target": "ff".repeat(32)
+        }]);
+        let error = live_job_from_fulcrum_values(
+            "http://node.invalid",
+            json!(["BCHN", "28.0"]),
+            &header,
+            &gbt_shaped_utxo,
+        )
+        .expect_err("compact bits must not become a PHOTON target");
+        assert!(error.contains("exactly one live PHOTON baton"), "{error}");
+    }
+
+    #[test]
     fn fulcrum_header_hash_matches_genesis_header() {
         let header = json!({
             "height": 0,

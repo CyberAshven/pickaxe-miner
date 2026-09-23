@@ -3048,8 +3048,10 @@ fn prepare_fulcrum_endpoint_change(
 }
 
 fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
-    !current.tip_hash.eq_ignore_ascii_case(&next.tip_hash)
-        || current.baton_txid != next.baton_txid
+    // Tip hash and route metadata are not the resident GPU job. A same-height
+    // reorg that leaves baton, height, target, and source work unchanged must
+    // keep the current generation mining.
+    current.baton_txid != next.baton_txid
         || current.baton_vout != next.baton_vout
         || current.baton_height != next.baton_height
         || current.baton_value_sats != next.baton_value_sats
@@ -3591,8 +3593,8 @@ mod tests {
         next = current.clone();
         next.tip_hash = "33".repeat(32);
         assert!(
-            live_job_changed(&current, &next),
-            "same-height BCH tip replacement must invalidate the mining generation"
+            !live_job_changed(&current, &next),
+            "same-height tip replacement with unchanged baton, height, and target must not replace the GPU job"
         );
 
         next = current.clone();
@@ -3606,7 +3608,7 @@ mod tests {
     }
 
     #[test]
-    fn same_height_tip_reorg_stages_one_new_generation() {
+    fn same_height_tip_reorg_does_not_publish_a_new_generation() {
         let (cfg, current, _secret, _public, _mining_payout, _journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &current).unwrap();
         let mut reorged = current.clone();
@@ -3623,21 +3625,11 @@ mod tests {
                 Ok(())
             },
         )
-        .unwrap()
         .unwrap();
 
-        assert_eq!(staged.0.generation_id, cfg.generation_id + 1);
-        assert_eq!(preflight_calls, 1);
-
-        let unchanged = prepare_generation_transition(
-            &staged.0,
-            &reorged,
-            &staged.1,
-            &reorged,
-            |_next_cfg, _next_live| Ok(()),
-        )
-        .unwrap();
-        assert!(unchanged.is_none());
+        assert!(staged.is_none());
+        assert_eq!(preflight_calls, 0);
+        assert_eq!(cfg.generation_id, settlement.generation_id);
     }
 
     #[test]
@@ -3920,6 +3912,45 @@ mod tests {
         let mut next_baton = job;
         next_baton.baton_vout = 1;
         assert!(!winner_matches_live(&current, 4, &next_baton));
+    }
+
+    #[test]
+    fn stale_or_wrong_generation_winner_is_not_prepared_for_broadcast() {
+        let (cfg, job, reward_secret, reward_public, _mining_payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let wrong_generation = winner(cfg.generation_id.saturating_add(9), &job);
+        let error = prepare_pending_submission(
+            &wrong_generation,
+            &cfg,
+            &job,
+            &reward_secret,
+            &reward_public,
+            &settlement,
+            &journal,
+        )
+        .expect_err("wrong generation must not be journaled");
+        assert!(error.contains("stale"), "{error}");
+        assert!(!journal.exists());
+
+        let mut drifted = job.clone();
+        drifted.baton_txid = "ab".repeat(32);
+        let current = winner(cfg.generation_id, &job);
+        let error = prepare_pending_submission(
+            &current,
+            &cfg,
+            &drifted,
+            &reward_secret,
+            &reward_public,
+            &settlement,
+            &journal,
+        )
+        .expect_err("drifted baton must not be journaled");
+        assert!(error.contains("stale"), "{error}");
+        assert!(!journal.exists());
+        assert_eq!(
+            submission_decision(false, false, false),
+            SubmissionDecision::StaleUnbroadcast
+        );
     }
 
     #[test]

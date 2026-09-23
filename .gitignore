@@ -7,11 +7,12 @@ Thumbs.db
 .env.*
 /artifacts/
 
-cuda/build/
+cuda/build/*
 hip/build/
 __pycache__/
 *.obj
 
 
 !cuda/build/stage_a_hash256.ptx
+!cuda/build/stage_a_rfc6979.ptx
 

@@ -373,4 +373,29 @@ mod tests {
         cfg.clear_node_url();
         assert_eq!(cfg.generation_id, 6);
     }
+
+    #[test]
+    fn donation_is_exactly_two_percent_and_config_cannot_override_it() {
+        assert_eq!(DONATION_BPS, 200);
+        assert_eq!(RuntimeConfig::split_reward(100), (98, 2));
+        assert_eq!(
+            RuntimeConfig::split_reward(4_999_773_813),
+            (4_899_778_337, 99_995_476)
+        );
+        assert!(serde_json::from_str::<SavedConfig>(r#"{"donation_bps":0}"#).is_err());
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_payout(PAYOUT.into()).unwrap();
+        let saved = SavedConfig::from_effective("cuda", Some(0), &cfg);
+        let value = serde_json::to_value(&saved).unwrap();
+        assert!(value.get("donation_bps").is_none());
+        assert!(value.get("donation").is_none());
+        let reloaded: SavedConfig = serde_json::from_value(value).unwrap();
+        let mut applied = RuntimeConfig::default();
+        reloaded.apply_to_runtime(&mut applied).unwrap();
+        assert_eq!(
+            RuntimeConfig::split_reward(4_999_773_813),
+            (4_899_778_337, 99_995_476)
+        );
+        assert_eq!(applied.intensity, 100);
+    }
 }
