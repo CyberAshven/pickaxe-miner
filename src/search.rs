@@ -24,7 +24,7 @@ pub const REFERENCE_GPU_PIPELINE_READY: bool = true;
 
 pub(crate) const MAX_BATCH_CANDIDATES: u32 = 65_536;
 const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 524_288;
-const THROTTLED_BATCH_CANDIDATES: u32 = 4_096;
+const THROTTLED_BATCH_CANDIDATES: u32 = 16_384;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const JOB_UPDATE_CHANNEL_CAP: usize = 2;
@@ -395,6 +395,86 @@ pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> 
     }
 }
 
+/// How much busy/wall history the duty pacer keeps before halving it.
+const DUTY_WINDOW: Duration = Duration::from_secs(2);
+/// Throttled work runs as one burst then one rest per period of this length.
+const DUTY_PERIOD: Duration = Duration::from_millis(100);
+
+/// Paces throttled GPU batches to the requested duty cycle.
+///
+/// Sleeps round up to the OS timer tick (about 15.6 ms on Windows), so a
+/// per-batch rest of a fraction of a millisecond becomes a 15 ms stall and
+/// every intensity below 100 collapses to the same low rate. The pacer
+/// instead accounts GPU-busy time against wall time and asks for rest only
+/// while busy time is ahead of the requested share; an oversleep is repaid
+/// by running the following batches back to back. Rest is taken in whole
+/// periods (25% runs about 25 ms, then rests about 75 ms), so the GPU works
+/// at full clocks instead of idling between tiny bursts.
+#[derive(Debug, Clone)]
+pub(crate) struct DutyPacer {
+    intensity: u8,
+    window_start: Instant,
+    busy: Duration,
+}
+
+impl DutyPacer {
+    /// Starts an empty pacing window.
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            intensity: 100,
+            window_start: now,
+            busy: Duration::ZERO,
+        }
+    }
+
+    /// Forgets pacing history, e.g. after a pause, so idle time is not
+    /// spent later as a full-speed burst.
+    pub(crate) fn reset(&mut self, now: Instant) {
+        self.window_start = now;
+        self.busy = Duration::ZERO;
+    }
+
+    /// Records one finished batch and returns how long to rest before the
+    /// next one.
+    pub(crate) fn record_batch(
+        &mut self,
+        intensity: u8,
+        compute_time: Duration,
+        now: Instant,
+    ) -> Duration {
+        let intensity = intensity.clamp(10, 100);
+        if intensity != self.intensity {
+            self.intensity = intensity;
+            self.window_start = now.checked_sub(compute_time).unwrap_or(now);
+            self.busy = Duration::ZERO;
+        }
+        if intensity >= 100 {
+            self.reset(now);
+            return Duration::ZERO;
+        }
+        self.busy = self.busy.saturating_add(compute_time);
+        let elapsed = now.saturating_duration_since(self.window_start);
+        let required = self.busy.saturating_add(duty_rest(self.busy, intensity));
+        let rest = required.saturating_sub(elapsed);
+        if elapsed >= DUTY_WINDOW {
+            // Halve the history: the ratio is kept, old surplus or debt fades.
+            self.busy /= 2;
+            self.window_start = now.checked_sub(elapsed / 2).unwrap_or(now);
+        }
+        // Rest only in whole-period chunks. Short bursts between short rests
+        // keep the GPU in a low clock state and cost throughput per busy ms.
+        if rest < duty_rest_quantum(intensity) {
+            return Duration::ZERO;
+        }
+        rest
+    }
+}
+
+/// Idle part of one pacing period at the given intensity.
+fn duty_rest_quantum(intensity: u8) -> Duration {
+    DUTY_PERIOD * u32::from(100 - intensity.clamp(10, 100)) / 100
+}
+
 /// Calculates the pause needed to honor GPU intensity.
 pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     let intensity = intensity.clamp(10, 100);
@@ -526,6 +606,7 @@ fn run_worker(
 ) {
     let mut rng = rand::rng();
     let mut nonce_base = rng.random::<u32>();
+    let mut pacer = DutyPacer::new(Instant::now());
     while !stop.load(Ordering::Relaxed) {
         loop {
             match job_rx.try_recv() {
@@ -554,6 +635,7 @@ fn run_worker(
         if paused.load(Ordering::SeqCst) {
             batch_in_flight.store(false, Ordering::SeqCst);
             thread::park_timeout(PAUSE_POLL);
+            pacer.reset(Instant::now());
             continue;
         }
 
@@ -582,7 +664,7 @@ fn run_worker(
         batch_in_flight.store(false, Ordering::SeqCst);
 
         nonce_base = nonce_base.wrapping_add(accepted.candidates);
-        let rest = duty_rest(compute_time, active_intensity);
+        let rest = pacer.record_batch(active_intensity, compute_time, Instant::now());
         if !rest.is_zero() {
             thread::park_timeout(rest);
         }
@@ -1012,6 +1094,102 @@ mod tests {
         assert!(meets_target_le(&d, &t));
     }
 
+    /// Runs the pacer against a simulated clock whose sleeps round up to a
+    /// timer tick, and returns the achieved GPU duty cycle.
+    fn simulated_duty(intensity: u8, compute: Duration, tick: Duration, total: Duration) -> f64 {
+        let start = Instant::now();
+        let mut now = start;
+        let mut pacer = DutyPacer::new(now);
+        let mut busy = Duration::ZERO;
+        while now.duration_since(start) < total {
+            now += compute;
+            busy += compute;
+            let rest = pacer.record_batch(intensity, compute, now);
+            if !rest.is_zero() {
+                let ticks = rest.as_nanos().div_ceil(tick.as_nanos()) as u32;
+                now += tick * ticks;
+            }
+        }
+        busy.as_secs_f64() / now.duration_since(start).as_secs_f64()
+    }
+
+    #[test]
+    fn duty_pacer_holds_intensity_despite_coarse_sleep_ticks() {
+        // A 16,384-candidate batch is about 1 ms on the RTX 5070 Ti, and
+        // Windows sleeps round up to about 15.6 ms.
+        let compute = Duration::from_micros(1_000);
+        let tick = Duration::from_micros(15_625);
+        for intensity in [10_u8, 25, 30, 50, 75, 90] {
+            let duty = simulated_duty(intensity, compute, tick, Duration::from_secs(30));
+            let expected = f64::from(intensity) / 100.0;
+            assert!(
+                (duty - expected).abs() <= 0.02,
+                "intensity {intensity}% achieved duty {duty:.3}"
+            );
+        }
+        // Per-batch rest (the old pacing) collapses every level to about 6%.
+        let old_duty = compute.as_secs_f64() / (compute + tick).as_secs_f64();
+        assert!(old_duty < 0.07);
+    }
+
+    #[test]
+    fn duty_pacer_works_in_bursts_and_rests_in_whole_periods() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut pacer = DutyPacer::new(now);
+        let compute = Duration::from_millis(1);
+        let mut burst = Duration::ZERO;
+        let mut rests = 0;
+        while now.duration_since(start) < Duration::from_secs(5) {
+            now += compute;
+            burst += compute;
+            let rest = pacer.record_batch(25, compute, now);
+            if !rest.is_zero() {
+                // 25% of a 100 ms period: about 25 ms of work, 75 ms of rest.
+                assert!(rest >= Duration::from_millis(75), "short rest {rest:?}");
+                assert!(burst >= Duration::from_millis(20), "short burst {burst:?}");
+                rests += 1;
+                burst = Duration::ZERO;
+                now += rest;
+            }
+        }
+        assert!((45..=55).contains(&rests), "{rests} periods in 5 s");
+    }
+
+    #[test]
+    fn duty_pacer_never_rests_at_full_intensity() {
+        let now = Instant::now();
+        let mut pacer = DutyPacer::new(now);
+        for step in 1..=100_u32 {
+            let rest = pacer.record_batch(
+                100,
+                Duration::from_millis(4),
+                now + step * 4 * Duration::from_millis(1),
+            );
+            assert_eq!(rest, Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn duty_pacer_reset_discards_idle_credit() {
+        let start = Instant::now();
+        let mut pacer = DutyPacer::new(start);
+        let compute = Duration::from_millis(60);
+        assert_eq!(pacer.record_batch(50, compute, start + compute), compute);
+
+        // Ten idle seconds without a reset read as credit: no rest at all.
+        let resumed = start + Duration::from_secs(10);
+        let mut unreset = pacer.clone();
+        assert_eq!(
+            unreset.record_batch(50, compute, resumed + compute),
+            Duration::ZERO
+        );
+
+        // After a reset the first batch is paced again.
+        pacer.reset(resumed);
+        assert_eq!(pacer.record_batch(50, compute, resumed + compute), compute);
+    }
+
     #[test]
     fn intensity_scales_real_gpu_duty() {
         assert_eq!(scheduled_batch_candidates(), MAX_BATCH_CANDIDATES);
@@ -1019,9 +1197,9 @@ mod tests {
             intensity_batch_candidates(MAX_BATCH_CANDIDATES, 100),
             65_536
         );
-        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 50), 4_096);
-        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 25), 4_096);
-        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 10), 4_096);
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 50), 16_384);
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 25), 16_384);
+        assert_eq!(intensity_batch_candidates(MAX_BATCH_CANDIDATES, 10), 16_384);
         let compute = Duration::from_millis(10);
         assert_eq!(duty_rest(compute, 100), Duration::ZERO);
         assert_eq!(duty_rest(compute, 50), Duration::from_millis(10));
