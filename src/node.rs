@@ -20,8 +20,7 @@ const NODE_RPC_PASSWORD_ENV: &str = "PICKAXE_NODE_RPC_PASSWORD";
 pub fn connect_failover(endpoints: &[String]) -> Result<(String, Value), String> {
     if endpoints.is_empty() {
         return Err(
-            "no native node endpoints Ã¢â‚¬â€ set `node http://127.0.0.1:8332` (Start9 etc.)"
-                .into(),
+            "no native node endpoints -- set `node http://127.0.0.1:8332` (Start9 etc.)".into(),
         );
     }
     let mut failures = Vec::new();
@@ -911,7 +910,7 @@ pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, 
         return Err("raw tx must be hex".into());
     }
     if endpoints.is_empty() {
-        return Err("no node endpoints Ã¢â‚¬â€ set `node http://user:pass@127.0.0.1:8332`".into());
+        return Err("no node endpoints -- set `node http://user:pass@127.0.0.1:8332`".into());
     }
     let mut failures = Vec::new();
     let mut backoff_ms: u64 = 400;
@@ -1024,7 +1023,7 @@ fn bits_to_target_le_hex(bits: u32) -> String {
 
 pub fn fetch_block_template(endpoints: &[String]) -> Result<BlockTemplate, String> {
     if endpoints.is_empty() {
-        return Err("no node endpoints Ã¢â‚¬â€ set `node http://user:pass@127.0.0.1:8332`".into());
+        return Err("no node endpoints -- set `node http://user:pass@127.0.0.1:8332`".into());
     }
     let mut failures = Vec::new();
     let mut backoff_ms: u64 = 400;

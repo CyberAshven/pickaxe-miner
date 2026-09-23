@@ -601,8 +601,10 @@ impl SourceRouter<'_> {
     }
 
     /// PHOTON route among peers that are already healthy and capable.
-    /// A native node that can do the job wins over a Fulcrum peer. An
-    /// unhealthy or unproven node is not in this set, so Fulcrum remains.
+    /// Candidates are ordered by health, failure count, then latency.
+    /// The best native node in that order wins over Fulcrum when its
+    /// PhotonState proof is current. An unhealthy or unproven node is
+    /// absent, so Fulcrum remains.
     pub(crate) fn select_photon_route(&self, now_ms: u64) -> Option<&SourceEntry> {
         let candidates = self.candidates(SourceCapability::PhotonState, now_ms);
         candidates
