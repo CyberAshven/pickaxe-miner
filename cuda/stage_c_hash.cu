@@ -1,5 +1,7 @@
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #include <stdint.h>
+#elif defined(PICKAXE_STDINT_INCLUDED)
+// The including file already brought in <cstdint>.
 #else
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;

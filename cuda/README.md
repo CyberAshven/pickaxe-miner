@@ -27,8 +27,9 @@
 - Stage A: existing exact `stage_a_rfc6979.ptx`; message SHA-256 and BCH RFC6979 stay on-device
 - Stage B: `photon_stage_b16.cu` / `build/photon_stage_b16.ptx`; M45-style 4+4+4+4 fixed-base windows
 - Fixed-base table: exact M67.38 M29 16-bit format, 67,108,864 bytes, generated locally and accepted only when SHA-256 is `f6238556c4cf380be0479c14511c97cf996290eed88ce220c9dd28301c87b0e1`
-- C1: `photon_c1_schnorr.cu` / `build/photon_c1_schnorr.ptx`; Jacobian normalization, BCH quadratic-residue rule, challenge, fixed-private-key M39 `e*d`, and R||s all run on-device
-- C2/C3: existing exact completed-transaction HASH256 and strict little-endian target filter
+- C1: `photon_c1_schnorr.cu` / `build/photon_c1_schnorr.ptx`; Jacobian normalization, challenge, fixed-private-key M39 `e*d`, and R||s all run on-device. CUDA uses `pickaxe_photon_c1_schnorr_dual`, which writes `s` for both nonce signs (`k + e*d` and `(n - k) + e*d`) and skips the per-candidate quadratic-residue test; HIP still uses `pickaxe_photon_c1_schnorr`, which applies the residue rule in C1
+- C2/C3: CUDA uses `photon_c3_dual.cu` / `build/photon_c3_dual.ptx`. It resumes SHA-256 from a per-job midstate of transaction bytes 0..383, hashes both signature variants, and runs the BCH residue test (on `Y*Z`, no inversion) only for a candidate whose variant meets the target, emitting it only if that variant is the real signature. HIP still uses the single-variant `stage_c_hash.cu` filter
+- Field arithmetic (`stage_b_kg.cu`): straight-line column-sum multiply and square with a two-step `2^256 = 2^32 + 977` fold; inversion and the residue test use the libsecp256k1 addition chains
 - Host boundary: only winner count and a configured bounded winner nonce/HASH256 array; no per-candidate message, RFC6979 scalar, point, signature, or digest readback
 - Resources: one CUDA context/stream plus persistent table and candidate buffers per engine; host table bytes are dropped after the one-time upload
 - Production integration: connected to immutable live job generations, CPU reconstruction/verification of returned winners, authoritative freshness recheck, durable submission journaling, and self-funded settlement. Real-mainnet natural-winner evidence remains an external validation item.
@@ -40,5 +41,6 @@ nvcc -ptx -O3 -arch=sm_120 -o cuda\build\stage_a_rfc6979.ptx cuda\stage_a_rfc697
 nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -o cuda\build\stage_b_kg.ptx cuda\stage_b_kg.cu
 nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -o cuda\build\photon_stage_b16.ptx cuda\photon_stage_b16.cu
 nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -o cuda\build\photon_c1_schnorr.ptx cuda\photon_c1_schnorr.cu
+nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -o cuda\build\photon_c3_dual.ptx cuda\photon_c3_dual.cu
 nvcc -ptx -O3 -arch=sm_120 -o cuda\build\stage_c_hash.ptx cuda\stage_c_hash.cu
 ```

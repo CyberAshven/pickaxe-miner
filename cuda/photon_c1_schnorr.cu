@@ -291,3 +291,55 @@ extern "C" __global__ void pickaxe_photon_c1_schnorr(
     c1_copy(signature, r_bytes, 32u);
     c1_copy(signature + 32u, s_bytes, 32u);
 }
+
+// C1 without the per-candidate quadratic-residue test. BCH Schnorr signs
+// with k when R.y is a square and with n - k otherwise; R.x and e are the
+// same either way. This writes R||s for s = k + e*d and, separately, the
+// other candidate s = (n - k) + e*d. The dual C3 filter hashes both and
+// tests the residue only for a candidate that meets the target.
+extern "C" __global__ void pickaxe_photon_c1_schnorr_dual(
+    const uint8_t* __restrict__ message_hashes,
+    const uint8_t* __restrict__ rfc6979_scalars,
+    const uint32_t* __restrict__ points,
+    const uint8_t* __restrict__ public_key33,
+    const uint32_t* __restrict__ fixed_d_table,
+    uint8_t* __restrict__ signatures,
+    uint8_t* __restrict__ negated_nonce_s,
+    uint32_t candidate_count
+) {
+    const uint32_t candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= candidate_count) return;
+
+    const JPoint point = c1_load_point(points, candidate);
+    if (point.infinity) return;
+
+    Fe z_inv, z2, rx;
+    feinv(&z_inv, &point.z);
+    fesqr(&z2, &z_inv);
+    femul(&rx, &point.x, &z2);
+
+    uint8_t r_bytes[32];
+    fe_to_be(&rx, r_bytes);
+
+    const uint8_t* message = message_hashes + (size_t)candidate * 32u;
+    uint8_t challenge_input[97];
+    c1_copy(challenge_input, r_bytes, 32u);
+    c1_copy(challenge_input + 32u, public_key33, 33u);
+    c1_copy(challenge_input + 65u, message, 32u);
+    uint8_t challenge_hash[32];
+    c1_sha256(challenge_input, 97u, challenge_hash);
+    const Scalar256 e = scalar_reduce_hash(challenge_hash);
+    const Scalar256 ed = scalar_mul_fixed_d(&e, fixed_d_table);
+
+    const uint8_t* k_bytes = rfc6979_scalars + (size_t)candidate * 32u;
+    const Scalar256 k = scalar_from_be(k_bytes);
+    const Scalar256 n = scalar_n();
+    const Scalar256 negated_k = scalar_sub_raw(&n, &k);
+    const Scalar256 s_plus = scalar_add_mod_n(&k, &ed);
+    const Scalar256 s_minus = scalar_add_mod_n(&negated_k, &ed);
+
+    uint8_t* signature = signatures + (size_t)candidate * 64u;
+    c1_copy(signature, r_bytes, 32u);
+    scalar_to_be(&s_plus, signature + 32u);
+    scalar_to_be(&s_minus, negated_nonce_s + (size_t)candidate * 32u);
+}

@@ -2,7 +2,9 @@
 //!
 //! One context owns the complete candidate path:
 //! Stage A (message SHA-256 + RFC6979) -> M45-style split M29 fixed-base Stage B
-//! -> BCH Schnorr C1 -> completed transaction HASH256/strict target filter.
+//! -> BCH Schnorr C1 (both nonce signs) -> completed transaction HASH256/strict
+//! target filter, with the BCH residue test only for a candidate that meets
+//! the target.
 //! Candidate intermediates remain in device memory. The host reads one winner
 //! count and a bounded winner record array only.
 
@@ -21,6 +23,18 @@ const TARGET_OFFSET: usize = 394;
 const SIGNATURE_BYTES: usize = 64;
 const POINT_WORDS: usize = 24;
 const FIXED_D_WORDS: usize = 32 * 256 * 8;
+/// Transaction bytes before the nonce's SHA-256 block; fixed for a job.
+const MIDSTATE_BYTES: usize = 384;
+const SHA256_INITIAL_STATE: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotonCudaWinner {
@@ -58,6 +72,8 @@ pub struct CudaPhotonEngine {
     rfc6979_gpu: CudaSlice<u8>,
     points_gpu: CudaSlice<u32>,
     signatures_gpu: CudaSlice<u8>,
+    negated_nonce_s_gpu: CudaSlice<u8>,
+    midstate_gpu: CudaSlice<u32>,
     template_gpu: CudaSlice<u8>,
     winner_count_gpu: CudaSlice<u32>,
     winner_nonces_gpu: CudaSlice<u32>,
@@ -124,6 +140,17 @@ fn load_function(
         .map_err(|error| format!("load {function_name}: {error}"))
 }
 
+/// SHA-256 state after the job-fixed transaction bytes 0..384.
+fn transaction_midstate(template: &[u8; TX_BYTES]) -> [u32; 8] {
+    let mut state = SHA256_INITIAL_STATE;
+    let blocks = template[..MIDSTATE_BYTES]
+        .chunks_exact(64)
+        .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
+        .collect::<Vec<_>>();
+    sha2::compress256(&mut state, &blocks);
+    state
+}
+
 /// Builds the fixed scalar lookup table used by CUDA kernels.
 fn fixed_d_table(private_key: &[u8; 32]) -> Vec<u32> {
     let order = BigUint::from_bytes_be(
@@ -171,8 +198,12 @@ impl CudaPhotonEngine {
             load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part2")?,
             load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part3")?,
         ];
-        let stage_c1 = load_function(&ctx, "photon_c1_schnorr.ptx", "pickaxe_photon_c1_schnorr")?;
-        let stage_c3 = load_function(&ctx, "stage_c_hash.ptx", "pickaxe_stage_c_hash_filter")?;
+        let stage_c1 = load_function(
+            &ctx,
+            "photon_c1_schnorr.ptx",
+            "pickaxe_photon_c1_schnorr_dual",
+        )?;
+        let stage_c3 = load_function(&ctx, "photon_c3_dual.ptx", "pickaxe_stage_c_dual_filter")?;
 
         let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
         let table_gpu = stream
@@ -204,6 +235,12 @@ impl CudaPhotonEngine {
         let signatures_gpu = stream
             .alloc_zeros::<u8>((max_candidates as usize) * SIGNATURE_BYTES)
             .map_err(|error| format!("alloc signatures: {error}"))?;
+        let negated_nonce_s_gpu = stream
+            .alloc_zeros::<u8>((max_candidates as usize) * 32)
+            .map_err(|error| format!("alloc negated-nonce signatures: {error}"))?;
+        let midstate_gpu = stream
+            .alloc_zeros::<u32>(8)
+            .map_err(|error| format!("alloc transaction midstate: {error}"))?;
         let template_gpu = stream
             .alloc_zeros::<u8>(TX_BYTES)
             .map_err(|error| format!("alloc transaction template: {error}"))?;
@@ -233,6 +270,8 @@ impl CudaPhotonEngine {
             rfc6979_gpu,
             points_gpu,
             signatures_gpu,
+            negated_nonce_s_gpu,
+            midstate_gpu,
             template_gpu,
             winner_count_gpu,
             winner_nonces_gpu,
@@ -256,8 +295,9 @@ impl CudaPhotonEngine {
             + 32
             + 33
             + FIXED_D_WORDS * std::mem::size_of::<u32>()
-            + (self.max_candidates as usize) * (32 + 32 + POINT_WORDS * 4 + SIGNATURE_BYTES)
+            + (self.max_candidates as usize) * (32 + 32 + POINT_WORDS * 4 + SIGNATURE_BYTES + 32)
             + TX_BYTES
+            + 8 * std::mem::size_of::<u32>()
             + std::mem::size_of::<u32>()
             + (self.winner_cap as usize) * (4 + 32)
     }
@@ -292,6 +332,9 @@ impl CudaPhotonEngine {
         self.stream
             .memcpy_htod(template, &mut self.template_gpu)
             .map_err(|error| format!("upload transaction template: {error}"))?;
+        self.stream
+            .memcpy_htod(&transaction_midstate(template), &mut self.midstate_gpu)
+            .map_err(|error| format!("upload transaction midstate: {error}"))?;
         self.job_ready = true;
         Ok(())
     }
@@ -374,6 +417,7 @@ impl CudaPhotonEngine {
                 .arg(&self.public_key_gpu)
                 .arg(&self.fixed_d_gpu)
                 .arg(&mut self.signatures_gpu)
+                .arg(&mut self.negated_nonce_s_gpu)
                 .arg(&candidate_count);
             c1.launch(c1_cfg)
                 .map_err(|error| format!("launch PHOTON Stage C1: {error}"))?;
@@ -387,7 +431,10 @@ impl CudaPhotonEngine {
         let mut c3 = self.stream.launch_builder(&self.stage_c3);
         unsafe {
             c3.arg(&self.template_gpu)
+                .arg(&self.midstate_gpu)
                 .arg(&self.signatures_gpu)
+                .arg(&self.negated_nonce_s_gpu)
+                .arg(&self.points_gpu)
                 .arg(&nonce_base)
                 .arg(&self.target_gpu)
                 .arg(&candidate_count)
@@ -454,6 +501,35 @@ mod tests {
             placeholders.is_empty(),
             "production CUDA source tree must not contain placeholder kernels: {placeholders:?}"
         );
+    }
+
+    #[test]
+    fn transaction_midstate_resumes_to_the_full_transaction_sha256() {
+        use sha2::{Digest, Sha256};
+
+        let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
+        let template: [u8; TX_BYTES] = raw.try_into().unwrap();
+        let mut state = transaction_midstate(&template);
+
+        let mut tail = template[MIDSTATE_BYTES..].to_vec();
+        tail.push(0x80);
+        while (MIDSTATE_BYTES + tail.len()) % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&((TX_BYTES as u64) * 8).to_be_bytes());
+        let blocks = tail
+            .chunks_exact(64)
+            .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
+            .collect::<Vec<_>>();
+        sha2::compress256(&mut state, &blocks);
+        let resumed = state
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect::<Vec<_>>();
+
+        assert_eq!(resumed, Sha256::digest(template).to_vec());
+        // The midstate stops on a block boundary before the nonce at 390.
+        const { assert!(MIDSTATE_BYTES <= 390 && MIDSTATE_BYTES.is_multiple_of(64)) };
     }
 
     #[test]
@@ -583,8 +659,9 @@ mod tests {
             + 32
             + 33
             + FIXED_D_WORDS * 4
-            + 256 * (32 + 32 + POINT_WORDS * 4 + SIGNATURE_BYTES)
+            + 256 * (32 + 32 + POINT_WORDS * 4 + SIGNATURE_BYTES + 32)
             + TX_BYTES
+            + 8 * 4
             + 4
             + 8 * (4 + 32);
         assert_eq!(engine.persistent_device_bytes(), expected);
@@ -635,6 +712,126 @@ mod tests {
             completed[390..394].copy_from_slice(&winner.nonce.to_le_bytes());
             completed[426..490].copy_from_slice(&signature);
             assert_eq!(winner.digest, search::hash256(&completed));
+        }
+    }
+
+    /// Host HASH256 of the completed transaction for the real BCH Schnorr
+    /// signature and for the same R with the other nonce sign.
+    fn real_and_other_sign_hashes(
+        template: &[u8; TX_BYTES],
+        target: &[u8; 32],
+        private_key: &[u8; 32],
+        nonce: u32,
+    ) -> ([u8; 32], [u8; 32]) {
+        use sha2::{Digest, Sha256};
+
+        let order = BigUint::from_bytes_be(
+            &hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+                .unwrap(),
+        );
+        let secret = SecretKey::from_secret_bytes(*private_key).unwrap();
+        let public_key = PublicKey::from_secret_key(&secret).serialize();
+        let message = tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
+        let signature = crypto::bch_schnorr_sign(private_key, &message).unwrap();
+
+        let mut challenge = signature[..32].to_vec();
+        challenge.extend_from_slice(&public_key);
+        challenge.extend_from_slice(&message);
+        let e = BigUint::from_bytes_be(&Sha256::digest(&challenge)) % &order;
+        let d = BigUint::from_bytes_be(private_key);
+        let s = BigUint::from_bytes_be(&signature[32..]);
+        // s_real + s_other = n + 2*e*d (mod n).
+        let other = (&e * &d * 2u32 + &order - &s) % &order;
+        let other_bytes = other.to_bytes_be();
+        let mut other_signature = signature;
+        other_signature[32..].fill(0);
+        other_signature[64 - other_bytes.len()..].copy_from_slice(&other_bytes);
+
+        let completed = |signature: &[u8; 64]| {
+            let mut completed = *template;
+            completed[390..394].copy_from_slice(&nonce.to_le_bytes());
+            completed[426..490].copy_from_slice(signature);
+            search::hash256(&completed)
+        };
+        (completed(&signature), completed(&other_signature))
+    }
+
+    #[test]
+    fn gpu_dual_filter_reports_every_real_signature_hash_if_cuda_present() {
+        let target = [0xffu8; 32];
+        let template = reference_template_with_target(target);
+        let mut private_key = [0u8; 32];
+        private_key[31] = 1;
+        let nonce_base = 0x2718_0000;
+        let candidate_count = 256;
+
+        let mut engine = match CudaPhotonEngine::new(0, candidate_count, candidate_count) {
+            Ok(engine) => engine,
+            Err(error) if should_skip_cuda_error(&error) => {
+                eprintln!("skip PHOTON CUDA dual readback test: {error}");
+                return;
+            }
+            Err(error) => panic!("PHOTON CUDA init failed: {error}"),
+        };
+        engine.set_job(&template, &target, &private_key).unwrap();
+        let result = engine.search_batch(nonce_base, candidate_count).unwrap();
+        assert_eq!(result.total_winners, candidate_count);
+        assert_eq!(result.winners.len(), candidate_count as usize);
+
+        // Every candidate passes, so about half of them need the n - k
+        // signature; each reported hash must be the real one.
+        let mut seen = std::collections::BTreeSet::new();
+        for winner in &result.winners {
+            let (real, other) =
+                real_and_other_sign_hashes(&template, &target, &private_key, winner.nonce);
+            assert_eq!(winner.digest, real, "nonce {:#x}", winner.nonce);
+            assert_ne!(winner.digest, other);
+            assert!(seen.insert(winner.nonce));
+        }
+    }
+
+    #[test]
+    fn gpu_dual_filter_emits_only_the_real_signature_variant_if_cuda_present() {
+        // Half of the hash space: a hash meets it when its top byte is < 0x80.
+        let mut target = [0u8; 32];
+        target[31] = 0x80;
+        let template = reference_template_with_target(target);
+        let mut private_key = [0u8; 32];
+        private_key[31] = 7;
+
+        let mut engine = match CudaPhotonEngine::new(0, 1, 2) {
+            Ok(engine) => engine,
+            Err(error) if should_skip_cuda_error(&error) => {
+                eprintln!("skip PHOTON CUDA dual selection test: {error}");
+                return;
+            }
+            Err(error) => panic!("PHOTON CUDA init failed: {error}"),
+        };
+        engine.set_job(&template, &target, &private_key).unwrap();
+
+        for (real_meets, other_meets) in
+            [(false, true), (true, false), (true, true), (false, false)]
+        {
+            let nonce = (0x5000_0000u32..)
+                .find(|&nonce| {
+                    let (real, other) =
+                        real_and_other_sign_hashes(&template, &target, &private_key, nonce);
+                    search::meets_target_le(&real, &target) == real_meets
+                        && search::meets_target_le(&other, &target) == other_meets
+                })
+                .unwrap();
+            let (real, _) = real_and_other_sign_hashes(&template, &target, &private_key, nonce);
+            let result = engine.search_batch(nonce, 1).unwrap();
+            if real_meets {
+                assert_eq!(result.total_winners, 1, "real variant missed at {nonce:#x}");
+                assert_eq!(result.winners[0].nonce, nonce);
+                assert_eq!(result.winners[0].digest, real);
+            } else {
+                assert_eq!(
+                    result.total_winners, 0,
+                    "other-sign variant reported at {nonce:#x} (other meets: {other_meets})"
+                );
+            }
         }
     }
 }
