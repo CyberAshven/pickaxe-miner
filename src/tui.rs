@@ -1138,8 +1138,11 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             snapshot.baton_vout
         )),
         Line::from(format!(
-            "winners {}   stale {}   pending {}",
-            snapshot.verified_winners, snapshot.stale_winners, snapshot.pending_winners
+            "winners {}   stale {}   rejected {}   pending {}",
+            snapshot.verified_winners,
+            snapshot.stale_winners,
+            snapshot.search.rejected_winners,
+            snapshot.pending_winners
         )),
         Line::from(format!("payout: {}", shorten(&snapshot.payout_address, 66))),
         Line::from(format!(
@@ -1655,6 +1658,7 @@ mod tests {
         snapshot.search.current_rate = 500_000.0;
         snapshot.search.rate = 1.2e9;
         snapshot.search.peak_rate = 2.5e15;
+        snapshot.search.rejected_winners = 2;
         snapshot.photon_target_le = "ab".repeat(32);
         snapshot.gpu_telemetry = crate::telemetry::GpuTelemetry {
             samples: 2,
@@ -1687,6 +1691,10 @@ mod tests {
         assert!(rendered.contains("2.50 PH/s"));
         assert!(rendered.contains("target abababab...abababab"));
         assert!(rendered.contains("reconnects"));
+        assert!(
+            rendered.contains("rejected 2"),
+            "host-rejected GPU winners must be visible on the runtime dashboard"
+        );
     }
 
     #[test]
