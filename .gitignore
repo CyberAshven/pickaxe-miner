@@ -15,4 +15,5 @@ __pycache__/
 
 !cuda/build/stage_a_hash256.ptx
 !cuda/build/stage_a_rfc6979.ptx
+!cuda/build/photon_c3_dual.ptx
 
