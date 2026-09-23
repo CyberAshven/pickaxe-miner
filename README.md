@@ -4,8 +4,6 @@
 
 Rust-first, GPU-only miner for the PHOTON CashToken on Bitcoin Cash.
 
-The logo above is the teal/mint mark. Navy/cyan and black/white alternatives are `docs/assets/pickaxe-miner-logo-navy-cyan.png` and `docs/assets/pickaxe-miner-logo-black-white.png`.
-
 ## Scope
 
 PHOTON work is the live covenant and CashToken baton: the baton outpoint, NFT commitment, token amount, and PHOTON target. BCH `getblocktemplate` and `getblocktemplatelight` are not a mining job source.
