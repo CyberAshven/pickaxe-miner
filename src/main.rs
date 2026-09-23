@@ -54,12 +54,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Prints the miner startup banner and donation policy.
 fn print_banner() {
     println!("Pickaxe Miner 0.1.0 - interactive CLI");
     println!("Donation: 2%");
     println!("Type `help` for commands.\n");
 }
 
+/// Prints available interactive commands and their syntax.
 fn print_help() {
     println!(
         r#"Commands:
@@ -86,6 +88,7 @@ Donation: 2%"#
     );
 }
 
+/// Prints the current configuration, live job, and search status.
 fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option<LiveJob>) {
     println!("intensity:     {}%", cfg.intensity);
     println!(
@@ -149,6 +152,7 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
     );
 }
 
+/// Removes credentials before displaying an endpoint URL.
 fn redact_url(url: &str) -> String {
     // Strip userinfo so passwords never hit the terminal/logs.
     if let Some(scheme_end) = url.find("://") {
@@ -161,6 +165,7 @@ fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Displays the newly fetched live PHOTON job.
 fn publish_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>, job: LiveJob) {
     let changed = live.as_ref().is_none_or(|current| {
         current.baton_txid != job.baton_txid
@@ -191,6 +196,7 @@ struct ArmedTx {
 }
 
 impl ArmedTx {
+    /// Creates a ArmedTx for the miner CLI.
     fn new(raw_hex: String, cfg: &RuntimeConfig, job: &LiveJob) -> Result<Self, String> {
         if cfg.generation_id == 0 {
             return Err("cannot arm a transaction before a live generation is published".into());
@@ -204,6 +210,7 @@ impl ArmedTx {
     }
 
     #[cfg(test)]
+    /// Checks that the current job still matches the live state.
     fn validate_current<'a>(
         &'a self,
         cfg: &RuntimeConfig,
@@ -223,6 +230,7 @@ impl ArmedTx {
     }
 }
 
+/// Builds reference transaction context for a live job.
 fn reference_job_context(job: &LiveJob) -> tx::ReferenceJobContext {
     tx::ReferenceJobContext {
         prev_txid: job.baton_txid.clone(),
@@ -235,6 +243,7 @@ fn reference_job_context(job: &LiveJob) -> tx::ReferenceJobContext {
     }
 }
 
+/// Fetches and validates a refreshed live PHOTON job.
 fn refresh_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>) -> Result<(), String> {
     let mut session = ElectrumSession::connect_failover(&cfg.electrum_endpoints())?;
     let job = session.fetch_live_job()?;
@@ -242,6 +251,7 @@ fn refresh_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>) -> Resu
     Ok(())
 }
 
+/// Synchronizes the GPU search worker with the live job.
 fn sync_search_job(
     cfg: &RuntimeConfig,
     handle: Option<&SearchHandle>,
@@ -265,6 +275,7 @@ fn sync_search_job(
     Ok(())
 }
 
+/// Rechecks a GPU winner against the current live job.
 fn validate_verified_winner_current(
     winner: &search::VerifiedWinner,
     cfg: &RuntimeConfig,
@@ -289,6 +300,7 @@ fn validate_verified_winner_current(
     Ok(())
 }
 
+/// Processes verified GPU winners before continuing search.
 fn process_gpu_winners(
     cfg: &mut RuntimeConfig,
     handle: &Option<SearchHandle>,
@@ -339,10 +351,12 @@ fn process_gpu_winners(
     }
 }
 
+/// Prints the compiled miner donation policy.
 fn print_donation() {
     println!("Donation: 2%");
 }
 
+/// Parses and executes one interactive command.
 fn handle_line(
     cfg: &mut RuntimeConfig,
     handle: &mut Option<SearchHandle>,
@@ -720,6 +734,7 @@ fn handle_line(
     true
 }
 
+/// Combines CLI options with a loaded runtime configuration.
 fn runtime_config_from_cli_with_base(
     args: &cli::Cli,
     mut cfg: RuntimeConfig,
@@ -743,6 +758,7 @@ fn runtime_config_from_cli_with_base(
 }
 
 #[cfg(test)]
+/// Builds the effective runtime configuration from CLI options.
 fn runtime_config_from_cli(args: &cli::Cli) -> Result<RuntimeConfig, String> {
     runtime_config_from_cli_with_base(args, RuntimeConfig::default())
 }
@@ -753,6 +769,7 @@ enum MineStartup {
     Direct,
 }
 
+/// Starts mining after the configured runtime checks.
 fn mine_startup(args: &cli::Cli, cfg: &RuntimeConfig) -> MineStartup {
     if !(args.no_tui || args.json) && cfg.payout_address.trim().is_empty() {
         MineStartup::InteractiveSetup
@@ -761,6 +778,7 @@ fn mine_startup(args: &cli::Cli, cfg: &RuntimeConfig) -> MineStartup {
     }
 }
 
+/// Formats and prints a runtime event in headless mode.
 fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
     if json {
         let value = match event {
@@ -883,6 +901,7 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
     }
 }
 
+/// Serializes the current runtime snapshot as JSON.
 fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Value {
     let efficiency = snapshot
         .gpu_telemetry
@@ -924,12 +943,14 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
     })
 }
 
+/// Formats a runtime metric when telemetry is present.
 fn runtime_metric(value: Option<f64>, unit: &str) -> String {
     value
         .map(|value| format!("{value:.1}{unit}"))
         .unwrap_or_else(|| "N/A".into())
 }
 
+/// Prints the current runtime status in headless mode.
 fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
     if json {
         println!("{}", runtime_snapshot_json(snapshot));
@@ -971,6 +992,7 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
     }
 }
 
+/// Reads interactive intensity commands for the headless miner.
 fn spawn_intensity_commands() -> std::sync::mpsc::Receiver<u8> {
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
@@ -994,6 +1016,7 @@ fn spawn_intensity_commands() -> std::sync::mpsc::Receiver<u8> {
     rx
 }
 
+/// Runs the mining supervisor without the terminal UI.
 fn run_headless_mining(
     cfg: RuntimeConfig,
     backend: backend::BackendKind,
@@ -1056,6 +1079,7 @@ fn run_headless_mining(
     Ok(())
 }
 
+/// Dispatches the requested CLI command and mining mode.
 fn main() {
     let args = cli::parse();
     let config_path = match config::config_path(args.config.as_deref()) {
@@ -1258,6 +1282,7 @@ fn main() {
     }
 }
 
+/// Runs the interactive command loop until exit.
 fn run_repl(mut cfg: RuntimeConfig) {
     let mut handle: Option<SearchHandle> = None;
     let mut live: Option<LiveJob> = None;

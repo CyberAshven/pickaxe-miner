@@ -95,6 +95,7 @@ pub fn fetch_relay_policy(endpoints: &[String]) -> Result<(String, RelayPolicy),
     ))
 }
 
+/// Converts a JSON BCH amount into integral satoshis.
 fn bch_value_to_sats(value: &Value) -> Result<u64, String> {
     let text = match value {
         Value::Number(number) => number.to_string(),
@@ -104,6 +105,7 @@ fn bch_value_to_sats(value: &Value) -> Result<u64, String> {
     decimal_bch_to_sats(&text)
 }
 
+/// Converts a decimal BCH amount without floating-point rounding.
 fn decimal_bch_to_sats(text: &str) -> Result<u64, String> {
     let text = text.trim();
     if text.is_empty() || text.starts_with('-') || text.starts_with('+') {
@@ -199,6 +201,7 @@ pub struct NativePhotonSession {
 /// Runtime capability remains fail-closed until the normalized state is proven
 /// equivalent to the canonical Fulcrum path.
 impl NativePhotonSession {
+    /// Connects to a native node using the configured failover order.
     pub fn connect_failover(endpoints: &[String]) -> Result<Self, String> {
         if endpoints.is_empty() {
             return Err("no native node endpoints configured for PHOTON state".into());
@@ -229,6 +232,7 @@ impl NativePhotonSession {
         ))
     }
 
+    /// Returns the most recently verified native node state.
     pub fn snapshot(&self) -> &LiveStateSnapshot {
         &self.snapshot
     }
@@ -287,6 +291,7 @@ pub fn fetch_photon_live_job(endpoints: &[String]) -> Result<LiveJob, String> {
     Ok(session.snapshot().job.clone())
 }
 
+/// Initializes native PHOTON state from canonical source evidence.
 fn bootstrap_native_photon(url: &str) -> Result<NativePhotonBootstrap, String> {
     let descriptor = format!("raw({COVENANT_LOCKING_BYTECODE_HEX})");
     let scan = rpc_call(url, "scantxoutset", json!(["start", [descriptor]]))?;
@@ -347,6 +352,7 @@ fn bootstrap_native_photon(url: &str) -> Result<NativePhotonBootstrap, String> {
     Ok(NativePhotonBootstrap { snapshot, baton })
 }
 
+/// Fetches the native node height and current tip hash.
 fn fetch_native_chain_tip(url: &str) -> Result<(u32, String), String> {
     let info = rpc_call(url, "getblockchaininfo", json!([]))?;
     let height = info
@@ -363,6 +369,7 @@ fn fetch_native_chain_tip(url: &str) -> Result<(u32, String), String> {
     Ok((height, bestblock))
 }
 
+/// Validates and publishes the native PHOTON snapshot.
 fn finalize_native_photon_snapshot(
     url: &str,
     height: u32,
@@ -425,6 +432,7 @@ fn finalize_native_photon_snapshot(
     })
 }
 
+/// Extracts authoritative baton information from a live job.
 fn baton_from_live_job(job: &LiveJob) -> NativePhotonBaton {
     NativePhotonBaton {
         txid: job.baton_txid.clone(),
@@ -436,6 +444,7 @@ fn baton_from_live_job(job: &LiveJob) -> NativePhotonBaton {
     }
 }
 
+/// Checks a native job against the canonical PHOTON live state.
 pub fn verify_live_photon_equivalence(
     native: &mut NativePhotonSession,
     canonical: &mut ElectrumSession,
@@ -446,6 +455,7 @@ pub fn verify_live_photon_equivalence(
     Ok(native_snapshot)
 }
 
+/// Rejects native state that disagrees with the canonical source.
 pub(crate) fn verify_photon_state_equivalence(
     native: &LiveStateSnapshot,
     canonical: &LiveStateSnapshot,
@@ -483,6 +493,7 @@ pub(crate) fn verify_photon_state_equivalence(
     Ok(())
 }
 
+/// Finds the current baton successor in the native mempool.
 fn resolve_native_mempool_baton(
     url: &str,
     confirmed_baton: &NativePhotonBaton,
@@ -569,6 +580,7 @@ fn resolve_native_mempool_baton(
     ))
 }
 
+/// Parses a baton successor from native mempool transaction data.
 fn parse_native_mempool_successor(
     expected_txid: &str,
     transaction: &Value,
@@ -619,6 +631,7 @@ fn parse_native_mempool_successor(
     parse_native_transaction_output_baton(transaction_txid, successors[0]).map(Some)
 }
 
+/// Checks whether an output preserves the PHOTON baton contract.
 fn native_transaction_output_is_photon_baton(output: &Value) -> bool {
     let script_matches = output
         .pointer("/scriptPubKey/hex")
@@ -635,6 +648,7 @@ fn native_transaction_output_is_photon_baton(output: &Value) -> bool {
     script_matches && category_matches && mutable
 }
 
+/// Parses baton details from a native transaction output.
 fn parse_native_transaction_output_baton(
     txid: &str,
     output: &Value,
@@ -674,6 +688,7 @@ fn parse_native_transaction_output_baton(
     })
 }
 
+/// Checks whether a scan entry represents a PHOTON baton.
 fn native_scan_entry_is_photon_baton(utxo: &Value) -> bool {
     let script_matches = utxo
         .get("scriptPubKey")
@@ -690,6 +705,7 @@ fn native_scan_entry_is_photon_baton(utxo: &Value) -> bool {
     script_matches && category_matches && mutable
 }
 
+/// Parses a baton from an unspent-output scan entry.
 fn parse_native_scan_baton(utxo: &Value) -> Result<NativePhotonBaton, String> {
     if !native_scan_entry_is_photon_baton(utxo) {
         return Err("native UTXO is not the authoritative PHOTON baton shape".into());
@@ -736,6 +752,7 @@ fn parse_native_scan_baton(utxo: &Value) -> Result<NativePhotonBaton, String> {
     })
 }
 
+/// Parses baton information from a gettxout response.
 fn parse_native_gettxout_baton(
     txid: &str,
     vout: u32,
@@ -931,6 +948,7 @@ pub fn broadcast_raw(endpoints: &[String], raw_tx_hex: &str) -> Result<(String, 
     ))
 }
 
+/// Strips credentials from a node URL before reporting errors.
 pub(crate) fn redact_url(url: &str) -> String {
     // Strip userinfo before @ so credentials never land in logs.
     if let Some(scheme_end) = url.find("://") {
@@ -943,6 +961,7 @@ pub(crate) fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Chooses URL or environment credentials for basic authentication.
 fn select_node_rpc_basic_auth(
     url_auth: Option<&str>,
     env_user: Option<&str>,
@@ -960,6 +979,7 @@ fn select_node_rpc_basic_auth(
     }
 }
 
+/// Builds the HTTP basic-auth header for a node request.
 fn node_rpc_basic_auth(url_auth: Option<&str>) -> Result<Option<String>, String> {
     let env_user = std::env::var(NODE_RPC_USER_ENV).ok();
     let env_password = std::env::var(NODE_RPC_PASSWORD_ENV).ok();
@@ -978,6 +998,7 @@ pub struct BlockTemplate {
 }
 
 impl BlockTemplate {
+    /// Prints a redacted summary of the connected native node.
     pub fn print_summary(&self) {
         println!(
             "node template via {} ({})",
@@ -1001,6 +1022,7 @@ impl BlockTemplate {
 }
 
 #[cfg(test)]
+/// Converts compact target bits to a little-endian target hex string.
 fn bits_to_target_le_hex(bits: u32) -> String {
     let exp = (bits >> 24) as i32;
     let mant = bits & 0x00ff_ffff;
@@ -1021,6 +1043,7 @@ fn bits_to_target_le_hex(bits: u32) -> String {
     hex::encode(target.iter().rev().copied().collect::<Vec<_>>())
 }
 
+/// Fetches the native node’s current block template.
 pub fn fetch_block_template(endpoints: &[String]) -> Result<BlockTemplate, String> {
     if endpoints.is_empty() {
         return Err("no node endpoints -- set `node http://user:pass@127.0.0.1:8332`".into());
@@ -1135,6 +1158,7 @@ struct NodeRpcTarget {
     path: String,
 }
 
+/// Extracts a valid mining target from a node RPC response.
 fn parse_node_rpc_target(url: &str) -> Result<NodeRpcTarget, String> {
     let lower = url.to_ascii_lowercase();
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
@@ -1212,6 +1236,7 @@ fn parse_node_rpc_target(url: &str) -> Result<NodeRpcTarget, String> {
 trait NodeRpcStream: Read + Write {}
 impl<T: Read + Write> NodeRpcStream for T {}
 
+/// Sends a JSON-RPC request and validates its response.
 fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     let target = parse_node_rpc_target(url)?;
     let auth = node_rpc_basic_auth(target.url_auth.as_deref())?;
@@ -1277,6 +1302,7 @@ fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
 }
 
+/// Base64-encodes credentials for the RPC authorization header.
 fn simple_b64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();

@@ -27,17 +27,20 @@ const SECP_N_BE: [u8; 32] = [
 ];
 
 #[cfg(test)]
+/// Derives a compressed public key from test secret key bytes.
 pub fn compressed_pubkey(sk_bytes: &[u8; 32]) -> Result<[u8; 33], String> {
     let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
     Ok(PublicKey::from_secret_key(&sk).serialize())
 }
 
+/// Computes the SHA-256 digest of input bytes.
 fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&Sha256::digest(data));
     out
 }
 
+/// Computes HMAC-SHA256 for nonce generation.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
     mac.update(data);
@@ -46,6 +49,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Reduces a message modulo the secp256k1 group order.
 fn reduce_msg_mod_n(msg32: &[u8; 32]) -> [u8; 32] {
     let m = BigUint::from_bytes_be(msg32);
     let n = BigUint::from_bytes_be(&SECP_N_BE);
@@ -96,6 +100,7 @@ pub fn bch_rfc6979_nonce(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 3
     }
 }
 
+/// Tests a curve point’s Y coordinate for quadratic residuosity.
 fn y_is_quadratic_residue(y_be: &[u8; 32]) -> bool {
     let y = BigUint::from_bytes_be(y_be);
     let p = BigUint::from_bytes_be(&SECP_P_BE);
@@ -106,6 +111,7 @@ fn y_is_quadratic_residue(y_be: &[u8; 32]) -> bool {
     y.modpow(&exp, &p) == BigUint::one()
 }
 
+/// Creates a deterministic BCH Schnorr signature for a message.
 pub fn bch_schnorr_sign(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 64], String> {
     let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
     let pk_bytes = PublicKey::from_secret_key(&sk).serialize();
@@ -144,6 +150,7 @@ pub fn bch_schnorr_sign(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 64
     Ok(sig)
 }
 
+/// Verifies a BCH Schnorr signature against a compressed public key.
 pub fn bch_schnorr_verify(
     pk33: &[u8; 33],
     msg32: &[u8; 32],
@@ -176,6 +183,7 @@ pub fn bch_schnorr_verify(
 }
 
 #[cfg(test)]
+/// Checks that BCH Schnorr primitives match production test vectors.
 pub fn schnorr_production_gate_ok() -> bool {
     let mut sk = [0u8; 32];
     sk[31] = 1;
@@ -191,6 +199,7 @@ pub fn schnorr_production_gate_ok() -> bool {
 }
 
 #[cfg(test)]
+/// Decodes a 32-byte hexadecimal test vector.
 fn hex_32(s: &str) -> [u8; 32] {
     let b = hex::decode(s).unwrap();
     let mut o = [0u8; 32];
@@ -198,6 +207,7 @@ fn hex_32(s: &str) -> [u8; 32] {
     o
 }
 #[cfg(test)]
+/// Decodes a 64-byte hexadecimal test vector.
 fn hex_64(s: &str) -> [u8; 64] {
     let b = hex::decode(s).unwrap();
     let mut o = [0u8; 64];

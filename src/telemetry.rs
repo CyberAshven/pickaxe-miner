@@ -27,6 +27,7 @@ pub struct GpuTelemetry {
 }
 
 impl GpuTelemetry {
+    /// Calculates hash-rate efficiency for positive GPU power readings.
     pub fn candidates_per_watt(&self, candidates_per_second: f64) -> Option<f64> {
         self.power_watts
             .filter(|watts| *watts > 0.0)
@@ -69,10 +70,12 @@ pub(crate) fn format_photon_target(target_le_hex: &str) -> String {
     format!("{}...{}", &target[..8], &target[target.len() - 8..])
 }
 
+/// Parses an optional numeric GPU telemetry field.
 fn parse_metric(value: Option<&&str>) -> Option<f64> {
     value?.trim().parse::<f64>().ok()
 }
 
+/// Decodes utilization and power metrics from nvidia-smi output.
 pub(crate) fn parse_nvidia_smi_line(line: &str) -> Option<GpuTelemetry> {
     let fields = line.split(',').collect::<Vec<_>>();
     if fields.len() != 6 {
@@ -89,6 +92,7 @@ pub(crate) fn parse_nvidia_smi_line(line: &str) -> Option<GpuTelemetry> {
     })
 }
 
+/// Samples telemetry from the selected NVIDIA GPU.
 pub(crate) fn sample_nvidia_telemetry(device: u32) -> Option<GpuTelemetry> {
     let output = Command::new("nvidia-smi")
         .arg(format!("--id={device}"))
@@ -103,6 +107,7 @@ pub(crate) fn sample_nvidia_telemetry(device: u32) -> Option<GpuTelemetry> {
     parse_nvidia_smi_line(stdout.lines().next()?)
 }
 
+/// Normalizes AMD telemetry keys across output formats.
 fn normalized_metric_key(key: &str) -> String {
     key.chars()
         .filter(|character| character.is_ascii_alphanumeric())
@@ -110,6 +115,7 @@ fn normalized_metric_key(key: &str) -> String {
         .collect()
 }
 
+/// Extracts a numeric value from a GPU metric field.
 fn metric_number(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
@@ -125,6 +131,7 @@ fn metric_number(value: &Value) -> Option<f64> {
     }
 }
 
+/// Finds a metric in nested AMD telemetry values.
 fn find_metric(value: &Value, aliases: &[&str]) -> Option<f64> {
     match value {
         Value::Object(object) => {
@@ -149,6 +156,7 @@ fn find_metric(value: &Value, aliases: &[&str]) -> Option<f64> {
     }
 }
 
+/// Decodes AMD GPU metrics from amd-smi JSON output.
 pub(crate) fn parse_amd_smi_json(stdout: &str) -> Option<GpuTelemetry> {
     let value: Value = serde_json::from_str(stdout).ok()?;
     let telemetry = GpuTelemetry {
@@ -179,6 +187,7 @@ pub(crate) fn parse_amd_smi_json(stdout: &str) -> Option<GpuTelemetry> {
     .then_some(telemetry)
 }
 
+/// Samples telemetry from the selected AMD GPU.
 pub(crate) fn sample_amd_telemetry(device: u32) -> Option<GpuTelemetry> {
     let output = Command::new("amd-smi")
         .arg("monitor")
@@ -201,6 +210,7 @@ pub(crate) fn sample_amd_telemetry(device: u32) -> Option<GpuTelemetry> {
     parse_amd_smi_json(&stdout)
 }
 
+/// Samples metrics from the selected GPU backend.
 pub(crate) fn sample_gpu_telemetry(backend: BackendKind, device: u32) -> Option<GpuTelemetry> {
     match backend {
         BackendKind::Cuda => sample_nvidia_telemetry(device),
@@ -216,6 +226,7 @@ pub struct LiveTelemetrySampler {
 }
 
 impl LiveTelemetrySampler {
+    /// Starts the background GPU telemetry sampler.
     pub fn start(backend: BackendKind, device: u32) -> Self {
         let latest = Arc::new(Mutex::new(GpuTelemetry::default()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -251,6 +262,7 @@ impl LiveTelemetrySampler {
         }
     }
 
+    /// Returns the most recent GPU telemetry sample.
     pub fn snapshot(&self) -> GpuTelemetry {
         self.latest
             .lock()
@@ -258,6 +270,7 @@ impl LiveTelemetrySampler {
             .clone()
     }
 
+    /// Stops the GPU telemetry sampler and joins its thread.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
@@ -267,6 +280,7 @@ impl LiveTelemetrySampler {
 }
 
 impl Drop for LiveTelemetrySampler {
+    /// Stops sampling when the telemetry handle is dropped.
     fn drop(&mut self) {
         self.stop();
     }

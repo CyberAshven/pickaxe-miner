@@ -32,6 +32,7 @@ pub struct StageCBatchResult {
 }
 
 impl StageCBatchResult {
+    /// Checks whether a stage C result exceeds its readback capacity.
     pub fn truncated(&self) -> bool {
         self.total_winners as usize > self.winners.len()
     }
@@ -55,6 +56,7 @@ pub struct CudaStageC {
 }
 
 impl CudaStageC {
+    /// Allocates CUDA stage C buffers and loads the filter kernels.
     pub fn new(
         device_ordinal: usize,
         max_candidates: u32,
@@ -128,6 +130,7 @@ impl CudaStageC {
         })
     }
 
+    /// Uploads PHOTON job material to the stage C kernels.
     pub fn set_job(&mut self, template: &[u8; TX_BYTES], target: &[u8; 32]) -> Result<(), String> {
         if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
             return Err("Stage C target must match transaction template bytes 394..425".into());
@@ -141,6 +144,7 @@ impl CudaStageC {
         Ok(())
     }
 
+    /// Hashes stage C candidates and filters them against the target.
     pub fn hash_and_filter(
         &mut self,
         nonce_base: u32,
@@ -229,6 +233,7 @@ impl CudaStageC {
     }
 
     #[cfg(test)]
+    /// Reads the stage C hash of a candidate for comparison.
     fn probe_hash(
         &mut self,
         nonce: u32,
@@ -279,6 +284,7 @@ impl CudaStageC {
     }
 
     #[cfg(test)]
+    /// Compares a probe hash against the strict PHOTON target.
     fn compare_probe(&mut self, hash: &[u8; 32], target: &[u8; 32]) -> Result<bool, String> {
         let hash_gpu = self
             .stream

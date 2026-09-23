@@ -72,11 +72,13 @@ struct RefreshFailureTracker {
 }
 
 impl RefreshFailureTracker {
+    /// Resets refresh failure tracking after obtaining a valid live job.
     fn refresh_success(&mut self) {
         self.consecutive = 0;
         self.same_source_timeout_reconnect_pending = false;
     }
 
+    /// Resets reconnect failures and records whether the endpoint rotated.
     fn reconnect_success(&mut self, rotated: bool) {
         self.consecutive = 0;
         if rotated {
@@ -84,6 +86,7 @@ impl RefreshFailureTracker {
         }
     }
 
+    /// Advances refresh failure tracking and chooses the next recovery action.
     fn failure(&mut self, kind: RefreshFailureKind) -> RefreshFailureAction {
         match kind {
             RefreshFailureKind::Transient => {
@@ -121,11 +124,13 @@ impl RefreshFailureTracker {
         }
     }
 
+    /// Reports whether refresh failures have degraded the live source.
     fn degraded(&self) -> bool {
         self.consecutive != 0
     }
 }
 
+/// Classifies a refresh error for backoff and recovery decisions.
 fn classify_refresh_failure(error: &str) -> RefreshFailureKind {
     let error = error.to_ascii_lowercase();
     let transport_failure = error.contains("transport:")
@@ -146,6 +151,7 @@ fn classify_refresh_failure(error: &str) -> RefreshFailureKind {
     }
 }
 
+/// Advances the periodic refresh deadline past the current instant.
 fn next_periodic_deadline(previous_deadline: Instant, now: Instant, interval: Duration) -> Instant {
     debug_assert!(!interval.is_zero());
     if previous_deadline > now {
@@ -181,6 +187,7 @@ struct NativePhotonWorkIdentity {
 }
 
 impl From<&LiveJob> for NativePhotonWorkIdentity {
+    /// Captures the baton identity and generation from a live job.
     fn from(job: &LiveJob) -> Self {
         Self {
             height: job.height,
@@ -205,6 +212,7 @@ struct NativePhotonEquivalenceProof {
 }
 
 impl NativePhotonEquivalenceProof {
+    /// Creates a continuation proof from a verified live snapshot.
     fn from_verified_snapshot(
         endpoint: &str,
         snapshot: &LiveStateSnapshot,
@@ -230,6 +238,7 @@ impl NativePhotonEquivalenceProof {
         })
     }
 
+    /// Rejects a snapshot that breaks the verified baton lineage.
     fn validate_continuation(&self, snapshot: &LiveStateSnapshot) -> Result<(), String> {
         if snapshot.job.url.trim() != self.endpoint {
             return Err(format!(
@@ -253,10 +262,12 @@ impl NativePhotonEquivalenceProof {
     }
 }
 
+/// Converts elapsed time to the capability clock in milliseconds.
 fn source_capability_now_ms(epoch: Instant) -> u64 {
     u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Filters configured Fulcrum endpoints by current source capability.
 fn eligible_fulcrum_endpoints(
     sources: &SourceCatalog,
     now_ms: u64,
@@ -302,6 +313,7 @@ struct SettlementState {
 }
 
 impl SettlementState {
+    /// Creates a SettlementState for the live mining runtime.
     fn new(generation_id: u64, live: &LiveJob) -> Result<Self, String> {
         if live.baton_vout != 0 {
             return Err(format!(
@@ -316,11 +328,13 @@ impl SettlementState {
         })
     }
 
+    /// Updates the job stamp for a newly verified generation.
     fn restamp(&self, generation_id: u64, live: &LiveJob) -> Result<Self, String> {
         self.ensure_current(self.generation_id, live)?;
         Self::new(generation_id, live)
     }
 
+    /// Rejects a job stamp that no longer matches the current generation.
     fn ensure_current(&self, generation_id: u64, live: &LiveJob) -> Result<(), String> {
         if self.generation_id != generation_id
             || self.baton_txid != live.baton_txid
@@ -369,20 +383,24 @@ struct ResolvedSubmission {
 }
 
 impl PendingSubmission {
+    /// Derives a durable submission marker path from the journal path.
     fn marker_path(journal_path: &Path, suffix: &str) -> PathBuf {
         let mut path = journal_path.as_os_str().to_os_string();
         path.push(suffix);
         PathBuf::from(path)
     }
 
+    /// Returns the marker path for an attempted parent broadcast.
     fn parent_attempted_path(journal_path: &Path) -> PathBuf {
         Self::marker_path(journal_path, ".parent-attempted")
     }
 
+    /// Returns the marker path for an accepted parent broadcast.
     fn parent_accepted_path(journal_path: &Path) -> PathBuf {
         Self::marker_path(journal_path, ".parent-accepted")
     }
 
+    /// Checks whether a durable marker names the expected parent transaction.
     fn marker_present(path: &Path, expected_parent_txid: &str) -> Result<bool, String> {
         let marker = match fs::read_to_string(path) {
             Ok(marker) => marker,
@@ -404,6 +422,7 @@ impl PendingSubmission {
         }
     }
 
+    /// Durably records a parent transaction identifier in a marker file.
     fn persist_marker(path: &Path, parent_txid: &str) -> Result<(), String> {
         let parent = path
             .parent()
@@ -459,6 +478,7 @@ impl PendingSubmission {
         Self::sync_committed(path, parent)
     }
 
+    /// Checks whether the parent broadcast attempt was durably recorded.
     fn parent_attempted(&self, journal_path: &Path) -> Result<bool, String> {
         Self::marker_present(
             &Self::parent_attempted_path(journal_path),
@@ -466,10 +486,12 @@ impl PendingSubmission {
         )
     }
 
+    /// Checks whether acceptance of the parent was durably recorded.
     fn parent_accepted(&self, journal_path: &Path) -> Result<bool, String> {
         Self::marker_present(&Self::parent_accepted_path(journal_path), &self.parent_txid)
     }
 
+    /// Persists the parent-attempt marker before broadcasting.
     fn mark_parent_attempted(&self, journal_path: &Path) -> Result<(), String> {
         Self::persist_marker(
             &Self::parent_attempted_path(journal_path),
@@ -477,11 +499,13 @@ impl PendingSubmission {
         )
     }
 
+    /// Persists the parent-acceptance marker after broadcasting.
     fn mark_parent_accepted(&self, journal_path: &Path) -> Result<(), String> {
         self.mark_parent_attempted(journal_path)?;
         Self::persist_marker(&Self::parent_accepted_path(journal_path), &self.parent_txid)
     }
 
+    /// Constructs a pending submission from verified winner and baton data.
     fn from_verified(
         winner: &VerifiedWinner,
         settlement: &reward::PreparedSelfFundedSettlement,
@@ -510,6 +534,7 @@ impl PendingSubmission {
         Ok(pending)
     }
 
+    /// Validates PendingSubmission state before use by the live mining runtime.
     fn validate(&self) -> Result<(), String> {
         if self.version != SUBMISSION_JOURNAL_VERSION {
             return Err(format!(
@@ -577,12 +602,14 @@ impl PendingSubmission {
         Ok(())
     }
 
+    /// Checks whether the pending submission still targets the live baton.
     fn expected_baton_is_current(&self, live: &LiveJob) -> bool {
         self.expected_baton_txid
             .eq_ignore_ascii_case(&live.baton_txid)
             && self.expected_baton_vout == live.baton_vout
     }
 
+    /// Loads PendingSubmission state needed by the live mining runtime.
     fn load(path: &Path) -> Result<Option<Self>, String> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -604,6 +631,7 @@ impl PendingSubmission {
         Ok(Some(pending))
     }
 
+    /// Atomically stores a newly prepared submission journal.
     fn persist_new(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
         let parent = path
@@ -675,6 +703,7 @@ impl PendingSubmission {
         Self::sync_committed(path, parent)
     }
 
+    /// Syncs the committed journal and its parent directory to storage.
     fn sync_committed(path: &Path, _parent: &Path) -> Result<(), String> {
         OpenOptions::new()
             .read(true)
@@ -699,6 +728,7 @@ impl PendingSubmission {
         Ok(())
     }
 
+    /// Removes the durable journal after submission resolution.
     fn remove(path: &Path) -> Result<(), String> {
         for marker in [
             Self::parent_accepted_path(path),
@@ -727,12 +757,14 @@ impl PendingSubmission {
 }
 
 impl ResolvedSubmission {
+    /// Derives the stale-resolution record path from the journal path.
     fn path(journal_path: &Path) -> PathBuf {
         let mut path = journal_path.as_os_str().to_os_string();
         path.push(".resolved");
         PathBuf::from(path)
     }
 
+    /// Captures the evidence required to resolve a stale submission.
     fn from_stale(
         pending: &PendingSubmission,
         fresh: &LiveJob,
@@ -783,6 +815,7 @@ impl ResolvedSubmission {
         })
     }
 
+    /// Captures a confirmed submission and its resulting live baton.
     fn from_confirmed(pending: &PendingSubmission, fresh: &LiveJob) -> Result<Self, String> {
         pending.validate()?;
         Ok(Self {
@@ -803,6 +836,7 @@ impl ResolvedSubmission {
         })
     }
 
+    /// Validates ResolvedSubmission state before use by the live mining runtime.
     fn validate(&self) -> Result<(), String> {
         if self.version != SUBMISSION_RESOLUTION_VERSION {
             return Err(format!(
@@ -844,6 +878,7 @@ impl ResolvedSubmission {
         Ok(())
     }
 
+    /// Loads ResolvedSubmission state needed by the live mining runtime.
     fn load(journal_path: &Path) -> Result<Option<Self>, String> {
         let path = Self::path(journal_path);
         let bytes = match fs::read(&path) {
@@ -866,6 +901,7 @@ impl ResolvedSubmission {
         Ok(Some(resolved))
     }
 
+    /// Atomically stores the latest stale-resolution evidence.
     fn persist_latest(&self, journal_path: &Path) -> Result<(), String> {
         self.validate()?;
         let path = Self::path(journal_path);
@@ -931,6 +967,7 @@ impl ResolvedSubmission {
     }
 }
 
+/// Records and resolves a submission whose baton became stale.
 fn resolve_stale_submission(
     pending: &PendingSubmission,
     fresh: &LiveJob,
@@ -941,6 +978,7 @@ fn resolve_stale_submission(
     PendingSubmission::remove(journal_path)
 }
 
+/// Records a confirmed settlement before resuming search.
 fn resolve_confirmed_submission(
     pending: &PendingSubmission,
     fresh: &LiveJob,
@@ -951,6 +989,7 @@ fn resolve_confirmed_submission(
     PendingSubmission::remove(journal_path)
 }
 
+/// Returns the durable path used for pending submission recovery.
 fn submission_journal_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
@@ -988,6 +1027,7 @@ enum SubmissionDecision {
     StaleUnbroadcast,
 }
 
+/// Chooses a recovery action from journal and live-chain evidence.
 fn submission_decision(
     parent_known: bool,
     parent_attempted: bool,
@@ -1009,6 +1049,7 @@ enum SubmissionAttempt {
     StaleUnbroadcast(Box<LiveJob>),
 }
 
+/// Checks whether the live job directly names the resulting baton.
 fn resulting_baton_is_authoritative(pending: &PendingSubmission, fresh: &LiveJob) -> bool {
     fresh
         .baton_txid
@@ -1016,6 +1057,7 @@ fn resulting_baton_is_authoritative(pending: &PendingSubmission, fresh: &LiveJob
         && fresh.baton_vout == pending.resulting_baton_vout
 }
 
+/// Decodes a compact-size integer and advances the byte offset.
 fn read_compact_size(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
     let marker = *bytes
         .get(*offset)
@@ -1054,6 +1096,7 @@ fn read_compact_size(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
     Ok(value)
 }
 
+/// Extracts the first input outpoint from a raw transaction.
 fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
     let raw = hex::decode(raw_tx_hex.trim())
         .map_err(|error| format!("decode PHOTON lineage transaction: {error}"))?;
@@ -1080,6 +1123,7 @@ fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
     ))
 }
 
+/// Follows transaction ancestry to prove descent from the expected baton.
 fn prove_baton_descends_from<F>(
     current_txid: &str,
     current_vout: u32,
@@ -1126,6 +1170,7 @@ where
     ))
 }
 
+/// Accepts only a live baton matching or proven descended from the result.
 fn resulting_baton_is_authoritative_or_descendant(
     session: &mut ElectrumSession,
     pending: &PendingSubmission,
@@ -1153,6 +1198,7 @@ fn resulting_baton_is_authoritative_or_descendant(
     )
 }
 
+/// Rejects a broadcast result whose transaction ID differs from the expected ID.
 fn ensure_broadcast_txid(label: &str, expected: &str, returned: &str) -> Result<(), String> {
     if returned.eq_ignore_ascii_case(expected) {
         Ok(())
@@ -1163,6 +1209,7 @@ fn ensure_broadcast_txid(label: &str, expected: &str, returned: &str) -> Result<
     }
 }
 
+/// Broadcasts through the preferred source with the configured fallback.
 fn broadcast_with_preference<F, N>(
     source: JobSource,
     node_configured: bool,
@@ -1195,6 +1242,7 @@ where
     }
 }
 
+/// Broadcasts a prepared transaction and checks its returned ID.
 fn broadcast_pending_transaction(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
@@ -1210,6 +1258,7 @@ fn broadcast_pending_transaction(
     )
 }
 
+/// Checks the native node mempool acceptance result before broadcast.
 fn validate_node_mempool_acceptance(
     label: &str,
     expected_txid: &str,
@@ -1240,6 +1289,7 @@ fn validate_node_mempool_acceptance(
     ))
 }
 
+/// Validates a pending transaction against the current relay policy.
 fn preflight_pending_transaction(
     cfg: &RuntimeConfig,
     label: &str,
@@ -1260,6 +1310,7 @@ fn preflight_pending_transaction(
     validate_node_mempool_acceptance(label, expected_txid, &endpoint, &acceptance)
 }
 
+/// Broadcasts the self-funded settlement after parent acceptance.
 fn broadcast_settlement(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
@@ -1283,6 +1334,7 @@ fn broadcast_settlement(
     }
 }
 
+/// Attempts the journaled parent and settlement submission safely.
 fn attempt_pending_submission(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
@@ -1354,6 +1406,7 @@ fn attempt_pending_submission(
     broadcast_settlement(session, cfg, pending)
 }
 
+/// Builds and journals a settlement for a verified GPU winner.
 fn prepare_pending_submission(
     winner: &VerifiedWinner,
     cfg: &RuntimeConfig,
@@ -1382,6 +1435,7 @@ fn prepare_pending_submission(
     Ok(pending)
 }
 
+/// Resolves any outstanding submission before allowing new GPU work.
 fn resolve_pending_before_search(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
@@ -1401,6 +1455,7 @@ fn resolve_pending_before_search(
     }
 }
 
+/// Selects a safe production relay fee from live node policy.
 fn production_relay_fee_sats_per_kb(cfg: &RuntimeConfig) -> Result<u64, String> {
     let endpoints = cfg.node_endpoints();
     if endpoints.is_empty() {
@@ -1425,6 +1480,7 @@ fn production_relay_fee_sats_per_kb(cfg: &RuntimeConfig) -> Result<u64, String> 
     }
 }
 
+/// Checks the submission journal for recovery hazards on startup.
 fn probe_submission_journal(journal_path: &Path) -> Result<(), String> {
     if journal_path.exists() {
         return Err(format!(
@@ -1501,6 +1557,7 @@ fn probe_submission_journal(journal_path: &Path) -> Result<(), String> {
     result
 }
 
+/// Verifies external requirements before starting production mining.
 fn production_preflight(
     session: &mut ElectrumSession,
     cfg: &RuntimeConfig,
@@ -1528,6 +1585,7 @@ fn production_preflight(
     )
 }
 
+/// Requires complete winner recovery support before live mining.
 fn require_complete_live_winner_lifecycle() -> Result<(), String> {
     if VERIFIED_WINNER_DURABILITY_READY {
         Ok(())
@@ -1540,6 +1598,7 @@ fn require_complete_live_winner_lifecycle() -> Result<(), String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Validates local prerequisites without network access.
 fn production_preflight_local(
     cfg: &RuntimeConfig,
     live: &LiveJob,
@@ -1613,6 +1672,7 @@ fn production_preflight_local(
     Ok(())
 }
 
+/// Checks that the parent transaction matches verified baton evidence.
 fn validate_verified_parent(
     winner: &VerifiedWinner,
     live: &LiveJob,
@@ -1730,6 +1790,7 @@ struct ShutdownSignal {
 }
 
 impl ShutdownSignal {
+    /// Creates a ShutdownSignal for the live mining runtime.
     fn new(search_pause: SearchPauseHandle) -> Self {
         Self {
             requested: Arc::new(AtomicBool::new(false)),
@@ -1737,11 +1798,13 @@ impl ShutdownSignal {
         }
     }
 
+    /// Queues a control request for the live mining runtime.
     fn request(&self) {
         self.requested.store(true, Ordering::SeqCst);
         self.search_pause.pause();
     }
 
+    /// Reports whether requested for the live mining runtime.
     fn is_requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
     }
@@ -1758,10 +1821,12 @@ pub struct RuntimeSupervisor {
 
 impl RuntimeSupervisor {
     #[allow(dead_code)]
+    /// Starts the mining runtime on a selected device ordinal.
     pub fn start_on_device(cfg: RuntimeConfig, device_ordinal: u32) -> Result<Self, String> {
         Self::start_on_backend_device(cfg, BackendKind::Cuda, device_ordinal)
     }
 
+    /// Starts the runtime on an explicit backend and device.
     pub fn start_on_backend_device(
         cfg: RuntimeConfig,
         backend: BackendKind,
@@ -1770,6 +1835,7 @@ impl RuntimeSupervisor {
         Self::start_inner(cfg, backend, device_ordinal)
     }
 
+    /// Starts supervised GPU search after runtime preflight.
     fn start_inner(
         mut cfg: RuntimeConfig,
         backend: BackendKind,
@@ -1899,6 +1965,7 @@ impl RuntimeSupervisor {
         })
     }
 
+    /// Captures the current state of the live mining runtime.
     pub fn snapshot(&self) -> RuntimeSnapshot {
         let mut snapshot = self
             .snapshot
@@ -1909,45 +1976,54 @@ impl RuntimeSupervisor {
         snapshot
     }
 
+    /// Drains pending runtime events for the user interface.
     pub fn drain_events(&self) -> Vec<RuntimeEvent> {
         self.event_rx.try_iter().collect()
     }
 
     #[allow(dead_code)]
+    /// Requests an updated GPU work intensity.
     pub fn set_intensity(&self, value: u8) -> Result<(), String> {
         self.request(|reply| SupervisorCommand::SetIntensity(value, reply))
     }
 
     #[allow(dead_code)]
+    /// Pauses the live mining runtime at a safe boundary.
     pub fn pause(&self) -> Result<(), String> {
         self.request(SupervisorCommand::Pause)
     }
 
     #[allow(dead_code)]
+    /// Resumes the live mining runtime after a safe boundary.
     pub fn resume(&self) -> Result<(), String> {
         self.request(SupervisorCommand::Resume)
     }
 
     #[allow(dead_code)]
+    /// Requests an updated miner payout address.
     pub fn set_payout(&self, payout: String) -> Result<(), String> {
         self.request(|reply| SupervisorCommand::SetPayout(payout, reply))
     }
 
     #[allow(dead_code)]
+    /// Requests a new custom Fulcrum endpoint.
     pub fn set_fulcrum_endpoint(&self, url: String) -> Result<(), String> {
         self.request(|reply| SupervisorCommand::SetFulcrum(Some(url), reply))
     }
 
     #[allow(dead_code)]
+    /// Removes the custom Fulcrum endpoint from the running session.
     pub fn clear_fulcrum_endpoint(&self) -> Result<(), String> {
         self.request(|reply| SupervisorCommand::SetFulcrum(None, reply))
     }
 
+    /// Requests a reconnect to refresh the live job source.
     pub fn reconnect(&self) -> Result<(), String> {
         self.request(SupervisorCommand::Reconnect)
     }
 
     #[allow(dead_code)]
+    /// Queues a control request for the live mining runtime.
     fn request(
         &self,
         build: impl FnOnce(SyncSender<Result<(), String>>) -> SupervisorCommand,
@@ -1961,6 +2037,7 @@ impl RuntimeSupervisor {
             .map_err(|_| "timed out waiting for live PHOTON supervisor".to_string())?
     }
 
+    /// Stops the live mining runtime and waits for outstanding work.
     pub fn stop(mut self) -> RuntimeSnapshot {
         self.shutdown.request();
         let _ = self.command_tx.try_send(SupervisorCommand::Stop);
@@ -1974,6 +2051,7 @@ impl RuntimeSupervisor {
 }
 
 impl Drop for RuntimeSupervisor {
+    /// Releases resources owned by RuntimeSupervisor.
     fn drop(&mut self) {
         self.shutdown.request();
         let _ = self.command_tx.try_send(SupervisorCommand::Stop);
@@ -1985,6 +2063,7 @@ impl Drop for RuntimeSupervisor {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Supervises live job refresh, search generations, and winner recovery.
 fn run_supervisor(
     mut cfg: RuntimeConfig,
     mut endpoints: Vec<String>,
@@ -2788,6 +2867,7 @@ struct PhotonBoundaryRefresh {
     route_warning: Option<String>,
 }
 
+/// Chooses a PHOTON job at the verified source boundary.
 fn select_boundary_photon_job(
     cfg: &RuntimeConfig,
     sources: &SourceCatalog,
@@ -2811,6 +2891,7 @@ fn select_boundary_photon_job(
     canonical_snapshot.job.clone()
 }
 
+/// Records a canonical Fulcrum capability probe.
 fn record_canonical_fulcrum_probe(
     sources: &mut SourceCatalog,
     canonical_snapshot: &LiveStateSnapshot,
@@ -2842,6 +2923,7 @@ fn record_canonical_fulcrum_probe(
     Ok(())
 }
 
+/// Records the native node PHOTON equivalence proof.
 fn record_native_photon_probe(
     sources: &mut SourceCatalog,
     endpoint: &str,
@@ -2879,6 +2961,7 @@ fn record_native_photon_probe(
     }
 }
 
+/// Refreshes a native job while enforcing its current proof.
 fn refresh_native_with_current_proof(
     sources: &mut SourceCatalog,
     endpoint: &str,
@@ -2924,6 +3007,7 @@ fn refresh_native_with_current_proof(
     }
 }
 
+/// Refreshes the PHOTON job on the periodic source cadence.
 fn refresh_photon_job_on_cadence(
     cfg: &RuntimeConfig,
     canonical: &mut ElectrumSession,
@@ -3034,6 +3118,7 @@ fn refresh_photon_job_on_cadence(
     })
 }
 
+/// Pauses the old search generation before installing a new job.
 fn prepare_generation_transition<F>(
     cfg: &RuntimeConfig,
     live: &LiveJob,
@@ -3057,6 +3142,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Installs a verified refreshed job into the active search generation.
 fn apply_refreshed_job(
     session: &mut ElectrumSession,
     cfg: &mut RuntimeConfig,
@@ -3093,6 +3179,7 @@ fn apply_refreshed_job(
     }
 }
 
+/// Prepares a safe transition to a different Fulcrum endpoint.
 fn prepare_fulcrum_endpoint_change(
     cfg: &RuntimeConfig,
     endpoint: Option<&str>,
@@ -3115,6 +3202,7 @@ fn prepare_fulcrum_endpoint_change(
     Ok(Some((next, endpoints)))
 }
 
+/// Reports whether the refreshed job changes search-relevant material.
 fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
     // Tip hash and route metadata are not the resident GPU job. A same-height
     // reorg that leaves baton, height, target, and source work unchanged must
@@ -3131,6 +3219,7 @@ fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
         || current.reward_raw != next.reward_raw
 }
 
+/// Checks whether a GPU winner belongs to the current live baton.
 fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJob) -> bool {
     winner.generation_id == generation_id
         && winner.height == live.height
@@ -3138,6 +3227,7 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
         && winner.baton_vout == live.baton_vout
 }
 
+/// Reports whether a pending winner can be reconciled with fresh state.
 fn winner_refresh_ready(
     winner_refresh_pending: bool,
     batch_in_flight: bool,
@@ -3146,6 +3236,7 @@ fn winner_refresh_ready(
     winner_refresh_pending && !batch_in_flight && session_connected
 }
 
+/// Checks whether winner recovery needs an immediate job refresh.
 fn should_begin_winner_refresh(
     winner_refresh_pending: bool,
     has_pending_winner: bool,
@@ -3159,10 +3250,12 @@ fn should_begin_winner_refresh(
         && current_winners > observed_winners
 }
 
+/// Reports whether shutdown may finish without losing a pending winner.
 fn shutdown_can_exit(pending_winner: bool, batch_in_flight: bool) -> bool {
     !pending_winner && !batch_in_flight
 }
 
+/// Checks whether search can resume without violating recovery gates.
 fn search_resume_allowed(
     shutdown: &ShutdownSignal,
     user_paused: bool,
@@ -3171,6 +3264,7 @@ fn search_resume_allowed(
     !shutdown.is_requested() && !user_paused && pending_winners == 0
 }
 
+/// Resumes GPU search only when live state and recovery permit it.
 fn resume_search_if_safe<F>(
     shutdown: &ShutdownSignal,
     session_connected: bool,
@@ -3216,6 +3310,7 @@ struct ThroughputTracker {
 }
 
 impl ThroughputTracker {
+    /// Creates a ThroughputTracker for the live mining runtime.
     fn new(now: Instant, candidates: u64, mining: bool) -> Self {
         let mut samples = std::collections::VecDeque::with_capacity(THROUGHPUT_HISTORY_CAP);
         samples.push_back((now, candidates));
@@ -3230,6 +3325,7 @@ impl ThroughputTracker {
         }
     }
 
+    /// Accumulates a batch result into the runtime rate snapshot.
     fn observe(&mut self, stats: &mut SearchStats, now: Instant) {
         let mining = stats.state == MiningState::Mining;
         if !mining {
@@ -3296,6 +3392,7 @@ impl ThroughputTracker {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Publishes the latest runtime status and measured rates.
 fn write_snapshot(
     shared: &Arc<Mutex<RuntimeSnapshot>>,
     state: SupervisorState,
@@ -3344,12 +3441,14 @@ fn write_snapshot(
     }
 }
 
+/// Sends a runtime event to the status channel.
 fn emit(tx: &SyncSender<RuntimeEvent>, event: RuntimeEvent) {
     match tx.try_send(event) {
         Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
     }
 }
 
+/// Emits a job-change event only when the live job differs.
 fn emit_job_change_if_changed(
     tx: &SyncSender<RuntimeEvent>,
     changed: bool,
@@ -3378,6 +3477,7 @@ mod tests {
     const TEST_PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
     static PREFLIGHT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
+    /// Builds synthetic GPU search statistics for rate-tracking tests.
     fn throughput_stats(candidates: u64, state: MiningState, average_rate: f64) -> SearchStats {
         SearchStats {
             candidates,
@@ -3393,6 +3493,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that shared throughput tracks current average peak and resets after pause.
     fn shared_throughput_tracks_current_average_peak_and_resets_after_pause() {
         let start = Instant::now();
         let mut tracker = ThroughputTracker::new(start, 0, true);
@@ -3424,6 +3525,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that shared throughput rejects short batch spikes and holds between batches.
     fn shared_throughput_rejects_short_batch_spikes_and_holds_between_batches() {
         let start = Instant::now();
         let mut tracker = ThroughputTracker::new(start, 0, true);
@@ -3448,6 +3550,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that shared throughput history is bounded and real sustained rate updates peak.
     fn shared_throughput_history_is_bounded_and_real_sustained_rate_updates_peak() {
         let start = Instant::now();
         let mut tracker = ThroughputTracker::new(start, 0, true);
@@ -3477,6 +3580,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that shared throughput reports zero after a real no progress stall.
     fn shared_throughput_reports_zero_after_a_real_no_progress_stall() {
         let start = Instant::now();
         let mut tracker = ThroughputTracker::new(start, 0, true);
@@ -3493,6 +3597,7 @@ mod tests {
         assert!((stats.peak_rate - 1_000.0).abs() < 0.01);
     }
 
+    /// Creates a fixed Fulcrum PHOTON job for runtime tests.
     fn live_job() -> LiveJob {
         LiveJob {
             url: "wss://one.invalid".into(),
@@ -3511,6 +3616,7 @@ mod tests {
         }
     }
 
+    /// Wraps a fixed PHOTON job in a live snapshot for an endpoint.
     fn live_snapshot(url: &str) -> LiveStateSnapshot {
         let mut job = live_job();
         job.url = url.into();
@@ -3521,6 +3627,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that unchanged state check emits no job change event.
     fn unchanged_state_check_emits_no_job_change_event() {
         let job = live_job();
         let (event_tx, event_rx) = sync_channel(1);
@@ -3546,6 +3653,7 @@ mod tests {
         assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
+    /// Serializes a test transaction that spends the given outpoint.
     fn transaction_spending(txid: &str, vout: u32) -> String {
         let mut previous = hex::decode(txid).unwrap();
         previous.reverse();
@@ -3563,6 +3671,7 @@ mod tests {
         hex::encode(raw)
     }
 
+    /// Creates a verified winner tied to a live job generation.
     fn winner(generation_id: u64, job: &LiveJob) -> VerifiedWinner {
         VerifiedWinner {
             generation_id,
@@ -3577,6 +3686,7 @@ mod tests {
         }
     }
 
+    /// Creates a signed winner and its self-funded settlement fixture.
     fn signed_winner(
         generation_id: u64,
         job: &LiveJob,
@@ -3620,6 +3730,7 @@ mod tests {
         }
     }
 
+    /// Prepares a live job, payout identity, and journal path for preflight tests.
     fn preflight_fixture() -> (RuntimeConfig, LiveJob, [u8; 32], [u8; 33], String, PathBuf) {
         let mut cfg = RuntimeConfig::default();
         cfg.set_payout(TEST_PAYOUT.into()).unwrap();
@@ -3647,6 +3758,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that photon work change invalidates generation but route metadata does not.
     fn photon_work_change_invalidates_generation_but_route_metadata_does_not() {
         let current = live_job();
         let mut next = current.clone();
@@ -3677,6 +3789,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that same height tip reorg does not publish a new generation.
     fn same_height_tip_reorg_does_not_publish_a_new_generation() {
         let (cfg, current, _secret, _public, _mining_payout, _journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &current).unwrap();
@@ -3702,6 +3815,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that native boundary route requires current typed proof.
     fn native_boundary_route_requires_current_typed_proof() {
         let endpoint = "http://node.invalid";
         let mut cfg = RuntimeConfig::default();
@@ -3740,6 +3854,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that native boundary route uses redacted endpoint identity.
     fn native_boundary_route_uses_redacted_endpoint_identity() {
         let endpoint = "http://u:p@node.invalid";
         let endpoint_identity = "http://***@node.invalid";
@@ -3772,6 +3887,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that healthy node is preferred even when fulcrum is faster.
     fn healthy_node_is_preferred_even_when_fulcrum_is_faster() {
         let endpoint = "http://node.invalid";
         let mut cfg = RuntimeConfig::default();
@@ -3802,6 +3918,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that chain healthy node without photon proof stays off the photon route.
     fn chain_healthy_node_without_photon_proof_stays_off_the_photon_route() {
         let endpoint = "http://node.invalid";
         let mut cfg = RuntimeConfig::default();
@@ -3820,6 +3937,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that stabler healthy node beats a slower node and fulcrum.
     fn stabler_healthy_node_beats_a_slower_node_and_fulcrum() {
         let slow = "http://node-slow.invalid";
         let fast = "http://node-fast.invalid";
@@ -3847,6 +3965,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that native outage continuity is bounded by equivalence proof.
     fn native_outage_continuity_is_bounded_by_equivalence_proof() {
         let endpoint = "http://node.invalid";
         let mut cfg = RuntimeConfig::default();
@@ -3916,6 +4035,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that native outage continuity rejects unproven state change inside lease.
     fn native_outage_continuity_rejects_unproven_state_change_inside_lease() {
         let endpoint = "http://node.invalid";
         let mut cfg = RuntimeConfig::default();
@@ -3974,6 +4094,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that route only refresh skips generation transition and preflight.
     fn route_only_refresh_skips_generation_transition_and_preflight() {
         let (cfg, job, _secret, _public, _mining_payout, _journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -4000,6 +4121,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that divergent native boundary probe revokes and falls back to canonical.
     fn divergent_native_boundary_probe_revokes_and_falls_back_to_canonical() {
         let endpoint = "http://node.invalid";
         let mut cfg = RuntimeConfig::default();
@@ -4041,6 +4163,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that refreshed state rejects old generation height or baton winner.
     fn refreshed_state_rejects_old_generation_height_or_baton_winner() {
         let job = live_job();
         let current = winner(4, &job);
@@ -4059,6 +4182,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that stale or wrong generation winner is not prepared for broadcast.
     fn stale_or_wrong_generation_winner_is_not_prepared_for_broadcast() {
         let (cfg, job, reward_secret, reward_public, _mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -4098,6 +4222,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that runtime rebuilds verified parent from exact live state before journaling.
     fn runtime_rebuilds_verified_parent_from_exact_live_state_before_journaling() {
         let job = live_job();
         let mining_secret = [1u8; 32];
@@ -4155,6 +4280,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that verified winner is journaled from prevalidated state before network retry.
     fn verified_winner_is_journaled_from_prevalidated_state_before_network_retry() {
         let (cfg, job, reward_secret, reward_public, reward_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -4238,6 +4364,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that shutdown waits for inflight or unpersisted winner.
     fn shutdown_waits_for_inflight_or_unpersisted_winner() {
         assert!(shutdown_can_exit(false, false));
         assert!(!shutdown_can_exit(true, false));
@@ -4246,6 +4373,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that shutdown signal pauses search immediately and blocks resume.
     fn shutdown_signal_pauses_search_immediately_and_blocks_resume() {
         let paused = Arc::new(AtomicBool::new(false));
         let shutdown = ShutdownSignal::new(SearchPauseHandle::from_shared(Arc::clone(&paused)));
@@ -4257,6 +4385,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that rejected manual resume preserves user pause intent.
     fn rejected_manual_resume_preserves_user_pause_intent() {
         let paused = Arc::new(AtomicBool::new(false));
         let shutdown = ShutdownSignal::new(SearchPauseHandle::from_shared(paused));
@@ -4311,11 +4440,13 @@ mod tests {
     }
 
     #[test]
+    /// Checks that photon state recheck matches authoritative m67 cadence.
     fn photon_state_recheck_matches_authoritative_m67_cadence() {
         assert_eq!(PHOTON_STATE_RECHECK, Duration::from_millis(500));
     }
 
     #[test]
+    /// Checks that photon state recheck deadline does not add request latency.
     fn photon_state_recheck_deadline_does_not_add_request_latency() {
         let start = Instant::now();
         let first_deadline = start + PHOTON_STATE_RECHECK;
@@ -4332,6 +4463,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that transient refresh failures use hysteresis and recover.
     fn transient_refresh_failures_use_hysteresis_and_recover() {
         let mut failures = RefreshFailureTracker::default();
         assert_eq!(
@@ -4379,6 +4511,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that stable refresh after same source reconnect clears rotation escalation.
     fn stable_refresh_after_same_source_reconnect_clears_rotation_escalation() {
         let mut failures = RefreshFailureTracker::default();
         for _ in 0..REFRESH_RECONNECT_THRESHOLD - 1 {
@@ -4409,6 +4542,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that transport failure reconnects immediately and classification is conservative.
     fn transport_failure_reconnects_immediately_and_classification_is_conservative() {
         let mut failures = RefreshFailureTracker::default();
         assert_eq!(
@@ -4444,6 +4578,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that prefer active keeps healthy peer outside the probe window.
     fn prefer_active_keeps_healthy_peer_outside_the_probe_window() {
         let mut sources = SourceCatalog::mainnet();
         let active = crate::protocol::FULCRUM_WSS_BOOTSTRAP
@@ -4467,6 +4602,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that reconnect candidates respect retry and ban policy.
     fn reconnect_candidates_respect_retry_and_ban_policy() {
         let mut sources = SourceCatalog::default();
         sources
@@ -4518,6 +4654,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that reconnect prefers an alternate eligible source.
     fn reconnect_prefers_an_alternate_eligible_source() {
         let mut sources = SourceCatalog::default();
         for endpoint in ["wss://a.invalid", "wss://b.invalid"] {
@@ -4538,6 +4675,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that timeout reconnect prefers current healthy source.
     fn timeout_reconnect_prefers_current_healthy_source() {
         let mut sources = SourceCatalog::default();
         for endpoint in ["wss://a.invalid", "wss://b.invalid"] {
@@ -4558,6 +4696,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that same peer reconnect does not offer a failover target.
     fn same_peer_reconnect_does_not_offer_a_failover_target() {
         let mut sources = SourceCatalog::default();
         for endpoint in ["wss://a.invalid", "wss://b.invalid"] {
@@ -4594,6 +4733,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that queued gpu winner requires an immediate authoritative refresh.
     fn queued_gpu_winner_requires_an_immediate_authoritative_refresh() {
         assert!(!should_begin_winner_refresh(false, false, false, 0, 0));
         assert!(should_begin_winner_refresh(false, false, false, 0, 1));
@@ -4608,6 +4748,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that submission retry never rebroadcasts parent after it is known.
     fn submission_retry_never_rebroadcasts_parent_after_it_is_known() {
         assert_eq!(
             submission_decision(true, false, false),
@@ -4628,6 +4769,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that completed submission requires exact journaled resulting baton.
     fn completed_submission_requires_exact_journaled_resulting_baton() {
         let job = live_job();
         let settlement_txid = reward::transaction_id(&[2]);
@@ -4666,6 +4808,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that restart recovery accepts only proven output zero baton descendants.
     fn restart_recovery_accepts_only_proven_output_zero_baton_descendants() {
         let settlement = "aa".repeat(32);
         let child_raw = transaction_spending(&settlement, 0);
@@ -4707,6 +4850,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that lineage parser reads wire endian first input outpoint.
     fn lineage_parser_reads_wire_endian_first_input_outpoint() {
         let previous_txid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let raw = transaction_spending(previous_txid, 7);
@@ -4716,6 +4860,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that broadcast preference uses selected transport then safe fallback.
     fn broadcast_preference_uses_selected_transport_then_safe_fallback() {
         use std::cell::RefCell;
 
@@ -4755,6 +4900,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that native node mempool preflight requires exact txid and policy acceptance.
     fn native_node_mempool_preflight_requires_exact_txid_and_policy_acceptance() {
         let expected_txid = "aa".repeat(32);
         let allowed = crate::node::MempoolAcceptance {
@@ -4799,6 +4945,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that native node source refuses live search without node endpoint.
     fn native_node_source_refuses_live_search_without_node_endpoint() {
         let cfg = RuntimeConfig {
             source: JobSource::Node,
@@ -4809,6 +4956,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that configured node binds live mempool fee floor with fulcrum preference.
     fn configured_node_binds_live_mempool_fee_floor_with_fulcrum_preference() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -4840,6 +4988,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that production preflight proves parent reward split and journal readiness.
     fn production_preflight_proves_parent_reward_split_and_journal_readiness() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         production_preflight_local(
@@ -4856,6 +5005,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that production preflight refuses insufficient self funded baton value before search.
     fn production_preflight_refuses_insufficient_self_funded_baton_value_before_search() {
         let (cfg, mut job, secret, public, mining_payout, journal) = preflight_fixture();
         job.baton_value_sats = 1_500;
@@ -4874,6 +5024,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that production preflight refuses relay floor above covenant budget.
     fn production_preflight_refuses_relay_floor_above_covenant_budget() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let error = production_preflight_local(
@@ -4891,6 +5042,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that production preflight refuses unresolved submission journal.
     fn production_preflight_refuses_unresolved_submission_journal() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         fs::write(&journal, b"occupied").unwrap();
@@ -4909,6 +5061,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that baton transition requires preflighted self funded settlement.
     fn baton_transition_requires_preflighted_self_funded_settlement() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -4952,6 +5105,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that same baton generation revalidates self funded settlement.
     fn same_baton_generation_revalidates_self_funded_settlement() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -4980,6 +5134,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that transitioned generation journal survives restart and duplicate retry.
     fn transitioned_generation_journal_survives_restart_and_duplicate_retry() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -5038,11 +5193,13 @@ mod tests {
     }
 
     #[test]
+    /// Checks that live search gate opens after generation bound winner durability.
     fn live_search_gate_opens_after_generation_bound_winner_durability() {
         require_complete_live_winner_lifecycle().unwrap();
     }
 
     #[test]
+    /// Checks that pending submission journal round trips signed bytes without secrets.
     fn pending_submission_journal_round_trips_signed_bytes_without_secrets() {
         let parent = vec![0x02, 0x00, 0x00, 0x00, 0x01];
         let settlement = vec![0x02, 0x00, 0x00, 0x00, 0x02];
@@ -5086,6 +5243,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that parent broadcast progress survives restart and is removed with journal.
     fn parent_broadcast_progress_survives_restart_and_is_removed_with_journal() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -5119,6 +5277,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that height only advance cannot resolve a journaled winner as stale.
     fn height_only_advance_cannot_resolve_a_journaled_winner_as_stale() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -5146,6 +5305,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that stale unbroadcast winner keeps durable resolution evidence.
     fn stale_unbroadcast_winner_keeps_durable_resolution_evidence() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -5185,6 +5345,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that confirmed submission keeps durable resolution evidence before journal cleanup.
     fn confirmed_submission_keeps_durable_resolution_evidence_before_journal_cleanup() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -5227,6 +5388,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that attempted parent cannot be resolved as stale on ambiguous network evidence.
     fn attempted_parent_cannot_be_resolved_as_stale_on_ambiguous_network_evidence() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -5261,6 +5423,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that stale resolution never discards an accepted parent.
     fn stale_resolution_never_discards_an_accepted_parent() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
@@ -5290,6 +5453,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that production preflight refuses orphan submission progress.
     fn production_preflight_refuses_orphan_submission_progress() {
         let (cfg, job, secret, public, mining_payout, journal) = preflight_fixture();
         let marker = PendingSubmission::parent_attempted_path(&journal);
@@ -5309,6 +5473,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that journaled unbroadcast pair survives height advance while baton is current.
     fn journaled_unbroadcast_pair_survives_height_advance_while_baton_is_current() {
         let job = live_job();
         let settlement_txid = reward::transaction_id(&[2]);
@@ -5368,6 +5533,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that fulcrum endpoint change is atomic and invalidates generation.
     fn fulcrum_endpoint_change_is_atomic_and_invalidates_generation() {
         let cfg = RuntimeConfig::default();
         let original_generation = cfg.generation_id;

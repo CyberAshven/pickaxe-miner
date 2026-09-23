@@ -25,6 +25,7 @@ const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 const MATRIX_MONOTONIC_TOLERANCE_PERCENT: f64 = 12.5;
 const MIN_MATRIX_100_TO_10_THROUGHPUT_RATIO: f64 = 2.0;
 
+/// Selects the configured GPU intensity samples for a benchmark.
 fn benchmark_intensities(requested: Option<u8>) -> Result<Vec<u8>, String> {
     match requested {
         Some(intensity) if (10..=100).contains(&intensity) => Ok(vec![intensity]),
@@ -62,6 +63,7 @@ pub struct BenchmarkReport {
 }
 
 impl BenchmarkReport {
+    /// Reports whether the GPU benchmark checks passed.
     pub fn passed(&self) -> bool {
         self.status == "PASS"
     }
@@ -79,6 +81,7 @@ pub struct BenchmarkMatrixValidation {
 }
 
 impl BenchmarkMatrixValidation {
+    /// Reports whether the GPU benchmark checks passed.
     fn passed(&self) -> bool {
         self.required_intensities_present
             && self.approximately_monotonic_throughput
@@ -126,6 +129,7 @@ struct TelemetryAccumulator {
 }
 
 impl TelemetryAccumulator {
+    /// Accumulates a GPU telemetry sample for the benchmark window.
     fn add(&mut self, sample: &GpuTelemetry) {
         self.samples = self.samples.saturating_add(1);
         add_metric(
@@ -160,6 +164,7 @@ impl TelemetryAccumulator {
         );
     }
 
+    /// Computes averaged GPU telemetry for the benchmark window.
     fn finish(self) -> GpuTelemetry {
         GpuTelemetry {
             samples: self.samples,
@@ -173,6 +178,7 @@ impl TelemetryAccumulator {
     }
 }
 
+/// Adds an available GPU metric to its running total.
 fn add_metric(value: Option<f64>, sum: &mut f64, count: &mut u32) {
     if let Some(value) = value {
         *sum += value;
@@ -180,10 +186,12 @@ fn add_metric(value: Option<f64>, sum: &mut f64, count: &mut u32) {
     }
 }
 
+/// Returns the average of available metric samples.
 fn average(sum: f64, count: u32) -> Option<f64> {
     (count > 0).then_some(sum / f64::from(count))
 }
 
+/// Checks the measured GPU throughput across all intensity levels.
 fn validate_intensity_matrix(samples: &[BenchmarkSample]) -> BenchmarkMatrixValidation {
     let required_intensities_present = samples.len() == BENCHMARK_INTENSITIES.len()
         && samples
@@ -239,6 +247,7 @@ fn validate_intensity_matrix(samples: &[BenchmarkSample]) -> BenchmarkMatrixVali
     }
 }
 
+/// Starts collecting GPU telemetry during a benchmark window.
 fn start_telemetry_sampler(
     backend: BackendKind,
     device: u32,
@@ -264,6 +273,7 @@ fn start_telemetry_sampler(
     (stop, samples, handle)
 }
 
+/// Stops sampling and collects averaged GPU telemetry.
 fn finish_telemetry_sampler(
     stop: Arc<AtomicBool>,
     samples: Arc<Mutex<TelemetryAccumulator>>,
@@ -280,12 +290,14 @@ fn finish_telemetry_sampler(
     }
 }
 
+/// Derives a repeatable private key for offline benchmark jobs.
 fn deterministic_secret() -> [u8; 32] {
     let mut secret = [0u8; 32];
     secret[31] = 1;
     secret
 }
 
+/// Creates a reproducible PHOTON job without network access.
 fn benchmark_fixture() -> Result<BenchmarkFixture, String> {
     let target = search::parse_hex32(VECTOR_TARGET_LE)?;
     let private_key = deterministic_secret();
@@ -324,6 +336,7 @@ fn benchmark_fixture() -> Result<BenchmarkFixture, String> {
     })
 }
 
+/// Measures one GPU intensity window and its telemetry.
 fn run_intensity_window(
     engine: &mut search::PhotonEngine,
     backend: BackendKind,
@@ -405,6 +418,7 @@ fn run_intensity_window(
     })
 }
 
+/// Runs the offline GPU benchmark across requested intensities.
 pub fn run_gpu_benchmark(
     device: &GpuDevice,
     seconds: u64,
@@ -515,12 +529,14 @@ pub fn run_gpu_benchmark(
     })
 }
 
+/// Formats an optional benchmark metric with its unit.
 fn fmt_metric(value: Option<f64>, suffix: &str) -> String {
     value
         .map(|value| format!("{value:.1}{suffix}"))
         .unwrap_or_else(|| "n/a".into())
 }
 
+/// Prints measured throughput and GPU telemetry.
 pub fn print_report(report: &BenchmarkReport, json: bool) {
     if json {
         match serde_json::to_string_pretty(report) {
@@ -594,6 +610,7 @@ mod tests {
     use super::*;
     use crate::telemetry::parse_nvidia_smi_line;
 
+    /// Creates a synthetic one-second sample for throughput assertions.
     fn benchmark_sample(intensity: u8, candidates_per_second: f64) -> BenchmarkSample {
         BenchmarkSample {
             intensity,
@@ -608,6 +625,7 @@ mod tests {
         }
     }
 
+    /// Creates a placeholder GPU device for benchmark validation tests.
     fn benchmark_device(backend: BackendKind) -> GpuDevice {
         GpuDevice {
             index: 0,
@@ -620,6 +638,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that benchmark matrix covers required intensities.
     fn benchmark_matrix_covers_required_intensities() {
         assert_eq!(benchmark_intensities(None).unwrap(), [10, 25, 50, 75, 100]);
         assert_eq!(
@@ -629,11 +648,13 @@ mod tests {
     }
 
     #[test]
+    /// Checks that benchmark explicit intensity selects one window.
     fn benchmark_explicit_intensity_selects_one_window() {
         assert_eq!(benchmark_intensities(Some(30)).unwrap(), [30]);
     }
 
     #[test]
+    /// Checks that intensity matrix validation accepts real monotonic scaling.
     fn intensity_matrix_validation_accepts_real_monotonic_scaling() {
         let samples = [
             benchmark_sample(10, 20_000.0),
@@ -648,6 +669,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that intensity matrix validation rejects display only intensity.
     fn intensity_matrix_validation_rejects_display_only_intensity() {
         let samples = BENCHMARK_INTENSITIES.map(|intensity| benchmark_sample(intensity, 100_000.0));
         let validation = validate_intensity_matrix(&samples);
@@ -658,6 +680,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that intensity matrix validation tolerates small measurement noise.
     fn intensity_matrix_validation_tolerates_small_measurement_noise() {
         let samples = [
             benchmark_sample(10, 20_000.0),
@@ -672,6 +695,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that benchmark fixture matches reference layout.
     fn benchmark_fixture_matches_reference_layout() {
         let fixture = benchmark_fixture().unwrap();
         assert_eq!(fixture.template.len(), TX_BYTES);
@@ -683,6 +707,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that nvidia telemetry parser handles values and na.
     fn nvidia_telemetry_parser_handles_values_and_na() {
         let parsed = parse_nvidia_smi_line("87, 123.5, 68, 2048, 2450, N/A").unwrap();
         assert_eq!(parsed.gpu_utilization_percent, Some(87.0));
@@ -695,6 +720,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
+    /// Checks that benchmark refuses debug measurements before gpu initialization.
     fn benchmark_refuses_debug_measurements_before_gpu_initialization() {
         let error =
             run_gpu_benchmark(&benchmark_device(BackendKind::Cuda), 1, None, false).unwrap_err();
@@ -703,6 +729,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
+    /// Checks that benchmark accepts all production backends before gpu initialization.
     fn benchmark_accepts_all_production_backends_before_gpu_initialization() {
         for backend in [BackendKind::Cuda, BackendKind::Hip, BackendKind::Wgpu] {
             let error = run_gpu_benchmark(&benchmark_device(backend), 1, None, false).unwrap_err();
@@ -715,6 +742,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
+    /// Checks that benchmark accepts one hour matrix window without initializing gpu.
     fn benchmark_accepts_one_hour_matrix_window_without_initializing_gpu() {
         let device = benchmark_device(BackendKind::Cuda);
         let accepted =

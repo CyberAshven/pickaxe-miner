@@ -68,6 +68,7 @@ struct SetupFlow {
 }
 
 impl SetupFlow {
+    /// Creates a SetupFlow for the terminal interface.
     fn new(
         config: RuntimeConfig,
         devices: Vec<GpuDevice>,
@@ -93,10 +94,12 @@ impl SetupFlow {
         })
     }
 
+    /// Returns the GPU device selected in the setup wizard.
     fn selected_device(&self) -> &GpuDevice {
         &self.devices[self.selected]
     }
 
+    /// Handles keyboard input for the active terminal view.
     fn handle_key(&mut self, key: KeyEvent) -> SetupAction {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return SetupAction::Cancel;
@@ -193,6 +196,7 @@ struct TerminalSession {
 }
 
 impl TerminalSession {
+    /// Enters raw terminal mode and switches to the alternate screen.
     fn enter() -> Result<Self, String> {
         enable_raw_mode().map_err(|error| format!("enable terminal raw mode: {error}"))?;
         let mut stdout = io::stdout();
@@ -222,6 +226,7 @@ impl TerminalSession {
 }
 
 impl Drop for TerminalSession {
+    /// Releases resources owned by TerminalSession.
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
@@ -262,6 +267,7 @@ struct TuiState {
 }
 
 impl TuiState {
+    /// Creates a TuiState for the terminal interface.
     fn new(_snapshot: &RuntimeSnapshot) -> Self {
         let mut events = VecDeque::with_capacity(EVENT_HISTORY_CAP);
         events.push_back("started; supervising PHOTON state".into());
@@ -280,6 +286,7 @@ impl TuiState {
         }
     }
 
+    /// Adds a runtime event to the bounded terminal log.
     fn push_event(&mut self, message: String) {
         if self.events.len() == EVENT_HISTORY_CAP {
             self.events.pop_front();
@@ -287,10 +294,12 @@ impl TuiState {
         self.events.push_back(message);
     }
 
+    /// Updates GPU devices displayed by the setup wizard.
     fn set_devices(&mut self, devices: Vec<GpuDevice>) {
         self.devices = devices;
     }
 
+    /// Opens the command palette for interactive input.
     fn open_command(&mut self, prefill: &str) {
         self.command_mode = true;
         self.command_input.clear();
@@ -302,6 +311,7 @@ impl TuiState {
         self.logs_mode = false;
     }
 
+    /// Closes the command palette without applying its draft.
     fn cancel_command(&mut self) {
         self.command_mode = false;
         self.command_input.clear();
@@ -309,6 +319,7 @@ impl TuiState {
         self.command_draft.clear();
     }
 
+    /// Commits a command and updates the bounded command history.
     fn finish_command(&mut self) -> String {
         let input = std::mem::take(&mut self.command_input);
         self.command_mode = false;
@@ -324,6 +335,7 @@ impl TuiState {
         input
     }
 
+    /// Loads the preceding command from history into the palette.
     fn history_previous(&mut self) {
         if self.command_history.is_empty() {
             return;
@@ -339,6 +351,7 @@ impl TuiState {
         self.command_input = self.command_history[next].clone();
     }
 
+    /// Loads the next command from history into the palette.
     fn history_next(&mut self) {
         let Some(index) = self.command_history_cursor else {
             return;
@@ -354,6 +367,7 @@ impl TuiState {
     }
 }
 
+/// Runs the interactive setup flow before starting mining.
 pub(crate) fn run_setup(
     config: RuntimeConfig,
     devices: Vec<GpuDevice>,
@@ -362,6 +376,7 @@ pub(crate) fn run_setup(
     run_setup_terminal(SetupFlow::new(config, devices, default_device)?)
 }
 
+/// Draws and processes setup screens in the terminal.
 fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, String> {
     let mut terminal = TerminalSession::enter()?;
     loop {
@@ -393,6 +408,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
     }
 }
 
+/// Mirrors runtime status updates to the terminal view.
 fn mirror_tui_status(snapshot: &RuntimeSnapshot) {
     let Ok(path) = std::env::var("PICKAXE_TUI_LOG") else {
         return;
@@ -420,6 +436,7 @@ fn mirror_tui_status(snapshot: &RuntimeSnapshot) {
     }
 }
 
+/// Runs the mining terminal event loop until exit.
 pub fn run(
     supervisor: RuntimeSupervisor,
     devices: Vec<GpuDevice>,
@@ -464,10 +481,12 @@ pub fn run(
     Ok(supervisor.stop())
 }
 
+/// Returns the render interval for a benchmark run.
 pub(crate) fn benchmark_draw_interval() -> Duration {
     DRAW_INTERVAL
 }
 
+/// Measures terminal redraw overhead during a GPU benchmark.
 pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String> {
     let mut snapshot = RuntimeSnapshot {
         state: SupervisorState::Mining,
@@ -541,6 +560,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
     Ok(draws)
 }
 
+/// Handles keyboard input for the active terminal view.
 fn handle_key(
     key: KeyEvent,
     supervisor: &RuntimeSupervisor,
@@ -654,6 +674,7 @@ fn handle_key(
     }
 }
 
+/// Changes GPU intensity from a keyboard shortcut.
 fn adjust_intensity(
     supervisor: &RuntimeSupervisor,
     snapshot: &RuntimeSnapshot,
@@ -673,6 +694,7 @@ fn adjust_intensity(
     );
 }
 
+/// Switches GPU mining between paused and running states.
 fn toggle_pause(
     supervisor: &RuntimeSupervisor,
     snapshot: &RuntimeSnapshot,
@@ -692,6 +714,7 @@ fn toggle_pause(
     Ok(())
 }
 
+/// Applies a parsed palette command to the running miner.
 fn apply_palette_command(
     command: PaletteCommand,
     supervisor: &RuntimeSupervisor,
@@ -812,6 +835,7 @@ fn apply_palette_command(
     Ok(false)
 }
 
+/// Shows the result of a palette command in the event log.
 fn apply_result(result: Result<(), String>, success: &str, state: &mut TuiState) {
     match result {
         Ok(()) => {
@@ -825,6 +849,7 @@ fn apply_result(result: Result<(), String>, success: &str, state: &mut TuiState)
     }
 }
 
+/// Parses interactive text into a runtime control command.
 fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
     let trimmed = input
         .trim()
@@ -879,6 +904,7 @@ fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
     }
 }
 
+/// Renders the current setup wizard step.
 fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
     let area = frame.area();
     let rows = Layout::default()
@@ -925,6 +951,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
     );
 }
 
+/// Renders GPU backend and device selection.
 fn render_setup_gpu(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let items = state.devices.iter().enumerate().map(|(index, device)| {
         let marker = if index == state.selected { "> " } else { "  " };
@@ -942,6 +969,7 @@ fn render_setup_gpu(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     );
 }
 
+/// Renders miner payout address configuration.
 fn render_setup_payout(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     frame.render_widget(
         Paragraph::new(state.payout_input.as_str())
@@ -950,6 +978,7 @@ fn render_setup_payout(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     );
 }
 
+/// Renders the GPU intensity configuration step.
 fn render_setup_intensity(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let ratio = f64::from(state.config.intensity) / 100.0;
     frame.render_widget(
@@ -966,6 +995,7 @@ fn render_setup_intensity(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) 
     );
 }
 
+/// Renders a review of the configured mining settings.
 fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let device = state.selected_device();
     frame.render_widget(
@@ -988,6 +1018,7 @@ fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     );
 }
 
+/// Renders the active mining dashboard.
 fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     let area = frame.area();
     let rows = Layout::default()
@@ -1022,6 +1053,7 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     }
 }
 
+/// Renders the dashboard header and live connection state.
 fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let state_text = format!("{:?}", snapshot.state).to_ascii_uppercase();
     let line = Line::from(vec![
@@ -1038,6 +1070,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) 
     );
 }
 
+/// Renders the GPU intensity control and current value.
 fn render_intensity(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let ratio = f64::from(snapshot.search.intensity) / 100.0;
     let gauge = Gauge::default()
@@ -1052,6 +1085,7 @@ fn render_intensity(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
     frame.render_widget(gauge, area);
 }
 
+/// Renders live hash rates, shares, and GPU statistics.
 fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let endpoint = redact_endpoint(&snapshot.endpoint);
     let last_error = snapshot.last_error.as_deref().unwrap_or("none");
@@ -1131,12 +1165,14 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     );
 }
 
+/// Formats an optional GPU metric for the dashboard.
 fn format_metric(value: Option<f64>, unit: &str) -> String {
     value
         .map(|value| format!("{value:.1}{unit}"))
         .unwrap_or_else(|| "N/A".into())
 }
 
+/// Renders the bounded runtime event list.
 fn render_events(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let max_items = area.height.saturating_sub(2) as usize;
     let items: Vec<ListItem<'_>> = state
@@ -1156,6 +1192,7 @@ fn render_events(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
+/// Renders keyboard shortcuts and the command prompt.
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let text = if state.command_mode {
         vec![Line::from(vec![
@@ -1178,6 +1215,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
+/// Renders active miner configuration.
 fn render_settings(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let popup = centered_rect(82, 58, area);
     frame.render_widget(Clear, popup);
@@ -1208,6 +1246,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
     frame.render_widget(settings, popup);
 }
 
+/// Renders the interactive keyboard help panel.
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(76, 72, area);
     frame.render_widget(Clear, popup);
@@ -1238,6 +1277,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(help, popup);
 }
 
+/// Renders the diagnostic event log.
 fn render_logs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let popup = centered_rect(92, 82, area);
     frame.render_widget(Clear, popup);
@@ -1259,6 +1299,7 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
+/// Computes a centered terminal area for a dialog.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1278,6 +1319,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
+/// Formats a runtime event for display in the terminal.
 fn format_event(event: RuntimeEvent) -> String {
     match event {
         RuntimeEvent::JobRefreshed {
@@ -1326,6 +1368,7 @@ fn format_event(event: RuntimeEvent) -> String {
     }
 }
 
+/// Removes embedded credentials from a displayed endpoint.
 fn redact_endpoint(input: &str) -> String {
     let Some((scheme, rest)) = input.split_once("://") else {
         return input.into();
@@ -1336,6 +1379,7 @@ fn redact_endpoint(input: &str) -> String {
     }
 }
 
+/// Truncates display text to fit the available terminal width.
 fn shorten(input: &str, max: usize) -> String {
     if input.chars().count() <= max {
         return input.into();
@@ -1362,6 +1406,7 @@ fn shorten(input: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Returns synthetic GPU devices for interactive setup tests.
     fn test_devices() -> Vec<GpuDevice> {
         vec![
             GpuDevice {
@@ -1383,10 +1428,12 @@ mod tests {
         ]
     }
 
+    /// Creates a key event without modifier keys for input tests.
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Returns synthetic runtime status for dashboard rendering tests.
     fn test_snapshot() -> RuntimeSnapshot {
         RuntimeSnapshot {
             state: SupervisorState::Mining,
@@ -1417,6 +1464,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that setup default selection.
     fn setup_default_selection() {
         let devices = test_devices();
         let default_device = devices[0].clone();
@@ -1430,6 +1478,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that setup validation stays on input.
     fn setup_validation_stays_on_input() {
         let devices = test_devices();
         let default_device = devices[0].clone();
@@ -1441,6 +1490,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that setup valid input advances.
     fn setup_valid_input_advances() {
         let devices = test_devices();
         let default_device = devices[0].clone();
@@ -1453,6 +1503,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that setup intensity stays in range.
     fn setup_intensity_stays_in_range() {
         let devices = test_devices();
         let default_device = devices[0].clone();
@@ -1474,6 +1525,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that setup review displays the selected GPU and payout values.
     fn setup_review_values() {
         let devices = test_devices();
         let default_device = devices[0].clone();
@@ -1491,6 +1543,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that palette parses shared runtime controls.
     fn palette_parses_shared_runtime_controls() {
         assert_eq!(
             parse_palette_command("intensity 75").unwrap(),
@@ -1516,6 +1569,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that slash palette parses extended runtime commands.
     fn slash_palette_parses_extended_runtime_commands() {
         assert_eq!(
             parse_palette_command("/endpoint auto").unwrap(),
@@ -1548,6 +1602,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that command history is bounded and restores draft.
     fn command_history_is_bounded_and_restores_draft() {
         let snapshot = test_snapshot();
         let mut state = TuiState::new(&snapshot);
@@ -1574,6 +1629,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that eighty column footer keeps slash command hint visible.
     fn eighty_column_footer_keeps_slash_command_hint_visible() {
         let snapshot = test_snapshot();
         let state = TuiState::new(&snapshot);
@@ -1593,6 +1649,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that runtime view renders shared gpu telemetry and efficiency.
     fn runtime_view_renders_shared_gpu_telemetry_and_efficiency() {
         let mut snapshot = test_snapshot();
         snapshot.search.current_rate = 500_000.0;
@@ -1633,6 +1690,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that runtime view shows live intensity and reconnect counts.
     fn runtime_view_shows_live_intensity_and_reconnect_counts() {
         let mut snapshot = test_snapshot();
         snapshot.search.intensity = 30;
@@ -1677,6 +1735,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that palette rejects invalid intensity without touching runtime.
     fn palette_rejects_invalid_intensity_without_touching_runtime() {
         assert!(parse_palette_command("intensity 9").is_err());
         assert!(parse_palette_command("intensity 101").is_err());
@@ -1684,6 +1743,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that endpoint redaction removes embedded credentials.
     fn endpoint_redaction_removes_embedded_credentials() {
         assert_eq!(
             redact_endpoint("wss://user:secret@example.test:50004"),
@@ -1696,6 +1756,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that event history is bounded.
     fn event_history_is_bounded() {
         let snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,

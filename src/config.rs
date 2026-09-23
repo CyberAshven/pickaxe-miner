@@ -25,6 +25,7 @@ pub enum JobSource {
 }
 
 impl JobSource {
+    /// Parses a configured source kind from its persisted name.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "node" | "bchn" | "rpc" => Ok(JobSource::Node),
@@ -33,6 +34,7 @@ impl JobSource {
         }
     }
 
+    /// Returns the persisted name of the source kind.
     pub fn as_str(self) -> &'static str {
         match self {
             JobSource::Node => "node",
@@ -64,6 +66,7 @@ pub struct RuntimeConfig {
 }
 
 impl Default for RuntimeConfig {
+    /// Creates the default runtime configuration.
     fn default() -> Self {
         Self {
             intensity: 100,
@@ -78,6 +81,7 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Updates the configured GPU intensity within the accepted range.
     pub fn set_intensity(&mut self, value: u8) -> Result<(), String> {
         if !(10..=100).contains(&value) {
             return Err("intensity must be 10..=100".into());
@@ -86,6 +90,7 @@ impl RuntimeConfig {
         Ok(())
     }
 
+    /// Validates and stores the miner payout CashAddr.
     pub fn set_payout(&mut self, addr: String) -> Result<(), String> {
         let trimmed = addr.trim().to_string();
         if trimmed.is_empty() {
@@ -123,6 +128,7 @@ impl RuntimeConfig {
         Ok(())
     }
 
+    /// Removes the custom Fulcrum endpoint.
     pub fn clear_fulcrum_url(&mut self) {
         if self.fulcrum_url.take().is_some() {
             self.bump_generation();
@@ -144,6 +150,7 @@ impl RuntimeConfig {
         out
     }
 
+    /// Validates and stores the native node endpoint.
     pub fn set_node_url(&mut self, url: &str) -> Result<(), String> {
         let trimmed = url.trim().to_string();
         if trimmed.is_empty() {
@@ -162,12 +169,14 @@ impl RuntimeConfig {
         Ok(())
     }
 
+    /// Removes the custom native node endpoint.
     pub fn clear_node_url(&mut self) {
         if self.node_url.take().is_some() {
             self.bump_generation();
         }
     }
 
+    /// Changes the selected job source and increments its generation.
     pub fn set_source(&mut self, s: &str) -> Result<(), String> {
         let source = JobSource::parse(s)?;
         if self.source != source {
@@ -177,6 +186,7 @@ impl RuntimeConfig {
         Ok(())
     }
 
+    /// Advances the generation when job-affecting settings change.
     pub fn bump_generation(&mut self) -> u64 {
         self.generation_id = self.generation_id.wrapping_add(1);
         if self.generation_id == 0 {
@@ -221,6 +231,7 @@ pub struct SavedConfig {
 }
 
 impl SavedConfig {
+    /// Applies saved configuration values to a running miner.
     pub fn apply_to_runtime(&self, cfg: &mut RuntimeConfig) -> Result<(), String> {
         if let Some(value) = self.intensity {
             cfg.set_intensity(value)?;
@@ -240,6 +251,7 @@ impl SavedConfig {
         Ok(())
     }
 
+    /// Rejects inconsistent or unsupported saved configuration values.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(value) = &self.backend {
             crate::backend::BackendKind::parse(value)?;
@@ -248,6 +260,7 @@ impl SavedConfig {
         self.apply_to_runtime(&mut runtime)
     }
 
+    /// Loads and validates the saved miner configuration.
     pub fn load(path: &Path) -> Result<Self, String> {
         let bytes =
             fs::read(path).map_err(|error| format!("read config {}: {error}", path.display()))?;
@@ -259,6 +272,7 @@ impl SavedConfig {
         Ok(config)
     }
 
+    /// Loads saved configuration when the file exists.
     pub fn load_optional(path: &Path) -> Result<Option<Self>, String> {
         if !path.exists() {
             return Ok(None);
@@ -266,6 +280,7 @@ impl SavedConfig {
         Self::load(path).map(Some)
     }
 
+    /// Persists the current miner configuration to disk.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
         if let Some(parent) = path
@@ -281,6 +296,7 @@ impl SavedConfig {
         fs::write(path, bytes).map_err(|error| format!("write config {}: {error}", path.display()))
     }
 
+    /// Captures the effective runtime settings for persistence.
     pub fn from_effective(backend: &str, device: Option<u32>, runtime: &RuntimeConfig) -> Self {
         let address = if runtime.payout_address.is_empty() {
             None
@@ -299,6 +315,7 @@ impl SavedConfig {
     }
 }
 
+/// Returns the location of the miner configuration file.
 pub fn config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
