@@ -34,6 +34,41 @@ impl GpuTelemetry {
     }
 }
 
+const HASH_RATE_UNITS: [&str; 6] = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s"];
+
+/// Scale a candidate rate by 1000 into H/s through PH/s.
+/// At least 100 in the chosen unit uses one decimal; smaller values use two.
+pub(crate) fn format_hash_rate(rate: f64) -> String {
+    let mut value = if rate.is_finite() && rate > 0.0 {
+        rate
+    } else {
+        0.0
+    };
+    let mut unit = 0usize;
+    while unit + 1 < HASH_RATE_UNITS.len() && value >= 1000.0 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    let decimals = if value >= 100.0 { 1 } else { 2 };
+    format!(
+        "{value:.decimals$} {unit}",
+        decimals = decimals,
+        unit = HASH_RATE_UNITS[unit]
+    )
+}
+
+/// Short live PHOTON target for display. Empty means the target was not read.
+pub(crate) fn format_photon_target(target_le_hex: &str) -> String {
+    let target = target_le_hex.trim();
+    if target.is_empty() {
+        return "unavailable".to_string();
+    }
+    if target.len() <= 18 {
+        return target.to_string();
+    }
+    format!("{}...{}", &target[..8], &target[target.len() - 8..])
+}
+
 fn parse_metric(value: Option<&&str>) -> Option<f64> {
     value?.trim().parse::<f64>().ok()
 }
@@ -311,5 +346,26 @@ mod tests {
         assert_eq!(telemetry.candidates_per_watt(500_000.0), Some(5_000.0));
         telemetry.power_watts = Some(0.0);
         assert_eq!(telemetry.candidates_per_watt(500_000.0), None);
+    }
+
+    #[test]
+    fn hash_rate_uses_1000_based_units_for_current_average_and_peak() {
+        assert_eq!(format_hash_rate(0.0), "0.00 H/s");
+        assert_eq!(format_hash_rate(f64::NAN), "0.00 H/s");
+        assert_eq!(format_hash_rate(999.0), "999.0 H/s");
+        assert_eq!(format_hash_rate(500_000.0), "500.0 KH/s");
+        assert_eq!(format_hash_rate(1.2e9), "1.20 GH/s");
+        assert_eq!(format_hash_rate(1.5e12), "1.50 TH/s");
+        assert_eq!(format_hash_rate(2.5e15), "2.50 PH/s");
+        assert_eq!(format_hash_rate(1.0e18), "1000.0 PH/s");
+    }
+
+    #[test]
+    fn photon_target_text_says_unavailable_when_missing() {
+        assert_eq!(format_photon_target(""), "unavailable");
+        assert_eq!(format_photon_target("  "), "unavailable");
+        assert_eq!(format_photon_target("abcd"), "abcd");
+        let target = "ab".repeat(32);
+        assert_eq!(format_photon_target(&target), "abababab...abababab");
     }
 }

@@ -1664,6 +1664,8 @@ pub struct RuntimeSnapshot {
     pub height: u32,
     pub baton_txid: String,
     pub baton_vout: u32,
+    /// Little-endian PHOTON target hex from the live baton. Empty means unavailable.
+    pub photon_target_le: String,
     pub state_checks: u64,
     pub transient_refresh_failures: u64,
     pub transport_failures: u64,
@@ -1838,6 +1840,7 @@ impl RuntimeSupervisor {
             height: initial.height,
             baton_txid: initial.baton_txid.clone(),
             baton_vout: initial.baton_vout,
+            photon_target_le: initial.target_le_hex.clone(),
             state_checks: 0,
             transient_refresh_failures: 0,
             transport_failures: 0,
@@ -3322,6 +3325,7 @@ fn write_snapshot(
     snapshot.height = live.height;
     snapshot.baton_txid.clone_from(&live.baton_txid);
     snapshot.baton_vout = live.baton_vout;
+    snapshot.photon_target_le.clone_from(&live.target_le_hex);
     snapshot.state_checks = state_checks;
     snapshot.transient_refresh_failures = refresh_failures.transient_total;
     snapshot.transport_failures = refresh_failures.transport_total;

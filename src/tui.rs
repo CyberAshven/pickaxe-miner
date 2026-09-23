@@ -479,6 +479,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         height: 1,
         baton_txid: "00".repeat(32),
         baton_vout: 0,
+        photon_target_le: String::new(),
         state_checks: 1,
         transient_refresh_failures: 0,
         transport_failures: 0,
@@ -727,10 +728,13 @@ fn apply_palette_command(
         ),
         PaletteCommand::Status => {
             let status = format!(
-                "generation={} height={} rate={:.0}/s pending={}",
+                "generation={} height={} rate={} avg={} peak={} target={} pending={}",
                 snapshot.generation_id,
                 snapshot.height,
-                snapshot.search.rate,
+                crate::telemetry::format_hash_rate(snapshot.search.current_rate),
+                crate::telemetry::format_hash_rate(snapshot.search.rate),
+                crate::telemetry::format_hash_rate(snapshot.search.peak_rate),
+                crate::telemetry::format_photon_target(&snapshot.photon_target_le),
                 snapshot.pending_winners
             );
             state.status_line = status.clone();
@@ -1072,12 +1076,18 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             snapshot.transient_refresh_failures, snapshot.consecutive_refresh_failures
         )),
         Line::from(format!(
-            "rate {:>8.0}/s   avg {:>8.0}/s",
-            snapshot.search.current_rate, snapshot.search.rate
+            "rate {}   avg {}",
+            crate::telemetry::format_hash_rate(snapshot.search.current_rate),
+            crate::telemetry::format_hash_rate(snapshot.search.rate),
         )),
         Line::from(format!(
-            "peak {:>8.0}/s   uptime {}s",
-            snapshot.search.peak_rate, snapshot.search.elapsed_secs
+            "peak {}   uptime {}s",
+            crate::telemetry::format_hash_rate(snapshot.search.peak_rate),
+            snapshot.search.elapsed_secs
+        )),
+        Line::from(format!(
+            "target {}",
+            crate::telemetry::format_photon_target(&snapshot.photon_target_le)
         )),
         Line::from(format!(
             "candidates {}   batches {}",
@@ -1388,6 +1398,7 @@ mod tests {
             height: 1,
             baton_txid: "00".repeat(32),
             baton_vout: 0,
+            photon_target_le: String::new(),
             state_checks: 0,
             transient_refresh_failures: 0,
             transport_failures: 0,
@@ -1585,6 +1596,9 @@ mod tests {
     fn runtime_view_renders_shared_gpu_telemetry_and_efficiency() {
         let mut snapshot = test_snapshot();
         snapshot.search.current_rate = 500_000.0;
+        snapshot.search.rate = 1.2e9;
+        snapshot.search.peak_rate = 2.5e15;
+        snapshot.photon_target_le = "ab".repeat(32);
         snapshot.gpu_telemetry = crate::telemetry::GpuTelemetry {
             samples: 2,
             gpu_utilization_percent: Some(88.0),
@@ -1611,6 +1625,11 @@ mod tests {
         assert!(rendered.contains("temp 72.0C"));
         assert!(rendered.contains("power 100.0W"));
         assert!(rendered.contains("efficiency 5000.0 cand/s/W"));
+        assert!(rendered.contains("500.0 KH/s"));
+        assert!(rendered.contains("1.20 GH/s"));
+        assert!(rendered.contains("2.50 PH/s"));
+        assert!(rendered.contains("target abababab...abababab"));
+        assert!(rendered.contains("reconnects"));
     }
 
     #[test]
@@ -1688,6 +1707,7 @@ mod tests {
             height: 1,
             baton_txid: "00".repeat(32),
             baton_vout: 0,
+            photon_target_le: String::new(),
             state_checks: 0,
             transient_refresh_failures: 0,
             transport_failures: 0,
