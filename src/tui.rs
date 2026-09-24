@@ -449,8 +449,9 @@ fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
         .map(|seconds| format!("{seconds:.0}"))
         .unwrap_or_else(|| "n/a".into());
     format!(
-        "status state={:?} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} expected_winner_s={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} target_le={} endpoint={} last_error={}",
+        "status state={:?} waiting_for_job={} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} expected_winner_s={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} target_le={} endpoint={} last_error={}",
         snapshot.state,
+        snapshot.search.waiting_for_job,
         snapshot.search.intensity,
         snapshot.search.current_rate,
         snapshot.search.rate,
@@ -1102,7 +1103,10 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
 
 /// Renders the dashboard header and live connection state.
 fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
-    let state_text = format!("{:?}", snapshot.state).to_ascii_uppercase();
+    let mut state_text = format!("{:?}", snapshot.state).to_ascii_uppercase();
+    if snapshot.search.waiting_for_job {
+        state_text.push_str(" (all nonces tried, waiting for next job)");
+    }
     let line = Line::from(vec![
         Span::styled(" PICKAXE ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(

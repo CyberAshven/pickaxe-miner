@@ -909,6 +909,7 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
     serde_json::json!({
         "event": "status",
         "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
+        "waiting_for_job": snapshot.search.waiting_for_job,
         "backend": snapshot.gpu_backend,
         "device": snapshot.gpu_device,
         "generation_id": snapshot.generation_id,
@@ -1474,6 +1475,7 @@ mod tests {
                 peak_rate: 65_536.0,
                 winners: 0,
                 rejected_winners: 2,
+                waiting_for_job: false,
                 last_error: Some(
                     "GPU winner rejected by host verification: HASH256 mismatch".into(),
                 ),

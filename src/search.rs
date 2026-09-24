@@ -197,6 +197,9 @@ pub struct SearchStats {
     pub peak_rate: f64,
     pub winners: u64,
     pub rejected_winners: u64,
+    /// Every nonce of the current job has been tried; the GPU idles until
+    /// the next job instead of hashing the same candidates again.
+    pub waiting_for_job: bool,
     pub last_error: Option<String>,
 }
 
@@ -403,6 +406,33 @@ pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> 
     }
 }
 
+/// Tracks how much of a job's 2^32 nonce space has been searched.
+///
+/// The 4-byte nonce is the only per-candidate input, so a job has exactly
+/// 2^32 candidates. Batches walk the space from a random start with
+/// wrapping arithmetic; the last batch is trimmed so no nonce is hashed
+/// twice, and after that the job is exhausted.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct NonceSweep {
+    searched: u64,
+}
+
+impl NonceSweep {
+    const SPACE: u64 = 1 << 32;
+
+    /// Size of the next batch, or None once every nonce has been searched.
+    pub(crate) fn next_batch(&self, requested: u32) -> Option<u32> {
+        let remaining = Self::SPACE.saturating_sub(self.searched);
+        (remaining > 0 && requested > 0)
+            .then(|| u32::try_from(remaining.min(u64::from(requested))).unwrap_or(requested))
+    }
+
+    /// Counts candidates of a finished batch.
+    pub(crate) fn record(&mut self, candidates: u32) {
+        self.searched = self.searched.saturating_add(u64::from(candidates));
+    }
+}
+
 /// How much busy/wall history the duty pacer keeps before halving it.
 const DUTY_WINDOW: Duration = Duration::from_secs(2);
 /// Throttled work runs as one burst then one rest per period of this length.
@@ -522,6 +552,7 @@ fn deliver_verified_batch(
 struct WorkerDiagnostics {
     last_error: Mutex<Option<String>>,
     rejected_winners: AtomicU64,
+    job_exhausted: AtomicBool,
 }
 
 impl WorkerDiagnostics {
@@ -529,6 +560,7 @@ impl WorkerDiagnostics {
         Self {
             last_error: Mutex::new(None),
             rejected_winners: AtomicU64::new(0),
+            job_exhausted: AtomicBool::new(false),
         }
     }
 
@@ -550,6 +582,7 @@ impl WorkerDiagnostics {
 
     fn publish(&self, stats: &mut SearchStats) {
         stats.rejected_winners = self.rejected_winners.load(Ordering::Relaxed);
+        stats.waiting_for_job = self.job_exhausted.load(Ordering::Relaxed);
         stats.last_error = self
             .last_error
             .lock()
@@ -614,6 +647,7 @@ fn run_worker(
 ) {
     let mut rng = rand::rng();
     let mut nonce_base = rng.random::<u32>();
+    let mut sweep = NonceSweep::default();
     let mut pacer = DutyPacer::new(Instant::now());
     while !stop.load(Ordering::Relaxed) {
         loop {
@@ -624,6 +658,8 @@ fn run_worker(
                         generation_id.store(next.job.generation_id, Ordering::Release);
                         prepared = next;
                         nonce_base = rng.random::<u32>();
+                        sweep = NonceSweep::default();
+                        diagnostics.job_exhausted.store(false, Ordering::Relaxed);
                         Ok(())
                     });
                     let _ = reply.send(result);
@@ -648,7 +684,17 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
-        let batch_size = engine.scheduled_batch_candidates(active_intensity);
+        let Some(batch_size) =
+            sweep.next_batch(engine.scheduled_batch_candidates(active_intensity))
+        else {
+            // All 2^32 nonces of this job are done; hashing on would only
+            // repeat them. Idle until the supervisor installs the next job.
+            diagnostics.job_exhausted.store(true, Ordering::Relaxed);
+            batch_in_flight.store(false, Ordering::SeqCst);
+            thread::park_timeout(PAUSE_POLL);
+            pacer.reset(Instant::now());
+            continue;
+        };
         let batch_started = Instant::now();
         let batch = engine.search_batch(nonce_base, batch_size);
         let control = absorb_search_batch(&diagnostics, batch, |gpu_winner| {
@@ -672,6 +718,7 @@ fn run_worker(
         batch_in_flight.store(false, Ordering::SeqCst);
 
         nonce_base = nonce_base.wrapping_add(accepted.candidates);
+        sweep.record(accepted.candidates);
         let rest = pacer.record_batch(active_intensity, compute_time, Instant::now());
         if !rest.is_zero() {
             thread::park_timeout(rest);
@@ -990,6 +1037,7 @@ impl SearchHandle {
             peak_rate: 0.0,
             winners: self.winners.load(Ordering::Relaxed),
             rejected_winners: 0,
+            waiting_for_job: false,
             last_error: None,
         };
         self.diagnostics.publish(&mut stats);
@@ -1162,6 +1210,29 @@ mod tests {
             }
         }
         assert!((45..=55).contains(&rests), "{rests} periods in 5 s");
+    }
+
+    #[test]
+    fn nonce_sweep_covers_each_nonce_once_then_stops() {
+        let mut sweep = NonceSweep::default();
+        let batch = 262_144_u32;
+        let full_batches = (1_u64 << 32) / u64::from(batch);
+        for _ in 0..full_batches - 1 {
+            assert_eq!(sweep.next_batch(batch), Some(batch));
+            sweep.record(batch);
+        }
+        // Leave an uneven tail: the last batch is trimmed to what remains.
+        assert_eq!(sweep.next_batch(batch), Some(batch));
+        sweep.record(batch - 100);
+        assert_eq!(sweep.next_batch(batch), Some(100));
+        sweep.record(100);
+        assert_eq!(sweep.next_batch(batch), None);
+        assert_eq!(sweep.next_batch(1), None);
+
+        // Wrapping from any start with these sizes visits 2^32 distinct nonces.
+        let total = (full_batches - 1) * u64::from(batch) + u64::from(batch - 100) + 100;
+        assert_eq!(total, 1_u64 << 32);
+        assert_eq!(NonceSweep::default().next_batch(0), None);
     }
 
     #[test]

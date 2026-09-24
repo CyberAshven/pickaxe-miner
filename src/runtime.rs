@@ -3551,6 +3551,7 @@ mod tests {
             peak_rate: 0.0,
             winners: 0,
             rejected_winners: 0,
+            waiting_for_job: false,
             last_error: None,
         }
     }
