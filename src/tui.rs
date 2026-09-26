@@ -12,8 +12,12 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
+    widgets::{
+        Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, LineGauge, List, ListItem,
+        Paragraph, Wrap,
+    },
     Frame, Terminal, TerminalOptions, Viewport,
 };
 use std::{
@@ -31,6 +35,12 @@ const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EVENT_HISTORY_CAP: usize = 96;
+/// Spacing of hash-rate history samples.
+const RATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+/// One hour of hash-rate history.
+const RATE_HISTORY_CAP: usize = 720;
+/// Smallest leftover height worth a hash-rate chart.
+const HISTORY_MIN_ROWS: u16 = 7;
 const COMMAND_HISTORY_CAP: usize = 32;
 const BENCHMARK_TERMINAL_WIDTH: u16 = 120;
 const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
@@ -265,6 +275,8 @@ struct TuiState {
     status_line: String,
     events: VecDeque<String>,
     devices: Vec<GpuDevice>,
+    rate_history: VecDeque<f64>,
+    last_rate_sample: Option<Instant>,
 }
 
 impl TuiState {
@@ -284,7 +296,26 @@ impl TuiState {
             status_line: "Donation: 2%".into(),
             events,
             devices: Vec::new(),
+            rate_history: VecDeque::with_capacity(RATE_HISTORY_CAP),
+            last_rate_sample: None,
         }
+    }
+
+    /// Samples the current hash rate for the history chart at most once
+    /// per sample interval.
+    fn record_rate(&mut self, rate: f64, now: Instant) {
+        if self
+            .last_rate_sample
+            .is_some_and(|sampled| now.duration_since(sampled) < RATE_SAMPLE_INTERVAL)
+        {
+            return;
+        }
+        if self.rate_history.len() == RATE_HISTORY_CAP {
+            self.rate_history.pop_front();
+        }
+        self.rate_history
+            .push_back(if rate.is_finite() { rate.max(0.0) } else { 0.0 });
+        self.last_rate_sample = Some(now);
     }
 
     /// Adds a runtime event to the bounded terminal log.
@@ -502,6 +533,7 @@ pub fn run(
     let mut last_status_log: Option<Instant> = None;
     while !quit {
         let snapshot = supervisor.snapshot();
+        state.record_rate(snapshot.search.current_rate, Instant::now());
 
         for event in supervisor.drain_events() {
             append_tui_log(&format!("event {}", event_log_text(&event)));
@@ -1078,13 +1110,26 @@ fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
 /// Renders the active mining dashboard.
 fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     let area = frame.area();
+    // The runtime and events panes are only as tall as the runtime rows
+    // need; a tall window gives the rest to the hash-rate chart instead of
+    // empty boxes.
+    let runtime_width = runtime_pane_width(area.width);
+    let available = area.height.saturating_sub(3 + 3 + 4);
+    let needed = u16::try_from(runtime_fields(snapshot, runtime_width).len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let (body_height, history_height) = match available.checked_sub(needed) {
+        Some(spare) if spare >= HISTORY_MIN_ROWS => (needed, spare),
+        _ => (available, 0),
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(4),
+            Constraint::Length(body_height),
+            Constraint::Length(history_height),
+            Constraint::Min(4),
         ])
         .split(area);
 
@@ -1093,11 +1138,14 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([Constraint::Length(runtime_width), Constraint::Min(0)])
         .split(rows[2]);
     render_stats(frame, body[0], snapshot);
     render_events(frame, body[1], state);
-    render_footer(frame, rows[3], state);
+    if history_height > 0 {
+        render_history(frame, rows[3], state);
+    }
+    render_footer(frame, rows[4], state);
 
     if state.show_help {
         render_help(frame, area);
@@ -1132,16 +1180,18 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) 
 
 /// Renders the GPU intensity control and current value.
 fn render_intensity(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
-    let ratio = f64::from(snapshot.search.intensity) / 100.0;
-    let gauge = Gauge::default()
+    let ratio = f64::from(snapshot.search.intensity.min(100)) / 100.0;
+    let gauge = LineGauge::default()
         .block(
             Block::default()
                 .title(" GPU intensity ")
                 .borders(Borders::ALL),
         )
-        .gauge_style(Style::default().fg(Color::Cyan))
+        .filled_style(Style::default().fg(Color::Cyan))
+        .unfilled_style(Style::default().fg(Color::DarkGray))
+        .line_set(symbols::line::THICK)
         .ratio(ratio)
-        .label(format!("{}%", snapshot.search.intensity));
+        .label(format!("{:>3}% ", snapshot.search.intensity));
     frame.render_widget(gauge, area);
 }
 
@@ -1341,8 +1391,33 @@ fn format_duration(seconds: f64) -> String {
 /// shown in full: long values wrap under their label, and when the pane is
 /// too short the least important fields are left out.
 fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
-    let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
+    let lines = fit_runtime_fields(runtime_field_groups(snapshot, area.width), inner_height);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().title(" Runtime ").borders(Borders::ALL)),
+        area,
+    );
+}
+
+/// Width of the runtime pane: enough for the full target on one row when
+/// the window allows, at most 58% of a narrow window, and never less than
+/// half; the events pane gets the rest.
+fn runtime_pane_width(total: u16) -> u16 {
+    const PREFERRED: u16 = 2 + RUNTIME_LABEL_WIDTH as u16 + 71;
+    PREFERRED.min(total * 58 / 100).max(total / 2)
+}
+
+/// Every runtime row at `pane_width`, before any are dropped for height.
+fn runtime_fields(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Line<'static>> {
+    runtime_field_groups(snapshot, pane_width)
+        .into_iter()
+        .flat_map(|field| field.lines)
+        .collect()
+}
+
+/// Builds the labelled runtime fields for a pane `pane_width` columns wide.
+fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<RuntimeField> {
+    let inner_width = pane_width.saturating_sub(2) as usize;
     let value_width = inner_width.saturating_sub(RUNTIME_LABEL_WIDTH);
     let wrap = |value: String| wrap_value(&value, value_width);
     let search = &snapshot.search;
@@ -1366,7 +1441,7 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
         _ => "waiting for the live target".into(),
     };
 
-    let fields = vec![
+    vec![
         RuntimeField::new(
             "Hashrate",
             wrap(format!(
@@ -1378,7 +1453,7 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             1,
         ),
         RuntimeField::new(
-            "Winners",
+            "Wins",
             wrap(format!(
                 "{} found · {} stale · {} rejected · {} pending",
                 snapshot.verified_winners,
@@ -1477,12 +1552,72 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             wrap(last_error.to_string()),
             if snapshot.last_error.is_some() { 2 } else { 9 },
         ),
-    ];
-    frame.render_widget(
-        Paragraph::new(fit_runtime_fields(fields, inner_height))
-            .block(Block::default().title(" Runtime ").borders(Borders::ALL)),
-        area,
+    ]
+}
+
+/// Rounds a positive value up to 1, 1.5, 2, 2.5, 3, 4, 5, 6 or 8 times a
+/// power of ten, so chart labels read as round numbers.
+fn nice_ceiling(value: f64) -> f64 {
+    if !value.is_finite() || value <= 1.0 {
+        return 1.0;
+    }
+    let magnitude = 10f64.powf(value.log10().floor());
+    [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+        .into_iter()
+        .map(|step| step * magnitude)
+        .find(|candidate| *candidate >= value)
+        .unwrap_or(10.0 * magnitude)
+}
+
+/// Charts the last hour of hash rate; dips to zero show idle GPU time.
+fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let step = RATE_SAMPLE_INTERVAL.as_secs_f64();
+    let window = RATE_HISTORY_CAP as f64 * step;
+    let newest = state.rate_history.len().saturating_sub(1) as f64;
+    let points = state
+        .rate_history
+        .iter()
+        .enumerate()
+        .map(|(index, rate)| ((index as f64 - newest) * step, *rate))
+        .collect::<Vec<_>>();
+    let top = nice_ceiling(points.iter().map(|(_, rate)| *rate).fold(0.0_f64, f64::max) * 1.1);
+    let minutes = |seconds: f64| format!("{:.0}m", seconds / 60.0);
+    let hash_rate = crate::telemetry::format_hash_rate;
+    let chart = Chart::new(vec![Dataset::default()
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Cyan))
+        .data(&points)])
+    .block(
+        Block::default()
+            .title(format!(
+                " Hashrate · last {} min · one sample every {} s ",
+                (window / 60.0).round(),
+                step.round()
+            ))
+            .borders(Borders::ALL),
+    )
+    .x_axis(
+        Axis::default()
+            .style(Style::default().fg(Color::DarkGray))
+            .bounds([-window, 0.0])
+            .labels([
+                Span::raw(format!("-{}", minutes(window))),
+                Span::raw(format!("-{}", minutes(window / 2.0))),
+                Span::raw("now"),
+            ]),
+    )
+    .y_axis(
+        Axis::default()
+            .style(Style::default().fg(Color::DarkGray))
+            .bounds([0.0, top])
+            .labels([
+                Span::raw(hash_rate(0.0)),
+                Span::raw(hash_rate(top / 2.0)),
+                Span::raw(hash_rate(top)),
+            ]),
     );
+    frame.render_widget(chart, area);
 }
 
 /// Formats an optional GPU metric as a whole number.
@@ -2111,7 +2246,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("jobs 1")));
         let row_of = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
         assert!(
-            row_of("Hashrate ") < row_of("Winners ") && row_of("Winners ") < row_of("reconnects "),
+            row_of("Hashrate ") < row_of("Wins ") && row_of("Wins ") < row_of("reconnects "),
             "hash rate, then winners, then connection counters: {rows:?}"
         );
         assert!(
@@ -2170,7 +2305,7 @@ mod tests {
         assert!(normal.iter().any(|row| row.contains("1 win per ")));
 
         let short = rendered_rows(&snapshot, 120, 16);
-        for kept in ["Hashrate", "Winners", "Last error"] {
+        for kept in ["Hashrate", "Wins", "Last error"] {
             assert!(
                 short.iter().any(|row| row.contains(kept)),
                 "{kept}: {short:?}"
@@ -2182,6 +2317,41 @@ mod tests {
                 "{dropped}: {short:?}"
             );
         }
+    }
+
+    #[test]
+    fn rate_history_samples_on_its_interval_and_stays_bounded() {
+        let mut state = TuiState::new(&test_snapshot());
+        let start = Instant::now();
+        state.record_rate(1.0, start);
+        state.record_rate(2.0, start + Duration::from_secs(1));
+        assert_eq!(state.rate_history.len(), 1);
+        for step in 1..=(RATE_HISTORY_CAP as u64 + 5) {
+            state.record_rate(step as f64, start + RATE_SAMPLE_INTERVAL * step as u32);
+        }
+        assert_eq!(state.rate_history.len(), RATE_HISTORY_CAP);
+        assert_eq!(
+            state.rate_history.back().copied(),
+            Some((RATE_HISTORY_CAP + 5) as f64)
+        );
+    }
+
+    #[test]
+    fn tall_window_charts_hash_rate_instead_of_empty_rows() {
+        let snapshot = test_snapshot();
+        let rows = rendered_rows(&snapshot, 190, 50);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(" Hashrate · last 60 min")),
+            "{rows:?}"
+        );
+        let runtime_bottom = rows
+            .iter()
+            .position(|row| row.contains("Last error"))
+            .unwrap();
+        assert!(rows[runtime_bottom + 1].starts_with("└"), "{rows:?}");
+        let short = rendered_rows(&snapshot, 120, 30);
+        assert!(!short.iter().any(|row| row.contains(" Hashrate · last")));
     }
 
     #[test]
@@ -2203,6 +2373,10 @@ mod tests {
         assert_eq!(format_duration(90_061.0), "1d 01h 01m");
         assert_eq!(format_duration(42.0), "42s");
         assert_eq!(format_si_count(126_400_000_000.0), "126.4 G");
+        assert_eq!(nice_ceiling(34.5e6), 40e6);
+        assert_eq!(nice_ceiling(31.42e6 * 1.1), 40e6);
+        assert_eq!(nice_ceiling(0.0), 1.0);
+        assert_eq!(nice_ceiling(2.0e3), 2.0e3);
     }
 
     #[test]
