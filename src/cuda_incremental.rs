@@ -96,10 +96,14 @@ impl Incremental {
             )
             .serialize_uncompressed();
             let words: Vec<u32> = point[1..]
-                .chunks_exact(32)
+                .as_chunks::<32>()
+                .0
+                .iter()
                 .flat_map(|coordinate| {
                     coordinate
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .rev()
                         .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
                 })
