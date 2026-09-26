@@ -4,6 +4,25 @@ Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7
 
 **Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. The user subsequently authorized promoting `fd95cbc` to master and continuing measured optimization rounds. The default release build and `D:\pickaxe-live` remain unchanged. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
 
+## Round 6: rejected centered affine batches and register-limit trials
+
+The next approach generated affine points around a lane's center scalar. Positive and negative offsets share the same x-coordinate denominator; a prefix product supplies their inverses together. A dedicated C1 entry reused the production signing helper while skipping normalization for these Z=1 points. The derivation used the [EFD affine group formulas](https://www.hyperelliptic.org/EFD/g1p/auto-shortw.html); [VanitySearch's GPU point batching](https://github.com/JeanLucPons/VanitySearch/blob/master/GPU/GPUCompute.h) was inspected as a conceptual comparison, without importing source. This still enumerated the original consecutive public search scalars and retained the funded-key separation.
+
+Both 32- and 16-candidate lane shapes passed the 13,920 independent cases. Full-batch signature sampling was expanded to include the first, second and last lane at every offset within each group. The 128-register builds required 1024/832 bytes of stack and 128/112 bytes of spill stores respectively. Raising the compiler limit to 256 removed spills: actual allocation became 184/182 registers, with 992/736 bytes of stack. The affine C1 used 79 registers and no stack or spills. All changed compiler variants also passed the independent checks before timing.
+
+Each comparison used the same full pipeline and master reference kernels, 45 seconds of warm-up, eight alternating eight-second windows and one-second inter-window warm-ups. The reference retained 32 candidates per lane. The candidate changed both point generation and C1 together; host geometry changed with the selected kernel pair. A final trial kept the original algorithm and C1 and changed only the point-generator register limit (190 actual registers, 264-byte stack, zero spills):
+
+| Candidate | Order | Master median, million/s | Candidate median, million/s | Difference |
+| --- | --- | ---: | ---: | ---: |
+| Affine 32, register limit 128 | ABBA ABBA | 103.139 | 90.483 | -12.27% |
+| Affine 16, register limit 128 | BAAB BAAB | 104.590 | 100.570 | -3.84% |
+| Affine 16, register limit 256 | ABBA ABBA | 107.353 | 99.805 | -7.03% |
+| Original walk, register limit 256 | BAAB BAAB | 109.363 | 109.251 | -0.10% |
+
+None established a speed record. Telemetry varied and included isolated idle/low-utilization samples, retained in the raw JSON rather than discarded. Removing reported spills did not establish a speed gain; the precise limiting hardware mechanism remains unproven. An Nsight Compute attempt with clock control disabled was denied access to GPU counters (`ERR_NVGPUCTRPERM`). Its partial, instrumented timings are excluded from these comparisons, and the diagnostic child was stopped. No driver permission or clock setting was changed.
+
+All task-owned CUDA/Rust candidate changes were removed and saved as an ignored patch. No candidate reached the live TUI or master. The unchanged verified miner was restarted after confirming GPU tests had exited. `artifacts/incremental-k/round6/` contains the candidate patch, compiler logs, correctness evidence, reference PTX, all four raw comparisons and the failed profiler log. The timing evidence rejects these implementations; it does not prove an absolute optimization ceiling or rule out other affine designs.
+
 ## Round 5: rejected shared C3 SHA-256 schedules
 
 A new Nsight Systems capture of the master pipeline's existing nine-shape tuning sweep attributed 49.0% of CUDA kernel time to C1 signing, 32.4% to incremental point generation and 18.6% to C3 filtering. Median kernel durations across that sweep were 1.264, 0.833 and 0.485 ms respectively. These aggregated profiling measurements locate work; they are not a controlled speed comparison or live rate.
