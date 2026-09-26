@@ -10,6 +10,148 @@ use std::time::{Duration, Instant};
 const NONCE: u32 = 0x1234_5678;
 const BATCH: u32 = 262_144;
 
+#[test]
+#[ignore = "serial Montgomery scalar arithmetic CUDA oracle"]
+fn incremental_k_montgomery_scalar_oracle() {
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let kernel =
+        load_function(&ctx, "scalar-check.ptx", "pickaxe_scalar_montgomery_check").unwrap();
+    let n = BigUint::from_bytes_be(
+        &hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141").unwrap(),
+    );
+    let mut values = vec![
+        BigUint::from(0u32),
+        BigUint::from(1u32),
+        &n - 1u32,
+        &n - 2u32,
+    ];
+    for bits in (32..256).step_by(32) {
+        values.push((BigUint::from(1u32) << bits) - 1u32);
+        values.push(BigUint::from(1u32) << bits);
+    }
+    for i in 0..512u32 {
+        values.push(BigUint::from_bytes_be(&Sha256::digest(i.to_le_bytes())) % &n);
+    }
+    let words = |value: &BigUint| {
+        let mut out = value.to_u32_digits();
+        out.resize(8, 0);
+        out
+    };
+    let inputs: Vec<u32> = values.iter().flat_map(words).collect();
+    let mut inputs_gpu = stream.alloc_zeros::<u32>(inputs.len()).unwrap();
+    stream.memcpy_htod(&inputs, &mut inputs_gpu).unwrap();
+    let mut table_gpu = stream.alloc_zeros::<u32>(FIXED_D_WORDS).unwrap();
+    let mut output_gpu = stream.alloc_zeros::<u32>(inputs.len()).unwrap();
+    let mut keys = vec![
+        BigUint::from(1u32),
+        BigUint::from(2u32),
+        &n - 1u32,
+        &n - 2u32,
+    ];
+    keys.extend(values.iter().skip(18).take(32).cloned());
+    for d in &keys {
+        let mut key = [0; 32];
+        let bytes = d.to_bytes_be();
+        key[32 - bytes.len()..].copy_from_slice(&bytes);
+        stream
+            .memcpy_htod(&fixed_d_table(&key), &mut table_gpu)
+            .unwrap();
+        let count = values.len() as u32;
+        unsafe {
+            stream
+                .launch_builder(&kernel)
+                .arg(&inputs_gpu)
+                .arg(&table_gpu)
+                .arg(&mut output_gpu)
+                .arg(&count)
+                .launch(LaunchConfig {
+                    grid_dim: (count.div_ceil(64), 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let outputs = stream.clone_dtoh(&output_gpu).unwrap();
+        for (e, out) in values.iter().zip(outputs.as_chunks::<8>().0) {
+            assert_eq!(out.as_slice(), words(&((e * d) % &n)), "e={e} d={d}");
+        }
+    }
+    eprintln!(
+        "PASS {} independent scalar products including zero, order and limb boundaries",
+        keys.len() * values.len()
+    );
+}
+
+#[test]
+#[ignore = "serial C1 comparison; requires old photon_c1_reference.ptx and current kernels"]
+fn incremental_k_c1_comparison() {
+    let mut engine = CudaPhotonEngine::new(0, BATCH, 8).unwrap();
+    let mut incremental = Incremental::new(&engine, 32).unwrap();
+    let mut target = [0u8; 32];
+    target[28] = 1;
+    engine
+        .set_job(&template(10, &target, &[0x11; 32]), &target, &[0x11; 32])
+        .unwrap();
+    incremental.set_message(&engine, &target, NONCE).unwrap();
+    let kernels = [
+        load_function(
+            &engine._ctx,
+            "photon_c1_reference.ptx",
+            "pickaxe_photon_c1_schnorr_dual_batched",
+        )
+        .unwrap(),
+        engine.stage_c1.clone(),
+    ];
+    let reverse = usize::from(std::env::var_os("PICKAXE_C1_REVERSE").is_some());
+    engine.stage_c1 = kernels[reverse].clone();
+    let mut records = Vec::new();
+    let thermal_warmup = Instant::now();
+    while thermal_warmup.elapsed() < Duration::from_secs(45) {
+        incremental.batch(&mut engine, 0, BATCH).unwrap();
+    }
+    for (round, variant) in [0, 1, 1, 0, 0, 1, 1, 0].into_iter().enumerate() {
+        let variant = variant ^ reverse;
+        engine.stage_c1 = kernels[variant].clone();
+        let mut base = 0u32;
+        let mut run = || {
+            let batch = incremental.batch(&mut engine, base, BATCH).unwrap();
+            assert_eq!(batch.candidates, BATCH);
+            base = base.wrapping_add(BATCH);
+        };
+        let warm = Instant::now();
+        while warm.elapsed() < Duration::from_secs(1) {
+            run();
+        }
+        let start = Instant::now();
+        let mut candidates = 0u64;
+        while start.elapsed() < Duration::from_secs(8) {
+            run();
+            candidates += u64::from(BATCH);
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let rate = candidates as f64 / seconds / 1e6;
+        eprintln!("round={round} variant={variant} M_candidates_per_s={rate:.6}");
+        let telemetry = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=temperature.gpu,power.draw,clocks.sm,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+            .unwrap();
+        eprintln!(
+            "telemetry={}",
+            String::from_utf8_lossy(&telemetry.stdout).trim()
+        );
+        records.push(serde_json::json!({"round":round,"variant":variant,"candidates":candidates,"seconds":seconds,"million_candidates_per_second":rate,"telemetry_csv":String::from_utf8_lossy(&telemetry.stdout).trim()}));
+    }
+    std::fs::write(
+        "artifacts/incremental-k/round3/comparison.json",
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
+}
+
 fn secret(value: u64) -> [u8; 32] {
     let mut out = [0; 32];
     out[24..].copy_from_slice(&value.to_be_bytes());

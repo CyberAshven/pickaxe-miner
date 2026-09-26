@@ -4,6 +4,23 @@ Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7
 
 **Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. The user subsequently authorized promoting `fd95cbc` to master and continuing measured optimization rounds. The default release build and `D:\pickaxe-live` remain unchanged. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
 
+## Round 3: Montgomery scalar multiplication
+
+CUDA C1 replaces 32 challenge-indexed table additions with an eight-limb Montgomery product. For R=2^256, the existing table entry at byte 31, digit 128 is d*R/2 mod n; doubling it supplies d*R mod n, so Montgomery(e, d*R) returns e*d mod n. This preserves full-width random search keys, all signatures, the kernel ABI and persistent allocations. HIP keeps the existing table algorithm. The algorithm was researched against NVIDIA's [CGBN Montgomery documentation](https://github.com/NVlabs/CGBN/blob/master/docs/CGBN.md); no external library or source was imported.
+
+Two interleaved comparisons used 45 seconds of initial GPU warm-up, one second before each window and eight seconds measured per window. Eight windows per run used ABBA ABBA and BAAB BAAB. Same full-width key, target, 262,144-candidate batches, complete incremental pipeline and compact winner readback:
+
+| Order | Previous C1 median, million/s | Montgomery C1 median, million/s | Gain |
+| --- | ---: | ---: | ---: |
+| ABBA ABBA | 97.049 | 105.424 | 8.63% |
+| BAAB BAAB | 96.990 | 107.512 | 10.85% |
+
+Temperatures/clocks varied: 84–86 C and 2362–2692 MHz in the first run, 79–81 C and 2400–2707 MHz in the second. One second-run baseline telemetry sample had 85% utilization; the other second-run samples had 97–99%. The repeated advantage is stronger evidence than the highest 110.269 million/s window; it is not a guarantee of that speed under thermal throttling. Before this round, the unchanged live executable and C1 hashes were checked when speed fell to 81.6 million/s: NVIDIA reported active software thermal slowdown at 87 C. No overclock, power, fan or system thermal setting was changed by this work.
+
+The candidate passed 19,080 direct GPU scalar products against Rust BigUint, including zero, order-minus-one/two, limb boundaries and deterministic random full-width operands. It also passed 13,920 independently reconstructed signatures/transactions and full-batch lane samples. Final-source regression, CI and live validation results are recorded below once complete. Evidence is in ignored `artifacts/incremental-k/round3/`.
+
+The direct arithmetic test is `incremental_k_montgomery_scalar_oracle` (ignored, explicit CUDA run). `tools/build-incremental-k.cmd` now builds six runtime PTX files plus `scalar-check.ptx`, a test-only export of the production multiplication. For a controlled comparison, retain the previous C1 as `photon_c1_reference.ptx` beside the test executable, install current kernels, and run `incremental_k_c1_comparison -- --ignored --nocapture --test-threads=1`. Set `PICKAXE_C1_REVERSE=1` for BAAB BAAB. The earlier raw reverse-run log used swapped PTX aliases (variant 0 was Montgomery); the committed comparison test always labels variant 0 as reference and variant 1 as current.
+
 ## Round 2: rejected C1 memory and arithmetic candidates
 
 Research reviewed NVIDIA's [shared-memory spilling guidance](https://developer.nvidia.com/blog/?p=105101), [local-memory behavior](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html), and [extended-precision carry instructions](https://docs.nvidia.com/cuda/parallel-thread-execution/contents.html). Other implementations, including [UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1), use Montgomery batch inversion; Pickaxe already uses that algorithm. External throughput claims were not treated as comparable PHOTON results.

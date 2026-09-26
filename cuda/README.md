@@ -41,6 +41,9 @@ The opt-in CUDA incremental search candidate is built with
 Place its six PTX files beside the executable under `cuda\build`.
 It walks public signing scalars using only the worker's unfunded search key,
 rotates that key after each 2^32 sweep, and retains RFC6979 for reward signing.
+CUDA C1 uses Montgomery multiplication with the existing fixed-key table;
+HIP retains its table algorithm. The build helper also emits the test-only
+`scalar-check.ptx` for independent scalar arithmetic verification.
 The default build retains the pipeline above. Measurements, live validation
 and serial reproduction steps are in [the experiment report](../docs/incremental-k.md).
 

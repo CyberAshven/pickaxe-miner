@@ -15,3 +15,6 @@ for %%K in (photon_stage_b16 photon_c1_schnorr photon_c3_dual photon_incremental
 )
 nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -DPICKAXE_INCREMENTAL_K_EXPERIMENT -o "%KERNEL_OUT%\photon_incremental_c3.ptx" cuda\photon_c3_dual.cu
 if errorlevel 1 exit /b 1
+rem Arithmetic oracle only; not loaded by the miner.
+nvcc -ptx -O3 -arch=sm_120 -maxrregcount=128 -DPICKAXE_C1_SCALAR_CHECK -o "%KERNEL_OUT%\scalar-check.ptx" cuda\photon_c1_schnorr.cu
+if errorlevel 1 exit /b 1

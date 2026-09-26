@@ -3,9 +3,11 @@
 // PHOTON Stage C1: Jacobian kG -> exact BCH Schnorr R||s.
 //
 // Inputs are persistent device buffers produced by Stage A and Stage B. The
-// fixed-private-key multiplication uses the M39 reference table:
+// fixed-private-key factor uses the M39 reference table:
 //   T[bytePosition][digit] = d * digit * 256^bytePosition mod n
-// (32 * 256 * 32 bytes = 256 KiB). No per-candidate crypto crosses to host.
+// (32 * 256 * 32 bytes = 256 KiB). CUDA reads one fixed entry for Montgomery
+// multiplication; HIP retains byte-indexed accumulation. No candidate crypto
+// crosses to the host.
 
 namespace {
 
@@ -217,6 +219,46 @@ __device__ __forceinline__ Scalar256 fixed_d_value(
     return value;
 }
 
+#if defined(__CUDA_ARCH__) && !defined(__HIPCC__)
+// R=2^256. The existing table gives d*2^255 mod n at byte 31, digit 128.
+// Doubling it supplies d*R mod n without changing the kernel ABI or job data.
+__device__ Scalar256 scalar_mul_fixed_d(const Scalar256* e, const uint32_t* table) {
+    const Scalar256 half = fixed_d_value(table, 31u, 128u);
+    const Scalar256 d_mont = scalar_add_mod_n(&half, &half);
+    const Scalar256 n = scalar_n();
+    uint32_t t[10] = {};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint64_t carry = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint64_t sum = (uint64_t)e->d[j] * d_mont.d[i] + t[j] + carry;
+            t[j] = (uint32_t)sum;
+            carry = sum >> 32;
+        }
+        const uint64_t top = (uint64_t)t[8] + carry;
+        t[8] = (uint32_t)top;
+        t[9] = (uint32_t)(top >> 32);
+        // -n[0]^-1 mod 2^32: the low word cancels before the right shift.
+        const uint32_t m = t[0] * 0x5588b13fu;
+        carry = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint64_t sum = (uint64_t)m * n.d[j] + t[j] + carry;
+            if (j != 0) t[j - 1] = (uint32_t)sum;
+            carry = sum >> 32;
+        }
+        const uint64_t reduced_top = (uint64_t)t[8] + carry;
+        t[7] = (uint32_t)reduced_top;
+        t[8] = t[9] + (uint32_t)(reduced_top >> 32);
+    }
+    Scalar256 result;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) result.d[i] = t[i];
+    if (t[8] != 0 || scalar_cmp(&result, &n) >= 0) result = scalar_sub_raw(&result, &n);
+    return result;
+}
+#else
 __device__ Scalar256 scalar_mul_fixed_d(const Scalar256* e, const uint32_t* table) {
     Scalar256 result = scalar_zero();
     for (uint32_t byte_position = 0u; byte_position < 32u; ++byte_position) {
@@ -229,6 +271,8 @@ __device__ Scalar256 scalar_mul_fixed_d(const Scalar256* e, const uint32_t* tabl
     }
     return result;
 }
+
+#endif
 
 __device__ __forceinline__ void fe_to_be(const Fe* value, uint8_t bytes[32]) {
     for (int i = 0; i < 8; ++i) {
@@ -396,3 +440,15 @@ extern "C" __global__ void pickaxe_photon_c1_schnorr_dual_batched(
                      public_key33, fixed_d_table, signatures, negated_nonce_s);
     }
 }
+
+#ifdef PICKAXE_C1_SCALAR_CHECK
+extern "C" __global__ void pickaxe_scalar_montgomery_check(const uint32_t* es, const uint32_t* table, uint32_t* out, uint32_t count) {
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    Scalar256 e;
+    for (int j=0; j<8; ++j) e.d[j]=es[index*8+j];
+    const Scalar256 product=scalar_mul_fixed_d(&e,table);
+    for (int j=0; j<8; ++j) out[index*8+j]=product.d[j];
+}
+
+#endif
