@@ -4,6 +4,21 @@ Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7
 
 **Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. The user subsequently authorized promoting `fd95cbc` to master and continuing measured optimization rounds. The default release build and `D:\pickaxe-live` remain unchanged. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
 
+## Round 4: rejected fixed-eight C1 specialization
+
+Starting from master `6710112`, a CUDA-only offline prototype fixed C1 to eight candidates per thread and unrolled both prefix-product and reverse-signing loops. NVIDIA's [private-array indexing guidance](https://developer.nvidia.com/blog/fast-dynamic-indexing-private-arrays-cuda/) motivated replacing dynamic local-array access with constant indexes. This was a restricted test kernel, not a replacement for the generic production entry point: other batch sizes were intentionally unsupported and it was never deployed live.
+
+The 128-register build reduced the C1 stack from 672 to 160 bytes without spills, but used 128 rather than 75 registers. A second build capped registers at 96 and required a 232-byte stack, 72 bytes of spill stores and 104 bytes of spill loads. Both passed 13,920 independent signature/transaction cases and full-batch lane samples using the eight-candidate configuration.
+
+Each full-pipeline comparison used the same workload as round 3, 45 seconds of warm-up and eight interleaved eight-second windows:
+
+| Prototype | Order | Master median, million/s | Candidate median, million/s | Difference |
+| --- | --- | ---: | ---: | ---: |
+| Fixed eight, 128 registers | ABBA ABBA | 94.964 | 95.708 | +0.78% |
+| Fixed eight, 96 registers | BAAB BAAB | 101.174 | 102.544 | +1.35% |
+
+The first run sampled 86–87 C and 2385–2452 MHz; the second sampled 77–83 C and 2250–2707 MHz. These differences are within the observed variability and do not establish a repeatable speed record. Both prototypes were rejected. No product source or live kernel changed. The sole live miner was stopped cleanly for serial GPU testing, then the verified Montgomery runtime was restarted. Ignored `artifacts/incremental-k/round4/` retains prototype source, compiler resource reports, correctness logs, reference PTX and raw comparisons.
+
 ## Round 3: Montgomery scalar multiplication
 
 CUDA C1 replaces 32 challenge-indexed table additions with an eight-limb Montgomery product. For R=2^256, the existing table entry at byte 31, digit 128 is d*R/2 mod n; doubling it supplies d*R mod n, so Montgomery(e, d*R) returns e*d mod n. This preserves full-width random search keys, all signatures, the kernel ABI and persistent allocations. HIP keeps the existing table algorithm. The algorithm was researched against NVIDIA's [CGBN Montgomery documentation](https://github.com/NVlabs/CGBN/blob/master/docs/CGBN.md); no external library or source was imported.
