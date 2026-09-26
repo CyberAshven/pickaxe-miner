@@ -24,7 +24,9 @@ The prepared v0.0.1 archives are:
 - Linux: `pickaxe-miner-v0.0.1-linux-x86_64.tar.gz`
 - Windows: `pickaxe-miner-v0.0.1-windows-x86_64.zip`
 
-The release also publishes `SHA256SUMS.txt` for those two archives. Merging to `master` runs the Release workflow, which tags the merged commit `pickaxe-miner-v<Cargo.toml version>` and publishes these archives. A merge that does not bump the version publishes nothing, and a push that only changes Markdown files or `docs/` never starts a release. Pull requests run the same build and packaging as a dry run. Until the v0.0.1 release exists, build from source.
+The [v0.0.1 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.1) publishes these archives and `SHA256SUMS.txt`. Release binaries enable the tested CUDA incremental search and tuned batch geometry. HIP retains its existing search path.
+
+Merging to `master` runs the Release workflow, which tags the merged commit `pickaxe-miner-v<Cargo.toml version>` and publishes these archives. A merge that does not bump the version publishes nothing, and a push that only changes Markdown files or `docs/` never starts a release. Pull requests affecting release packaging run it as a dry run. Manual dispatch rebuilds an existing tag.
 
 Linux:
 
@@ -55,21 +57,23 @@ Headless, from the same directory:
 ## Build
 
 ```bash
-cargo build --release
+cargo build --release --locked --features incremental-k
 ```
 
 The cargo binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.1`.
 
+Keep the bundled `cuda/build` directory beside the executable when distributing it. Omitting `--features incremental-k` builds the original CUDA search path.
+
 Interactive TUI:
 
 ```bash
-cargo run --release -- mine
+cargo run --release --features incremental-k -- mine
 ```
 
 Headless:
 
 ```bash
-cargo run --release -- mine --no-tui
+cargo run --release --features incremental-k -- mine --no-tui
 ```
 
 List GPUs:
@@ -89,7 +93,7 @@ cargo run --release -- benchmark
 - There is no CPU mining fallback.
 - `wgpu` is not a verified production backend. Production mining is CUDA or HIP.
 - The donation is hard-coded at 2%.
-- Tag `pickaxe-miner-v0.0.1` and its GitHub Release are created automatically when this work is merged to `master`; they do not exist before that.
+- CUDA performance was measured on the local NVIDIA GPU; HIP artifacts are build-verified, without a physical AMD performance claim.
 
 ## Features
 

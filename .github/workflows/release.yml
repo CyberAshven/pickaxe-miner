@@ -251,7 +251,7 @@ jobs:
         run: cargo test --locked --release --all-features --no-fail-fast -- --skip if_cuda
 
       - name: Build release
-        run: cargo build --locked --release
+        run: cargo build --locked --release --features incremental-k
 
       - name: Verify interactive TUI binary
         shell: bash
@@ -301,6 +301,8 @@ jobs:
             photon_stage_b16.ptx \
             photon_c1_schnorr.ptx \
             photon_c3_dual.ptx \
+            photon_incremental_k.ptx \
+            photon_incremental_c3.ptx \
             stage_c_hash.ptx; do
             test -s "cuda/build/${artifact}"
             grep -q '^\.target sm_120$' "cuda/build/${artifact}"
@@ -322,6 +324,7 @@ jobs:
             echo "Platform: Linux x86_64. This archive is not ARM, ARM64, or macOS."
             echo "Interactive TUI: ./pickaxe mine. Headless: ./pickaxe mine --no-tui."
             echo "NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required."
+            echo "CUDA incremental search and tuned batch geometry are enabled."
             echo "AMD HIP code objects in hip/build/gfx1036 are gfx1036 only and were built by this workflow."
             echo "No CPU mining fallback. wgpu is not a verified production mining backend in this asset."
           } > "dist/${package}/BACKENDS.txt"
@@ -387,6 +390,8 @@ jobs:
             'photon_stage_b16.ptx',
             'photon_c1_schnorr.ptx',
             'photon_c3_dual.ptx',
+            'photon_incremental_k.ptx',
+            'photon_incremental_c3.ptx',
             'stage_c_hash.ptx'
           )
           foreach ($artifact in $requiredPtx) {
@@ -422,6 +427,7 @@ jobs:
             'Platform: Windows x86_64. This archive is not ARM, ARM64, or macOS.'
             'Interactive TUI: .\pickaxe.exe mine. Headless: .\pickaxe.exe mine --no-tui.'
             'NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required.'
+            'CUDA incremental search and tuned batch geometry are enabled.'
             'AMD HIP code objects in hip/build/gfx1036 are gfx1036 only and were built by this workflow.'
             'No CPU mining fallback. wgpu is not a verified production mining backend in this asset.'
           ) | Set-Content -LiteralPath (Join-Path $packageDir 'BACKENDS.txt') -Encoding utf8
@@ -468,6 +474,7 @@ jobs:
         env:
           TAG: ${{ needs.validate.outputs.tag }}
           MODE: ${{ needs.validate.outputs.mode }}
+          SHA: ${{ needs.validate.outputs.sha }}
         run: |
           set -euo pipefail
           version="${TAG#pickaxe-miner-v}"
@@ -484,9 +491,11 @@ jobs:
             echo "Verified assets are Windows x86_64 and Linux x86_64 only."
             echo "No ARM or ARM64 binary is published."
             echo "Bundled NVIDIA CUDA PTX is sm_120 only."
+            echo "CUDA incremental search and tuned batch geometry are enabled."
             echo "Bundled AMD HIP code objects are gfx1036 only."
             echo "The default interface is the interactive TUI. Headless mode is --no-tui."
             echo "There is no CPU mining fallback."
+            echo "Source commit: ${SHA}"
             echo
             echo "SHA-256"
             cat SHA256SUMS.txt
@@ -574,6 +583,7 @@ jobs:
 
           if gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
             gh release upload "${TAG}" --repo "${GH_REPO}" "${assets[@]}" --clobber
+            gh release edit "${TAG}" --repo "${GH_REPO}" --target "${SHA}" --notes-file dist/RELEASE_NOTES.md
           else
             gh release create "${TAG}"               --repo "${GH_REPO}"               "${tag_args[@]}"               --title "${release_title}"               --notes-file dist/RELEASE_NOTES.md               "${prerelease_args[@]}"               "${assets[@]}"
           fi

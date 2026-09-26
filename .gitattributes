@@ -3,3 +3,4 @@ reference/** linguist-vendored
 
 # Generated CUDA compiler output.
 cuda/build/** linguist-generated
+cuda/build/*.ptx -text
