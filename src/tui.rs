@@ -430,17 +430,25 @@ fn append_tui_log(line: &str) {
 /// Expected seconds between winners at `rate` candidates/s for a
 /// little-endian hex PHOTON target, if both are known.
 fn expected_winner_seconds(target_le_hex: &str, rate: f64) -> Option<f64> {
-    let bytes = hex::decode(target_le_hex).ok()?;
-    if bytes.len() != 32 || rate <= 0.0 {
+    if rate <= 0.0 {
         return None;
     }
-    // The covenant ignores digest bit 255, so P(win) = target / 2^255.
+    win_probability(target_le_hex).map(|probability| 1.0 / (probability * rate))
+}
+
+/// Chance that one candidate wins against a little-endian hex target. The
+/// covenant ignores digest bit 255, so P(win) = target / 2^255.
+fn win_probability(target_le_hex: &str) -> Option<f64> {
+    let bytes = hex::decode(target_le_hex.trim()).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
     let probability = bytes
         .iter()
         .rev()
         .fold(0.0_f64, |value, byte| value * 256.0 + f64::from(*byte))
         / 2f64.powi(255);
-    (probability > 0.0).then(|| 1.0 / (probability * rate))
+    (probability > 0.0).then_some(probability)
 }
 
 /// Formats the periodic status line for the TUI observation log.
@@ -497,7 +505,7 @@ pub fn run(
 
         for event in supervisor.drain_events() {
             append_tui_log(&format!("event {}", event_log_text(&event)));
-            state.push_event(format_event(event));
+            state.push_event(event_log_text(&event));
         }
 
         if last_draw.elapsed() >= DRAW_INTERVAL {
@@ -1137,89 +1145,351 @@ fn render_intensity(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
     frame.render_widget(gauge, area);
 }
 
-/// Renders live hash rates, shares, and GPU statistics.
-fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
-    let endpoint = redact_endpoint(&snapshot.endpoint);
-    let last_error = snapshot.last_error.as_deref().unwrap_or("none");
-    let telemetry = &snapshot.gpu_telemetry;
-    let efficiency = telemetry.candidates_per_watt(snapshot.search.current_rate);
-    // Most-watched first: hashing, winners, the work itself and GPU
-    // health; chain position and connection counters below.
-    let lines = vec![
-        Line::from(format!(
-            "rate {}   avg {}",
-            crate::telemetry::format_hash_rate(snapshot.search.current_rate),
-            crate::telemetry::format_hash_rate(snapshot.search.rate),
-        )),
-        Line::from(format!(
-            "peak {}   uptime {}s",
-            crate::telemetry::format_hash_rate(snapshot.search.peak_rate),
-            snapshot.search.elapsed_secs
-        )),
-        Line::from(format!(
-            "winners {}   stale {}   rejected {}   pending {}",
-            snapshot.verified_winners,
-            snapshot.stale_winners,
-            snapshot.search.rejected_winners,
-            snapshot.pending_winners
-        )),
-        Line::from(format!(
-            "target {}",
-            crate::telemetry::format_photon_target(&snapshot.photon_target_le)
-        )),
-        Line::from(format!(
-            "candidates {}   batches {}   keys {}",
-            snapshot.search.candidates, snapshot.search.batches, snapshot.search.key_rotations
-        )),
-        Line::from(format!(
-            "GPU: util {}   temp {}   power {}   VRAM {}",
-            format_metric(telemetry.gpu_utilization_percent, "%"),
-            format_metric(telemetry.temperature_c, "C"),
-            format_metric(telemetry.power_watts, "W"),
-            format_metric(telemetry.vram_used_mib, "MiB"),
-        )),
-        Line::from(format!(
-            "clocks: {}/{}   efficiency {}",
-            format_metric(telemetry.graphics_clock_mhz, "MHz"),
-            format_metric(telemetry.memory_clock_mhz, "MHz"),
-            format_metric(efficiency, " cand/s/W"),
-        )),
-        Line::from(format!("payout: {}", shorten(&snapshot.payout_address, 66))),
-        Line::from(format!(
-            "gen {}   height {}   checks {}",
-            snapshot.generation_id, snapshot.height, snapshot.state_checks
-        )),
-        Line::from(format!(
-            "baton {}:{}",
-            shorten(&snapshot.baton_txid, 16),
-            snapshot.baton_vout
-        )),
-        Line::from(format!("endpoint {}", shorten(&endpoint, 40))),
-        Line::from(format!(
-            "reconnects {}   rotations {}   jobs {}",
-            snapshot.reconnects, snapshot.endpoint_rotations, snapshot.job_changes
-        )),
-        Line::from(format!(
-            "source {}   transport {}",
-            if snapshot.source_degraded {
-                "degraded"
+/// Width of the label column in the runtime pane.
+const RUNTIME_LABEL_WIDTH: usize = 11;
+
+/// One labelled group of runtime rows. When the pane is too short, the
+/// group with the largest `priority` number is dropped first.
+struct RuntimeField {
+    priority: u8,
+    lines: Vec<Line<'static>>,
+}
+
+impl RuntimeField {
+    /// Lays out `rows` under a fixed-width label; continuation rows are
+    /// indented to the value column.
+    fn new(label: &str, rows: Vec<String>, priority: u8) -> Self {
+        let lines = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let label = if index == 0 { label } else { "" };
+                Line::from(vec![
+                    Span::styled(
+                        format!("{label:<RUNTIME_LABEL_WIDTH$}"),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(row),
+                ])
+            })
+            .collect();
+        Self { priority, lines }
+    }
+}
+
+/// Keeps fields in priority order while they fit `height` rows, so a
+/// short pane still fills its space, then shows them in display order.
+fn fit_runtime_fields(fields: Vec<RuntimeField>, height: usize) -> Vec<Line<'static>> {
+    let mut order = (0..fields.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| (fields[index].priority, index));
+    let mut keep = vec![false; fields.len()];
+    let mut used = 0;
+    for index in order {
+        let rows = fields[index].lines.len();
+        if used + rows <= height {
+            keep[index] = true;
+            used += rows;
+        }
+    }
+    fields
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .flat_map(|(field, _)| field.lines)
+        .collect()
+}
+
+/// Wraps a value to `width` columns without dropping any of it: breaks
+/// between " · " parts first, then between words, then splits a single
+/// over-long word into even pieces.
+fn wrap_value(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    push_wrapped(value, &[" · ", " "], width, &mut rows, &mut current);
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+/// Appends `text` to the wrapped rows, splitting on the coarsest separator
+/// that makes each piece fit.
+fn push_wrapped(
+    text: &str,
+    separators: &[&str],
+    width: usize,
+    rows: &mut Vec<String>,
+    current: &mut String,
+) {
+    let Some((separator, finer)) = separators.split_first() else {
+        let chars = text.chars().collect::<Vec<_>>();
+        let pieces = chars.len().div_ceil(width).max(1);
+        let size = chars.len().div_ceil(pieces).max(1);
+        let mut chunks = chars.chunks(size).peekable();
+        while let Some(chunk) = chunks.next() {
+            let piece = chunk.iter().collect::<String>();
+            if chunks.peek().is_some() {
+                rows.push(piece);
             } else {
-                "healthy"
-            },
-            snapshot.transport_failures
-        )),
-        Line::from(format!(
-            "refresh {}   consecutive {}",
-            snapshot.transient_refresh_failures, snapshot.consecutive_refresh_failures
-        )),
-        Line::from(format!("last error: {}", shorten(last_error, 42))),
+                *current = piece;
+            }
+        }
+        return;
+    };
+    for part in text.split(separator) {
+        let part_len = part.chars().count();
+        let joined = if current.is_empty() {
+            part_len
+        } else {
+            current.chars().count() + separator.chars().count() + part_len
+        };
+        if joined <= width {
+            if !current.is_empty() {
+                current.push_str(separator);
+            }
+            current.push_str(part);
+            continue;
+        }
+        if !current.is_empty() {
+            rows.push(std::mem::take(current));
+        }
+        if part_len <= width {
+            current.push_str(part);
+        } else {
+            push_wrapped(part, finer, width, rows, current);
+        }
+    }
+}
+
+/// The full PHOTON target as big-endian hex in 8-digit groups, with as many
+/// groups per row as the width allows (8, 4, 2 or 1).
+fn target_rows(target_le_hex: &str, width: usize) -> Vec<String> {
+    let Ok(mut bytes) = hex::decode(target_le_hex.trim()) else {
+        return vec!["unavailable".into()];
+    };
+    if bytes.len() != 32 {
+        return vec!["unavailable".into()];
+    }
+    bytes.reverse();
+    let groups = bytes.chunks(4).map(hex::encode).collect::<Vec<_>>();
+    let mut per_row = 8;
+    while per_row > 1 && per_row * 9 - 1 > width {
+        per_row /= 2;
+    }
+    groups.chunks(per_row).map(|row| row.join(" ")).collect()
+}
+
+/// Formats an integer with thousands separators.
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Formats a count with a 1000-based K/M/G/T/P/E suffix.
+fn format_si_count(value: f64) -> String {
+    const UNITS: [&str; 7] = ["", " K", " M", " G", " T", " P", " E"];
+    let mut value = if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    };
+    let mut unit = 0;
+    while unit + 1 < UNITS.len() && value >= 1000.0 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+/// Formats seconds as its two or three most significant units.
+fn format_duration(seconds: f64) -> String {
+    let total = if seconds.is_finite() && seconds > 0.0 {
+        seconds.round() as u64
+    } else {
+        0
+    };
+    let (days, hours, minutes, secs) = (
+        total / 86_400,
+        total / 3_600 % 24,
+        total / 60 % 60,
+        total % 60,
+    );
+    if days > 0 {
+        format!("{days}d {hours:02}h {minutes:02}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes:02}m {secs:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {secs:02}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Renders live hash rates, winners and GPU statistics. Every value is
+/// shown in full: long values wrap under their label, and when the pane is
+/// too short the least important fields are left out.
+fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let value_width = inner_width.saturating_sub(RUNTIME_LABEL_WIDTH);
+    let wrap = |value: String| wrap_value(&value, value_width);
+    let search = &snapshot.search;
+    let telemetry = &snapshot.gpu_telemetry;
+    let efficiency = telemetry.candidates_per_watt(search.current_rate);
+    let last_error = snapshot.last_error.as_deref().unwrap_or("none");
+    let hash_rate = crate::telemetry::format_hash_rate;
+
+    let odds = match (
+        win_probability(&snapshot.photon_target_le),
+        expected_winner_seconds(&snapshot.photon_target_le, search.rate),
+    ) {
+        (Some(probability), Some(seconds)) => format!(
+            "1 win per {} hashes · ~{} at avg rate",
+            format_si_count(1.0 / probability),
+            format_duration(seconds)
+        ),
+        (Some(probability), None) => {
+            format!("1 win per {} hashes", format_si_count(1.0 / probability))
+        }
+        _ => "waiting for the live target".into(),
+    };
+
+    let fields = vec![
+        RuntimeField::new(
+            "Hashrate",
+            wrap(format!(
+                "{} · avg {} · peak {}",
+                hash_rate(search.current_rate),
+                hash_rate(search.rate),
+                hash_rate(search.peak_rate)
+            )),
+            1,
+        ),
+        RuntimeField::new(
+            "Winners",
+            wrap(format!(
+                "{} found · {} stale · {} rejected · {} pending",
+                snapshot.verified_winners,
+                snapshot.stale_winners,
+                search.rejected_winners,
+                snapshot.pending_winners
+            )),
+            1,
+        ),
+        RuntimeField::new("Odds", wrap(odds), 3),
+        RuntimeField::new(
+            "Target",
+            target_rows(&snapshot.photon_target_le, value_width),
+            6,
+        ),
+        RuntimeField::new(
+            "Work",
+            wrap(format!(
+                "{} candidates · {} batches · {} key switches",
+                group_digits(search.candidates),
+                group_digits(search.batches),
+                group_digits(search.key_rotations)
+            )),
+            5,
+        ),
+        RuntimeField::new(
+            "Uptime",
+            wrap(format_duration(search.elapsed_secs as f64)),
+            4,
+        ),
+        RuntimeField::new(
+            "GPU",
+            wrap(format!(
+                "util {} · {} · {} · VRAM {}",
+                format_metric(telemetry.gpu_utilization_percent, "%"),
+                format_metric(telemetry.temperature_c, " C"),
+                format_metric(telemetry.power_watts, " W"),
+                format_metric(telemetry.vram_used_mib, " MiB"),
+            )),
+            3,
+        ),
+        RuntimeField::new(
+            "Clocks",
+            wrap(format!(
+                "core {} · memory {} · {}",
+                format_whole(telemetry.graphics_clock_mhz, " MHz"),
+                format_whole(telemetry.memory_clock_mhz, " MHz"),
+                efficiency
+                    .map(|value| format!("{} cand/s/W", format_si_count(value)))
+                    .unwrap_or_else(|| "N/A cand/s/W".into()),
+            )),
+            9,
+        ),
+        RuntimeField::new("Payout", wrap(snapshot.payout_address.clone()), 7),
+        RuntimeField::new(
+            "Chain",
+            wrap(format!(
+                "height {} · generation {} · checks {}",
+                snapshot.height,
+                snapshot.generation_id,
+                group_digits(snapshot.state_checks)
+            )),
+            6,
+        ),
+        RuntimeField::new(
+            "Baton",
+            wrap(format!("{}:{}", snapshot.baton_txid, snapshot.baton_vout)),
+            8,
+        ),
+        RuntimeField::new("Endpoint", wrap(redact_endpoint(&snapshot.endpoint)), 8),
+        RuntimeField::new(
+            "Network",
+            wrap(format!(
+                "reconnects {} · rotations {} · jobs {}",
+                snapshot.reconnects, snapshot.endpoint_rotations, snapshot.job_changes
+            )),
+            5,
+        ),
+        RuntimeField::new(
+            "Source",
+            wrap(format!(
+                "{} · errors: transport {} · refresh {} ({} in a row)",
+                if snapshot.source_degraded {
+                    "degraded"
+                } else {
+                    "healthy"
+                },
+                snapshot.transport_failures,
+                snapshot.transient_refresh_failures,
+                snapshot.consecutive_refresh_failures
+            )),
+            5,
+        ),
+        RuntimeField::new(
+            "Last error",
+            wrap(last_error.to_string()),
+            if snapshot.last_error.is_some() { 2 } else { 9 },
+        ),
     ];
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().title(" Runtime ").borders(Borders::ALL))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(fit_runtime_fields(fields, inner_height))
+            .block(Block::default().title(" Runtime ").borders(Borders::ALL)),
         area,
     );
+}
+
+/// Formats an optional GPU metric as a whole number.
+fn format_whole(value: Option<f64>, unit: &str) -> String {
+    value
+        .map(|value| format!("{value:.0}{unit}"))
+        .unwrap_or_else(|| "N/A".into())
 }
 
 /// Formats an optional GPU metric for the dashboard.
@@ -1231,14 +1501,29 @@ fn format_metric(value: Option<f64>, unit: &str) -> String {
 
 /// Renders the bounded runtime event list.
 fn render_events(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let max_items = area.height.saturating_sub(2) as usize;
-    let items: Vec<ListItem<'_>> = state
-        .events
-        .iter()
-        .rev()
-        .take(max_items)
-        .map(|event| ListItem::new(event.as_str()))
-        .collect();
+    let height = area.height.saturating_sub(2) as usize;
+    let width = area.width.saturating_sub(2) as usize;
+    // Newest first. Events keep their full text and wrap with a hanging
+    // indent, so a wider pane shows more per row and nothing is cut out.
+    let mut items: Vec<ListItem<'_>> = Vec::new();
+    let mut used = 0;
+    for event in state.events.iter().rev() {
+        let mut rows = wrap_value(event, width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| if index == 0 { row } else { format!("  {row}") })
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        if used + rows.len() > height {
+            if items.is_empty() {
+                rows.truncate(height);
+                items.push(ListItem::new(rows));
+            }
+            break;
+        }
+        used += rows.len();
+        items.push(ListItem::new(rows));
+    }
     frame.render_widget(
         List::new(items).block(
             Block::default()
@@ -1374,55 +1659,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
-}
-
-/// Formats a runtime event for display in the terminal.
-fn format_event(event: RuntimeEvent) -> String {
-    match event {
-        RuntimeEvent::JobRefreshed {
-            generation_id,
-            height,
-            baton_txid,
-            baton_vout,
-        } => format!(
-            "job g={generation_id} h={height} {}:{}",
-            shorten(&baton_txid, 10),
-            baton_vout
-        ),
-        RuntimeEvent::StateRefreshFailed { error, consecutive } => {
-            format!("refresh failed x{consecutive}: {}", shorten(&error, 24))
-        }
-        RuntimeEvent::Reconnecting(error) => format!("reconnecting {}", shorten(&error, 28)),
-        RuntimeEvent::Reconnected(endpoint) => {
-            format!("reconnected {}", shorten(&redact_endpoint(&endpoint), 30))
-        }
-        RuntimeEvent::EndpointRotated { from, to } => format!(
-            "switch {} -> {}",
-            shorten(&redact_endpoint(&from), 16),
-            shorten(&redact_endpoint(&to), 16)
-        ),
-        RuntimeEvent::StaleWinner {
-            winner_generation,
-            current_generation,
-        } => format!(
-            "stale winner discarded: generation {winner_generation} -> {current_generation}"
-        ),
-        RuntimeEvent::VerifiedWinner(winner) => format!(
-            "winner verified: gen={} nonce={} hash={}",
-            winner.generation_id,
-            winner.nonce,
-            shorten(&hex::encode(winner.digest), 20)
-        ),
-        RuntimeEvent::SubmissionAccepted {
-            parent_txid,
-            child_txid,
-        } => format!(
-            "submission accepted: parent={} reward={}",
-            shorten(&parent_txid, 18),
-            shorten(&child_txid, 18)
-        ),
-        RuntimeEvent::Error(error) => format!("error: {error}"),
-    }
 }
 
 /// Formats a runtime event for the observation log: the same facts as the
@@ -1811,7 +2047,7 @@ mod tests {
             memory_clock_mhz: Some(8_100.0),
         };
         let state = TuiState::new(&snapshot);
-        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| render(frame, &snapshot, &state))
@@ -1824,16 +2060,18 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("util 88.0%"));
-        assert!(rendered.contains("temp 72.0C"));
-        assert!(rendered.contains("power 100.0W"));
-        assert!(rendered.contains("efficiency 5000.0 cand/s/W"));
+        assert!(rendered.contains("72.0 C"));
+        assert!(rendered.contains("100.0 W"));
+        assert!(rendered.contains("5.0 K cand/s/W"));
+        assert!(rendered.contains("core 2500 MHz"));
         assert!(rendered.contains("500.0 KH/s"));
         assert!(rendered.contains("1.20 GH/s"));
         assert!(rendered.contains("2.50 PH/s"));
-        assert!(rendered.contains("target abababab...abababab"));
+        assert_eq!(rendered.matches("abababab").count(), 8, "full target");
+        assert!(!rendered.contains("..."), "nothing is cut short");
         assert!(rendered.contains("reconnects"));
         assert!(
-            rendered.contains("rejected 2"),
+            rendered.contains("2 rejected"),
             "host-rejected GPU winners must be visible on the runtime dashboard"
         );
     }
@@ -1847,7 +2085,7 @@ mod tests {
         snapshot.endpoint_rotations = 2;
         snapshot.job_changes = 1;
         let mut state = TuiState::new(&snapshot);
-        state.push_event(format_event(RuntimeEvent::EndpointRotated {
+        state.push_event(event_log_text(&RuntimeEvent::EndpointRotated {
             from: "wss://blackie.c3-soft.com:50004".into(),
             to: "wss://bch.soul-dev.com:50004".into(),
         }));
@@ -1873,7 +2111,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("jobs 1")));
         let row_of = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
         assert!(
-            row_of("rate ") < row_of("winners ") && row_of("winners ") < row_of("reconnects "),
+            row_of("Hashrate ") < row_of("Winners ") && row_of("Winners ") < row_of("reconnects "),
             "hash rate, then winners, then connection counters: {rows:?}"
         );
         assert!(
@@ -1886,6 +2124,85 @@ mod tests {
                 .any(|row| row.contains("switch ") && row.contains("->")),
             "peer switch must be visible on one events row: {rows:?}"
         );
+    }
+
+    /// Renders the dashboard at `width` x `height` and returns its rows.
+    fn rendered_rows(snapshot: &RuntimeSnapshot, width: u16, height: u16) -> Vec<String> {
+        let state = TuiState::new(snapshot);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render(frame, snapshot, &state))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    /// Checks that the runtime pane shows full values when maximized, wraps
+    /// them under their label when narrower, and drops the least important
+    /// rows when short.
+    fn runtime_pane_adapts_to_window_size() {
+        let mut snapshot = test_snapshot();
+        // Little-endian bytes 00..1f read most-significant first as 1f..00.
+        snapshot.photon_target_le = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
+        snapshot.baton_txid = "0123456789abcdef".repeat(4);
+        snapshot.search.rate = 30e6;
+        snapshot.last_error = Some("settlement preflight retry".into());
+        let target = "1f1e1d1c 1b1a1918 17161514 13121110 0f0e0d0c 0b0a0908 07060504 03020100";
+
+        let wide = rendered_rows(&snapshot, 220, 50);
+        assert!(wide.iter().any(|row| row.contains(target)), "{wide:?}");
+        let baton = format!("{}:0", snapshot.baton_txid);
+        assert!(wide.iter().any(|row| row.contains(&baton)), "{wide:?}");
+
+        let normal = rendered_rows(&snapshot, 120, 40);
+        let first = normal
+            .iter()
+            .position(|row| row.contains("Target     1f1e1d1c 1b1a1918 17161514 13121110"))
+            .unwrap_or_else(|| panic!("{normal:?}"));
+        assert!(normal[first + 1].contains("           0f0e0d0c 0b0a0908 07060504 03020100"));
+        assert!(normal.iter().any(|row| row.contains("1 win per ")));
+
+        let short = rendered_rows(&snapshot, 120, 16);
+        for kept in ["Hashrate", "Winners", "Last error"] {
+            assert!(
+                short.iter().any(|row| row.contains(kept)),
+                "{kept}: {short:?}"
+            );
+        }
+        for dropped in ["Clocks", "Baton", "Endpoint"] {
+            assert!(
+                !short.iter().any(|row| row.contains(dropped)),
+                "{dropped}: {short:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_wrapping_never_drops_text() {
+        assert_eq!(wrap_value("a · b · c", 20), vec!["a · b · c"]);
+        assert_eq!(
+            wrap_value("alpha · beta · gamma", 12),
+            vec!["alpha · beta", "gamma"]
+        );
+        let txid = "ab".repeat(33);
+        let rows = wrap_value(&txid, 40);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.concat(), txid);
+        assert_eq!(rows[0].len(), rows[1].len());
+        assert_eq!(group_digits(45_460_291_584), "45,460,291,584");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(format_duration(59_018.0), "16h 23m 38s");
+        assert_eq!(format_duration(4_195.0), "1h 09m 55s");
+        assert_eq!(format_duration(90_061.0), "1d 01h 01m");
+        assert_eq!(format_duration(42.0), "42s");
+        assert_eq!(format_si_count(126_400_000_000.0), "126.4 G");
     }
 
     #[test]
