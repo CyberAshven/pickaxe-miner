@@ -56,7 +56,10 @@ use std::time::{Duration, Instant};
 
 /// Prints the miner startup banner and donation policy.
 fn print_banner() {
-    println!("Pickaxe Miner 0.1.0 - interactive CLI");
+    println!(
+        "Pickaxe Miner {} - interactive CLI",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("Donation: 2%");
     println!("Type `help` for commands.\n");
 }
@@ -1377,29 +1380,29 @@ mod tests {
     }
 
     #[test]
-    fn release_workflow_prepares_pickaxe_miner_v0_1_0() {
+    fn release_workflow_prepares_pickaxe_miner_v0_0_1() {
         let workflow = include_str!("../.github/workflows/release.yml");
         let version = cargo_package_version(include_str!("../Cargo.toml"));
-        assert_eq!(version, "0.1.0");
+        assert_eq!(version, "0.0.1");
 
         let pattern = release_tag_pattern(workflow);
         assert!(
-            release_tag_matches(&pattern, "pickaxe-miner-v0.1.0"),
+            release_tag_matches(&pattern, "pickaxe-miner-v0.0.1"),
             "{pattern}"
         );
-        assert!(!release_tag_matches(&pattern, "v0.1.0"), "{pattern}");
-        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.1.0-rc.1"));
+        assert!(!release_tag_matches(&pattern, "v0.0.1"), "{pattern}");
+        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.1-rc.1"));
         assert!(workflow.contains("pickaxe-miner-v*.*.*"));
         assert!(!workflow.lines().any(|line| line.trim() == "- \"v*.*.*\""));
         assert!(workflow.contains("if [[ \"pickaxe-miner-v${version}\" != \"${TAG}\" ]]; then"));
         let tag = format!("pickaxe-miner-v{version}");
-        assert_eq!(tag, "pickaxe-miner-v0.1.0");
+        assert_eq!(tag, "pickaxe-miner-v0.0.1");
         assert_ne!(tag, format!("v{version}"));
 
         assert!(workflow.contains("release_title=\"Pickaxe Miner v${version}\""));
         assert!(workflow.contains("--title \"${release_title}\""));
         let title = format!("Pickaxe Miner v{version}");
-        assert_eq!(title, "Pickaxe Miner v0.1.0");
+        assert_eq!(title, "Pickaxe Miner v0.0.1");
 
         assert!(workflow.contains("pickaxe-miner-v${version}-linux-x86_64"));
         assert!(workflow.contains("pickaxe-miner-v$version-windows-x86_64"));

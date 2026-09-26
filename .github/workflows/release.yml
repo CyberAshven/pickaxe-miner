@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing semantic tag to build and publish, e.g. pickaxe-miner-v0.1.0"
+        description: "Existing semantic tag to build and publish, e.g. pickaxe-miner-v0.0.1"
         required: true
         type: string
 

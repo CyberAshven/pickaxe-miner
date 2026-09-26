@@ -19,26 +19,26 @@ Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain 
 
 ## Install a release archive
 
-The prepared v0.1.0 archives are:
+The prepared v0.0.1 archives are:
 
-- Linux: `pickaxe-miner-v0.1.0-linux-x86_64.tar.gz`
-- Windows: `pickaxe-miner-v0.1.0-windows-x86_64.zip`
+- Linux: `pickaxe-miner-v0.0.1-linux-x86_64.tar.gz`
+- Windows: `pickaxe-miner-v0.0.1-windows-x86_64.zip`
 
-The release also publishes `SHA256SUMS.txt` for those two archives. Merging to `master` runs the Release workflow, which tags the merged commit `pickaxe-miner-v<Cargo.toml version>` and publishes these archives. A merge that does not bump the version publishes nothing, and a push that only changes Markdown files or `docs/` never starts a release. Pull requests run the same build and packaging as a dry run. Until the v0.1.0 release exists, build from source.
+The release also publishes `SHA256SUMS.txt` for those two archives. Merging to `master` runs the Release workflow, which tags the merged commit `pickaxe-miner-v<Cargo.toml version>` and publishes these archives. A merge that does not bump the version publishes nothing, and a push that only changes Markdown files or `docs/` never starts a release. Pull requests run the same build and packaging as a dry run. Until the v0.0.1 release exists, build from source.
 
 Linux:
 
 ```bash
-tar -xzf pickaxe-miner-v0.1.0-linux-x86_64.tar.gz
-cd pickaxe-miner-v0.1.0-linux-x86_64
+tar -xzf pickaxe-miner-v0.0.1-linux-x86_64.tar.gz
+cd pickaxe-miner-v0.0.1-linux-x86_64
 ./pickaxe mine
 ```
 
 Windows PowerShell:
 
 ```powershell
-Expand-Archive pickaxe-miner-v0.1.0-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.1.0-windows-x86_64
-cd pickaxe-miner-v0.1.0-windows-x86_64
+Expand-Archive pickaxe-miner-v0.0.1-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.1-windows-x86_64
+cd pickaxe-miner-v0.0.1-windows-x86_64
 .\pickaxe.exe mine
 ```
 
@@ -58,7 +58,7 @@ Headless, from the same directory:
 cargo build --release
 ```
 
-The cargo binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.1.0`.
+The cargo binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.1`.
 
 Interactive TUI:
 
@@ -89,7 +89,7 @@ cargo run --release -- benchmark
 - There is no CPU mining fallback.
 - `wgpu` is not a verified production backend. Production mining is CUDA or HIP.
 - The donation is hard-coded at 2%.
-- Tag `pickaxe-miner-v0.1.0` and its GitHub Release are created automatically when this work is merged to `master`; they do not exist before that.
+- Tag `pickaxe-miner-v0.0.1` and its GitHub Release are created automatically when this work is merged to `master`; they do not exist before that.
 
 ## Features
 
