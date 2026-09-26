@@ -2,11 +2,11 @@
 
 ![Pickaxe Miner](docs/assets/pickaxe-miner-logo.png)
 
-Rust-first, GPU-only miner for the PHOTON CashToken on Bitcoin Cash.
+Rust-first, GPU-only miner for CashTokens on Bitcoin Cash.
 
 ## Scope
 
-PHOTON work is the live covenant and CashToken baton: the baton outpoint, NFT commitment, token amount, and PHOTON target. BCH `getblocktemplate` and `getblocktemplatelight` are not a mining job source.
+PHOTON is a live covenant and CashToken baton it is the first minable CashToken in the BCH network: the baton outpoint, NFT commitment, token amount, and PHOTON target. BCH `getblocktemplate` and `getblocktemplatelight` are not a mining job source.
 
 Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
 
