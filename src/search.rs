@@ -1560,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_live_winner_reconstruction_and_identity_rotation() {
+    fn incremental_search_bounds_and_identity_separation() {
         assert_eq!(batch_before_wrap(u32::MAX - 2, 64), 3);
         assert_eq!(batch_before_wrap(0, 64), 64);
         assert!(crypto::bch_schnorr_sign_search_candidate(&[1; 32], &[2; 32], 0).is_err());
@@ -1579,6 +1579,15 @@ mod tests {
             .err()
             .unwrap()
             .contains("separate"));
+    }
+
+    #[test]
+    fn incremental_live_winner_reconstruction_and_identity_rotation_if_cuda() {
+        let sk = [0x11u8; 32];
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
+        let mut job = integration_job(1);
+        job.target_le_hex = format!("{}7f", "ff".repeat(31));
         let mut cuda = match CudaPhotonEngine::new(0, 65, 65) {
             Ok(cuda) => cuda,
             Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => return,
