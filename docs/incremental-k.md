@@ -4,6 +4,25 @@ Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7
 
 **Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. The user subsequently authorized promoting `fd95cbc` to master and continuing measured optimization rounds. The default release build and `D:\pickaxe-live` remain unchanged. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
 
+## Round 7: researched and rejected binary/shared inversion prototypes
+
+The user's request for broader internet research led to [gECC](https://arxiv.org/html/2501.03245v1). Its Gather-Apply-Scatter design combines thread products, performs fewer inversions, and distributes the inverses. The authors' [MIT implementation](https://github.com/CGCL-codes/gECC/blob/322c1c143d6a886747308f5b4d88603d6e30a48a/include/gecc/arith/batch_ec.h) was inspected at commit `322c1c1`. Its SM2/A100 results do not establish a PHOTON/secp256k1/Blackwell gain. No third-party implementation was imported into product code.
+
+Two offline C1 prototypes reused Pickaxe's field arithmetic: a per-thread binary inverse, then a 64-thread shared product tree with one binary inverse per block. At eight candidates per thread the latter shares an inverse across 512 candidates. Empty lanes contributed one and reached every barrier; modular halving preserved the 257th carry bit. The binary coefficient invariant was `u=a*x, v=a*y (mod p)`. These variable-time experiments used only synthetic keys and were never deployed.
+
+Both passed all 13,920 independent CPU reconstruction checks, eight age layouts, partial batches, scalar boundaries, target/readback limits and full-batch samples. Compiler reports showed 88 registers/576-byte stack for binary inversion, and 94 registers/576-byte stack/4096-byte shared memory for the tree, with no spills in the measured batched entry.
+
+The unchanged comparison harness measured complete pipelines, using 45 seconds of warm-up and eight ABBA ABBA eight-second windows with one-second inter-window warm-ups:
+
+| Candidate | Master median, million/s | Candidate median, million/s | Difference |
+| --- | ---: | ---: | ---: |
+| Per-thread binary inverse | 104.731 | 92.229 | -11.94% |
+| Shared 64-thread binary inverse | 107.218 | 106.831 | -0.36% |
+
+Neither established an improvement. The shared result is within variability; telemetry reached 87 C and is retained in the raw results. All task-owned source changes were removed and test PTX restored. Master remains `6710112`; the unchanged best miner was restarted after the sole offline worker exited. No CI or additional live candidate validation was needed for rejected, removed prototypes.
+
+Ignored `artifacts/incremental-k/round7/` retains both patches, kernels, compiler logs, correctness logs, raw comparisons and a primary-source research note. Other research leads include per-limb point-buffer coalescing from gECC and batch/occupancy tuning from [BitcoinAddressFinder's performance notes](https://github.com/bernardladenthin/BitcoinAddressFinder/blob/main/docs/performance.md). These remain hypotheses; this result does not rule out other cooperative inversion designs.
+
 ## Round 6: rejected centered affine batches and register-limit trials
 
 The next approach generated affine points around a lane's center scalar. Positive and negative offsets share the same x-coordinate denominator; a prefix product supplies their inverses together. A dedicated C1 entry reused the production signing helper while skipping normalization for these Z=1 points. The derivation used the [EFD affine group formulas](https://www.hyperelliptic.org/EFD/g1p/auto-shortw.html); [VanitySearch's GPU point batching](https://github.com/JeanLucPons/VanitySearch/blob/master/GPU/GPUCompute.h) was inspected as a conceptual comparison, without importing source. This still enumerated the original consecutive public search scalars and retained the funded-key separation.
