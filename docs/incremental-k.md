@@ -8,16 +8,26 @@ Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7
 
 CUDA C1 replaces 32 challenge-indexed table additions with an eight-limb Montgomery product. For R=2^256, the existing table entry at byte 31, digit 128 is d*R/2 mod n; doubling it supplies d*R mod n, so Montgomery(e, d*R) returns e*d mod n. This preserves full-width random search keys, all signatures, the kernel ABI and persistent allocations. HIP keeps the existing table algorithm. The algorithm was researched against NVIDIA's [CGBN Montgomery documentation](https://github.com/NVlabs/CGBN/blob/master/docs/CGBN.md); no external library or source was imported.
 
-Two interleaved comparisons used 45 seconds of initial GPU warm-up, one second before each window and eight seconds measured per window. Eight windows per run used ABBA ABBA and BAAB BAAB. Same full-width key, target, 262,144-candidate batches, complete incremental pipeline and compact winner readback:
+Three interleaved comparisons used 45 seconds of initial GPU warm-up, one second before each window and eight seconds measured per window. Eight windows per run used ABBA ABBA and BAAB BAAB. Same full-width key, target, 262,144-candidate batches, complete incremental pipeline and compact winner readback:
 
 | Order | Previous C1 median, million/s | Montgomery C1 median, million/s | Gain |
 | --- | ---: | ---: | ---: |
 | ABBA ABBA | 97.049 | 105.424 | 8.63% |
 | BAAB BAAB | 96.990 | 107.512 | 10.85% |
+| ABBA ABBA, final production source | 96.743 | 106.991 | 10.59% |
 
 Temperatures/clocks varied: 84–86 C and 2362–2692 MHz in the first run, 79–81 C and 2400–2707 MHz in the second. One second-run baseline telemetry sample had 85% utilization; the other second-run samples had 97–99%. The repeated advantage is stronger evidence than the highest 110.269 million/s window; it is not a guarantee of that speed under thermal throttling. Before this round, the unchanged live executable and C1 hashes were checked when speed fell to 81.6 million/s: NVIDIA reported active software thermal slowdown at 87 C. No overclock, power, fan or system thermal setting was changed by this work.
 
-The candidate passed 19,080 direct GPU scalar products against Rust BigUint, including zero, order-minus-one/two, limb boundaries and deterministic random full-width operands. It also passed 13,920 independently reconstructed signatures/transactions and full-batch lane samples. Final-source regression, CI and live validation results are recorded below once complete. Evidence is in ignored `artifacts/incremental-k/round3/`.
+The final comparison ran at 76–79 C. Reference clocks were 2625–2677 MHz and candidate clocks 2700–2707 MHz, so these are complete-pipeline laptop results including hardware clock behavior, not equal-clock instruction throughput.
+
+The final production source passed 19,080 direct GPU scalar products against Rust BigUint, including zero, order-minus-one/two, limb boundaries and deterministic random full-width operands. It also passed 13,920 independently reconstructed signatures/transactions and full-batch lane samples. The feature-enabled release suite passed 258 tests, zero failures, five ignored. Explicit VM validation matched all 216 expectations (103 accepted, 113 rejected) under both BCH 2026 standard and consensus rules. Formatting, Rust 1.98 all-target/all-feature Clippy with warnings denied, and all four [CI jobs for 935a1e1](https://github.com/CyberAshven/pickaxe-miner/actions/runs/36261741047) passed, including Windows, Linux, HIP gfx1036 compilation and BCH VM proof. Evidence is in ignored `artifacts/incremental-k/round3/`.
+
+The single live TUI loaded C1 SHA-256 `520cb82795f0c8bfc8ad2ddef10fe1f73ec09c08391ce7ad0af872aa0cd97139`. After resuming, its candidate counter advanced by 22,144,704,318 over 220 seconds (Unix 1790446674–1790446894): **100.658 million/s including settlement/reconnect time**. This excludes the earlier paused interval; the TUI session average includes that pause and is not the comparison metric. It recorded three search-key rotations, one verified winner, zero rejected/stale winners and zero pending winners at the endpoint. One settlement-authority retry recovered automatically, with application-recorded submission acceptance at Unix 1790446797:
+
+- Parent: `8000000003d1226f990c9bc1279b15f6e0199118e84751b747a7f78c61e6ab1f`
+- Reward: `8d1e1cf6f56f5570d2f498f811f386ec7ed92fe628164cd3f3a9f05ef99f23c0`
+
+The TUI subsequently observed that reward as the live baton. This is a short live validation, not independent block-confirmation proof or a long soak. Initial sampled live rates were about 105–109 million/s and later fell to about 94 million/s as a GPU sample reached 87 C. The repeated controlled gain is the promotion criterion; neither a peak nor a pause-diluted session average establishes a regression. Exactly one miner and one miner terminal remained running.
 
 The direct arithmetic test is `incremental_k_montgomery_scalar_oracle` (ignored, explicit CUDA run). `tools/build-incremental-k.cmd` now builds six runtime PTX files plus `scalar-check.ptx`, a test-only export of the production multiplication. For a controlled comparison, retain the previous C1 as `photon_c1_reference.ptx` beside the test executable, install current kernels, and run `incremental_k_c1_comparison -- --ignored --nocapture --test-threads=1`. Set `PICKAXE_C1_REVERSE=1` for BAAB BAAB. The earlier raw reverse-run log used swapped PTX aliases (variant 0 was Montgomery); the committed comparison test always labels variant 0 as reference and variant 1 as current.
 
