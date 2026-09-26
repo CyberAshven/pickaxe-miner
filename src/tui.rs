@@ -434,12 +434,12 @@ fn expected_winner_seconds(target_le_hex: &str, rate: f64) -> Option<f64> {
     if bytes.len() != 32 || rate <= 0.0 {
         return None;
     }
-    // P(hash < target) = target / 2^256.
+    // The covenant ignores digest bit 255, so P(win) = target / 2^255.
     let probability = bytes
         .iter()
         .rev()
         .fold(0.0_f64, |value, byte| value * 256.0 + f64::from(*byte))
-        / 2f64.powi(256);
+        / 2f64.powi(255);
     (probability > 0.0).then(|| 1.0 / (probability * rate))
 }
 
@@ -449,9 +449,10 @@ fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
         .map(|seconds| format!("{seconds:.0}"))
         .unwrap_or_else(|| "n/a".into());
     format!(
-        "status state={:?} waiting_for_job={} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} expected_winner_s={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} target_le={} endpoint={} last_error={}",
+        "status state={:?} waiting_for_job={} key_rotations={} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} expected_winner_s={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} target_le={} endpoint={} last_error={}",
         snapshot.state,
         snapshot.search.waiting_for_job,
+        snapshot.search.key_rotations,
         snapshot.search.intensity,
         snapshot.search.current_rate,
         snapshot.search.rate,
@@ -1777,11 +1778,12 @@ mod tests {
     #[test]
     /// Checks the expected time between winners from the live target.
     fn expected_winner_seconds_follows_target_and_rate() {
-        // Target 2^224 (LE byte 28 = 1): one winner per 2^32 candidates.
+        // Target 2^224 (LE byte 28 = 1): with digest bit 255 ignored, one
+        // winner per 2^31 candidates.
         let mut target = [0u8; 32];
         target[28] = 1;
         let target = hex::encode(target);
-        let seconds = expected_winner_seconds(&target, 2f64.powi(32) / 100.0).unwrap();
+        let seconds = expected_winner_seconds(&target, 2f64.powi(31) / 100.0).unwrap();
         assert!((seconds - 100.0).abs() < 1e-6, "{seconds}");
         assert!(expected_winner_seconds(&target, 0.0).is_none());
         assert!(expected_winner_seconds("", 1.0).is_none());

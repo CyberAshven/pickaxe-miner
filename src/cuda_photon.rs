@@ -9,6 +9,7 @@
 //! count and a bounded winner record array only.
 
 use crate::m29_table::{self, M29TableSource};
+use crate::tx::PhotonLayout;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -18,9 +19,16 @@ use secp256k1::{PublicKey, SecretKey};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const TX_BYTES: usize = 615;
-const TARGET_OFFSET: usize = 394;
+/// Template buffer size: the widest layout the covenant's age bound allows.
+const MAX_TX_BYTES: usize = 615 + PhotonLayout::MAX_SHIFT;
 const SIGNATURE_BYTES: usize = 64;
+/// C2/C3 entry points by layout shift (age push width minus one).
+const STAGE_C3_FUNCTIONS: [&str; PhotonLayout::MAX_SHIFT + 1] = [
+    "pickaxe_stage_c_dual_filter",
+    "pickaxe_stage_c_dual_filter_shift1",
+    "pickaxe_stage_c_dual_filter_shift2",
+    "pickaxe_stage_c_dual_filter_shift3",
+];
 const POINT_WORDS: usize = 24;
 const FIXED_D_WORDS: usize = 32 * 256 * 8;
 /// Candidates per C1 thread that share one field inversion.
@@ -64,7 +72,8 @@ pub struct CudaPhotonEngine {
     stage_a: CudaFunction,
     stage_b: [CudaFunction; 4],
     stage_c1: CudaFunction,
-    stage_c3: CudaFunction,
+    stage_c3: [CudaFunction; PhotonLayout::MAX_SHIFT + 1],
+    layout: PhotonLayout,
     table_gpu: CudaSlice<u8>,
     target_gpu: CudaSlice<u8>,
     private_key_gpu: CudaSlice<u8>,
@@ -157,7 +166,7 @@ pub(crate) fn cuda_unavailable_for_tests(error: &str) -> bool {
 }
 
 /// SHA-256 state after the job-fixed transaction bytes 0..384.
-fn transaction_midstate(template: &[u8; TX_BYTES]) -> [u32; 8] {
+fn transaction_midstate(template: &[u8]) -> [u32; 8] {
     let mut state = SHA256_INITIAL_STATE;
     let blocks = template[..MIDSTATE_BYTES]
         .as_chunks::<64>()
@@ -221,7 +230,12 @@ impl CudaPhotonEngine {
             "photon_c1_schnorr.ptx",
             "pickaxe_photon_c1_schnorr_dual_batched",
         )?;
-        let stage_c3 = load_function(&ctx, "photon_c3_dual.ptx", "pickaxe_stage_c_dual_filter")?;
+        let stage_c3 = [
+            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[0])?,
+            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[1])?,
+            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[2])?,
+            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[3])?,
+        ];
 
         let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
         let table_gpu = stream
@@ -260,7 +274,7 @@ impl CudaPhotonEngine {
             .alloc_zeros::<u32>(8)
             .map_err(|error| format!("alloc transaction midstate: {error}"))?;
         let template_gpu = stream
-            .alloc_zeros::<u8>(TX_BYTES)
+            .alloc_zeros::<u8>(MAX_TX_BYTES)
             .map_err(|error| format!("alloc transaction template: {error}"))?;
         let winner_count_gpu = stream
             .alloc_zeros::<u32>(1)
@@ -279,6 +293,7 @@ impl CudaPhotonEngine {
             stage_b,
             stage_c1,
             stage_c3,
+            layout: PhotonLayout::BASE,
             table_gpu,
             target_gpu,
             private_key_gpu,
@@ -314,7 +329,7 @@ impl CudaPhotonEngine {
             + 33
             + FIXED_D_WORDS * std::mem::size_of::<u32>()
             + (self.max_candidates as usize) * (32 + 32 + POINT_WORDS * 4 + SIGNATURE_BYTES + 32)
-            + TX_BYTES
+            + MAX_TX_BYTES
             + 8 * std::mem::size_of::<u32>()
             + std::mem::size_of::<u32>()
             + (self.winner_cap as usize) * (4 + 32)
@@ -323,13 +338,26 @@ impl CudaPhotonEngine {
     /// Uploads validated PHOTON job bytes and target to CUDA.
     pub fn set_job(
         &mut self,
-        template: &[u8; TX_BYTES],
+        template: &[u8],
         target: &[u8; 32],
         private_key: &[u8; 32],
     ) -> Result<(), String> {
-        if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
-            return Err("PHOTON target must match transaction template bytes 394..425".into());
+        let layout = PhotonLayout::for_tx_len(template.len())?;
+        // The midstate covers job-fixed bytes only, and C3 overwrites R||s
+        // inside the transaction.
+        if layout.nonce_offset() < MIDSTATE_BYTES
+            || layout.signature_offset() + SIGNATURE_BYTES > template.len()
+        {
+            return Err("PHOTON layout does not fit the CUDA midstate and signature split".into());
         }
+        let target_offset = layout.target_offset();
+        if template[target_offset..target_offset + 32] != target[..] {
+            return Err(format!(
+                "PHOTON target must match transaction template bytes {target_offset}..{}",
+                target_offset + 31
+            ));
+        }
+        self.job_ready = false;
         let secret = SecretKey::from_secret_bytes(*private_key)
             .map_err(|error| format!("invalid PHOTON signing key: {error}"))?;
         let public_key = PublicKey::from_secret_key(&secret).serialize();
@@ -347,12 +375,15 @@ impl CudaPhotonEngine {
         self.stream
             .memcpy_htod(&fixed_d, &mut self.fixed_d_gpu)
             .map_err(|error| format!("upload fixed-d table: {error}"))?;
+        let mut padded = [0u8; MAX_TX_BYTES];
+        padded[..template.len()].copy_from_slice(template);
         self.stream
-            .memcpy_htod(template, &mut self.template_gpu)
+            .memcpy_htod(&padded, &mut self.template_gpu)
             .map_err(|error| format!("upload transaction template: {error}"))?;
         self.stream
             .memcpy_htod(&transaction_midstate(template), &mut self.midstate_gpu)
             .map_err(|error| format!("upload transaction midstate: {error}"))?;
+        self.layout = layout;
         self.job_ready = true;
         Ok(())
     }
@@ -448,7 +479,9 @@ impl CudaPhotonEngine {
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut c3 = self.stream.launch_builder(&self.stage_c3);
+        let mut c3 = self
+            .stream
+            .launch_builder(&self.stage_c3[self.layout.shift()]);
         unsafe {
             c3.arg(&self.template_gpu)
                 .arg(&self.midstate_gpu)
@@ -504,6 +537,9 @@ impl CudaPhotonEngine {
 mod tests {
     use super::*;
     use crate::{crypto, search, tx};
+
+    /// Length of the age 0..=16 reference vector.
+    const TX_BYTES: usize = 615;
 
     #[test]
     fn cuda_source_tree_contains_no_placeholder_kernel() {
@@ -678,7 +714,7 @@ mod tests {
             + 33
             + FIXED_D_WORDS * 4
             + 256 * (32 + 32 + POINT_WORDS * 4 + SIGNATURE_BYTES + 32)
-            + TX_BYTES
+            + MAX_TX_BYTES
             + 8 * 4
             + 4
             + 8 * (4 + 32);
@@ -812,9 +848,10 @@ mod tests {
 
     #[test]
     fn gpu_dual_filter_emits_only_the_real_signature_variant_if_cuda_present() {
-        // Half of the hash space: a hash meets it when its top byte is < 0x80.
+        // Half of the hash space: the covenant ignores digest bit 255, so a
+        // hash meets it when its top byte masked to 0x7f is < 0x40.
         let mut target = [0u8; 32];
-        target[31] = 0x80;
+        target[31] = 0x40;
         let template = reference_template_with_target(target);
         let mut private_key = [0u8; 32];
         private_key[31] = 7;
@@ -852,6 +889,75 @@ mod tests {
                     "other-sign variant reported at {nonce:#x} (other meets: {other_meets})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gpu_pipeline_hashes_every_age_layout_if_cuda_present() {
+        let payout = hex::decode("76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac").unwrap();
+        let mut private_key = [0u8; 32];
+        private_key[31] = 3;
+        let public_key =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(private_key).unwrap())
+                .serialize();
+        // About one candidate in four meets this target, so both outcomes
+        // are exercised for every layout.
+        let mut target = [0u8; 32];
+        target[31] = 0x20;
+        let candidate_count = 512;
+
+        let mut engine = match CudaPhotonEngine::new(0, candidate_count, candidate_count) {
+            Ok(engine) => engine,
+            Err(error) if should_skip_cuda_error(&error) => {
+                eprintln!("skip PHOTON CUDA age layout test: {error}");
+                return;
+            }
+            Err(error) => panic!("PHOTON CUDA init failed: {error}"),
+        };
+        for age in [16u32, 17, 128, 40_000] {
+            let layout = PhotonLayout::for_age(age).unwrap();
+            let template = tx::build_photon_template_bytes(&tx::TemplateParams {
+                prev_tx_hash_hex:
+                    "42a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae124712000000".into(),
+                prev_index: 0,
+                age,
+                public_key_hex: hex::encode(public_key),
+                target_hex: hex::encode(target),
+                signature_hex: "00".repeat(64),
+                nonce: 0,
+                contract_value_sats: 15_971_500,
+                contract_token_amount: 2_099_905_002_035_715,
+                reward_amount: 4_999_773_813,
+                payout_locking: payout.clone(),
+            })
+            .unwrap();
+            assert_eq!(template.len(), layout.tx_bytes());
+            engine.set_job(&template, &target, &private_key).unwrap();
+            let nonce_base = 0x7700_0000 + age;
+            let result = engine.search_batch(nonce_base, candidate_count).unwrap();
+
+            let mut expected = std::collections::BTreeMap::new();
+            for nonce in nonce_base..nonce_base + candidate_count {
+                let message = tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
+                let signature = crypto::bch_schnorr_sign(&private_key, &message).unwrap();
+                let mut completed = template.clone();
+                let n = layout.nonce_offset();
+                completed[n..n + 4].copy_from_slice(&nonce.to_le_bytes());
+                let s = layout.signature_offset();
+                completed[s..s + 64].copy_from_slice(&signature);
+                let digest = search::hash256(&completed);
+                if search::meets_target_le(&digest, &target) {
+                    expected.insert(nonce, digest);
+                }
+            }
+            let found = result
+                .winners
+                .iter()
+                .map(|winner| (winner.nonce, winner.digest))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert!(!expected.is_empty(), "age {age}: no host winners");
+            assert_eq!(result.total_winners as usize, expected.len(), "age {age}");
+            assert_eq!(found, expected, "age {age}");
         }
     }
 }

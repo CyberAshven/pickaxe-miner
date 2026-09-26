@@ -89,15 +89,19 @@ impl PhotonEngine {
     /// Installs validated PHOTON job data into the GPU search worker.
     pub(crate) fn set_job(
         &mut self,
-        template: &[u8; 615],
+        template: &[u8],
         target: &[u8; 32],
         private_key: &[u8; 32],
     ) -> Result<(), String> {
         match self {
             Self::Cuda(engine) => engine.set_job(template, target, private_key),
-            Self::Hip(engine) => engine.set_job(template, target, private_key),
+            Self::Hip(engine) => {
+                engine.set_job(base_layout_template(template, "HIP")?, target, private_key)
+            }
             #[cfg(feature = "portable-wgpu")]
-            Self::Wgpu(engine) => engine.set_job(template, target, private_key),
+            Self::Wgpu(engine) => {
+                engine.set_job(base_layout_template(template, "wgpu")?, target, private_key)
+            }
         }
     }
 
@@ -197,9 +201,11 @@ pub struct SearchStats {
     pub peak_rate: f64,
     pub winners: u64,
     pub rejected_winners: u64,
-    /// Every nonce of the current job has been tried; the GPU idles until
-    /// the next job instead of hashing the same candidates again.
+    /// Every nonce of the current job has been tried and a fresh signing
+    /// key could not be installed, so the GPU idles until the next job.
     pub waiting_for_job: bool,
+    /// Fresh signing keys installed after a job's 2^32 nonces ran out.
+    pub key_rotations: u64,
     pub last_error: Option<String>,
 }
 
@@ -250,10 +256,27 @@ pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Compares a candidate hash against a little-endian target.
+/// Returns the 615-byte template the HIP and wgpu kernels are built for.
+fn base_layout_template<'a>(template: &'a [u8], backend: &str) -> Result<&'a [u8; 615], String> {
+    template.try_into().map_err(|_| {
+        format!(
+            "{backend} kernels support only the 615-byte PHOTON layout (baton age 0..=16); this job is {} bytes",
+            template.len()
+        )
+    })
+}
+
+/// Applies the covenant's proof-of-work rule to a little-endian digest.
+///
+/// The covenant checks `ABS(BIN2NUM(HASH256(tx))) < target`. BIN2NUM reads
+/// the digest as a little-endian script number whose top bit is the sign
+/// and ABS drops it, so bit 255 never matters. Equality is not a win.
 pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
-    // PHOTON / Codex audit: strict hash < target (equality is NOT a win).
-    for i in (0..32).rev() {
+    let top = digest[31] & 0x7f;
+    if top != target_le[31] {
+        return top < target_le[31];
+    }
+    for i in (0..31).rev() {
         if digest[i] < target_le[i] {
             return true;
         }
@@ -266,7 +289,7 @@ pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
 
 struct PreparedJob {
     job: MiningJob,
-    template: [u8; 615],
+    template: Vec<u8>,
     target: [u8; 32],
 }
 
@@ -282,12 +305,8 @@ fn validate_job(job: &MiningJob) -> Result<[u8; 32], String> {
     if job.generation_id == 0 {
         return Err("mining job generation_id must be nonzero".into());
     }
-    if job.age > 16 {
-        return Err(format!(
-            "live baton age {} exceeds the fixed 615-byte PHOTON layout (0..=16)",
-            job.age
-        ));
-    }
+    tx::PhotonLayout::for_age(job.age)?;
+    tx::require_covenant_hash_preimage(job.token_amount, job.reward_raw)?;
     if job.payout_address.trim().is_empty() {
         return Err("mining payout address is required".into());
     }
@@ -320,14 +339,18 @@ fn prepare_job(
         reward_amount: job.reward_raw,
         payout_locking,
     };
-    let bytes = tx::build_photon_template_bytes(&params)?;
-    let template: [u8; 615] = bytes.try_into().map_err(|bytes: Vec<u8>| {
-        format!(
-            "PHOTON live template is {} bytes; CUDA requires 615",
-            bytes.len()
-        )
-    })?;
-    if template[394..426] != target[..] {
+    let template = tx::build_photon_template_bytes(&params)?;
+    let layout = tx::PhotonLayout::for_age(job.age)?;
+    if template.len() != layout.tx_bytes() {
+        return Err(format!(
+            "PHOTON live template is {} bytes; age {} needs {}",
+            template.len(),
+            job.age,
+            layout.tx_bytes()
+        ));
+    }
+    let target_offset = layout.target_offset();
+    if template[target_offset..target_offset + 32] != target[..] {
         return Err("PHOTON template target bytes do not match live target".into());
     }
     Ok(PreparedJob {
@@ -335,6 +358,19 @@ fn prepare_job(
         template,
         target,
     })
+}
+
+/// Installs the current job under a fresh random signing key.
+fn rotate_search_identity(
+    engine: &mut PhotonEngine,
+    job: &MiningJob,
+) -> Result<(PreparedJob, [u8; 32], [u8; 33]), String> {
+    let secret = SecretKey::new(&mut rand::rng());
+    let sk = secret.to_secret_bytes();
+    let public_key = PublicKey::from_secret_key(&secret).serialize();
+    let prepared = prepare_job(job.clone(), &sk, &public_key)?;
+    engine.set_job(&prepared.template, &prepared.target, &sk)?;
+    Ok((prepared, sk, public_key))
 }
 
 /// Reconstructs a GPU winner and checks its PHOTON proof.
@@ -553,6 +589,7 @@ struct WorkerDiagnostics {
     last_error: Mutex<Option<String>>,
     rejected_winners: AtomicU64,
     job_exhausted: AtomicBool,
+    key_rotations: AtomicU64,
 }
 
 impl WorkerDiagnostics {
@@ -561,6 +598,7 @@ impl WorkerDiagnostics {
             last_error: Mutex::new(None),
             rejected_winners: AtomicU64::new(0),
             job_exhausted: AtomicBool::new(false),
+            key_rotations: AtomicU64::new(0),
         }
     }
 
@@ -583,6 +621,7 @@ impl WorkerDiagnostics {
     fn publish(&self, stats: &mut SearchStats) {
         stats.rejected_winners = self.rejected_winners.load(Ordering::Relaxed);
         stats.waiting_for_job = self.job_exhausted.load(Ordering::Relaxed);
+        stats.key_rotations = self.key_rotations.load(Ordering::Relaxed);
         stats.last_error = self
             .last_error
             .lock()
@@ -631,8 +670,8 @@ fn absorb_search_batch(
 fn run_worker(
     mut engine: PhotonEngine,
     mut prepared: PreparedJob,
-    sk: [u8; 32],
-    public_key: [u8; 33],
+    mut sk: [u8; 32],
+    mut public_key: [u8; 33],
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     batch_in_flight: Arc<AtomicBool>,
@@ -687,12 +726,29 @@ fn run_worker(
         let Some(batch_size) =
             sweep.next_batch(engine.scheduled_batch_candidates(active_intensity))
         else {
-            // All 2^32 nonces of this job are done; hashing on would only
-            // repeat them. Idle until the supervisor installs the next job.
-            diagnostics.job_exhausted.store(true, Ordering::Relaxed);
+            // All 2^32 nonces under this signing key are done. The key only
+            // signs the PHOTON commitment and holds no funds, so a fresh key
+            // gives a new template and another 2^32 candidates for the same
+            // job instead of idling until the next block.
             batch_in_flight.store(false, Ordering::SeqCst);
-            thread::park_timeout(PAUSE_POLL);
-            pacer.reset(Instant::now());
+            match rotate_search_identity(&mut engine, &prepared.job) {
+                Ok((next, next_sk, next_public_key)) => {
+                    prepared = next;
+                    sk.fill(0);
+                    sk = next_sk;
+                    public_key = next_public_key;
+                    nonce_base = rng.random::<u32>();
+                    sweep = NonceSweep::default();
+                    diagnostics.key_rotations.fetch_add(1, Ordering::Relaxed);
+                    diagnostics.job_exhausted.store(false, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    diagnostics.record_batch_error(format!("search key rotation failed: {error}"));
+                    diagnostics.job_exhausted.store(true, Ordering::Relaxed);
+                    thread::park_timeout(PAUSE_POLL);
+                    pacer.reset(Instant::now());
+                }
+            }
             continue;
         };
         let batch_started = Instant::now();
@@ -1038,6 +1094,7 @@ impl SearchHandle {
             winners: self.winners.load(Ordering::Relaxed),
             rejected_winners: 0,
             waiting_for_job: false,
+            key_rotations: 0,
             last_error: None,
         };
         self.diagnostics.publish(&mut stats);
@@ -1139,8 +1196,29 @@ mod tests {
 
     #[test]
     fn equality_is_not_a_win() {
-        let t = parse_hex32(&"aa".repeat(32)).unwrap();
+        // A live target is a positive script number, so its top bit is clear.
+        let mut t = parse_hex32(&"aa".repeat(32)).unwrap();
+        t[31] = 0x2a;
         assert!(!meets_target_le(&t, &t));
+    }
+
+    #[test]
+    fn digest_sign_bit_is_ignored_like_the_covenant() {
+        let mut target = [0u8; 32];
+        target[28] = 0x02;
+        let mut digest = [0u8; 32];
+        digest[28] = 0x01;
+        assert!(meets_target_le(&digest, &target));
+        // ABS(BIN2NUM(..)) drops bit 255, so the same digest with the sign
+        // bit set is still a win.
+        digest[31] = 0x80;
+        assert!(meets_target_le(&digest, &target));
+        // Any other high bit keeps it above the target.
+        digest[31] = 0x81;
+        assert!(!meets_target_le(&digest, &target));
+        digest[31] = 0x80;
+        digest[28] = 0x02;
+        assert!(!meets_target_le(&digest, &target));
     }
 
     #[test]
@@ -1408,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_job_uses_identity_and_exact_615_byte_layout() {
+    fn prepared_job_uses_identity_and_age_layout() {
         let sk = [1u8; 32];
         let secret = SecretKey::from_secret_bytes(sk).unwrap();
         let public_key = PublicKey::from_secret_key(&secret).serialize();
@@ -1426,11 +1504,21 @@ mod tests {
             generation_id: 1,
             ..MiningJob::default()
         };
-        let prepared = prepare_job(job, &sk, &public_key).unwrap();
+        let prepared = prepare_job(job.clone(), &sk, &public_key).unwrap();
         assert_eq!(prepared.template.len(), 615);
         assert_eq!(&prepared.template[390..394], &[0u8; 4]);
         assert_eq!(&prepared.template[394..426], &prepared.target);
         assert_eq!(&prepared.template[45..78], &public_key);
+
+        for (age, bytes) in [(17u32, 616usize), (128, 617), (40_000, 618)] {
+            let prepared = prepare_job(MiningJob { age, ..job.clone() }, &sk, &public_key).unwrap();
+            let layout = tx::PhotonLayout::for_age(age).unwrap();
+            assert_eq!(prepared.template.len(), bytes);
+            let t = layout.target_offset();
+            assert_eq!(&prepared.template[t..t + 32], &prepared.target);
+            assert_eq!(&prepared.template[45..78], &public_key);
+        }
+        assert!(prepare_job(MiningJob { age: 65_535, ..job }, &sk, &public_key).is_err());
     }
 
     fn integration_job(generation_id: u64) -> MiningJob {

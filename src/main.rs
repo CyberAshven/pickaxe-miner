@@ -1476,6 +1476,7 @@ mod tests {
                 winners: 0,
                 rejected_winners: 2,
                 waiting_for_job: false,
+                key_rotations: 0,
                 last_error: Some(
                     "GPU winner rejected by host verification: HASH256 mismatch".into(),
                 ),

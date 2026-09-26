@@ -167,8 +167,6 @@ fn next_periodic_deadline(previous_deadline: Instant, now: Instant, interval: Du
 }
 const SUBMISSION_JOURNAL_VERSION: u8 = 3;
 const SUBMISSION_RESOLUTION_VERSION: u8 = 1;
-const PHOTON_TX_BYTES: usize = 615;
-const PHOTON_TARGET_OFFSET: usize = 394;
 const BATON_LINEAGE_MAX_STEPS: usize = 256;
 const VERIFIED_WINNER_DURABILITY_READY: bool = true;
 
@@ -1657,15 +1655,20 @@ fn production_preflight_local(
         contract_token_amount: live.token_amount,
         reward_raw: live.reward_raw,
     };
+    let layout = tx::PhotonLayout::for_age(live.age)?;
+    tx::require_covenant_hash_preimage(live.token_amount, live.reward_raw)?;
     let parent_preview = tx::build_unsigned_reference_preview(&context, mining_payout_address)?;
-    if parent_preview.len() != PHOTON_TX_BYTES {
+    if parent_preview.len() != layout.tx_bytes() {
         return Err(format!(
-            "PHOTON parent builder produced {} bytes; expected {PHOTON_TX_BYTES}",
-            parent_preview.len()
+            "PHOTON parent builder produced {} bytes; age {} needs {}",
+            parent_preview.len(),
+            live.age,
+            layout.tx_bytes()
         ));
     }
     let target = crate::search::parse_hex32(&live.target_le_hex)?;
-    if parent_preview[PHOTON_TARGET_OFFSET..PHOTON_TARGET_OFFSET + 32] != target {
+    let target_offset = layout.target_offset();
+    if parent_preview[target_offset..target_offset + 32] != target {
         return Err("PHOTON parent builder target placement disagrees with the live target".into());
     }
 
@@ -3552,6 +3555,7 @@ mod tests {
             winners: 0,
             rejected_winners: 0,
             waiting_for_job: false,
+            key_rotations: 0,
             last_error: None,
         }
     }

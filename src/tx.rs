@@ -220,6 +220,100 @@ fn compact_token_amount(amount: u128) -> Result<Vec<u8>, String> {
     Ok(compact_uint(amount as u64))
 }
 
+/// Byte positions of a PHOTON mining transaction for one baton age.
+///
+/// The input script pushes the age as a minimal script number, so the
+/// transaction is 615 bytes for age 0..=16 and one byte longer per extra
+/// number byte: 616 for 17..=127, 617 for 128..=32767, 618 for
+/// 32768..=65534. The covenant rejects age >= 65535. Every byte after the
+/// age push, including the nonce, target and signature, moves by `shift`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhotonLayout {
+    shift: usize,
+}
+
+impl PhotonLayout {
+    /// Layout of the age 0..=16 reference vector.
+    pub const BASE: Self = Self { shift: 0 };
+    /// Largest layout shift the covenant's age bound allows.
+    pub const MAX_SHIFT: usize = 3;
+    /// Covenant bound: `age < 65535`.
+    pub const MAX_AGE: u32 = 65_534;
+
+    /// Returns the layout for a baton age the covenant accepts.
+    pub fn for_age(age: u32) -> Result<Self, String> {
+        if age > Self::MAX_AGE {
+            return Err(format!(
+                "baton age {age} is outside the PHOTON covenant bound (age < 65535)"
+            ));
+        }
+        let push_bytes = encode_positive_script_number_push(age)?.len();
+        Ok(Self {
+            shift: push_bytes - 1,
+        })
+    }
+
+    /// Returns the layout of a serialized mining transaction of `len` bytes.
+    pub fn for_tx_len(len: usize) -> Result<Self, String> {
+        let shift = len
+            .checked_sub(Self::BASE.tx_bytes())
+            .filter(|shift| *shift <= Self::MAX_SHIFT)
+            .ok_or_else(|| {
+                format!("PHOTON mining transaction is {len} bytes; expected 615..=618")
+            })?;
+        Ok(Self { shift })
+    }
+
+    /// Bytes the age push adds beyond the one-byte reference layout.
+    pub const fn shift(self) -> usize {
+        self.shift
+    }
+
+    /// Serialized transaction length.
+    pub const fn tx_bytes(self) -> usize {
+        615 + self.shift
+    }
+
+    /// Offset of the 4-byte little-endian commitment nonce.
+    pub const fn nonce_offset(self) -> usize {
+        390 + self.shift
+    }
+
+    /// Offset of the 32-byte little-endian target.
+    pub const fn target_offset(self) -> usize {
+        394 + self.shift
+    }
+
+    /// Offset of the 64-byte Schnorr signature.
+    pub const fn signature_offset(self) -> usize {
+        426 + self.shift
+    }
+}
+
+/// Checks that the real transaction bytes equal the serialization the
+/// covenant rebuilds for its proof-of-work hash.
+///
+/// The covenant always writes the remaining baton amount as `0xff` plus 8
+/// bytes, and the reward as `0xff` plus 8 bytes once it needs more than a
+/// 4-byte script number, with the reward output length fixed at 68 bytes.
+/// The CompactSize encoding in the real transaction matches that only when
+/// both amounts exceed `u32::MAX`; below that the miner would hash a
+/// different preimage than the covenant checks.
+pub fn require_covenant_hash_preimage(
+    contract_token_amount: u128,
+    reward_amount: u128,
+) -> Result<(), String> {
+    let remaining = contract_token_amount
+        .checked_sub(reward_amount)
+        .ok_or("reward exceeds contract token amount")?;
+    if reward_amount <= u128::from(u32::MAX) || remaining <= u128::from(u32::MAX) {
+        return Err(format!(
+            "PHOTON reward {reward_amount} or remaining amount {remaining} is at or below 2^32-1; the covenant then hashes a different serialization than the transaction"
+        ));
+    }
+    Ok(())
+}
+
 /// Inputs for the reference single-payout PHOTON template (2 outputs).
 pub struct TemplateParams {
     pub prev_tx_hash_hex: String,
@@ -527,6 +621,60 @@ mod tests {
         let built = build_photon_template_bytes(&p).expect("build");
         assert_eq!(hex::encode(&built), expected);
         assert_eq!(built.len(), 615);
+    }
+
+    #[test]
+    fn layout_follows_the_age_push_width() {
+        let payout = hex::decode("76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac").unwrap();
+        let target = "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000";
+        for (age, bytes) in [
+            (0u32, 615usize),
+            (16, 615),
+            (17, 616),
+            (127, 616),
+            (128, 617),
+            (32_767, 617),
+            (32_768, 618),
+            (65_534, 618),
+        ] {
+            let layout = PhotonLayout::for_age(age).unwrap();
+            assert_eq!(layout.tx_bytes(), bytes, "age {age}");
+            let built = build_photon_template_bytes(&TemplateParams {
+                prev_tx_hash_hex: "00".repeat(32),
+                prev_index: 0,
+                age,
+                public_key_hex:
+                    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+                target_hex: target.into(),
+                signature_hex: "ab".repeat(64),
+                nonce: 0x1234_5678,
+                contract_value_sats: 15_971_500,
+                contract_token_amount: 2_099_905_002_035_715,
+                reward_amount: 4_999_773_813,
+                payout_locking: payout.clone(),
+            })
+            .unwrap();
+            assert_eq!(built.len(), bytes, "age {age}");
+            assert_eq!(PhotonLayout::for_tx_len(built.len()).unwrap(), layout);
+            let nonce = layout.nonce_offset();
+            assert_eq!(&built[nonce..nonce + 4], &0x1234_5678u32.to_le_bytes());
+            let t = layout.target_offset();
+            assert_eq!(hex::encode(&built[t..t + 32]), target);
+            let s = layout.signature_offset();
+            assert_eq!(&built[s..s + 64], &[0xab; 64][..]);
+        }
+        assert!(PhotonLayout::for_age(65_535).is_err());
+        assert!(PhotonLayout::for_tx_len(614).is_err());
+        assert!(PhotonLayout::for_tx_len(619).is_err());
+    }
+
+    #[test]
+    fn covenant_preimage_requires_eight_byte_amounts() {
+        let amount = 2_099_905_002_035_715u128;
+        assert!(require_covenant_hash_preimage(amount, amount / 420_000).is_ok());
+        assert!(require_covenant_hash_preimage(amount, u128::from(u32::MAX)).is_err());
+        assert!(require_covenant_hash_preimage(u128::from(u32::MAX) * 2, 5_000_000_000).is_err());
+        assert!(require_covenant_hash_preimage(1, 2).is_err());
     }
 
     #[test]
