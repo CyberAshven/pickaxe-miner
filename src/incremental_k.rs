@@ -86,7 +86,17 @@ fn incremental_k_montgomery_scalar_oracle() {
 #[test]
 #[ignore = "serial C1 comparison; requires old photon_c1_reference.ptx and current kernels"]
 fn incremental_k_c1_comparison() {
-    let mut engine = CudaPhotonEngine::new(0, BATCH, 8).unwrap();
+    let geometry = std::env::var_os("PICKAXE_COMPARE_GEOMETRY").is_some();
+    assert!(!geometry || cfg!(feature = "incremental-k"));
+    let sizes = [
+        BATCH,
+        if geometry {
+            search::CUDA_MAX_BATCH_CANDIDATES
+        } else {
+            BATCH
+        },
+    ];
+    let mut engine = CudaPhotonEngine::new(0, sizes[1], 8).unwrap();
     let mut incremental = Incremental::new(&engine, 32).unwrap();
     let mut target = [0u8; 32];
     target[28] = 1;
@@ -113,11 +123,16 @@ fn incremental_k_c1_comparison() {
     for (round, variant) in [0, 1, 1, 0, 0, 1, 1, 0].into_iter().enumerate() {
         let variant = variant ^ reverse;
         engine.stage_c1 = kernels[variant].clone();
+        let count = sizes[variant];
+        incremental.c1_per_thread = if geometry && variant == 1 { 16 } else { 8 };
         let mut base = 0u32;
         let mut run = || {
-            let batch = incremental.batch(&mut engine, base, BATCH).unwrap();
-            assert_eq!(batch.candidates, BATCH);
-            base = base.wrapping_add(BATCH);
+            if u64::from(base) + u64::from(count) > 1u64 << 32 {
+                base = 0;
+            }
+            let batch = incremental.batch(&mut engine, base, count).unwrap();
+            assert_eq!(batch.candidates, count);
+            base = base.wrapping_add(count);
         };
         let warm = Instant::now();
         while warm.elapsed() < Duration::from_secs(1) {
@@ -127,7 +142,7 @@ fn incremental_k_c1_comparison() {
         let mut candidates = 0u64;
         while start.elapsed() < Duration::from_secs(8) {
             run();
-            candidates += u64::from(BATCH);
+            candidates += u64::from(count);
         }
         let seconds = start.elapsed().as_secs_f64();
         let rate = candidates as f64 / seconds / 1e6;
@@ -143,7 +158,7 @@ fn incremental_k_c1_comparison() {
             "telemetry={}",
             String::from_utf8_lossy(&telemetry.stdout).trim()
         );
-        records.push(serde_json::json!({"round":round,"variant":variant,"candidates":candidates,"seconds":seconds,"million_candidates_per_second":rate,"telemetry_csv":String::from_utf8_lossy(&telemetry.stdout).trim()}));
+        records.push(serde_json::json!({"round":round,"variant":variant,"batch_size":count,"c1_per_thread":incremental.c1_per_thread,"candidates":candidates,"seconds":seconds,"million_candidates_per_second":rate,"telemetry_csv":String::from_utf8_lossy(&telemetry.stdout).trim()}));
     }
     std::fs::write(
         "artifacts/incremental-k/round3/comparison.json",
@@ -207,8 +222,8 @@ fn signature(key: &[u8; 32], message: &[u8; 32], k: u64) -> [u8; 64] {
 #[ignore = "requires built experimental PTX and a CUDA GPU; offline synthetic keys only"]
 fn incremental_k_correctness() {
     let mut engine = CudaPhotonEngine::new(0, 257, 257).unwrap();
-    let mut incremental = Incremental::new(&engine, 32).unwrap();
-    incremental.c1_per_thread = 8;
+    engine.enable_incremental_search().unwrap();
+    let mut incremental = engine.incremental.take().unwrap();
     let mut vectors = Vec::new();
     let mut checked = 0;
     for age in [0u32, 16, 17, 127, 128, 32767, 32768, 65534] {
@@ -282,20 +297,21 @@ fn incremental_k_correctness() {
         assert_eq!(result.winners.len(), expected.min(4) as usize);
         assert_eq!(result.truncated(), expected > 4);
     }
-    // Exercise the benchmark's full 32-step lane geometry, including its tail.
+    // Exercise the production batch and 32-step lane geometry, including its tail.
     drop(incremental);
     drop(engine);
-    let mut engine = CudaPhotonEngine::new(0, BATCH, 8).unwrap();
-    let mut incremental = Incremental::new(&engine, 32).unwrap();
-    incremental.c1_per_thread = 8;
+    let full_batch = search::CUDA_MAX_BATCH_CANDIDATES;
+    let mut engine = CudaPhotonEngine::new(0, full_batch, 8).unwrap();
+    engine.enable_incremental_search().unwrap();
+    let mut incremental = engine.incremental.take().unwrap();
     let mut target = [255; 32];
     target[31] = 127;
     engine
         .set_job(&template(128, &target, &secret(7)), &target, &secret(7))
         .unwrap();
     incremental.set_message(&engine, &target, NONCE).unwrap();
-    let result = incremental.batch(&mut engine, 65520, BATCH).unwrap();
-    assert_eq!(result.total_winners, BATCH);
+    let result = incremental.batch(&mut engine, 65520, full_batch).unwrap();
+    assert_eq!(result.total_winners, full_batch);
     assert!(result.truncated());
     let plus = engine.stream.clone_dtoh(&engine.signatures_gpu).unwrap();
     let minus = engine
@@ -312,7 +328,7 @@ fn incremental_k_correctness() {
         8191,
         8192,
         16384,
-        BATCH as usize - 1,
+        full_batch as usize - 1,
     ] {
         let expected = signature(&secret(7), &message, 65521 + index as u64);
         assert_eq!(&plus[index * 64..index * 64 + 32], &expected[..32]);

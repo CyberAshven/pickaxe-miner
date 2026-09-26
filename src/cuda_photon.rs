@@ -328,7 +328,8 @@ impl CudaPhotonEngine {
         if self.job_ready {
             return Err("enable incremental search before configuring a job".into());
         }
-        let incremental = incremental::Incremental::new(self, 32)?;
+        let mut incremental = incremental::Incremental::new(self, 32)?;
+        incremental.c1_per_thread = 16;
         self.incremental = Some(incremental);
         Ok(())
     }

@@ -26,7 +26,12 @@ pub(crate) const MAX_BATCH_CANDIDATES: u32 = 65_536;
 /// CUDA batches are larger: C1 gives each thread 8 candidates that share
 /// one inversion, so a 256K batch keeps every SM busy (35.0M/s against
 /// 29.8M/s at 64K on the RTX 5070 Ti).
+#[cfg(not(feature = "incremental-k"))]
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 262_144;
+/// Incremental search uses 16 candidates per C1 thread. This batch fills
+/// twelve 64-thread C1 blocks per SM on the measured 46-SM laptop GPU.
+#[cfg(feature = "incremental-k")]
+pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 565_248;
 const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 524_288;
 /// Throttled batches are a quarter of the full batch: small enough for
 /// fine duty pacing, large enough to keep the GPU busy during a burst.
@@ -1312,24 +1317,25 @@ mod tests {
 
     #[test]
     fn nonce_sweep_covers_each_nonce_once_then_stops() {
-        let mut sweep = NonceSweep::default();
-        let batch = 262_144_u32;
-        let full_batches = (1_u64 << 32) / u64::from(batch);
-        for _ in 0..full_batches - 1 {
-            assert_eq!(sweep.next_batch(batch), Some(batch));
-            sweep.record(batch);
+        // Include full/throttled batches that do not divide the scalar space.
+        for batch in [65_536, 262_144, 565_248, 141_312] {
+            for start in [0u32, 0x1234_5678, u32::MAX - 16] {
+                let mut sweep = NonceSweep::default();
+                let mut base = start;
+                let mut total = 0u64;
+                while let Some(requested) = sweep.next_batch(batch) {
+                    let count = batch_before_wrap(base, requested);
+                    assert!(count > 0 && count <= batch);
+                    assert!(u64::from(base) + u64::from(count) <= 1u64 << 32);
+                    base = base.wrapping_add(count);
+                    sweep.record(count);
+                    total += u64::from(count);
+                }
+                assert_eq!(total, 1u64 << 32);
+                assert_eq!(base, start);
+                assert_eq!(sweep.next_batch(1), None);
+            }
         }
-        // Leave an uneven tail: the last batch is trimmed to what remains.
-        assert_eq!(sweep.next_batch(batch), Some(batch));
-        sweep.record(batch - 100);
-        assert_eq!(sweep.next_batch(batch), Some(100));
-        sweep.record(100);
-        assert_eq!(sweep.next_batch(batch), None);
-        assert_eq!(sweep.next_batch(1), None);
-
-        // Wrapping from any start with these sizes visits 2^32 distinct nonces.
-        let total = (full_batches - 1) * u64::from(batch) + u64::from(batch - 100) + 100;
-        assert_eq!(total, 1_u64 << 32);
         assert_eq!(NonceSweep::default().next_batch(0), None);
     }
 
@@ -1371,11 +1377,11 @@ mod tests {
     fn intensity_scales_real_gpu_duty() {
         assert_eq!(
             intensity_batch_candidates(CUDA_MAX_BATCH_CANDIDATES, 100),
-            262_144
+            CUDA_MAX_BATCH_CANDIDATES
         );
         assert_eq!(
             intensity_batch_candidates(CUDA_MAX_BATCH_CANDIDATES, 50),
-            65_536
+            CUDA_MAX_BATCH_CANDIDATES / 4
         );
         assert_eq!(
             intensity_batch_candidates(MAX_BATCH_CANDIDATES, 100),
@@ -1412,7 +1418,14 @@ mod tests {
 
     #[test]
     fn production_batch_envelope_keeps_native_limit_and_reference_wgpu_limit() {
-        assert_eq!(production_max_batch_candidates(BackendKind::Cuda), 262_144);
+        assert_eq!(
+            production_max_batch_candidates(BackendKind::Cuda),
+            if cfg!(feature = "incremental-k") {
+                565_248
+            } else {
+                262_144
+            }
+        );
         assert_eq!(production_max_batch_candidates(BackendKind::Hip), 65_536);
         assert_eq!(
             production_max_batch_candidates(BackendKind::Wgpu),

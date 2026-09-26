@@ -4,6 +4,28 @@ Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7
 
 **Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. The user subsequently authorized promoting `fd95cbc` to master and continuing measured optimization rounds. The default release build and `D:\pickaxe-live` remain unchanged. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
 
+## Round 8: joint batch and inversion tuning
+
+[NVIDIA's execution-configuration guidance](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#thread-and-block-heuristics) recommends measuring launch parameters together. [BitcoinAddressFinder's joint tuning notes](https://github.com/bernardladenthin/BitcoinAddressFinder/blob/main/docs/performance.md) also distinguish batch size from work per thread; its address-generation rates are not PHOTON comparisons. This machine reports 46 CUDA multiprocessors.
+
+An initial 15-shape screen varied 131,072–1,048,576 candidates and 32/64/128 candidates per walking thread, keeping eight per C1 thread. The best short result was 282,624/32, but its longer comparison improved only 1.08%, insufficient for promotion alone. A second nine-shape screen varied C1's inversion group too. **565,248 candidates, 32 per walking thread and 16 per C1 thread** performed best. That gives 552 C1 blocks, or twelve per SM on this device. Both screens checked full all-pass winner counts and independent boundary signatures before measuring, including scalar 2^32.
+
+The retained implementation changes only the opt-in `incremental-k` CUDA batch cap and C1 group size. CUDA kernels, scalar arithmetic, transactions and funded signing are unchanged. The default build remains at 262,144 candidates. Accounted persistent buffers increase by 74 MiB; measured average batch time is about 5 ms. Commands and job updates still run between bounded batches. Sweep coverage now explicitly tests both old and new full/throttled sizes from three starting indexes, including a near-wrap start.
+
+Complete-pipeline comparisons use identical master PTX in both slots, synthetic full-width keys, 45 seconds of warm-up, eight eight-second windows and one-second inter-window warm-ups:
+
+| Order | Master median, million/s | Candidate median, million/s | Gain |
+| --- | ---: | ---: | ---: |
+| ABBA ABBA | 109.444 | 114.499 | +4.62% |
+| BAAB BAAB | 107.176 | 111.295 | +3.84% |
+| Final source, ABBA ABBA | 105.817 | 111.476 | +5.35% |
+
+Raw telemetry is retained, including isolated idle samples; no sample was discarded to improve the result. These are comparisons on this laptop, not a guarantee of improvement on every GPU or a new universal ceiling.
+
+The final source passed 258 feature-enabled regression tests, 13,920 independently reconstructed candidates across eight age layouts and three keys, the production-sized full-batch samples, and 216 BCH 2026 standard/consensus transaction proofs (103 accepted, 113 rejected). Default release checking, all-target/all-feature Clippy with warnings denied, formatting and the opt-in release build passed. The GPU integration tests cover winner reconstruction, key rotation and search/reward identity separation. Live and remote CI results must be checked separately before promotion.
+
+To reproduce the geometry comparison, put identical master C1 PTX in `photon_c1_reference.ptx` and `photon_c1_schnorr.ptx`, build tests with `--features incremental-k`, set `PICKAXE_COMPARE_GEOMETRY=1`, and run `incremental_k_c1_comparison` explicitly. Add `PICKAXE_C1_REVERSE=1` for reversed order. Without the geometry flag, the original C1-only comparison remains available. The correctness test now obtains settings through the same `enable_incremental_search` method as the live worker. Ignored `artifacts/incremental-k/round8/` contains the screening harness patches, comparisons, compiler/check logs and validation evidence.
+
 ## Round 7: researched and rejected binary/shared inversion prototypes
 
 The user's request for broader internet research led to [gECC](https://arxiv.org/html/2501.03245v1). Its Gather-Apply-Scatter design combines thread products, performs fewer inversions, and distributes the inverses. The authors' [MIT implementation](https://github.com/CGCL-codes/gECC/blob/322c1c143d6a886747308f5b4d88603d6e30a48a/include/gecc/arith/batch_ec.h) was inspected at commit `322c1c1`. Its SM2/A100 results do not establish a PHOTON/secp256k1/Blackwell gain. No third-party implementation was imported into product code.
