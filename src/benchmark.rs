@@ -185,6 +185,8 @@ impl TelemetryAccumulator {
             vram_used_mib: average(self.vram_sum, self.vram_count),
             graphics_clock_mhz: average(self.graphics_clock_sum, self.graphics_clock_count),
             memory_clock_mhz: average(self.memory_clock_sum, self.memory_clock_count),
+            // Benchmark reports do not show fan duty.
+            fan_percent: None,
         }
     }
 }

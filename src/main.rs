@@ -1492,6 +1492,7 @@ mod tests {
                 vram_used_mib: Some(512.0),
                 graphics_clock_mhz: Some(2_400.0),
                 memory_clock_mhz: Some(8_000.0),
+                fan_percent: None,
             },
         };
 

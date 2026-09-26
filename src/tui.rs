@@ -15,8 +15,8 @@ use ratatui::{
     symbols,
     text::{Line, Span},
     widgets::{
-        Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, LineGauge, List, ListItem,
-        Paragraph, Wrap,
+        Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, List, ListItem, Paragraph,
+        Wrap,
     },
     Frame, Terminal, TerminalOptions, Viewport,
 };
@@ -35,12 +35,14 @@ const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EVENT_HISTORY_CAP: usize = 96;
-/// Spacing of hash-rate history samples.
-const RATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
-/// One hour of hash-rate history.
-const RATE_HISTORY_CAP: usize = 720;
-/// Smallest leftover height worth a hash-rate chart.
-const HISTORY_MIN_ROWS: u16 = 7;
+/// Spacing of chart history samples.
+const HISTORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+/// One hour of chart history.
+const HISTORY_CAP: usize = 720;
+/// Height the chart area gets when the window has no spare rows.
+const CHART_MIN_ROWS: u16 = 8;
+/// Narrowest chart placed beside another instead of stacked.
+const CHART_MIN_WIDTH: u16 = 50;
 const COMMAND_HISTORY_CAP: usize = 32;
 const BENCHMARK_TERMINAL_WIDTH: u16 = 120;
 const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
@@ -259,8 +261,118 @@ enum PaletteCommand {
     Devices,
     Backend,
     Benchmark,
+    Charts(ChartRequest),
     Help,
     Quit,
+}
+
+/// A live value the optional history charts can plot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartMetric {
+    Hashrate,
+    Temperature,
+    Power,
+    Fan,
+    Utilization,
+    CoreClock,
+}
+
+impl ChartMetric {
+    const ALL: [Self; 6] = [
+        Self::Hashrate,
+        Self::Temperature,
+        Self::Power,
+        Self::Fan,
+        Self::Utilization,
+        Self::CoreClock,
+    ];
+
+    /// Accepts the command names shown in help, plus a few aliases.
+    fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "hash" | "hashrate" | "rate" => Some(Self::Hashrate),
+            "temp" | "temperature" => Some(Self::Temperature),
+            "power" | "watts" => Some(Self::Power),
+            "fan" => Some(Self::Fan),
+            "util" | "utilization" | "load" => Some(Self::Utilization),
+            "clock" | "clocks" | "core" => Some(Self::CoreClock),
+            _ => None,
+        }
+    }
+
+    /// Short command name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hashrate => "hash",
+            Self::Temperature => "temp",
+            Self::Power => "power",
+            Self::Fan => "fan",
+            Self::Utilization => "util",
+            Self::CoreClock => "clock",
+        }
+    }
+
+    /// Chart title.
+    fn title(self) -> &'static str {
+        match self {
+            Self::Hashrate => "Hashrate",
+            Self::Temperature => "GPU temperature",
+            Self::Power => "GPU power",
+            Self::Fan => "Fan speed",
+            Self::Utilization => "GPU utilization",
+            Self::CoreClock => "Core clock",
+        }
+    }
+
+    /// Reads this metric from one history sample.
+    fn value(self, sample: &HistorySample) -> Option<f64> {
+        let gpu = &sample.gpu;
+        match self {
+            Self::Hashrate => Some(sample.rate),
+            Self::Temperature => gpu.temperature_c,
+            Self::Power => gpu.power_watts,
+            Self::Fan => gpu.fan_percent,
+            Self::Utilization => gpu.gpu_utilization_percent,
+            Self::CoreClock => gpu.graphics_clock_mhz,
+        }
+        .filter(|value| value.is_finite())
+    }
+
+    /// Formats a value of this metric for titles and axis labels.
+    fn format(self, value: f64) -> String {
+        match self {
+            Self::Hashrate => crate::telemetry::format_hash_rate(value),
+            Self::Temperature => format!("{value:.0} C"),
+            Self::Power => format!("{value:.0} W"),
+            Self::Fan | Self::Utilization => format!("{value:.0}%"),
+            Self::CoreClock => format!("{value:.0} MHz"),
+        }
+    }
+
+    /// Axis top: 100 for percentages and temperature unless exceeded,
+    /// otherwise a round number above the largest value.
+    fn axis_top(self, largest: f64) -> f64 {
+        let fitted = nice_ceiling(largest * 1.1);
+        match self {
+            Self::Temperature | Self::Fan | Self::Utilization => fitted.max(100.0),
+            _ => fitted,
+        }
+    }
+}
+
+/// One history point for the charts.
+#[derive(Debug, Clone, Default)]
+struct HistorySample {
+    rate: f64,
+    gpu: crate::telemetry::GpuTelemetry,
+}
+
+/// A `/chart` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChartRequest {
+    Toggle,
+    Off,
+    Show(Vec<ChartMetric>),
 }
 
 struct TuiState {
@@ -275,8 +387,12 @@ struct TuiState {
     status_line: String,
     events: VecDeque<String>,
     devices: Vec<GpuDevice>,
-    rate_history: VecDeque<f64>,
-    last_rate_sample: Option<Instant>,
+    history: VecDeque<HistorySample>,
+    last_history_sample: Option<Instant>,
+    /// Charts on screen; empty means charts are hidden (the default).
+    charts: Vec<ChartMetric>,
+    /// Charts that `G` or a bare `/chart` brings back.
+    last_charts: Vec<ChartMetric>,
 }
 
 impl TuiState {
@@ -296,26 +412,61 @@ impl TuiState {
             status_line: "Donation: 2%".into(),
             events,
             devices: Vec::new(),
-            rate_history: VecDeque::with_capacity(RATE_HISTORY_CAP),
-            last_rate_sample: None,
+            history: VecDeque::with_capacity(HISTORY_CAP),
+            last_history_sample: None,
+            charts: Vec::new(),
+            last_charts: vec![ChartMetric::Hashrate],
         }
     }
 
-    /// Samples the current hash rate for the history chart at most once
-    /// per sample interval.
-    fn record_rate(&mut self, rate: f64, now: Instant) {
+    /// Records hash rate and GPU telemetry for the charts at most once per
+    /// sample interval, whether or not charts are shown.
+    fn record_sample(&mut self, snapshot: &RuntimeSnapshot, now: Instant) {
         if self
-            .last_rate_sample
-            .is_some_and(|sampled| now.duration_since(sampled) < RATE_SAMPLE_INTERVAL)
+            .last_history_sample
+            .is_some_and(|sampled| now.duration_since(sampled) < HISTORY_SAMPLE_INTERVAL)
         {
             return;
         }
-        if self.rate_history.len() == RATE_HISTORY_CAP {
-            self.rate_history.pop_front();
+        if self.history.len() == HISTORY_CAP {
+            self.history.pop_front();
         }
-        self.rate_history
-            .push_back(if rate.is_finite() { rate.max(0.0) } else { 0.0 });
-        self.last_rate_sample = Some(now);
+        let rate = snapshot.search.current_rate;
+        self.history.push_back(HistorySample {
+            rate: if rate.is_finite() { rate.max(0.0) } else { 0.0 },
+            gpu: snapshot.gpu_telemetry.clone(),
+        });
+        self.last_history_sample = Some(now);
+    }
+
+    /// Applies a `/chart` request or the `G` toggle.
+    fn apply_chart_request(&mut self, request: ChartRequest) {
+        match request {
+            ChartRequest::Toggle if self.charts.is_empty() => {
+                self.charts = self.last_charts.clone();
+            }
+            ChartRequest::Toggle | ChartRequest::Off => {
+                if !self.charts.is_empty() {
+                    self.last_charts = std::mem::take(&mut self.charts);
+                }
+            }
+            ChartRequest::Show(metrics) => {
+                self.charts = metrics.clone();
+                self.last_charts = metrics;
+            }
+        }
+        self.status_line = if self.charts.is_empty() {
+            "Charts hidden. Press G or type /chart to show them.".into()
+        } else {
+            format!(
+                "Charts: {}. Press G to hide.",
+                self.charts
+                    .iter()
+                    .map(|metric| metric.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
     }
 
     /// Adds a runtime event to the bounded terminal log.
@@ -533,7 +684,7 @@ pub fn run(
     let mut last_status_log: Option<Instant> = None;
     while !quit {
         let snapshot = supervisor.snapshot();
-        state.record_rate(snapshot.search.current_rate, Instant::now());
+        state.record_sample(&snapshot, Instant::now());
 
         for event in supervisor.drain_events() {
             append_tui_log(&format!("event {}", event_log_text(&event)));
@@ -743,6 +894,10 @@ fn handle_key(
             apply_result(supervisor.reconnect(), "Reconnect requested", state);
             Ok(false)
         }
+        KeyCode::Char('g') | KeyCode::Char('G') => {
+            state.apply_chart_request(ChartRequest::Toggle);
+            Ok(false)
+        }
         KeyCode::Char('+') | KeyCode::Char(']') => {
             adjust_intensity(supervisor, snapshot, 10, state);
             Ok(false)
@@ -918,10 +1073,42 @@ fn apply_palette_command(
             state.status_line = message.into();
             state.push_event(message.into());
         }
+        PaletteCommand::Charts(request) => state.apply_chart_request(request),
         PaletteCommand::Help => state.show_help = true,
         PaletteCommand::Quit => return Ok(true),
     }
     Ok(false)
+}
+
+/// Parses `/chart` arguments: none toggles, `off` hides, `all` shows every
+/// chart, otherwise a list of chart names.
+fn parse_chart_request(argument: &str) -> Result<PaletteCommand, String> {
+    let names = argument
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    let request = match names.as_slice() {
+        [] => ChartRequest::Toggle,
+        [one] if ["off", "hide", "none"].contains(&one.to_ascii_lowercase().as_str()) => {
+            ChartRequest::Off
+        }
+        [one] if one.eq_ignore_ascii_case("all") => ChartRequest::Show(ChartMetric::ALL.to_vec()),
+        names => {
+            let mut metrics = Vec::new();
+            for name in names {
+                let metric = ChartMetric::parse(name).ok_or_else(|| {
+                    format!(
+                        "unknown chart {name}. Choose hash temp power fan util clock, all or off."
+                    )
+                })?;
+                if !metrics.contains(&metric) {
+                    metrics.push(metric);
+                }
+            }
+            ChartRequest::Show(metrics)
+        }
+    };
+    Ok(PaletteCommand::Charts(request))
 }
 
 /// Shows the result of a palette command in the event log.
@@ -987,6 +1174,7 @@ fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
         "devices" | "gpus" => Ok(PaletteCommand::Devices),
         "backend" => Ok(PaletteCommand::Backend),
         "benchmark" | "bench" => Ok(PaletteCommand::Benchmark),
+        "chart" | "charts" | "graph" | "graphs" => parse_chart_request(argument),
         "help" | "?" => Ok(PaletteCommand::Help),
         "quit" | "exit" => Ok(PaletteCommand::Quit),
         _ => Err(format!("unknown command {command}. Try help.")),
@@ -1111,16 +1299,21 @@ fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
 fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     let area = frame.area();
     // The runtime and events panes are only as tall as the runtime rows
-    // need; a tall window gives the rest to the hash-rate chart instead of
-    // empty boxes.
+    // need, so a tall window never shows empty boxes. Charts are off until
+    // asked for; then they get the spare rows, or at least CHART_MIN_ROWS
+    // with the least important runtime rows giving way.
     let runtime_width = runtime_pane_width(area.width);
     let available = area.height.saturating_sub(3 + 3 + 4);
     let needed = u16::try_from(runtime_fields(snapshot, runtime_width).len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
-    let (body_height, history_height) = match available.checked_sub(needed) {
-        Some(spare) if spare >= HISTORY_MIN_ROWS => (needed, spare),
-        _ => (available, 0),
+    let (body_height, chart_height) = if state.charts.is_empty() {
+        (needed.min(available), 0)
+    } else {
+        let charts = available
+            .saturating_sub(needed)
+            .max(CHART_MIN_ROWS.min(available / 2));
+        (available - charts, charts)
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1128,8 +1321,9 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(body_height),
-            Constraint::Length(history_height),
-            Constraint::Min(4),
+            Constraint::Length(chart_height),
+            Constraint::Length(4),
+            Constraint::Min(0),
         ])
         .split(area);
 
@@ -1142,8 +1336,8 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
         .split(rows[2]);
     render_stats(frame, body[0], snapshot);
     render_events(frame, body[1], state);
-    if history_height > 0 {
-        render_history(frame, rows[3], state);
+    if chart_height > 0 {
+        render_charts(frame, rows[3], state);
     }
     render_footer(frame, rows[4], state);
 
@@ -1181,17 +1375,15 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) 
 /// Renders the GPU intensity control and current value.
 fn render_intensity(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let ratio = f64::from(snapshot.search.intensity.min(100)) / 100.0;
-    let gauge = LineGauge::default()
+    let gauge = Gauge::default()
         .block(
             Block::default()
                 .title(" GPU intensity ")
                 .borders(Borders::ALL),
         )
-        .filled_style(Style::default().fg(Color::Cyan))
-        .unfilled_style(Style::default().fg(Color::DarkGray))
-        .line_set(symbols::line::THICK)
+        .gauge_style(Style::default().fg(Color::Cyan))
         .ratio(ratio)
-        .label(format!("{:>3}% ", snapshot.search.intensity));
+        .label(format!("{}%", snapshot.search.intensity));
     frame.render_widget(gauge, area);
 }
 
@@ -1569,34 +1761,94 @@ fn nice_ceiling(value: f64) -> f64 {
         .unwrap_or(10.0 * magnitude)
 }
 
-/// Charts the last hour of hash rate; dips to zero show idle GPU time.
-fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let step = RATE_SAMPLE_INTERVAL.as_secs_f64();
-    let window = RATE_HISTORY_CAP as f64 * step;
-    let newest = state.rate_history.len().saturating_sub(1) as f64;
+/// Lays out the selected charts side by side when each can be at least
+/// CHART_MIN_WIDTH wide, otherwise in stacked rows.
+fn render_charts(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let count = state.charts.len();
+    if count == 0 {
+        return;
+    }
+    let mut columns = usize::from(area.width / CHART_MIN_WIDTH).clamp(1, count);
+    let stacked_rows = u16::try_from(count.div_ceil(columns)).unwrap_or(u16::MAX);
+    if area.height / stacked_rows < 6 {
+        columns = count;
+    }
+    let row_count = count.div_ceil(columns);
+    let row_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Ratio(1, row_count as u32); row_count])
+        .split(area);
+    for (metrics, row_area) in state.charts.chunks(columns).zip(row_areas.iter()) {
+        let cells = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(vec![
+                Constraint::Ratio(1, metrics.len() as u32);
+                metrics.len()
+            ])
+            .split(*row_area);
+        for (metric, cell) in metrics.iter().zip(cells.iter()) {
+            render_metric_chart(frame, *cell, state, *metric);
+        }
+    }
+}
+
+/// Charts the last hour of one metric; a hash-rate dip to zero shows idle
+/// GPU time.
+fn render_metric_chart(frame: &mut Frame<'_>, area: Rect, state: &TuiState, metric: ChartMetric) {
+    let step = HISTORY_SAMPLE_INTERVAL.as_secs_f64();
+    let window = HISTORY_CAP as f64 * step;
+    let newest = state.history.len().saturating_sub(1) as f64;
     let points = state
-        .rate_history
+        .history
         .iter()
         .enumerate()
-        .map(|(index, rate)| ((index as f64 - newest) * step, *rate))
+        .filter_map(|(index, sample)| {
+            metric
+                .value(sample)
+                .map(|value| ((index as f64 - newest) * step, value))
+        })
         .collect::<Vec<_>>();
-    let top = nice_ceiling(points.iter().map(|(_, rate)| *rate).fold(0.0_f64, f64::max) * 1.1);
+    let current = state.history.back().and_then(|sample| metric.value(sample));
+    let block = Block::default()
+        .title(match current {
+            Some(value) => format!(
+                " {} · {} · last 60 min ",
+                metric.title(),
+                metric.format(value)
+            ),
+            None => format!(" {} · last 60 min ", metric.title()),
+        })
+        .borders(Borders::ALL);
+    if points.is_empty() {
+        let message = if state.history.is_empty() {
+            "collecting samples…".to_string()
+        } else {
+            format!(
+                "{} is not reported by this GPU",
+                metric.title().to_ascii_lowercase()
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block),
+            area,
+        );
+        return;
+    }
+    let top = metric.axis_top(
+        points
+            .iter()
+            .map(|(_, value)| *value)
+            .fold(0.0_f64, f64::max),
+    );
     let minutes = |seconds: f64| format!("{:.0}m", seconds / 60.0);
-    let hash_rate = crate::telemetry::format_hash_rate;
     let chart = Chart::new(vec![Dataset::default()
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Cyan))
         .data(&points)])
-    .block(
-        Block::default()
-            .title(format!(
-                " Hashrate · last {} min · one sample every {} s ",
-                (window / 60.0).round(),
-                step.round()
-            ))
-            .borders(Borders::ALL),
-    )
+    .block(block)
     .x_axis(
         Axis::default()
             .style(Style::default().fg(Color::DarkGray))
@@ -1612,9 +1864,9 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .style(Style::default().fg(Color::DarkGray))
             .bounds([0.0, top])
             .labels([
-                Span::raw(hash_rate(0.0)),
-                Span::raw(hash_rate(top / 2.0)),
-                Span::raw(hash_rate(top)),
+                Span::raw(metric.format(0.0)),
+                Span::raw(metric.format(top / 2.0)),
+                Span::raw(metric.format(top)),
             ]),
     );
     frame.render_widget(chart, area);
@@ -1679,7 +1931,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         vec![
             Line::from(
-                "[/] command  [P] pause  [+/-] intensity  [R] reconnect  [S] settings  [?] help  [Q] quit",
+                "[/] command  [P] pause  [+/-] intensity  [R] reconnect  [S] settings  [G] charts  [?] help  [Q] quit",
             ),
             Line::from(state.status_line.as_str()),
         ]
@@ -1739,6 +1991,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Space / P    pause or resume"),
         Line::from("R            reconnect the current source"),
         Line::from("S            settings"),
+        Line::from("G            show or hide charts"),
         Line::from("/ (: or C)   command bar"),
         Line::from("?            close/open help"),
         Line::from("Q / Ctrl+C   graceful quit"),
@@ -1747,6 +2000,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  /intensity <10-100> | /pause | /resume | /reconnect"),
         Line::from("  /address <cashaddr> | /endpoint <wss://...> | /endpoint auto"),
         Line::from("  /status | /config | /devices | /backend | /logs"),
+        Line::from("  /chart [hash temp power fan util clock | all | off]"),
         Line::from("  /benchmark | /help | /quit"),
     ])
     .block(Block::default().title(" Help ").borders(Borders::ALL))
@@ -2180,6 +2434,7 @@ mod tests {
             vram_used_mib: Some(640.0),
             graphics_clock_mhz: Some(2_500.0),
             memory_clock_mhz: Some(8_100.0),
+            fan_percent: Some(45.0),
         };
         let state = TuiState::new(&snapshot);
         let backend = ratatui::backend::TestBackend::new(120, 40);
@@ -2320,29 +2575,69 @@ mod tests {
     }
 
     #[test]
-    fn rate_history_samples_on_its_interval_and_stays_bounded() {
+    fn chart_history_samples_on_its_interval_and_stays_bounded() {
         let mut state = TuiState::new(&test_snapshot());
+        let mut snapshot = test_snapshot();
         let start = Instant::now();
-        state.record_rate(1.0, start);
-        state.record_rate(2.0, start + Duration::from_secs(1));
-        assert_eq!(state.rate_history.len(), 1);
-        for step in 1..=(RATE_HISTORY_CAP as u64 + 5) {
-            state.record_rate(step as f64, start + RATE_SAMPLE_INTERVAL * step as u32);
+        state.record_sample(&snapshot, start);
+        state.record_sample(&snapshot, start + Duration::from_secs(1));
+        assert_eq!(state.history.len(), 1);
+        for step in 1..=(HISTORY_CAP as u32 + 5) {
+            snapshot.search.current_rate = f64::from(step);
+            state.record_sample(&snapshot, start + HISTORY_SAMPLE_INTERVAL * step);
         }
-        assert_eq!(state.rate_history.len(), RATE_HISTORY_CAP);
+        assert_eq!(state.history.len(), HISTORY_CAP);
         assert_eq!(
-            state.rate_history.back().copied(),
-            Some((RATE_HISTORY_CAP + 5) as f64)
+            state.history.back().map(|sample| sample.rate),
+            Some((HISTORY_CAP + 5) as f64)
         );
     }
 
     #[test]
-    fn tall_window_charts_hash_rate_instead_of_empty_rows() {
+    fn chart_command_selects_toggles_and_hides_charts() {
+        assert_eq!(
+            parse_palette_command("/chart temp, fan hash temp").unwrap(),
+            PaletteCommand::Charts(ChartRequest::Show(vec![
+                ChartMetric::Temperature,
+                ChartMetric::Fan,
+                ChartMetric::Hashrate,
+            ]))
+        );
+        assert_eq!(
+            parse_palette_command("chart").unwrap(),
+            PaletteCommand::Charts(ChartRequest::Toggle)
+        );
+        assert_eq!(
+            parse_palette_command("graph off").unwrap(),
+            PaletteCommand::Charts(ChartRequest::Off)
+        );
+        assert_eq!(
+            parse_palette_command("charts all").unwrap(),
+            PaletteCommand::Charts(ChartRequest::Show(ChartMetric::ALL.to_vec()))
+        );
+        assert!(parse_palette_command("chart bogus").is_err());
+
+        let mut state = TuiState::new(&test_snapshot());
+        assert!(state.charts.is_empty(), "charts are off by default");
+        state.apply_chart_request(ChartRequest::Toggle);
+        assert_eq!(state.charts, vec![ChartMetric::Hashrate]);
+        state.apply_chart_request(ChartRequest::Show(vec![ChartMetric::Power]));
+        state.apply_chart_request(ChartRequest::Off);
+        assert!(state.charts.is_empty());
+        state.apply_chart_request(ChartRequest::Toggle);
+        assert_eq!(
+            state.charts,
+            vec![ChartMetric::Power],
+            "G brings back the last choice"
+        );
+    }
+
+    #[test]
+    fn charts_are_off_by_default_and_panes_never_pad_with_empty_rows() {
         let snapshot = test_snapshot();
         let rows = rendered_rows(&snapshot, 190, 50);
         assert!(
-            rows.iter()
-                .any(|row| row.contains(" Hashrate · last 60 min")),
+            !rows.iter().any(|row| row.contains("last 60 min")),
             "{rows:?}"
         );
         let runtime_bottom = rows
@@ -2350,8 +2645,78 @@ mod tests {
             .position(|row| row.contains("Last error"))
             .unwrap();
         assert!(rows[runtime_bottom + 1].starts_with("└"), "{rows:?}");
-        let short = rendered_rows(&snapshot, 120, 30);
-        assert!(!short.iter().any(|row| row.contains(" Hashrate · last")));
+        assert!(
+            rows[runtime_bottom + 2].contains("┌"),
+            "footer follows the panes"
+        );
+    }
+
+    /// Renders with the given charts selected.
+    fn rendered_rows_with_charts(
+        snapshot: &RuntimeSnapshot,
+        charts: &[ChartMetric],
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let mut state = TuiState::new(snapshot);
+        state.record_sample(snapshot, Instant::now());
+        state.apply_chart_request(ChartRequest::Show(charts.to_vec()));
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render(frame, snapshot, &state))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn selected_charts_sit_side_by_side_when_wide_and_stack_when_narrow() {
+        let mut snapshot = test_snapshot();
+        snapshot.search.current_rate = 30e6;
+        snapshot.gpu_telemetry.temperature_c = Some(71.0);
+        let charts = [
+            ChartMetric::Hashrate,
+            ChartMetric::Temperature,
+            ChartMetric::Fan,
+        ];
+
+        let wide = rendered_rows_with_charts(&snapshot, &charts, 190, 50);
+        assert!(
+            wide.iter().any(|row| row.contains("Hashrate · 30.00 MH/s")
+                && row.contains("GPU temperature · 71 C")
+                && row.contains("Fan speed")),
+            "{wide:?}"
+        );
+        assert!(wide
+            .iter()
+            .any(|row| row.contains("fan speed is not reported")));
+
+        let narrow = rendered_rows_with_charts(&snapshot, &charts[..2], 90, 60);
+        let hash = narrow
+            .iter()
+            .position(|row| row.contains("Hashrate · "))
+            .unwrap();
+        let temp = narrow
+            .iter()
+            .position(|row| row.contains("GPU temperature · "))
+            .unwrap();
+        assert!(temp > hash, "stacked: {narrow:?}");
+
+        let small = rendered_rows_with_charts(&snapshot, &charts[..1], 120, 30);
+        assert!(
+            small.iter().any(|row| row.contains("Hashrate · ")),
+            "{small:?}"
+        );
+        assert!(
+            small.iter().any(|row| row.contains("Hashrate   ")),
+            "runtime stays"
+        );
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub struct GpuTelemetry {
     pub vram_used_mib: Option<f64>,
     pub graphics_clock_mhz: Option<f64>,
     pub memory_clock_mhz: Option<f64>,
+    /// Fan duty in percent; laptop GPUs usually do not report it.
+    pub fan_percent: Option<f64>,
 }
 
 impl GpuTelemetry {
@@ -78,7 +80,7 @@ fn parse_metric(value: Option<&&str>) -> Option<f64> {
 /// Decodes utilization and power metrics from nvidia-smi output.
 pub(crate) fn parse_nvidia_smi_line(line: &str) -> Option<GpuTelemetry> {
     let fields = line.split(',').collect::<Vec<_>>();
-    if fields.len() != 6 {
+    if !(6..=7).contains(&fields.len()) {
         return None;
     }
     Some(GpuTelemetry {
@@ -89,6 +91,7 @@ pub(crate) fn parse_nvidia_smi_line(line: &str) -> Option<GpuTelemetry> {
         vram_used_mib: parse_metric(fields.get(3)),
         graphics_clock_mhz: parse_metric(fields.get(4)),
         memory_clock_mhz: parse_metric(fields.get(5)),
+        fan_percent: parse_metric(fields.get(6)),
     })
 }
 
@@ -96,7 +99,7 @@ pub(crate) fn parse_nvidia_smi_line(line: &str) -> Option<GpuTelemetry> {
 pub(crate) fn sample_nvidia_telemetry(device: u32) -> Option<GpuTelemetry> {
     let output = Command::new("nvidia-smi")
         .arg(format!("--id={device}"))
-        .arg("--query-gpu=utilization.gpu,power.draw,temperature.gpu,memory.used,clocks.gr,clocks.mem")
+        .arg("--query-gpu=utilization.gpu,power.draw,temperature.gpu,memory.used,clocks.gr,clocks.mem,fan.speed")
         .arg("--format=csv,noheader,nounits")
         .output()
         .ok()?;
@@ -173,6 +176,7 @@ pub(crate) fn parse_amd_smi_json(stdout: &str) -> Option<GpuTelemetry> {
         vram_used_mib: find_metric(&value, &["vram_used", "used_vram"]),
         graphics_clock_mhz: find_metric(&value, &["gfx_clock", "graphics_clock", "gfxclk"]),
         memory_clock_mhz: find_metric(&value, &["mem_clock", "memory_clock", "mclk"]),
+        fan_percent: find_metric(&value, &["fan_speed", "fan_speed_percent", "fan_usage"]),
     };
     [
         telemetry.gpu_utilization_percent,
@@ -181,6 +185,7 @@ pub(crate) fn parse_amd_smi_json(stdout: &str) -> Option<GpuTelemetry> {
         telemetry.vram_used_mib,
         telemetry.graphics_clock_mhz,
         telemetry.memory_clock_mhz,
+        telemetry.fan_percent,
     ]
     .iter()
     .any(Option::is_some)
@@ -300,6 +305,13 @@ mod tests {
         assert_eq!(parsed.vram_used_mib, Some(2048.0));
         assert_eq!(parsed.graphics_clock_mhz, Some(2450.0));
         assert_eq!(parsed.memory_clock_mhz, None);
+        assert_eq!(parsed.fan_percent, None);
+
+        let with_fan = parse_nvidia_smi_line("87, 123.5, 68, 2048, 2450, 12001, 45").unwrap();
+        assert_eq!(with_fan.fan_percent, Some(45.0));
+        let laptop = parse_nvidia_smi_line("87, 123.5, 68, 2048, 2450, 12001, [N/A]").unwrap();
+        assert_eq!(laptop.fan_percent, None);
+        assert!(parse_nvidia_smi_line("87, 123.5, 68, 2048, 2450, 12001, 45, 1").is_none());
     }
 
     #[test]
