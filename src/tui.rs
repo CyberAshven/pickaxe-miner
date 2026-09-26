@@ -371,12 +371,30 @@ struct HistorySample {
     gpu: crate::telemetry::GpuTelemetry,
 }
 
-/// A `/chart` request.
+/// A `/chart` request or chart key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChartRequest {
+    /// `G`: show or hide the chosen charts.
     Toggle,
+    On,
     Off,
+    /// Show exactly these charts.
     Show(Vec<ChartMetric>),
+    Add(Vec<ChartMetric>),
+    Remove(Vec<ChartMetric>),
+    /// `/chart options`: open the chart options menu.
+    Options,
+}
+
+/// Charts shown the first time `G` is pressed.
+const DEFAULT_CHARTS: [ChartMetric; 2] = [ChartMetric::Hashrate, ChartMetric::Temperature];
+
+/// Puts charts in the fixed on-screen order and drops duplicates.
+fn chart_order(metrics: &[ChartMetric]) -> Vec<ChartMetric> {
+    ChartMetric::ALL
+        .into_iter()
+        .filter(|metric| metrics.contains(metric))
+        .collect()
 }
 
 struct TuiState {
@@ -395,8 +413,10 @@ struct TuiState {
     last_history_sample: Option<Instant>,
     /// Charts on screen; empty means charts are hidden (the default).
     charts: Vec<ChartMetric>,
-    /// Charts that `G` or a bare `/chart` brings back; all of them at first.
-    last_charts: Vec<ChartMetric>,
+    /// The charts `G` shows; hash rate and temperature at first.
+    chart_selection: Vec<ChartMetric>,
+    /// Cursor row while the chart options menu is open.
+    chart_options: Option<usize>,
 }
 
 impl TuiState {
@@ -419,7 +439,8 @@ impl TuiState {
             history: VecDeque::with_capacity(HISTORY_CAP),
             last_history_sample: None,
             charts: Vec::new(),
-            last_charts: ChartMetric::ALL.to_vec(),
+            chart_selection: DEFAULT_CHARTS.to_vec(),
+            chart_options: None,
         }
     }
 
@@ -443,27 +464,40 @@ impl TuiState {
         self.last_history_sample = Some(now);
     }
 
-    /// Applies a `/chart` request or the `G` toggle.
+    /// Applies a `/chart` request, a chart key, or a menu change. Changes
+    /// to the selection show the charts right away.
     fn apply_chart_request(&mut self, request: ChartRequest) {
         match request {
-            ChartRequest::Toggle if self.charts.is_empty() => {
-                self.charts = self.last_charts.clone();
-            }
-            ChartRequest::Toggle | ChartRequest::Off => {
-                if !self.charts.is_empty() {
-                    self.last_charts = std::mem::take(&mut self.charts);
-                }
-            }
+            ChartRequest::Toggle if self.charts.is_empty() => self.show_selected_charts(),
+            ChartRequest::Toggle | ChartRequest::Off => self.charts.clear(),
+            ChartRequest::On => self.show_selected_charts(),
             ChartRequest::Show(metrics) => {
-                self.charts = metrics.clone();
-                self.last_charts = metrics;
+                self.chart_selection = chart_order(&metrics);
+                self.charts = self.chart_selection.clone();
+            }
+            ChartRequest::Add(metrics) => {
+                let mut selection = self.chart_selection.clone();
+                selection.extend(metrics);
+                self.chart_selection = chart_order(&selection);
+                self.charts = self.chart_selection.clone();
+            }
+            ChartRequest::Remove(metrics) => {
+                self.chart_selection
+                    .retain(|metric| !metrics.contains(metric));
+                self.charts = self.chart_selection.clone();
+            }
+            ChartRequest::Options => {
+                self.chart_options = Some(0);
+                self.status_line =
+                    "Chart options: arrows move, Space toggles, A all, N none, Enter closes".into();
+                return;
             }
         }
         self.status_line = if self.charts.is_empty() {
-            "Charts hidden. Press G or type /chart to show them.".into()
+            "Charts hidden. G shows them, O picks which.".into()
         } else {
             format!(
-                "Charts: {}. Press G to hide.",
+                "Charts: {}. G hides them, O picks which.",
                 self.charts
                     .iter()
                     .map(|metric| metric.name())
@@ -471,6 +505,51 @@ impl TuiState {
                     .join(", ")
             )
         };
+    }
+
+    /// Shows the chosen charts, falling back to the defaults when none are
+    /// chosen.
+    fn show_selected_charts(&mut self) {
+        if self.chart_selection.is_empty() {
+            self.chart_selection = DEFAULT_CHARTS.to_vec();
+        }
+        self.charts = self.chart_selection.clone();
+    }
+
+    /// Handles a key while the chart options menu is open. Returns true
+    /// when the key asks to quit.
+    fn chart_options_key(&mut self, code: KeyCode) -> bool {
+        let Some(cursor) = self.chart_options else {
+            return false;
+        };
+        let count = ChartMetric::ALL.len();
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.chart_options = Some(cursor.checked_sub(1).unwrap_or(count - 1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.chart_options = Some((cursor + 1) % count),
+            KeyCode::Char(' ') | KeyCode::Char('x') => {
+                let metric = ChartMetric::ALL[cursor];
+                let request = if self.chart_selection.contains(&metric) {
+                    ChartRequest::Remove(vec![metric])
+                } else {
+                    ChartRequest::Add(vec![metric])
+                };
+                self.apply_chart_request(request);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.apply_chart_request(ChartRequest::Show(ChartMetric::ALL.to_vec()));
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.apply_chart_request(ChartRequest::Show(Vec::new()));
+            }
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('O') => {
+                self.chart_options = None;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+            _ => {}
+        }
+        false
     }
 
     /// Adds a runtime event to the bounded terminal log.
@@ -844,6 +923,10 @@ fn handle_key(
         return Ok(false);
     }
 
+    if state.chart_options.is_some() {
+        return Ok(state.chart_options_key(key.code));
+    }
+
     if state.show_help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') => state.show_help = false,
@@ -900,6 +983,10 @@ fn handle_key(
         }
         KeyCode::Char('g') | KeyCode::Char('G') => {
             state.apply_chart_request(ChartRequest::Toggle);
+            Ok(false)
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            state.apply_chart_request(ChartRequest::Options);
             Ok(false)
         }
         KeyCode::Char('+') | KeyCode::Char(']') => {
@@ -1084,33 +1171,38 @@ fn apply_palette_command(
     Ok(false)
 }
 
-/// Parses `/chart` arguments: none toggles, `off` hides, `all` shows every
-/// chart, otherwise a list of chart names.
+/// Parses `/chart` arguments: none shows the ticked charts, `options`
+/// opens the chart menu; also `on`, `off`, `all`, `add <names>`,
+/// `remove <names>`, or a list of names to show exactly those charts.
 fn parse_chart_request(argument: &str) -> Result<PaletteCommand, String> {
-    let names = argument
+    let words = argument
         .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|name| !name.is_empty())
+        .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
-    let request = match names.as_slice() {
-        [] => ChartRequest::Toggle,
-        [one] if ["off", "hide", "none"].contains(&one.to_ascii_lowercase().as_str()) => {
-            ChartRequest::Off
+    let names = |names: &[&str]| -> Result<Vec<ChartMetric>, String> {
+        if names.is_empty() {
+            return Err("name at least one chart: hash temp power fan util clock".into());
         }
-        [one] if one.eq_ignore_ascii_case("all") => ChartRequest::Show(ChartMetric::ALL.to_vec()),
-        names => {
-            let mut metrics = Vec::new();
-            for name in names {
-                let metric = ChartMetric::parse(name).ok_or_else(|| {
-                    format!(
-                        "unknown chart {name}. Choose hash temp power fan util clock, all or off."
-                    )
-                })?;
-                if !metrics.contains(&metric) {
-                    metrics.push(metric);
-                }
+        let mut metrics = Vec::new();
+        for name in names {
+            let metric = ChartMetric::parse(name).ok_or_else(|| {
+                format!("unknown chart {name}. Charts: hash temp power fan util clock.")
+            })?;
+            if !metrics.contains(&metric) {
+                metrics.push(metric);
             }
-            ChartRequest::Show(metrics)
         }
+        Ok(metrics)
+    };
+    let first = words.first().map(|word| word.to_ascii_lowercase());
+    let request = match first.as_deref() {
+        None | Some("on" | "show") if words.len() <= 1 => ChartRequest::On,
+        Some("options" | "menu" | "choose" | "pick") if words.len() == 1 => ChartRequest::Options,
+        Some("off" | "hide" | "none") if words.len() == 1 => ChartRequest::Off,
+        Some("all") if words.len() == 1 => ChartRequest::Show(ChartMetric::ALL.to_vec()),
+        Some("add" | "+") => ChartRequest::Add(names(&words[1..])?),
+        Some("remove" | "rm" | "del" | "-") => ChartRequest::Remove(names(&words[1..])?),
+        _ => ChartRequest::Show(names(&words)?),
     };
     Ok(PaletteCommand::Charts(request))
 }
@@ -1355,6 +1447,64 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     if state.logs_mode {
         render_logs(frame, area, state);
     }
+    if let Some(cursor) = state.chart_options {
+        render_chart_options(frame, area, state, cursor);
+    }
+}
+
+/// Renders the chart options menu: one checkbox per chart.
+fn render_chart_options(frame: &mut Frame<'_>, area: Rect, state: &TuiState, cursor: usize) {
+    let width = 52.min(area.width);
+    let height = (ChartMetric::ALL.len() as u16 + 6).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Space toggles · A all · N none · Enter closes",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+    for (index, metric) in ChartMetric::ALL.iter().enumerate() {
+        let mark = if state.chart_selection.contains(metric) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let note = if metric_reported(state, *metric) {
+            ""
+        } else {
+            "  (not reported)"
+        };
+        let style = if index == cursor {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" {mark} {}{note} ", metric.title()),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(if state.charts.is_empty() {
+        "Charts hidden · G shows them"
+    } else {
+        "Charts shown · G hides them"
+    }));
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" Chart options ")
+                .borders(Borders::ALL),
+        ),
+        popup,
+    );
 }
 
 /// Renders the dashboard header and live connection state.
@@ -2013,7 +2163,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         vec![
             Line::from(
-                "[/] command  [P] pause  [+/-] intensity  [R] reconnect  [S] settings  [G] charts  [?] help  [Q] quit",
+                "[/] command  [P] pause  [+/-] intensity  [R] reconnect  [S] settings  [G] charts  [O] pick charts  [?] help  [Q] quit",
             ),
             Line::from(state.status_line.as_str()),
         ]
@@ -2073,7 +2223,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Space / P    pause or resume"),
         Line::from("R            reconnect the current source"),
         Line::from("S            settings"),
-        Line::from("G            show or hide charts"),
+        Line::from("G            show or hide charts (hash rate and temperature at first)"),
+        Line::from("O            chart options: pick which charts to show"),
         Line::from("/ (: or C)   command bar"),
         Line::from("?            close/open help"),
         Line::from("Q / Ctrl+C   graceful quit"),
@@ -2082,7 +2233,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  /intensity <10-100> | /pause | /resume | /reconnect"),
         Line::from("  /address <cashaddr> | /endpoint <wss://...> | /endpoint auto"),
         Line::from("  /status | /config | /devices | /backend | /logs"),
-        Line::from("  /chart [hash temp power fan util clock | all | off]"),
+        Line::from("  /chart shows the ticked charts | /chart options picks them"),
+        Line::from("  /chart off | /chart all"),
+        Line::from("  /chart add <names> | /chart remove <names> | /chart <names>"),
+        Line::from("      names: hash temp power fan util clock"),
         Line::from("  /benchmark | /help | /quit"),
     ])
     .block(Block::default().title(" Help ").borders(Borders::ALL))
@@ -2676,46 +2830,127 @@ mod tests {
     }
 
     #[test]
-    fn chart_command_selects_toggles_and_hides_charts() {
+    fn chart_commands_parse() {
+        let charts = |argument: &str| match parse_palette_command(argument) {
+            Ok(PaletteCommand::Charts(request)) => Ok(request),
+            Ok(other) => panic!("{argument}: {other:?}"),
+            Err(error) => Err(error),
+        };
+        assert_eq!(charts("/chart"), Ok(ChartRequest::On));
+        assert_eq!(charts("chart options"), Ok(ChartRequest::Options));
+        assert_eq!(charts("chart on"), Ok(ChartRequest::On));
+        assert_eq!(charts("graph off"), Ok(ChartRequest::Off));
         assert_eq!(
-            parse_palette_command("/chart temp, fan hash temp").unwrap(),
-            PaletteCommand::Charts(ChartRequest::Show(vec![
-                ChartMetric::Temperature,
-                ChartMetric::Fan,
-                ChartMetric::Hashrate,
+            charts("charts all"),
+            Ok(ChartRequest::Show(ChartMetric::ALL.to_vec()))
+        );
+        assert_eq!(
+            charts("chart add power, fan power"),
+            Ok(ChartRequest::Add(vec![
+                ChartMetric::Power,
+                ChartMetric::Fan
             ]))
         );
         assert_eq!(
-            parse_palette_command("chart").unwrap(),
-            PaletteCommand::Charts(ChartRequest::Toggle)
+            charts("chart remove temp"),
+            Ok(ChartRequest::Remove(vec![ChartMetric::Temperature]))
         );
         assert_eq!(
-            parse_palette_command("graph off").unwrap(),
-            PaletteCommand::Charts(ChartRequest::Off)
+            charts("chart temp hash"),
+            Ok(ChartRequest::Show(vec![
+                ChartMetric::Temperature,
+                ChartMetric::Hashrate
+            ]))
         );
-        assert_eq!(
-            parse_palette_command("charts all").unwrap(),
-            PaletteCommand::Charts(ChartRequest::Show(ChartMetric::ALL.to_vec()))
-        );
-        assert!(parse_palette_command("chart bogus").is_err());
+        assert!(charts("chart add").is_err());
+        assert!(charts("chart bogus").is_err());
+    }
 
+    #[test]
+    fn g_shows_hash_and_temperature_and_options_change_the_choice() {
         let mut state = TuiState::new(&test_snapshot());
         assert!(state.charts.is_empty(), "charts are off by default");
         state.apply_chart_request(ChartRequest::Toggle);
+        assert_eq!(state.charts, DEFAULT_CHARTS.to_vec());
+
+        state.apply_chart_request(ChartRequest::Add(vec![ChartMetric::Power]));
         assert_eq!(
             state.charts,
-            ChartMetric::ALL.to_vec(),
-            "G shows every chart"
+            vec![
+                ChartMetric::Hashrate,
+                ChartMetric::Temperature,
+                ChartMetric::Power
+            ]
         );
-        state.apply_chart_request(ChartRequest::Show(vec![ChartMetric::Power]));
-        state.apply_chart_request(ChartRequest::Off);
+        state.apply_chart_request(ChartRequest::Remove(vec![ChartMetric::Temperature]));
+        assert_eq!(
+            state.charts,
+            vec![ChartMetric::Hashrate, ChartMetric::Power]
+        );
+
+        state.apply_chart_request(ChartRequest::Toggle);
         assert!(state.charts.is_empty());
         state.apply_chart_request(ChartRequest::Toggle);
         assert_eq!(
             state.charts,
-            vec![ChartMetric::Power],
+            vec![ChartMetric::Hashrate, ChartMetric::Power],
             "G brings back the last choice"
         );
+
+        state.apply_chart_request(ChartRequest::Show(vec![
+            ChartMetric::Temperature,
+            ChartMetric::Hashrate,
+        ]));
+        assert_eq!(state.charts, DEFAULT_CHARTS.to_vec(), "fixed order");
+
+        // The options menu: move to power, tick it, untick hash rate.
+        state.apply_chart_request(ChartRequest::Options);
+        assert_eq!(state.chart_options, Some(0));
+        assert!(!state.chart_options_key(KeyCode::Char(' ')));
+        assert_eq!(state.charts, vec![ChartMetric::Temperature]);
+        state.chart_options_key(KeyCode::Down);
+        state.chart_options_key(KeyCode::Down);
+        state.chart_options_key(KeyCode::Char(' '));
+        assert_eq!(
+            state.charts,
+            vec![ChartMetric::Temperature, ChartMetric::Power]
+        );
+        state.chart_options_key(KeyCode::Char('n'));
+        assert!(state.charts.is_empty());
+        state.chart_options_key(KeyCode::Char('a'));
+        assert_eq!(state.charts, ChartMetric::ALL.to_vec());
+        state.chart_options_key(KeyCode::Enter);
+        assert_eq!(state.chart_options, None);
+        assert!(
+            !state.chart_options_key(KeyCode::Char('q')),
+            "closed menu ignores keys"
+        );
+    }
+
+    #[test]
+    fn chart_options_menu_lists_every_chart_with_its_state() {
+        let mut snapshot = test_snapshot();
+        snapshot.gpu_telemetry.temperature_c = Some(70.0);
+        let mut state = TuiState::new(&snapshot);
+        state.record_sample(&snapshot, Instant::now());
+        state.apply_chart_request(ChartRequest::Toggle);
+        state.apply_chart_request(ChartRequest::Options);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &snapshot, &state))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(" Chart options "));
+        assert!(rendered.contains("[x] Hashrate"));
+        assert!(rendered.contains("[x] GPU temperature"));
+        assert!(rendered.contains("[ ] GPU power  (not reported)"));
+        assert!(rendered.contains("[ ] Core clock"));
     }
 
     #[test]
@@ -2809,7 +3044,7 @@ mod tests {
             .iter()
             .position(|row| row.contains("Hashrate · "))
             .unwrap();
-        assert!(temp < hash, "{chosen:?}");
+        assert!(hash < temp, "charts keep the fixed order: {chosen:?}");
         assert!(!chosen.iter().any(|row| row.contains("GPU power")));
     }
 
