@@ -124,6 +124,32 @@ const amount = 2_099_905_002_035_715n;
 const reward = amount / 420000n;
 const value = 15_971_500n;
 
+// Optional independently reconstructed incremental-k GPU test vectors.
+if (process.argv[2]) {
+  const vectors = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+  let accepts = 0;
+  for (const sample of vectors) {
+    const transaction = decodeTransactionBch(hexToBin(sample.raw));
+    if (typeof transaction === 'string') throw new Error(transaction);
+    const source = {
+      lockingBytecode: covenantLock, valueSatoshis: value,
+      token: { category, amount, nft: {
+        capability: 'mutable',
+        commitment: concat(u32le(0), numToLe32(BigInt(`0x${sample.old_target}`)), new Uint8Array(64)),
+      } },
+    };
+    for (const vm of vms) {
+      const verdict = vm.verify({ sourceOutputs: [source], transaction });
+      if ((verdict === true) !== sample.meets) {
+        throw new Error(`incremental age=${sample.age}: expected=${sample.meets}, verdict=${verdict}`);
+      }
+    }
+    if (sample.meets) accepts += 1;
+  }
+  if (!accepts || accepts === vectors.length) throw new Error('incremental vectors need wins and misses');
+  console.log(`PASS incremental-k BCH 2026 VM: ${accepts} accepted, ${vectors.length - accepts} rejected, standard and consensus`);
+}
+
 const expectedBytes = (age) => 615 + agePush(age).length - 1;
 const results = [];
 for (const age of [10, 16, 17, 127, 128, 32767, 32768, 65534]) {

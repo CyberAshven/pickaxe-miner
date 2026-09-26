@@ -48,7 +48,12 @@ __device__ __forceinline__ uint8_t dual_tx_byte(
     constexpr uint32_t r_offset = SIGNATURE_OFFSET + SHIFT;
     constexpr uint32_t s_offset = r_offset + 32u;
     if (byte_index >= nonce_offset && byte_index < nonce_offset + 4u) {
+#ifdef PICKAXE_INCREMENTAL_K_EXPERIMENT
+        // Offline experiment: nonce_base identifies k, commitment stays fixed.
+        return tx_template[byte_index];
+#else
         return (uint8_t)(nonce >> ((byte_index - nonce_offset) * 8u));
+#endif
     }
     if (byte_index >= r_offset && byte_index < s_offset) {
         return r_bytes[byte_index - r_offset];

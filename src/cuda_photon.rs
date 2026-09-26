@@ -453,6 +453,14 @@ impl CudaPhotonEngine {
             }
         }
 
+        self.finish_batch(nonce_base, candidate_count)
+    }
+
+    fn finish_batch(
+        &mut self,
+        nonce_base: u32,
+        candidate_count: u32,
+    ) -> Result<PhotonCudaBatchResult, String> {
         let c1_per_thread = C1_CANDIDATES_PER_THREAD;
         let c1_cfg = LaunchConfig {
             grid_dim: (candidate_count.div_ceil(c1_per_thread).div_ceil(64), 1, 1),
@@ -532,6 +540,10 @@ impl CudaPhotonEngine {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "incremental_k.rs"]
+mod incremental_k;
 
 #[cfg(test)]
 mod tests {
