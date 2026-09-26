@@ -87,12 +87,12 @@ Benchmark:
 ```bash
 cargo run --release -- benchmark
 ```
-
+## Note
+- `wgpu` is not a verified production backend. Production mining is CUDA or HIP.
+  
 ## Limitations
 
 - There is no CPU mining fallback.
-- `wgpu` is not a verified production backend. Production mining is CUDA or HIP.
-- The donation is hard-coded at 2%.
 - CUDA performance was measured on the local NVIDIA GPU; HIP artifacts are build-verified, without a physical AMD performance claim.
 
 ## Features
