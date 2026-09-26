@@ -1143,7 +1143,58 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let last_error = snapshot.last_error.as_deref().unwrap_or("none");
     let telemetry = &snapshot.gpu_telemetry;
     let efficiency = telemetry.candidates_per_watt(snapshot.search.current_rate);
+    // Most-watched first: hashing, winners, the work itself and GPU
+    // health; chain position and connection counters below.
     let lines = vec![
+        Line::from(format!(
+            "rate {}   avg {}",
+            crate::telemetry::format_hash_rate(snapshot.search.current_rate),
+            crate::telemetry::format_hash_rate(snapshot.search.rate),
+        )),
+        Line::from(format!(
+            "peak {}   uptime {}s",
+            crate::telemetry::format_hash_rate(snapshot.search.peak_rate),
+            snapshot.search.elapsed_secs
+        )),
+        Line::from(format!(
+            "winners {}   stale {}   rejected {}   pending {}",
+            snapshot.verified_winners,
+            snapshot.stale_winners,
+            snapshot.search.rejected_winners,
+            snapshot.pending_winners
+        )),
+        Line::from(format!(
+            "target {}",
+            crate::telemetry::format_photon_target(&snapshot.photon_target_le)
+        )),
+        Line::from(format!(
+            "candidates {}   batches {}   keys {}",
+            snapshot.search.candidates, snapshot.search.batches, snapshot.search.key_rotations
+        )),
+        Line::from(format!(
+            "GPU: util {}   temp {}   power {}   VRAM {}",
+            format_metric(telemetry.gpu_utilization_percent, "%"),
+            format_metric(telemetry.temperature_c, "C"),
+            format_metric(telemetry.power_watts, "W"),
+            format_metric(telemetry.vram_used_mib, "MiB"),
+        )),
+        Line::from(format!(
+            "clocks: {}/{}   efficiency {}",
+            format_metric(telemetry.graphics_clock_mhz, "MHz"),
+            format_metric(telemetry.memory_clock_mhz, "MHz"),
+            format_metric(efficiency, " cand/s/W"),
+        )),
+        Line::from(format!("payout: {}", shorten(&snapshot.payout_address, 66))),
+        Line::from(format!(
+            "gen {}   height {}   checks {}",
+            snapshot.generation_id, snapshot.height, snapshot.state_checks
+        )),
+        Line::from(format!(
+            "baton {}:{}",
+            shorten(&snapshot.baton_txid, 16),
+            snapshot.baton_vout
+        )),
+        Line::from(format!("endpoint {}", shorten(&endpoint, 40))),
         Line::from(format!(
             "reconnects {}   rotations {}   jobs {}",
             snapshot.reconnects, snapshot.endpoint_rotations, snapshot.job_changes
@@ -1160,55 +1211,6 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
         Line::from(format!(
             "refresh {}   consecutive {}",
             snapshot.transient_refresh_failures, snapshot.consecutive_refresh_failures
-        )),
-        Line::from(format!(
-            "rate {}   avg {}",
-            crate::telemetry::format_hash_rate(snapshot.search.current_rate),
-            crate::telemetry::format_hash_rate(snapshot.search.rate),
-        )),
-        Line::from(format!(
-            "peak {}   uptime {}s",
-            crate::telemetry::format_hash_rate(snapshot.search.peak_rate),
-            snapshot.search.elapsed_secs
-        )),
-        Line::from(format!(
-            "target {}",
-            crate::telemetry::format_photon_target(&snapshot.photon_target_le)
-        )),
-        Line::from(format!(
-            "candidates {}   batches {}",
-            snapshot.search.candidates, snapshot.search.batches
-        )),
-        Line::from(format!(
-            "gen {}   height {}   checks {}",
-            snapshot.generation_id, snapshot.height, snapshot.state_checks
-        )),
-        Line::from(format!("endpoint {}", shorten(&endpoint, 40))),
-        Line::from(format!(
-            "baton {}:{}",
-            shorten(&snapshot.baton_txid, 16),
-            snapshot.baton_vout
-        )),
-        Line::from(format!(
-            "winners {}   stale {}   rejected {}   pending {}",
-            snapshot.verified_winners,
-            snapshot.stale_winners,
-            snapshot.search.rejected_winners,
-            snapshot.pending_winners
-        )),
-        Line::from(format!("payout: {}", shorten(&snapshot.payout_address, 66))),
-        Line::from(format!(
-            "GPU: util {}   temp {}   power {}   VRAM {}",
-            format_metric(telemetry.gpu_utilization_percent, "%"),
-            format_metric(telemetry.temperature_c, "C"),
-            format_metric(telemetry.power_watts, "W"),
-            format_metric(telemetry.vram_used_mib, "MiB"),
-        )),
-        Line::from(format!(
-            "clocks: {}/{}   efficiency {}",
-            format_metric(telemetry.graphics_clock_mhz, "MHz"),
-            format_metric(telemetry.memory_clock_mhz, "MHz"),
-            format_metric(efficiency, " cand/s/W"),
         )),
         Line::from(format!("last error: {}", shorten(last_error, 42))),
     ];
@@ -1869,6 +1871,11 @@ mod tests {
             "reconnect and rotation counts must share one 120-column row: {rows:?}"
         );
         assert!(rows.iter().any(|row| row.contains("jobs 1")));
+        let row_of = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
+        assert!(
+            row_of("rate ") < row_of("winners ") && row_of("winners ") < row_of("reconnects "),
+            "hash rate, then winners, then connection counters: {rows:?}"
+        );
         assert!(
             rows.iter()
                 .any(|row| row.contains("supervising PHOTON state")),
