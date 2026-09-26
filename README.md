@@ -111,3 +111,7 @@ cargo run --release -- benchmark
 - Device discovery and benchmark tools
 
 The `reference/` directory contains PHOTON reference material used for implementation and correctness testing.
+
+## License
+
+Pickaxe Miner is licensed under the [GNU Affero General Public License, version 3.0 only](LICENSE) (`AGPL-3.0-only`). Third-party components and reference materials retain their respective licenses.
