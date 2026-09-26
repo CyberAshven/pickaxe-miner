@@ -35,6 +35,15 @@
 - Production integration: connected to immutable live job generations, CPU reconstruction/verification of returned winners, authoritative freshness recheck, durable submission journaling, and self-funded settlement. Real-mainnet natural-winner evidence remains an external validation item.
 
 ## Build (Windows)
+
+The opt-in CUDA incremental search candidate is built with
+`tools\build-incremental-k.cmd` and Cargo `--features incremental-k`.
+Place its six PTX files beside the executable under `cuda\build`.
+It walks public signing scalars using only the worker's unfunded search key,
+rotates that key after each 2^32 sweep, and retains RFC6979 for reward signing.
+The default build retains the pipeline above. Measurements, live validation
+and serial reproduction steps are in [the experiment report](../docs/incremental-k.md).
+
 ```bat
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 nvcc -ptx -O3 -arch=sm_120 -o cuda\build\stage_a_rfc6979.ptx cuda\stage_a_rfc6979.cu

@@ -981,7 +981,11 @@ impl HipPhotonEngine {
             .map(|(index, nonce)| {
                 let mut digest = [0u8; 32];
                 digest.copy_from_slice(&hashes[index * 32..(index + 1) * 32]);
-                PhotonCudaWinner { nonce, digest }
+                PhotonCudaWinner {
+                    nonce,
+                    digest,
+                    schnorr_k: None,
+                }
             })
             .collect();
 

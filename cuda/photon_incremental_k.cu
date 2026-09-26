@@ -1,4 +1,4 @@
-// Offline experiment only: public k values MUST NOT sign for a funded key.
+// Unfunded PHOTON search only: public k values MUST NOT sign for a funded key.
 #include "photon_stage_b16.cu"
 
 extern "C" __global__ void pickaxe_photon_incremental_k(

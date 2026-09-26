@@ -830,7 +830,11 @@ impl WgpuPhotonEngine {
                 let word = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
                 digest[word_index * 4..word_index * 4 + 4].copy_from_slice(&word.to_be_bytes());
             }
-            winners.push(PhotonCudaWinner { nonce, digest });
+            winners.push(PhotonCudaWinner {
+                nonce,
+                digest,
+                schnorr_k: None,
+            });
         }
         drop(view);
         self.readback_gpu.unmap();

@@ -50,6 +50,8 @@ const SHA256_INITIAL_STATE: [u32; 8] = [
 pub struct PhotonCudaWinner {
     pub nonce: u32,
     pub digest: [u8; 32],
+    /// Explicit signing scalar for incremental search; never a reward-key nonce.
+    pub schnorr_k: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +95,8 @@ pub struct CudaPhotonEngine {
     winner_cap: u32,
     table_source: M29TableSource,
     job_ready: bool,
+    incremental: Option<incremental::Incremental>,
+    commitment_nonce: u32,
 }
 
 /// Lists locations searched for compiled CUDA PTX kernels.
@@ -313,7 +317,20 @@ impl CudaPhotonEngine {
             winner_cap,
             table_source,
             job_ready: false,
+            incremental: None,
+            commitment_nonce: 0,
         })
+    }
+
+    /// Enable only for the worker's fresh, unfunded search identity, before set_job.
+    #[cfg(any(feature = "incremental-k", test))]
+    pub(crate) fn enable_incremental_search(&mut self) -> Result<(), String> {
+        if self.job_ready {
+            return Err("enable incremental search before configuring a job".into());
+        }
+        let incremental = incremental::Incremental::new(self, 32)?;
+        self.incremental = Some(incremental);
+        Ok(())
     }
 
     /// Returns the source of the CUDA lookup table.
@@ -333,6 +350,7 @@ impl CudaPhotonEngine {
             + 8 * std::mem::size_of::<u32>()
             + std::mem::size_of::<u32>()
             + (self.winner_cap as usize) * (4 + 32)
+            + if self.incremental.is_some() { 96 } else { 0 }
     }
 
     /// Uploads validated PHOTON job bytes and target to CUDA.
@@ -384,6 +402,16 @@ impl CudaPhotonEngine {
             .memcpy_htod(&transaction_midstate(template), &mut self.midstate_gpu)
             .map_err(|error| format!("upload transaction midstate: {error}"))?;
         self.layout = layout;
+        self.commitment_nonce = u32::from_le_bytes(
+            template[layout.nonce_offset()..layout.nonce_offset() + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if let Some(mut incremental) = self.incremental.take() {
+            let result = incremental.set_message(self, target, self.commitment_nonce);
+            self.incremental = Some(incremental);
+            result?;
+        }
         self.job_ready = true;
         Ok(())
     }
@@ -394,6 +422,17 @@ impl CudaPhotonEngine {
         nonce_base: u32,
         candidate_count: u32,
     ) -> Result<PhotonCudaBatchResult, String> {
+        if let Some(mut incremental) = self.incremental.take() {
+            let result = incremental.batch(self, nonce_base, candidate_count);
+            self.incremental = Some(incremental);
+            return result.map(|mut batch| {
+                for winner in &mut batch.winners {
+                    winner.schnorr_k = Some(u64::from(winner.nonce) + 1);
+                    winner.nonce = self.commitment_nonce;
+                }
+                batch
+            });
+        }
         if !self.job_ready {
             return Err("PHOTON CUDA job is not configured".into());
         }
@@ -453,15 +492,15 @@ impl CudaPhotonEngine {
             }
         }
 
-        self.finish_batch(nonce_base, candidate_count)
+        self.finish_batch(nonce_base, candidate_count, C1_CANDIDATES_PER_THREAD)
     }
 
     fn finish_batch(
         &mut self,
         nonce_base: u32,
         candidate_count: u32,
+        c1_per_thread: u32,
     ) -> Result<PhotonCudaBatchResult, String> {
-        let c1_per_thread = C1_CANDIDATES_PER_THREAD;
         let c1_cfg = LaunchConfig {
             grid_dim: (candidate_count.div_ceil(c1_per_thread).div_ceil(64), 1, 1),
             block_dim: (64, 1, 1),
@@ -529,6 +568,7 @@ impl CudaPhotonEngine {
                 winners.push(PhotonCudaWinner {
                     nonce: nonces[index],
                     digest,
+                    schnorr_k: None,
                 });
             }
         }
@@ -540,6 +580,9 @@ impl CudaPhotonEngine {
         })
     }
 }
+
+#[path = "cuda_incremental.rs"]
+mod incremental;
 
 #[cfg(test)]
 #[path = "incremental_k.rs"]

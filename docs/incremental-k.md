@@ -2,7 +2,26 @@
 
 Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7a6e8235440168c6fe08140964890`.
 
-**Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second. This is an offline candidate, compiled only into the Rust test executable. No production switch, deployment, release, broadcast or master update was made.
+**Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. Master, the default release build, and `D:\pickaxe-live` remain unchanged. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
+
+## Live integration and follow-up measurements
+
+The CUDA worker now returns the explicit signing scalar separately from the commitment nonce. CPU verification independently reconstructs the signature and checks the full transaction digest and target. Batches stop at the scalar-index boundary; the existing sweep counter rotates the unfunded search key after 2^32 candidates. Job replacement and key rotation reload the uniform message and signing state. A guard rejects a search identity equal to the reward destination identity; reward signing continues to use RFC6979. Existing freshness, settlement, journal and donation checks remain in place.
+
+At 20:11 Arabia Standard Time on September 26, the only running miner was `D:\pickaxe-candidate\pickaxe_miner.exe`, in the terminal titled `Pickaxe Miner - incremental-k`. Its TUI log recorded about 57–60 million candidates/s average during the initial minutes, a 73.711 million instantaneous peak, successful key rotation, one verified winner and zero rejected winners. These live numbers are not an A/B comparison. One settlement-authority retry reconnected automatically, followed by `submission accepted` at Unix time 1790442734:
+
+- Parent: `800000000175105a8059af2fe2ccc7b2835fe6e510ffe887468c89ceaa28e93c`
+- Reward: `d09e48be6d76e6cbdf06c77cf4e5550be40346154d6d1b531fb3cf987ebe33ff`
+
+This is application-recorded mainnet submission acceptance, not an independently checked block confirmation or long soak. Process, window title and TUI-generated logs were checked; screen capture returned black, so visual rendering was not verified. A later live GPU sample was 78 C, 129.35 W, 100% utilization.
+
+Further trials kept 32 candidates per walking lane and eight per C1 thread:
+
+- Nsight Systems put median C1 signing at about 1.669 ms, point walking at 0.887 ms and C3 at 0.545 ms in the sampled run. C1 is the next measured bottleneck.
+- A 16-word unrolled SHA schedule passed correctness but repeated comparison gave about 58.074 versus 57.898 million candidates/s: less than 1%, within run variability. Removed.
+- Lane/inversion batching sweeps did not establish a repeatable improvement. Increasing C1 inversion capacity to 64 grew PTX from about 5.5 MB to 19.8 MB; 64-candidate batches fell to roughly 35–44 million/s, and 32-candidate batches to 47–57 million/s versus roughly 61 million/s for the retained shape in that trial. Removed.
+
+The tested tuning approach follows NVIDIA's [CUDA best practices](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-best-practices-guide/) and [private-array indexing discussion](https://developer.nvidia.com/blog/fast-dynamic-indexing-private-arrays-cuda/). Rejected experiment patches, profiler output and measurements remain in ignored local evidence; their implementations are not shipped. Larger changes to C1 would require another correctness and controlled performance cycle. GPU tests/benchmarks must run serially while the live miner is stopped, to preserve the user's single-miner constraint.
 
 ## What was measured
 
@@ -37,9 +56,11 @@ All six kernels were rebuilt from source and SHA-256 matched the files used in t
 
 [BCH's Schnorr specification](https://bitcoin-cash-node.gitlab.io/bchn-sw/bitcoincash-upgrade-specifications/2019-05-15-schnorr/) defines verification independently of nonce generation, including the R-y quadratic-residue rule; its nonce-generation section explains why predictable nonces compromise signing keys. [RFC 6979](https://www.rfc-editor.org/rfc/rfc6979) describes the deterministic construction removed by this experiment. Current pinned PHOTON covenant source `reference/vox/packages/photon/src/mine.cash` verifies the commitment signature, not its RFC6979 derivation; the VM evidence above verifies the experiment against the compiled covenant.
 
-Here k is deliberately public and bounded to 1..2^32. Given k and a signature, d can be recovered from s=±k+e*d modulo n. This MUST NOT be used with a funded signing identity. Source inspection confirms that `SearchHandle::start_inner` creates a search key independently of `RuntimeSupervisor::start_on_backend_device`'s intermediate reward identity (`new_intermediate_identity`); the experiment does not change or execute either live path. That separation must remain enforced in any future integration.
+Here k is deliberately public and bounded to 1..2^32. Given k and a signature, d can be recovered from s=±k+e*d modulo n. This MUST NOT be used with a funded signing identity. `SearchHandle::start_inner` creates a search key independently of `RuntimeSupervisor::start_on_backend_device`'s intermediate reward identity (`new_intermediate_identity`). The live integration preserves that separation, rejects matching search/reward identities, and leaves reward signatures on RFC6979.
 
-The production `verify_gpu_winner` still reconstructs RFC6979 signatures. It cannot consume these experimental scalar indexes as commitment nonces. A deployable version needs an explicit result representation, independent reconstruction of the chosen k signature, key/job generation binding and exhaustion handling, with the existing stale-job, settlement and donation checks preserved. No live winner, settlement, long soak or AMD result is claimed. This branch supplies the measured candidate and evidence for review before that integration.
+`verify_gpu_winner` reconstructs explicit-k signatures when the result contains `schnorr_k`, and RFC6979 signatures otherwise. Live CUDA integration is enabled only by the `incremental-k` build feature. HIP and WGPU retain their existing behavior. No AMD hardware result, long soak or independent block confirmation is claimed.
+
+The final feature-enabled suite passed **257 tests, zero failures, three ignored**. The explicit hardware correctness run then passed all 13,920 candidates and full-batch samples, followed by the 216-sample VM checks above. The independent CPU oracle also matched the new production signature reconstruction. The new live-path check covers funded-identity rejection, boundary trimming, four baton ages, scalar 2^32, wrong-mode rejection, key rotation and rejection of a previous key's winner. `cargo check --locked --all-targets --all-features` and the feature-enabled release build passed. These checks ran before starting the sole live miner.
 
 ## Reproduce on this Windows machine
 
@@ -57,3 +78,5 @@ cargo test --release --locked --target-dir D:\pickaxe-incremental-target cuda_ph
 ```
 
 The adjacent test-executable PTX directory deliberately isolates kernel selection from `D:\pickaxe-live`. Experimental tests are ignored by default and fail if CUDA/PTX is unavailable. Keep GPU tests and timing runs serial; record concurrent GPU activity and thermals on each rerun.
+
+Build the opt-in live executable with `cargo build --release --locked --features incremental-k --target-dir D:\pickaxe-incremental-target`. Deploy that executable with the six generated PTX files in its adjacent `cuda\build` directory, then use the normal `mine --backend cuda` TUI command with the existing payout. Stop any current miner before launching it. The checked live executable SHA-256 was `9B2C70AFD06457720CB3C3C65F2C1127FC0887B2FA1F3FFDACDD93F86B873AF3`.

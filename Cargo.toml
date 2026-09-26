@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 default = []
+incremental-k = []
 portable-wgpu = ["dep:pollster", "dep:wgpu"]
 
 [dependencies]

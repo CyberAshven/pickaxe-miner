@@ -113,10 +113,31 @@ fn y_is_quadratic_residue(y_be: &[u8; 32]) -> bool {
 
 /// Creates a deterministic BCH Schnorr signature for a message.
 pub fn bch_schnorr_sign(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 64], String> {
+    bch_schnorr_sign_with_k(sk_bytes, msg32, bch_rfc6979_nonce(sk_bytes, msg32)?)
+}
+
+/// Reconstruct a PHOTON search signature. Public k exposes sk: NEVER use a funded key.
+pub(crate) fn bch_schnorr_sign_search_candidate(
+    sk_bytes: &[u8; 32],
+    msg32: &[u8; 32],
+    scalar: u64,
+) -> Result<[u8; 64], String> {
+    if !(1..=1u64 << 32).contains(&scalar) {
+        return Err("incremental search scalar is outside 1..=2^32".into());
+    }
+    let mut k = [0u8; 32];
+    k[24..].copy_from_slice(&scalar.to_be_bytes());
+    bch_schnorr_sign_with_k(sk_bytes, msg32, k)
+}
+
+fn bch_schnorr_sign_with_k(
+    sk_bytes: &[u8; 32],
+    msg32: &[u8; 32],
+    k_bytes: [u8; 32],
+) -> Result<[u8; 64], String> {
     let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
     let pk_bytes = PublicKey::from_secret_key(&sk).serialize();
 
-    let k_bytes = bch_rfc6979_nonce(sk_bytes, msg32)?;
     let k = SecretKey::from_secret_bytes(k_bytes).map_err(|e| e.to_string())?;
     let r_pk = PublicKey::from_secret_key(&k);
     let r_unc = r_pk.serialize_uncompressed();

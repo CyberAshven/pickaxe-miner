@@ -1,6 +1,7 @@
 //! Offline-only incremental-k experiment. Never compiled into the miner CLI.
 //! Known k leaks the signing key: synthetic, unfunded identities only.
-//! ponytail: k is limited to 1..=2^32; production needs explicit scalar/key rotation.
+//! The live worker rotates its unfunded search identity after each 2^32 sweep.
+use super::incremental::Incremental;
 use super::*;
 use crate::{crypto, search, tx};
 use sha2::{Digest, Sha256};
@@ -32,108 +33,6 @@ fn template(age: u32, target: &[u8; 32], key: &[u8; 32]) -> Vec<u8> {
     .unwrap()
 }
 
-struct Incremental {
-    walk: CudaFunction,
-    filters: [CudaFunction; 4],
-    message: CudaSlice<u8>,
-    step: CudaSlice<u32>,
-    stride: u32,
-    per_lane: u32,
-}
-
-impl Incremental {
-    fn new(engine: &CudaPhotonEngine, per_lane: u32) -> Self {
-        assert!((1..=128).contains(&per_lane));
-        Self {
-            walk: load_function(
-                &engine._ctx,
-                "photon_incremental_k.ptx",
-                "pickaxe_photon_incremental_k",
-            )
-            .unwrap(),
-            filters: STAGE_C3_FUNCTIONS.map(|name| {
-                load_function(&engine._ctx, "photon_incremental_c3.ptx", name).unwrap()
-            }),
-            message: engine.stream.alloc_zeros(32).unwrap(),
-            step: engine.stream.alloc_zeros(16).unwrap(),
-            stride: 0,
-            per_lane,
-        }
-    }
-
-    fn set_message(&mut self, engine: &CudaPhotonEngine, target: &[u8; 32]) {
-        let hash = tx::photon_message_sha256(NONCE, &hex::encode(target)).unwrap();
-        engine.stream.memcpy_htod(&hash, &mut self.message).unwrap();
-    }
-
-    fn batch(
-        &mut self,
-        engine: &mut CudaPhotonEngine,
-        base: u32,
-        count: u32,
-    ) -> Result<PhotonCudaBatchResult, String> {
-        if !engine.job_ready
-            || count > engine.max_candidates
-            || u64::from(base) + u64::from(count) > 1u64 << 32
-        {
-            return Err("incremental batch is unconfigured, oversized, or exhausts the 32-bit experiment range".into());
-        }
-        if count == 0 {
-            return Ok(PhotonCudaBatchResult {
-                candidates: 0,
-                total_winners: 0,
-                winners: vec![],
-            });
-        }
-        let blocks = count.div_ceil(self.per_lane).div_ceil(64);
-        let stride = blocks * 64;
-        if self.stride != stride {
-            let point = PublicKey::from_secret_key(
-                &SecretKey::from_secret_bytes(secret(u64::from(stride))).unwrap(),
-            )
-            .serialize_uncompressed();
-            let words: Vec<u32> = point[1..]
-                .chunks_exact(32)
-                .flat_map(|coordinate| {
-                    coordinate
-                        .chunks_exact(4)
-                        .rev()
-                        .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
-                })
-                .collect();
-            engine.stream.memcpy_htod(&words, &mut self.step).unwrap();
-            self.stride = stride;
-        }
-        engine
-            .stream
-            .memset_zeros(&mut engine.winner_count_gpu)
-            .unwrap();
-        unsafe {
-            engine
-                .stream
-                .launch_builder(&self.walk)
-                .arg(&base)
-                .arg(&count)
-                .arg(&engine.table_gpu)
-                .arg(&self.step)
-                .arg(&self.message)
-                .arg(&mut engine.message_hashes_gpu)
-                .arg(&mut engine.rfc6979_gpu)
-                .arg(&mut engine.points_gpu)
-                .launch(LaunchConfig {
-                    grid_dim: (blocks, 1, 1),
-                    block_dim: (64, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-                .map_err(|error| format!("incremental point walk: {error}"))?;
-        }
-        std::mem::swap(&mut self.filters, &mut engine.stage_c3);
-        let result = engine.finish_batch(base, count);
-        std::mem::swap(&mut self.filters, &mut engine.stage_c3);
-        result
-    }
-}
-
 // Independent CPU oracle: libsecp256k1 point multiplication + BigUint scalars.
 fn signature(key: &[u8; 32], message: &[u8; 32], k: u64) -> [u8; 64] {
     let point = PublicKey::from_secret_key(&SecretKey::from_secret_bytes(secret(k)).unwrap())
@@ -155,6 +54,10 @@ fn signature(key: &[u8; 32], message: &[u8; 32], k: u64) -> [u8; 64] {
     let s = s.to_bytes_be();
     out[64 - s.len()..].copy_from_slice(&s);
     assert!(crypto::bch_schnorr_verify(&public, message, &out).unwrap());
+    assert_eq!(
+        crypto::bch_schnorr_sign_search_candidate(key, message, k).unwrap(),
+        out
+    );
     out
 }
 
@@ -162,7 +65,8 @@ fn signature(key: &[u8; 32], message: &[u8; 32], k: u64) -> [u8; 64] {
 #[ignore = "requires built experimental PTX and a CUDA GPU; offline synthetic keys only"]
 fn incremental_k_correctness() {
     let mut engine = CudaPhotonEngine::new(0, 257, 257).unwrap();
-    let mut incremental = Incremental::new(&engine, 32);
+    let mut incremental = Incremental::new(&engine, 32).unwrap();
+    incremental.c1_per_thread = 8;
     let mut vectors = Vec::new();
     let mut checked = 0;
     for age in [0u32, 16, 17, 127, 128, 32767, 32768, 65534] {
@@ -177,7 +81,7 @@ fn incremental_k_correctness() {
             let layout = PhotonLayout::for_age(age).unwrap();
             let message = tx::photon_message_sha256(NONCE, &hex::encode(target)).unwrap();
             engine.set_job(&raw, &target, &key).unwrap();
-            incremental.set_message(&engine, &target);
+            incremental.set_message(&engine, &target, NONCE).unwrap();
             for (base, count) in [(0, 1), (1, 65), (65520, 257), (u32::MAX - 256, 257)] {
                 let result = incremental.batch(&mut engine, base, count).unwrap();
                 let mut expected = Vec::new();
@@ -196,6 +100,7 @@ fn incremental_k_correctness() {
                         expected.push(PhotonCudaWinner {
                             nonce: candidate,
                             digest,
+                            schnorr_k: None,
                         });
                     }
                     checked += 1;
@@ -228,7 +133,7 @@ fn incremental_k_correctness() {
         engine
             .set_job(&template(17, &target, &secret(7)), &target, &secret(7))
             .unwrap();
-        incremental.set_message(&engine, &target);
+        incremental.set_message(&engine, &target, NONCE).unwrap();
         engine.winner_cap = 4;
         let result = incremental.batch(&mut engine, 0, 65).unwrap();
         assert_eq!(result.total_winners, expected);
@@ -239,13 +144,14 @@ fn incremental_k_correctness() {
     drop(incremental);
     drop(engine);
     let mut engine = CudaPhotonEngine::new(0, BATCH, 8).unwrap();
-    let mut incremental = Incremental::new(&engine, 32);
+    let mut incremental = Incremental::new(&engine, 32).unwrap();
+    incremental.c1_per_thread = 8;
     let mut target = [255; 32];
     target[31] = 127;
     engine
         .set_job(&template(128, &target, &secret(7)), &target, &secret(7))
         .unwrap();
-    incremental.set_message(&engine, &target);
+    incremental.set_message(&engine, &target, NONCE).unwrap();
     let result = incremental.batch(&mut engine, 65520, BATCH).unwrap();
     assert_eq!(result.total_winners, BATCH);
     assert!(result.truncated());
@@ -255,7 +161,17 @@ fn incremental_k_correctness() {
         .clone_dtoh(&engine.negated_nonce_s_gpu)
         .unwrap();
     let message = tx::photon_message_sha256(NONCE, &hex::encode(target)).unwrap();
-    for index in [0usize, 1, 63, 8191, 8192, 16384, BATCH as usize - 1] {
+    for index in [
+        0usize,
+        1,
+        63,
+        2047,
+        2048,
+        8191,
+        8192,
+        16384,
+        BATCH as usize - 1,
+    ] {
         let expected = signature(&secret(7), &message, 65521 + index as u64);
         assert_eq!(&plus[index * 64..index * 64 + 32], &expected[..32]);
         assert!(
@@ -276,7 +192,7 @@ fn incremental_k_correctness() {
 #[ignore = "requires CUDA; run serially after correctness and record other GPU activity"]
 fn incremental_k_benchmark() {
     let mut engine = CudaPhotonEngine::new(0, BATCH, 8).unwrap();
-    let mut incremental = Incremental::new(&engine, 32);
+    let mut incremental = Incremental::new(&engine, 32).unwrap();
     let target: [u8; 32] =
         hex::decode("ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000")
             .unwrap()
@@ -285,7 +201,7 @@ fn incremental_k_benchmark() {
     engine
         .set_job(&template(10, &target, &[0x11; 32]), &target, &[0x11; 32])
         .unwrap();
-    incremental.set_message(&engine, &target);
+    incremental.set_message(&engine, &target, NONCE).unwrap();
     let mut records = Vec::new();
     let mut base = 0u32;
     for (round, candidate) in [false, true, true, false, false, true, true, false]
@@ -321,6 +237,50 @@ fn incremental_k_benchmark() {
     std::fs::create_dir_all("artifacts/incremental-k").unwrap();
     std::fs::write(
         "artifacts/incremental-k/benchmark.json",
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "CUDA tuning, serial offline synthetic-key comparison"]
+fn incremental_k_tuning() {
+    let mut engine = CudaPhotonEngine::new(0, BATCH, 8).unwrap();
+    let mut target = [0u8; 32];
+    target[28] = 1;
+    engine
+        .set_job(&template(10, &target, &[0x11; 32]), &target, &[0x11; 32])
+        .unwrap();
+    let mut records = Vec::new();
+    {
+        for per_lane in [16, 32, 64] {
+            for c1 in [4, 8, 16] {
+                let mut incremental = Incremental::new(&engine, per_lane).unwrap();
+                incremental.c1_per_thread = c1;
+                incremental.set_message(&engine, &target, NONCE).unwrap();
+                let mut base = 65536u32;
+                let mut run = || {
+                    incremental.batch(&mut engine, base, BATCH).unwrap();
+                    base = base.wrapping_add(BATCH);
+                };
+                let warm = Instant::now();
+                while warm.elapsed() < Duration::from_millis(250) {
+                    run();
+                }
+                let start = Instant::now();
+                let mut candidates = 0u64;
+                while start.elapsed() < Duration::from_secs(1) {
+                    run();
+                    candidates += u64::from(BATCH);
+                }
+                let rate = candidates as f64 / start.elapsed().as_secs_f64() / 1e6;
+                eprintln!("lane={per_lane} c1={c1} M_candidates_per_s={rate:.3}");
+                records.push(serde_json::json!({"per_lane":per_lane,"c1":c1,"million_candidates_per_second":rate}));
+            }
+        }
+    }
+    std::fs::write(
+        "artifacts/incremental-k/tuning.json",
         serde_json::to_vec_pretty(&records).unwrap(),
     )
     .unwrap();

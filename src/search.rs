@@ -321,6 +321,11 @@ fn prepare_job(
 ) -> Result<PreparedJob, String> {
     let target = validate_job(&job)?;
     let payout_locking = tx::cashaddr_to_p2pkh_locking(&job.payout_address)?;
+    if payout_locking == crate::reward::p2pkh_locking_from_public_key(public_key) {
+        return Err(
+            "PHOTON search identity must be separate from the funded reward identity".into(),
+        );
+    }
     let message = tx::photon_message_sha256(0, &job.target_le_hex)?;
     let signature = crypto::bch_schnorr_sign(sk, &message)?;
     if !crypto::bch_schnorr_verify(public_key, &message, &signature)? {
@@ -381,7 +386,10 @@ fn verify_gpu_winner(
     winner: &PhotonCudaWinner,
 ) -> Result<VerifiedWinner, String> {
     let message = tx::photon_message_sha256(winner.nonce, &prepared.job.target_le_hex)?;
-    let signature = crypto::bch_schnorr_sign(sk, &message)?;
+    let signature = match winner.schnorr_k {
+        Some(k) => crypto::bch_schnorr_sign_search_candidate(sk, &message, k)?,
+        None => crypto::bch_schnorr_sign(sk, &message)?,
+    };
     if !crypto::bch_schnorr_verify(public_key, &message, &signature)? {
         return Err("returned GPU winner failed BCH Schnorr verification".into());
     }
@@ -442,12 +450,16 @@ pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> 
     }
 }
 
+fn batch_before_wrap(base: u32, requested: u32) -> u32 {
+    u64::from(requested).min((1u64 << 32) - u64::from(base)) as u32
+}
+
 /// Tracks how much of a job's 2^32 nonce space has been searched.
 ///
-/// The 4-byte nonce is the only per-candidate input, so a job has exactly
-/// 2^32 candidates. Batches walk the space from a random start with
-/// wrapping arithmetic; the last batch is trimmed so no nonce is hashed
-/// twice, and after that the job is exhausted.
+/// The baseline varies a 4-byte commitment nonce; incremental search varies
+/// a 32-bit scalar index. Batches walk either space from a random start with
+/// wrapping arithmetic. The last batch is trimmed to prevent repeats, then
+/// the worker rotates its unfunded search identity before the next sweep.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct NonceSweep {
     searched: u64,
@@ -751,6 +763,9 @@ fn run_worker(
             }
             continue;
         };
+        // Incremental scalar indexes must not cross u32::MAX inside a batch.
+        // The next batch wraps to zero; NonceSweep still counts each index once.
+        let batch_size = batch_before_wrap(nonce_base, batch_size);
         let batch_started = Instant::now();
         let batch = engine.search_batch(nonce_base, batch_size);
         let control = absorb_search_batch(&diagnostics, batch, |gpu_winner| {
@@ -923,6 +938,10 @@ impl SearchHandle {
             production_max_batch_candidates(backend),
             WINNER_BUFFER_CAP,
         )?;
+        #[cfg(feature = "incremental-k")]
+        if let PhotonEngine::Cuda(cuda) = &mut engine {
+            cuda.enable_incremental_search()?;
+        }
         engine.set_job(&prepared.template, &prepared.target, &sk)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1161,6 +1180,7 @@ mod tests {
             winners: vec![PhotonCudaWinner {
                 nonce: 7,
                 digest: [9; 32],
+                schnorr_k: None,
             }],
         };
         let control =
@@ -1536,6 +1556,60 @@ mod tests {
             payout_address: "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh".into(),
             source_identity: "test".into(),
             generation_id,
+        }
+    }
+
+    #[test]
+    fn incremental_live_winner_reconstruction_and_identity_rotation() {
+        assert_eq!(batch_before_wrap(u32::MAX - 2, 64), 3);
+        assert_eq!(batch_before_wrap(0, 64), 64);
+        assert!(crypto::bch_schnorr_sign_search_candidate(&[1; 32], &[2; 32], 0).is_err());
+        assert!(
+            crypto::bch_schnorr_sign_search_candidate(&[1; 32], &[2; 32], (1u64 << 32) + 1)
+                .is_err()
+        );
+        let sk = [0x11u8; 32];
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
+        let mut job = integration_job(1);
+        job.target_le_hex = format!("{}7f", "ff".repeat(31));
+        let mut funded = job.clone();
+        funded.payout_address = crate::reward::p2pkh_cashaddr_from_public_key(&public).unwrap();
+        assert!(prepare_job(funded, &sk, &public)
+            .err()
+            .unwrap()
+            .contains("separate"));
+        let mut cuda = match CudaPhotonEngine::new(0, 65, 65) {
+            Ok(cuda) => cuda,
+            Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => return,
+            Err(error) => panic!("{error}"),
+        };
+        cuda.enable_incremental_search().unwrap();
+        let mut engine = PhotonEngine::Cuda(Box::new(cuda));
+        for age in [0, 17, 128, 65534] {
+            job.age = age;
+            job.generation_id += 1;
+            let prepared = prepare_job(job.clone(), &sk, &public).unwrap();
+            engine
+                .set_job(&prepared.template, &prepared.target, &sk)
+                .unwrap();
+            let result = engine.search_batch(u32::MAX - 64, 65).unwrap();
+            assert_eq!(result.total_winners, 65);
+            for winner in &result.winners {
+                assert_eq!(winner.nonce, 0);
+                assert!(winner.schnorr_k.unwrap() >= (1u64 << 32) - 64);
+                let verified = verify_gpu_winner(&prepared, &sk, &public, winner).unwrap();
+                assert_eq!(verified.generation_id, job.generation_id);
+                let mut wrong = winner.clone();
+                wrong.schnorr_k = None;
+                assert!(verify_gpu_winner(&prepared, &sk, &public, &wrong).is_err());
+            }
+            let (next, next_sk, next_public) = rotate_search_identity(&mut engine, &job).unwrap();
+            assert_ne!(next_public, public);
+            assert!(verify_gpu_winner(&next, &next_sk, &next_public, &result.winners[0]).is_err());
+            for winner in engine.search_batch(0, 2).unwrap().winners {
+                verify_gpu_winner(&next, &next_sk, &next_public, &winner).unwrap();
+            }
         }
     }
 
