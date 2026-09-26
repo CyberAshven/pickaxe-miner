@@ -2,7 +2,19 @@
 
 Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7a6e8235440168c6fe08140964890`.
 
-**Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. Master, the default release build, and `D:\pickaxe-live` remain unchanged. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
+**Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. The user subsequently authorized promoting `fd95cbc` to master and continuing measured optimization rounds. The default release build and `D:\pickaxe-live` remain unchanged. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
+
+## Round 2: rejected C1 memory and arithmetic candidates
+
+Research reviewed NVIDIA's [shared-memory spilling guidance](https://developer.nvidia.com/blog/?p=105101), [local-memory behavior](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html), and [extended-precision carry instructions](https://docs.nvidia.com/cuda/parallel-thread-execution/contents.html). Other implementations, including [UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1), use Montgomery batch inversion; Pickaxe already uses that algorithm. External throughput claims were not treated as comparable PHOTON results.
+
+- Shared-memory spilling alone: both versions compiled to 70 registers, a 704-byte stack and no spill loads/stores. The large local array is not a register spill, so this pragma was not pursued.
+- Explicit shared prefix array: stack fell to 192 bytes, but each block needed 32 KiB shared memory and 94 registers. All 13,920 independent cases and full-batch samples passed. ABBA ABBA full-pipeline medians were **96.176 baseline vs 88.350 candidate million/s**: rejected.
+- Scalar addition/subtraction via explicit PTX carry chains: 66 registers, 672-byte stack; the same independent correctness checks passed. ABBA ABBA medians were **100.353 baseline vs 96.776 candidate million/s**: rejected.
+
+Both comparisons used the same full-width key, 262,144-candidate batches, one-second warmups and four-second measured windows. The miner was stopped cleanly through its TUI input before serial GPU tests and the unchanged best live executable was restored afterwards. A GPU sample between tests was 66 C; these later rates must not be compared directly against the hotter initial benchmark as a code improvement. Rejected source variants, build resource reports, correctness logs, raw timings and the temporary comparison-test patch are retained in ignored `artifacts/incremental-k/round2/`, not product code.
+
+CI also found two issues missed by the original local gate: current Rust requires `as_chunks` for these fixed-size slices, and the new hardware integration test lacked the existing `if_cuda` naming convention used by non-GPU CI. The fix keeps scalar-boundary and funded-identity guards in a separate CPU test, while preserving the hardware test for explicit CUDA runs. Neither fix changes mining arithmetic or claims a performance gain.
 
 ## Live integration and follow-up measurements
 
