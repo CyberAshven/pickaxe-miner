@@ -39,10 +39,14 @@ const EVENT_HISTORY_CAP: usize = 96;
 const HISTORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// One hour of chart history.
 const HISTORY_CAP: usize = 720;
-/// Height the chart area gets when the window has no spare rows.
-const CHART_MIN_ROWS: u16 = 8;
-/// Narrowest chart placed beside another instead of stacked.
-const CHART_MIN_WIDTH: u16 = 50;
+/// Height of one stacked chart window: borders plus three plot rows.
+const CHART_MIN_ROWS: u16 = 5;
+/// Extra rows the bottom chart needs for the shared time axis.
+const CHART_AXIS_ROWS: u16 = 2;
+/// Height of the note shown for a metric the GPU does not report.
+const CHART_NOTE_ROWS: u16 = 3;
+/// Runtime rows (with borders) kept when charts need the space.
+const RUNTIME_MIN_ROWS: u16 = 5;
 const COMMAND_HISTORY_CAP: usize = 32;
 const BENCHMARK_TERMINAL_WIDTH: u16 = 120;
 const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
@@ -352,10 +356,10 @@ impl ChartMetric {
     /// Axis top: 100 for percentages and temperature unless exceeded,
     /// otherwise a round number above the largest value.
     fn axis_top(self, largest: f64) -> f64 {
-        let fitted = nice_ceiling(largest * 1.1);
         match self {
-            Self::Temperature | Self::Fan | Self::Utilization => fitted.max(100.0),
-            _ => fitted,
+            Self::Fan | Self::Utilization => 100.0,
+            Self::Temperature => nice_ceiling(largest * 1.1).max(100.0),
+            _ => nice_ceiling(largest * 1.1),
         }
     }
 }
@@ -391,7 +395,7 @@ struct TuiState {
     last_history_sample: Option<Instant>,
     /// Charts on screen; empty means charts are hidden (the default).
     charts: Vec<ChartMetric>,
-    /// Charts that `G` or a bare `/chart` brings back.
+    /// Charts that `G` or a bare `/chart` brings back; all of them at first.
     last_charts: Vec<ChartMetric>,
 }
 
@@ -415,7 +419,7 @@ impl TuiState {
             history: VecDeque::with_capacity(HISTORY_CAP),
             last_history_sample: None,
             charts: Vec::new(),
-            last_charts: vec![ChartMetric::Hashrate],
+            last_charts: ChartMetric::ALL.to_vec(),
         }
     }
 
@@ -1300,8 +1304,8 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     let area = frame.area();
     // The runtime and events panes are only as tall as the runtime rows
     // need, so a tall window never shows empty boxes. Charts are off until
-    // asked for; then they get the spare rows, or at least CHART_MIN_ROWS
-    // with the least important runtime rows giving way.
+    // asked for; then they get the spare rows, or at least enough for every
+    // selected chart, with the least important runtime rows giving way.
     let runtime_width = runtime_pane_width(area.width);
     let available = area.height.saturating_sub(3 + 3 + 4);
     let needed = u16::try_from(runtime_fields(snapshot, runtime_width).len())
@@ -1312,7 +1316,8 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     } else {
         let charts = available
             .saturating_sub(needed)
-            .max(CHART_MIN_ROWS.min(available / 2));
+            .max(charts_min_height(state))
+            .min(available.saturating_sub(RUNTIME_MIN_ROWS.min(available)));
         (available - charts, charts)
     };
     let rows = Layout::default()
@@ -1761,40 +1766,110 @@ fn nice_ceiling(value: f64) -> f64 {
         .unwrap_or(10.0 * magnitude)
 }
 
-/// Lays out the selected charts side by side when each can be at least
-/// CHART_MIN_WIDTH wide, otherwise in stacked rows.
+/// Whether the GPU has reported `metric` yet. Before the first sample
+/// every metric counts as reported, so its chart space is kept.
+fn metric_reported(state: &TuiState, metric: ChartMetric) -> bool {
+    state.history.is_empty()
+        || state
+            .history
+            .iter()
+            .any(|sample| metric.value(sample).is_some())
+}
+
+/// Rows the selected charts need at their smallest, including the time
+/// axis under the bottom chart.
+fn charts_min_height(state: &TuiState) -> u16 {
+    let mut any_chart = false;
+    let rows = state
+        .charts
+        .iter()
+        .map(|metric| {
+            if metric_reported(state, *metric) {
+                any_chart = true;
+                CHART_MIN_ROWS
+            } else {
+                CHART_NOTE_ROWS
+            }
+        })
+        .sum::<u16>();
+    if any_chart {
+        rows + CHART_AXIS_ROWS
+    } else {
+        rows
+    }
+}
+
+/// Stacks the selected charts top to bottom in the order chosen. Reported
+/// metrics share the height equally; one the GPU does not report is a
+/// short note. Only the bottom chart carries the time axis.
 fn render_charts(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let count = state.charts.len();
-    if count == 0 {
-        return;
-    }
-    let mut columns = usize::from(area.width / CHART_MIN_WIDTH).clamp(1, count);
-    let stacked_rows = u16::try_from(count.div_ceil(columns)).unwrap_or(u16::MAX);
-    if area.height / stacked_rows < 6 {
-        columns = count;
-    }
-    let row_count = count.div_ceil(columns);
-    let row_areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Ratio(1, row_count as u32); row_count])
-        .split(area);
-    for (metrics, row_area) in state.charts.chunks(columns).zip(row_areas.iter()) {
-        let cells = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(vec![
-                Constraint::Ratio(1, metrics.len() as u32);
-                metrics.len()
-            ])
-            .split(*row_area);
-        for (metric, cell) in metrics.iter().zip(cells.iter()) {
-            render_metric_chart(frame, *cell, state, *metric);
+    // Keep charts in the chosen order while they fit at their smallest.
+    let mut shown = Vec::new();
+    let mut used = 0u16;
+    for metric in &state.charts {
+        let reported = metric_reported(state, *metric);
+        let rows = if reported {
+            CHART_MIN_ROWS
+        } else {
+            CHART_NOTE_ROWS
+        };
+        let axis = if reported && !shown.iter().any(|(_, reported)| *reported) {
+            CHART_AXIS_ROWS
+        } else {
+            0
+        };
+        if used + rows + axis > area.height && !shown.is_empty() {
+            break;
         }
+        used += rows + axis;
+        shown.push((*metric, reported));
+    }
+    // Charts share the rows left after the notes and the time axis; the
+    // bottom chart also gets the axis rows.
+    let axis_chart = shown.iter().rposition(|(_, reported)| *reported);
+    let charts = shown.iter().filter(|(_, reported)| *reported).count() as u16;
+    let notes = shown.len() as u16 - charts;
+    let pool = area
+        .height
+        .saturating_sub(notes * CHART_NOTE_ROWS)
+        .saturating_sub(if charts > 0 { CHART_AXIS_ROWS } else { 0 });
+    let mut remainder = if charts > 0 { pool % charts } else { 0 };
+    let heights = shown
+        .iter()
+        .enumerate()
+        .map(|(index, (_, reported))| {
+            if !*reported {
+                return CHART_NOTE_ROWS;
+            }
+            let mut rows = pool / charts.max(1);
+            if remainder > 0 {
+                rows += 1;
+                remainder -= 1;
+            }
+            if axis_chart == Some(index) {
+                rows += CHART_AXIS_ROWS;
+            }
+            rows
+        })
+        .collect::<Vec<_>>();
+    let cells = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(heights.iter().map(|rows| Constraint::Length(*rows)))
+        .split(area);
+    for (index, ((metric, _), cell)) in shown.iter().zip(cells.iter()).enumerate() {
+        render_metric_chart(frame, *cell, state, *metric, axis_chart == Some(index));
     }
 }
 
 /// Charts the last hour of one metric; a hash-rate dip to zero shows idle
 /// GPU time.
-fn render_metric_chart(frame: &mut Frame<'_>, area: Rect, state: &TuiState, metric: ChartMetric) {
+fn render_metric_chart(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiState,
+    metric: ChartMetric,
+    time_axis: bool,
+) {
     let step = HISTORY_SAMPLE_INTERVAL.as_secs_f64();
     let window = HISTORY_CAP as f64 * step;
     let newest = state.history.len().saturating_sub(1) as f64;
@@ -1843,31 +1918,38 @@ fn render_metric_chart(frame: &mut Frame<'_>, area: Rect, state: &TuiState, metr
             .fold(0.0_f64, f64::max),
     );
     let minutes = |seconds: f64| format!("{:.0}m", seconds / 60.0);
+    let mut x_axis = Axis::default()
+        .style(Style::default().fg(Color::DarkGray))
+        .bounds([-window, 0.0]);
+    if time_axis {
+        x_axis = x_axis.labels([
+            Span::raw(format!("-{}", minutes(window))),
+            Span::raw(format!("-{}", minutes(window / 2.0))),
+            Span::raw("now"),
+        ]);
+    }
+    // A short chart has room for the bottom and top labels only.
+    let y_labels = if area.height >= 8 {
+        vec![
+            Span::raw(metric.format(0.0)),
+            Span::raw(metric.format(top / 2.0)),
+            Span::raw(metric.format(top)),
+        ]
+    } else {
+        vec![Span::raw(metric.format(0.0)), Span::raw(metric.format(top))]
+    };
     let chart = Chart::new(vec![Dataset::default()
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Cyan))
         .data(&points)])
     .block(block)
-    .x_axis(
-        Axis::default()
-            .style(Style::default().fg(Color::DarkGray))
-            .bounds([-window, 0.0])
-            .labels([
-                Span::raw(format!("-{}", minutes(window))),
-                Span::raw(format!("-{}", minutes(window / 2.0))),
-                Span::raw("now"),
-            ]),
-    )
+    .x_axis(x_axis)
     .y_axis(
         Axis::default()
             .style(Style::default().fg(Color::DarkGray))
             .bounds([0.0, top])
-            .labels([
-                Span::raw(metric.format(0.0)),
-                Span::raw(metric.format(top / 2.0)),
-                Span::raw(metric.format(top)),
-            ]),
+            .labels(y_labels),
     );
     frame.render_widget(chart, area);
 }
@@ -2620,7 +2702,11 @@ mod tests {
         let mut state = TuiState::new(&test_snapshot());
         assert!(state.charts.is_empty(), "charts are off by default");
         state.apply_chart_request(ChartRequest::Toggle);
-        assert_eq!(state.charts, vec![ChartMetric::Hashrate]);
+        assert_eq!(
+            state.charts,
+            ChartMetric::ALL.to_vec(),
+            "G shows every chart"
+        );
         state.apply_chart_request(ChartRequest::Show(vec![ChartMetric::Power]));
         state.apply_chart_request(ChartRequest::Off);
         assert!(state.charts.is_empty());
@@ -2676,47 +2762,55 @@ mod tests {
     }
 
     #[test]
-    fn selected_charts_sit_side_by_side_when_wide_and_stack_when_narrow() {
+    fn charts_stack_top_to_bottom_in_the_chosen_order() {
         let mut snapshot = test_snapshot();
         snapshot.search.current_rate = 30e6;
         snapshot.gpu_telemetry.temperature_c = Some(71.0);
-        let charts = [
-            ChartMetric::Hashrate,
-            ChartMetric::Temperature,
-            ChartMetric::Fan,
+        snapshot.gpu_telemetry.power_watts = Some(95.0);
+        snapshot.gpu_telemetry.gpu_utilization_percent = Some(99.0);
+        snapshot.gpu_telemetry.graphics_clock_mhz = Some(2550.0);
+
+        let rows = rendered_rows_with_charts(&snapshot, &ChartMetric::ALL, 190, 50);
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {rows:?}"))
+        };
+        let order = [
+            row_of("Hashrate · 30.00 MH/s"),
+            row_of("GPU temperature · 71 C"),
+            row_of("GPU power · 95 W"),
+            row_of("fan speed is not reported"),
+            row_of("GPU utilization · 99%"),
+            row_of("Core clock · 2550 MHz"),
         ];
-
-        let wide = rendered_rows_with_charts(&snapshot, &charts, 190, 50);
-        assert!(
-            wide.iter().any(|row| row.contains("Hashrate · 30.00 MH/s")
-                && row.contains("GPU temperature · 71 C")
-                && row.contains("Fan speed")),
-            "{wide:?}"
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{rows:?}");
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("now")).count(),
+            1,
+            "only the bottom chart has the time axis: {rows:?}"
         );
-        assert!(wide
-            .iter()
-            .any(|row| row.contains("fan speed is not reported")));
+        assert!(
+            rows.iter().any(|row| row.contains("Hashrate   ")),
+            "runtime stays"
+        );
 
-        let narrow = rendered_rows_with_charts(&snapshot, &charts[..2], 90, 60);
-        let hash = narrow
-            .iter()
-            .position(|row| row.contains("Hashrate · "))
-            .unwrap();
-        let temp = narrow
+        let chosen = rendered_rows_with_charts(
+            &snapshot,
+            &[ChartMetric::Temperature, ChartMetric::Hashrate],
+            120,
+            30,
+        );
+        let temp = chosen
             .iter()
             .position(|row| row.contains("GPU temperature · "))
             .unwrap();
-        assert!(temp > hash, "stacked: {narrow:?}");
-
-        let small = rendered_rows_with_charts(&snapshot, &charts[..1], 120, 30);
-        assert!(
-            small.iter().any(|row| row.contains("Hashrate · ")),
-            "{small:?}"
-        );
-        assert!(
-            small.iter().any(|row| row.contains("Hashrate   ")),
-            "runtime stays"
-        );
+        let hash = chosen
+            .iter()
+            .position(|row| row.contains("Hashrate · "))
+            .unwrap();
+        assert!(temp < hash, "{chosen:?}");
+        assert!(!chosen.iter().any(|row| row.contains("GPU power")));
     }
 
     #[test]
