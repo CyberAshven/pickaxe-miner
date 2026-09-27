@@ -23,6 +23,26 @@ pub(super) struct Incremental {
 }
 
 impl Incremental {
+    #[cfg(test)]
+    pub(super) fn use_upstream_kernels(
+        &mut self,
+        engine: &mut CudaPhotonEngine,
+        c1_file: &str,
+    ) -> Result<(), String> {
+        self.walk = load_function(
+            &engine._ctx,
+            "ultrafast_walk.ptx",
+            "pickaxe_photon_incremental_k",
+        )?;
+        self.filters = load_filters(engine, "ultrafast_c3.ptx")?;
+        engine.stage_c1 = load_function(
+            &engine._ctx,
+            c1_file,
+            "pickaxe_photon_c1_schnorr_dual_batched",
+        )?;
+        Ok(())
+    }
+
     pub(super) fn new(engine: &CudaPhotonEngine, per_lane: u32) -> Result<Self, String> {
         if !(1..=128).contains(&per_lane) {
             return Err("invalid incremental lane size".into());

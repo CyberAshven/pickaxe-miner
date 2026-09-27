@@ -11,11 +11,11 @@ Upstream release: `v4.6.0`, commit `540ac5b9c910f089c449177ebf000e4c130cab19`.
 - Upstream contributions may include binding fixes and independently useful PHOTON optimizations, with reproducible evidence. Do not describe a primitive benchmark as a full mining comparison.
 - If a swap is confirmed, preserve the original engine in `reference/legacy-engine-by-cyberashven/`, including source, build instructions, tests, original licensing/attribution, and the exact baseline commit. Until then, keep the original engine active rather than moving it prematurely.
 
-## Decision
+## Decision: retain Pickaxe on the tested NVIDIA GPU
 
-Do not replace the production engine with v4.6.0 through its existing public API. The Rust integration and available GPU primitives work after compatibility fixes, but the library does not supply the resident PHOTON search pipeline or an equivalent public batch-signing interface. Point generation alone measures far below the current miner's observed candidate rate on this machine. This supports rejecting an **as-is** replacement; it does not establish the performance of a future custom PHOTON implementation built from upstream primitives.
+The initial public-API probes do not settle whether an integrated engine can preserve Pickaxe's performance. The user requested the actual integration and complete-pipeline test before concluding. A candidate now compiles upstream CUDA point, field, and scalar arithmetic into Pickaxe's existing GPU-resident PHOTON pipeline; it retains incremental search, batched inversion, dual-signature filtering, and transaction midstates. Rust continues to own orchestration and independent winner checks. This is a native primitive integration, not a benchmark of host buffer transfers.
 
-Keep the current engine, master, release, and single live TUI unchanged by this experiment. No legacy copy is created because no swap occurred. A future replacement would require a native PHOTON search implementation, then full protocol/winner tests and sustained equivalent-work measurements before promotion. The test module is not a runtime engine selector.
+Both integrated candidates pass the full PHOTON correctness oracle and covenant checks, but are 2.4% and 2.1% slower than their matched Pickaxe baselines. The short geometry screen did not identify a clear improvement. These measurements support keeping the current engine on this NVIDIA GPU; they do not establish that every possible upstream integration or other GPU would be slower. Master, release, and live TUI continue using the existing engine; experimental selection is confined to ignored tests. No legacy copy is created because no swap is adopted.
 
 ## Findings
 
@@ -46,7 +46,7 @@ Final run: all three ignored integration probes pass against the final saved pat
 
 These rates are **point generation, not mining hashrate**. Pickaxe's observed mining rate is context for the decision, not a controlled complete-pipeline A/B result. No Metal/Apple, discrete AMD, other NVIDIA model, sustained candidate mining, or future CashToken algorithm is validated here.
 
-Additional checks: upstream Rust wrapper 12 smoke tests plus 1 doc test pass; Pickaxe `cargo clippy --locked --all-targets --all-features -- -D warnings` passes; `cargo test --locked --all-features --no-fail-fast -- --skip if_cuda --skip if_wgpu` passes with 251 passed, 8 ignored, 18 filtered. The filtered production GPU tests were not run while the miner was active. Native upstream builds emit pre-existing MSVC warnings; the full upstream CTest suite was not run. No claim of a warning-free or fully audited upstream library is made.
+Additional checks: upstream Rust wrapper 12 smoke tests plus 1 doc test pass; Pickaxe `cargo clippy --locked --all-targets --all-features -- -D warnings` passes; the final `cargo test --locked --all-features --no-fail-fast -- --skip if_cuda --skip if_wgpu` passes with 251 passed, 14 ignored, 18 filtered. Formatting and diff checks pass. The filtered production GPU tests were not run while the miner was active. Native upstream builds emit pre-existing MSVC warnings; the full upstream CTest suite was not run. No claim of a warning-free or fully audited upstream library is made.
 
 ## Reproduce on Windows
 
@@ -90,3 +90,41 @@ Stop on a failed command and inspect its diagnostic before continuing. The ignor
 The test-only Rust module `src/ultrafast_probe.rs` exercises the pinned shared library through its C ABI with existing `libloading`. It adds no runtime backend and cannot activate itself in a production build. Its ignored tests require `PICKAXE_UFSECP_LIBRARY` to name the locally built, trusted library. GPU tests require exclusive use of the GPU.
 
 Local build logs, sources, and measurements are under ignored `artifacts/ultrafast-evaluation/`. No current finding establishes that a complete engine swap preserves hashrate or supports every GPU/token.
+
+## Integrated CUDA candidate
+
+`cuda/ultrafast_compat.cuh` adapts the pinned upstream 4x64 field/point representation to Pickaxe's existing device buffers. It calls upstream mixed-point addition, field multiplication/squaring/inversion, and square-root arithmetic. The first candidate C1 kernel uses upstream scalar addition and multiplication. The second retains Pickaxe's fixed-key Montgomery multiplication while using upstream arithmetic elsewhere. Pickaxe retains the PHOTON transaction format, search scheduling, batched inversion, dual-signature technique, and SHA-256 transaction filtering. Only ignored Rust tests select the candidate kernels; the live CLI cannot activate them.
+
+The baseline and both candidates pass the same correctness harness: 13,920 independently reconstructed candidates each across eight ages and three synthetic keys, partial batches, the 32-bit index boundary, zero/all-pass targets, bounded winner readback, and production-sized batch samples. Each candidate's 216 transaction vectors pass the existing BCH 2026 VM harness in both standard and consensus modes (103 accepted, 113 rejected). Both candidate scalar kernels also pass 19,080 independent BigUint multiplication checks each, including zero, order, limb boundaries, and full-width synthetic values. These checks exercise the actual candidate kernels, not separate replacement implementations.
+
+The timing harness uses one CUDA context and the same 565,248-candidate buffers, 32 candidates per walk lane, 16 candidates per inversion thread, job, key, and target. It warms the baseline for 45 seconds, then alternates baseline/candidate in ABBA/ABBA order, with one second settling and twelve seconds timing per trial. Both pipelines include point generation, BCH signature construction, both transaction hashes, target filtering, and bounded winner readback. It records temperature, power, clocks, and GPU utilization after each trial. Those snapshots may capture idle transitions and are not in-trial averages or evidence of power efficiency. Neither pipeline broadcasts anything. Job setup, key rotation, networking, and transaction submission are outside timing.
+
+Each row below is a separate matched A/B session. Rates aggregate total candidates divided by total measured time over four trials per pipeline; compare each candidate with its own baseline.
+
+| Candidate | Pickaxe baseline (MH/s) | Candidate (MH/s) | Change |
+| --- | ---: | ---: | ---: |
+| Upstream field, point, and scalar arithmetic | 114.90 | 112.13 | -2.4% |
+| Upstream with Pickaxe fixed-key multiplication | 114.16 | 111.79 | -2.1% |
+
+Every candidate trial is below every baseline trial within its matched session. Unlike the earlier point-generation probe, these measure the complete GPU PHOTON search pipeline. Raw trials and correctness counts are committed in `docs/ultrafast-full-pipeline-results.json`.
+
+A short screen covers both candidates with walk lanes 16/32/64 and inversion groups 8/16 (12 configurations). It uses 0.5 seconds warmup and 2 seconds timing per configuration, with no matched baseline, so it is only a tuning screen. The normal candidate's 64/16 and 32/16 results differ by less than 0.1%; the fixed-key candidate's best result is 32/16. It does not establish an improvement worth promoting or an exhaustive optimization limit.
+
+The original TUI was restored after each exclusive GPU session and confirmed mining at intensity 100 without a reported error. There was one live miner. This experiment does not validate prolonged candidate mining, restart stability, an integrated AMD/OpenCL/Metal backend, or future CashToken algorithms. A future upstream version or backend can be retested with this harness; adoption still requires the applicable correctness, performance, and live stability gates.
+
+```powershell
+tools/build-ultrafast-candidate.cmd
+# With the live miner stopped normally, run serially:
+cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_correctness -- --ignored --exact --nocapture
+cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_scalar_oracle -- --ignored --exact --nocapture
+cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_correctness -- --ignored --exact --nocapture
+cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_fixed_d_correctness -- --ignored --exact --nocapture
+node tools/reward-policy-vm/photon-layout.mjs artifacts/incremental-k/ultrafast-vectors.json
+node tools/reward-policy-vm/photon-layout.mjs artifacts/incremental-k/ultrafast-fixed-d-vectors.json
+cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_comparison -- --ignored --exact --nocapture
+cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_fixed_d_comparison -- --ignored --exact --nocapture
+cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_tuning -- --ignored --exact --nocapture
+# Resume the original miner afterward.
+```
+
+The build script uses the same Windows CUDA/MSVC toolchain as `build-incremental-k.cmd`; its CUDA architecture is specific to the measured host. The VM harness uses its existing pinned Libauth dependency. Results go to `artifacts/ultrafast-evaluation/{full-pipeline-comparison,fixed-d-comparison,tuning}.json`. The integrated candidate needs only the pinned upstream headers; building the public API DLL is necessary only for the separate API probes.

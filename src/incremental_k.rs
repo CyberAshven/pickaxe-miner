@@ -13,10 +13,21 @@ const BATCH: u32 = 262_144;
 #[test]
 #[ignore = "serial Montgomery scalar arithmetic CUDA oracle"]
 fn incremental_k_montgomery_scalar_oracle() {
+    check_scalar_products("scalar-check.ptx");
+}
+
+#[test]
+#[ignore = "exclusive upstream scalar arithmetic oracle including order boundaries"]
+fn incremental_k_ultrafast_scalar_oracle() {
+    for file in ["ultrafast_c1.ptx", "ultrafast_c1_fixed_d.ptx"] {
+        check_scalar_products(file);
+    }
+}
+
+fn check_scalar_products(file: &str) {
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
-    let kernel =
-        load_function(&ctx, "scalar-check.ptx", "pickaxe_scalar_montgomery_check").unwrap();
+    let kernel = load_function(&ctx, file, "pickaxe_scalar_montgomery_check").unwrap();
     let n = BigUint::from_bytes_be(
         &hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141").unwrap(),
     );
@@ -221,9 +232,30 @@ fn signature(key: &[u8; 32], message: &[u8; 32], k: u64) -> [u8; 64] {
 #[test]
 #[ignore = "requires built experimental PTX and a CUDA GPU; offline synthetic keys only"]
 fn incremental_k_correctness() {
+    check_correctness(None);
+}
+
+#[test]
+#[ignore = "exclusive full-pipeline upstream CUDA candidate; synthetic keys only"]
+fn incremental_k_ultrafast_correctness() {
+    check_correctness(Some("ultrafast_c1.ptx"));
+}
+
+#[test]
+#[ignore = "exclusive upstream CUDA candidate with Pickaxe fixed-key multiplication"]
+fn incremental_k_ultrafast_fixed_d_correctness() {
+    check_correctness(Some("ultrafast_c1_fixed_d.ptx"));
+}
+
+fn check_correctness(upstream: Option<&str>) {
     let mut engine = CudaPhotonEngine::new(0, 257, 257).unwrap();
     engine.enable_incremental_search().unwrap();
     let mut incremental = engine.incremental.take().unwrap();
+    if let Some(c1_file) = upstream {
+        incremental
+            .use_upstream_kernels(&mut engine, c1_file)
+            .unwrap();
+    }
     let mut vectors = Vec::new();
     let mut checked = 0;
     for age in [0u32, 16, 17, 127, 128, 32767, 32768, 65534] {
@@ -304,6 +336,11 @@ fn incremental_k_correctness() {
     let mut engine = CudaPhotonEngine::new(0, full_batch, 8).unwrap();
     engine.enable_incremental_search().unwrap();
     let mut incremental = engine.incremental.take().unwrap();
+    if let Some(c1_file) = upstream {
+        incremental
+            .use_upstream_kernels(&mut engine, c1_file)
+            .unwrap();
+    }
     let mut target = [255; 32];
     target[31] = 127;
     engine
@@ -339,7 +376,13 @@ fn incremental_k_correctness() {
     }
     std::fs::create_dir_all("artifacts/incremental-k").unwrap();
     std::fs::write(
-        "artifacts/incremental-k/vectors.json",
+        match upstream {
+            Some("ultrafast_c1_fixed_d.ptx") => {
+                "artifacts/incremental-k/ultrafast-fixed-d-vectors.json"
+            }
+            Some(_) => "artifacts/incremental-k/ultrafast-vectors.json",
+            None => "artifacts/incremental-k/vectors.json",
+        },
         serde_json::to_vec_pretty(&vectors).unwrap(),
     )
     .unwrap();
@@ -401,6 +444,109 @@ fn incremental_k_benchmark() {
 }
 
 #[test]
+#[cfg(feature = "incremental-k")]
+#[ignore = "exclusive complete-pipeline A/B; run both correctness gates first"]
+fn incremental_k_ultrafast_comparison() {
+    compare_upstream("ultrafast_c1.ptx", 32, 16, "full-pipeline-comparison.json");
+}
+
+#[test]
+#[cfg(feature = "incremental-k")]
+#[ignore = "exclusive complete-pipeline A/B; run fixed-key correctness gate first"]
+fn incremental_k_ultrafast_fixed_d_comparison() {
+    compare_upstream(
+        "ultrafast_c1_fixed_d.ptx",
+        32,
+        16,
+        "fixed-d-comparison.json",
+    );
+}
+
+#[cfg(feature = "incremental-k")]
+fn compare_upstream(c1_file: &str, per_lane: u32, c1_per_thread: u32, output: &str) {
+    let count = search::CUDA_MAX_BATCH_CANDIDATES;
+    let mut engine = CudaPhotonEngine::new(0, count, 8).unwrap();
+    engine.enable_incremental_search().unwrap();
+    let mut baseline = engine.incremental.take().unwrap();
+    let baseline_c1 = engine.stage_c1.clone();
+    let mut candidate = Incremental::new(&engine, per_lane).unwrap();
+    candidate.c1_per_thread = c1_per_thread;
+    candidate
+        .use_upstream_kernels(&mut engine, c1_file)
+        .unwrap();
+    let upstream_c1 = engine.stage_c1.clone();
+    let mut target = [0u8; 32];
+    target[28] = 1;
+    let key = [0x11; 32];
+    engine
+        .set_job(&template(10, &target, &key), &target, &key)
+        .unwrap();
+    baseline.set_message(&engine, &target, NONCE).unwrap();
+    candidate.set_message(&engine, &target, NONCE).unwrap();
+    engine.stage_c1 = baseline_c1.clone();
+    let warmup = Instant::now();
+    while warmup.elapsed() < Duration::from_secs(45) {
+        baseline.batch(&mut engine, 0, count).unwrap();
+    }
+    let mut records = Vec::new();
+    for (round, upstream) in [false, true, true, false, false, true, true, false]
+        .into_iter()
+        .enumerate()
+    {
+        let pipeline = if upstream { "ultrafast" } else { "pickaxe" };
+        engine.stage_c1 = if upstream {
+            upstream_c1.clone()
+        } else {
+            baseline_c1.clone()
+        };
+        let incremental = if upstream {
+            &mut candidate
+        } else {
+            &mut baseline
+        };
+        let settle = Instant::now();
+        while settle.elapsed() < Duration::from_secs(1) {
+            incremental.batch(&mut engine, 0, count).unwrap();
+        }
+        // Each timed trial starts with the same contiguous candidate ranges.
+        let mut base = 0u32;
+        let mut run = || {
+            if u64::from(base) + u64::from(count) > 1u64 << 32 {
+                base = 0;
+            }
+            let result = incremental.batch(&mut engine, base, count).unwrap();
+            assert_eq!(result.candidates, count);
+            assert!(!result.truncated());
+            base = base.wrapping_add(count);
+        };
+        let start = Instant::now();
+        let mut candidates = 0u64;
+        while start.elapsed() < Duration::from_secs(12) {
+            run();
+            candidates += u64::from(count);
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let telemetry = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=temperature.gpu,power.draw,clocks.sm,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+            .unwrap();
+        assert!(telemetry.status.success());
+        let record = serde_json::json!({"round":round,"pipeline":pipeline,"c1_kernel":if upstream {c1_file} else {"photon_c1_schnorr.ptx"},"per_lane":if upstream {per_lane} else {32},"batch_size":count,"c1_per_thread":incremental.c1_per_thread,"candidates":candidates,"seconds":seconds,"million_candidates_per_second":candidates as f64/seconds/1e6,"telemetry_csv":String::from_utf8_lossy(&telemetry.stdout).trim()});
+        eprintln!("{record}");
+        records.push(record);
+    }
+    std::fs::create_dir_all("artifacts/ultrafast-evaluation").unwrap();
+    std::fs::write(
+        std::path::Path::new("artifacts/ultrafast-evaluation").join(output),
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
 #[ignore = "CUDA tuning, serial offline synthetic-key comparison"]
 fn incremental_k_tuning() {
     let mut engine = CudaPhotonEngine::new(0, BATCH, 8).unwrap();
@@ -439,6 +585,62 @@ fn incremental_k_tuning() {
     }
     std::fs::write(
         "artifacts/incremental-k/tuning.json",
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "incremental-k")]
+#[ignore = "exclusive upstream geometry screen; correctness gates must pass first"]
+fn incremental_k_ultrafast_tuning() {
+    let count = search::CUDA_MAX_BATCH_CANDIDATES;
+    let mut engine = CudaPhotonEngine::new(0, count, 8).unwrap();
+    let mut target = [0; 32];
+    target[28] = 1;
+    let key = [0x11; 32];
+    engine
+        .set_job(&template(10, &target, &key), &target, &key)
+        .unwrap();
+    let mut records = Vec::new();
+    for c1_file in ["ultrafast_c1.ptx", "ultrafast_c1_fixed_d.ptx"] {
+        for per_lane in [16, 32, 64] {
+            for c1 in [8, 16] {
+                let mut incremental = Incremental::new(&engine, per_lane).unwrap();
+                incremental.c1_per_thread = c1;
+                incremental
+                    .use_upstream_kernels(&mut engine, c1_file)
+                    .unwrap();
+                incremental.set_message(&engine, &target, NONCE).unwrap();
+                let mut base = 0u32;
+                let mut run = || {
+                    if u64::from(base) + u64::from(count) > 1u64 << 32 {
+                        base = 0;
+                    }
+                    let result = incremental.batch(&mut engine, base, count).unwrap();
+                    assert_eq!(result.candidates, count);
+                    assert!(!result.truncated());
+                    base = base.wrapping_add(count);
+                };
+                let warm = Instant::now();
+                while warm.elapsed() < Duration::from_millis(500) {
+                    run();
+                }
+                let start = Instant::now();
+                let mut candidates = 0u64;
+                while start.elapsed() < Duration::from_secs(2) {
+                    run();
+                    candidates += u64::from(count);
+                }
+                let seconds = start.elapsed().as_secs_f64();
+                let record = serde_json::json!({"c1_kernel":c1_file,"per_lane":per_lane,"c1_per_thread":c1,"candidates":candidates,"seconds":seconds,"million_candidates_per_second":candidates as f64/seconds/1e6});
+                eprintln!("{record}");
+                records.push(record);
+            }
+        }
+    }
+    std::fs::write(
+        "artifacts/ultrafast-evaluation/tuning.json",
         serde_json::to_vec_pretty(&records).unwrap(),
     )
     .unwrap();

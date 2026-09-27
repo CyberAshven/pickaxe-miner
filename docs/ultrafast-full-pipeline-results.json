@@ -1,0 +1,328 @@
+{
+  "baseline_commit": "59c93c17f12244a6a81419fe47df83449f2d530d",
+  "upstream_commit": "540ac5b9c910f089c449177ebf000e4c130cab19",
+  "device": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+  "mode": "offline complete PHOTON pipeline; synthetic key; no broadcasts",
+  "date": "2026-09-27",
+  "method": {
+    "warmup_seconds": 45,
+    "settle_seconds_per_trial": 1,
+    "timed_seconds_per_trial": 12,
+    "order": "ABBA/ABBA",
+    "batch_size": 565248,
+    "per_lane": 32,
+    "c1_per_thread": 16,
+    "telemetry": "post-trial temperature C, power W, SM MHz, utilization percent; snapshots, not in-trial averages"
+  },
+  "comparisons": [
+    {
+      "candidate": "upstream_scalar",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 114.895763448239,
+        "ultrafast": 112.13281860537198
+      },
+      "candidate_change_percent": -2.4047404011652063,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_per_thread": 16,
+          "candidates": 1388814336,
+          "million_candidates_per_second": 115.72115738460718,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.0013865,
+          "telemetry_csv": "82, 133.15, 2722, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_per_thread": 16,
+          "candidates": 1346985984,
+          "million_candidates_per_second": 112.2138203529347,
+          "pipeline": "ultrafast",
+          "round": 1,
+          "seconds": 12.0037441,
+          "telemetry_csv": "83, 122.86, 2047, 65"
+        },
+        {
+          "batch_size": 565248,
+          "c1_per_thread": 16,
+          "candidates": 1352073216,
+          "million_candidates_per_second": 112.6415531482634,
+          "pipeline": "ultrafast",
+          "round": 2,
+          "seconds": 12.0033254,
+          "telemetry_csv": "84, 132.22, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_per_thread": 16,
+          "candidates": 1365073920,
+          "million_candidates_per_second": 113.75029996371354,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0006182,
+          "telemetry_csv": "84, 130.01, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_per_thread": 16,
+          "candidates": 1379205120,
+          "million_candidates_per_second": 114.89906144093703,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0036239,
+          "telemetry_csv": "76, 118.36, 1110, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_per_thread": 16,
+          "candidates": 1333420032,
+          "million_candidates_per_second": 111.11026383933208,
+          "pipeline": "ultrafast",
+          "round": 5,
+          "seconds": 12.0008718,
+          "telemetry_csv": "85, 130.83, 2692, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_per_thread": 16,
+          "candidates": 1350942720,
+          "million_candidates_per_second": 112.56549489822548,
+          "pipeline": "ultrafast",
+          "round": 6,
+          "seconds": 12.0013928,
+          "telemetry_csv": "86, 131.49, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_per_thread": 16,
+          "candidates": 1382596608,
+          "million_candidates_per_second": 115.21248693762932,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0004059,
+          "telemetry_csv": "82, 132.77, 2707, 99"
+        }
+      ]
+    },
+    {
+      "candidate": "pickaxe_fixed_d",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 114.15579995633672,
+        "ultrafast": 111.78825646737403
+      },
+      "candidate_change_percent": -2.0739581255339257,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1385422848,
+          "million_candidates_per_second": 115.41045721955102,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.0043095,
+          "telemetry_csv": "81, 124.66, 1687, 29"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1335681024,
+          "million_candidates_per_second": 111.2639941742388,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 1,
+          "seconds": 12.0046115,
+          "telemetry_csv": "85, 123.75, 2662, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1341333504,
+          "million_candidates_per_second": 111.76235668718854,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 2,
+          "seconds": 12.0016573,
+          "telemetry_csv": "86, 130.90, 2497, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1358856192,
+          "million_candidates_per_second": 113.1976553759757,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0042786,
+          "telemetry_csv": "86, 130.73, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1357725696,
+          "million_candidates_per_second": 113.11725655195583,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0028167,
+          "telemetry_csv": "86, 132.18, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1345290240,
+          "million_candidates_per_second": 112.06099974363975,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 5,
+          "seconds": 12.0049816,
+          "telemetry_csv": "86, 131.24, 2685, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1345290240,
+          "million_candidates_per_second": 112.06566347469222,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 6,
+          "seconds": 12.004482,
+          "telemetry_csv": "86, 132.63, 2685, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1379205120,
+          "million_candidates_per_second": 114.89773285838115,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0037627,
+          "telemetry_csv": "86, 132.75, 2700, 99"
+        }
+      ]
+    }
+  ],
+  "geometry_screen": {
+    "note": "Short sequential screen only; 0.5 s warmup and 2 s timing per configuration. No same-session baseline. Do not compare absolute rates with A/B sessions.",
+    "trials": [
+      {
+        "c1_kernel": "ultrafast_c1.ptx",
+        "c1_per_thread": 8,
+        "candidates": 209141760,
+        "million_candidates_per_second": 104.35858333392379,
+        "per_lane": 16,
+        "seconds": 2.0040686
+      },
+      {
+        "c1_kernel": "ultrafast_c1.ptx",
+        "c1_per_thread": 16,
+        "candidates": 196706304,
+        "million_candidates_per_second": 98.22263866886874,
+        "per_lane": 16,
+        "seconds": 2.0026575
+      },
+      {
+        "c1_kernel": "ultrafast_c1.ptx",
+        "c1_per_thread": 8,
+        "candidates": 208576512,
+        "million_candidates_per_second": 104.17773904553356,
+        "per_lane": 32,
+        "seconds": 2.0021217
+      },
+      {
+        "c1_kernel": "ultrafast_c1.ptx",
+        "c1_per_thread": 16,
+        "candidates": 216489984,
+        "million_candidates_per_second": 108.24365519085839,
+        "per_lane": 32,
+        "seconds": 2.0000247
+      },
+      {
+        "c1_kernel": "ultrafast_c1.ptx",
+        "c1_per_thread": 8,
+        "candidates": 209141760,
+        "million_candidates_per_second": 104.52018770896115,
+        "per_lane": 64,
+        "seconds": 2.00097
+      },
+      {
+        "c1_kernel": "ultrafast_c1.ptx",
+        "c1_per_thread": 16,
+        "candidates": 217055232,
+        "million_candidates_per_second": 108.34398918992146,
+        "per_lane": 64,
+        "seconds": 2.0033897
+      },
+      {
+        "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+        "c1_per_thread": 8,
+        "candidates": 209141760,
+        "million_candidates_per_second": 104.45234747608414,
+        "per_lane": 16,
+        "seconds": 2.0022696
+      },
+      {
+        "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+        "c1_per_thread": 16,
+        "candidates": 215924736,
+        "million_candidates_per_second": 107.68819922917248,
+        "per_lane": 16,
+        "seconds": 2.0050919
+      },
+      {
+        "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+        "c1_per_thread": 8,
+        "candidates": 210837504,
+        "million_candidates_per_second": 105.16355160930969,
+        "per_lane": 32,
+        "seconds": 2.0048534
+      },
+      {
+        "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+        "c1_per_thread": 16,
+        "candidates": 215924736,
+        "million_candidates_per_second": 107.76866998100965,
+        "per_lane": 32,
+        "seconds": 2.0035947
+      },
+      {
+        "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+        "c1_per_thread": 8,
+        "candidates": 209141760,
+        "million_candidates_per_second": 104.51800434160357,
+        "per_lane": 64,
+        "seconds": 2.0010118
+      },
+      {
+        "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+        "c1_per_thread": 16,
+        "candidates": 215359488,
+        "million_candidates_per_second": 107.53866402666343,
+        "per_lane": 64,
+        "seconds": 2.0026238
+      }
+    ]
+  },
+  "correctness": {
+    "scalar_products_per_candidate": 19080,
+    "independent_candidates_per_pipeline": 13920,
+    "vm_vectors_per_candidate": 216,
+    "vm_accepted": 103,
+    "vm_rejected": 113,
+    "vm_modes": [
+      "standard",
+      "consensus"
+    ]
+  },
+  "conclusion": "Both tested candidates pass the correctness gates but trail Pickaxe on this NVIDIA GPU. No swap or release promotion. Other devices and long-duration candidate stability remain unvalidated."
+}

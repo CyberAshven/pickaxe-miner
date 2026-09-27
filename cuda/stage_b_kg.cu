@@ -1,4 +1,7 @@
 // Pickaxe Stage B â€” secp256k1 k*G (Jacobian double-and-add). 8xu32 limbs. MSVC/nvcc safe.
+#ifdef PICKAXE_ULTRAFAST_EXPERIMENT
+#include "ultrafast_compat.cuh"
+#else
 #include <cstdint>
 
 struct Fe { uint32_t d[8]; }; // little-endian
@@ -580,3 +583,4 @@ extern "C" __global__ void pickaxe_stage_b_kg(
     scalar_mul_g(&P, k);
     jacobian_to_compressed(out_pub33 + (size_t)i * 33, &P);
 }
+#endif // PICKAXE_ULTRAFAST_EXPERIMENT
