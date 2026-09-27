@@ -1,17 +1,22 @@
-# Rust GPU engine experiment
+# Rust CPU and GPU engine experiment
 
 Branch: `experiment/rust-engine`. Release/master baseline:
 `59c93c17f12244a6a81419fe47df83449f2d530d`.
 
-The requested scope is Rust GPU kernel implementation only. CPU key handling,
-BCH Schnorr signing/verification, job setup, table generation and dependencies
-remain unchanged from the branch base.
+The branch retains both the Rust CPU rewrite and Rust NVIDIA GPU kernels for
+the intended upstream contribution. CPU key handling, BCH Schnorr signing and
+verification, job setup and table generation use Rust implementations.
 This is an experimental Pickaxe implementation, not a Rust wrapper around
 UltrafastSecp256k1. It does not rewrite the entire upstream library or constitute
 an upstream Rust-engine PR. Pickaxe's AGPL-3.0-only license continues to apply.
 
 ## Implemented
 
+- CPU public keys, BCH Schnorr signing/verification, identity creation and M29
+  table generation use RustCrypto `k256` arithmetic. BCH's quadratic-residue
+  signature rule is retained; this does not use the library's BIP340 signer.
+  Native `secp256k1` remains a test oracle only, outside the normal dependency
+  tree. CPU and GPU share the allocation-free Rust RFC6979 implementation.
 - `rust-engine/src` contains Rust field/scalar/Jacobian arithmetic and NVIDIA
   kernels for RFC6979, fixed-base multiplication, incremental point walking,
   batched inversion, dual BCH Schnorr signatures and all four PHOTON transaction
@@ -23,8 +28,9 @@ an upstream Rust-engine PR. Pickaxe's AGPL-3.0-only license continues to apply.
 - Rust's built-in NVPTX target compiles these kernels. No NVCC, C++ kernel,
   or Rust-CUDA codegen plugin is used to build the Rust PTX.
   NVIDIA's driver/JIT and the operating system remain external platform APIs.
-- The standalone kernel crate can also compile for the CPU to run arithmetic
-  oracle tests. It is not a production CPU dependency or CPU mining backend.
+- The standalone kernel crate also compiles for the CPU to run arithmetic
+  oracle tests and provide the shared nonce routine. Production CPU signing
+  uses `k256` arithmetic, not the GPU's variable-time field/point implementation.
 
 ## Reproduce
 
@@ -49,6 +55,7 @@ and do not broadcast transactions:
 
 ```powershell
 cargo test --release --all-features -- --test-threads=1 --skip if_wgpu_present
+cargo test --release --all-features rust_generator_table_matches_authoritative_checksum -- --ignored --test-threads=1
 cargo test --release --all-features incremental_k_rust_correctness -- --ignored --nocapture --test-threads=1
 node tools/reward-policy-vm/photon-layout.mjs artifacts/incremental-k/rust-vectors.json
 cargo test --release --features incremental-k incremental_k_rust_comparison -- --ignored --nocapture --test-threads=1
@@ -65,9 +72,12 @@ build which would silently compare Rust against itself.
 - 260 scalar/point cases against BigUint and native libsecp256k1, including zero,
   order boundaries, infinity, doubling and inverse points.
 - The authoritative PHOTON RFC6979 vector passes.
-- After retaining the original CPU implementation, 265 application tests passed,
-  including real CUDA tests for the Rust regular pipeline and incremental search
-  supervision. Eighteen tests were ignored by
+- 128 CPU BCH Schnorr signatures match independent native points and BigUint
+  scalars; verification rejects mutated signatures and noncanonical scalars.
+- The Rust-generated 64 MiB M29 table matches its authoritative SHA-256.
+- After restoring the CPU rewrite, 266 application tests passed, including real
+  CUDA tests for the Rust regular pipeline and incremental search supervision.
+  Nineteen benchmarks and explicit oracle tests were ignored by
   default; the unrelated legacy WGPU hardware test was explicitly excluded.
   The suite also retains native-kernel reference tests: it is not evidence that
   HIP/WGPU were rewritten.
@@ -80,18 +90,19 @@ build which would silently compare Rust against itself.
   formatting/Clippy checks pass. The Rust-feature release binary builds.
 
 Explicit multiplication columns and a dedicated square implementation improved
-the initial prototype. The final GPU-only experiment still fails the agreed
+the initial prototype. Both combined CPU/GPU and GPU-only experiments fail the agreed
 maximum 2% performance loss:
 
 | Experiment | Original kernels | Rust kernels | Rust loss |
 | --- | ---: | ---: | ---: |
 | Initial prototype | 114.60 MH/s | 52.99 MH/s | 53.76% |
 | Unrolled multiplication/squaring | 113.85 MH/s | 86.08 MH/s | 24.39% |
-| Final GPU-only scope, original CPU restored | 113.96 MH/s | 85.35 MH/s | 25.11% |
+| GPU-only comparison, original CPU | 113.96 MH/s | 85.35 MH/s | 25.11% |
 
 Rates are total candidates divided by total measured time across each pipeline's
-four trials. The first two comparisons included a CPU rewrite that has since
-been reverted; only the last comparison describes the retained implementation.
+four trials. The first two comparisons include the Rust CPU implementation now
+retained on the branch. The last is the diagnostic comparison with the original
+CPU code; the GPU kernels are identical to the second comparison.
 Raw matched trials are saved in `rust-engine-results.json`.
 These are complete pipeline measurements, not a
 primitive benchmark. Each comparison uses 45 seconds of warmup, eight ABBA/ABBA
@@ -105,8 +116,9 @@ some snapshots catch idle gaps. No performance ceiling is claimed.
 The Rust GPU migration is **not complete across hardware backends**. HIP still
 uses native kernels and the portable backend still uses WGSL. Those paths need
 Rust shader implementations and their own physical-device evidence. This feature
-currently establishes Rust NVIDIA kernels only. CPU cryptography is outside
-the requested rewrite scope.
+currently establishes a Rust CPU/NVIDIA path. Upstream packaging and maintainer
+review remain necessary; retaining both components does not mean the upstream
+library's full API or every backend has been ported.
 
 Performance must meet the agreed acceptance criteria before promotion. These
 short tests also do not establish long-session stability or resolve the earlier

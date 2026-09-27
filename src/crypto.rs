@@ -8,29 +8,51 @@
 //! The signer is shared by deterministic vector tests, live job setup, and rare
 //! returned-winner reconstruction. Mining identities remain runtime-only.
 
-use hmac::{Hmac, Mac};
+use k256::elliptic_curve::{ops::Reduce, sec1::ToEncodedPoint, Group, PrimeField};
+use k256::{ProjectivePoint, PublicKey, Scalar, SecretKey, U256};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
-use secp256k1::{PublicKey, Scalar, SecretKey};
 use sha2::{Digest, Sha256};
-
-type HmacSha256 = Hmac<Sha256>;
 
 const SECP_P_BE: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xFF, 0xFF, 0xFC, 0x2F,
 ];
 
+#[cfg(test)]
 const SECP_N_BE: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
     0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
 ];
 
-#[cfg(test)]
-/// Derives a compressed public key from test secret key bytes.
+/// Derives a compressed public key using RustCrypto's constant-time arithmetic.
 pub fn compressed_pubkey(sk_bytes: &[u8; 32]) -> Result<[u8; 33], String> {
-    let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
-    Ok(PublicKey::from_secret_key(&sk).serialize())
+    let secret = SecretKey::from_slice(sk_bytes).map_err(|e| e.to_string())?;
+    Ok(secret
+        .public_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .expect("compressed SEC1 length"))
+}
+
+pub fn uncompressed_pubkey(sk_bytes: &[u8; 32]) -> Result<[u8; 65], String> {
+    let secret = SecretKey::from_slice(sk_bytes).map_err(|e| e.to_string())?;
+    Ok(secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .try_into()
+        .expect("uncompressed SEC1 length"))
+}
+
+pub fn random_keypair() -> ([u8; 32], [u8; 33]) {
+    loop {
+        let secret = rand::random::<[u8; 32]>();
+        if let Ok(public) = compressed_pubkey(&secret) {
+            return (secret, public);
+        }
+    }
 }
 
 /// Computes the SHA-256 digest of input bytes.
@@ -40,64 +62,10 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Computes HMAC-SHA256 for nonce generation.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
-    mac.update(data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&mac.finalize().into_bytes());
-    out
-}
-
-/// Reduces a message modulo the secp256k1 group order.
-fn reduce_msg_mod_n(msg32: &[u8; 32]) -> [u8; 32] {
-    let m = BigUint::from_bytes_be(msg32);
-    let n = BigUint::from_bytes_be(&SECP_N_BE);
-    let r = m % n;
-    let bytes = r.to_bytes_be();
-    let mut out = [0u8; 32];
-    out[32 - bytes.len()..].copy_from_slice(&bytes);
-    out
-}
-
-/// RFC6979 nonce for BCH Schnorr (algo tag ASCII `Schnorr+SHA256  `).
+/// RFC6979 nonce for BCH Schnorr, shared with the Rust GPU kernel.
 pub fn bch_rfc6979_nonce(sk_bytes: &[u8; 32], msg32: &[u8; 32]) -> Result<[u8; 32], String> {
-    let reduced = reduce_msg_mod_n(msg32);
-    let algo = b"Schnorr+SHA256  ";
-    let mut v = [1u8; 32];
-    let mut k = [0u8; 32];
-
-    let mut buf = Vec::with_capacity(113);
-    buf.extend_from_slice(&v);
-    buf.push(0);
-    buf.extend_from_slice(sk_bytes);
-    buf.extend_from_slice(&reduced);
-    buf.extend_from_slice(algo);
-    k = hmac_sha256(&k, &buf);
-    v = hmac_sha256(&k, &v);
-
-    buf.clear();
-    buf.extend_from_slice(&v);
-    buf.push(1);
-    buf.extend_from_slice(sk_bytes);
-    buf.extend_from_slice(&reduced);
-    buf.extend_from_slice(algo);
-    k = hmac_sha256(&k, &buf);
-    v = hmac_sha256(&k, &v);
-
-    let n = BigUint::from_bytes_be(&SECP_N_BE);
-    loop {
-        v = hmac_sha256(&k, &v);
-        let cand = BigUint::from_bytes_be(&v);
-        if cand > BigUint::zero() && cand < n {
-            return Ok(v);
-        }
-        let mut t = Vec::with_capacity(33);
-        t.extend_from_slice(&v);
-        t.push(0);
-        k = hmac_sha256(&k, &t);
-        v = hmac_sha256(&k, &v);
-    }
+    SecretKey::from_slice(sk_bytes).map_err(|error| error.to_string())?;
+    Ok(pickaxe_rust_engine::nonce::bch_rfc6979(sk_bytes, msg32))
 }
 
 /// Tests a curve point’s Y coordinate for quadratic residuosity.
@@ -135,21 +103,20 @@ fn bch_schnorr_sign_with_k(
     msg32: &[u8; 32],
     k_bytes: [u8; 32],
 ) -> Result<[u8; 64], String> {
-    let sk = SecretKey::from_secret_bytes(*sk_bytes).map_err(|e| e.to_string())?;
-    let pk_bytes = PublicKey::from_secret_key(&sk).serialize();
+    let sk = SecretKey::from_slice(sk_bytes).map_err(|e| e.to_string())?;
+    let pk_bytes = compressed_pubkey(sk_bytes)?;
 
-    let k = SecretKey::from_secret_bytes(k_bytes).map_err(|e| e.to_string())?;
-    let r_pk = PublicKey::from_secret_key(&k);
-    let r_unc = r_pk.serialize_uncompressed();
+    let k = SecretKey::from_slice(&k_bytes).map_err(|e| e.to_string())?;
+    let r_unc = uncompressed_pubkey(&k_bytes)?;
     let mut r_x = [0u8; 32];
     r_x.copy_from_slice(&r_unc[1..33]);
     let mut r_y = [0u8; 32];
     r_y.copy_from_slice(&r_unc[33..65]);
 
     let k_adj = if y_is_quadratic_residue(&r_y) {
-        k
+        *k.to_nonzero_scalar()
     } else {
-        k.negate()
+        -*k.to_nonzero_scalar()
     };
 
     let mut chal = Vec::with_capacity(97);
@@ -157,13 +124,8 @@ fn bch_schnorr_sign_with_k(
     chal.extend_from_slice(&pk_bytes);
     chal.extend_from_slice(msg32);
     let e_bytes = sha256(&chal);
-    let e = Scalar::from_be_bytes(e_bytes).map_err(|_| "bad e")?;
-
-    let ed = sk.mul_tweak(&e).map_err(|err| err.to_string())?;
-    let s_key = k_adj
-        .add_tweak(&Scalar::from(ed))
-        .map_err(|err| err.to_string())?;
-    let s_bytes = s_key.to_secret_bytes();
+    let e = <Scalar as Reduce<U256>>::reduce_bytes(&e_bytes.into());
+    let s_bytes = (k_adj + e * *sk.to_nonzero_scalar()).to_bytes();
 
     let mut sig = [0u8; 64];
     sig[..32].copy_from_slice(&r_x);
@@ -177,7 +139,7 @@ pub fn bch_schnorr_verify(
     msg32: &[u8; 32],
     sig64: &[u8; 64],
 ) -> Result<bool, String> {
-    let pk = PublicKey::from_slice(pk33).map_err(|e| e.to_string())?;
+    let pk = PublicKey::from_sec1_bytes(pk33).map_err(|e| e.to_string())?;
     let mut r_x = [0u8; 32];
     let mut s_bytes = [0u8; 32];
     r_x.copy_from_slice(&sig64[..32]);
@@ -188,13 +150,16 @@ pub fn bch_schnorr_verify(
     chal.extend_from_slice(pk33);
     chal.extend_from_slice(msg32);
     let e_bytes = sha256(&chal);
-    let e = Scalar::from_be_bytes(e_bytes).map_err(|_| "bad e")?;
-
-    let s_key = SecretKey::from_secret_bytes(s_bytes).map_err(|e| e.to_string())?;
-    let s_g = PublicKey::from_secret_key(&s_key);
-    let e_p = pk.mul_tweak(&e).map_err(|e| e.to_string())?;
-    let r_prime = s_g.combine(&e_p.negate()).map_err(|e| e.to_string())?;
-    let r_unc = r_prime.serialize_uncompressed();
+    let e = <Scalar as Reduce<U256>>::reduce_bytes(&e_bytes.into());
+    let Some(s) = Option::<Scalar>::from(Scalar::from_repr(s_bytes.into())) else {
+        return Ok(false);
+    };
+    let r_prime = ProjectivePoint::GENERATOR * s - ProjectivePoint::from(*pk.as_affine()) * e;
+    if bool::from(r_prime.is_identity()) {
+        return Ok(false);
+    }
+    let r_encoded = r_prime.to_affine().to_encoded_point(false);
+    let r_unc = r_encoded.as_bytes();
     if r_unc[1..33] != r_x {
         return Ok(false);
     }
@@ -239,6 +204,49 @@ fn hex_64(s: &str) -> [u8; 64] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_signer_matches_independent_native_points_and_integer_scalars() {
+        let n = BigUint::from_bytes_be(&SECP_N_BE);
+        for index in 0..128u32 {
+            let key = sha256(&index.to_le_bytes());
+            let message = sha256(&index.to_be_bytes());
+            let nonce = bch_rfc6979_nonce(&key, &message).unwrap();
+            let native_key = secp256k1::SecretKey::from_secret_bytes(key).unwrap();
+            let public = secp256k1::PublicKey::from_secret_key(&native_key).serialize();
+            assert_eq!(compressed_pubkey(&key).unwrap(), public);
+            let r = secp256k1::PublicKey::from_secret_key(
+                &secp256k1::SecretKey::from_secret_bytes(nonce).unwrap(),
+            )
+            .serialize_uncompressed();
+            let mut challenge = r[1..33].to_vec();
+            challenge.extend_from_slice(&public);
+            challenge.extend_from_slice(&message);
+            let k = BigUint::from_bytes_be(&nonce);
+            let k = if y_is_quadratic_residue(r[33..].try_into().unwrap()) {
+                k
+            } else {
+                &n - k
+            };
+            let s = (k + BigUint::from_bytes_be(&sha256(&challenge))
+                * BigUint::from_bytes_be(&key))
+                % &n;
+            let mut expected = [0; 64];
+            expected[..32].copy_from_slice(&r[1..33]);
+            let bytes = s.to_bytes_be();
+            expected[64 - bytes.len()..].copy_from_slice(&bytes);
+            let actual = bch_schnorr_sign(&key, &message).unwrap();
+            assert_eq!(actual, expected);
+            assert!(bch_schnorr_verify(&public, &message, &actual).unwrap());
+            let mut bad = actual;
+            bad[63] ^= 1;
+            assert!(!bch_schnorr_verify(&public, &message, &bad).unwrap());
+            bad[32..].copy_from_slice(&SECP_N_BE);
+            assert!(!bch_schnorr_verify(&public, &message, &bad).unwrap());
+        }
+        assert!(compressed_pubkey(&[0; 32]).is_err());
+        assert!(compressed_pubkey(&SECP_N_BE).is_err());
+    }
 
     #[test]
     fn pubkey_from_known_one() {

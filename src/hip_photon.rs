@@ -4,7 +4,6 @@ use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
 use libloading::Library;
 use num_bigint::BigUint;
-use secp256k1::{PublicKey, SecretKey};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
@@ -782,9 +781,8 @@ impl HipPhotonEngine {
         if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
             return Err("PHOTON HIP target does not match transaction template".into());
         }
-        let secret = SecretKey::from_secret_bytes(*private_key)
+        let public_key = crate::crypto::compressed_pubkey(private_key)
             .map_err(|error| format!("invalid PHOTON signing key: {error}"))?;
-        let public_key = PublicKey::from_secret_key(&secret).serialize();
         let fixed_d = fixed_d_table(private_key);
         self.target_gpu.copy_from(target, "upload target")?;
         self.private_key_gpu

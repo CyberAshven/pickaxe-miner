@@ -15,6 +15,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 use num_bigint::BigUint;
+#[cfg(test)]
 use secp256k1::{PublicKey, SecretKey};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -418,9 +419,8 @@ impl CudaPhotonEngine {
             ));
         }
         self.job_ready = false;
-        let secret = SecretKey::from_secret_bytes(*private_key)
+        let public_key = crate::crypto::compressed_pubkey(private_key)
             .map_err(|error| format!("invalid PHOTON signing key: {error}"))?;
-        let public_key = PublicKey::from_secret_key(&secret).serialize();
         let fixed_d = fixed_d_table(private_key);
 
         self.stream

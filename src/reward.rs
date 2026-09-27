@@ -9,6 +9,7 @@ use crate::crypto;
 use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
 use crate::tx;
 use ripemd::Ripemd160;
+#[cfg(test)]
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 
@@ -397,9 +398,7 @@ pub fn p2pkh_cashaddr_from_public_key(public_key: &[u8; 33]) -> Result<String, S
 
 /// Creates an ephemeral identity for the self-funded settlement.
 pub fn new_intermediate_identity() -> Result<([u8; 32], [u8; 33], String), String> {
-    let secret = SecretKey::new(&mut rand::rng());
-    let secret_bytes = secret.to_secret_bytes();
-    let public_key = PublicKey::from_secret_key(&secret).serialize();
+    let (secret_bytes, public_key) = crate::crypto::random_keypair();
     let address = p2pkh_cashaddr_from_public_key(&public_key)?;
     Ok((secret_bytes, public_key, address))
 }
@@ -577,10 +576,7 @@ pub fn build_self_funded_settlement_with_relay_fee(
     reward_token_amount: u128,
     relay_fee_sats_per_kb: u64,
 ) -> Result<PreparedSelfFundedSettlement, String> {
-    let derived_public = PublicKey::from_secret_key(
-        &SecretKey::from_secret_bytes(*reward_secret).map_err(|error| error.to_string())?,
-    )
-    .serialize();
+    let derived_public = crate::crypto::compressed_pubkey(reward_secret)?;
     if &derived_public != reward_public_key {
         return Err("reward public key does not match the runtime reward secret".into());
     }

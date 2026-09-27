@@ -4,7 +4,6 @@
 use crate::backend::{BackendKind, GpuDevice};
 use crate::telemetry::{sample_gpu_telemetry, GpuTelemetry};
 use crate::{reward, search, tui, tx};
-use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -354,9 +353,8 @@ fn deterministic_secret() -> [u8; 32] {
 fn benchmark_fixture() -> Result<BenchmarkFixture, String> {
     let target = search::parse_hex32(VECTOR_TARGET_LE)?;
     let private_key = deterministic_secret();
-    let secret = SecretKey::from_secret_bytes(private_key)
+    let public_key = crate::crypto::compressed_pubkey(&private_key)
         .map_err(|error| format!("benchmark key: {error}"))?;
-    let public_key = PublicKey::from_secret_key(&secret).serialize();
     let payout_address = reward::p2pkh_cashaddr_from_public_key(&public_key)?;
     let payout_locking = tx::cashaddr_to_p2pkh_locking(&payout_address)?;
     let params = tx::TemplateParams {

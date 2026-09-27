@@ -14,7 +14,7 @@ portable-wgpu = ["dep:pollster", "dep:wgpu"]
 sha2 = { version = "0.10", features = ["compress"] }
 ripemd = "0.1"
 hex = "0.4"
-secp256k1 = { version = "0.33.1", features = ["global-context", "rand"] }
+k256 = { version = "0.13.4", default-features = false, features = ["arithmetic", "std"] }
 tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -23,7 +23,7 @@ num-bigint = "0.4"
 num-traits = "0.2"
 cudarc = { version = "0.19.9", features = ["cuda-12000"] }
 clap = { version = "4.6.7", features = ["derive"] }
-hmac = "0.12"
+pickaxe-rust-engine = { path = "rust-engine" }
 rand = "0.9"
 ctrlc = "3.4"
 ratatui = "0.29"
@@ -31,3 +31,6 @@ crossterm = "0.28"
 libloading = "0.9"
 pollster = { version = "0.4", optional = true }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"], optional = true }
+
+[dev-dependencies]
+secp256k1 = { version = "0.33.1", features = ["global-context", "rand"] }

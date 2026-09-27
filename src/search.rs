@@ -9,6 +9,7 @@ use crate::hip_photon::HipPhotonEngine;
 use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, tx};
 use rand::Rng;
+#[cfg(test)]
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -375,9 +376,7 @@ fn rotate_search_identity(
     engine: &mut PhotonEngine,
     job: &MiningJob,
 ) -> Result<(PreparedJob, [u8; 32], [u8; 33]), String> {
-    let secret = SecretKey::new(&mut rand::rng());
-    let sk = secret.to_secret_bytes();
-    let public_key = PublicKey::from_secret_key(&secret).serialize();
+    let (sk, public_key) = crate::crypto::random_keypair();
     let prepared = prepare_job(job.clone(), &sk, &public_key)?;
     engine.set_job(&prepared.template, &prepared.target, &sk)?;
     Ok((prepared, sk, public_key))
@@ -930,9 +929,7 @@ impl SearchHandle {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
         }
-        let secret = SecretKey::new(&mut rand::rng());
-        let sk = secret.to_secret_bytes();
-        let public_key = PublicKey::from_secret_key(&secret).serialize();
+        let (sk, public_key) = crate::crypto::random_keypair();
         let prepared = prepare_job(job, &sk, &public_key)?;
 
         // Fail fast and create exactly one native GPU context. The configured

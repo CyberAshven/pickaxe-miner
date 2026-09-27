@@ -117,15 +117,9 @@ impl Incremental {
         let blocks = count.div_ceil(self.per_lane).div_ceil(64);
         let stride = blocks * 64;
         if self.stride != stride {
-            let point = PublicKey::from_secret_key(
-                &SecretKey::from_secret_bytes({
-                    let mut bytes = [0u8; 32];
-                    bytes[24..].copy_from_slice(&u64::from(stride).to_be_bytes());
-                    bytes
-                })
-                .map_err(|error| error.to_string())?,
-            )
-            .serialize_uncompressed();
+            let mut bytes = [0u8; 32];
+            bytes[24..].copy_from_slice(&u64::from(stride).to_be_bytes());
+            let point = crate::crypto::uncompressed_pubkey(&bytes)?;
             let words: Vec<u32> = point[1..]
                 .as_chunks::<32>()
                 .0

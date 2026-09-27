@@ -7,7 +7,6 @@
 
 use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
-use secp256k1::SecretKey;
 use sha2::compress256;
 use sha2::digest::generic_array::GenericArray;
 use std::borrow::Cow;
@@ -229,7 +228,7 @@ fn validate_job_material(
     if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
         return Err("PHOTON WGPU target must match transaction template bytes 394..425".into());
     }
-    SecretKey::from_secret_bytes(*private_key)
+    k256::SecretKey::from_slice(private_key)
         .map_err(|error| format!("invalid PHOTON WGPU signing key: {error}"))?;
     Ok(())
 }

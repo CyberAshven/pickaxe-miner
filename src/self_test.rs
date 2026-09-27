@@ -8,7 +8,6 @@ use crate::hip_photon::HipPhotonEngine;
 #[cfg(feature = "portable-wgpu")]
 use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, reward, search, tx};
-use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
 
 const TX_BYTES: usize = 615;
@@ -59,9 +58,7 @@ fn deterministic_secret(last_byte: u8) -> [u8; 32] {
 
 /// Derives the compressed public key for a test identity.
 fn public_key(secret: &[u8; 32]) -> Result<[u8; 33], String> {
-    let secret =
-        SecretKey::from_secret_bytes(*secret).map_err(|error| format!("test key: {error}"))?;
-    Ok(PublicKey::from_secret_key(&secret).serialize())
+    crate::crypto::compressed_pubkey(secret).map_err(|error| format!("test key: {error}"))
 }
 
 /// Builds the reference PHOTON transaction context.
