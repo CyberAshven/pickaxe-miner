@@ -413,7 +413,8 @@ fn run_intensity_window(
     let mut pacer = search::DutyPacer::new(started);
 
     while started.elapsed() < requested {
-        let batch_candidates = engine.scheduled_batch_candidates(intensity);
+        let batch_candidates =
+            search::batch_before_wrap(*nonce_base, engine.scheduled_batch_candidates(intensity));
         let batch_started = Instant::now();
         let result = match engine.search_batch(*nonce_base, batch_candidates) {
             Ok(result) => result,
@@ -695,6 +696,31 @@ mod tests {
             backend,
             detail: String::new(),
         }
+    }
+
+    #[test]
+    fn benchmark_crosses_nonce_boundary_if_cuda() {
+        let fixture = benchmark_fixture().unwrap();
+        let mut engine = match search::PhotonEngine::new(
+            BackendKind::Cuda,
+            0,
+            search::CUDA_MAX_BATCH_CANDIDATES,
+            search::WINNER_BUFFER_CAP,
+        ) {
+            Ok(engine) => engine,
+            Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => return,
+            Err(error) => panic!("{error}"),
+        };
+        engine
+            .set_job(&fixture.template, &fixture.target, &fixture.private_key)
+            .unwrap();
+        let mut base = u32::MAX - 3;
+        let window =
+            run_intensity_window(&mut engine, BackendKind::Cuda, 0, 100, 1, &mut base, false)
+                .unwrap();
+        assert!(window.sample.candidates > 4);
+        assert!(window.sample.batches > 1);
+        assert_eq!(u64::from(base), window.sample.candidates - 4);
     }
 
     #[test]

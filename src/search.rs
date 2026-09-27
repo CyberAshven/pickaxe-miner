@@ -460,7 +460,7 @@ pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> 
     }
 }
 
-fn batch_before_wrap(base: u32, requested: u32) -> u32 {
+pub(crate) fn batch_before_wrap(base: u32, requested: u32) -> u32 {
     u64::from(requested).min((1u64 << 32) - u64::from(base)) as u32
 }
 
