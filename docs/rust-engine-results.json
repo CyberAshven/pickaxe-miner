@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "date": "2026-09-27",
   "scope": "Rust CPU key handling, BCH signing and table generation plus Rust NVIDIA GPU kernels",
   "branch": "experiment/rust-engine",
@@ -11,7 +11,7 @@
     "sm_75"
   ],
   "gpu_compiler": "nightly-2026-04-02; rustc 1.96.0-nightly; LLVM 22.1.2",
-  "measured_ptx_sha256": "3488509d4e2c7c47b0338427fd4110e0c969ef5eb98b5f7f96c0f246156d1c7f",
+  "measured_ptx_sha256": "ca09f9322d3dac650f9e099ec3bf8befd25d0a6d23cf6336df98d76309907c1a",
   "protocol": {
     "order": "ABBAABBA",
     "warmup_seconds": 45,
@@ -37,10 +37,10 @@
   },
   "validations": {
     "application_tests_passed": 266,
-    "application_tests_ignored": 19,
+    "application_tests_ignored": 21,
     "application_tests_filtered": 1,
     "filtered_test": "if_wgpu_present",
-    "kernel_arithmetic_tests_passed": 3,
+    "kernel_arithmetic_tests_passed": 4,
     "field_cases": 591,
     "scalar_point_cases": 260,
     "independent_gpu_candidates": 13920,
@@ -55,13 +55,22 @@
     "cpu_signature_differential_cases": 128,
     "full_m29_table_sha256_pass": true,
     "native_secp256k1_in_production_dependencies": false,
-    "restoration_logs_prefix": "artifacts/rust-engine/combined-restored-"
+    "sha256_differential_cases": 256,
+    "final_logs_prefix": "artifacts/rust-engine/final-",
+    "sm75_compile_pass": true,
+    "sm120_compile_pass": true,
+    "sm120_rebuild_matches_measured_ptx": true,
+    "rust_feature_release_build_pass": true,
+    "host_clippy_pass": true,
+    "kernel_crate_clippy_pass": true
   },
   "acceptance": {
-    "maximum_loss_percent": 2,
-    "performance_pass": false,
+    "maximum_loss_percent": 0,
+    "performance_pass": true,
     "promoted_to_master": false,
-    "upstream_rust_engine_pr": false
+    "upstream_rust_engine_pr": false,
+    "scope": "Observed complete GPU pipeline rates on this NVIDIA device; not all library APIs or hardware",
+    "repeatable_improvement_required_for_performance_pr": true
   },
   "limitations": [
     "Rust GPU kernels support NVIDIA only; HIP and WGSL kernels are unchanged",
@@ -390,6 +399,660 @@
           "telemetry_csv": "87, 132.02, 2700, 99"
         }
       ]
+    },
+    {
+      "stage": "scalar SHA compression",
+      "disposition": "superseded",
+      "host": "Retained Rust CPU implementation",
+      "ptx_sha256": "fd50d44f8e86f4663e00431c9d0dfe371ee107331bdc08190f1f4a832a6fc371",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 113.40202543000703,
+        "rust": 88.60930884885518
+      },
+      "rust_loss_percent": 21.86267528039364,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1387118592,
+          "million_candidates_per_second": 115.55221422265333,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.004258,
+          "telemetry_csv": "86, 133.00, 2377, 97"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1060405248,
+          "million_candidates_per_second": 88.35355424617673,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.0018403,
+          "telemetry_csv": "87, 132.24, 2542, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1079623680,
+          "million_candidates_per_second": 89.96484198425424,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.0005066,
+          "telemetry_csv": "87, 127.92, 2512, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1366769664,
+          "million_candidates_per_second": 113.86385464578129,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0035429,
+          "telemetry_csv": "86, 126.65, 2670, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1348681728,
+          "million_candidates_per_second": 112.34615860646959,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0046982,
+          "telemetry_csv": "86, 125.34, 2655, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1053622272,
+          "million_candidates_per_second": 87.77298380841775,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.0039473,
+          "telemetry_csv": "87, 122.64, 2467, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1060405248,
+          "million_candidates_per_second": 88.34617479119197,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0028428,
+          "telemetry_csv": "87, 120.71, 2452, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1342464000,
+          "million_candidates_per_second": 111.84575352983833,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.002816,
+          "telemetry_csv": "87, 123.29, 2640, 99"
+        }
+      ]
+    },
+    {
+      "stage": "fixed transaction blocks",
+      "disposition": "superseded",
+      "host": "Retained Rust CPU implementation",
+      "ptx_sha256": "aac5a43d19387b576a497b8ea107b35b44856cc043fdcd1b29c90f39f83f265a",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 114.52546880809732,
+        "rust": 99.44569688462671
+      },
+      "rust_loss_percent": 13.167177642152916,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1388249088,
+          "million_candidates_per_second": 115.65141304126426,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.0037365,
+          "telemetry_csv": "85, 132.70, 2722, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1187586048,
+          "million_candidates_per_second": 98.95736887963335,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.0009865,
+          "telemetry_csv": "86, 131.99, 2580, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1218109440,
+          "million_candidates_per_second": 101.48184929004952,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.0032247,
+          "telemetry_csv": "87, 133.65, 2595, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1383727104,
+          "million_candidates_per_second": 115.27874624634944,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.003315,
+          "telemetry_csv": "77, 18.01, 1725, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1357160448,
+          "million_candidates_per_second": 113.07214473016462,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0026064,
+          "telemetry_csv": "77, 102.27, 1920, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1185890304,
+          "million_candidates_per_second": 98.81835101196893,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.0007093,
+          "telemetry_csv": "86, 123.75, 2527, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1182498816,
+          "million_candidates_per_second": 98.52490415454399,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0020296,
+          "telemetry_csv": "86, 125.48, 2520, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1369595904,
+          "million_candidates_per_second": 114.099453416497,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0035273,
+          "telemetry_csv": "86, 126.82, 2670, 99"
+        }
+      ]
+    },
+    {
+      "stage": "register SHA state",
+      "disposition": "retained",
+      "host": "Retained Rust CPU implementation",
+      "ptx_sha256": "ca09f9322d3dac650f9e099ec3bf8befd25d0a6d23cf6336df98d76309907c1a",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 114.47704480119279,
+        "rust": 115.630129407062
+      },
+      "rust_loss_percent": -1.007262729284908,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1385988096,
+          "million_candidates_per_second": 115.45393382211972,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.0046849,
+          "telemetry_csv": "85, 132.43, 2625, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1380900864,
+          "million_candidates_per_second": 115.06221188011887,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.0013412,
+          "telemetry_csv": "86, 129.22, 2587, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1384857600,
+          "million_candidates_per_second": 115.3909934676316,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.0014358,
+          "telemetry_csv": "87, 130.34, 2595, 98"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1380335616,
+          "million_candidates_per_second": 115.02647265585546,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.000156,
+          "telemetry_csv": "87, 132.07, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1379205120,
+          "million_candidates_per_second": 114.905620571069,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0029387,
+          "telemetry_csv": "86, 129.37, 2692, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1405206528,
+          "million_candidates_per_second": 117.06490944156599,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.0036528,
+          "telemetry_csv": "87, 126.89, 2572, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1380335616,
+          "million_candidates_per_second": 115.00219888228544,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0026889,
+          "telemetry_csv": "86, 121.71, 2535, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1350377472,
+          "million_candidates_per_second": 112.52182600705757,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.001027,
+          "telemetry_csv": "79, 106.28, 1942, 91"
+        }
+      ]
+    },
+    {
+      "stage": "register field equality",
+      "disposition": "rejected",
+      "host": "Retained Rust CPU implementation",
+      "ptx_sha256": "794fc41f16ee0a5d8cfa09a5a6a1ff4c5a8cbe5e15ed37e948a270b895a69eb1",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 114.82000079803227,
+        "rust": 113.74284811913319
+      },
+      "rust_loss_percent": 0.9381228631009875,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1391075328,
+          "million_candidates_per_second": 115.88928299201095,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.0034855,
+          "telemetry_csv": "76, 91.58, 2722, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1309679616,
+          "million_candidates_per_second": 109.10354559969397,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.004006,
+          "telemetry_csv": "86, 128.78, 2610, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1400684544,
+          "million_candidates_per_second": 116.68767204009315,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.0037063,
+          "telemetry_csv": "86, 133.72, 2640, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1384292352,
+          "million_candidates_per_second": 115.32195484314524,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0037191,
+          "telemetry_csv": "86, 132.69, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1379770368,
+          "million_candidates_per_second": 114.9671254285113,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.001434,
+          "telemetry_csv": "86, 132.80, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1401249792,
+          "million_candidates_per_second": 116.75593642886828,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.0015293,
+          "telemetry_csv": "87, 128.84, 2610, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1349246976,
+          "million_candidates_per_second": 112.42464145020539,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0013456,
+          "telemetry_csv": "86, 119.14, 2580, 98"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1357725696,
+          "million_candidates_per_second": 113.10179445342037,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0044576,
+          "telemetry_csv": "86, 126.73, 2670, 99"
+        }
+      ]
+    },
+    {
+      "stage": "register SHA state repeat",
+      "disposition": "retained",
+      "host": "Retained Rust CPU implementation",
+      "ptx_sha256": "ca09f9322d3dac650f9e099ec3bf8befd25d0a6d23cf6336df98d76309907c1a",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 114.51293257871139,
+        "rust": 116.66718095514454
+      },
+      "rust_loss_percent": -1.8812271486911891,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1390510080,
+          "million_candidates_per_second": 115.8398292584112,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.0037304,
+          "telemetry_csv": "83, 131.30, 2722, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1403510784,
+          "million_candidates_per_second": 116.93319097836911,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.0026724,
+          "telemetry_csv": "85, 131.28, 2617, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1383161856,
+          "million_candidates_per_second": 115.23891138149936,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.0025592,
+          "telemetry_csv": "85, 129.74, 2595, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1366769664,
+          "million_candidates_per_second": 113.89273785852967,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0004988,
+          "telemetry_csv": "85, 132.92, 2715, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1363378176,
+          "million_candidates_per_second": 113.58234925032075,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0034335,
+          "telemetry_csv": "86, 131.27, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1395032064,
+          "million_candidates_per_second": 116.24290953298106,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.0010078,
+          "telemetry_csv": "86, 130.18, 2595, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1419337728,
+          "million_candidates_per_second": 118.25366450600006,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0024841,
+          "telemetry_csv": "86, 130.15, 2595, 98"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1376944128,
+          "million_candidates_per_second": 114.73667660022183,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0009065,
+          "telemetry_csv": "86, 132.62, 2707, 99"
+        }
+      ]
+    },
+    {
+      "stage": "register SHA state versus adapted upstream",
+      "disposition": "retained",
+      "host": "Retained Rust CPU implementation",
+      "ptx_sha256": "ca09f9322d3dac650f9e099ec3bf8befd25d0a6d23cf6336df98d76309907c1a",
+      "aggregate_million_candidates_per_second": {
+        "rust": 115.70825764539595,
+        "ultrafast": 112.33939720638085
+      },
+      "rust_loss_percent": -2.99882367432156,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1354899456,
+          "million_candidates_per_second": 112.90769241192251,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 0,
+          "seconds": 12.0000633,
+          "telemetry_csv": "86, 126.57, 2647, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1391075328,
+          "million_candidates_per_second": 115.89350994581152,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.0030477,
+          "telemetry_csv": "86, 123.24, 2542, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1397293056,
+          "million_candidates_per_second": 116.43306382135165,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.000827,
+          "telemetry_csv": "86, 123.74, 2542, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1352638464,
+          "million_candidates_per_second": 112.68842911106728,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 3,
+          "seconds": 12.0033483,
+          "telemetry_csv": "87, 129.50, 2655, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1348116480,
+          "million_candidates_per_second": 112.31115299181307,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 4,
+          "seconds": 12.003407,
+          "telemetry_csv": "86, 124.74, 2640, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1387118592,
+          "million_candidates_per_second": 115.57132101323405,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.0022734,
+          "telemetry_csv": "86, 121.23, 2527, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1379770368,
+          "million_candidates_per_second": 114.93537066470138,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0047498,
+          "telemetry_csv": "87, 123.01, 2542, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1337942016,
+          "million_candidates_per_second": 111.450577552676,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 7,
+          "seconds": 12.0048011,
+          "telemetry_csv": "86, 123.41, 2625, 99"
+        }
+      ]
     }
   ],
   "gpu_only_validations": {
@@ -410,5 +1073,25 @@
       "consensus"
     ]
   },
-  "performance_retested_after_cpu_restoration": false
+  "performance_retested_after_cpu_restoration": false,
+  "current_source_base_commit": "137c4da",
+  "profiling": {
+    "tool": "Nsight Systems 2026.3.2 CUDA tracing",
+    "batches_per_trace": 128,
+    "original_rust_filter_average_ms": 2.61,
+    "fixed_blocks_filter_average_ms": 1.562,
+    "register_state_filter_average_ms": 0.984,
+    "limitation": "Short diagnostic traces without matched warmup; not performance acceptance evidence",
+    "hardware_counters": "Nsight Compute denied ERR_NVGPUCTRPERM; driver permissions unchanged"
+  },
+  "retained_candidate_summary": {
+    "original_baseline_sessions": 2,
+    "trials_per_pipeline": 8,
+    "aggregate_million_candidates_per_second": {
+      "pickaxe": 114.49498864558639,
+      "rust": 116.14865304690215
+    },
+    "gain_over_original_percent": 1.4443115990295352,
+    "gain_over_adapted_upstream_percent": 2.99882367432156
+  }
 }

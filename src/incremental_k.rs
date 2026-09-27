@@ -333,6 +333,46 @@ fn incremental_k_rust_correctness() {
 }
 
 #[test]
+#[ignore = "exclusive synthetic-key workload for Nsight; PICKAXE_PROFILE_PIPELINE=pickaxe|ultrafast|rust"]
+#[allow(clippy::assertions_on_constants)]
+fn incremental_k_stage_profile() {
+    assert!(
+        !cfg!(feature = "rust-engine"),
+        "build with incremental-k only"
+    );
+    let pipeline = std::env::var("PICKAXE_PROFILE_PIPELINE").unwrap_or_else(|_| "rust".into());
+    let file = match pipeline.as_str() {
+        "pickaxe" => None,
+        "ultrafast" => Some("ultrafast_c1_fixed_d.ptx"),
+        "rust" => Some("photon_rust.ptx"),
+        _ => panic!("unsupported profiling pipeline"),
+    };
+    let count = search::CUDA_MAX_BATCH_CANDIDATES;
+    let mut engine = CudaPhotonEngine::new(0, count, 8).unwrap();
+    let mut incremental = Incremental::new(&engine, 32).unwrap();
+    incremental.c1_per_thread = 16;
+    if let Some(file) = file {
+        incremental
+            .use_candidate_kernels(&mut engine, file)
+            .unwrap();
+    }
+    let mut target = [0; 32];
+    target[28] = 1;
+    let key = [0x11; 32];
+    engine
+        .set_job(&template(10, &target, &key), &target, &key)
+        .unwrap();
+    incremental.set_message(&engine, &target, NONCE).unwrap();
+    for batch in 0..128 {
+        let result = incremental
+            .batch(&mut engine, batch * count, count)
+            .unwrap();
+        assert_eq!(result.candidates, count);
+        assert!(!result.truncated());
+    }
+}
+
+#[test]
 #[cfg(feature = "incremental-k")]
 #[ignore = "exclusive Rust GPU comparison; run its correctness gate first"]
 fn incremental_k_rust_comparison() {
@@ -342,6 +382,19 @@ fn incremental_k_rust_comparison() {
         16,
         "rust-pipeline-comparison.json",
         None,
+    );
+}
+
+#[test]
+#[cfg(feature = "incremental-k")]
+#[ignore = "exclusive Rust versus adapted upstream full-pipeline comparison"]
+fn incremental_k_rust_ultrafast_comparison() {
+    compare_candidate(
+        "photon_rust.ptx",
+        32,
+        16,
+        "rust-ultrafast-comparison.json",
+        Some("ultrafast_c1_fixed_d.ptx"),
     );
 }
 
@@ -643,7 +696,7 @@ fn compare_candidate(
     {
         let pipeline = if upstream && c1_file == "photon_rust.ptx" {
             "rust"
-        } else if upstream {
+        } else if upstream || reference == Some("ultrafast_c1_fixed_d.ptx") {
             "ultrafast"
         } else if reference.is_some() {
             "ultrafast_before"

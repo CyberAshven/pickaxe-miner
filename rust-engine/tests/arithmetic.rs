@@ -6,6 +6,31 @@ use pickaxe_rust_engine::{
 };
 use sha2::{Digest, Sha256};
 
+#[test]
+fn gpu_sha256_matches_rustcrypto() {
+    use pickaxe_rust_engine::sha256;
+    for index in 0..256u32 {
+        let r: [u8; 32] = Sha256::digest(index.to_le_bytes()).into();
+        let message: [u8; 32] = Sha256::digest(index.to_be_bytes()).into();
+        let mut public = [0; 33];
+        public[0] = 2;
+        public[1..].copy_from_slice(&r);
+        let expected: [u8; 32] = Sha256::digest([r.as_slice(), &public, &message].concat()).into();
+        assert_eq!(sha256::challenge(r, public, message), expected);
+        let mut state =
+            core::array::from_fn(|i| u32::from_be_bytes(r[i * 4..i * 4 + 4].try_into().unwrap()));
+        let mut block = [0; 64];
+        block[..32].copy_from_slice(&r);
+        block[32..].copy_from_slice(&message);
+        let mut expected = state;
+        sha2::compress256(&mut expected, &[block.into()]);
+        sha256::compress_bytes(&mut state, block);
+        assert_eq!(state, expected);
+        let expected: [u8; 32] = Sha256::digest(sha256::bytes(state)).into();
+        assert_eq!(sha256::hash_state(state), expected);
+    }
+}
+
 fn integer(words: [u32; 8]) -> BigUint {
     BigUint::new(words.to_vec())
 }

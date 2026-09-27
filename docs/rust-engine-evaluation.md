@@ -31,6 +31,11 @@ an upstream Rust-engine PR. Pickaxe's AGPL-3.0-only license continues to apply.
 - The standalone kernel crate also compiles for the CPU to run arithmetic
   oracle tests and provide the shared nonce routine. Production CPU signing
   uses `k256` arithmetic, not the GPU's variable-time field/point implementation.
+- GPU SHA-256 uses a scalar, unrolled compression routine, fixed transaction
+  block positions and fixed BCH challenge padding. Explicit feed-forward
+  assignments keep the eight SHA state words in registers: the earlier
+  iterator/zip form generated a local-memory loop after every compression.
+  RustCrypto remains the independent SHA oracle and supplies CPU hashing/HMAC.
 
 ## Reproduce
 
@@ -48,6 +53,8 @@ locally, but physical execution was validated only on the available RTX 5070 Ti
 Laptop GPU (`sm_120`). Kernel compilation uses nightly 1.96.0 / LLVM 22.1.2.
 CI adds separate Rust PTX compilation and arithmetic checks; remote CI has not
 been run for this unpushed branch.
+The final `sm_120` rebuild reproduces the measured PTX byte for byte; its SHA-256
+is recorded in `rust-engine-results.json`.
 
 Stop the single live TUI normally before any GPU test. Run tests serially and
 restore the original deployed TUI afterward. The following use synthetic keys
@@ -59,6 +66,7 @@ cargo test --release --all-features rust_generator_table_matches_authoritative_c
 cargo test --release --all-features incremental_k_rust_correctness -- --ignored --nocapture --test-threads=1
 node tools/reward-policy-vm/photon-layout.mjs artifacts/incremental-k/rust-vectors.json
 cargo test --release --features incremental-k incremental_k_rust_comparison -- --ignored --nocapture --test-threads=1
+cargo test --release --features incremental-k incremental_k_rust_ultrafast_comparison -- --ignored --nocapture --test-threads=1
 ```
 
 The A/B command deliberately omits `rust-engine`: its baseline must retain the
@@ -72,12 +80,14 @@ build which would silently compare Rust against itself.
 - 260 scalar/point cases against BigUint and native libsecp256k1, including zero,
   order boundaries, infinity, doubling and inverse points.
 - The authoritative PHOTON RFC6979 vector passes.
+- 256 SHA cases compare fixed 97-byte challenges, compression from arbitrary
+  states and second-hash padding against RustCrypto.
 - 128 CPU BCH Schnorr signatures match independent native points and BigUint
   scalars; verification rejects mutated signatures and noncanonical scalars.
 - The Rust-generated 64 MiB M29 table matches its authoritative SHA-256.
-- After restoring the CPU rewrite, 266 application tests passed, including real
+- On the final hashing candidate, 266 application tests passed, including real
   CUDA tests for the Rust regular pipeline and incremental search supervision.
-  Nineteen benchmarks and explicit oracle tests were ignored by
+  Twenty-one benchmarks and explicit oracle tests were ignored by
   default; the unrelated legacy WGPU hardware test was explicitly excluded.
   The suite also retains native-kernel reference tests: it is not evidence that
   HIP/WGPU were rewritten.
@@ -89,27 +99,57 @@ build which would silently compare Rust against itself.
 - Host formatting, host Clippy with warnings denied, and the Rust-engine crate's
   formatting/Clippy checks pass. The Rust-feature release binary builds.
 
-Explicit multiplication columns and a dedicated square implementation improved
-the initial prototype. Both combined CPU/GPU and GPU-only experiments fail the agreed
-maximum 2% performance loss:
+The Rust contribution must preserve performance against the applicable existing
+implementations. A repeatable improvement is required before presenting it as a
+performance upgrade. The earlier acceptance of approximately 2% loss concerned
+adopting the maintained native library, not submitting a slower Rust rewrite.
+
+Each row is a separate matched session. Loss is negative when Rust is faster.
 
 | Experiment | Original kernels | Rust kernels | Rust loss |
 | --- | ---: | ---: | ---: |
 | Initial prototype | 114.60 MH/s | 52.99 MH/s | 53.76% |
 | Unrolled multiplication/squaring | 113.85 MH/s | 86.08 MH/s | 24.39% |
 | GPU-only comparison, original CPU | 113.96 MH/s | 85.35 MH/s | 25.11% |
+| Scalar SHA compression | 113.40 MH/s | 88.61 MH/s | 21.86% |
+| Fixed transaction block positions | 114.53 MH/s | 99.45 MH/s | 13.17% |
+| Register SHA state | 114.48 MH/s | 115.63 MH/s | -1.01% |
+| Register field equality, rejected | 114.82 MH/s | 113.74 MH/s | 0.94% |
+| Register SHA state, repeat | 114.51 MH/s | 116.67 MH/s | -1.88% |
 
 Rates are total candidates divided by total measured time across each pipeline's
-four trials. The first two comparisons include the Rust CPU implementation now
-retained on the branch. The last is the diagnostic comparison with the original
-CPU code; the GPU kernels are identical to the second comparison.
+four trials. All comparisons include the retained Rust CPU implementation except
+the explicitly labeled GPU-only diagnostic; that diagnostic uses the same GPU
+kernels as the unrolled multiplication/squaring comparison.
 Raw matched trials are saved in `rust-engine-results.json`.
+Across the two retained-candidate comparisons (eight trials per pipeline), Rust
+averaged 116.15 MH/s against 114.49 MH/s for the original kernels, a 1.44% gain.
+Both matched sessions improved, by 1.01% and 1.88% respectively. These measurements
+establish recovery of the earlier regression on this GPU, not a general claim
+that one language is faster or that the optimization ceiling has been reached.
+The direct matched comparison against the adapted upstream fixed-key engine
+measured 115.71 MH/s for Rust versus 112.34 MH/s for upstream, a 3.00% gain.
+Every Rust trial exceeded every upstream trial in that session.
 These are complete pipeline measurements, not a
 primitive benchmark. Each comparison uses 45 seconds of warmup, eight ABBA/ABBA
 trials, one second settling and 12 seconds measured per trial, with 565,248
 candidates per batch, 32 candidates per point-walk lane and 16 per C1 thread.
 Power/clock/temperature values are snapshots after trials, not interval averages;
 some snapshots catch idle gaps. No performance ceiling is claimed.
+
+Nsight Systems CUDA traces located the hashing regression. The original Rust
+filter took about 2.61 ms per batch in its short profile; fixed block positions
+reduced that to 1.56 ms, and register SHA state reduced it to 0.98 ms. These
+128-batch traces are diagnostic, not controlled performance comparisons.
+The field-equality experiment removed device `memcmp` calls but failed the
+matched performance comparison, so it was reverted. Nsight Compute hardware
+counters were unavailable (`ERR_NVGPUCTRPERM`); no driver permissions were changed.
+
+The reproducible trace workload is the ignored `incremental_k_stage_profile`
+test built with `--features incremental-k`. Set `PICKAXE_PROFILE_PIPELINE` to
+`pickaxe`, `ultrafast` or `rust`, then run that test under `nsys profile
+--trace=cuda --sample=none --cpuctxsw=none --stats=true`. It uses synthetic keys
+and the same batch geometry, with no transaction broadcasts.
 
 ## Remaining adoption gates
 
@@ -120,8 +160,10 @@ currently establishes a Rust CPU/NVIDIA path. Upstream packaging and maintainer
 review remain necessary; retaining both components does not mean the upstream
 library's full API or every backend has been ported.
 
-Performance must meet the agreed acceptance criteria before promotion. These
-short tests also do not establish long-session stability or resolve the earlier
+The local NVIDIA pipeline performance gate now passes against both measured
+baselines. This does not benchmark every CPU library operation or establish
+cross-device performance. These short tests also do not establish long-session
+stability or resolve the earlier
 unexplained PC restart. The original deployed miner remains the live TUI, and
 master/releases have not changed. Preserve the existing engine under
 `reference/legacy-engine-by-cyberashven/` when an actual swap is approved; it has

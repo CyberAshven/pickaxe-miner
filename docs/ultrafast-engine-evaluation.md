@@ -14,6 +14,10 @@ Upstream release: `v4.6.0`, commit `540ac5b9c910f089c449177ebf000e4c130cab19`.
 
 ## Current direction: a fully Rust engine
 
+The Rust contribution must match or improve the applicable existing engine's
+performance. The earlier approximately 2% native-adoption allowance below does
+not apply to a slower Rust rewrite offered upstream as an improvement.
+
 The user now requires the engine implementation itself, including GPU kernels, in Rust. This supersedes adopting the native C++/CUDA candidate described below. Preserve the native evaluation as a reference; its performance measurements do not establish performance for a Rust rewrite. No native optimization PR was opened. Rust-binding PR #442 is ready for review and remains a separate, useful build fix.
 
 The small native follow-up tried the existing alternate point-addition formula and two equivalent inversion tails that remove one field multiplication. Both inversion tails pass the independent 530-value Rust oracle, 13,920-candidate PHOTON checks, and BCH VM validation; the first also passes all 51 upstream CUDA self-tests. Direct full-pipeline before/after results are -0.30% for the first tail and +0.24% for the second, with overlapping trial ranges. Neither establishes a reliable hashrate improvement. Raw results are retained in `docs/ultrafast-full-pipeline-results.json`.

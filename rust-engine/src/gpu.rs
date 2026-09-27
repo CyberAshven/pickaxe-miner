@@ -1,6 +1,6 @@
 //! The host owns buffer sizes and launches one-dimensional grids. Kernels retain
 //! the existing Pickaxe ABI so the established end-to-end oracle can test them.
-use crate::{field::Field, point::Point, scalar::Scalar};
+use crate::{field::Field, point::Point, scalar::Scalar, sha256};
 use core::arch::nvptx;
 use core::sync::atomic::{AtomicU32, Ordering};
 use sha2::{Digest, Sha256};
@@ -230,11 +230,7 @@ pub unsafe extern "ptx-kernel" fn pickaxe_photon_c1_schnorr_dual_batched(
         inverse = inverse.mul_mod(point.z);
         let r = point.x.mul_mod(z_inverse.square()).to_be_bytes();
         let message: [u8; 32] = read(messages.add(candidate * 32));
-        let mut challenge = Sha256::new();
-        challenge.update(r);
-        challenge.update(public);
-        challenge.update(message);
-        let e = Scalar::from_be_bytes(challenge.finalize().into());
+        let e = Scalar::from_be_bytes(sha256::challenge(r, public, message));
         let ed = e.montgomery_mul(d_montgomery);
         let k = Scalar::from_be_bytes(read(scalars.add(candidate * 32)));
         write(signatures.add(candidate * 64), &r);
@@ -249,15 +245,14 @@ pub unsafe extern "ptx-kernel" fn pickaxe_photon_c1_schnorr_dual_batched(
     }
 }
 
-unsafe fn tx_block<const SHIFT: usize, const INCREMENTAL: bool>(
+#[inline(always)]
+unsafe fn tx_block<const SHIFT: usize, const INCREMENTAL: bool, const BLOCK: usize>(
     template: *const u8,
     r: &[u8; 32],
     s: &[u8; 32],
-    block: usize,
     nonce: u32,
-) -> [u8; 64] {
-    core::array::from_fn(|j| {
-        let pos = block * 64 + j;
+) -> [u32; 16] {
+    let byte = |pos: usize| {
         let signature = 426 + SHIFT;
         let length = 615 + SHIFT;
         if !INCREMENTAL && (390 + SHIFT..394 + SHIFT).contains(&pos) {
@@ -275,9 +270,38 @@ unsafe fn tx_block<const SHIFT: usize, const INCREMENTAL: bool>(
         } else {
             0
         }
-    })
+    };
+    macro_rules! word {
+        ($i:literal) => {
+            u32::from_be_bytes([
+                byte(BLOCK * 64 + $i * 4),
+                byte(BLOCK * 64 + $i * 4 + 1),
+                byte(BLOCK * 64 + $i * 4 + 2),
+                byte(BLOCK * 64 + $i * 4 + 3),
+            ])
+        };
+    }
+    [
+        word!(0),
+        word!(1),
+        word!(2),
+        word!(3),
+        word!(4),
+        word!(5),
+        word!(6),
+        word!(7),
+        word!(8),
+        word!(9),
+        word!(10),
+        word!(11),
+        word!(12),
+        word!(13),
+        word!(14),
+        word!(15),
+    ]
 }
 
+#[inline(always)]
 unsafe fn finish_hash<const SHIFT: usize, const INCREMENTAL: bool>(
     mut state: [u32; 8],
     template: *const u8,
@@ -285,17 +309,18 @@ unsafe fn finish_hash<const SHIFT: usize, const INCREMENTAL: bool>(
     s: &[u8; 32],
     nonce: u32,
 ) -> [u8; 32] {
-    for block in 7..10 {
-        sha2::compress256(
-            &mut state,
-            &[tx_block::<SHIFT, INCREMENTAL>(template, r, s, block, nonce).into()],
-        );
+    macro_rules! block {
+        ($block:literal) => {
+            sha256::compress(
+                &mut state,
+                tx_block::<SHIFT, INCREMENTAL, $block>(template, r, s, nonce),
+            );
+        };
     }
-    let mut hash = [0; 32];
-    for (bytes, word) in hash.chunks_exact_mut(4).zip(state) {
-        bytes.copy_from_slice(&word.to_be_bytes());
-    }
-    Sha256::digest(hash).into()
+    block!(7);
+    block!(8);
+    block!(9);
+    sha256::hash_state(state)
 }
 
 fn meets(hash: &[u8; 32], target: &[u8; 32]) -> bool {
@@ -308,6 +333,7 @@ fn meets(hash: &[u8; 32], target: &[u8; 32]) -> bool {
     false
 }
 
+#[inline(always)]
 unsafe fn filter<const SHIFT: usize, const INCREMENTAL: bool>(
     template: *const u8,
     midstate: *const u32,
@@ -331,16 +357,9 @@ unsafe fn filter<const SHIFT: usize, const INCREMENTAL: bool>(
     let minus = read(negated_s.add(candidate * 32));
     let target = read(target);
     let mut state = read(midstate);
-    sha2::compress256(
+    sha256::compress(
         &mut state,
-        &[tx_block::<SHIFT, INCREMENTAL>(
-            template,
-            &r,
-            &plus,
-            6,
-            base.wrapping_add(candidate as u32),
-        )
-        .into()],
+        tx_block::<SHIFT, INCREMENTAL, 6>(template, &r, &plus, base.wrapping_add(candidate as u32)),
     );
     let hash_plus = finish_hash::<SHIFT, INCREMENTAL>(
         state,

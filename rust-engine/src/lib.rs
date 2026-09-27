@@ -9,6 +9,7 @@ mod gpu;
 pub mod nonce;
 pub mod point;
 pub mod scalar;
+pub mod sha256;
 
 #[cfg(target_os = "cuda")]
 #[panic_handler]
