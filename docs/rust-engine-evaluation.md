@@ -164,7 +164,7 @@ The local NVIDIA pipeline performance gate now passes against both measured
 baselines. This does not benchmark every CPU library operation or establish
 cross-device performance. These short tests also do not establish long-session
 stability or resolve the earlier
-unexplained PC restart. The original deployed miner remains the live TUI, and
-master/releases have not changed. Preserve the existing engine under
-`reference/legacy-engine-by-cyberashven/` when an actual swap is approved; it has
-not been moved during this experiment.
+unexplained PC restart. This document records the earlier independent-engine
+experiment. The subsequent default backend and adoption evidence are described
+in [the upstream-derived Rust evaluation](upstream-rust-port-evaluation.md).
+Historical source is preserved under `reference/legacy-engine-by-cyberashven/`.

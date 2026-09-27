@@ -103,8 +103,16 @@ check remains unavailable (advisory exit 77); optional Python coincurve/noble
 comparisons were unavailable. The original CTest invocation was not fully green,
 and no native source/test policy was altered to hide this limitation.
 
-Master, release assets and the deployed live binary remain unchanged. The
-original single TUI is restored after exclusive tests. The fork pin is
-experimental; upstream acceptance and an upstream revision pin are separate
-adoption steps. This work does not establish a CPU performance improvement or
-replace the existing constant-time Rust signer.
+The validated upstream-derived Rust CUDA backend is selected by default. The
+independent historical sources are preserved in
+`reference/legacy-engine-by-cyberashven/`. Upstream acceptance and moving the
+fork pin to an accepted upstream revision remain separate steps. This work
+does not establish a CPU performance improvement or replace the existing
+constant-time Rust signer.
+
+The promotion checks additionally passed 267 host/GPU tests, full mining
+candidate reconstruction, and GPU-to-host winner verification. The executable
+benchmark now uses the same search initialization as live mining; a 30-second
+smoke run measured 123.8874 MH/s. That single run is not a controlled A/B result.
+Live network submission and packaged executable checks are tracked on the
+[promotion PR](https://github.com/CyberAshven/pickaxe-miner/pull/2).
