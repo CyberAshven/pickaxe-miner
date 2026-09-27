@@ -324,5 +324,5 @@
       "consensus"
     ]
   },
-  "conclusion": "Both tested candidates pass the correctness gates but trail Pickaxe on this NVIDIA GPU. No swap or release promotion. Other devices and long-duration candidate stability remain unvalidated."
+  "conclusion": "Both tested candidates pass the correctness gates. The user accepts the fixed-key candidate's measured 2.1% loss on this NVIDIA GPU, conditional on upstream Rust-binding PR #442 merging. Revalidate the merged revision, complete production integration and live stability validation before adoption, then preserve the original engine under reference/legacy-engine-by-cyberashven/. Master and release remain unchanged pending those gates. Other devices remain unvalidated."
 }

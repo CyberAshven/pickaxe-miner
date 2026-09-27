@@ -7,15 +7,18 @@ Upstream release: `v4.6.0`, commit `540ac5b9c910f089c449177ebf000e4c130cab19`.
 
 - Evaluate a Rust-first integration of the maintained upstream engine. Rust owns the integration and PHOTON orchestration; upstream native GPU kernels remain native code. A full rewrite of upstream cryptography in Rust is outside this experiment.
 - Keep master and published releases unchanged until correctness, sustained full-pipeline performance, and applicable hardware validation support promotion.
+- The user accepts the measured approximately 2% performance loss for upstream adoption, conditional on upstream PR #442 merging. Performance parity is no longer an adoption requirement; the remaining integration and stability gates still apply.
 - Exactly one mining process/window. Stop the live miner normally before exclusive GPU tests, and restore it after testing. Synthetic test keys only; no test broadcasts or funded-key experiments.
 - Upstream contributions may include binding fixes and independently useful PHOTON optimizations, with reproducible evidence. Do not describe a primitive benchmark as a full mining comparison.
 - If a swap is confirmed, preserve the original engine in `reference/legacy-engine-by-cyberashven/`, including source, build instructions, tests, original licensing/attribution, and the exact baseline commit. Until then, keep the original engine active rather than moving it prematurely.
 
-## Decision: retain Pickaxe on the tested NVIDIA GPU
+## Decision: conditional upstream adoption; approximately 2% loss accepted
 
 The initial public-API probes do not settle whether an integrated engine can preserve Pickaxe's performance. The user requested the actual integration and complete-pipeline test before concluding. A candidate now compiles upstream CUDA point, field, and scalar arithmetic into Pickaxe's existing GPU-resident PHOTON pipeline; it retains incremental search, batched inversion, dual-signature filtering, and transaction midstates. Rust continues to own orchestration and independent winner checks. This is a native primitive integration, not a benchmark of host buffer transfers.
 
-Both integrated candidates pass the full PHOTON correctness oracle and covenant checks, but are 2.4% and 2.1% slower than their matched Pickaxe baselines. The short geometry screen did not identify a clear improvement. These measurements support keeping the current engine on this NVIDIA GPU; they do not establish that every possible upstream integration or other GPU would be slower. Master, release, and live TUI continue using the existing engine; experimental selection is confined to ignored tests. No legacy copy is created because no swap is adopted.
+Both integrated candidates pass the full PHOTON correctness oracle and covenant checks, and are 2.4% and 2.1% slower than their matched Pickaxe baselines. The user accepts this approximate 2% tradeoff for adopting the maintained upstream engine, conditional on upstream PR #442 merging. Proceed with the candidate retaining Pickaxe's fixed-key multiplication once that condition is met; its measured 2.1% loss is acceptable and is not a reason to reject the swap. These measurements apply to the tested NVIDIA GPU and do not establish performance on other hardware.
+
+PR #442 contains only the Rust-binding declaration fix, not the Pickaxe mining integration or its optimizations. Before production adoption, pin and revalidate the merged upstream revision, finish production build/runtime integration, and pass live stability validation in the single TUI. Preserve the current engine under `reference/legacy-engine-by-cyberashven/` when the swap is adopted. Master, release, and live TUI continue using the existing engine while the condition and remaining gates are outstanding; experimental selection is currently confined to ignored tests.
 
 ## Findings
 
@@ -23,7 +26,7 @@ Both integrated candidates pass the full PHOTON correctness oracle and covenant 
 - The GPU generator API takes host scalar buffers and returns compressed public keys to host memory. Pickaxe's current PHOTON pipeline keeps intermediate points/signatures on the GPU and returns bounded winners. This interface difference must be measured and addressed before claiming a performance-neutral swap.
 - Stock v4.6.0 Rust bindings fail `cargo check`: unexpected closing delimiter in `bindings/rust/ufsecp-sys/src/lib.rs:376`. A duplicated trailing block redeclares 58 functions already present in the first block. Removing only that duplicated block makes the Rust wrapper build and its tests pass.
 - The Windows MSVC CUDA+OpenCL build succeeds after three local compatibility fixes: removing the duplicated Rust declarations, splitting oversized embedded OpenCL string literals without changing their concatenated contents, and using the MSVC byte-swap intrinsic on MSVC while retaining the existing builtin elsewhere. The final patch also backports internal linkage for 46 embedded OpenCL helpers from upstream development commit `73372cec7dc23fee1bac40fae991e3d1ac28bd9d`. These changes are preserved in `tools/ultrafast-v4.6.0-compat.patch`.
-- The independently useful Rust declaration fix is submitted as [upstream draft PR #442](https://github.com/shrec/UltrafastSecp256k1/pull/442), commit `21a7899`. The OpenCL linkage fix was already present in upstream development and is credited as a backport. The remaining Windows fixes are local evaluation patches. No Pickaxe AGPL engine code is included in the upstream contribution.
+- The independently useful Rust declaration fix is submitted as [upstream PR #442](https://github.com/shrec/UltrafastSecp256k1/pull/442), commit `21a7899`. The OpenCL linkage fix was already present in upstream development and is credited as a backport. The remaining Windows fixes are local evaluation patches. No Pickaxe AGPL engine code is included in the upstream contribution.
 
 ## Measured results (2026-09-27)
 
