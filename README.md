@@ -17,16 +17,9 @@ Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain 
 - AMD: HIP `gfx1036`
 - No ARM, ARM64, or macOS build
 
-## Install a release archive
+## Install
 
-The prepared v0.0.1 archives are:
-
-- Linux: `pickaxe-miner-v0.0.1-linux-x86_64.tar.gz`
-- Windows: `pickaxe-miner-v0.0.1-windows-x86_64.zip`
-
-The [v0.0.1 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.1) publishes these archives and `SHA256SUMS.txt`. Release binaries enable the tested CUDA incremental search and tuned batch geometry. HIP retains its existing search path.
-
-Merging to `master` runs the Release workflow, which tags the merged commit `pickaxe-miner-v<Cargo.toml version>` and publishes these archives. A merge that does not bump the version publishes nothing, and a push that only changes Markdown files or `docs/` never starts a release. Pull requests affecting release packaging run it as a dry run. Manual dispatch rebuilds an existing tag.
+Download the archive for your operating system from the [v0.0.1 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.1). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
 
 Linux:
 
