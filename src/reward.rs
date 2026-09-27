@@ -4,12 +4,11 @@
 //! together, preserves the baton at output 0, and splits the exact winning
 //! reward 98/2 without any external funding input.
 
-use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS};
+use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, SHREC_DONATION_ADDRESS};
 use crate::crypto;
 use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
 use crate::tx;
 use ripemd::Ripemd160;
-#[cfg(test)]
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 
@@ -30,8 +29,11 @@ pub struct PreparedSelfFundedSettlement {
     pub baton_output_value_sats: u64,
     pub miner_output_value_sats: u64,
     pub donation_output_value_sats: u64,
+    pub shrec_output_value_sats: u64,
     pub miner_token_amount: u128,
     pub donation_token_amount: u128,
+    pub original_donation_token_amount: u128,
+    pub shrec_donation_token_amount: u128,
     pub required_relay_fee_sats: u64,
     pub fee_sats: u64,
 }
@@ -398,7 +400,9 @@ pub fn p2pkh_cashaddr_from_public_key(public_key: &[u8; 33]) -> Result<String, S
 
 /// Creates an ephemeral identity for the self-funded settlement.
 pub fn new_intermediate_identity() -> Result<([u8; 32], [u8; 33], String), String> {
-    let (secret_bytes, public_key) = crate::crypto::random_keypair();
+    let secret = SecretKey::new(&mut rand::rng());
+    let secret_bytes = secret.to_secret_bytes();
+    let public_key = PublicKey::from_secret_key(&secret).serialize();
     let address = p2pkh_cashaddr_from_public_key(&public_key)?;
     Ok((secret_bytes, public_key, address))
 }
@@ -426,8 +430,10 @@ fn build_self_funded_outputs(
     reward_value_sats: u64,
     miner_lock: &[u8],
     donation_lock: &[u8],
+    shrec_lock: &[u8],
     miner_token_amount: u128,
-    donation_token_amount: u128,
+    original_donation_token_amount: u128,
+    shrec_donation_token_amount: u128,
 ) -> Result<Vec<u8>, String> {
     let mut outputs = Vec::new();
     outputs.extend_from_slice(&encode_raw_output(
@@ -441,8 +447,13 @@ fn build_self_funded_outputs(
     )?);
     outputs.extend_from_slice(&encode_output(
         reward_value_sats,
-        Some(donation_token_amount),
+        Some(original_donation_token_amount),
         donation_lock,
+    )?);
+    outputs.extend_from_slice(&encode_output(
+        reward_value_sats,
+        Some(shrec_donation_token_amount),
+        shrec_lock,
     )?);
     Ok(outputs)
 }
@@ -458,8 +469,10 @@ fn self_funded_serialized_len(
     reward_public_key: &[u8; 33],
     miner_lock: &[u8],
     donation_lock: &[u8],
+    shrec_lock: &[u8],
     miner_token_amount: u128,
-    donation_token_amount: u128,
+    original_donation_token_amount: u128,
+    shrec_donation_token_amount: u128,
 ) -> Result<usize, String> {
     let redeem_script = crate::protocol::photon_authoritative_redeem_script()?;
     let baton_unlocking = push_data(&redeem_script)?;
@@ -476,8 +489,10 @@ fn self_funded_serialized_len(
         reward_value_sats,
         miner_lock,
         donation_lock,
+        shrec_lock,
         miner_token_amount,
-        donation_token_amount,
+        original_donation_token_amount,
+        shrec_donation_token_amount,
     )?;
 
     let mut raw = Vec::new();
@@ -485,7 +500,7 @@ fn self_funded_serialized_len(
     raw.push(2);
     raw.extend_from_slice(&encode_input(parent_txid, 0, &baton_unlocking)?);
     raw.extend_from_slice(&encode_input(parent_txid, 1, &reward_unlocking)?);
-    raw.push(3);
+    raw.push(4);
     raw.extend_from_slice(&outputs);
     raw.extend_from_slice(&0u32.to_le_bytes());
     Ok(raw.len())
@@ -504,8 +519,10 @@ fn build_self_funded_raw(
     reward_public_key: &[u8; 33],
     miner_lock: &[u8],
     donation_lock: &[u8],
+    shrec_lock: &[u8],
     miner_token_amount: u128,
-    donation_token_amount: u128,
+    original_donation_token_amount: u128,
+    shrec_donation_token_amount: u128,
 ) -> Result<Vec<u8>, String> {
     let redeem_script = crate::protocol::photon_authoritative_redeem_script()?;
     let reward_lock = p2pkh_locking_from_public_key(reward_public_key);
@@ -515,8 +532,10 @@ fn build_self_funded_raw(
         reward_value_sats,
         miner_lock,
         donation_lock,
+        shrec_lock,
         miner_token_amount,
-        donation_token_amount,
+        original_donation_token_amount,
+        shrec_donation_token_amount,
     )?;
 
     let sighash = self_funded_p2pkh_sighash(
@@ -541,7 +560,7 @@ fn build_self_funded_raw(
     raw.push(2);
     raw.extend_from_slice(&encode_input(parent_txid, 0, &baton_unlocking)?);
     raw.extend_from_slice(&encode_input(parent_txid, 1, &reward_unlocking)?);
-    raw.push(3);
+    raw.push(4);
     raw.extend_from_slice(&outputs);
     raw.extend_from_slice(&0u32.to_le_bytes());
     Ok(raw)
@@ -576,7 +595,10 @@ pub fn build_self_funded_settlement_with_relay_fee(
     reward_token_amount: u128,
     relay_fee_sats_per_kb: u64,
 ) -> Result<PreparedSelfFundedSettlement, String> {
-    let derived_public = crate::crypto::compressed_pubkey(reward_secret)?;
+    let derived_public = PublicKey::from_secret_key(
+        &SecretKey::from_secret_bytes(*reward_secret).map_err(|error| error.to_string())?,
+    )
+    .serialize();
     if &derived_public != reward_public_key {
         return Err("reward public key does not match the runtime reward secret".into());
     }
@@ -598,6 +620,7 @@ pub fn build_self_funded_settlement_with_relay_fee(
 
     let miner_lock = tx::cashaddr_to_p2pkh_locking(miner_payout)?;
     let donation_lock = tx::cashaddr_to_p2pkh_locking(DONATION_ADDRESS)?;
+    let shrec_lock = tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS)?;
     let (miner_token_amount, donation_token_amount) =
         RuntimeConfig::split_reward(reward_token_amount);
     if donation_token_amount
@@ -608,6 +631,12 @@ pub fn build_self_funded_settlement_with_relay_fee(
             != reward_token_amount
     {
         return Err("reward split failed exact 98/2 conservation".into());
+    }
+
+    let (original_donation_token_amount, shrec_donation_token_amount) =
+        RuntimeConfig::split_donation(donation_token_amount);
+    if original_donation_token_amount == 0 || shrec_donation_token_amount == 0 {
+        return Err("reward donation is too small to split into two token outputs".into());
     }
 
     let parent_txid = transaction_id(parent_raw);
@@ -624,13 +653,16 @@ pub fn build_self_funded_settlement_with_relay_fee(
         reward_public_key,
         &miner_lock,
         &donation_lock,
+        &shrec_lock,
         miner_token_amount,
-        donation_token_amount,
+        original_donation_token_amount,
+        shrec_donation_token_amount,
     )?;
     let required_relay_fee_sats = required_relay_fee_sats(serialized_len, relay_fee_sats_per_kb)?;
     let baton_decrease = reward
         .value_sats
-        .checked_add(required_relay_fee_sats)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(required_relay_fee_sats))
         .ok_or("baton decrease overflow")?;
     if baton_decrease > multi_input_max_baton_decrease_sats {
         return Err(format!(
@@ -651,8 +683,10 @@ pub fn build_self_funded_settlement_with_relay_fee(
         reward_public_key,
         &miner_lock,
         &donation_lock,
+        &shrec_lock,
         miner_token_amount,
-        donation_token_amount,
+        original_donation_token_amount,
+        shrec_donation_token_amount,
     )?;
     if raw_settlement.len() != serialized_len {
         return Err("settlement relay-fee sizing changed after finalization".into());
@@ -663,6 +697,7 @@ pub fn build_self_funded_settlement_with_relay_fee(
         .ok_or("settlement input value overflow")?;
     let output_value = baton_output_value_sats
         .checked_add(reward.value_sats)
+        .and_then(|value| value.checked_add(reward.value_sats))
         .and_then(|value| value.checked_add(reward.value_sats))
         .ok_or("settlement output value overflow")?;
     let fee_sats = input_value
@@ -681,8 +716,11 @@ pub fn build_self_funded_settlement_with_relay_fee(
         baton_output_value_sats,
         miner_output_value_sats: reward.value_sats,
         donation_output_value_sats: reward.value_sats,
+        shrec_output_value_sats: reward.value_sats,
         miner_token_amount,
         donation_token_amount,
+        original_donation_token_amount,
+        shrec_donation_token_amount,
         required_relay_fee_sats,
         fee_sats,
     })
@@ -773,16 +811,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(settlement.raw_settlement.len(), 794);
-        assert_eq!(settlement.required_relay_fee_sats, 794);
-        assert_eq!(settlement.fee_sats, 794);
+        assert_eq!(settlement.raw_settlement.len(), 867);
+        assert_eq!(settlement.required_relay_fee_sats, 867);
+        assert_eq!(settlement.fee_sats, 867);
         assert_eq!(settlement.baton_input_value_sats, 15_970_000);
-        assert_eq!(settlement.baton_output_value_sats, 15_968_506);
+        assert_eq!(settlement.baton_output_value_sats, 15_967_733);
         assert_eq!(settlement.miner_token_amount, 4_899_778_337);
         assert_eq!(settlement.donation_token_amount, 99_995_476);
+        assert_eq!(settlement.original_donation_token_amount, 49_997_738);
+        assert_eq!(settlement.shrec_donation_token_amount, 49_997_738);
         assert_eq!(
             hex::encode(hash256(&settlement.raw_settlement)),
-            "dab595f2cf51f796a722f4fd75c2d31c1607ed42ed4bd1983d7344f050fee3bc"
+            "271815f7527c379a72f71ba216272750f48ff2fb0c7333dc537b2b8d3114b0c3"
         );
         assert_eq!(
             settlement.miner_token_amount + settlement.donation_token_amount,
@@ -790,7 +830,7 @@ mod tests {
         );
         assert_eq!(
             settlement.baton_input_value_sats - settlement.baton_output_value_sats,
-            TOKEN_OUTPUT_SATS + settlement.fee_sats
+            2 * TOKEN_OUTPUT_SATS + settlement.fee_sats
         );
         assert!(
             settlement.baton_input_value_sats - settlement.baton_output_value_sats
@@ -809,7 +849,46 @@ mod tests {
             let script_len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
             cursor += script_len + 4;
         }
-        assert_eq!(raw[cursor], 3);
+        assert_eq!(raw[cursor], 4);
+        cursor += 1;
+        let expected = [
+            (settlement.baton_output_value_sats, None),
+            (
+                TOKEN_OUTPUT_SATS,
+                Some((
+                    settlement.miner_token_amount,
+                    tx::cashaddr_to_p2pkh_locking(&miner_payout).unwrap(),
+                )),
+            ),
+            (
+                TOKEN_OUTPUT_SATS,
+                Some((
+                    settlement.original_donation_token_amount,
+                    tx::cashaddr_to_p2pkh_locking(DONATION_ADDRESS).unwrap(),
+                )),
+            ),
+            (
+                TOKEN_OUTPUT_SATS,
+                Some((
+                    settlement.shrec_donation_token_amount,
+                    tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS).unwrap(),
+                )),
+            ),
+        ];
+        for (value, token) in expected {
+            let output_value = u64::from_le_bytes(raw[cursor..cursor + 8].try_into().unwrap());
+            assert_eq!(output_value, value);
+            cursor += 8;
+            let size = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            let bytecode = &raw[cursor..cursor + size];
+            if let Some((amount, lock)) = token {
+                let mut expected_bytecode = token_prefix(amount).unwrap();
+                expected_bytecode.extend_from_slice(&lock);
+                assert_eq!(bytecode, expected_bytecode);
+            }
+            cursor += size;
+        }
+        assert_eq!(cursor + 4, raw.len());
     }
 
     #[test]
@@ -833,13 +912,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(settlement.raw_settlement.len(), 794);
-        assert_eq!(settlement.required_relay_fee_sats, 1_588);
-        assert_eq!(settlement.fee_sats, 1_588);
-        assert_eq!(settlement.baton_output_value_sats, 15_967_712);
+        assert_eq!(settlement.raw_settlement.len(), 867);
+        assert_eq!(settlement.required_relay_fee_sats, 1_734);
+        assert_eq!(settlement.fee_sats, 1_734);
+        assert_eq!(settlement.baton_output_value_sats, 15_966_866);
         assert_eq!(
             settlement.baton_input_value_sats - settlement.baton_output_value_sats,
-            TOKEN_OUTPUT_SATS + settlement.fee_sats
+            2 * TOKEN_OUTPUT_SATS + settlement.fee_sats
         );
     }
 

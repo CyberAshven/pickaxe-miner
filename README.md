@@ -10,6 +10,8 @@ Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken bat
 
 Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
 
+Each mined PHOTON reward gives 98% of its tokens to the miner. The existing 2% donation is split equally: 1% to the original project address (`bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3`) and 1% to shrec (`bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3`).
+
 ## Supported platforms
 
 - Operating systems: Windows x86_64 and Linux x86_64
@@ -19,21 +21,21 @@ Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain 
 
 ## Install
 
-Download the archive for your operating system from the [v0.0.1 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.1). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
+Download the archive for your operating system from the [v0.0.2 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.2). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
 
 Linux:
 
 ```bash
-tar -xzf pickaxe-miner-v0.0.1-linux-x86_64.tar.gz
-cd pickaxe-miner-v0.0.1-linux-x86_64
+tar -xzf pickaxe-miner-v0.0.2-linux-x86_64.tar.gz
+cd pickaxe-miner-v0.0.2-linux-x86_64
 ./pickaxe mine
 ```
 
 Windows PowerShell:
 
 ```powershell
-Expand-Archive pickaxe-miner-v0.0.1-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.1-windows-x86_64
-cd pickaxe-miner-v0.0.1-windows-x86_64
+Expand-Archive pickaxe-miner-v0.0.2-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.2-windows-x86_64
+cd pickaxe-miner-v0.0.2-windows-x86_64
 .\pickaxe.exe mine
 ```
 
@@ -85,31 +87,23 @@ Log files are appended to without automatic rotation or a size limit. After an i
 ## Build
 
 ```bash
-rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
-pwsh -File tools/build-rust-kernels.ps1 -Architecture sm_120
-cargo build --release --locked
+cargo build --release --locked --features tail-grind
 ```
 
-The cargo binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.1`.
+The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.2`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
 
-The default CUDA backend uses the pinned Rust arithmetic port of UltrafastSecp256k1. Building its kernels requires PowerShell 7 (`pwsh`), including on Linux. Keep `cuda/build`, including `photon_rust.ptx`, beside the executable when distributing it. HIP retains its existing backend.
-
-The example targets SM 12.0, as do the release archives; use your GPU's SM architecture when building for other NVIDIA devices. The pinned engine and compiler make comparisons repeatable, but MH/s also depends on the GPU, driver, clocks, power limits and cooling. Physical validation currently covers SM 12.0; SM 7.5 has compilation coverage.
-
-For the legacy native CUDA backend, build with `--no-default-features --features incremental-k`. Historical source is preserved in [legacy-engine-by-cyberashven](reference/legacy-engine-by-cyberashven/README.md).
-
-Contract identity is maintained in one [protocol profile](docs/protocol-profile.md); changing it requires rebuilding and end-to-end validation.
+The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing backend. Other NVIDIA architectures require compatible CUDA files and separate validation.
 
 Interactive TUI:
 
 ```bash
-cargo run --release -- mine
+cargo run --release --features tail-grind -- mine
 ```
 
 Headless:
 
 ```bash
-cargo run --release -- mine --no-tui
+cargo run --release --features tail-grind -- mine --no-tui
 ```
 
 List GPUs:

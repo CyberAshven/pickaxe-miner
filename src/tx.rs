@@ -314,6 +314,50 @@ pub fn require_covenant_hash_preimage(
     Ok(())
 }
 
+/// Moves `j` tokens from the reward back to the baton while preserving the
+/// covenant's fixed nine-byte CompactSize amount serialization.
+pub fn t2_reward_amount(
+    contract_token_amount: u128,
+    reward_amount: u128,
+    j: u16,
+) -> Result<u128, String> {
+    let moved = reward_amount
+        .checked_sub(u128::from(j))
+        .ok_or("T2 adjustment exceeds the reward")?;
+    require_covenant_hash_preimage(contract_token_amount, moved)?;
+    Ok(moved)
+}
+
+/// Reads the reward in a PHOTON parent, checking T2's bounded, conserved
+/// amount change before the caller reconstructs the full signed transaction.
+pub fn t2_parent_reward_amount(
+    parent: &[u8],
+    contract_token_amount: u128,
+    base_reward: u128,
+) -> Result<u128, String> {
+    let shift = PhotonLayout::for_tx_len(parent.len())?.shift();
+    if parent[490 + shift] != 0xff || parent[577 + shift] != 0xff {
+        return Err("T2 parent token amount markers are not 8-byte CompactSize".into());
+    }
+    let baton = u128::from(u64::from_le_bytes(
+        parent[491 + shift..499 + shift].try_into().unwrap(),
+    ));
+    let reward = u128::from(u64::from_le_bytes(
+        parent[578 + shift..586 + shift].try_into().unwrap(),
+    ));
+    if baton.checked_add(reward) != Some(contract_token_amount) {
+        return Err("T2 parent does not conserve the job token supply".into());
+    }
+    let j = base_reward
+        .checked_sub(reward)
+        .ok_or("T2 parent reward exceeds the job reward")?;
+    let j = u16::try_from(j).map_err(|_| "T2 parent reward adjustment exceeds 65535")?;
+    if t2_reward_amount(contract_token_amount, base_reward, j)? != reward {
+        return Err("T2 parent reward adjustment is invalid".into());
+    }
+    Ok(reward)
+}
+
 /// Inputs for the reference single-payout PHOTON template (2 outputs).
 pub struct TemplateParams {
     pub prev_tx_hash_hex: String,
@@ -423,6 +467,43 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
     Ok(tx)
 }
 
+/// Changes the unsigned BCH value of the miner's P2PKH output.
+/// The range respects the 675-satoshi token dust floor and the default
+/// 1 sat/byte relay fee for this fixed two-output PHOTON layout.
+pub fn set_payout_value_sats(tx: &mut [u8], sats: u16) -> Result<(), String> {
+    let layout = PhotonLayout::for_tx_len(tx.len())?;
+    let max_sats = 1_500usize
+        .checked_sub(tx.len())
+        .ok_or("PHOTON transaction exceeds its 1500-satoshi output budget")?;
+    if sats < 675 || usize::from(sats) > max_sats {
+        return Err(format!(
+            "payout BCH value {sats} is outside 675..={max_sats}"
+        ));
+    }
+    let offset = 534 + layout.shift();
+    if tx[offset..offset + 8] != 700u64.to_le_bytes() {
+        return Err("PHOTON payout BCH value is not the expected 700 satoshis".into());
+    }
+    tx[offset..offset + 8].copy_from_slice(&u64::from(sats).to_le_bytes());
+    Ok(())
+}
+
+/// Reads and bounds the unsigned BCH payout value in a PHOTON parent.
+pub fn payout_value_sats(tx: &[u8]) -> Result<u16, String> {
+    let layout = PhotonLayout::for_tx_len(tx.len())?;
+    let offset = 534 + layout.shift();
+    let sats = u64::from_le_bytes(tx[offset..offset + 8].try_into().unwrap());
+    let max_sats = 1_500usize
+        .checked_sub(tx.len())
+        .ok_or("PHOTON transaction exceeds its 1500-satoshi output budget")?;
+    if sats < 675 || sats > max_sats as u64 {
+        return Err(format!(
+            "PHOTON payout BCH value {sats} is outside relay bounds"
+        ));
+    }
+    u16::try_from(sats).map_err(|_| "PHOTON payout BCH value exceeds u16".into())
+}
+
 /// Historical 3-output 98/2 experiment, now fail-closed because the covenant
 /// reference only proves a two-output mining transaction.
 #[cfg(test)]
@@ -446,7 +527,8 @@ pub fn win_tx_preview_lines(
     let miner_lock = cashaddr_to_p2pkh_locking(miner_payout)?;
     let (miner_tokens, donation_tokens) =
         crate::config::RuntimeConfig::split_reward(job_reward_raw);
-    let donation_percent = crate::config::DONATION_BPS / 100;
+    let (original_tokens, shrec_tokens) =
+        crate::config::RuntimeConfig::split_donation(donation_tokens);
     Ok(vec![
         "win-tx preview (unsigned two-output parent; no mining or broadcast):".into(),
         format!(
@@ -455,8 +537,12 @@ pub fn win_tx_preview_lines(
         ),
         "  this template has no donation output".into(),
         format!(
-            "  mine settlement pays FT={miner_tokens} -> {miner_payout} and FT={donation_tokens} ({donation_percent}%) -> {}",
+            "  mine settlement pays FT={miner_tokens} -> {miner_payout}; FT={original_tokens} (~1%) -> {}",
             crate::config::DONATION_ADDRESS
+        ),
+        format!(
+            "  mine settlement pays FT={shrec_tokens} (~1%) -> {}",
+            crate::config::SHREC_DONATION_ADDRESS
         ),
     ])
 }
@@ -513,6 +599,25 @@ pub fn apply_reference_signature(
     nonce: u32,
     signature_hex: &str,
 ) -> Result<Vec<u8>, String> {
+    apply_reference_signature_with_payout_sats(
+        job,
+        miner_payout,
+        public_key_hex,
+        nonce,
+        signature_hex,
+        None,
+    )
+}
+
+/// Rebuilds a V-coordinate winner with its exact unsigned BCH payout value.
+pub fn apply_reference_signature_with_payout_sats(
+    job: &ReferenceJobContext,
+    miner_payout: &str,
+    public_key_hex: &str,
+    nonce: u32,
+    signature_hex: &str,
+    payout_sats: Option<u16>,
+) -> Result<Vec<u8>, String> {
     let sig = parse_hex(signature_hex)?;
     if sig.len() != 64 {
         return Err("signature must be 64 bytes".into());
@@ -540,7 +645,10 @@ pub fn apply_reference_signature(
         reward_amount: job.reward_raw,
         payout_locking: payout,
     };
-    let tx = build_photon_template_bytes(&p)?;
+    let mut tx = build_photon_template_bytes(&p)?;
+    if let Some(sats) = payout_sats {
+        set_payout_value_sats(&mut tx, sats)?;
+    }
     let target = crate::search::parse_hex32(&job.target_le_hex)?;
     let digest = crate::search::hash256(&tx);
     if !crate::search::meets_target_le(&digest, &target) {
@@ -581,6 +689,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn t2_reward_preserves_token_supply_and_fixed_width_encoding() {
+        let total = 2_099_905_002_035_715u128;
+        let reward = 4_999_773_813u128;
+        for j in [0, 1, 255, 65_535] {
+            let moved = t2_reward_amount(total, reward, j).unwrap();
+            assert_eq!(moved, reward - u128::from(j));
+            assert_eq!(moved + (total - moved), total);
+            assert_eq!(compact_token_amount(moved).unwrap().len(), 9);
+            assert_eq!(compact_token_amount(total - moved).unwrap().len(), 9);
+        }
+        assert!(t2_reward_amount(total, u128::from(u32::MAX) + 1, 1).is_err());
+        assert!(t2_reward_amount(u128::from(u32::MAX) + 1, 1, 0).is_err());
+    }
+
+    #[test]
+    fn t2_parent_reward_reads_only_bounded_supply_preserving_amounts() {
+        let total = 2_099_905_002_035_715u128;
+        let reward = 4_999_773_813u128;
+        let payout =
+            cashaddr_to_p2pkh_locking("zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3").unwrap();
+        for age in [10, 17, 128, 32_768] {
+            let mut raw = build_photon_template_bytes(&TemplateParams {
+                prev_tx_hash_hex: "aa".repeat(32),
+                prev_index: 0,
+                age,
+                public_key_hex:
+                    "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into(),
+                target_hex: "ff".repeat(32),
+                signature_hex: "00".repeat(64),
+                nonce: 0,
+                contract_value_sats: 15_971_500,
+                contract_token_amount: total,
+                reward_amount: reward - 65_535,
+                payout_locking: payout.clone(),
+            })
+            .unwrap();
+            assert_eq!(
+                t2_parent_reward_amount(&raw, total, reward).unwrap(),
+                reward - 65_535
+            );
+            let shift = PhotonLayout::for_age(age).unwrap().shift();
+            raw[578 + shift] ^= 1;
+            assert!(t2_parent_reward_amount(&raw, total, reward).is_err());
+        }
+    }
+
+    #[test]
     fn decode_known_vector() {
         let lock =
             cashaddr_to_p2pkh_locking("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh")
@@ -600,7 +755,7 @@ mod tests {
 
     #[test]
     fn serializer_matches_reference_vector() {
-        let expected = crate::protocol::MINING_VECTOR_HEX.trim();
+        let expected = include_str!("../reference/photon_vector_tx.hex").trim();
         let payout = hex::decode("76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac").unwrap();
         let p = TemplateParams {
             prev_tx_hash_hex: "000000124712ae4765fe9789372faebca19c99cc1d59f43df2508bf5c42ea042"
@@ -726,13 +881,39 @@ mod tests {
         assert_ne!(miner_tokens, reward);
         assert!(text.contains(&format!("FT={reward}")));
         assert!(text.contains(&format!("FT={miner_tokens} -> {payout}")));
+        let (original, shrec) = crate::config::RuntimeConfig::split_donation(donation_tokens);
         assert!(text.contains(&format!(
-            "FT={donation_tokens} ({}%) -> {}",
-            crate::config::DONATION_BPS / 100,
+            "FT={original} (~1%) -> {}",
             crate::config::DONATION_ADDRESS
+        )));
+        assert!(text.contains(&format!(
+            "FT={shrec} (~1%) -> {}",
+            crate::config::SHREC_DONATION_ADDRESS
         )));
         assert!(text.contains("this template has no donation output"));
         assert!(!text.contains("10000 bps"));
         print_win_tx_preview(reward, payout, None).expect("preview prints the same report");
+    }
+    #[test]
+    fn payout_value_coordinate_changes_only_output_satoshis() {
+        let original =
+            hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
+        let mut candidate = original.clone();
+        set_payout_value_sats(&mut candidate, 684).unwrap();
+        assert_eq!(payout_value_sats(&candidate).unwrap(), 684);
+        assert_eq!(&candidate[534..542], &684u64.to_le_bytes());
+        assert_eq!(&candidate[586..611], &original[586..611]);
+        assert_eq!(&candidate[491..499], &original[491..499]);
+        assert_eq!(&candidate[578..586], &original[578..586]);
+        assert_eq!(
+            candidate
+                .iter()
+                .zip(&original)
+                .filter(|(a, b)| a != b)
+                .count(),
+            1
+        );
+        assert!(set_payout_value_sats(&mut candidate, 674).is_err());
+        assert!(set_payout_value_sats(&mut candidate, 886).is_err());
     }
 }

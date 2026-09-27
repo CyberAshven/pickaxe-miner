@@ -159,15 +159,6 @@ __device__ __forceinline__ Scalar256 scalar_sub_raw(const Scalar256* a, const Sc
 }
 
 __device__ __forceinline__ Scalar256 scalar_add_mod_n(const Scalar256* a, const Scalar256* b) {
-#ifdef PICKAXE_ULTRAFAST_EXPERIMENT
-    const auto x = uf_read<uf::Scalar>(a->d);
-    const auto y = uf_read<uf::Scalar>(b->d);
-    uf::Scalar value;
-    uf::scalar_add(&x, &y, &value);
-    Scalar256 out;
-    uf_write(out.d, value);
-    return out;
-#else
     Scalar256 sum;
     uint64_t carry = 0u;
     for (int i = 0; i < 8; ++i) {
@@ -186,7 +177,6 @@ __device__ __forceinline__ Scalar256 scalar_add_mod_n(const Scalar256* a, const 
         }
     }
     return sum;
-#endif
 }
 
 __device__ __forceinline__ Scalar256 scalar_from_be(const uint8_t bytes[32]) {
@@ -229,18 +219,7 @@ __device__ __forceinline__ Scalar256 fixed_d_value(
     return value;
 }
 
-#if defined(PICKAXE_ULTRAFAST_EXPERIMENT) && !defined(PICKAXE_KEEP_FIXED_D)
-__device__ Scalar256 scalar_mul_fixed_d(const Scalar256* e, const uint32_t* table) {
-    const Scalar256 d = fixed_d_value(table, 0u, 1u);
-    const auto x = uf_read<uf::Scalar>(e->d);
-    const auto y = uf_read<uf::Scalar>(d.d);
-    uf::Scalar value;
-    uf::scalar_mul_mod_n(&x, &y, &value);
-    Scalar256 out;
-    uf_write(out.d, value);
-    return out;
-}
-#elif defined(__CUDA_ARCH__) && !defined(__HIPCC__)
+#if defined(__CUDA_ARCH__) && !defined(__HIPCC__)
 // R=2^256. The existing table gives d*2^255 mod n at byte 31, digit 128.
 // Doubling it supplies d*R mod n without changing the kernel ABI or job data.
 __device__ Scalar256 scalar_mul_fixed_d(const Scalar256* e, const uint32_t* table) {
@@ -463,11 +442,6 @@ extern "C" __global__ void pickaxe_photon_c1_schnorr_dual_batched(
 }
 
 #ifdef PICKAXE_C1_SCALAR_CHECK
-extern "C" __global__ void pickaxe_field_inverse_check(const Fe* inputs, Fe* outputs, uint32_t count) {
-    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < count) feinv(&outputs[index], &inputs[index]);
-}
-
 extern "C" __global__ void pickaxe_scalar_montgomery_check(const uint32_t* es, const uint32_t* table, uint32_t* out, uint32_t count) {
     const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= count) return;

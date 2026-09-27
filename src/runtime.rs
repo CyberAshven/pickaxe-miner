@@ -347,8 +347,6 @@ impl SettlementState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingSubmission {
     version: u8,
-    #[serde(default = "original_contract_id")]
-    contract_id: String,
     generation_id: u64,
     expected_height: u32,
     expected_baton_txid: String,
@@ -380,15 +378,6 @@ struct ResolvedSubmission {
     observed_baton_txid: String,
     observed_baton_vout: u32,
     reason: String,
-}
-
-// Journals written before profile support belong to the frozen reference identity.
-fn original_contract_id() -> String {
-    format!(
-        "{}:{}",
-        include_str!("../reference/photon_category.hex").trim(),
-        include_str!("../reference/photon_script_hash.hex").trim()
-    )
 }
 
 impl PendingSubmission {
@@ -525,7 +514,6 @@ impl PendingSubmission {
         }
         let pending = Self {
             version: SUBMISSION_JOURNAL_VERSION,
-            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: winner.generation_id,
             expected_height: winner.height,
             expected_baton_txid: winner.baton_txid.clone(),
@@ -551,9 +539,6 @@ impl PendingSubmission {
                 "unsupported pending-submission journal version {}",
                 self.version
             ));
-        }
-        if self.contract_id != crate::protocol::CONTRACT_ID {
-            return Err("pending submission belongs to a different contract profile; preserve it and resolve it with the matching miner before switching".into());
         }
         if self.expected_baton_txid.len() != 64
             || !self
@@ -1461,13 +1446,15 @@ fn prepare_pending_submission(
     }
     settlement.ensure_current(cfg.generation_id, live)?;
     validate_verified_parent(winner, live, reward_public_key)?;
+    let actual_reward =
+        tx::t2_parent_reward_amount(&winner.transaction, live.token_amount, live.reward_raw)?;
     let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(cfg)?;
     let split = reward::build_self_funded_settlement_with_relay_fee(
         &winner.transaction,
         reward_secret,
         reward_public_key,
         &cfg.payout_address,
-        live.reward_raw,
+        actual_reward,
         relay_fee_sats_per_kb,
     )?;
     let pending = PendingSubmission::from_verified(winner, &split)?;
@@ -1655,6 +1642,8 @@ fn production_preflight_local(
         .map_err(|error| format!("production payout validation failed: {error}"))?;
     tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS)
         .map_err(|error| format!("compiled donation address is invalid: {error}"))?;
+    tx::cashaddr_to_p2pkh_locking(crate::config::SHREC_DONATION_ADDRESS)
+        .map_err(|error| format!("compiled shrec donation address is invalid: {error}"))?;
     if crate::config::DONATION_BPS != 200 {
         return Err("compiled donation policy must be exactly 200 basis points".into());
     }
@@ -1696,8 +1685,11 @@ fn production_preflight_local(
         relay_fee_sats_per_kb,
     )?;
     let (expected_miner, expected_donation) = RuntimeConfig::split_reward(live.reward_raw);
+    let (expected_original, expected_shrec) = RuntimeConfig::split_donation(expected_donation);
     if split.miner_token_amount != expected_miner
         || split.donation_token_amount != expected_donation
+        || split.original_donation_token_amount != expected_original
+        || split.shrec_donation_token_amount != expected_shrec
         || split
             .miner_token_amount
             .checked_add(split.donation_token_amount)
@@ -1707,6 +1699,8 @@ fn production_preflight_local(
     }
     let multi_input_max_baton_decrease_sats = reward::photon_multi_input_max_baton_decrease_sats()?;
     if split.fee_sats != split.required_relay_fee_sats
+        || split.shrec_output_value_sats != reward::TOKEN_OUTPUT_SATS
+        || split.donation_output_value_sats != reward::TOKEN_OUTPUT_SATS
         || split.baton_input_value_sats < split.baton_output_value_sats
         || split.baton_input_value_sats - split.baton_output_value_sats
             > multi_input_max_baton_decrease_sats
@@ -1723,6 +1717,11 @@ fn validate_verified_parent(
     live: &LiveJob,
     reward_public_key: &[u8; 33],
 ) -> Result<(), String> {
+    if winner.job_reward_raw != live.reward_raw {
+        return Err("verified winner belongs to a different PHOTON reward job".into());
+    }
+    let actual_reward =
+        tx::t2_parent_reward_amount(&winner.transaction, live.token_amount, live.reward_raw)?;
     let intermediate_payout = reward::p2pkh_cashaddr_from_public_key(reward_public_key)?;
     let context = tx::ReferenceJobContext {
         prev_txid: live.baton_txid.clone(),
@@ -1731,8 +1730,14 @@ fn validate_verified_parent(
         target_le_hex: live.target_le_hex.clone(),
         contract_value_sats: live.baton_value_sats,
         contract_token_amount: live.token_amount,
-        reward_raw: live.reward_raw,
+        reward_raw: actual_reward,
     };
+    let payout_sats = tx::payout_value_sats(&winner.transaction)?;
+    if u64::from(payout_sats) != reward::TOKEN_OUTPUT_SATS {
+        return Err(format!(
+            "verified PHOTON parent BCH value must remain 700 sats (got {payout_sats})"
+        ));
+    }
     let rebuilt = tx::apply_reference_signature(
         &context,
         &intermediate_payout,
@@ -3793,6 +3798,7 @@ mod tests {
             height: job.height,
             baton_txid: job.baton_txid.clone(),
             baton_vout: job.baton_vout,
+            job_reward_raw: job.reward_raw,
             nonce: 7,
             digest: [0u8; 32],
             public_key: [0u8; 33],
@@ -3837,6 +3843,7 @@ mod tests {
             height: job.height,
             baton_txid: job.baton_txid.clone(),
             baton_vout: job.baton_vout,
+            job_reward_raw: job.reward_raw,
             nonce,
             digest: crate::search::hash256(&transaction),
             public_key: mining_public,
@@ -4376,6 +4383,7 @@ mod tests {
             height: job.height,
             baton_txid: job.baton_txid.clone(),
             baton_vout: job.baton_vout,
+            job_reward_raw: job.reward_raw,
             nonce,
             digest: crate::search::hash256(&transaction),
             public_key: mining_public,
@@ -4384,6 +4392,11 @@ mod tests {
         };
 
         validate_verified_parent(&winner, &job, &reward_public).unwrap();
+
+        let mut varied = winner.clone();
+        tx::set_payout_value_sats(&mut varied.transaction, 707).unwrap();
+        varied.digest = crate::search::hash256(&varied.transaction);
+        assert!(validate_verified_parent(&varied, &job, &reward_public).is_err());
 
         let mut wrong_parent = winner.clone();
         wrong_parent.transaction[10] ^= 1;
@@ -4429,6 +4442,7 @@ mod tests {
             height: job.height,
             baton_txid: job.baton_txid.clone(),
             baton_vout: job.baton_vout,
+            job_reward_raw: job.reward_raw,
             nonce,
             digest: crate::search::hash256(&transaction),
             public_key: mining_public,
@@ -4475,6 +4489,75 @@ mod tests {
         wrong_split.donation_token_amount += 1;
         assert!(wrong_split.validate().is_err());
 
+        PendingSubmission::remove(&journal).unwrap();
+    }
+
+    #[test]
+    fn t2_parent_settlement_uses_reduced_reward_and_current_job() {
+        let (mut cfg, job, reward_secret, reward_public, mining_payout, journal) =
+            preflight_fixture();
+        cfg.set_payout("zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3".into())
+            .unwrap();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let search_key = [1u8; 32];
+        let search_public = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes(search_key).unwrap(),
+        )
+        .serialize();
+        let actual_reward = job.reward_raw - 31;
+        let mut found = None;
+        for nonce in 0..1000 {
+            let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+            let signature = crate::crypto::bch_schnorr_sign(&search_key, &message).unwrap();
+            let context = tx::ReferenceJobContext {
+                prev_txid: job.baton_txid.clone(),
+                prev_vout: job.baton_vout,
+                age: job.age,
+                target_le_hex: job.target_le_hex.clone(),
+                contract_value_sats: job.baton_value_sats,
+                contract_token_amount: job.token_amount,
+                reward_raw: actual_reward,
+            };
+            if let Ok(transaction) = tx::apply_reference_signature(
+                &context,
+                &mining_payout,
+                &hex::encode(search_public),
+                nonce,
+                &hex::encode(signature),
+            ) {
+                found = Some(VerifiedWinner {
+                    generation_id: cfg.generation_id,
+                    height: job.height,
+                    baton_txid: job.baton_txid.clone(),
+                    baton_vout: job.baton_vout,
+                    job_reward_raw: job.reward_raw,
+                    nonce,
+                    digest: crate::search::hash256(&transaction),
+                    public_key: search_public,
+                    signature,
+                    transaction,
+                });
+                break;
+            }
+        }
+        let winner = found.expect("easy PHOTON target should admit a T2 transaction");
+        let pending = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &reward_secret,
+            &reward_public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+        assert_eq!(
+            pending.miner_token_amount + pending.donation_token_amount,
+            actual_reward
+        );
+        let mut stale_job = job.clone();
+        stale_job.reward_raw += 1;
+        assert!(validate_verified_parent(&winner, &stale_job, &reward_public).is_err());
         PendingSubmission::remove(&journal).unwrap();
     }
 
@@ -4890,7 +4973,6 @@ mod tests {
         let settlement_txid = reward::transaction_id(&[2]);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
-            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: job.baton_txid.clone(),
@@ -5016,7 +5098,6 @@ mod tests {
         let job = live_job();
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
-            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: "11".repeat(32),
@@ -5401,7 +5482,6 @@ mod tests {
         let settlement_txid = reward::transaction_id(&settlement);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
-            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: 1,
             expected_height: 1_000,
             expected_baton_txid: "11".repeat(32),
@@ -5433,23 +5513,6 @@ mod tests {
         assert!(!serialized.contains("private"));
         assert!(!serialized.contains("sponsor"));
         assert_eq!(PendingSubmission::load(&path).unwrap(), Some(pending));
-
-        // Old journals retain their original identity; changing profiles fails closed.
-        let mut legacy: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-        legacy.as_object_mut().unwrap().remove("contract_id");
-        let restored: PendingSubmission = serde_json::from_value(legacy.clone()).unwrap();
-        assert_eq!(restored.contract_id, original_contract_id());
-        assert_eq!(
-            restored.validate().is_ok(),
-            original_contract_id() == crate::protocol::CONTRACT_ID
-        );
-        legacy["contract_id"] = "different-contract".into();
-        let incompatible = legacy.to_string();
-        fs::write(&path, &incompatible).unwrap();
-        assert!(PendingSubmission::load(&path)
-            .unwrap_err()
-            .contains("different contract"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), incompatible);
 
         PendingSubmission::remove(&path).unwrap();
         assert!(!path.exists());
@@ -5692,7 +5755,6 @@ mod tests {
         let settlement_txid = reward::transaction_id(&[2]);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
-            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: job.baton_txid.clone(),

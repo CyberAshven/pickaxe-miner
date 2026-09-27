@@ -23,37 +23,6 @@ pub(super) struct Incremental {
 }
 
 impl Incremental {
-    #[cfg(test)]
-    pub(super) fn use_candidate_kernels(
-        &mut self,
-        engine: &mut CudaPhotonEngine,
-        c1_file: &str,
-    ) -> Result<(), String> {
-        self.walk = load_function(
-            &engine._ctx,
-            if c1_file == "photon_rust.ptx" {
-                c1_file
-            } else {
-                "ultrafast_walk.ptx"
-            },
-            "pickaxe_photon_incremental_k",
-        )?;
-        self.filters = load_filters(
-            engine,
-            if c1_file == "photon_rust.ptx" {
-                c1_file
-            } else {
-                "ultrafast_c3.ptx"
-            },
-        )?;
-        engine.stage_c1 = load_function(
-            &engine._ctx,
-            c1_file,
-            "pickaxe_photon_c1_schnorr_dual_batched",
-        )?;
-        Ok(())
-    }
-
     pub(super) fn new(engine: &CudaPhotonEngine, per_lane: u32) -> Result<Self, String> {
         if !(1..=128).contains(&per_lane) {
             return Err("invalid incremental lane size".into());
@@ -61,11 +30,11 @@ impl Incremental {
         Ok(Self {
             walk: load_function(
                 &engine._ctx,
-                engine_ptx("photon_incremental_k.ptx"),
+                "photon_incremental_k.ptx",
                 "pickaxe_photon_incremental_k",
             )
             .map_err(|error| error.to_string())?,
-            filters: load_filters(engine, engine_ptx("photon_incremental_c3.ptx"))?,
+            filters: load_filters(engine, "photon_incremental_c3.ptx")?,
             message: engine
                 .stream
                 .alloc_zeros(32)
@@ -117,9 +86,15 @@ impl Incremental {
         let blocks = count.div_ceil(self.per_lane).div_ceil(64);
         let stride = blocks * 64;
         if self.stride != stride {
-            let mut bytes = [0u8; 32];
-            bytes[24..].copy_from_slice(&u64::from(stride).to_be_bytes());
-            let point = crate::crypto::uncompressed_pubkey(&bytes)?;
+            let point = PublicKey::from_secret_key(
+                &SecretKey::from_secret_bytes({
+                    let mut bytes = [0u8; 32];
+                    bytes[24..].copy_from_slice(&u64::from(stride).to_be_bytes());
+                    bytes
+                })
+                .map_err(|error| error.to_string())?,
+            )
+            .serialize_uncompressed();
             let words: Vec<u32> = point[1..]
                 .as_chunks::<32>()
                 .0

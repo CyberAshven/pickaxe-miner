@@ -16,12 +16,14 @@ import {
 
 const DONATION_ADDRESS =
   'bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3';
+const SHREC_DONATION_ADDRESS =
+  'bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3';
 const DONATION_BPS = 200n;
 const MULTI_INPUT_MAX_BATON_DECREASE_SATS = 8000n;
 const RELAY_FEE_SATS_PER_KB = 1000n;
 const PRIVATE_KEY = hexToBin('00'.repeat(31) + '01');
 const EXPECTED_SETTLEMENT_HASH_INTERNAL =
-  'dab595f2cf51f796a722f4fd75c2d31c1607ed42ed4bd1983d7344f050fee3bc';
+  '271815f7527c379a72f71ba216272750f48ff2fb0c7333dc537b2b8d3114b0c3';
 
 const rustConfig = readFileSync(
   new URL('../../src/config.rs', import.meta.url),
@@ -38,6 +40,12 @@ if (rustDonationBps === undefined || BigInt(rustDonationBps) !== DONATION_BPS) {
 }
 if (rustDonationAddress !== DONATION_ADDRESS) {
   throw new Error('Rust donation address drifted from the BCH 2026 VM proof');
+}
+const rustShrecAddress = rustConfig.match(
+  /pub const SHREC_DONATION_ADDRESS:\s*&str\s*=\s*"([^"]+)"\s*;/,
+)?.[1];
+if (rustShrecAddress !== SHREC_DONATION_ADDRESS) {
+  throw new Error('Rust shrec donation address drifted from the BCH 2026 VM proof');
 }
 
 const concat = (...parts) => {
@@ -108,11 +116,15 @@ const parentBytes = encodeTransactionBch(parent);
 const parentHash = hash256(parentBytes);
 const parentOutpointHash = reverse(parentHash);
 const donationLock = decodeP2pkh(DONATION_ADDRESS);
+const shrecLock = decodeP2pkh(SHREC_DONATION_ADDRESS);
 const rewardRaw = reward.token.amount;
 const donationRaw = (rewardRaw * DONATION_BPS) / 10000n;
 const minerRaw = rewardRaw - donationRaw;
-if (minerRaw + donationRaw !== rewardRaw) throw new Error('98/2 token conservation failed');
-
+const shrecDonationRaw = donationRaw / 2n;
+const originalDonationRaw = donationRaw - shrecDonationRaw;
+if (minerRaw + originalDonationRaw + shrecDonationRaw !== rewardRaw) {
+  throw new Error('98/1/1 token conservation failed');
+}
 const buildSettlement = (batonDecreaseSats, patch = {}) => {
   const batonValue = baton.valueSatoshis - batonDecreaseSats;
   if (batonValue < 0n) throw new Error('negative baton value');
@@ -134,7 +146,12 @@ const buildSettlement = (batonDecreaseSats, patch = {}) => {
     {
       lockingBytecode: patch.redirectDonation ? rewardLock : donationLock,
       valueSatoshis: reward.valueSatoshis,
-      token: { ...reward.token, amount: donationRaw + (patch.mintExtra ?? 0n) },
+      token: { ...reward.token, amount: originalDonationRaw + (patch.mintExtra ?? 0n) },
+    },
+    {
+      lockingBytecode: shrecLock,
+      valueSatoshis: reward.valueSatoshis,
+      token: { ...reward.token, amount: shrecDonationRaw },
     },
   ];
   if (patch.extraOutput) {
@@ -172,7 +189,7 @@ const buildSettlement = (batonDecreaseSats, patch = {}) => {
 const provisional = buildSettlement(MULTI_INPUT_MAX_BATON_DECREASE_SATS);
 const settlementBytes = encodeTransactionBch(provisional).length;
 const relayFee = requiredRelayFee(settlementBytes);
-const batonDecrease = reward.valueSatoshis + relayFee;
+const batonDecrease = 2n * reward.valueSatoshis + relayFee;
 if (batonDecrease > MULTI_INPUT_MAX_BATON_DECREASE_SATS) {
   throw new Error(
     `self-funded settlement requires ${batonDecrease} baton sats, covenant allows 8000`,
@@ -235,10 +252,19 @@ if (
 if (settlement.outputs[1].token?.amount !== minerRaw) {
   throw new Error('miner token amount is not exact 98% remainder');
 }
-if (settlement.outputs[2].token?.amount !== donationRaw) {
-  throw new Error('donation token amount is not exact 2% floor');
+if (settlement.outputs[2].token?.amount !== originalDonationRaw) {
+  throw new Error('original recipient token amount is not half of 2%');
 }
-if (minerRaw + donationRaw !== rewardRaw) {
+if (settlement.outputs[3].token?.amount !== shrecDonationRaw) {
+  throw new Error('shrec token amount is not half of 2%');
+}
+if (!bytesEqual(settlement.outputs[2].lockingBytecode, donationLock)) {
+  throw new Error('original recipient output lock changed');
+}
+if (!bytesEqual(settlement.outputs[3].lockingBytecode, shrecLock)) {
+  throw new Error('shrec output lock changed');
+}
+if (minerRaw + originalDonationRaw + shrecDonationRaw !== rewardRaw) {
   throw new Error('reward token split does not conserve the full reward');
 }
 
@@ -276,9 +302,11 @@ console.log(`baton_output_sats=${settlement.outputs[0].valueSatoshis}`);
 console.log(`baton_decrease_sats=${batonDecrease}`);
 console.log(`reward_input_sats=${reward.valueSatoshis}`);
 console.log(`miner_output_sats=${settlement.outputs[1].valueSatoshis}`);
-console.log(`donation_output_sats=${settlement.outputs[2].valueSatoshis}`);
+console.log(`original_donation_output_sats=${settlement.outputs[2].valueSatoshis}`);
+console.log(`shrec_donation_output_sats=${settlement.outputs[3].valueSatoshis}`);
 console.log(`reward_raw=${rewardRaw}`);
 console.log(`miner_raw=${minerRaw}`);
-console.log(`donation_raw=${donationRaw}`);
+console.log(`original_donation_raw=${originalDonationRaw}`);
+console.log(`shrec_donation_raw=${shrecDonationRaw}`);
 console.log(`settlement_txid_internal=${settlementHashInternal}`);
 console.log(`adversarial_cases=${attacks.length + 1}`);

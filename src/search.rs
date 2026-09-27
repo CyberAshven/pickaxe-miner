@@ -9,7 +9,6 @@ use crate::hip_photon::HipPhotonEngine;
 use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, tx};
 use rand::Rng;
-#[cfg(test)]
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -27,12 +26,14 @@ pub(crate) const MAX_BATCH_CANDIDATES: u32 = 65_536;
 /// CUDA batches are larger: C1 gives each thread 8 candidates that share
 /// one inversion, so a 256K batch keeps every SM busy (35.0M/s against
 /// 29.8M/s at 64K on the RTX 5070 Ti).
-#[cfg(not(feature = "incremental-k"))]
+#[cfg(all(not(feature = "incremental-k"), not(feature = "tail-grind")))]
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 262_144;
 /// Incremental search uses 16 candidates per C1 thread. This batch fills
 /// twelve 64-thread C1 blocks per SM on the measured 46-SM laptop GPU.
-#[cfg(feature = "incremental-k")]
+#[cfg(all(feature = "incremental-k", not(feature = "tail-grind")))]
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 565_248;
+#[cfg(feature = "tail-grind")]
+pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 65_536;
 const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 524_288;
 /// Throttled batches are a quarter of the full batch: small enough for
 /// fine duty pacing, large enough to keep the GPU busy during a burst.
@@ -58,17 +59,11 @@ impl PhotonEngine {
         winner_buffer_cap: u32,
     ) -> Result<Self, String> {
         match backend {
-            BackendKind::Cuda => {
-                let engine =
-                    CudaPhotonEngine::new(device_ordinal, max_batch_candidates, winner_buffer_cap)?;
-                #[cfg(feature = "incremental-k")]
-                let engine = {
-                    let mut engine = engine;
-                    engine.enable_incremental_search()?;
-                    engine
-                };
-                Ok(Self::Cuda(Box::new(engine)))
-            }
+            BackendKind::Cuda => Ok(Self::Cuda(Box::new(CudaPhotonEngine::new(
+                device_ordinal,
+                max_batch_candidates,
+                winner_buffer_cap,
+            )?))),
             BackendKind::Hip => Ok(Self::Hip(Box::new(HipPhotonEngine::new(
                 device_ordinal,
                 max_batch_candidates,
@@ -154,7 +149,14 @@ impl PhotonEngine {
     /// Calculates a bounded batch size for the selected intensity.
     pub(crate) fn scheduled_batch_candidates(&self, intensity: u8) -> u32 {
         let capacity = match self {
-            Self::Cuda(_) => production_max_batch_candidates(BackendKind::Cuda),
+            Self::Cuda(engine) => {
+                #[cfg(feature = "tail-grind")]
+                if let Some(capacity) = engine.t2_group_batch_candidates() {
+                    return intensity_batch_candidates(capacity, intensity);
+                }
+                let _ = engine;
+                production_max_batch_candidates(BackendKind::Cuda)
+            }
             Self::Hip(_) => production_max_batch_candidates(BackendKind::Hip),
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.recommended_batch_candidates(),
@@ -194,6 +196,8 @@ pub struct VerifiedWinner {
     pub height: u32,
     pub baton_txid: String,
     pub baton_vout: u32,
+    /// Base reward of the job that produced this winner; anchors T2 validation.
+    pub job_reward_raw: u128,
     pub nonce: u32,
     pub digest: [u8; 32],
     pub public_key: [u8; 33],
@@ -382,7 +386,9 @@ fn rotate_search_identity(
     engine: &mut PhotonEngine,
     job: &MiningJob,
 ) -> Result<(PreparedJob, [u8; 32], [u8; 33]), String> {
-    let (sk, public_key) = crate::crypto::random_keypair();
+    let secret = SecretKey::new(&mut rand::rng());
+    let sk = secret.to_secret_bytes();
+    let public_key = PublicKey::from_secret_key(&secret).serialize();
     let prepared = prepare_job(job.clone(), &sk, &public_key)?;
     engine.set_job(&prepared.template, &prepared.target, &sk)?;
     Ok((prepared, sk, public_key))
@@ -395,6 +401,18 @@ fn verify_gpu_winner(
     public_key: &[u8; 33],
     winner: &PhotonCudaWinner,
 ) -> Result<VerifiedWinner, String> {
+    if winner.tail_j.is_some() && winner.schnorr_k.is_some() {
+        return Err("GPU winner cannot combine T2 amount and incremental scalar modes".into());
+    }
+    if let Some(sats) = winner.tail_value_sats {
+        return Err(format!(
+            "GPU payout BCH value must remain 700 sats (got {sats})"
+        ));
+    }
+    let actual_reward = match winner.tail_j {
+        Some(j) => tx::t2_reward_amount(prepared.job.token_amount, prepared.job.reward_raw, j)?,
+        None => prepared.job.reward_raw,
+    };
     let message = tx::photon_message_sha256(winner.nonce, &prepared.job.target_le_hex)?;
     let signature = match winner.schnorr_k {
         Some(k) => crypto::bch_schnorr_sign_search_candidate(sk, &message, k)?,
@@ -410,7 +428,7 @@ fn verify_gpu_winner(
         target_le_hex: prepared.job.target_le_hex.clone(),
         contract_value_sats: prepared.job.baton_value_sats,
         contract_token_amount: prepared.job.token_amount,
-        reward_raw: prepared.job.reward_raw,
+        reward_raw: actual_reward,
     };
     let transaction = tx::apply_reference_signature(
         &context,
@@ -435,6 +453,7 @@ fn verify_gpu_winner(
         height: prepared.job.height,
         baton_txid: prepared.job.baton_txid.clone(),
         baton_vout: prepared.job.baton_vout,
+        job_reward_raw: prepared.job.reward_raw,
         nonce: winner.nonce,
         digest,
         public_key: *public_key,
@@ -460,7 +479,7 @@ pub(crate) const fn intensity_batch_candidates(capacity: u32, intensity: u8) -> 
     }
 }
 
-pub(crate) fn batch_before_wrap(base: u32, requested: u32) -> u32 {
+fn batch_before_wrap(base: u32, requested: u32) -> u32 {
     u64::from(requested).min((1u64 << 32) - u64::from(base)) as u32
 }
 
@@ -706,8 +725,13 @@ fn run_worker(
     job_rx: Receiver<WorkerCommand>,
     winner_tx: SyncSender<VerifiedWinner>,
 ) {
+    let t2_coordinate = cfg!(feature = "tail-grind") && matches!(&engine, PhotonEngine::Cuda(_));
     let mut rng = rand::rng();
-    let mut nonce_base = rng.random::<u32>();
+    let mut nonce_base = if t2_coordinate {
+        0
+    } else {
+        rng.random::<u32>()
+    };
     let mut sweep = NonceSweep::default();
     let mut pacer = DutyPacer::new(Instant::now());
     while !stop.load(Ordering::Relaxed) {
@@ -718,7 +742,11 @@ fn run_worker(
                         engine.set_job(&next.template, &next.target, &sk)?;
                         generation_id.store(next.job.generation_id, Ordering::Release);
                         prepared = next;
-                        nonce_base = rng.random::<u32>();
+                        nonce_base = if t2_coordinate {
+                            0
+                        } else {
+                            rng.random::<u32>()
+                        };
                         sweep = NonceSweep::default();
                         diagnostics.job_exhausted.store(false, Ordering::Relaxed);
                         Ok(())
@@ -759,7 +787,11 @@ fn run_worker(
                     sk.fill(0);
                     sk = next_sk;
                     public_key = next_public_key;
-                    nonce_base = rng.random::<u32>();
+                    nonce_base = if t2_coordinate {
+                        0
+                    } else {
+                        rng.random::<u32>()
+                    };
                     sweep = NonceSweep::default();
                     diagnostics.key_rotations.fetch_add(1, Ordering::Relaxed);
                     diagnostics.job_exhausted.store(false, Ordering::Relaxed);
@@ -935,7 +967,9 @@ impl SearchHandle {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
         }
-        let (sk, public_key) = crate::crypto::random_keypair();
+        let secret = SecretKey::new(&mut rand::rng());
+        let sk = secret.to_secret_bytes();
+        let public_key = PublicKey::from_secret_key(&secret).serialize();
         let prepared = prepare_job(job, &sk, &public_key)?;
 
         // Fail fast and create exactly one native GPU context. The configured
@@ -946,6 +980,15 @@ impl SearchHandle {
             production_max_batch_candidates(backend),
             WINNER_BUFFER_CAP,
         )?;
+        #[cfg(feature = "tail-grind")]
+        if let PhotonEngine::Cuda(cuda) = &mut engine {
+            // The parent reward BCH output must remain exactly 700 sats.
+            cuda.enable_t2_search()?;
+        }
+        #[cfg(all(feature = "incremental-k", not(feature = "tail-grind")))]
+        if let PhotonEngine::Cuda(cuda) = &mut engine {
+            cuda.enable_incremental_search()?;
+        }
         engine.set_job(&prepared.template, &prepared.target, &sk)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1185,6 +1228,8 @@ mod tests {
                 nonce: 7,
                 digest: [9; 32],
                 schnorr_k: None,
+                tail_j: None,
+                tail_value_sats: None,
             }],
         };
         let control =
@@ -1419,7 +1464,9 @@ mod tests {
     fn production_batch_envelope_keeps_native_limit_and_reference_wgpu_limit() {
         assert_eq!(
             production_max_batch_candidates(BackendKind::Cuda),
-            if cfg!(feature = "incremental-k") {
+            if cfg!(feature = "tail-grind") {
+                65_536
+            } else if cfg!(feature = "incremental-k") {
                 565_248
             } else {
                 262_144
@@ -1445,6 +1492,7 @@ mod tests {
                 height: 1_000,
                 baton_txid: "11".repeat(32),
                 baton_vout: 0,
+                job_reward_raw: 4_999_773_813,
                 nonce,
                 digest: [0u8; 32],
                 public_key: [2u8; 33],
@@ -1553,6 +1601,65 @@ mod tests {
         assert!(prepare_job(MiningJob { age: 65_535, ..job }, &sk, &public_key).is_err());
     }
 
+    #[test]
+    fn t2_winner_reconstructs_the_actual_reduced_reward() {
+        let sk = [0x11; 32];
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
+        let job = MiningJob {
+            target_le_hex: "ff".repeat(32),
+            payout_address: "zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3".into(),
+            ..integration_job(12)
+        };
+        let prepared = prepare_job(job.clone(), &sk, &public).unwrap();
+        let nonce = 7;
+        let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+        let signature = crypto::bch_schnorr_sign(&sk, &message).unwrap();
+        let context = tx::ReferenceJobContext {
+            prev_txid: job.baton_txid.clone(),
+            prev_vout: job.baton_vout,
+            age: job.age,
+            target_le_hex: job.target_le_hex.clone(),
+            contract_value_sats: job.baton_value_sats,
+            contract_token_amount: job.token_amount,
+            reward_raw: job.reward_raw - 31,
+        };
+        let tx = tx::apply_reference_signature(
+            &context,
+            &job.payout_address,
+            &hex::encode(public),
+            nonce,
+            &hex::encode(signature),
+        )
+        .unwrap();
+        let gpu = PhotonCudaWinner {
+            nonce,
+            digest: hash256(&tx),
+            schnorr_k: None,
+            tail_j: Some(31),
+            tail_value_sats: None,
+        };
+        let verified = verify_gpu_winner(&prepared, &sk, &public, &gpu).unwrap();
+        assert_eq!(verified.transaction, tx);
+        assert_eq!(verified.job_reward_raw, job.reward_raw);
+        let varied = tx::apply_reference_signature_with_payout_sats(
+            &context,
+            &job.payout_address,
+            &hex::encode(public),
+            nonce,
+            &hex::encode(signature),
+            Some(707),
+        )
+        .unwrap();
+        let gpu_v = PhotonCudaWinner {
+            digest: hash256(&varied),
+            tail_value_sats: Some(707),
+            ..gpu
+        };
+        let error = verify_gpu_winner(&prepared, &sk, &public, &gpu_v).unwrap_err();
+        assert!(error.contains("700"));
+    }
+
     fn integration_job(generation_id: u64) -> MiningJob {
         MiningJob {
             height: 1_000,
@@ -1594,18 +1701,19 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "incremental-k")]
     fn incremental_live_winner_reconstruction_and_identity_rotation_if_cuda() {
         let sk = [0x11u8; 32];
         let public =
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
         let mut job = integration_job(1);
         job.target_le_hex = format!("{}7f", "ff".repeat(31));
-        let mut engine = match PhotonEngine::new(BackendKind::Cuda, 0, 65, 65) {
-            Ok(engine) => engine,
+        let mut cuda = match CudaPhotonEngine::new(0, 65, 65) {
+            Ok(cuda) => cuda,
             Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => return,
             Err(error) => panic!("{error}"),
         };
+        cuda.enable_incremental_search().unwrap();
+        let mut engine = PhotonEngine::Cuda(Box::new(cuda));
         for age in [0, 17, 128, 65534] {
             job.age = age;
             job.generation_id += 1;
@@ -1746,9 +1854,17 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let after = handle.snapshot();
-        assert!(after.batches > before.batches);
+        assert!(
+            after.batches > before.batches,
+            "supervised worker stalled: before={before:?}, after={after:?}"
+        );
         assert!(after.candidates > before.candidates);
-        let expected_batch = u64::from(intensity_batch_candidates(CUDA_MAX_BATCH_CANDIDATES, 30));
+        let capacity = if cfg!(feature = "tail-grind") {
+            crate::cuda_photon::T2_GROUP_CANDIDATES
+        } else {
+            CUDA_MAX_BATCH_CANDIDATES
+        };
+        let expected_batch = u64::from(intensity_batch_candidates(capacity, 30));
         assert_eq!(
             after.candidates,
             after.batches * expected_batch,
