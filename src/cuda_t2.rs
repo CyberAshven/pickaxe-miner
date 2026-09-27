@@ -235,8 +235,8 @@ impl T2Engine {
         sha2::compress256(&mut state, &blocks);
         // Bytes 512..575 are unchanged by the nonce, signature, and T2 amounts.
         let mut middle_schedule = [0u32; 64];
-        for (word, bytes) in template[512..576].chunks_exact(4).enumerate() {
-            middle_schedule[word] = u32::from_be_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in template[512..576].as_chunks::<4>().0.iter().enumerate() {
+            middle_schedule[word] = u32::from_be_bytes(*bytes);
         }
         for word in 16..64 {
             let a = middle_schedule[word - 15];
