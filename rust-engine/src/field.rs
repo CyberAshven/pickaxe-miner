@@ -227,7 +227,7 @@ impl Field {
 
     pub fn to_be_bytes(self) -> [u8; 32] {
         let mut out = [0; 32];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.0.iter().rev()) {
+        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.0.iter().rev()) {
             chunk.copy_from_slice(&word.to_be_bytes());
         }
         out
