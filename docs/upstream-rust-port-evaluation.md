@@ -4,7 +4,7 @@ This branch consumes `ufsecp-core` from the UltrafastSecp256k1 fork at
 `e346efe3239175ef5d8dc97ca6e46920658bdf97`. The crate is a direct MIT port of
 upstream public field/scalar/point arithmetic for portable CPU and NVIDIA GPU.
 It is distinct from the independent Pickaxe Rust engine in `rust-engine/src`.
-Both implementations remain available; neither changes the default miner.
+Both implementations remain available; the validated upstream-derived Rust backend is now the default CUDA miner.
 
 The port's source, independent oracle tests, provenance and scope live in
 [`rust/ufsecp-core`](https://github.com/CyberAshven/UltrafastSecp256k1/tree/e346efe3239175ef5d8dc97ca6e46920658bdf97/rust/ufsecp-core).
@@ -29,18 +29,18 @@ cargo build --locked --release --features upstream-rust-engine
 The default `build-rust-kernels.ps1` command still builds the independent
 Pickaxe Rust engine. Both emit `cuda/build/photon_rust.ptx`; preserve each
 artifact and its hash when comparing them. Build for the target GPU, and
-distribute the exact tested PTX with the matching experimental executable.
+distribute the exact tested PTX with the matching executable.
 Do not infer which engine a previously built PTX contains from its filename.
 
 For the established offline mining oracle and matched comparison, build the
-host test executable with `--features incremental-k` (without `rust-engine`).
+host test executable with `--no-default-features --features incremental-k` (without `rust-engine`).
 Stop the one live TUI normally, run tests exclusively, and restore exactly one
 TUI afterward:
 
 ```powershell
-cargo test --locked --release --features incremental-k incremental_k_rust_correctness -- --ignored --nocapture --test-threads=1
+cargo test --locked --release --no-default-features --features incremental-k incremental_k_rust_correctness -- --ignored --nocapture --test-threads=1
 node tools/reward-policy-vm/photon-layout.mjs artifacts/incremental-k/rust-vectors.json
-cargo test --locked --release --features incremental-k incremental_k_rust_comparison -- --ignored --nocapture --test-threads=1
+cargo test --locked --release --no-default-features --features incremental-k incremental_k_rust_comparison -- --ignored --nocapture --test-threads=1
 ```
 
 The upstream crate README contains the separate raw GPU arithmetic probe.

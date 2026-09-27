@@ -58,11 +58,17 @@ impl PhotonEngine {
         winner_buffer_cap: u32,
     ) -> Result<Self, String> {
         match backend {
-            BackendKind::Cuda => Ok(Self::Cuda(Box::new(CudaPhotonEngine::new(
-                device_ordinal,
-                max_batch_candidates,
-                winner_buffer_cap,
-            )?))),
+            BackendKind::Cuda => {
+                let engine =
+                    CudaPhotonEngine::new(device_ordinal, max_batch_candidates, winner_buffer_cap)?;
+                #[cfg(feature = "incremental-k")]
+                let engine = {
+                    let mut engine = engine;
+                    engine.enable_incremental_search()?;
+                    engine
+                };
+                Ok(Self::Cuda(Box::new(engine)))
+            }
             BackendKind::Hip => Ok(Self::Hip(Box::new(HipPhotonEngine::new(
                 device_ordinal,
                 max_batch_candidates,
@@ -940,10 +946,6 @@ impl SearchHandle {
             production_max_batch_candidates(backend),
             WINNER_BUFFER_CAP,
         )?;
-        #[cfg(feature = "incremental-k")]
-        if let PhotonEngine::Cuda(cuda) = &mut engine {
-            cuda.enable_incremental_search()?;
-        }
         engine.set_job(&prepared.template, &prepared.target, &sk)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1598,13 +1600,11 @@ mod tests {
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
         let mut job = integration_job(1);
         job.target_le_hex = format!("{}7f", "ff".repeat(31));
-        let mut cuda = match CudaPhotonEngine::new(0, 65, 65) {
-            Ok(cuda) => cuda,
+        let mut engine = match PhotonEngine::new(BackendKind::Cuda, 0, 65, 65) {
+            Ok(engine) => engine,
             Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => return,
             Err(error) => panic!("{error}"),
         };
-        cuda.enable_incremental_search().unwrap();
-        let mut engine = PhotonEngine::Cuda(Box::new(cuda));
         for age in [0, 17, 128, 65534] {
             job.age = age;
             job.generation_id += 1;
