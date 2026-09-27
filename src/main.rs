@@ -42,6 +42,8 @@ mod telemetry;
 #[allow(dead_code)]
 mod tui;
 mod tx;
+#[cfg(test)]
+mod ultrafast_probe;
 #[cfg(feature = "portable-wgpu")]
 mod wgpu_photon;
 

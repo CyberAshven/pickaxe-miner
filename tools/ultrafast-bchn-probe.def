@@ -1,0 +1,7 @@
+LIBRARY pickaxe_bchn_probe
+EXPORTS
+    secp256k1_context_create
+    secp256k1_context_destroy
+    secp256k1_ec_pubkey_parse
+    secp256k1_schnorr_sign
+    secp256k1_schnorr_verify
