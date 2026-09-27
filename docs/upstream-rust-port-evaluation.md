@@ -84,6 +84,18 @@ VM checks passed again on the pinned package. Pickaxe's all-feature suite passed
 CUDA full-pipeline/RFC6979 tests executed on the GPU. Formatting, lint and the
 experimental release build passed locally.
 
+The final Rust 1.98 Clippy cleanup rebuilt PTX as
+`8e0df066f08e4d0cc5d1f2c1f6343fe268cae01dff05cccc13a951472e38d1c1`.
+A raw-byte comparison found only the RFC6979 helper changed; all incremental
+mining kernels and their arithmetic/hash functions remained byte-identical to
+the timed artifact. The physical GPU probe, mining oracle, VM cases and normal
+suite passed again, including RFC6979. Timings were not repeated for this
+helper-only change. The JSON records both artifacts separately.
+
+Pickaxe's [complete CI run](https://github.com/CyberAshven/pickaxe-miner/actions/runs/36318379441)
+passed Windows/Linux checks, HIP artifact validation, BCH VM validation, and
+SM 7.5/12.0 compilation for both Rust backends.
+
 The upstream Rust crate passed Windows/Linux CI and SM 7.5/12.0 compilation.
 The native regression suite produced 437 passing test processes after correcting
 Windows source-cwd and UTF-8 test setup. One optional OpenSSL interoperability
