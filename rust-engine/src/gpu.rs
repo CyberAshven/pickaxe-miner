@@ -1,9 +1,29 @@
 //! The host owns buffer sizes and launches one-dimensional grids. Kernels retain
 //! the existing Pickaxe ABI so the established end-to-end oracle can test them.
-use crate::{field::Field, point::Point, scalar::Scalar, sha256};
+use crate::sha256;
+#[cfg(feature = "upstream-rust")]
+use crate::upstream::{Field, Point, Scalar};
+#[cfg(not(feature = "upstream-rust"))]
+use crate::{field::Field, point::Point, scalar::Scalar};
 use core::arch::nvptx;
 use core::sync::atomic::{AtomicU32, Ordering};
 use sha2::{Digest, Sha256};
+
+#[inline(always)]
+fn field(words: [u32; 8]) -> Field {
+    #[cfg(feature = "upstream-rust")]
+    return Field::from_limbs_reduced(crate::upstream::limbs(words));
+    #[cfg(not(feature = "upstream-rust"))]
+    Field(words)
+}
+
+#[inline(always)]
+fn words(field: Field) -> [u32; 8] {
+    #[cfg(feature = "upstream-rust")]
+    return core::array::from_fn(|i| (field.to_limbs()[i / 2] >> ((i % 2) * 32)) as u32);
+    #[cfg(not(feature = "upstream-rust"))]
+    field.0
+}
 
 fn index() -> u32 {
     unsafe { nvptx::_block_idx_x() * nvptx::_block_dim_x() + nvptx::_thread_idx_x() }
@@ -58,13 +78,13 @@ unsafe fn fixed_base_part<const FIRST: usize>(
         }
         let offset = (window * 65536 + digit) * 16;
         point = point.add_affine(
-            Field(read(table.add(offset))),
-            Field(read(table.add(offset + 8))),
+            field(read(table.add(offset))),
+            field(read(table.add(offset + 8))),
         );
     }
-    write(points.add(candidate * 24), &point.x.0);
-    write(points.add(candidate * 24 + 8), &point.y.0);
-    write(points.add(candidate * 24 + 16), &point.z.0);
+    write(points.add(candidate * 24), &words(point.x));
+    write(points.add(candidate * 24 + 8), &words(point.y));
+    write(points.add(candidate * 24 + 16), &words(point.z));
 }
 
 macro_rules! fixed_base_kernel {
@@ -99,9 +119,9 @@ unsafe fn write<T: Copy>(ptr: *mut T, data: &[T]) {
 
 unsafe fn point_at(ptr: *const u32, candidate: usize) -> Point {
     Point {
-        x: Field(read(ptr.add(candidate * 24))),
-        y: Field(read(ptr.add(candidate * 24 + 8))),
-        z: Field(read(ptr.add(candidate * 24 + 16))),
+        x: field(read(ptr.add(candidate * 24))),
+        y: field(read(ptr.add(candidate * 24 + 8))),
+        z: field(read(ptr.add(candidate * 24 + 16))),
     }
 }
 
@@ -116,13 +136,13 @@ pub unsafe extern "ptx-kernel" fn pickaxe_rust_inverse(
     if index >= count as usize {
         return;
     }
-    let value = Field(core::array::from_fn(|i| unsafe {
+    let value = field(core::array::from_fn(|i| unsafe {
         *inputs.add(index * 8 + i)
     }));
     let inverse = value.inverse();
     for i in 0..8 {
         unsafe {
-            *outputs.add(index * 8 + i) = inverse.0[i];
+            *outputs.add(index * 8 + i) = words(inverse)[i];
         }
     }
 }
@@ -152,20 +172,20 @@ pub unsafe extern "ptx-kernel" fn pickaxe_photon_incremental_k(
         }
         let offset = (window * 65536 + digit) * 16;
         point = point.add_affine(
-            Field(read(table.add(offset))),
-            Field(read(table.add(offset + 8))),
+            field(read(table.add(offset))),
+            field(read(table.add(offset + 8))),
         );
     }
-    let dx = Field(read(step));
-    let dy = Field(read(step.add(8)));
+    let dx = field(read(step));
+    let dy = field(read(step.add(8)));
     let message: [u8; 32] = read(message);
     let stride = stride() as u64;
     let mut candidate = lane as u64;
     while candidate < count as u64 {
         let i = candidate as usize;
-        write(points.add(i * 24), &point.x.0);
-        write(points.add(i * 24 + 8), &point.y.0);
-        write(points.add(i * 24 + 16), &point.z.0);
+        write(points.add(i * 24), &words(point.x));
+        write(points.add(i * 24 + 8), &words(point.y));
+        write(points.add(i * 24 + 16), &words(point.z));
         write(messages.add(i * 32), &message);
         let mut bytes = [0; 32];
         bytes[24..].copy_from_slice(&k.to_be_bytes());
@@ -206,7 +226,7 @@ pub unsafe extern "ptx-kernel" fn pickaxe_photon_c1_schnorr_dual_batched(
             break;
         }
         *entry = product;
-        let z = Field(read(points.add(candidate * 24 + 16)));
+        let z = field(read(points.add(candidate * 24 + 16)));
         if z != Field::ZERO {
             product = product.mul_mod(z);
         }
@@ -217,7 +237,7 @@ pub unsafe extern "ptx-kernel" fn pickaxe_photon_c1_schnorr_dual_batched(
     }
     let mut inverse = product.inverse();
     // Existing fixed-d table contains d*2^255 at position 31, digit 128.
-    let half = Scalar(read(fixed_d.add((31 * 256 + 128) * 8)));
+    let half = crate::scalar::Scalar(read(fixed_d.add((31 * 256 + 128) * 8)));
     let d_montgomery = half.add_mod(half);
     let public: [u8; 33] = read(public_key);
     for j in (0..count).rev() {
@@ -231,7 +251,17 @@ pub unsafe extern "ptx-kernel" fn pickaxe_photon_c1_schnorr_dual_batched(
         let r = point.x.mul_mod(z_inverse.square()).to_be_bytes();
         let message: [u8; 32] = read(messages.add(candidate * 32));
         let e = Scalar::from_be_bytes(sha256::challenge(r, public, message));
+        #[cfg(not(feature = "upstream-rust"))]
         let ed = e.montgomery_mul(d_montgomery);
+        #[cfg(feature = "upstream-rust")]
+        let ed = {
+            // Pickaxe-specific fixed-key Montgomery multiplication remains
+            // mining glue, as in the native upstream adapter. Generic scalar
+            // arithmetic is ported separately in ufsecp-core and tested there.
+            let value =
+                crate::scalar::Scalar::from_be_bytes(e.to_be_bytes()).montgomery_mul(d_montgomery);
+            Scalar::from_limbs_reduced(crate::upstream::limbs(value.0))
+        };
         let k = Scalar::from_be_bytes(read(scalars.add(candidate * 32)));
         write(signatures.add(candidate * 64), &r);
         write(

@@ -20,12 +20,13 @@ env:
 
 jobs:
   rust-ptx:
-    name: Rust PTX ${{ matrix.arch }}
+    name: Rust PTX ${{ matrix.arch }} (${{ matrix.backend }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       matrix:
         arch: [sm_75, sm_120]
+        backend: [pickaxe, upstream]
     env:
       RUSTFLAGS: -C target-cpu=${{ matrix.arch }} -C panic=abort
     steps:
@@ -35,7 +36,7 @@ jobs:
       - name: Install pinned Rust GPU compiler
         run: rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
       - name: Compile Rust kernels without a CUDA C++ toolchain
-        run: cargo +nightly-2026-04-02 build --locked --release --manifest-path rust-engine/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core
+        run: cargo +nightly-2026-04-02 build --locked --release --manifest-path rust-engine/Cargo.toml --features "${{ matrix.backend == 'upstream' && 'upstream-rust' || '' }}" --target nvptx64-nvidia-cuda -Z build-std=core
 
   reward-policy-vm:
     name: BCH 2026 reward-policy VM proof

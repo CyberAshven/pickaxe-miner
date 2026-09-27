@@ -10,6 +10,8 @@ pub mod nonce;
 pub mod point;
 pub mod scalar;
 pub mod sha256;
+#[cfg(all(target_os = "cuda", feature = "upstream-rust"))]
+mod upstream;
 
 #[cfg(target_os = "cuda")]
 #[panic_handler]

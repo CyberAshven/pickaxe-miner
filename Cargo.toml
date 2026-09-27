@@ -8,6 +8,7 @@ license = "AGPL-3.0-only"
 default = []
 incremental-k = []
 rust-engine = ["incremental-k"]
+upstream-rust-engine = ["rust-engine", "pickaxe-rust-engine/upstream-rust"]
 portable-wgpu = ["dep:pollster", "dep:wgpu"]
 
 [dependencies]
