@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn t2_gpu_hash_matches_independent_host_serialization_at_each_age_width() {
+    fn t2_gpu_hash_matches_independent_host_serialization_at_each_age_width_if_cuda_present() {
         let mut engine = T2Engine::new(0, 65_536, 8).unwrap();
         let mut target = [0xff; 32];
         target[31] = 0x7f;
@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn t2_gpu_all_pass_readback_is_bounded_and_reconstructable() {
+    fn t2_gpu_all_pass_readback_is_bounded_and_reconstructable_if_cuda_present() {
         let mut engine = T2Engine::new(0, 65_536, 8).unwrap();
         let target = [0xff; 32];
         engine
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tail-grind")]
-    fn t2_live_mode_refreshes_signature_across_nonce_windows() {
+    fn t2_live_mode_refreshes_signature_across_nonce_windows_if_cuda_present() {
         let target = [0xff; 32];
         let key = [0x11; 32];
         let mut engine = CudaPhotonEngine::new(0, 65_536, 8).unwrap();
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tail-grind")]
-    fn t2_live_falls_back_when_reward_cannot_cover_the_full_window() {
+    fn t2_live_falls_back_when_reward_cannot_cover_the_full_window_if_cuda_present() {
         let target = [0xff; 32];
         let key = [0x11; 32];
         let mut engine = CudaPhotonEngine::new(0, 65_536, 8).unwrap();
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tail-grind")]
-    fn t2_live_group_spans_two_signed_windows_with_bounded_winners() {
+    fn t2_live_group_spans_two_signed_windows_with_bounded_winners_if_cuda_present() {
         let target = [0xff; 32];
         let key = [0x11; 32];
         let mut engine = CudaPhotonEngine::new(0, 65_536, 8).unwrap();
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tail-grind")]
-    fn t2_gpu_signature_and_hash_match_host_at_each_age_and_window_edge() {
+    fn t2_gpu_signature_and_hash_match_host_at_each_age_and_window_edge_if_cuda_present() {
         let target = [0xff; 32];
         let key = [0x11; 32];
         let mut engine = CudaPhotonEngine::new(0, 65_536, 8).unwrap();
@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tail-grind")]
-    fn t2_gpu_full_group_returns_exact_bounded_winners() {
+    fn t2_gpu_full_group_returns_exact_bounded_winners_if_cuda_present() {
         let mut target = [0xff; 32];
         target[31] = 0;
         target[30] = 0;
@@ -849,7 +849,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tail-value-grind")]
-    fn t2_value_group_winners_match_host_across_age_and_nonce_boundaries() {
+    fn t2_value_group_winners_match_host_across_age_and_nonce_boundaries_if_cuda_present() {
         let mut target = [0xff; 32];
         target[31] = 0x7f;
         let key = [0x11; 32];
