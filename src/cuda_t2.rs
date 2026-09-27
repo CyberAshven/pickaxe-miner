@@ -152,7 +152,9 @@ impl T2Engine {
             .alloc_zeros::<u8>(T2_MAX_WINDOWS * MAX_TX_BYTES)
             .map_err(|error| error.to_string())?;
         let window_prefixes_gpu = stream
-            .alloc_zeros::<u32>(T2_MAX_WINDOWS * 8)
+            // Rust stores the block-7 round-10 states after the existing prefix
+            // array, once per signature window instead of once per thread block.
+            .alloc_zeros::<u32>(T2_MAX_WINDOWS * if cfg!(feature = "rust-t2") { 16 } else { 8 })
             .map_err(|error| error.to_string())?;
         let target_gpu = stream
             .alloc_zeros::<u8>(32)

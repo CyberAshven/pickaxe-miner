@@ -24,6 +24,25 @@ fn gpu_sha256_matches_rustcrypto() {
         block[32..].copy_from_slice(&message);
         let mut expected = state;
         sha2::compress256(&mut expected, &[block.into()]);
+        let words: [u32; 16] = core::array::from_fn(|i| {
+            u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        let mut resumed = state;
+        sha256::compress_from::<10>(&mut resumed, words, sha256::head10(state, words));
+        assert_eq!(resumed, expected);
+        let mut schedule = [0u32; 64];
+        schedule[..16].copy_from_slice(&words);
+        for i in 16..64 {
+            let x = schedule[i - 15];
+            let y = schedule[i - 2];
+            schedule[i] = schedule[i - 16]
+                .wrapping_add(x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3))
+                .wrapping_add(schedule[i - 7])
+                .wrapping_add(y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10));
+        }
+        let mut scheduled = state;
+        sha256::compress_scheduled(&mut scheduled, &schedule);
+        assert_eq!(scheduled, expected);
         sha256::compress_bytes(&mut state, block);
         assert_eq!(state, expected);
         let expected: [u8; 32] = Sha256::digest(sha256::bytes(state)).into();

@@ -15,8 +15,17 @@ const K: [u32; 64] = [
 ];
 
 #[inline(always)]
-pub fn compress(state: &mut [u32; 8], mut w: [u32; 16]) {
-    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+pub fn compress(state: &mut [u32; 8], w: [u32; 16]) {
+    compress_from::<0>(state, w, *state);
+}
+
+/// Resume compression with an already computed round state.
+#[inline(always)]
+pub fn compress_from<const START: usize>(state: &mut [u32; 8], mut w: [u32; 16], head: [u32; 8]) {
+    // Unrolled rounds rotate variable roles rather than copying eight words.
+    // Map a resumed logical state back to those roles at START.
+    let head: [u32; 8] = core::array::from_fn(|i| head[(i + START) & 7]);
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = head;
     // Constant ring indices let the GPU compiler retain the schedule in registers.
     macro_rules! round {
         ($i:expr, $a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident) => {{
@@ -30,17 +39,19 @@ pub fn compress(state: &mut [u32; 8], mut w: [u32; 16]) {
                     .wrapping_add(w[($i + 9) & 15])
                     .wrapping_add(s1);
             }
-            let s1 = $e.rotate_right(6) ^ $e.rotate_right(11) ^ $e.rotate_right(25);
-            let ch = ($e & $f) ^ (!$e & $g);
-            let t = $h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[$i])
-                .wrapping_add(w[$i & 15]);
-            let s0 = $a.rotate_right(2) ^ $a.rotate_right(13) ^ $a.rotate_right(22);
-            let maj = ($a & $b) ^ ($a & $c) ^ ($b & $c);
-            $d = $d.wrapping_add(t);
-            $h = t.wrapping_add(s0).wrapping_add(maj);
+            if $i >= START {
+                let s1 = $e.rotate_right(6) ^ $e.rotate_right(11) ^ $e.rotate_right(25);
+                let ch = ($e & $f) ^ (!$e & $g);
+                let t = $h
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[$i])
+                    .wrapping_add(w[$i & 15]);
+                let s0 = $a.rotate_right(2) ^ $a.rotate_right(13) ^ $a.rotate_right(22);
+                let maj = ($a & $b) ^ ($a & $c) ^ ($b & $c);
+                $d = $d.wrapping_add(t);
+                $h = t.wrapping_add(s0).wrapping_add(maj);
+            }
         }};
     }
     macro_rules! eight {
@@ -73,6 +84,76 @@ pub fn compress(state: &mut [u32; 8], mut w: [u32; 16]) {
     state[5] = state[5].wrapping_add(f);
     state[6] = state[6].wrapping_add(g);
     state[7] = state[7].wrapping_add(h);
+}
+
+#[inline(always)]
+pub fn compress_scheduled(state: &mut [u32; 8], w: &[u32; 64]) {
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    // Constant ring indices let the GPU compiler retain the schedule in registers.
+    macro_rules! round {
+        ($i:expr, $a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident) => {{
+            {
+                let s1 = $e.rotate_right(6) ^ $e.rotate_right(11) ^ $e.rotate_right(25);
+                let ch = ($e & $f) ^ (!$e & $g);
+                let t = $h
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[$i])
+                    .wrapping_add(w[$i]);
+                let s0 = $a.rotate_right(2) ^ $a.rotate_right(13) ^ $a.rotate_right(22);
+                let maj = ($a & $b) ^ ($a & $c) ^ ($b & $c);
+                $d = $d.wrapping_add(t);
+                $h = t.wrapping_add(s0).wrapping_add(maj);
+            }
+        }};
+    }
+    macro_rules! eight {
+        ($i:literal) => {
+            round!($i, a, b, c, d, e, f, g, h);
+            round!($i + 1, h, a, b, c, d, e, f, g);
+            round!($i + 2, g, h, a, b, c, d, e, f);
+            round!($i + 3, f, g, h, a, b, c, d, e);
+            round!($i + 4, e, f, g, h, a, b, c, d);
+            round!($i + 5, d, e, f, g, h, a, b, c);
+            round!($i + 6, c, d, e, f, g, h, a, b);
+            round!($i + 7, b, c, d, e, f, g, h, a);
+        };
+    }
+    eight!(0);
+    eight!(8);
+    eight!(16);
+    eight!(24);
+    eight!(32);
+    eight!(40);
+    eight!(48);
+    eight!(56);
+    // Keep the feed-forward in registers too; the NVPTX backend does not
+    // unroll the iterator/zip form and otherwise stores each block's state locally.
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(h);
+}
+
+/// The first ten rounds precede every variable T2 amount byte.
+#[inline(always)]
+pub fn head10(mut state: [u32; 8], w: [u32; 16]) -> [u32; 8] {
+    for i in 0..10 {
+        let [a, b, c, d, e, f, g, h] = state;
+        let t = h
+            .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+            .wrapping_add((e & f) ^ (!e & g))
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let t2 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+            .wrapping_add((a & b) ^ (a & c) ^ (b & c));
+        state = [t.wrapping_add(t2), a, b, c, d.wrapping_add(t), e, f, g];
+    }
+    state
 }
 
 #[inline(always)]
