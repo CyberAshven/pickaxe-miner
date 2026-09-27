@@ -148,6 +148,10 @@ cargo run --release -- benchmark
 
 The `reference/` directory contains PHOTON reference material used for implementation and correctness testing.
 
+## Development
+
+`dev` is the alpha/testing branch; `master` is stable. Changes move through reviewed PRs. See [development and release steps](docs/development.md).
+
 ## License
 
 Pickaxe Miner is licensed under the [GNU Affero General Public License, version 3.0 only](LICENSE) (`AGPL-3.0-only`). Third-party components and reference materials retain their respective licenses.
