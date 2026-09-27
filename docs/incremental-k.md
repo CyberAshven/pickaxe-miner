@@ -1,5 +1,10 @@
 # Incremental-k experiment — 2026-09-26
 
+Historical evaluation: defaults and deployment descriptions below refer to the
+recorded revisions. Current CUDA builds default to the
+[upstream-derived Rust backend](upstream-rust-port-evaluation.md); reproduction
+commands below explicitly select the historical backend.
+
 Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7a6e8235440168c6fe08140964890`.
 
 **Result: 1.95x median complete-pipeline throughput**: 27.128 to 52.928 million candidates/second in the original controlled comparison. After explicit user approval, the candidate was integrated behind the opt-in `incremental-k` feature and deployed to the single live TUI in `D:\pickaxe-candidate`. It found a natural winner and logged its parent/reward submission as accepted. The user subsequently authorized promoting `fd95cbc` to master and continuing measured optimization rounds. The finalized v0.0.1 release workflow enables this feature and bundles its required PTX, including the later Montgomery and batch-geometry improvements below. Plain Cargo builds without the feature and `D:\pickaxe-live` retain their original behavior. This is the best verified candidate from these trials, not proof of an absolute optimization ceiling.
@@ -24,7 +29,7 @@ Raw telemetry is retained, including isolated idle samples; no sample was discar
 
 The final source passed 258 feature-enabled regression tests, 13,920 independently reconstructed candidates across eight age layouts and three keys, the production-sized full-batch samples, and 216 BCH 2026 standard/consensus transaction proofs (103 accepted, 113 rejected). Default release checking, all-target/all-feature Clippy with warnings denied, formatting and the opt-in release build passed. The GPU integration tests cover winner reconstruction, key rotation and search/reward identity separation. Live and remote CI results must be checked separately before promotion.
 
-To reproduce the geometry comparison, put identical master C1 PTX in `photon_c1_reference.ptx` and `photon_c1_schnorr.ptx`, build tests with `--features incremental-k`, set `PICKAXE_COMPARE_GEOMETRY=1`, and run `incremental_k_c1_comparison` explicitly. Add `PICKAXE_C1_REVERSE=1` for reversed order. Without the geometry flag, the original C1-only comparison remains available. The correctness test now obtains settings through the same `enable_incremental_search` method as the live worker. Ignored `artifacts/incremental-k/round8/` contains the screening harness patches, comparisons, compiler/check logs and validation evidence.
+To reproduce the geometry comparison, put identical master C1 PTX in `photon_c1_reference.ptx` and `photon_c1_schnorr.ptx`, build tests with `--no-default-features --features incremental-k`, set `PICKAXE_COMPARE_GEOMETRY=1`, and run `incremental_k_c1_comparison` explicitly. Add `PICKAXE_C1_REVERSE=1` for reversed order. Without the geometry flag, the original C1-only comparison remains available. The correctness test now obtains settings through the same `enable_incremental_search` method as the live worker. Ignored `artifacts/incremental-k/round8/` contains the screening harness patches, comparisons, compiler/check logs and validation evidence.
 
 ## Round 7: researched and rejected binary/shared inversion prototypes
 
@@ -203,4 +208,4 @@ cargo test --release --locked --target-dir D:\pickaxe-incremental-target cuda_ph
 
 The adjacent test-executable PTX directory deliberately isolates kernel selection from `D:\pickaxe-live`. Experimental tests are ignored by default and fail if CUDA/PTX is unavailable. Keep GPU tests and timing runs serial; record concurrent GPU activity and thermals on each rerun.
 
-Build the opt-in live executable with `cargo build --release --locked --features incremental-k --target-dir D:\pickaxe-incremental-target`. Deploy that executable with the six generated PTX files in its adjacent `cuda\build` directory, then use the normal `mine --backend cuda` TUI command with the existing payout. Stop any current miner before launching it. The checked live executable SHA-256 was `9B2C70AFD06457720CB3C3C65F2C1127FC0887B2FA1F3FFDACDD93F86B873AF3`.
+Build the opt-in live executable with `cargo build --release --locked --no-default-features --features incremental-k --target-dir D:\pickaxe-incremental-target`. Deploy that executable with the six generated PTX files in its adjacent `cuda\build` directory, then use the normal `mine --backend cuda` TUI command with the existing payout. Stop any current miner before launching it. The checked live executable SHA-256 was `9B2C70AFD06457720CB3C3C65F2C1127FC0887B2FA1F3FFDACDD93F86B873AF3`.

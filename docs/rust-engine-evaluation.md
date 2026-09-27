@@ -1,5 +1,10 @@
 # Rust CPU and GPU engine experiment
 
+Historical evaluation: defaults and deployment descriptions below refer to the
+recorded revisions. Current CUDA builds default to the
+[upstream-derived Rust backend](upstream-rust-port-evaluation.md); reproduction
+commands below explicitly select the historical backend.
+
 Branch: `experiment/rust-engine`. Release/master baseline:
 `59c93c17f12244a6a81419fe47df83449f2d530d`.
 
@@ -21,7 +26,7 @@ an upstream Rust-engine PR. Pickaxe's AGPL-3.0-only license continues to apply.
   kernels for RFC6979, fixed-base multiplication, incremental point walking,
   batched inversion, dual BCH Schnorr signatures and all four PHOTON transaction
   layouts. Candidate processing and winner filtering remain on the GPU.
-- `--features rust-engine` selects the Rust PTX for the CUDA engine, including
+- `--no-default-features --features rust-engine` selects the Rust PTX for the CUDA engine, including
   both ordinary RFC6979 search and the existing guarded incremental search.
   It is not enabled by default. Missing Rust PTX fails rather than falling back
   to native kernels.
@@ -43,8 +48,8 @@ Install the compiler once (the application's ordinary host build stays on stable
 
 ```powershell
 rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
-./tools/build-rust-kernels.ps1 -Architecture sm_120
-cargo build --locked --release --features rust-engine
+./tools/build-rust-kernels.ps1 -Upstream:$false -Architecture sm_120
+cargo build --locked --release --no-default-features --features rust-engine
 cargo test --locked --manifest-path rust-engine/Cargo.toml
 ```
 
@@ -61,12 +66,12 @@ restore the original deployed TUI afterward. The following use synthetic keys
 and do not broadcast transactions:
 
 ```powershell
-cargo test --release --all-features -- --test-threads=1 --skip if_wgpu_present
-cargo test --release --all-features rust_generator_table_matches_authoritative_checksum -- --ignored --test-threads=1
-cargo test --release --all-features incremental_k_rust_correctness -- --ignored --nocapture --test-threads=1
+cargo test --release --no-default-features --features rust-engine -- --test-threads=1 --skip if_wgpu_present
+cargo test --release --no-default-features --features rust-engine rust_generator_table_matches_authoritative_checksum -- --ignored --test-threads=1
+cargo test --release --no-default-features --features rust-engine incremental_k_rust_correctness -- --ignored --nocapture --test-threads=1
 node tools/reward-policy-vm/photon-layout.mjs artifacts/incremental-k/rust-vectors.json
-cargo test --release --features incremental-k incremental_k_rust_comparison -- --ignored --nocapture --test-threads=1
-cargo test --release --features incremental-k incremental_k_rust_ultrafast_comparison -- --ignored --nocapture --test-threads=1
+cargo test --release --no-default-features --features incremental-k incremental_k_rust_comparison -- --ignored --nocapture --test-threads=1
+cargo test --release --no-default-features --features incremental-k incremental_k_rust_ultrafast_comparison -- --ignored --nocapture --test-threads=1
 ```
 
 The A/B command deliberately omits `rust-engine`: its baseline must retain the
@@ -146,7 +151,7 @@ matched performance comparison, so it was reverted. Nsight Compute hardware
 counters were unavailable (`ERR_NVGPUCTRPERM`); no driver permissions were changed.
 
 The reproducible trace workload is the ignored `incremental_k_stage_profile`
-test built with `--features incremental-k`. Set `PICKAXE_PROFILE_PIPELINE` to
+test built with `--no-default-features --features incremental-k`. Set `PICKAXE_PROFILE_PIPELINE` to
 `pickaxe`, `ultrafast` or `rust`, then run that test under `nsys profile
 --trace=cuda --sample=none --cpuctxsw=none --stats=true`. It uses synthetic keys
 and the same batch geometry, with no transaction broadcasts.

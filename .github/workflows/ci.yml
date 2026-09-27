@@ -27,8 +27,6 @@ jobs:
       matrix:
         arch: [sm_75, sm_120]
         backend: [pickaxe, upstream]
-    env:
-      RUSTFLAGS: -C target-cpu=${{ matrix.arch }} -C panic=abort
     steps:
       - uses: actions/checkout@v7
         with:
@@ -36,7 +34,10 @@ jobs:
       - name: Install pinned Rust GPU compiler
         run: rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
       - name: Compile Rust kernels without a CUDA C++ toolchain
-        run: cargo +nightly-2026-04-02 build --locked --release --manifest-path rust-engine/Cargo.toml --features "${{ matrix.backend == 'upstream' && 'upstream-rust' || '' }}" --target nvptx64-nvidia-cuda -Z build-std=core
+        shell: pwsh
+        run: |
+          $legacy = if ('${{ matrix.backend }}' -eq 'pickaxe') { @{ Upstream = $false } } else { @{} }
+          ./tools/build-rust-kernels.ps1 -Architecture ${{ matrix.arch }} @legacy
 
   reward-policy-vm:
     name: BCH 2026 reward-policy VM proof

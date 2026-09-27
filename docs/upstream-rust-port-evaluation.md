@@ -1,6 +1,6 @@
 # Upstream-derived Rust backend experiment
 
-This branch consumes `ufsecp-core` from the UltrafastSecp256k1 fork at
+Pickaxe consumes `ufsecp-core` from the UltrafastSecp256k1 fork at
 `e346efe3239175ef5d8dc97ca6e46920658bdf97`. The crate is a direct MIT port of
 upstream public field/scalar/point arithmetic for portable CPU and NVIDIA GPU.
 It is distinct from the independent Pickaxe Rust engine in `rust-engine/src`.
@@ -22,12 +22,13 @@ fixed-key specialization.
 ## Reproduce
 
 ```powershell
-./tools/build-rust-kernels.ps1 -Upstream -Architecture sm_120
-cargo build --locked --release --features upstream-rust-engine
+./tools/build-rust-kernels.ps1 -Architecture sm_120
+cargo build --locked --release
 ```
 
-The default `build-rust-kernels.ps1` command still builds the independent
-Pickaxe Rust engine. Both emit `cuda/build/photon_rust.ptx`; preserve each
+The default `build-rust-kernels.ps1` command builds the upstream-derived
+Rust engine, matching the default host build. Use `-Upstream:$false` only
+for the independent Pickaxe Rust engine. Both emit `cuda/build/photon_rust.ptx`; preserve each
 artifact and its hash when comparing them. Build for the target GPU, and
 distribute the exact tested PTX with the matching executable.
 Do not infer which engine a previously built PTX contains from its filename.
@@ -116,3 +117,28 @@ benchmark now uses the same search initialization as live mining; a 30-second
 smoke run measured 123.8874 MH/s. That single run is not a controlled A/B result.
 Live network submission and packaged executable checks are tracked on the
 [promotion PR](https://github.com/CyberAshven/pickaxe-miner/pull/2).
+
+## Engine consistency
+
+The pinned `e346efe3` crate source, manifest and lockfile are identical to those
+in [upstream PR #444 at `c422cf39`](https://github.com/shrec/UltrafastSecp256k1/pull/444).
+Later PR commits add validation records and documentation, not arithmetic changes.
+Both Pickaxe lockfiles select that same immutable revision; upstream acceptance
+is still pending.
+
+The v0.0.1 archives from `a574126` contain the same Rust CUDA instructions and
+constants. Comparing their complete PTX after normalizing line endings and
+consistently renaming seven compiler-generated build identifiers gives identical
+text. Their original file hashes differ:
+
+| Archive | `photon_rust.ptx` SHA-256 |
+|---|---|
+| Windows | `8e0df066f08e4d0cc5d1f2c1f6343fe268cae01dff05cccc13a951472e38d1c1` |
+| Linux | `2f5a40ebd69b9c81e7a6e692153cf9ab2a8ded7c75e9d83d4b33557e655181bf` |
+
+The source-build script defaults to the same upstream-derived engine as Cargo;
+CI exercises that default and the explicit independent-engine option on both
+compiled architectures. Equal source and settings do not guarantee equal MH/s:
+compare warmed, sustained throughput on the same GPU, driver, power and cooling
+conditions. The release kernels target SM 12.0; other architectures require
+appropriate builds and physical validation.

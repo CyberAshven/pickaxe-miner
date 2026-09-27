@@ -1,4 +1,4 @@
-param([string]$Architecture = 'sm_120', [switch]$Upstream)
+param([string]$Architecture = 'sm_120', [switch]$Upstream = $true)
 $ErrorActionPreference = 'Stop'
 if ($Architecture -notmatch '^sm_[0-9]+$') { throw 'Expected an SM architecture such as sm_120' }
 $repo = Split-Path $PSScriptRoot -Parent

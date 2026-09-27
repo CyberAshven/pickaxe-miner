@@ -86,13 +86,15 @@ Log files are appended to without automatic rotation or a size limit. After an i
 
 ```bash
 rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
-pwsh -File tools/build-rust-kernels.ps1 -Upstream -Architecture sm_120
+pwsh -File tools/build-rust-kernels.ps1 -Architecture sm_120
 cargo build --release --locked
 ```
 
 The cargo binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.1`.
 
 The default CUDA backend uses the pinned Rust arithmetic port of UltrafastSecp256k1. Building its kernels requires PowerShell 7 (`pwsh`), including on Linux. Keep `cuda/build`, including `photon_rust.ptx`, beside the executable when distributing it. HIP retains its existing backend.
+
+The example targets SM 12.0, as do the release archives; use your GPU's SM architecture when building for other NVIDIA devices. The pinned engine and compiler make comparisons repeatable, but MH/s also depends on the GPU, driver, clocks, power limits and cooling. Physical validation currently covers SM 12.0; SM 7.5 has compilation coverage.
 
 For the legacy native CUDA backend, build with `--no-default-features --features incremental-k`. Historical source is preserved in [legacy-engine-by-cyberashven](reference/legacy-engine-by-cyberashven/README.md).
 

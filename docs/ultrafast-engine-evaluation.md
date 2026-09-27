@@ -1,5 +1,10 @@
 # UltrafastSecp256k1 integration evaluation
 
+Historical evaluation: defaults and deployment descriptions below refer to the
+recorded revisions. Current CUDA builds default to the
+[upstream-derived Rust backend](upstream-rust-port-evaluation.md); reproduction
+commands below explicitly select the historical backend.
+
 Branch: `experiment/ultrafast-engine`. Baseline: `59c93c17f12244a6a81419fe47df83449f2d530d`.
 Upstream release: `v4.6.0`, commit `540ac5b9c910f089c449177ebf000e4c130cab19`.
 
@@ -84,7 +89,7 @@ $env:UFSECP_LIB_DIR = (Resolve-Path "$build/include/ufsecp").Path
 $env:PATH = "$env:UFSECP_LIB_DIR;$env:PATH"
 cargo test --manifest-path "$src/bindings/rust/ufsecp/Cargo.toml"
 $env:PICKAXE_UFSECP_LIBRARY = "$env:UFSECP_LIB_DIR/ufsecp.dll"
-cargo test --locked --release --features incremental-k ultrafast_probe::cpu_signature_compatibility -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k ultrafast_probe::cpu_signature_compatibility -- --ignored --exact --nocapture
 
 # Export the existing static BCH shim for the Rust test; no replacement signer code.
 link /NOLOGO /DLL /MACHINE:X64 /OUT:artifacts/ultrafast-evaluation/pickaxe_bchn_probe.dll `
@@ -92,10 +97,10 @@ link /NOLOGO /DLL /MACHINE:X64 /OUT:artifacts/ultrafast-evaluation/pickaxe_bchn_
   "$build/compat/libsecp256k1_bchn_shim/secp256k1_bchn_shim.lib" `
   "$build/src/cpu/fastsecp256k1.lib" bcrypt.lib
 $env:PICKAXE_BCHN_LIBRARY = (Resolve-Path artifacts/ultrafast-evaluation/pickaxe_bchn_probe.dll).Path
-cargo test --locked --release --features incremental-k ultrafast_probe::bch_shim_signature_compatibility -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k ultrafast_probe::bch_shim_signature_compatibility -- --ignored --exact --nocapture
 
 # Stop the live miner normally first; resume it when this offline test finishes.
-cargo test --locked --release --features incremental-k ultrafast_probe::gpu_generator_compatibility_and_throughput -- --ignored --exact --nocapture --test-threads=1
+cargo test --locked --release --no-default-features --features incremental-k ultrafast_probe::gpu_generator_compatibility_and_throughput -- --ignored --exact --nocapture --test-threads=1
 ```
 
 Stop on a failed command and inspect its diagnostic before continuing. The ignored tests load native code only from the explicitly configured trusted DLL paths. The evaluation does not install a dependency, change a mining backend, or broadcast test transactions.
@@ -128,15 +133,15 @@ The original TUI was restored after each exclusive GPU session and confirmed min
 ```powershell
 tools/build-ultrafast-candidate.cmd
 # With the live miner stopped normally, run serially:
-cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_correctness -- --ignored --exact --nocapture
-cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_scalar_oracle -- --ignored --exact --nocapture
-cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_correctness -- --ignored --exact --nocapture
-cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_fixed_d_correctness -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_correctness -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_scalar_oracle -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_correctness -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_fixed_d_correctness -- --ignored --exact --nocapture
 node tools/reward-policy-vm/photon-layout.mjs artifacts/incremental-k/ultrafast-vectors.json
 node tools/reward-policy-vm/photon-layout.mjs artifacts/incremental-k/ultrafast-fixed-d-vectors.json
-cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_comparison -- --ignored --exact --nocapture
-cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_fixed_d_comparison -- --ignored --exact --nocapture
-cargo test --locked --release --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_tuning -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_comparison -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_fixed_d_comparison -- --ignored --exact --nocapture
+cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_tuning -- --ignored --exact --nocapture
 # Resume the original miner afterward.
 ```
 
