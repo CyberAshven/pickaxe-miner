@@ -15,10 +15,15 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 use num_bigint::BigUint;
-#[cfg(test)]
 use secp256k1::{PublicKey, SecretKey};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(any(feature = "tail-grind", test))]
+#[path = "cuda_t2.rs"]
+mod t2;
+#[cfg(test)]
+pub(crate) use t2::T2_GROUP_CANDIDATES;
 
 /// Template buffer size: the widest layout the covenant's age bound allows.
 const MAX_TX_BYTES: usize = 615 + PhotonLayout::MAX_SHIFT;
@@ -30,14 +35,6 @@ const STAGE_C3_FUNCTIONS: [&str; PhotonLayout::MAX_SHIFT + 1] = [
     "pickaxe_stage_c_dual_filter_shift2",
     "pickaxe_stage_c_dual_filter_shift3",
 ];
-
-fn engine_ptx(native: &str) -> &str {
-    if cfg!(feature = "rust-engine") {
-        "photon_rust.ptx"
-    } else {
-        native
-    }
-}
 const POINT_WORDS: usize = 24;
 const FIXED_D_WORDS: usize = 32 * 256 * 8;
 /// Candidates per C1 thread that share one field inversion.
@@ -61,8 +58,11 @@ pub struct PhotonCudaWinner {
     pub digest: [u8; 32],
     /// Explicit signing scalar for incremental search; never a reward-key nonce.
     pub schnorr_k: Option<u64>,
+    /// T2 amount offset from the job's base reward, when amount grinding is active.
+    pub tail_j: Option<u16>,
+    /// BCH value of the miner payout output for the V search coordinate.
+    pub tail_value_sats: Option<u16>,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotonCudaBatchResult {
     pub candidates: u32,
@@ -105,6 +105,12 @@ pub struct CudaPhotonEngine {
     table_source: M29TableSource,
     job_ready: bool,
     incremental: Option<incremental::Incremental>,
+    #[cfg(any(feature = "tail-grind", test))]
+    t2: Option<t2::T2Live>,
+    #[cfg(feature = "tail-grind")]
+    t2_requested: bool,
+    #[cfg(feature = "tail-grind")]
+    t2_value_requested: bool,
     commitment_nonce: u32,
 }
 
@@ -231,56 +237,23 @@ impl CudaPhotonEngine {
         let ctx =
             CudaContext::new(device_ordinal).map_err(|error| format!("cuda context: {error}"))?;
         let stream = ctx.default_stream();
-        let stage_a = load_function(
-            &ctx,
-            engine_ptx("stage_a_rfc6979.ptx"),
-            "pickaxe_stage_a_rfc6979",
-        )?;
+        let stage_a = load_function(&ctx, "stage_a_rfc6979.ptx", "pickaxe_stage_a_rfc6979")?;
         let stage_b = [
-            load_function(
-                &ctx,
-                engine_ptx("photon_stage_b16.ptx"),
-                "pickaxe_photon_b16_part0",
-            )?,
-            load_function(
-                &ctx,
-                engine_ptx("photon_stage_b16.ptx"),
-                "pickaxe_photon_b16_part1",
-            )?,
-            load_function(
-                &ctx,
-                engine_ptx("photon_stage_b16.ptx"),
-                "pickaxe_photon_b16_part2",
-            )?,
-            load_function(
-                &ctx,
-                engine_ptx("photon_stage_b16.ptx"),
-                "pickaxe_photon_b16_part3",
-            )?,
+            load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part0")?,
+            load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part1")?,
+            load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part2")?,
+            load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part3")?,
         ];
         let stage_c1 = load_function(
             &ctx,
-            engine_ptx("photon_c1_schnorr.ptx"),
+            "photon_c1_schnorr.ptx",
             "pickaxe_photon_c1_schnorr_dual_batched",
         )?;
-        let filter_names = if cfg!(feature = "rust-engine") {
-            [
-                "pickaxe_stage_c_dual_filter_rfc",
-                "pickaxe_stage_c_dual_filter_rfc_shift1",
-                "pickaxe_stage_c_dual_filter_rfc_shift2",
-                "pickaxe_stage_c_dual_filter_rfc_shift3",
-            ]
-        } else {
-            STAGE_C3_FUNCTIONS
-        };
-        let mut filters = filter_names
-            .into_iter()
-            .map(|name| load_function(&ctx, engine_ptx("photon_c3_dual.ptx"), name));
         let stage_c3 = [
-            filters.next().unwrap()?,
-            filters.next().unwrap()?,
-            filters.next().unwrap()?,
-            filters.next().unwrap()?,
+            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[0])?,
+            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[1])?,
+            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[2])?,
+            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[3])?,
         ];
 
         let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
@@ -360,6 +333,12 @@ impl CudaPhotonEngine {
             table_source,
             job_ready: false,
             incremental: None,
+            #[cfg(any(feature = "tail-grind", test))]
+            t2: None,
+            #[cfg(feature = "tail-grind")]
+            t2_requested: false,
+            #[cfg(feature = "tail-grind")]
+            t2_value_requested: false,
             commitment_nonce: 0,
         })
     }
@@ -370,10 +349,47 @@ impl CudaPhotonEngine {
         if self.job_ready {
             return Err("enable incremental search before configuring a job".into());
         }
+        #[cfg(any(feature = "tail-grind", test))]
+        if self.t2.is_some() {
+            return Err("T2 and incremental search cannot be enabled together".into());
+        }
         let mut incremental = incremental::Incremental::new(self, 32)?;
         incremental.c1_per_thread = 16;
         self.incremental = Some(incremental);
         Ok(())
+    }
+
+    /// Uses unsigned reward amount as the inner search coordinate.
+    #[cfg(feature = "tail-grind")]
+    pub(crate) fn enable_t2_search(&mut self) -> Result<(), String> {
+        self.enable_t2_mode(false)
+    }
+
+    /// Uses unsigned payout BCH value inside each T2 amount window.
+    #[cfg(feature = "tail-value-grind")]
+    pub(crate) fn enable_t2_value_search(&mut self) -> Result<(), String> {
+        self.enable_t2_mode(true)
+    }
+
+    #[cfg(feature = "tail-grind")]
+    fn enable_t2_mode(&mut self, value_mode: bool) -> Result<(), String> {
+        if self.job_ready || self.incremental.is_some() {
+            return Err("enable T2 before the job and without incremental search".into());
+        }
+        self.t2 = Some(t2::T2Live::new(
+            Arc::clone(&self._ctx),
+            Arc::clone(&self.stream),
+            self.winner_cap,
+            value_mode,
+        )?);
+        self.t2_requested = true;
+        self.t2_value_requested = value_mode;
+        Ok(())
+    }
+
+    #[cfg(feature = "tail-grind")]
+    pub(crate) fn t2_group_batch_candidates(&self) -> Option<u32> {
+        self.t2.as_ref().map(t2::T2Live::batch_capacity)
     }
 
     /// Returns the source of the CUDA lookup table.
@@ -419,8 +435,9 @@ impl CudaPhotonEngine {
             ));
         }
         self.job_ready = false;
-        let public_key = crate::crypto::compressed_pubkey(private_key)
+        let secret = SecretKey::from_secret_bytes(*private_key)
             .map_err(|error| format!("invalid PHOTON signing key: {error}"))?;
+        let public_key = PublicKey::from_secret_key(&secret).serialize();
         let fixed_d = fixed_d_table(private_key);
 
         self.stream
@@ -454,6 +471,25 @@ impl CudaPhotonEngine {
             self.incremental = Some(incremental);
             result?;
         }
+        #[cfg(feature = "tail-grind")]
+        if self.t2_requested {
+            if t2::T2Live::supports_job(template)? {
+                if self.t2.is_none() {
+                    self.t2 = Some(t2::T2Live::new(
+                        Arc::clone(&self._ctx),
+                        Arc::clone(&self.stream),
+                        self.winner_cap,
+                        self.t2_value_requested,
+                    )?);
+                }
+                self.t2
+                    .as_mut()
+                    .unwrap()
+                    .set_job(template, target, private_key)?;
+            } else {
+                self.t2 = None;
+            }
+        }
         self.job_ready = true;
         Ok(())
     }
@@ -464,6 +500,12 @@ impl CudaPhotonEngine {
         nonce_base: u32,
         candidate_count: u32,
     ) -> Result<PhotonCudaBatchResult, String> {
+        #[cfg(any(feature = "tail-grind", test))]
+        if let Some(mut t2) = self.t2.take() {
+            let result = t2.batch(self, nonce_base, candidate_count);
+            self.t2 = Some(t2);
+            return result;
+        }
         if let Some(mut incremental) = self.incremental.take() {
             let result = incremental.batch(self, nonce_base, candidate_count);
             self.incremental = Some(incremental);
@@ -611,6 +653,8 @@ impl CudaPhotonEngine {
                     nonce: nonces[index],
                     digest,
                     schnorr_k: None,
+                    tail_j: None,
+                    tail_value_sats: None,
                 });
             }
         }
@@ -660,7 +704,7 @@ mod tests {
     fn transaction_midstate_resumes_to_the_full_transaction_sha256() {
         use sha2::{Digest, Sha256};
 
-        let raw = hex::decode(crate::protocol::MINING_VECTOR_HEX.trim()).unwrap();
+        let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
         let template: [u8; TX_BYTES] = raw.try_into().unwrap();
         let mut state = transaction_midstate(&template);
 
@@ -720,7 +764,7 @@ mod tests {
     }
 
     fn reference_template_with_target(target: [u8; 32]) -> [u8; TX_BYTES] {
-        let raw = hex::decode(crate::protocol::MINING_VECTOR_HEX.trim()).unwrap();
+        let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
         let mut template: [u8; TX_BYTES] = raw.try_into().unwrap();
         template[390..394].fill(0);
         template[394..426].copy_from_slice(&target);

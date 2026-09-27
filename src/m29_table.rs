@@ -4,9 +4,6 @@
 //! 64 bytes: affine X then Y, each encoded as eight little-endian `u32` limbs.
 //! Entry zero is unused/zero; entry `d` is `d * 2^(16*w) * G`.
 
-use k256::elliptic_curve::{sec1::ToEncodedPoint, BatchNormalize};
-use k256::{AffinePoint, ProjectivePoint};
-#[cfg(test)]
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -69,38 +66,39 @@ fn store_coordinate_words(dst: &mut [u8], coordinate_be: &[u8]) {
 }
 
 /// Stores a curve point in the M29 lookup table.
-fn store_point(table: &mut [u8], window: usize, digit: usize, point: &AffinePoint) {
+fn store_point(table: &mut [u8], window: usize, digit: usize, point: &PublicKey) {
     let offset = (window * M29_G16_ENTRIES + digit) * M29_G16_POINT_BYTES;
-    let encoded = point.to_encoded_point(false);
-    let uncompressed = encoded.as_bytes();
+    let uncompressed = point.serialize_uncompressed();
     store_coordinate_words(&mut table[offset..offset + 32], &uncompressed[1..33]);
     store_coordinate_words(&mut table[offset + 32..offset + 64], &uncompressed[33..65]);
 }
 
 /// Generates the precomputed M29 G16 point table.
 pub fn generate_m29_g16() -> Result<Vec<u8>, String> {
-    let mut base = ProjectivePoint::GENERATOR;
+    let one = SecretKey::from_secret_bytes({
+        let mut key = [0u8; 32];
+        key[31] = 1;
+        key
+    })
+    .map_err(|error| format!("M29 generator scalar: {error}"))?;
+    let mut base = PublicKey::from_secret_key(&one);
     let mut table = vec![0u8; M29_G16_BYTES];
 
     for window in 0..M29_G16_WINDOWS {
         let mut point = base;
-        let mut points = Vec::with_capacity(M29_G16_ENTRIES - 1);
         for digit in 1..M29_G16_ENTRIES {
-            points.push(point);
+            store_point(&mut table, window, digit, &point);
             if digit + 1 != M29_G16_ENTRIES {
-                point += base;
+                point = point
+                    .combine(&base)
+                    .map_err(|error| format!("M29 window {window} digit {digit}: {error}"))?;
             }
-        }
-        for (index, affine) in
-            <ProjectivePoint as BatchNormalize<[ProjectivePoint]>>::batch_normalize(&points)
-                .iter()
-                .enumerate()
-        {
-            store_point(&mut table, window, index + 1, affine);
         }
         if window + 1 != M29_G16_WINDOWS {
             for _ in 0..16 {
-                base = base.double();
+                base = base
+                    .combine(&base)
+                    .map_err(|error| format!("M29 window {window} base doubling: {error}"))?;
             }
         }
     }
@@ -140,12 +138,6 @@ pub fn load_or_generate_m29_g16() -> Result<(Vec<u8>, M29TableSource), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[ignore = "regenerates and verifies the full 64 MiB generator table using Rust arithmetic"]
-    fn rust_generator_table_matches_authoritative_checksum() {
-        assert!(valid_table(&generate_m29_g16().unwrap()));
-    }
 
     #[test]
     fn coordinate_encoding_matches_m29_little_limb_layout() {

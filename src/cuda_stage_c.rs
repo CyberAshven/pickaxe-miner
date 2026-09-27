@@ -327,7 +327,7 @@ mod tests {
     }
 
     fn vector_parts() -> ([u8; TX_BYTES], u32, [u8; 32], [u8; SIGNATURE_BYTES]) {
-        let raw = hex::decode(crate::protocol::MINING_VECTOR_HEX.trim()).unwrap();
+        let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
         let mut template: [u8; TX_BYTES] = raw.try_into().unwrap();
         let nonce = u32::from_le_bytes(template[390..394].try_into().unwrap());
         let target: [u8; 32] = template[394..426].try_into().unwrap();

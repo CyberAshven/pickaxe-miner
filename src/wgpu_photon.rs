@@ -7,6 +7,7 @@
 
 use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
+use secp256k1::SecretKey;
 use sha2::compress256;
 use sha2::digest::generic_array::GenericArray;
 use std::borrow::Cow;
@@ -228,7 +229,7 @@ fn validate_job_material(
     if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
         return Err("PHOTON WGPU target must match transaction template bytes 394..425".into());
     }
-    k256::SecretKey::from_slice(private_key)
+    SecretKey::from_secret_bytes(*private_key)
         .map_err(|error| format!("invalid PHOTON WGPU signing key: {error}"))?;
     Ok(())
 }
@@ -833,6 +834,8 @@ impl WgpuPhotonEngine {
                 nonce,
                 digest,
                 schnorr_k: None,
+                tail_j: None,
+                tail_value_sats: None,
             });
         }
         drop(view);
@@ -860,7 +863,7 @@ mod tests {
     use secp256k1::{PublicKey, SecretKey};
 
     fn reference_template_with_target(target: [u8; 32]) -> [u8; TX_BYTES] {
-        let raw = hex::decode(crate::protocol::MINING_VECTOR_HEX.trim()).unwrap();
+        let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
         let mut template: [u8; TX_BYTES] = raw.try_into().unwrap();
         template[390..394].fill(0);
         template[394..426].copy_from_slice(&target);

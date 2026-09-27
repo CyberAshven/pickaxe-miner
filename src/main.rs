@@ -42,8 +42,6 @@ mod telemetry;
 #[allow(dead_code)]
 mod tui;
 mod tx;
-#[cfg(test)]
-mod ultrafast_probe;
 #[cfg(feature = "portable-wgpu")]
 mod wgpu_photon;
 
@@ -301,6 +299,9 @@ fn validate_verified_winner_current(
     }
     if winner.baton_txid != live.baton_txid || winner.baton_vout != live.baton_vout {
         return Err("winner PHOTON baton outpoint is stale".into());
+    }
+    if winner.job_reward_raw != live.reward_raw {
+        return Err("winner PHOTON reward job is stale".into());
     }
     Ok(())
 }
@@ -1382,29 +1383,29 @@ mod tests {
     }
 
     #[test]
-    fn release_workflow_prepares_pickaxe_miner_v0_0_1() {
+    fn release_workflow_prepares_pickaxe_miner_v0_0_2() {
         let workflow = include_str!("../.github/workflows/release.yml");
         let version = cargo_package_version(include_str!("../Cargo.toml"));
-        assert_eq!(version, "0.0.1");
+        assert_eq!(version, "0.0.2");
 
         let pattern = release_tag_pattern(workflow);
         assert!(
-            release_tag_matches(&pattern, "pickaxe-miner-v0.0.1"),
+            release_tag_matches(&pattern, "pickaxe-miner-v0.0.2"),
             "{pattern}"
         );
-        assert!(!release_tag_matches(&pattern, "v0.0.1"), "{pattern}");
-        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.1-rc.1"));
+        assert!(!release_tag_matches(&pattern, "v0.0.2"), "{pattern}");
+        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.2-rc.1"));
         assert!(workflow.contains("pickaxe-miner-v*.*.*"));
         assert!(!workflow.lines().any(|line| line.trim() == "- \"v*.*.*\""));
         assert!(workflow.contains("if [[ \"pickaxe-miner-v${version}\" != \"${TAG}\" ]]; then"));
         let tag = format!("pickaxe-miner-v{version}");
-        assert_eq!(tag, "pickaxe-miner-v0.0.1");
+        assert_eq!(tag, "pickaxe-miner-v0.0.2");
         assert_ne!(tag, format!("v{version}"));
 
         assert!(workflow.contains("release_title=\"Pickaxe Miner v${version}\""));
         assert!(workflow.contains("--title \"${release_title}\""));
         let title = format!("Pickaxe Miner v{version}");
-        assert_eq!(title, "Pickaxe Miner v0.0.1");
+        assert_eq!(title, "Pickaxe Miner v0.0.2");
 
         assert!(workflow.contains("pickaxe-miner-v${version}-linux-x86_64"));
         assert!(workflow.contains("pickaxe-miner-v$version-windows-x86_64"));
@@ -1637,6 +1638,7 @@ mod tests {
             height: job.height,
             baton_txid: job.baton_txid.clone(),
             baton_vout: job.baton_vout,
+            job_reward_raw: job.reward_raw,
             nonce: 7,
             digest: [0u8; 32],
             public_key: [0u8; 33],
@@ -1644,6 +1646,10 @@ mod tests {
             transaction: Vec::new(),
         };
         assert!(validate_verified_winner_current(&winner, &cfg, live.as_ref()).is_ok());
+
+        let mut stale_reward = winner.clone();
+        stale_reward.job_reward_raw += 1;
+        assert!(validate_verified_winner_current(&stale_reward, &cfg, live.as_ref()).is_err());
 
         let mut stale_generation = winner.clone();
         stale_generation.generation_id += 1;

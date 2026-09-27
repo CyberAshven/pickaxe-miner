@@ -12,6 +12,9 @@ pub const DONATION_BPS: u16 = 200;
 /// Locked donation payout for distribution builds (BCH cashaddr).
 pub const DONATION_ADDRESS: &str = "bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3";
 
+/// shrec's share of the existing 2% donation.
+pub const SHREC_DONATION_ADDRESS: &str = "bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3";
+
 /// Preferred network transport for explicit submission/diagnostic operations.
 /// PHOTON mining jobs come from the covenant CashToken baton through Fulcrum
 /// until an equivalent node-native indexed query is implemented.
@@ -215,6 +218,12 @@ impl RuntimeConfig {
         let donation = reward_raw.saturating_mul(DONATION_BPS as u128) / 10_000;
         let miner = reward_raw.saturating_sub(donation);
         (miner, donation)
+    }
+
+    /// Divide the existing donation equally; the original recipient gets an odd remainder.
+    pub fn split_donation(donation_raw: u128) -> (u128, u128) {
+        let shrec = donation_raw / 2;
+        (donation_raw - shrec, shrec)
     }
 }
 
@@ -582,5 +591,16 @@ mod tests {
             (4_899_778_337, 99_995_476)
         );
         assert_eq!(applied.intensity, 100);
+    }
+
+    #[test]
+    fn donation_is_shared_equally_with_odd_remainder_to_original_recipient() {
+        assert_eq!(RuntimeConfig::split_donation(0), (0, 0));
+        assert_eq!(RuntimeConfig::split_donation(2), (1, 1));
+        assert_eq!(RuntimeConfig::split_donation(5), (3, 2));
+        let (_, total_donation) = RuntimeConfig::split_reward(4_999_773_813);
+        let (original, shrec) = RuntimeConfig::split_donation(total_donation);
+        assert_eq!(original + shrec, total_donation);
+        assert_eq!(original, shrec);
     }
 }
