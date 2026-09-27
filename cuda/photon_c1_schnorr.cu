@@ -463,6 +463,11 @@ extern "C" __global__ void pickaxe_photon_c1_schnorr_dual_batched(
 }
 
 #ifdef PICKAXE_C1_SCALAR_CHECK
+extern "C" __global__ void pickaxe_field_inverse_check(const Fe* inputs, Fe* outputs, uint32_t count) {
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) feinv(&outputs[index], &inputs[index]);
+}
+
 extern "C" __global__ void pickaxe_scalar_montgomery_check(const uint32_t* es, const uint32_t* table, uint32_t* out, uint32_t count) {
     const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= count) return;

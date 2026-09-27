@@ -324,5 +324,423 @@
       "consensus"
     ]
   },
-  "conclusion": "Both tested candidates pass the correctness gates. The user accepts the fixed-key candidate's measured 2.1% loss on this NVIDIA GPU, conditional on upstream Rust-binding PR #442 merging. Revalidate the merged revision, complete production integration and live stability validation before adoption, then preserve the original engine under reference/legacy-engine-by-cyberashven/. Master and release remain unchanged pending those gates. Other devices remain unvalidated."
+  "conclusion": "Both tested candidates pass the correctness gates. The user accepts the fixed-key candidate's measured 2.1% loss on this NVIDIA GPU, conditional on upstream Rust-binding PR #442 merging. Revalidate the merged revision, complete production integration and live stability validation before adoption, then preserve the original engine under reference/legacy-engine-by-cyberashven/. Master and release remain unchanged pending those gates. Other devices remain unvalidated.",
+  "native_follow_up": {
+    "status": "Stopped when the user required a fully Rust engine. No native optimization PR opened; results do not establish a speedup for a Rust rewrite.",
+    "upstream_base": "73372cec7dc23fee1bac40fae991e3d1ac28bd9d",
+    "a3_commit": "72fade60fd8656457c0cf3114836feebccc3f6df",
+    "a7_change": "Reuse a^7 rather than a^3 in the inversion suffix; local experiment only.",
+    "trials": {
+      "h-point-comparison.json": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1380335616,
+          "million_candidates_per_second": 114.9894130080635,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.0040235,
+          "telemetry_csv": "85, 129.83, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1333420032,
+          "million_candidates_per_second": 111.09467098350265,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 1,
+          "seconds": 12.0025562,
+          "telemetry_csv": "85, 130.46, 2692, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1335681024,
+          "million_candidates_per_second": 111.26140648660798,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 2,
+          "seconds": 12.0048907,
+          "telemetry_csv": "85, 130.25, 2685, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1379205120,
+          "million_candidates_per_second": 114.91993991955852,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0014431,
+          "telemetry_csv": "86, 131.48, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1365639168,
+          "million_candidates_per_second": 113.77713508092867,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0027558,
+          "telemetry_csv": "86, 129.87, 2692, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1350377472,
+          "million_candidates_per_second": 112.50011909182697,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 5,
+          "seconds": 12.0033426,
+          "telemetry_csv": "76, 59.68, 232, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1340203008,
+          "million_candidates_per_second": 111.66219510652735,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 6,
+          "seconds": 12.0022986,
+          "telemetry_csv": "86, 130.55, 2685, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1350377472,
+          "million_candidates_per_second": 112.50922417730256,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0023712,
+          "telemetry_csv": "86, 130.62, 2700, 99"
+        }
+      ],
+      "inverse-a3-comparison.json": [
+        {
+          "kernel": "upstream_before",
+          "million_inversions_per_second": 100.4510324882861,
+          "operations": 200916992,
+          "round": 0,
+          "seconds": 2.0001486
+        },
+        {
+          "kernel": "upstream_after",
+          "million_inversions_per_second": 101.05179288127245,
+          "operations": 202113024,
+          "round": 1,
+          "seconds": 2.0000934
+        },
+        {
+          "kernel": "upstream_after",
+          "million_inversions_per_second": 101.19760773035415,
+          "operations": 202407936,
+          "round": 2,
+          "seconds": 2.0001257
+        },
+        {
+          "kernel": "upstream_before",
+          "million_inversions_per_second": 100.63024623531054,
+          "operations": 201261056,
+          "round": 3,
+          "seconds": 2.0000056
+        },
+        {
+          "kernel": "upstream_before",
+          "million_inversions_per_second": 99.5673279506144,
+          "operations": 199147520,
+          "round": 4,
+          "seconds": 2.0001292
+        },
+        {
+          "kernel": "upstream_after",
+          "million_inversions_per_second": 99.80959131311116,
+          "operations": 199622656,
+          "round": 5,
+          "seconds": 2.0000348
+        },
+        {
+          "kernel": "upstream_after",
+          "million_inversions_per_second": 100.84212837862837,
+          "operations": 201687040,
+          "round": 6,
+          "seconds": 2.0000276
+        },
+        {
+          "kernel": "upstream_before",
+          "million_inversions_per_second": 100.39305028084233,
+          "operations": 200802304,
+          "round": 7,
+          "seconds": 2.0001614
+        }
+      ],
+      "inverse-a3-pipeline-ab.json": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_inverse_before.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1378639872,
+          "million_candidates_per_second": 114.88456510091517,
+          "per_lane": 32,
+          "pipeline": "ultrafast_before",
+          "round": 0,
+          "seconds": 12.0002184,
+          "telemetry_csv": "85, 133.20, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1355464704,
+          "million_candidates_per_second": 112.93635469514355,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 1,
+          "seconds": 12.0020228,
+          "telemetry_csv": "85, 132.26, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1364508672,
+          "million_candidates_per_second": 113.70379246194061,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 2,
+          "seconds": 12.0005555,
+          "telemetry_csv": "75, 16.21, 1387, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_inverse_before.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1344159744,
+          "million_candidates_per_second": 111.98288531686869,
+          "per_lane": 32,
+          "pipeline": "ultrafast_before",
+          "round": 3,
+          "seconds": 12.0032605,
+          "telemetry_csv": "85, 131.38, 2692, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_inverse_before.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1372422144,
+          "million_candidates_per_second": 114.33535284208658,
+          "per_lane": 32,
+          "pipeline": "ultrafast_before",
+          "round": 4,
+          "seconds": 12.0034802,
+          "telemetry_csv": "86, 132.41, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1362812928,
+          "million_candidates_per_second": 113.55115606861764,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 5,
+          "seconds": 12.001753,
+          "telemetry_csv": "86, 132.28, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1364508672,
+          "million_candidates_per_second": 113.69062106579419,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 6,
+          "seconds": 12.0019458,
+          "telemetry_csv": "86, 132.58, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_inverse_before.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1368465408,
+          "million_candidates_per_second": 114.03566512455883,
+          "per_lane": 32,
+          "pipeline": "ultrafast_before",
+          "round": 7,
+          "seconds": 12.0003282,
+          "telemetry_csv": "86, 133.04, 2700, 99"
+        }
+      ],
+      "inverse-a7-comparison.json": [
+        {
+          "kernel": "upstream_before",
+          "million_inversions_per_second": 98.86096839389701,
+          "operations": 197738496,
+          "round": 0,
+          "seconds": 2.0001675
+        },
+        {
+          "kernel": "upstream_after",
+          "million_inversions_per_second": 100.69932173323508,
+          "operations": 201408512,
+          "round": 1,
+          "seconds": 2.000098
+        },
+        {
+          "kernel": "upstream_after",
+          "million_inversions_per_second": 100.43273489372825,
+          "operations": 200867840,
+          "round": 2,
+          "seconds": 2.0000236
+        },
+        {
+          "kernel": "upstream_before",
+          "million_inversions_per_second": 100.06856864013663,
+          "operations": 200146944,
+          "round": 3,
+          "seconds": 2.000098
+        },
+        {
+          "kernel": "upstream_before",
+          "million_inversions_per_second": 100.08822956626955,
+          "operations": 200179712,
+          "round": 4,
+          "seconds": 2.0000325
+        },
+        {
+          "kernel": "upstream_after",
+          "million_inversions_per_second": 100.26371325420835,
+          "operations": 200540160,
+          "round": 5,
+          "seconds": 2.000127
+        },
+        {
+          "kernel": "upstream_after",
+          "million_inversions_per_second": 100.31867523135246,
+          "operations": 200638464,
+          "round": 6,
+          "seconds": 2.0000111
+        },
+        {
+          "kernel": "upstream_before",
+          "million_inversions_per_second": 99.83603424023511,
+          "operations": 199688192,
+          "round": 7,
+          "seconds": 2.0001615
+        }
+      ],
+      "inverse-a7-pipeline-ab.json": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_inverse_before.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1372422144,
+          "million_candidates_per_second": 114.32920561910815,
+          "per_lane": 32,
+          "pipeline": "ultrafast_before",
+          "round": 0,
+          "seconds": 12.0041256,
+          "telemetry_csv": "85, 132.86, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1363378176,
+          "million_candidates_per_second": 113.58970965067338,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 1,
+          "seconds": 12.0026557,
+          "telemetry_csv": "79, 132.31, 2325, 93"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1349246976,
+          "million_candidates_per_second": 112.40056513889554,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 2,
+          "seconds": 12.0039163,
+          "telemetry_csv": "85, 131.74, 2685, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_inverse_before.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1355464704,
+          "million_candidates_per_second": 112.91300822048098,
+          "per_lane": 32,
+          "pipeline": "ultrafast_before",
+          "round": 3,
+          "seconds": 12.0045044,
+          "telemetry_csv": "86, 132.21, 2692, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_inverse_before.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1367900160,
+          "million_candidates_per_second": 113.95008537008779,
+          "per_lane": 32,
+          "pipeline": "ultrafast_before",
+          "round": 4,
+          "seconds": 12.0043803,
+          "telemetry_csv": "86, 132.75, 2692, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1368465408,
+          "million_candidates_per_second": 114.00514488191685,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 5,
+          "seconds": 12.0035408,
+          "telemetry_csv": "86, 130.83, 2685, 98"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_c1_fixed_d.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1367900160,
+          "million_candidates_per_second": 113.96940278073646,
+          "per_lane": 32,
+          "pipeline": "ultrafast",
+          "round": 6,
+          "seconds": 12.0023456,
+          "telemetry_csv": "87, 132.87, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "ultrafast_inverse_before.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1340768256,
+          "million_candidates_per_second": 111.70746587963473,
+          "per_lane": 32,
+          "pipeline": "ultrafast_before",
+          "round": 7,
+          "seconds": 12.0024946,
+          "telemetry_csv": "80, 93.58, 2287, 89"
+        }
+      ]
+    }
+  }
 }

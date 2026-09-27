@@ -12,7 +12,13 @@ Upstream release: `v4.6.0`, commit `540ac5b9c910f089c449177ebf000e4c130cab19`.
 - Upstream contributions may include binding fixes and independently useful PHOTON optimizations, with reproducible evidence. Do not describe a primitive benchmark as a full mining comparison.
 - If a swap is confirmed, preserve the original engine in `reference/legacy-engine-by-cyberashven/`, including source, build instructions, tests, original licensing/attribution, and the exact baseline commit. Until then, keep the original engine active rather than moving it prematurely.
 
-## Decision: conditional upstream adoption; approximately 2% loss accepted
+## Current direction: a fully Rust engine
+
+The user now requires the engine implementation itself, including GPU kernels, in Rust. This supersedes adopting the native C++/CUDA candidate described below. Preserve the native evaluation as a reference; its performance measurements do not establish performance for a Rust rewrite. No native optimization PR was opened. Rust-binding PR #442 is ready for review and remains a separate, useful build fix.
+
+The small native follow-up tried the existing alternate point-addition formula and two equivalent inversion tails that remove one field multiplication. Both inversion tails pass the independent 530-value Rust oracle, 13,920-candidate PHOTON checks, and BCH VM validation; the first also passes all 51 upstream CUDA self-tests. Direct full-pipeline before/after results are -0.30% for the first tail and +0.24% for the second, with overlapping trial ranges. Neither establishes a reliable hashrate improvement. Raw results are retained in `docs/ultrafast-full-pipeline-results.json`.
+
+## Earlier decision: conditional upstream adoption; approximately 2% loss accepted
 
 The initial public-API probes do not settle whether an integrated engine can preserve Pickaxe's performance. The user requested the actual integration and complete-pipeline test before concluding. A candidate now compiles upstream CUDA point, field, and scalar arithmetic into Pickaxe's existing GPU-resident PHOTON pipeline; it retains incremental search, batched inversion, dual-signature filtering, and transaction midstates. Rust continues to own orchestration and independent winner checks. This is a native primitive integration, not a benchmark of host buffer transfers.
 

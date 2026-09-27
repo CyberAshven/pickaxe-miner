@@ -95,6 +95,97 @@ fn check_scalar_products(file: &str) {
 }
 
 #[test]
+#[ignore = "exclusive upstream inversion oracle and before/after kernel comparison"]
+fn incremental_k_ultrafast_inverse_oracle() {
+    let p = (BigUint::from(1u32) << 256) - (BigUint::from(1u32) << 32) - 977u32;
+    let mut values = vec![
+        BigUint::from(0u32),
+        BigUint::from(1u32),
+        &p - 1u32,
+        &p - 2u32,
+    ];
+    for bits in (32..256).step_by(32) {
+        values.push((BigUint::from(1u32) << bits) - 1u32);
+        values.push(BigUint::from(1u32) << bits);
+    }
+    for i in 0..512u32 {
+        values.push(BigUint::from_bytes_be(&Sha256::digest(i.to_le_bytes())) % &p);
+    }
+    let words = |value: &BigUint| {
+        let mut out = value.to_u32_digits();
+        out.resize(8, 0);
+        out
+    };
+    let expected: Vec<Vec<u32>> = values
+        .iter()
+        .map(|x| words(&x.modpow(&(&p - 2u32), &p)))
+        .collect();
+    let count = 16_384u32;
+    let inputs: Vec<u32> = values
+        .iter()
+        .cycle()
+        .take(count as usize)
+        .flat_map(words)
+        .collect();
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let mut inputs_gpu = stream.alloc_zeros::<u32>(inputs.len()).unwrap();
+    let mut output_gpu = stream.alloc_zeros::<u32>(inputs.len()).unwrap();
+    stream.memcpy_htod(&inputs, &mut inputs_gpu).unwrap();
+    let kernels = ["ultrafast_inverse_before.ptx", "ultrafast_c1_fixed_d.ptx"]
+        .map(|file| load_function(&ctx, file, "pickaxe_field_inverse_check").unwrap());
+    let mut records = Vec::new();
+    for (round, index) in [0usize, 1, 1, 0, 0, 1, 1, 0].into_iter().enumerate() {
+        let mut run = || unsafe {
+            stream
+                .launch_builder(&kernels[index])
+                .arg(&inputs_gpu)
+                .arg(&mut output_gpu)
+                .arg(&count)
+                .launch(LaunchConfig {
+                    grid_dim: (count.div_ceil(64), 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+            stream.synchronize().unwrap();
+        };
+        let warm = Instant::now();
+        while warm.elapsed() < Duration::from_millis(500) {
+            run();
+        }
+        let start = Instant::now();
+        let mut operations = 0u64;
+        while start.elapsed() < Duration::from_secs(2) {
+            run();
+            operations += u64::from(count);
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let outputs = stream.clone_dtoh(&output_gpu).unwrap();
+        for (i, result) in outputs.as_chunks::<8>().0.iter().enumerate() {
+            assert_eq!(
+                result.as_slice(),
+                expected[i % values.len()],
+                "kernel={index} vector={i}"
+            );
+        }
+        let record = serde_json::json!({"round":round,"kernel":if index==0 {"upstream_before"} else {"upstream_after"},"operations":operations,"seconds":seconds,"million_inversions_per_second":operations as f64/seconds/1e6});
+        eprintln!("{record}");
+        records.push(record);
+    }
+    std::fs::create_dir_all("artifacts/ultrafast-evaluation").unwrap();
+    std::fs::write(
+        "artifacts/ultrafast-evaluation/inverse-comparison.json",
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
+    eprintln!(
+        "PASS {} independent inversion values, all outputs checked after each trial",
+        values.len()
+    );
+}
+
+#[test]
 #[ignore = "serial C1 comparison; requires old photon_c1_reference.ptx and current kernels"]
 fn incremental_k_c1_comparison() {
     let geometry = std::env::var_os("PICKAXE_COMPARE_GEOMETRY").is_some();
@@ -447,7 +538,13 @@ fn incremental_k_benchmark() {
 #[cfg(feature = "incremental-k")]
 #[ignore = "exclusive complete-pipeline A/B; run both correctness gates first"]
 fn incremental_k_ultrafast_comparison() {
-    compare_upstream("ultrafast_c1.ptx", 32, 16, "full-pipeline-comparison.json");
+    compare_upstream(
+        "ultrafast_c1.ptx",
+        32,
+        16,
+        "full-pipeline-comparison.json",
+        None,
+    );
 }
 
 #[test]
@@ -459,15 +556,38 @@ fn incremental_k_ultrafast_fixed_d_comparison() {
         32,
         16,
         "fixed-d-comparison.json",
+        None,
+    );
+}
+
+#[test]
+#[cfg(feature = "incremental-k")]
+#[ignore = "exclusive upstream before/after full-pipeline comparison"]
+fn incremental_k_ultrafast_inverse_comparison() {
+    compare_upstream(
+        "ultrafast_c1_fixed_d.ptx",
+        32,
+        16,
+        "inverse-pipeline-ab.json",
+        Some("ultrafast_inverse_before.ptx"),
     );
 }
 
 #[cfg(feature = "incremental-k")]
-fn compare_upstream(c1_file: &str, per_lane: u32, c1_per_thread: u32, output: &str) {
+fn compare_upstream(
+    c1_file: &str,
+    per_lane: u32,
+    c1_per_thread: u32,
+    output: &str,
+    reference: Option<&str>,
+) {
     let count = search::CUDA_MAX_BATCH_CANDIDATES;
     let mut engine = CudaPhotonEngine::new(0, count, 8).unwrap();
     engine.enable_incremental_search().unwrap();
     let mut baseline = engine.incremental.take().unwrap();
+    if let Some(file) = reference {
+        baseline.use_upstream_kernels(&mut engine, file).unwrap();
+    }
     let baseline_c1 = engine.stage_c1.clone();
     let mut candidate = Incremental::new(&engine, per_lane).unwrap();
     candidate.c1_per_thread = c1_per_thread;
@@ -493,7 +613,13 @@ fn compare_upstream(c1_file: &str, per_lane: u32, c1_per_thread: u32, output: &s
         .into_iter()
         .enumerate()
     {
-        let pipeline = if upstream { "ultrafast" } else { "pickaxe" };
+        let pipeline = if upstream {
+            "ultrafast"
+        } else if reference.is_some() {
+            "ultrafast_before"
+        } else {
+            "pickaxe"
+        };
         engine.stage_c1 = if upstream {
             upstream_c1.clone()
         } else {
@@ -534,7 +660,7 @@ fn compare_upstream(c1_file: &str, per_lane: u32, c1_per_thread: u32, output: &s
             .output()
             .unwrap();
         assert!(telemetry.status.success());
-        let record = serde_json::json!({"round":round,"pipeline":pipeline,"c1_kernel":if upstream {c1_file} else {"photon_c1_schnorr.ptx"},"per_lane":if upstream {per_lane} else {32},"batch_size":count,"c1_per_thread":incremental.c1_per_thread,"candidates":candidates,"seconds":seconds,"million_candidates_per_second":candidates as f64/seconds/1e6,"telemetry_csv":String::from_utf8_lossy(&telemetry.stdout).trim()});
+        let record = serde_json::json!({"round":round,"pipeline":pipeline,"c1_kernel":if upstream {c1_file} else {reference.unwrap_or("photon_c1_schnorr.ptx")},"per_lane":if upstream {per_lane} else {32},"batch_size":count,"c1_per_thread":incremental.c1_per_thread,"candidates":candidates,"seconds":seconds,"million_candidates_per_second":candidates as f64/seconds/1e6,"telemetry_csv":String::from_utf8_lossy(&telemetry.stdout).trim()});
         eprintln!("{record}");
         records.push(record);
     }
