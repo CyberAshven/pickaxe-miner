@@ -1594,6 +1594,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "incremental-k")]
     fn incremental_live_winner_reconstruction_and_identity_rotation_if_cuda() {
         let sk = [0x11u8; 32];
         let public =
