@@ -5,10 +5,11 @@ name: Release
 #   commit and publish it, unless that tag already exists (no version bump).
 #   A push that only changes Markdown files or docs/ never starts a release
 #   (paths-ignore below; GitHub does not apply path filters to tag pushes).
-# - pull_request to master: dry run of the same build and packaging; nothing
+# - pull_request to master/dev: dry run of the same build and packaging; nothing
 #   is tagged or published.
 # - push of a pickaxe-miner-v* tag, or manual dispatch with an existing tag:
-#   build and publish that tag.
+#   build and publish that tag. Prereleases must be reachable from dev;
+#   stable releases must be reachable from master. Dev pushes never publish.
 on:
   push:
     branches:
@@ -21,6 +22,7 @@ on:
   pull_request:
     branches:
       - master
+      - dev
     paths:
       - ".github/workflows/release.yml"
       - "Cargo.toml"
@@ -28,6 +30,7 @@ on:
       - "cuda/build/**"
       - "tools/build_hip.py"
       - "tools/build-rust-kernels.ps1"
+      - "tools/test_release_channel.py"
       - "rust-engine/**"
       - "protocol/**"
       - "build.rs"
@@ -64,6 +67,7 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || (github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha) }}
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Resolve release tag
         id: release
@@ -142,6 +146,33 @@ jobs:
           fi
 
           echo "Release version: ${version}"
+
+      - name: Verify release channel
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          MODE: ${{ steps.release.outputs.mode }}
+          SHA: ${{ steps.release.outputs.sha }}
+          BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#pickaxe-miner-v}"
+          if [[ "${MODE}" != "publish" && "${BRANCH}" == "master" && "${version}" == *-* ]]; then
+            echo "Remove the prerelease suffix before promoting to master." >&2
+            exit 1
+          fi
+          case "${MODE}" in
+            dry-run|skip) exit 0 ;;
+            create|publish) ;;
+            *) echo "Unknown release mode: ${MODE}" >&2; exit 1 ;;
+          esac
+          channel=master
+          if [[ "${version}" == *-* ]]; then channel=dev; fi
+          git fetch --no-tags origin "${channel}"
+          if ! git merge-base --is-ancestor "${SHA}" FETCH_HEAD; then
+            echo "${TAG} must point to a reviewed commit on ${channel}." >&2
+            exit 1
+          fi
 
   hip-gfx1036:
     name: Build HIP gfx1036 code objects
@@ -514,7 +545,7 @@ jobs:
             cat SHA256SUMS.txt
           } > RELEASE_NOTES.md
           if [[ "${MODE}" == "dry-run" ]]; then
-            echo "Dry run: ${TAG} would be tagged and published on merge to master."
+            echo "Dry run: ${TAG} packaging passed; no tag or release was published."
           fi
 
       - name: Upload release bundle
@@ -571,7 +602,7 @@ jobs:
 
           prerelease_args=()
           if [[ "${version}" == *-* ]]; then
-            prerelease_args+=(--prerelease)
+            prerelease_args+=(--prerelease --latest=false)
           fi
 
           # A new tag is created by the release itself, on the exact commit
@@ -596,7 +627,7 @@ jobs:
 
           if gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
             gh release upload "${TAG}" --repo "${GH_REPO}" "${assets[@]}" --clobber
-            gh release edit "${TAG}" --repo "${GH_REPO}" --target "${SHA}" --notes-file dist/RELEASE_NOTES.md
+            gh release edit "${TAG}" --repo "${GH_REPO}" --target "${SHA}" --notes-file dist/RELEASE_NOTES.md "${prerelease_args[@]}"
           else
             gh release create "${TAG}"               --repo "${GH_REPO}"               "${tag_args[@]}"               --title "${release_title}"               --notes-file dist/RELEASE_NOTES.md               "${prerelease_args[@]}"               "${assets[@]}"
           fi
