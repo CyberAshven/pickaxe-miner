@@ -68,7 +68,31 @@ elapsed time. No compilation or second miner runs during timing. All trials,
 including clock fluctuations, are retained. These are end-to-end mining rates;
 they are not isolated library benchmarks or proof of performance on other GPUs.
 
-Final pinned-package measurements and validation status are recorded separately
-before adoption. Master, release assets and the deployed live binary remain
-unchanged. The fork pin is experimental; upstream acceptance and an upstream
-revision pin are separate adoption steps.
+## Pinned package confirmation
+
+| Final matched session | Baseline MH/s | Port MH/s | Change |
+|---|---:|---:|---:|
+| Original Pickaxe | 114.2391 | 123.1706 | +7.82% |
+| Native upstream at `5536321b` | 115.2049 | 120.4858 | +4.58% |
+
+[Every timed trial and its metadata](upstream-rust-port-results.json) is retained,
+including clock fluctuations. The pinned PTX SHA-256 is
+`b2081dc6a02bf0db86d83fd3b86879901087157ef6ef92ca1f92a449327247da`.
+Both final sessions used this same artifact. The GPU probe, mining oracle and
+VM checks passed again on the pinned package. Pickaxe's all-feature suite passed
+266 tests, with 21 explicit ignores and one physical wgpu test filtered; existing
+CUDA full-pipeline/RFC6979 tests executed on the GPU. Formatting, lint and the
+experimental release build passed locally.
+
+The upstream Rust crate passed Windows/Linux CI and SM 7.5/12.0 compilation.
+The native regression suite produced 437 passing test processes after correcting
+Windows source-cwd and UTF-8 test setup. One optional OpenSSL interoperability
+check remains unavailable (advisory exit 77); optional Python coincurve/noble
+comparisons were unavailable. The original CTest invocation was not fully green,
+and no native source/test policy was altered to hide this limitation.
+
+Master, release assets and the deployed live binary remain unchanged. The
+original single TUI is restored after exclusive tests. The fork pin is
+experimental; upstream acceptance and an upstream revision pin are separate
+adoption steps. This work does not establish a CPU performance improvement or
+replace the existing constant-time Rust signer.
