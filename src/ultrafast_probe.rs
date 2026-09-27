@@ -323,7 +323,7 @@ fn gpu_generator_compatibility_and_throughput() {
             tested_devices += 1;
             for count in [16usize, 4096, 65_536, 262_144] {
                 let mut scalars = vec![0u8; count * 32];
-                for (i, scalar) in scalars.chunks_exact_mut(32).enumerate() {
+                for (i, scalar) in scalars.as_chunks_mut::<32>().0.iter_mut().enumerate() {
                     scalar[24..].copy_from_slice(&(i as u64 + 1).to_be_bytes());
                     if count == 16 && i % 2 == 1 {
                         scalar.copy_from_slice(&Sha256::digest((i as u64).to_be_bytes()));
