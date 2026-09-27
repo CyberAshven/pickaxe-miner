@@ -1,0 +1,23 @@
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = ["AGPL-3.0-only", "Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0"]
+
+[bans]
+# Different compatible dependency trees may need different crate major versions.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-git = ["https://github.com/CyberAshven/UltrafastSecp256k1.git"]

@@ -3,7 +3,8 @@
 Feature branch -> reviewed PR into `dev` -> alpha testing -> reviewed PR into `master`.
 
 Both long-lived branches require one independent approval, passing CI, resolved
-review conversations and up-to-date branches. Code changes need fresh approval.
+review conversations and up-to-date branches. Code changes need fresh approval. The repository owner can bypass the review
+requirement when merging a PR; required CI and resolved conversations still apply.
 Force pushes and deletion are blocked. Use a normal merge commit for `dev` into
 `master` promotions to preserve the shared history.
 

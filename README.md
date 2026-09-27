@@ -150,7 +150,7 @@ The `reference/` directory contains PHOTON reference material used for implement
 
 ## Development
 
-`dev` is the alpha/testing branch; `master` is stable. Changes move through reviewed PRs. See [development and release steps](docs/development.md).
+`dev` is the alpha/testing branch; `master` is stable. Changes move through reviewed PRs. See [development and release steps](docs/development.md) and [Rust security checks](docs/rust-security.md).
 
 ## License
 

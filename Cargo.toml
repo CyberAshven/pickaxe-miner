@@ -24,10 +24,10 @@ num-bigint = "0.4"
 num-traits = "0.2"
 cudarc = { version = "0.19.9", features = ["cuda-12000"] }
 clap = { version = "4.6.7", features = ["derive"] }
-pickaxe-rust-engine = { path = "rust-engine" }
+pickaxe-rust-engine = { path = "rust-engine", version = "0.0.1" }
 rand = "0.9"
 ctrlc = "3.4"
-ratatui = "0.29"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_28", "layout-cache", "underline-color"] }
 crossterm = "0.28"
 libloading = "0.9"
 pollster = { version = "0.4", optional = true }

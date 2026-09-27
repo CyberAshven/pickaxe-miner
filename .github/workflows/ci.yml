@@ -29,7 +29,7 @@ jobs:
         arch: [sm_75, sm_120]
         backend: [pickaxe, upstream]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Install pinned Rust GPU compiler
@@ -47,12 +47,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Install Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
           cache: npm
@@ -73,7 +73,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -112,7 +112,7 @@ jobs:
           cat hip/build/gfx1036/SHA256SUMS.txt
 
       - name: Upload verified gfx1036 code objects
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: hip-gfx1036-${{ github.sha }}
           path: hip/build/gfx1036/
@@ -134,7 +134,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -171,6 +171,11 @@ jobs:
         run: |
           cargo fmt --manifest-path rust-engine/Cargo.toml -- --check
           cargo clippy --locked --manifest-path rust-engine/Cargo.toml --all-targets -- -D warnings
+
+      - name: Rust dependency security policy
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash tools/check-rust-deps.sh
 
       - name: Release build
         run: cargo build --locked --release

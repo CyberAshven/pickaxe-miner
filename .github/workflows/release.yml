@@ -63,7 +63,7 @@ jobs:
 
     steps:
       - name: Checkout release source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || (github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha) }}
           persist-credentials: false
@@ -185,7 +185,7 @@ jobs:
 
     steps:
       - name: Checkout release source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
@@ -222,7 +222,7 @@ jobs:
           cat hip/build/gfx1036/SHA256SUMS.txt
 
       - name: Upload gfx1036 code objects
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: hip-gfx1036-codeobjects
           path: hip/build/gfx1036/
@@ -251,7 +251,7 @@ jobs:
 
     steps:
       - name: Checkout release source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
@@ -262,7 +262,7 @@ jobs:
           rustup default stable
 
       - name: Install Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
           cache: npm
@@ -277,7 +277,7 @@ jobs:
         run: npm test
 
       - name: Download verified gfx1036 HIP code objects
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: hip-gfx1036-codeobjects
           path: hip/build/gfx1036
@@ -488,7 +488,7 @@ jobs:
           Remove-Item -LiteralPath $packageDir -Recurse -Force
 
       - name: Upload packaged binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
@@ -507,7 +507,7 @@ jobs:
 
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: release-*
           path: dist
@@ -549,7 +549,7 @@ jobs:
           fi
 
       - name: Upload release bundle
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-bundle
           path: dist/*
@@ -572,13 +572,13 @@ jobs:
 
     steps:
       - name: Download release bundle
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: release-bundle
           path: dist
 
       - name: Generate build provenance
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: dist/SHA256SUMS.txt
 
