@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn serializer_matches_reference_vector() {
-        let expected = include_str!("../reference/photon_vector_tx.hex").trim();
+        let expected = crate::protocol::MINING_VECTOR_HEX.trim();
         let payout = hex::decode("76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac").unwrap();
         let p = TemplateParams {
             prev_tx_hash_hex: "000000124712ae4765fe9789372faebca19c99cc1d59f43df2508bf5c42ea042"

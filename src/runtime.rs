@@ -347,6 +347,8 @@ impl SettlementState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingSubmission {
     version: u8,
+    #[serde(default = "original_contract_id")]
+    contract_id: String,
     generation_id: u64,
     expected_height: u32,
     expected_baton_txid: String,
@@ -378,6 +380,15 @@ struct ResolvedSubmission {
     observed_baton_txid: String,
     observed_baton_vout: u32,
     reason: String,
+}
+
+// Journals written before profile support belong to the frozen reference identity.
+fn original_contract_id() -> String {
+    format!(
+        "{}:{}",
+        include_str!("../reference/photon_category.hex").trim(),
+        include_str!("../reference/photon_script_hash.hex").trim()
+    )
 }
 
 impl PendingSubmission {
@@ -514,6 +525,7 @@ impl PendingSubmission {
         }
         let pending = Self {
             version: SUBMISSION_JOURNAL_VERSION,
+            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: winner.generation_id,
             expected_height: winner.height,
             expected_baton_txid: winner.baton_txid.clone(),
@@ -539,6 +551,9 @@ impl PendingSubmission {
                 "unsupported pending-submission journal version {}",
                 self.version
             ));
+        }
+        if self.contract_id != crate::protocol::CONTRACT_ID {
+            return Err("pending submission belongs to a different contract profile; preserve it and resolve it with the matching miner before switching".into());
         }
         if self.expected_baton_txid.len() != 64
             || !self
@@ -4875,6 +4890,7 @@ mod tests {
         let settlement_txid = reward::transaction_id(&[2]);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: job.baton_txid.clone(),
@@ -5000,6 +5016,7 @@ mod tests {
         let job = live_job();
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: "11".repeat(32),
@@ -5384,6 +5401,7 @@ mod tests {
         let settlement_txid = reward::transaction_id(&settlement);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: 1,
             expected_height: 1_000,
             expected_baton_txid: "11".repeat(32),
@@ -5415,6 +5433,23 @@ mod tests {
         assert!(!serialized.contains("private"));
         assert!(!serialized.contains("sponsor"));
         assert_eq!(PendingSubmission::load(&path).unwrap(), Some(pending));
+
+        // Old journals retain their original identity; changing profiles fails closed.
+        let mut legacy: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        legacy.as_object_mut().unwrap().remove("contract_id");
+        let restored: PendingSubmission = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(restored.contract_id, original_contract_id());
+        assert_eq!(
+            restored.validate().is_ok(),
+            original_contract_id() == crate::protocol::CONTRACT_ID
+        );
+        legacy["contract_id"] = "different-contract".into();
+        let incompatible = legacy.to_string();
+        fs::write(&path, &incompatible).unwrap();
+        assert!(PendingSubmission::load(&path)
+            .unwrap_err()
+            .contains("different contract"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), incompatible);
 
         PendingSubmission::remove(&path).unwrap();
         assert!(!path.exists());
@@ -5657,6 +5692,7 @@ mod tests {
         let settlement_txid = reward::transaction_id(&[2]);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            contract_id: crate::protocol::CONTRACT_ID.into(),
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: job.baton_txid.clone(),

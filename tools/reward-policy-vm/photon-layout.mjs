@@ -71,9 +71,9 @@ const agePush = (age) => {
   return Uint8Array.of(bytes.length, ...bytes);
 };
 
-const read = (name) => readFileSync(new URL(`../../reference/${name}`, import.meta.url), 'utf8').trim();
-const redeem = hexToBin(read('photon_redeem.hex'));
-const vector = decodeTransactionBch(hexToBin(read('photon_vector_tx.hex')));
+const profile = JSON.parse(readFileSync(new URL('../../protocol/photon.json', import.meta.url), 'utf8'));
+const redeem = hexToBin(profile.redeem_script_hex);
+const vector = decodeTransactionBch(hexToBin(profile.mining_vector_hex));
 if (typeof vector === 'string') throw new Error(vector);
 const covenantLock = vector.outputs[0].lockingBytecode;
 const category = vector.outputs[0].token.category;
@@ -111,7 +111,7 @@ const buildMiningTx = ({ prevTxid, age, publicKey, target, signature, nonce, val
     amount: 2_099_905_002_035_715n,
     reward: 4_999_773_813n,
   });
-  if (Buffer.compare(Buffer.from(rebuilt), Buffer.from(hexToBin(read('photon_vector_tx.hex')))) !== 0) {
+  if (Buffer.compare(Buffer.from(rebuilt), Buffer.from(hexToBin(profile.mining_vector_hex))) !== 0) {
     throw new Error('JS mirror of the Rust PHOTON serializer drifted from the reference vector');
   }
 }

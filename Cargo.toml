@@ -5,7 +5,7 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [features]
-default = []
+default = ["upstream-rust-engine"]
 incremental-k = []
 rust-engine = ["incremental-k"]
 upstream-rust-engine = ["rust-engine", "pickaxe-rust-engine/upstream-rust"]
@@ -35,3 +35,9 @@ wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12"
 
 [dev-dependencies]
 secp256k1 = { version = "0.33.1", features = ["global-context", "rand"] }
+
+[build-dependencies]
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

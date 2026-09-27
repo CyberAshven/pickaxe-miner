@@ -27,6 +27,10 @@ on:
       - "Cargo.lock"
       - "cuda/build/**"
       - "tools/build_hip.py"
+      - "tools/build-rust-kernels.ps1"
+      - "rust-engine/**"
+      - "protocol/**"
+      - "build.rs"
   workflow_dispatch:
     inputs:
       tag:
@@ -247,11 +251,18 @@ jobs:
           name: hip-gfx1036-codeobjects
           path: hip/build/gfx1036
 
+      - name: Install pinned Rust GPU compiler
+        run: rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
+
+      - name: Compile Rust CUDA kernels
+        shell: pwsh
+        run: ./tools/build-rust-kernels.ps1 -Upstream -Architecture sm_120
+
       - name: Release tests
         run: cargo test --locked --release --all-features --no-fail-fast -- --skip if_cuda
 
       - name: Build release
-        run: cargo build --locked --release --features incremental-k
+        run: cargo build --locked --release
 
       - name: Verify interactive TUI binary
         shell: bash
@@ -297,6 +308,7 @@ jobs:
 
           mkdir -p "dist/${package}/cuda/build"
           for artifact in \
+            photon_rust.ptx \
             stage_a_rfc6979.ptx \
             photon_stage_b16.ptx \
             photon_c1_schnorr.ptx \
@@ -324,7 +336,7 @@ jobs:
             echo "Platform: Linux x86_64. This archive is not ARM, ARM64, or macOS."
             echo "Interactive TUI: ./pickaxe mine. Headless: ./pickaxe mine --no-tui."
             echo "NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required."
-            echo "CUDA incremental search and tuned batch geometry are enabled."
+            echo "Rust CUDA arithmetic, incremental search and tuned batch geometry are enabled."
             echo "AMD HIP code objects in hip/build/gfx1036 are gfx1036 only and were built by this workflow."
             echo "No CPU mining fallback. wgpu is not a verified production mining backend in this asset."
           } > "dist/${package}/BACKENDS.txt"
@@ -386,6 +398,7 @@ jobs:
           $cudaDir = Join-Path $packageDir 'cuda\build'
           New-Item -ItemType Directory -Force -Path $cudaDir | Out-Null
           $requiredPtx = @(
+            'photon_rust.ptx',
             'stage_a_rfc6979.ptx',
             'photon_stage_b16.ptx',
             'photon_c1_schnorr.ptx',
@@ -427,7 +440,7 @@ jobs:
             'Platform: Windows x86_64. This archive is not ARM, ARM64, or macOS.'
             'Interactive TUI: .\pickaxe.exe mine. Headless: .\pickaxe.exe mine --no-tui.'
             'NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required.'
-            'CUDA incremental search and tuned batch geometry are enabled.'
+            'Rust CUDA arithmetic, incremental search and tuned batch geometry are enabled.'
             'AMD HIP code objects in hip/build/gfx1036 are gfx1036 only and were built by this workflow.'
             'No CPU mining fallback. wgpu is not a verified production mining backend in this asset.'
           ) | Set-Content -LiteralPath (Join-Path $packageDir 'BACKENDS.txt') -Encoding utf8
@@ -491,7 +504,7 @@ jobs:
             echo "Verified assets are Windows x86_64 and Linux x86_64 only."
             echo "No ARM or ARM64 binary is published."
             echo "Bundled NVIDIA CUDA PTX is sm_120 only."
-            echo "CUDA incremental search and tuned batch geometry are enabled."
+            echo "Rust CUDA arithmetic, incremental search and tuned batch geometry are enabled."
             echo "Bundled AMD HIP code objects are gfx1036 only."
             echo "The default interface is the interactive TUI. Headless mode is --no-tui."
             echo "There is no CPU mining fallback."

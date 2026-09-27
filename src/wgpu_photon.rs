@@ -860,7 +860,7 @@ mod tests {
     use secp256k1::{PublicKey, SecretKey};
 
     fn reference_template_with_target(target: [u8; 32]) -> [u8; TX_BYTES] {
-        let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
+        let raw = hex::decode(crate::protocol::MINING_VECTOR_HEX.trim()).unwrap();
         let mut template: [u8; TX_BYTES] = raw.try_into().unwrap();
         template[390..394].fill(0);
         template[394..426].copy_from_slice(&target);

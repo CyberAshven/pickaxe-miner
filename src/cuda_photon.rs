@@ -660,7 +660,7 @@ mod tests {
     fn transaction_midstate_resumes_to_the_full_transaction_sha256() {
         use sha2::{Digest, Sha256};
 
-        let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
+        let raw = hex::decode(crate::protocol::MINING_VECTOR_HEX.trim()).unwrap();
         let template: [u8; TX_BYTES] = raw.try_into().unwrap();
         let mut state = transaction_midstate(&template);
 
@@ -720,7 +720,7 @@ mod tests {
     }
 
     fn reference_template_with_target(target: [u8; 32]) -> [u8; TX_BYTES] {
-        let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
+        let raw = hex::decode(crate::protocol::MINING_VECTOR_HEX.trim()).unwrap();
         let mut template: [u8; TX_BYTES] = raw.try_into().unwrap();
         template[390..394].fill(0);
         template[394..426].copy_from_slice(&target);

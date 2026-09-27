@@ -82,13 +82,9 @@ const imported = importWalletTemplate(walletTemplateP2pkhNonHd);
 if (typeof imported === 'string') throw new Error(imported);
 const p2pkhCompiler = walletTemplateToCompilerBch(imported);
 
-const referenceHex = readFileSync(
-  new URL('../../reference/photon_vector_tx.hex', import.meta.url),
-  'utf8',
-).trim();
-const redeemScript = hexToBin(
-  readFileSync(new URL('../../reference/photon_redeem.hex', import.meta.url), 'utf8').trim(),
-);
+const profile = JSON.parse(readFileSync(new URL('../../protocol/photon.json', import.meta.url), 'utf8'));
+const referenceHex = profile.mining_vector_hex;
+const redeemScript = hexToBin(profile.redeem_script_hex);
 const parent = decodeTransactionBch(hexToBin(referenceHex));
 if (parent.outputs.length !== 2) {
   throw new Error(`authoritative PHOTON vector has ${parent.outputs.length} outputs`);
@@ -97,6 +93,13 @@ const baton = parent.outputs[0];
 const reward = parent.outputs[1];
 if (baton.token === undefined || reward.token === undefined) {
   throw new Error('authoritative PHOTON vector outputs must carry CashTokens');
+}
+
+const expectedLock = concat(Uint8Array.of(0xaa, 0x20), hash256(redeemScript), Uint8Array.of(0x87));
+if (!bytesEqual(baton.lockingBytecode, expectedLock) ||
+    !bytesEqual(baton.token.category, hexToBin(profile.category_hex)) ||
+    !bytesEqual(reward.token.category, hexToBin(profile.category_hex))) {
+  throw new Error('protocol profile identity does not match its transaction');
 }
 
 const rewardLock = hexToBin('76a914751e76e8199196d454941c45d1b3a323f1433bd688ac');
