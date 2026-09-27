@@ -54,6 +54,41 @@ Headless, from the same directory:
 .\pickaxe.exe mine --no-tui
 ```
 
+## Diagnostic logging
+
+Optional file logging is disabled by default. Set `PICKAXE_TUI_LOG` before starting the interactive TUI to append timestamped events and status snapshots (about every 10 seconds) to a local file. Choose a writable location; its parent directory must already exist. This option does not apply to `--no-tui` mode.
+
+Windows PowerShell, from the extracted release directory:
+
+```powershell
+$env:PICKAXE_TUI_LOG = "$PWD\pickaxe-diagnostic.log"
+.\pickaxe.exe mine
+```
+
+To disable logging for the next launch in that PowerShell session:
+
+```powershell
+Remove-Item Env:PICKAXE_TUI_LOG -ErrorAction SilentlyContinue
+.\pickaxe.exe mine
+```
+
+Linux, from the extracted release directory:
+
+```bash
+PICKAXE_TUI_LOG="$PWD/pickaxe-diagnostic.log" ./pickaxe mine
+```
+
+That Linux command enables logging for that invocation only. If the variable was exported in your shell, remove it before the next launch:
+
+```bash
+unset PICKAXE_TUI_LOG
+./pickaxe mine
+```
+
+Stop the existing miner before relaunching. Changing the variable in a shell does not change a running miner, and a launcher script that sets it will enable logging again. There is no live logging toggle; `/logs` only displays runtime events in the TUI.
+
+Log files are appended to without automatic rotation or a size limit. After an investigation, stop the miner before archiving or deleting the log, and disable logging for subsequent runs.
+
 ## Build
 
 ```bash
