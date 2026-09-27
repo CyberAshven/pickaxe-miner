@@ -29,6 +29,14 @@ const STAGE_C3_FUNCTIONS: [&str; PhotonLayout::MAX_SHIFT + 1] = [
     "pickaxe_stage_c_dual_filter_shift2",
     "pickaxe_stage_c_dual_filter_shift3",
 ];
+
+fn engine_ptx(native: &str) -> &str {
+    if cfg!(feature = "rust-engine") {
+        "photon_rust.ptx"
+    } else {
+        native
+    }
+}
 const POINT_WORDS: usize = 24;
 const FIXED_D_WORDS: usize = 32 * 256 * 8;
 /// Candidates per C1 thread that share one field inversion.
@@ -222,23 +230,56 @@ impl CudaPhotonEngine {
         let ctx =
             CudaContext::new(device_ordinal).map_err(|error| format!("cuda context: {error}"))?;
         let stream = ctx.default_stream();
-        let stage_a = load_function(&ctx, "stage_a_rfc6979.ptx", "pickaxe_stage_a_rfc6979")?;
+        let stage_a = load_function(
+            &ctx,
+            engine_ptx("stage_a_rfc6979.ptx"),
+            "pickaxe_stage_a_rfc6979",
+        )?;
         let stage_b = [
-            load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part0")?,
-            load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part1")?,
-            load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part2")?,
-            load_function(&ctx, "photon_stage_b16.ptx", "pickaxe_photon_b16_part3")?,
+            load_function(
+                &ctx,
+                engine_ptx("photon_stage_b16.ptx"),
+                "pickaxe_photon_b16_part0",
+            )?,
+            load_function(
+                &ctx,
+                engine_ptx("photon_stage_b16.ptx"),
+                "pickaxe_photon_b16_part1",
+            )?,
+            load_function(
+                &ctx,
+                engine_ptx("photon_stage_b16.ptx"),
+                "pickaxe_photon_b16_part2",
+            )?,
+            load_function(
+                &ctx,
+                engine_ptx("photon_stage_b16.ptx"),
+                "pickaxe_photon_b16_part3",
+            )?,
         ];
         let stage_c1 = load_function(
             &ctx,
-            "photon_c1_schnorr.ptx",
+            engine_ptx("photon_c1_schnorr.ptx"),
             "pickaxe_photon_c1_schnorr_dual_batched",
         )?;
+        let filter_names = if cfg!(feature = "rust-engine") {
+            [
+                "pickaxe_stage_c_dual_filter_rfc",
+                "pickaxe_stage_c_dual_filter_rfc_shift1",
+                "pickaxe_stage_c_dual_filter_rfc_shift2",
+                "pickaxe_stage_c_dual_filter_rfc_shift3",
+            ]
+        } else {
+            STAGE_C3_FUNCTIONS
+        };
+        let mut filters = filter_names
+            .into_iter()
+            .map(|name| load_function(&ctx, engine_ptx("photon_c3_dual.ptx"), name));
         let stage_c3 = [
-            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[0])?,
-            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[1])?,
-            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[2])?,
-            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[3])?,
+            filters.next().unwrap()?,
+            filters.next().unwrap()?,
+            filters.next().unwrap()?,
+            filters.next().unwrap()?,
         ];
 
         let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;

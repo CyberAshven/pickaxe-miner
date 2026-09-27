@@ -1,0 +1,17 @@
+[package]
+name = "pickaxe-rust-engine"
+version = "0.0.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["compress"] }
+hmac = { version = "0.12", default-features = false }
+
+[dev-dependencies]
+num-bigint = "0.4"
+secp256k1 = "0.33.1"

@@ -327,6 +327,25 @@ fn incremental_k_correctness() {
 }
 
 #[test]
+#[ignore = "exclusive Rust GPU full-pipeline oracle; synthetic keys only"]
+fn incremental_k_rust_correctness() {
+    check_correctness(Some("photon_rust.ptx"));
+}
+
+#[test]
+#[cfg(feature = "incremental-k")]
+#[ignore = "exclusive Rust GPU comparison; run its correctness gate first"]
+fn incremental_k_rust_comparison() {
+    compare_candidate(
+        "photon_rust.ptx",
+        32,
+        16,
+        "rust-pipeline-comparison.json",
+        None,
+    );
+}
+
+#[test]
 #[ignore = "exclusive full-pipeline upstream CUDA candidate; synthetic keys only"]
 fn incremental_k_ultrafast_correctness() {
     check_correctness(Some("ultrafast_c1.ptx"));
@@ -344,7 +363,7 @@ fn check_correctness(upstream: Option<&str>) {
     let mut incremental = engine.incremental.take().unwrap();
     if let Some(c1_file) = upstream {
         incremental
-            .use_upstream_kernels(&mut engine, c1_file)
+            .use_candidate_kernels(&mut engine, c1_file)
             .unwrap();
     }
     let mut vectors = Vec::new();
@@ -429,7 +448,7 @@ fn check_correctness(upstream: Option<&str>) {
     let mut incremental = engine.incremental.take().unwrap();
     if let Some(c1_file) = upstream {
         incremental
-            .use_upstream_kernels(&mut engine, c1_file)
+            .use_candidate_kernels(&mut engine, c1_file)
             .unwrap();
     }
     let mut target = [255; 32];
@@ -468,6 +487,7 @@ fn check_correctness(upstream: Option<&str>) {
     std::fs::create_dir_all("artifacts/incremental-k").unwrap();
     std::fs::write(
         match upstream {
+            Some("photon_rust.ptx") => "artifacts/incremental-k/rust-vectors.json",
             Some("ultrafast_c1_fixed_d.ptx") => {
                 "artifacts/incremental-k/ultrafast-fixed-d-vectors.json"
             }
@@ -538,7 +558,7 @@ fn incremental_k_benchmark() {
 #[cfg(feature = "incremental-k")]
 #[ignore = "exclusive complete-pipeline A/B; run both correctness gates first"]
 fn incremental_k_ultrafast_comparison() {
-    compare_upstream(
+    compare_candidate(
         "ultrafast_c1.ptx",
         32,
         16,
@@ -551,7 +571,7 @@ fn incremental_k_ultrafast_comparison() {
 #[cfg(feature = "incremental-k")]
 #[ignore = "exclusive complete-pipeline A/B; run fixed-key correctness gate first"]
 fn incremental_k_ultrafast_fixed_d_comparison() {
-    compare_upstream(
+    compare_candidate(
         "ultrafast_c1_fixed_d.ptx",
         32,
         16,
@@ -564,7 +584,7 @@ fn incremental_k_ultrafast_fixed_d_comparison() {
 #[cfg(feature = "incremental-k")]
 #[ignore = "exclusive upstream before/after full-pipeline comparison"]
 fn incremental_k_ultrafast_inverse_comparison() {
-    compare_upstream(
+    compare_candidate(
         "ultrafast_c1_fixed_d.ptx",
         32,
         16,
@@ -574,25 +594,33 @@ fn incremental_k_ultrafast_inverse_comparison() {
 }
 
 #[cfg(feature = "incremental-k")]
-fn compare_upstream(
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "ignored A/B tests must refuse a mislabeled baseline at runtime"
+)]
+fn compare_candidate(
     c1_file: &str,
     per_lane: u32,
     c1_per_thread: u32,
     output: &str,
     reference: Option<&str>,
 ) {
+    assert!(
+        !cfg!(feature = "rust-engine"),
+        "A/B requires --features incremental-k so the baseline retains its native kernels"
+    );
     let count = search::CUDA_MAX_BATCH_CANDIDATES;
     let mut engine = CudaPhotonEngine::new(0, count, 8).unwrap();
     engine.enable_incremental_search().unwrap();
     let mut baseline = engine.incremental.take().unwrap();
     if let Some(file) = reference {
-        baseline.use_upstream_kernels(&mut engine, file).unwrap();
+        baseline.use_candidate_kernels(&mut engine, file).unwrap();
     }
     let baseline_c1 = engine.stage_c1.clone();
     let mut candidate = Incremental::new(&engine, per_lane).unwrap();
     candidate.c1_per_thread = c1_per_thread;
     candidate
-        .use_upstream_kernels(&mut engine, c1_file)
+        .use_candidate_kernels(&mut engine, c1_file)
         .unwrap();
     let upstream_c1 = engine.stage_c1.clone();
     let mut target = [0u8; 32];
@@ -613,7 +641,9 @@ fn compare_upstream(
         .into_iter()
         .enumerate()
     {
-        let pipeline = if upstream {
+        let pipeline = if upstream && c1_file == "photon_rust.ptx" {
+            "rust"
+        } else if upstream {
             "ultrafast"
         } else if reference.is_some() {
             "ultrafast_before"
@@ -735,7 +765,7 @@ fn incremental_k_ultrafast_tuning() {
                 let mut incremental = Incremental::new(&engine, per_lane).unwrap();
                 incremental.c1_per_thread = c1;
                 incremental
-                    .use_upstream_kernels(&mut engine, c1_file)
+                    .use_candidate_kernels(&mut engine, c1_file)
                     .unwrap();
                 incremental.set_message(&engine, &target, NONCE).unwrap();
                 let mut base = 0u32;

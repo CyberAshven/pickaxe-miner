@@ -24,17 +24,28 @@ pub(super) struct Incremental {
 
 impl Incremental {
     #[cfg(test)]
-    pub(super) fn use_upstream_kernels(
+    pub(super) fn use_candidate_kernels(
         &mut self,
         engine: &mut CudaPhotonEngine,
         c1_file: &str,
     ) -> Result<(), String> {
         self.walk = load_function(
             &engine._ctx,
-            "ultrafast_walk.ptx",
+            if c1_file == "photon_rust.ptx" {
+                c1_file
+            } else {
+                "ultrafast_walk.ptx"
+            },
             "pickaxe_photon_incremental_k",
         )?;
-        self.filters = load_filters(engine, "ultrafast_c3.ptx")?;
+        self.filters = load_filters(
+            engine,
+            if c1_file == "photon_rust.ptx" {
+                c1_file
+            } else {
+                "ultrafast_c3.ptx"
+            },
+        )?;
         engine.stage_c1 = load_function(
             &engine._ctx,
             c1_file,
@@ -50,11 +61,11 @@ impl Incremental {
         Ok(Self {
             walk: load_function(
                 &engine._ctx,
-                "photon_incremental_k.ptx",
+                engine_ptx("photon_incremental_k.ptx"),
                 "pickaxe_photon_incremental_k",
             )
             .map_err(|error| error.to_string())?,
-            filters: load_filters(engine, "photon_incremental_c3.ptx")?,
+            filters: load_filters(engine, engine_ptx("photon_incremental_c3.ptx"))?,
             message: engine
                 .stream
                 .alloc_zeros(32)

@@ -1,0 +1,391 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-27",
+  "scope": "GPU kernels only; original CPU implementation retained",
+  "branch": "experiment/rust-engine",
+  "source_base_commit": "9f0e831",
+  "release_baseline_commit": "59c93c17f12244a6a81419fe47df83449f2d530d",
+  "physical_gpu": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+  "tested_architecture": "sm_120",
+  "compile_only_architectures": [
+    "sm_75"
+  ],
+  "gpu_compiler": "nightly-2026-04-02; rustc 1.96.0-nightly; LLVM 22.1.2",
+  "measured_ptx_sha256": "3488509d4e2c7c47b0338427fd4110e0c969ef5eb98b5f7f96c0f246156d1c7f",
+  "protocol": {
+    "order": "ABBAABBA",
+    "warmup_seconds": 45,
+    "settle_seconds": 1,
+    "measured_seconds_per_trial": 12,
+    "batch_candidates": 565248,
+    "candidates_per_walk_lane": 32,
+    "candidates_per_c1_thread": 16,
+    "synthetic_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "age": 10,
+    "target_le_hex": "0000000000000000000000000000000000000000000000000000000001000000",
+    "broadcasts": false,
+    "concurrent_live_miners": 0
+  },
+  "telemetry": {
+    "csv_fields": [
+      "temperature_c",
+      "power_watts",
+      "sm_clock_mhz",
+      "gpu_utilization_percent"
+    ],
+    "sampling": "after each trial, not interval averages; idle gaps appear in some samples"
+  },
+  "validations": {
+    "application_tests_passed": 265,
+    "application_tests_ignored": 18,
+    "application_tests_filtered": 1,
+    "filtered_test": "if_wgpu_present",
+    "kernel_arithmetic_tests_passed": 3,
+    "field_cases": 591,
+    "scalar_point_cases": 260,
+    "independent_gpu_candidates": 13920,
+    "gpu_ages": 8,
+    "gpu_synthetic_keys": 3,
+    "vm_vectors_accepted": 103,
+    "vm_vectors_rejected": 113,
+    "vm_modes": [
+      "standard",
+      "consensus"
+    ]
+  },
+  "acceptance": {
+    "maximum_loss_percent": 2,
+    "performance_pass": false,
+    "promoted_to_master": false,
+    "upstream_rust_engine_pr": false
+  },
+  "limitations": [
+    "NVIDIA only; HIP and WGSL kernels are unchanged",
+    "Short comparisons do not prove long-session stability",
+    "Remote CI has not run",
+    "This is a Pickaxe implementation, not a rewrite of the whole UltrafastSecp256k1 library"
+  ],
+  "runs": [
+    {
+      "stage": "initial",
+      "host": "historical Rust CPU experiment, subsequently reverted",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 114.6042271809829,
+        "rust": 52.99488631286426
+      },
+      "rust_loss_percent": 53.75834939388861,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1387683840,
+          "million_candidates_per_second": 115.60778604221127,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.003377,
+          "telemetry_csv": "84, 132.07, 2722, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 637034496,
+          "million_candidates_per_second": 53.07225265116537,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.0031554,
+          "telemetry_csv": "85, 128.61, 2467, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 644382720,
+          "million_candidates_per_second": 53.67485673597491,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.0052993,
+          "telemetry_csv": "86, 134.10, 2497, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1370726400,
+          "million_candidates_per_second": 114.2228005184667,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0004622,
+          "telemetry_csv": "86, 132.67, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1369595904,
+          "million_candidates_per_second": 114.11593547151153,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0017936,
+          "telemetry_csv": "86, 132.54, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 624599040,
+          "million_candidates_per_second": 52.01879152166351,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.0071809,
+          "telemetry_csv": "86, 131.73, 2475, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 638730240,
+          "million_candidates_per_second": 53.21385157877322,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0030823,
+          "telemetry_csv": "87, 130.67, 2475, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1374117888,
+          "million_candidates_per_second": 114.47023828376417,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0041498,
+          "telemetry_csv": "86, 132.93, 2707, 99"
+        }
+      ]
+    },
+    {
+      "stage": "unrolled_arithmetic",
+      "host": "historical Rust CPU experiment, subsequently reverted",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 113.84633835273534,
+        "rust": 86.08074992104982
+      },
+      "rust_loss_percent": 24.38865301548665,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1383161856,
+          "million_candidates_per_second": 115.23872703885024,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.0025784,
+          "telemetry_csv": "86, 132.34, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1047404544,
+          "million_candidates_per_second": 87.26201357314159,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.0029839,
+          "telemetry_csv": "86, 133.15, 2512, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1010663424,
+          "million_candidates_per_second": 84.21564424824581,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.0008988,
+          "telemetry_csv": "78, 55.06, 952, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1350942720,
+          "million_candidates_per_second": 112.57064909763467,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0008433,
+          "telemetry_csv": "86, 130.22, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1353203712,
+          "million_candidates_per_second": 112.73001558555669,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0039344,
+          "telemetry_csv": "86, 131.29, 2700, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1038925824,
+          "million_candidates_per_second": 86.53072105725936,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.006439,
+          "telemetry_csv": "87, 128.73, 2482, 98"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1036099584,
+          "million_candidates_per_second": 86.31415101288668,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0038206,
+          "telemetry_csv": "86, 127.53, 2475, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1378639872,
+          "million_candidates_per_second": 114.84576229519074,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0042729,
+          "telemetry_csv": "87, 132.76, 2707, 98"
+        }
+      ]
+    },
+    {
+      "stage": "gpu_only",
+      "host": "unchanged original CPU code and dependencies",
+      "aggregate_million_candidates_per_second": {
+        "pickaxe": 113.96052382583461,
+        "rust": 85.34708363850903
+      },
+      "rust_loss_percent": 25.108203460924226,
+      "trials": [
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1389944832,
+          "million_candidates_per_second": 115.80830548477405,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 0,
+          "seconds": 12.002117,
+          "telemetry_csv": "85, 132.04, 2722, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1048535040,
+          "million_candidates_per_second": 87.34730476967823,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 1,
+          "seconds": 12.004206,
+          "telemetry_csv": "76, 18.21, 240, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1013489664,
+          "million_candidates_per_second": 84.45435915307888,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 2,
+          "seconds": 12.0004423,
+          "telemetry_csv": "86, 130.20, 2497, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1361117184,
+          "million_candidates_per_second": 113.41039860489722,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 3,
+          "seconds": 12.0016965,
+          "telemetry_csv": "81, 18.79, 1627, 52"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1356029952,
+          "million_candidates_per_second": 112.99063951556016,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 4,
+          "seconds": 12.0012592,
+          "telemetry_csv": "86, 132.62, 2707, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1014054912,
+          "million_candidates_per_second": 84.50194587693457,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 5,
+          "seconds": 12.0003735,
+          "telemetry_csv": "77, 68.59, 232, 0"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_rust.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1021403136,
+          "million_candidates_per_second": 85.08418406079906,
+          "per_lane": 32,
+          "pipeline": "rust",
+          "round": 6,
+          "seconds": 12.0046181,
+          "telemetry_csv": "87, 132.58, 2512, 99"
+        },
+        {
+          "batch_size": 565248,
+          "c1_kernel": "photon_c1_schnorr.ptx",
+          "c1_per_thread": 16,
+          "candidates": 1363943424,
+          "million_candidates_per_second": 113.63268968852704,
+          "per_lane": 32,
+          "pipeline": "pickaxe",
+          "round": 7,
+          "seconds": 12.0030902,
+          "telemetry_csv": "87, 132.02, 2700, 99"
+        }
+      ]
+    }
+  ]
+}
