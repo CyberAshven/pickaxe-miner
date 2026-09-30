@@ -121,14 +121,20 @@ __device__ bool dual_r_y_is_square(const uint32_t* points, uint32_t candidate) {
     return fe_is_square(&yz);
 }
 
-// The covenant compares ABS(BIN2NUM(HASH256(tx))) < target: the digest is
-// read as a little-endian script number whose top bit is the sign, and ABS
-// drops it, so bit 255 never affects the result.
+// Mainnet compares ABS(BIN2NUM(HASH256(tx))) < target. Chipnet requires a
+// positive ScriptNum and rejects the sign bit before the winner-slot atomic.
 __device__ __forceinline__ bool hash_meets_photon_target_le(
     const uint8_t hash[32],
-    const uint8_t target[32]
+    const uint8_t* target
 ) {
-    const uint8_t top = (uint8_t)(hash[31] & 0x7fu);
+    const bool strict_positive = target[32] != 0u;
+    if (strict_positive && (hash[31] & 0x80u)) return false;
+    if (strict_positive && hash[31] == 0u) {
+        uint8_t nonzero = 0u;
+        for (int i = 0; i < 31; ++i) nonzero |= hash[i];
+        if (nonzero == 0u) return false;
+    }
+    const uint8_t top = strict_positive ? hash[31] : (hash[31] & 0x7fu);
     if (top != target[31]) return top < target[31];
     for (int i = 30; i >= 0; --i) {
         if (hash[i] < target[i]) return true;

@@ -157,7 +157,7 @@ impl T2Engine {
             .alloc_zeros::<u32>(T2_MAX_WINDOWS * if cfg!(feature = "rust-t2") { 16 } else { 8 })
             .map_err(|error| error.to_string())?;
         let target_gpu = stream
-            .alloc_zeros::<u8>(32)
+            .alloc_zeros::<u8>(33)
             .map_err(|error| error.to_string())?;
         let count_gpu = stream
             .alloc_zeros::<u32>(1)
@@ -211,6 +211,7 @@ impl T2Engine {
         target: &[u8; 32],
         total: u128,
         reward: u128,
+        chipnet_signed_target: bool,
     ) -> Result<(), String> {
         let layout = PhotonLayout::for_tx_len(template.len())?;
         tx::t2_reward_amount(total, reward, u16::MAX)?;
@@ -261,8 +262,11 @@ impl T2Engine {
         self.stream
             .memcpy_htod(&middle_schedule, &mut self.middle_schedule_gpu)
             .map_err(|error| error.to_string())?;
+        let mut gpu_target = [0u8; 33];
+        gpu_target[..32].copy_from_slice(target);
+        gpu_target[32] = u8::from(chipnet_signed_target);
         self.stream
-            .memcpy_htod(target, &mut self.target_gpu)
+            .memcpy_htod(&gpu_target, &mut self.target_gpu)
             .map_err(|error| error.to_string())?;
         self.layout = layout;
         self.baton = baton;
@@ -580,6 +584,7 @@ impl T2Live {
         template: &[u8],
         target: &[u8; 32],
         key: &[u8; 32],
+        chipnet_signed_target: bool,
     ) -> Result<(), String> {
         if !Self::supports_job(template)? {
             return Err("T2 job cannot cover the complete 65,536-amount window".into());
@@ -588,8 +593,13 @@ impl T2Live {
         let baton = u64::from_le_bytes(template[491 + shift..499 + shift].try_into().unwrap());
         let reward = u64::from_le_bytes(template[578 + shift..586 + shift].try_into().unwrap());
         let total = u128::from(baton) + u128::from(reward);
-        self.engine
-            .set_template(template, target, total, u128::from(reward))?;
+        self.engine.set_template(
+            template,
+            target,
+            total,
+            u128::from(reward),
+            chipnet_signed_target,
+        )?;
         self.key.fill(0);
         self.key = *key;
         self.template = template.to_vec();
@@ -679,7 +689,7 @@ mod tests {
         for age in [10, 17, 128, 32_768] {
             let template = signed_template(age, target, REWARD);
             engine
-                .set_template(&template, &target, TOTAL, REWARD)
+                .set_template(&template, &target, TOTAL, REWARD, false)
                 .unwrap();
             for j in [0, 1, 255, 256, 65_535] {
                 let actual = engine.probe(j).unwrap();
@@ -710,7 +720,13 @@ mod tests {
             Err(error) => panic!("chipnet T2 GPU setup failed: {error}"),
         };
         engine
-            .set_template(&template, &target, 2_096_937_231_989_870, 4_992_707_694)
+            .set_template(
+                &template,
+                &target,
+                2_096_937_231_989_870,
+                4_992_707_694,
+                false,
+            )
             .unwrap();
         assert_eq!(engine.probe(0).unwrap(), search::hash256(&template));
     }
@@ -720,7 +736,13 @@ mod tests {
         let mut engine = T2Engine::new(0, 65_536, 8).unwrap();
         let target = [0xff; 32];
         engine
-            .set_template(&signed_template(10, target, REWARD), &target, TOTAL, REWARD)
+            .set_template(
+                &signed_template(10, target, REWARD),
+                &target,
+                TOTAL,
+                REWARD,
+                false,
+            )
             .unwrap();
         let result = engine.batch(0, 128).unwrap();
         assert_eq!(result.candidates, 128);
@@ -732,6 +754,45 @@ mod tests {
                 search::hash256(&signed_template(10, target, REWARD - u128::from(winner.j)))
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "tail-grind")]
+    fn chipnet_t2_filter_does_not_let_negative_hashes_fill_winner_buffer_if_cuda_present() {
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        let key = [0x11; 32];
+        let template = signed_template_with_nonce(10, target, REWARD, 0);
+        let baton = u64::try_from(TOTAL - REWARD).unwrap();
+        let reward = u64::try_from(REWARD).unwrap();
+        let digest_at = |j: u32| {
+            let mut tx = template.clone();
+            tx[491..499].copy_from_slice(&(baton + u64::from(j)).to_le_bytes());
+            tx[578..586].copy_from_slice(&(reward - u64::from(j)).to_le_bytes());
+            search::hash256(&tx)
+        };
+        let base = (0..65_528)
+            .find(|base| {
+                (0..8).all(|offset| digest_at(base + offset)[31] & 0x80 != 0)
+                    && digest_at(base + 8)[31] & 0x80 == 0
+            })
+            .expect("fixture has eight negative hashes followed by a positive hash");
+        let mut engine = match CudaPhotonEngine::new(0, 65_536, 1) {
+            Ok(engine) => engine,
+            Err(error) if cuda_unavailable_for_tests(&error) => {
+                eprintln!("skip chipnet signed T2 GPU filter: {error}");
+                return;
+            }
+            Err(error) => panic!("chipnet T2 GPU setup failed: {error}"),
+        };
+        engine.enable_t2_search().unwrap();
+        engine.set_chipnet_target_rule(true);
+        engine.set_job(&template, &target, &key).unwrap();
+        let result = engine.search_batch(base, 9).unwrap();
+        assert_eq!(result.total_winners, 1);
+        assert_eq!(result.winners.len(), 1);
+        assert_eq!(result.winners[0].tail_j, Some((base + 8) as u16));
+        assert_eq!(result.winners[0].digest, digest_at(base + 8));
     }
 
     #[test]
@@ -1014,8 +1075,14 @@ mod tests {
             .unwrap();
         incremental.set_message(&old, &target, NONCE).unwrap();
         let mut t2 = T2Engine::new(0, 65_536, 8).unwrap();
-        t2.set_template(&signed_template(10, target, REWARD), &target, TOTAL, REWARD)
-            .unwrap();
+        t2.set_template(
+            &signed_template(10, target, REWARD),
+            &target,
+            TOTAL,
+            REWARD,
+            false,
+        )
+        .unwrap();
         let mut old_base = 0u32;
         let mut t2_nonce = NONCE;
         let mut records = Vec::new();
@@ -1036,7 +1103,8 @@ mod tests {
                 }
                 _ => {
                     let template = signed_template_with_nonce(10, target, REWARD, t2_nonce);
-                    t2.set_template(&template, &target, TOTAL, REWARD).unwrap();
+                    t2.set_template(&template, &target, TOTAL, REWARD, false)
+                        .unwrap();
                     assert_eq!(t2.batch(0, 65_536).unwrap().candidates, 65_536);
                     t2_nonce = t2_nonce.wrapping_add(1);
                     65_536

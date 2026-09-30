@@ -140,7 +140,7 @@ unsafe fn filter<const SHIFT: usize>(
     }
     let j = base + index;
     let digest = hash::<SHIFT>(tx, prefix, baton, reward, j);
-    if !meets(&digest, &read(target)) {
+    if !meets(&digest, &read(target), *target.add(32) != 0) {
         return;
     }
     let slot = AtomicU32::from_ptr(winner_count).fetch_add(1, Ordering::Relaxed);
@@ -196,10 +196,13 @@ unsafe fn group<const SHIFT: usize>(
     // Broadcast the fixed schedule from block-local shared memory.
     sha256::compress_scheduled(&mut state, &*shared.cast::<[u32; 64]>());
     sha256::compress(&mut state, block::<SHIFT, 9>(tx, baton, reward, j));
-    let Some(digest) = sha256::hash_state_filtered(state, *target.add(31)) else {
+    let strict_positive = *target.add(32) != 0;
+    let Some(digest) =
+        sha256::hash_state_filtered_with_rule(state, *target.add(31), strict_positive)
+    else {
         return;
     };
-    if !meets(&digest, &read(target)) {
+    if !meets(&digest, &read(target), strict_positive) {
         return;
     }
     let slot = AtomicU32::from_ptr(winner_count).fetch_add(1, Ordering::Relaxed);

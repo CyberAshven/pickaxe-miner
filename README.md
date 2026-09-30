@@ -63,6 +63,8 @@ Chipnet mining starts without an external BCH deposit. Pickaxe derives a persist
 
 Optionally, a confirmed token-free Chipnet BCH UTXO at Pickaxe's separate funding address can enable the split immediately. Keep `chipnet-funding.key` safe until all rewards are settled: on Linux it is stored under `${XDG_STATE_HOME:-$HOME/.local/state}/pickaxe-miner/chipnet-funding.key`; on Windows, under `%LOCALAPPDATA%\Pickaxe Miner\chipnet-funding.key`.
 
+In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
+
 ## Diagnostic logging
 
 Optional file logging is disabled by default. Set `PICKAXE_TUI_LOG` before starting the interactive TUI to append timestamped events and status snapshots (about every 10 seconds) to a local file. Choose a writable location; its parent directory must already exist. This option does not apply to `--no-tui` mode.
@@ -101,7 +103,17 @@ Log files are appended to without automatic rotation or a size limit. After an i
 ## Build
 
 Rust is the default CUDA mining backend. Build its GPU kernels with the pinned
-compiler (PowerShell 7), then build the executable with stable Rust:
+nightly compiler, then build the executable with stable Rust.
+
+Linux:
+
+```bash
+rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
+bash tools/build-rust-kernels.sh sm_120
+cargo build --release --locked
+```
+
+Windows PowerShell 7:
 
 ```powershell
 rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker

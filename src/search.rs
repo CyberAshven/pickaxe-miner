@@ -101,8 +101,21 @@ impl PhotonEngine {
         target: &[u8; 32],
         private_key: &[u8; 32],
     ) -> Result<(), String> {
+        self.set_job_for_network(template, target, private_key, MiningNetwork::Mainnet)
+    }
+
+    pub(crate) fn set_job_for_network(
+        &mut self,
+        template: &[u8],
+        target: &[u8; 32],
+        private_key: &[u8; 32],
+        network: MiningNetwork,
+    ) -> Result<(), String> {
         match self {
-            Self::Cuda(engine) => engine.set_job(template, target, private_key),
+            Self::Cuda(engine) => {
+                engine.set_chipnet_target_rule(network == MiningNetwork::Chipnet);
+                engine.set_job(template, target, private_key)
+            }
             Self::Hip(engine) => {
                 engine.set_job(base_layout_template(template, "HIP")?, target, private_key)
             }
@@ -217,6 +230,9 @@ pub struct SearchStats {
     pub rate: f64,
     pub current_rate: f64,
     pub peak_rate: f64,
+    /// Throughput of the last completed GPU batch, excluding host verification.
+    /// Retained while settlement pauses GPU work.
+    pub active_rate: f64,
     pub winners: u64,
     pub rejected_winners: u64,
     /// Every nonce of the current job has been tried and a fresh signing
@@ -419,7 +435,12 @@ fn rotate_search_identity(
     let sk = secret.to_secret_bytes();
     let public_key = PublicKey::from_secret_key(&secret).serialize();
     let prepared = prepare_job(job.clone(), &sk, &public_key)?;
-    engine.set_job(&prepared.template, &prepared.target, &sk)?;
+    engine.set_job_for_network(
+        &prepared.template,
+        &prepared.target,
+        &sk,
+        prepared.job.network,
+    )?;
     Ok((prepared, sk, public_key))
 }
 
@@ -661,6 +682,7 @@ struct WorkerDiagnostics {
     rejected_winners: AtomicU64,
     job_exhausted: AtomicBool,
     key_rotations: AtomicU64,
+    active_rate_bits: AtomicU64,
 }
 
 impl WorkerDiagnostics {
@@ -670,6 +692,15 @@ impl WorkerDiagnostics {
             rejected_winners: AtomicU64::new(0),
             job_exhausted: AtomicBool::new(false),
             key_rotations: AtomicU64::new(0),
+            active_rate_bits: AtomicU64::new(0),
+        }
+    }
+
+    fn record_active_batch(&self, candidates: u32, elapsed: Duration) {
+        if candidates != 0 {
+            let rate = f64::from(candidates) / elapsed.as_secs_f64().max(1e-9);
+            self.active_rate_bits
+                .store(rate.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -690,6 +721,7 @@ impl WorkerDiagnostics {
     }
 
     fn publish(&self, stats: &mut SearchStats) {
+        stats.active_rate = f64::from_bits(self.active_rate_bits.load(Ordering::Relaxed));
         stats.rejected_winners = self.rejected_winners.load(Ordering::Relaxed);
         stats.waiting_for_job = self.job_exhausted.load(Ordering::Relaxed);
         stats.key_rotations = self.key_rotations.load(Ordering::Relaxed);
@@ -769,7 +801,12 @@ fn run_worker(
             match job_rx.try_recv() {
                 Ok(WorkerCommand::ReplaceJob { job, reply }) => {
                     let result = prepare_job(job, &sk, &public_key).and_then(|next| {
-                        engine.set_job(&next.template, &next.target, &sk)?;
+                        engine.set_job_for_network(
+                            &next.template,
+                            &next.target,
+                            &sk,
+                            next.job.network,
+                        )?;
                         generation_id.store(next.job.generation_id, Ordering::Release);
                         prepared = next;
                         nonce_base = if t2_coordinate {
@@ -840,6 +877,10 @@ fn run_worker(
         let batch_size = batch_before_wrap(nonce_base, batch_size);
         let batch_started = Instant::now();
         let batch = engine.search_batch(nonce_base, batch_size);
+        let gpu_elapsed = batch_started.elapsed();
+        if let Ok(ref result) = batch {
+            diagnostics.record_active_batch(result.candidates, gpu_elapsed);
+        }
         let control = absorb_search_batch(&diagnostics, batch, |gpu_winner| {
             verify_gpu_winner(&prepared, &sk, &public_key, gpu_winner)
         });
@@ -1019,7 +1060,12 @@ impl SearchHandle {
         if let PhotonEngine::Cuda(cuda) = &mut engine {
             cuda.enable_incremental_search()?;
         }
-        engine.set_job(&prepared.template, &prepared.target, &sk)?;
+        engine.set_job_for_network(
+            &prepared.template,
+            &prepared.target,
+            &sk,
+            prepared.job.network,
+        )?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(initially_paused));
@@ -1187,6 +1233,7 @@ impl SearchHandle {
             rate: candidates as f64 / elapsed,
             current_rate: 0.0,
             peak_rate: 0.0,
+            active_rate: 0.0,
             winners: self.winners.load(Ordering::Relaxed),
             rejected_winners: 0,
             waiting_for_job: false,
@@ -1282,6 +1329,20 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("HASH256 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn active_gpu_rate_is_measured_before_verification_and_retained_while_paused() {
+        let diagnostics = WorkerDiagnostics::new();
+        diagnostics.record_active_batch(10_000, Duration::from_millis(10));
+        let mut paused = SearchStats {
+            state: MiningState::Paused,
+            current_rate: 0.0,
+            ..SearchStats::default()
+        };
+        diagnostics.publish(&mut paused);
+        assert_eq!(paused.current_rate, 0.0);
+        assert_eq!(paused.active_rate, 1_000_000.0);
     }
 
     #[test]

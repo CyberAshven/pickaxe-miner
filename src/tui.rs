@@ -1074,16 +1074,17 @@ fn append_tui_log(line: &str) {
 
 /// Expected seconds between winners at `rate` candidates/s for a
 /// little-endian hex PHOTON target, if both are known.
-fn expected_winner_seconds(target_le_hex: &str, rate: f64) -> Option<f64> {
+fn expected_winner_seconds(target_le_hex: &str, rate: f64, network: MiningNetwork) -> Option<f64> {
     if rate <= 0.0 {
         return None;
     }
-    win_probability(target_le_hex).map(|probability| 1.0 / (probability * rate))
+    win_probability(target_le_hex, network).map(|probability| 1.0 / (probability * rate))
 }
 
 /// Chance that one candidate wins against a little-endian hex target. The
-/// covenant ignores digest bit 255, so P(win) = target / 2^255.
-fn win_probability(target_le_hex: &str) -> Option<f64> {
+/// mainnet covenant ignores digest bit 255 while chipnet requires a positive
+/// digest. Thus their denominators are 2^255 and 2^256 respectively.
+fn win_probability(target_le_hex: &str, network: MiningNetwork) -> Option<f64> {
     let bytes = hex::decode(target_le_hex.trim()).ok()?;
     if bytes.len() != 32 {
         return None;
@@ -1092,15 +1093,22 @@ fn win_probability(target_le_hex: &str) -> Option<f64> {
         .iter()
         .rev()
         .fold(0.0_f64, |value, byte| value * 256.0 + f64::from(*byte))
-        / 2f64.powi(255);
+        / match network {
+            MiningNetwork::Mainnet => 2f64.powi(255),
+            MiningNetwork::Chipnet => 2f64.powi(256),
+        };
     (probability > 0.0).then_some(probability)
 }
 
 /// Formats the periodic status line for the TUI observation log.
 fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
-    let expected = expected_winner_seconds(&snapshot.photon_target_le, snapshot.search.rate)
-        .map(|seconds| format!("{seconds:.0}"))
-        .unwrap_or_else(|| "n/a".into());
+    let expected = expected_winner_seconds(
+        &snapshot.photon_target_le,
+        snapshot.search.rate,
+        snapshot.network,
+    )
+    .map(|seconds| format!("{seconds:.0}"))
+    .unwrap_or_else(|| "n/a".into());
     format!(
         "status state={:?} waiting_for_job={} key_rotations={} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} expected_winner_s={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} target_le={} endpoint={} last_error={}",
         snapshot.state,
@@ -1196,6 +1204,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         gpu_backend: "cuda".into(),
         gpu_device: 0,
         generation_id: 1,
+        network: MiningNetwork::Mainnet,
         payout_address: "bitcoincash:qbenchmark".into(),
         endpoint: "offline-benchmark".into(),
         height: 1,
@@ -2427,8 +2436,8 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
     let hash_rate = crate::telemetry::format_hash_rate;
 
     let odds = match (
-        win_probability(&snapshot.photon_target_le),
-        expected_winner_seconds(&snapshot.photon_target_le, search.rate),
+        win_probability(&snapshot.photon_target_le, snapshot.network),
+        expected_winner_seconds(&snapshot.photon_target_le, search.rate, snapshot.network),
     ) {
         (Some(probability), Some(seconds)) => format!(
             "1 win per {} hashes · ~{} at avg rate",
@@ -2444,12 +2453,20 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
     vec![
         RuntimeField::new(
             "Hashrate",
-            wrap(format!(
-                "{} · avg {} · peak {}",
-                hash_rate(search.current_rate),
-                hash_rate(search.rate),
-                hash_rate(search.peak_rate)
-            )),
+            wrap(match snapshot.network {
+                MiningNetwork::Chipnet => format!(
+                    "now {} · active GPU {} · wall avg {}",
+                    hash_rate(search.current_rate),
+                    hash_rate(search.active_rate),
+                    hash_rate(search.rate),
+                ),
+                MiningNetwork::Mainnet => format!(
+                    "{} · avg {} · peak {}",
+                    hash_rate(search.current_rate),
+                    hash_rate(search.rate),
+                    hash_rate(search.peak_rate),
+                ),
+            }),
             1,
         ),
         RuntimeField::new(
@@ -3063,6 +3080,7 @@ mod tests {
             gpu_backend: "cuda".into(),
             gpu_device: 0,
             generation_id: 1,
+            network: MiningNetwork::Mainnet,
             payout_address: "bitcoincash:qexample".into(),
             endpoint: "wss://example.test".into(),
             height: 1,
@@ -3494,11 +3512,82 @@ mod tests {
         let mut target = [0u8; 32];
         target[28] = 1;
         let target = hex::encode(target);
-        let seconds = expected_winner_seconds(&target, 2f64.powi(31) / 100.0).unwrap();
+        let seconds =
+            expected_winner_seconds(&target, 2f64.powi(31) / 100.0, MiningNetwork::Mainnet)
+                .unwrap();
         assert!((seconds - 100.0).abs() < 1e-6, "{seconds}");
-        assert!(expected_winner_seconds(&target, 0.0).is_none());
-        assert!(expected_winner_seconds("", 1.0).is_none());
-        assert!(expected_winner_seconds(&"00".repeat(32), 1.0).is_none());
+        assert!(expected_winner_seconds(&target, 0.0, MiningNetwork::Mainnet).is_none());
+        assert!(expected_winner_seconds("", 1.0, MiningNetwork::Mainnet).is_none());
+        assert!(expected_winner_seconds(&"00".repeat(32), 1.0, MiningNetwork::Mainnet).is_none());
+    }
+
+    #[test]
+    fn chipnet_live_target_odds_use_the_full_digest_range() {
+        // The chipnet dashboard showed 1/5.2K for this live target. The
+        // positive-digest covenant actually gives about 1/10.4K.
+        let mut target =
+            hex::decode("000653ac2450dad20d93e4c456b89bb5f915e110e5c3fec49f74cfb564310cfa")
+                .unwrap();
+        target.reverse();
+        let target = hex::encode(target);
+        let probability = win_probability(&target, MiningNetwork::Chipnet).unwrap();
+        let candidates_per_win = 1.0 / probability;
+        assert!(
+            (10_300.0..10_400.0).contains(&candidates_per_win),
+            "{candidates_per_win}"
+        );
+        let mainnet_candidates_per_win =
+            1.0 / win_probability(&target, MiningNetwork::Mainnet).unwrap();
+        assert!((5_100.0..5_300.0).contains(&mainnet_candidates_per_win));
+
+        let mut snapshot = test_snapshot();
+        snapshot.network = MiningNetwork::Chipnet;
+        snapshot.photon_target_le = target;
+        snapshot.search.rate = 1.0e9;
+        let odds = runtime_field_groups(&snapshot, 140)
+            .into_iter()
+            .find(|field| field.lines[0].spans[0].content.starts_with("Odds"))
+            .unwrap();
+        assert!(odds
+            .lines
+            .iter()
+            .any(|line| line.spans[1].content.contains("10.4 K")));
+    }
+
+    #[test]
+    fn paused_runtime_shows_last_active_gpu_rate() {
+        let mut snapshot = test_snapshot();
+        snapshot.network = MiningNetwork::Chipnet;
+        snapshot.state = SupervisorState::Paused;
+        snapshot.search.current_rate = 0.0;
+        snapshot.search.active_rate = 1.23e9;
+        snapshot.search.rate = 928_400.0;
+        let hash_rate = runtime_field_groups(&snapshot, 140)
+            .into_iter()
+            .find(|field| field.lines[0].spans[0].content.starts_with("Hashrate"))
+            .unwrap();
+        let displayed = hash_rate
+            .lines
+            .iter()
+            .map(|line| line.spans[1].content.as_ref())
+            .collect::<String>();
+        assert!(displayed.contains("now 0.00 H/s"), "{displayed}");
+        assert!(displayed.contains("active GPU 1.23 GH/s"), "{displayed}");
+        assert!(displayed.contains("wall avg 928.4 KH/s"), "{displayed}");
+        assert!(!displayed.contains("peak"), "{displayed}");
+
+        snapshot.network = MiningNetwork::Mainnet;
+        let mainnet = runtime_field_groups(&snapshot, 140)
+            .into_iter()
+            .find(|field| field.lines[0].spans[0].content.starts_with("Hashrate"))
+            .unwrap();
+        let displayed = mainnet
+            .lines
+            .iter()
+            .map(|line| line.spans[1].content.as_ref())
+            .collect::<String>();
+        assert!(displayed.contains("avg 928.4 KH/s · peak 0.00 H/s"));
+        assert!(!displayed.contains("active GPU"));
     }
 
     #[test]
@@ -3950,6 +4039,7 @@ mod tests {
             gpu_backend: "cuda".into(),
             gpu_device: 2,
             generation_id: 1,
+            network: MiningNetwork::Mainnet,
             payout_address: "bitcoincash:qexample".into(),
             endpoint: "wss://example.test".into(),
             height: 1,

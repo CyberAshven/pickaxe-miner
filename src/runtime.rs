@@ -1736,7 +1736,7 @@ where
     }
 
     Err(format!(
-        "PHOTON baton lineage exceeded the bounded {BATON_LINEAGE_MAX_STEPS}-transaction recovery window"
+        "PHOTON baton lineage exceeded the bounded {BATON_LINEAGE_MAX_STEPS}-transaction recovery window: live_baton={current_txid}:{current_vout} expected_ancestor={ancestor_txid}:{ancestor_vout} last_cursor={cursor}:0"
     ))
 }
 
@@ -2657,6 +2657,7 @@ pub enum SupervisorState {
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
     pub state: SupervisorState,
+    pub network: MiningNetwork,
     pub gpu_backend: String,
     pub gpu_device: u32,
     pub generation_id: u64,
@@ -2906,6 +2907,7 @@ impl RuntimeSupervisor {
         let shutdown = ShutdownSignal::new(search.pause_handle());
         let initial_snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,
+            network: cfg.network,
             gpu_backend: backend.as_str().into(),
             gpu_device: device_ordinal,
             generation_id: cfg.generation_id,
@@ -4683,6 +4685,7 @@ fn write_snapshot(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     snapshot.state = state;
+    snapshot.network = cfg.network;
     snapshot.generation_id = cfg.generation_id;
     snapshot.payout_address.clone_from(&cfg.payout_address);
     snapshot.endpoint.clone_from(&live.url);
@@ -4764,6 +4767,7 @@ mod tests {
             state,
             elapsed_secs: 0,
             rate: average_rate,
+            active_rate: 0.0,
             current_rate: 0.0,
             peak_rate: 0.0,
             winners: 0,
@@ -6260,6 +6264,41 @@ mod tests {
         })
         .unwrap_err();
         assert!(mismatch.contains("do not match requested txid"));
+    }
+
+    #[test]
+    /// Preserves enough public outpoint context to diagnose an exhausted lineage walk.
+    fn exhausted_baton_lineage_reports_live_ancestor_and_last_cursor() {
+        use std::collections::HashMap;
+
+        let ancestor = "aa".repeat(32);
+        let mut previous = ancestor.clone();
+        let mut first_descendant = String::new();
+        let mut transactions = HashMap::new();
+        for step in 0..=BATON_LINEAGE_MAX_STEPS {
+            let mut raw = hex::decode(transaction_spending(&previous, 0)).unwrap();
+            let locktime_offset = raw.len() - 4;
+            raw[locktime_offset..].copy_from_slice(&((step + 1) as u32).to_le_bytes());
+            let txid = reward::transaction_id(&raw);
+            if step == 0 {
+                first_descendant = txid.clone();
+            }
+            transactions.insert(txid.clone(), hex::encode(raw));
+            previous = txid;
+        }
+        let live = previous;
+        let error = prove_baton_descends_from(&live, 0, &ancestor, 0, &[], |txid| {
+            transactions
+                .get(txid)
+                .cloned()
+                .ok_or_else(|| format!("missing test transaction {txid}"))
+        })
+        .unwrap_err();
+
+        assert!(error.contains("256-transaction recovery window"));
+        assert!(error.contains(&format!("live_baton={live}:0")));
+        assert!(error.contains(&format!("expected_ancestor={ancestor}:0")));
+        assert!(error.contains(&format!("last_cursor={first_descendant}:0")));
     }
 
     #[test]

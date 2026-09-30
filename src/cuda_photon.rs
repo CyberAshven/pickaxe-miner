@@ -104,6 +104,7 @@ pub struct CudaPhotonEngine {
     winner_cap: u32,
     table_source: M29TableSource,
     job_ready: bool,
+    chipnet_signed_target: bool,
     incremental: Option<incremental::Incremental>,
     #[cfg(any(feature = "tail-grind", test))]
     t2: Option<t2::T2Live>,
@@ -279,7 +280,8 @@ impl CudaPhotonEngine {
         drop(table_bytes);
 
         let target_gpu = stream
-            .alloc_zeros::<u8>(32)
+            // The 33rd byte selects chipnet's positive ScriptNum rule.
+            .alloc_zeros::<u8>(33)
             .map_err(|error| format!("alloc target: {error}"))?;
         let private_key_gpu = stream
             .alloc_zeros::<u8>(32)
@@ -348,6 +350,7 @@ impl CudaPhotonEngine {
             winner_cap,
             table_source,
             job_ready: false,
+            chipnet_signed_target: false,
             incremental: None,
             #[cfg(any(feature = "tail-grind", test))]
             t2: None,
@@ -416,7 +419,7 @@ impl CudaPhotonEngine {
     /// Returns the size of persistent CUDA device allocations.
     pub fn persistent_device_bytes(&self) -> usize {
         m29_table::M29_G16_BYTES
-            + 32
+            + 33
             + 32
             + 33
             + FIXED_D_WORDS * std::mem::size_of::<u32>()
@@ -426,6 +429,12 @@ impl CudaPhotonEngine {
             + std::mem::size_of::<u32>()
             + (self.winner_cap as usize) * (4 + 32)
             + if self.incremental.is_some() { 96 } else { 0 }
+    }
+
+    /// Selects chipnet's positive ScriptNum proof rule for the next job.
+    pub fn set_chipnet_target_rule(&mut self, enabled: bool) {
+        self.chipnet_signed_target = enabled;
+        self.job_ready = false;
     }
 
     /// Uploads validated PHOTON job bytes and target to CUDA.
@@ -456,8 +465,11 @@ impl CudaPhotonEngine {
         let public_key = PublicKey::from_secret_key(&secret).serialize();
         let fixed_d = fixed_d_table(private_key);
 
+        let mut gpu_target = [0u8; 33];
+        gpu_target[..32].copy_from_slice(target);
+        gpu_target[32] = u8::from(self.chipnet_signed_target);
         self.stream
-            .memcpy_htod(target, &mut self.target_gpu)
+            .memcpy_htod(&gpu_target, &mut self.target_gpu)
             .map_err(|error| format!("upload target: {error}"))?;
         self.stream
             .memcpy_htod(private_key, &mut self.private_key_gpu)
@@ -498,10 +510,12 @@ impl CudaPhotonEngine {
                         self.t2_value_requested,
                     )?);
                 }
-                self.t2
-                    .as_mut()
-                    .unwrap()
-                    .set_job(template, target, private_key)?;
+                self.t2.as_mut().unwrap().set_job(
+                    template,
+                    target,
+                    private_key,
+                    self.chipnet_signed_target,
+                )?;
             } else {
                 self.t2 = None;
             }
@@ -866,7 +880,7 @@ mod tests {
             Err(error) => panic!("PHOTON CUDA init failed: {error}"),
         };
         let expected = m29_table::M29_G16_BYTES
-            + 32
+            + 33
             + 32
             + 33
             + FIXED_D_WORDS * 4
@@ -1001,6 +1015,48 @@ mod tests {
             assert_ne!(winner.digest, other);
             assert!(seen.insert(winner.nonce));
         }
+    }
+
+    #[test]
+    fn chipnet_gpu_dual_filter_excludes_negative_hashes_if_cuda_present() {
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        let template = reference_template_with_target(target);
+        let mut private_key = [0u8; 32];
+        private_key[31] = 1;
+        let base = 0x2718_0000;
+        let count = 64;
+        let mut engine = match CudaPhotonEngine::new(0, count, count) {
+            Ok(engine) => engine,
+            Err(error) if should_skip_cuda_error(&error) => {
+                eprintln!("skip chipnet GPU dual filter: {error}");
+                return;
+            }
+            Err(error) => panic!("chipnet GPU setup failed: {error}"),
+        };
+        engine.set_chipnet_target_rule(true);
+        engine.set_job(&template, &target, &private_key).unwrap();
+        let result = engine.search_batch(base, count).unwrap();
+        let expected: Vec<_> = (base..base + count)
+            .filter_map(|nonce| {
+                let (digest, _) =
+                    real_and_other_sign_hashes(&template, &target, &private_key, nonce);
+                search::meets_target_le_for_network(
+                    &digest,
+                    &target,
+                    crate::config::MiningNetwork::Chipnet,
+                )
+                .then_some((nonce, digest))
+            })
+            .collect();
+        let mut actual: Vec<_> = result
+            .winners
+            .iter()
+            .map(|winner| (winner.nonce, winner.digest))
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(result.total_winners as usize, expected.len());
+        assert_eq!(actual, expected);
     }
 
     #[test]
