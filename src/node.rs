@@ -201,6 +201,10 @@ pub struct NativePhotonSession {
 /// Runtime capability remains fail-closed until the normalized state is proven
 /// equivalent to the canonical Fulcrum path.
 impl NativePhotonSession {
+    pub fn endpoint(&self) -> &str {
+        &self.url
+    }
+
     /// Connects to a native node using the configured failover order.
     pub fn connect_failover(endpoints: &[String]) -> Result<Self, String> {
         if endpoints.is_empty() {

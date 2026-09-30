@@ -14,6 +14,7 @@ mkdir -p "$staging/$package/cuda/build" dist
 install -m 0755 "$binary" "$staging/$package/pickaxe"
 
 for artifact in \
+  photon_rust.ptx \
   stage_a_rfc6979.ptx \
   photon_stage_b16.ptx \
   photon_c1_schnorr.ptx \
@@ -31,7 +32,7 @@ done
 cat > "$staging/$package/BACKENDS.txt" <<'EOF'
 Pickaxe Miner for Linux x86_64 and NVIDIA sm_120 GPUs.
 CUDA PTX targets sm_120 GPUs.
-This package contains the CUDA kernels it loads.
+The default CUDA T2 backend is Rust. This package contains the kernels it loads.
 HIP and wgpu are not validated or packaged in this local archive.
 No CPU mining fallback is available.
 Set a payout address with --address; no address is built into the binary.

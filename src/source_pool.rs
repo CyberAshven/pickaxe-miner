@@ -309,7 +309,7 @@ impl SourceCatalog {
     /// Adds configured endpoints to the built-in source catalog.
     pub(crate) fn configured(cfg: &crate::config::RuntimeConfig) -> Result<Self, String> {
         let mut catalog = Self::mainnet();
-        if let Some(endpoint) = cfg.fulcrum_url.as_deref() {
+        for endpoint in cfg.custom_fulcrum_endpoints() {
             let built_in = catalog
                 .find_index(SourceKind::Fulcrum, endpoint)
                 .is_some_and(|index| {
@@ -319,7 +319,7 @@ impl SourceCatalog {
                 catalog.add_user(SourceKind::Fulcrum, endpoint, "Configured Fulcrum")?;
             }
         }
-        if let Some(endpoint) = cfg.node_url.as_deref() {
+        for endpoint in cfg.custom_node_endpoints() {
             catalog.add_user(
                 SourceKind::NativeNode,
                 &crate::node::redact_url(endpoint),
@@ -797,7 +797,7 @@ mod tests {
     /// Checks that configured catalog can contain both source kinds.
     fn configured_catalog_can_contain_both_source_kinds() {
         let cfg = crate::config::RuntimeConfig {
-            node_url: Some("http://node.invalid".into()),
+            node_url: Some("http://node1.invalid, http://node2.invalid".into()),
             ..crate::config::RuntimeConfig::default()
         };
         let catalog = SourceCatalog::configured(&cfg).unwrap();
@@ -805,10 +805,14 @@ mod tests {
             .entries()
             .iter()
             .any(|entry| entry.kind == SourceKind::Fulcrum));
-        assert!(catalog
-            .entries()
-            .iter()
-            .any(|entry| entry.kind == SourceKind::NativeNode));
+        assert_eq!(
+            catalog
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind == SourceKind::NativeNode)
+                .count(),
+            2
+        );
     }
 
     #[test]

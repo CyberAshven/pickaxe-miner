@@ -1790,9 +1790,18 @@ mod tests {
         assert_eq!(handle.generation_id(), 2);
     }
 
+    // Winners pause the worker. Control/throughput tests must not race them;
+    // separate GPU winner tests retain their real targets and verification.
+    fn control_job(generation_id: u64) -> MiningJob {
+        MiningJob {
+            target_le_hex: "00".repeat(32),
+            ..integration_job(generation_id)
+        }
+    }
+
     #[test]
     fn gpu_search_handle_replaces_generation_and_keeps_runtime_controls_if_cuda_present() {
-        let handle = match SearchHandle::start(10, integration_job(1)) {
+        let handle = match SearchHandle::start(10, control_job(1)) {
             Ok(handle) => handle,
             Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => {
                 eprintln!("skip integrated PHOTON CUDA SearchHandle test: {error}");
@@ -1811,7 +1820,7 @@ mod tests {
         );
         assert_eq!(handle.generation_id(), 1);
 
-        handle.replace_job(integration_job(2)).unwrap();
+        handle.replace_job(control_job(2)).unwrap();
         assert_eq!(handle.generation_id(), 2);
         handle.set_intensity(25).unwrap();
         assert_eq!(handle.snapshot().intensity, 25);
@@ -1830,7 +1839,7 @@ mod tests {
 
     #[test]
     fn supervised_search_runs_full_back_to_back_batches_if_cuda_present() {
-        let handle = match SearchHandle::start_supervised(30, integration_job(1)) {
+        let handle = match SearchHandle::start_supervised(30, control_job(1)) {
             Ok(handle) => handle,
             Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => {
                 eprintln!("skip supervised PHOTON CUDA continuous-batch test: {error}");
@@ -1845,7 +1854,8 @@ mod tests {
         }
         assert!(
             handle.snapshot().batches >= 2,
-            "supervised GPU worker did not run consecutive batches"
+            "supervised GPU worker did not run consecutive batches: {:?}",
+            handle.snapshot()
         );
 
         let before = handle.snapshot();

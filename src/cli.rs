@@ -4,12 +4,19 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "pickaxe",
-    version,
-    about = "Pickaxe Miner - GPU-only PHOTON miner"
-)]
+#[command(name = "pickaxe", version, about = "Pickaxe Miner - CashToken mining")]
 pub struct Cli {
+    #[arg(long, global = true, value_parser = ["mainnet", "chipnet"], conflicts_with = "chipnet")]
+    pub network: Option<String>,
+
+    /// Shorthand for --network chipnet.
+    #[arg(long, global = true)]
+    pub chipnet: bool,
+
+    /// Token name, category ID, or covenant locking bytecode.
+    #[arg(long, global = true)]
+    pub token: Option<String>,
+
     #[arg(long, global = true, value_parser = ["auto", "cuda", "hip", "wgpu"])]
     pub backend: Option<String>,
 
@@ -20,7 +27,7 @@ pub struct Cli {
         long,
         global = true,
         value_parser = clap::value_parser!(u8).range(10..=100),
-        help = "GPU intensity 10..=100 (mine defaults to 100; benchmark without this flag runs 10/25/50/75/100)"
+        help = "GPU intensity 10..=100 (setup restores a saved profile; otherwise 100; benchmark without this flag runs 10/25/50/75/100)"
     )]
     pub intensity: Option<u8>,
 
@@ -199,5 +206,16 @@ mod tests {
     #[test]
     fn clap_rejects_removed_live_dry_run_flag() {
         assert!(Cli::try_parse_from(["pickaxe", "mine", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn mining_network_and_token_flags_parse_after_command() {
+        let cli =
+            Cli::try_parse_from(["pickaxe", "mine", "--chipnet", "--token", "PHOTON"]).unwrap();
+        assert!(cli.chipnet);
+        assert_eq!(cli.token.as_deref(), Some("PHOTON"));
+        assert!(
+            Cli::try_parse_from(["pickaxe", "mine", "--chipnet", "--network", "mainnet"]).is_err()
+        );
     }
 }

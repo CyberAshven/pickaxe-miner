@@ -5,9 +5,12 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [features]
-default = ["tail-grind"]
+default = ["rust-t2"]
 incremental-k = []
 tail-grind = []
+# Default Rust implementation of the complete CUDA T2 mining path.
+# Legacy CUDA C++: --no-default-features --features tail-grind.
+rust-t2 = ["tail-grind"]
 # GPU V-coordinate diagnostic only; live mining keeps the reward at 700 sats.
 tail-value-grind = ["tail-grind"]
 portable-wgpu = ["dep:pollster", "dep:wgpu"]
@@ -33,3 +36,6 @@ crossterm = "0.28"
 libloading = "0.9"
 pollster = { version = "0.4", optional = true }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }

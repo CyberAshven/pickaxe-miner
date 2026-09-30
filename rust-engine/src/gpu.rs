@@ -9,6 +9,9 @@ use core::arch::nvptx;
 use core::sync::atomic::{AtomicU32, Ordering};
 use sha2::{Digest, Sha256};
 
+#[path = "t2.rs"]
+mod t2;
+
 #[inline(always)]
 fn field(words: [u32; 8]) -> Field {
     #[cfg(feature = "upstream-rust")]

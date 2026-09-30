@@ -159,6 +159,22 @@ fn load_function(
     ptx_name: &str,
     function_name: &str,
 ) -> Result<CudaFunction, String> {
+    #[cfg(feature = "rust-t2")]
+    let rust_function = if ptx_name == "photon_c3_dual.ptx" {
+        function_name.replacen("dual_filter", "dual_filter_rfc", 1)
+    } else {
+        function_name.to_owned()
+    };
+    #[cfg(feature = "rust-t2")]
+    let function_name = rust_function.as_str();
+    // Diagnostic value grinding retains its native kernel. Ordinary T2 mining
+    // and its fallback load only Rust-generated kernels with this feature.
+    #[cfg(feature = "rust-t2")]
+    let ptx_name = if ptx_name == "photon_t2_value.ptx" {
+        ptx_name
+    } else {
+        "photon_rust.ptx"
+    };
     let path = resolve_ptx_path(ptx_name)?;
     let source = std::fs::read_to_string(&path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;

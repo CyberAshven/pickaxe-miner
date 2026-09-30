@@ -1,0 +1,493 @@
+{
+  "date": "2026-09-27",
+  "baseline_tag": "pickaxe-miner-v0.0.2",
+  "baseline_commit": "1d34584a7a92e44491f4739bedde5db827e63a18",
+  "gpu_arch": "sm_120",
+  "driver": "616.92",
+  "host_rust": "1.98.0",
+  "gpu_rust": "nightly-2026-04-02",
+  "final_artifacts": {
+    "cpp": {
+      "pickaxe.exe": "6a8c6b38d2de4efbf0b030efd131d9805e7f8bcce2adcdb54f997fdee0346966",
+      "cuda\\build\\photon_c1_schnorr.ptx": "0ef567e649a4e9d39f52017538f51cda1ecb736ae425917fcb3589c757e7c8a6",
+      "cuda\\build\\photon_c3_dual.ptx": "b9f798758e3aee78201fd099eb127174d76379f4ff5cedb1d7efb0eb10c839c2",
+      "cuda\\build\\photon_incremental_c3.ptx": "bb8b0ae27e41ac6c44e3ee2d44793c548405bc8bb7ecd174f084f1675f28bd4f",
+      "cuda\\build\\photon_incremental_k.ptx": "47a65aafadc65ac7ebfbb5570e2e8612edb51038cfd965feed3e6b8e89600e98",
+      "cuda\\build\\photon_stage_b16.ptx": "82fcee6536d4a0afb2bd212a05fd1b87b3f08e011d71589c67795079aa4f12e0",
+      "cuda\\build\\photon_t2_tail.ptx": "54a2b4a0ddfb2da5520f3eeb115949fb95ebee8e9ffbb0c54589170aa5ca7080",
+      "cuda\\build\\stage_a_rfc6979.ptx": "cb873049c999390bac8ae110a7c529ecb0ece75cfc2951d67d49d0d16920b95b",
+      "cuda\\build\\stage_c_hash.ptx": "67fd9655cbc8a34c5d08c81bff8710e88c64638120477368d5ee278c66e31a04"
+    },
+    "rust": {
+      "pickaxe_miner.exe": "1a7e74498e5b30d27804203deb293fa076b27be93eed4839154a46e971132189",
+      "cuda\\build\\photon_rust.ptx": "7402e93d518f1c89bcb5777a7852e36adc08bf230151aa22f9429fc500a8bcc9"
+    }
+  },
+  "initial_rust_ptx_sha256": "00776132b3f068fc75615e0af0c4279868db2bcab9ae86d1e5459b91cc6d9bf8",
+  "initial_trials": [
+    {
+      "backend": "cpp",
+      "label": "1-cpp",
+      "sha256": "6a8c6b38d2de4efbf0b030efd131d9805e7f8bcce2adcdb54f997fdee0346966",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0070478,
+            "candidates": 31054626816,
+            "batches": 1851,
+            "candidates_per_second": 1552184366.5510712,
+            "candidates_per_watt": 12547720.2687987,
+            "gpu_winners": 338,
+            "telemetry": {
+              "samples": 28,
+              "gpu_utilization_percent": 95.96428571428571,
+              "power_watts": 123.7025,
+              "temperature_c": 81.67857142857143,
+              "vram_used_mib": 255.0,
+              "graphics_clock_mhz": 2508.6785714285716,
+              "memory_clock_mhz": 12715.285714285714,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "rust",
+      "label": "2-rust",
+      "sha256": "1a7e74498e5b30d27804203deb293fa076b27be93eed4839154a46e971132189",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0052231,
+            "candidates": 29712449536,
+            "batches": 1771,
+            "candidates_per_second": 1485234600.3579435,
+            "candidates_per_watt": 12242700.939898115,
+            "gpu_winners": 327,
+            "telemetry": {
+              "samples": 27,
+              "gpu_utilization_percent": 95.74074074074075,
+              "power_watts": 121.31592592592594,
+              "temperature_c": 81.70370370370371,
+              "vram_used_mib": 257.0,
+              "graphics_clock_mhz": 2521.6666666666665,
+              "memory_clock_mhz": 12778.777777777777,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "rust",
+      "label": "3-rust",
+      "sha256": "1a7e74498e5b30d27804203deb293fa076b27be93eed4839154a46e971132189",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0010463,
+            "candidates": 29662117888,
+            "batches": 1768,
+            "candidates_per_second": 1483028309.7739742,
+            "candidates_per_watt": 12066206.452688104,
+            "gpu_winners": 327,
+            "telemetry": {
+              "samples": 29,
+              "gpu_utilization_percent": 96.10344827586206,
+              "power_watts": 122.90758620689653,
+              "temperature_c": 81.96551724137932,
+              "vram_used_mib": 257.0,
+              "graphics_clock_mhz": 2506.551724137931,
+              "memory_clock_mhz": 12759.620689655172,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "cpp",
+      "label": "4-cpp",
+      "sha256": "6a8c6b38d2de4efbf0b030efd131d9805e7f8bcce2adcdb54f997fdee0346966",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0013835,
+            "candidates": 30970740736,
+            "batches": 1846,
+            "candidates_per_second": 1548429924.1599963,
+            "candidates_per_watt": 12522395.033469249,
+            "gpu_winners": 337,
+            "telemetry": {
+              "samples": 28,
+              "gpu_utilization_percent": 95.92857142857143,
+              "power_watts": 123.6528571428571,
+              "temperature_c": 82.25,
+              "vram_used_mib": 255.0,
+              "graphics_clock_mhz": 2544.1785714285716,
+              "memory_clock_mhz": 12715.285714285714,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "cpp",
+      "label": "5-cpp",
+      "sha256": "6a8c6b38d2de4efbf0b030efd131d9805e7f8bcce2adcdb54f997fdee0346966",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0069474,
+            "candidates": 30886854656,
+            "batches": 1841,
+            "candidates_per_second": 1543806460.7497292,
+            "candidates_per_watt": 12329350.88263013,
+            "gpu_winners": 336,
+            "telemetry": {
+              "samples": 28,
+              "gpu_utilization_percent": 99.32142857142857,
+              "power_watts": 125.2139285714286,
+              "temperature_c": 82.75,
+              "vram_used_mib": 255.0,
+              "graphics_clock_mhz": 2560.535714285714,
+              "memory_clock_mhz": 12465.285714285714,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "rust",
+      "label": "6-rust",
+      "sha256": "1a7e74498e5b30d27804203deb293fa076b27be93eed4839154a46e971132189",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0050524,
+            "candidates": 29662117888,
+            "batches": 1768,
+            "candidates_per_second": 1482731326.8122206,
+            "candidates_per_watt": 12243447.118924323,
+            "gpu_winners": 327,
+            "telemetry": {
+              "samples": 27,
+              "gpu_utilization_percent": 95.74074074074075,
+              "power_watts": 121.1040740740741,
+              "temperature_c": 82.14814814814815,
+              "vram_used_mib": 257.0,
+              "graphics_clock_mhz": 2513.6666666666665,
+              "memory_clock_mhz": 12778.777777777777,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    }
+  ],
+  "inlined_trials": [
+    {
+      "backend": "cpp",
+      "label": "1-cpp",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0005178,
+            "candidates": 30735859712,
+            "batches": 1832,
+            "candidates_per_second": 1536753199.0596762,
+            "candidates_per_watt": 12492949.035258828,
+            "gpu_winners": 336,
+            "telemetry": {
+              "samples": 28,
+              "gpu_utilization_percent": 99.46428571428571,
+              "power_watts": 123.00964285714288,
+              "temperature_c": 82.32142857142857,
+              "vram_used_mib": 255.0,
+              "graphics_clock_mhz": 2539.8928571428573,
+              "memory_clock_mhz": 12251.0,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "rust",
+      "label": "2-rust",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0035136,
+            "candidates": 29544677376,
+            "batches": 1761,
+            "candidates_per_second": 1476974393.9384727,
+            "candidates_per_watt": 11879787.607419752,
+            "gpu_winners": 326,
+            "telemetry": {
+              "samples": 30,
+              "gpu_utilization_percent": 95.9,
+              "power_watts": 124.32666666666664,
+              "temperature_c": 82.46666666666667,
+              "vram_used_mib": 319.1333333333333,
+              "graphics_clock_mhz": 2510.0,
+              "memory_clock_mhz": 12734.333333333334,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "rust",
+      "label": "3-rust",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0029715,
+            "candidates": 29460791296,
+            "batches": 1756,
+            "candidates_per_second": 1472820740.4584863,
+            "candidates_per_watt": 12073750.284090774,
+            "gpu_winners": 325,
+            "telemetry": {
+              "samples": 28,
+              "gpu_utilization_percent": 95.71428571428571,
+              "power_watts": 121.98535714285717,
+              "temperature_c": 82.53571428571429,
+              "vram_used_mib": 324.0,
+              "graphics_clock_mhz": 2488.1428571428573,
+              "memory_clock_mhz": 12429.57142857143,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "cpp",
+      "label": "4-cpp",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0062386,
+            "candidates": 30769414144,
+            "batches": 1834,
+            "candidates_per_second": 1537990961.6793234,
+            "candidates_per_watt": 12730433.59141437,
+            "gpu_winners": 336,
+            "telemetry": {
+              "samples": 28,
+              "gpu_utilization_percent": 95.64285714285714,
+              "power_watts": 120.81214285714289,
+              "temperature_c": 83.10714285714286,
+              "vram_used_mib": 322.0,
+              "graphics_clock_mhz": 2521.785714285714,
+              "memory_clock_mhz": 12358.142857142857,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "cpp",
+      "label": "5-cpp",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0097347,
+            "candidates": 30802968576,
+            "batches": 1836,
+            "candidates_per_second": 1539399149.3550386,
+            "candidates_per_watt": 12709440.02439711,
+            "gpu_winners": 336,
+            "telemetry": {
+              "samples": 28,
+              "gpu_utilization_percent": 96.57142857142857,
+              "power_watts": 121.12249999999997,
+              "temperature_c": 83.28571428571429,
+              "vram_used_mib": 321.82142857142856,
+              "graphics_clock_mhz": 2516.785714285714,
+              "memory_clock_mhz": 12393.857142857143,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    },
+    {
+      "backend": "rust",
+      "label": "6-rust",
+      "report": {
+        "status": "PASS",
+        "backend": "cuda",
+        "device": 0,
+        "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+        "table_source": "Cache",
+        "persistent_device_bytes": 84149263,
+        "samples": [
+          {
+            "intensity": 100,
+            "requested_seconds": 20,
+            "elapsed_seconds": 20.0021676,
+            "candidates": 29544677376,
+            "batches": 1761,
+            "candidates_per_second": 1477073783.5433395,
+            "candidates_per_watt": 12236874.462381832,
+            "gpu_winners": 326,
+            "telemetry": {
+              "samples": 28,
+              "gpu_utilization_percent": 95.64285714285714,
+              "power_watts": 120.70678571428574,
+              "temperature_c": 82.96428571428571,
+              "vram_used_mib": 319.0,
+              "graphics_clock_mhz": 2500.4285714285716,
+              "memory_clock_mhz": 12679.57142857143,
+              "fan_percent": null
+            }
+          }
+        ],
+        "matrix_validation": null,
+        "ui_comparison": null,
+        "network_access": false,
+        "broadcast": false
+      }
+    }
+  ]
+}
