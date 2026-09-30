@@ -2,8 +2,8 @@
 //! Owned by Dev Assist. Search consumes MiningJob; no keys.
 //! Runtime winner settlement uses this session for ordered parent/settlement broadcast.
 
-use crate::config::DONATION_BPS;
-use crate::protocol::{derive_photon_state, EXPECTED_SCRIPT_HASH_HEX, MAINNET_CATEGORY_HEX};
+use crate::config::{MiningNetwork, DONATION_BPS};
+use crate::protocol::{derive_photon_state, PhotonDeployment, MAINNET_PHOTON};
 use crate::search::MiningJob;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -62,7 +62,18 @@ pub struct LiveStateSnapshot {
 impl LiveJob {
     /// Converts a verified Fulcrum snapshot into a mining job.
     pub fn to_mining_job(&self, generation_id: u64, payout_address: &str) -> MiningJob {
+        self.to_mining_job_for_network(generation_id, payout_address, MiningNetwork::Mainnet)
+    }
+
+    /// Converts a verified snapshot for the selected network into a mining job.
+    pub fn to_mining_job_for_network(
+        &self,
+        generation_id: u64,
+        payout_address: &str,
+        network: MiningNetwork,
+    ) -> MiningJob {
         MiningJob {
+            network,
             height: self.height,
             baton_txid: self.baton_txid.clone(),
             baton_vout: self.baton_vout,
@@ -109,12 +120,22 @@ pub struct ElectrumSession {
     ws: Ws,
     next_id: u64,
     buf: String,
+    deployment: &'static PhotonDeployment,
 }
 
 impl ElectrumSession {
     /// Ban-safe connect: **one endpoint at a time**, exponential backoff between
     /// tries, never parallel fan-out. Custom URL should already be first in `endpoints`.
     pub fn connect_failover(endpoints: &[String]) -> Result<Self, String> {
+        Self::connect_failover_for_deployment(endpoints, &MAINNET_PHOTON)
+    }
+
+    /// Connects using the selected PHOTON contract deployment.
+    pub fn connect_failover_for_deployment(
+        endpoints: &[String],
+        deployment: &'static PhotonDeployment,
+    ) -> Result<Self, String> {
+        deployment.verify()?;
         if endpoints.is_empty() {
             return Err("no Electrum/Fulcrum endpoints configured".into());
         }
@@ -125,7 +146,7 @@ impl ElectrumSession {
                 thread::sleep(Duration::from_millis(backoff_ms));
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
             }
-            match Self::connect_one(url) {
+            match Self::connect_one(url, deployment) {
                 Ok(s) => return Ok(s),
                 Err(e) => failures.push(format!("{url}: {e}")),
             }
@@ -137,7 +158,7 @@ impl ElectrumSession {
     }
 
     /// Connects to one Fulcrum endpoint and verifies its response.
-    fn connect_one(url_str: &str) -> Result<Self, String> {
+    fn connect_one(url_str: &str, deployment: &'static PhotonDeployment) -> Result<Self, String> {
         let (ws, _resp) = connect(url_str).map_err(|e| format!("connect: {e}"))?;
 
         match ws.get_ref() {
@@ -158,6 +179,7 @@ impl ElectrumSession {
             ws,
             next_id: 1,
             buf: String::new(),
+            deployment,
         };
 
         let ver = session.rpc("server.version", json!(["pickaxe-miner", "1.4.1"]))?;
@@ -258,17 +280,18 @@ impl ElectrumSession {
         let header_before = self.rpc("blockchain.headers.subscribe", json!([]))?;
         let unspent = self.rpc(
             "blockchain.scripthash.listunspent",
-            json!([EXPECTED_SCRIPT_HASH_HEX, "include_tokens"]),
+            json!([self.deployment.script_hash_hex, "include_tokens"]),
         )?;
         let header_after = self.rpc("blockchain.headers.subscribe", json!([]))?;
 
         let tip_hash = stable_fulcrum_tip_hash(&header_before, &header_after)?;
 
-        let job = live_job_from_fulcrum_values(
+        let job = live_job_from_fulcrum_values_for_deployment(
             &self.url,
             self.server_version.clone(),
             &header_after,
             &unspent,
+            self.deployment,
         )?;
         if !job.tip_hash.eq_ignore_ascii_case(&tip_hash) {
             return Err("Fulcrum PHOTON snapshot tip identity is inconsistent".into());
@@ -379,6 +402,23 @@ pub(crate) fn live_job_from_fulcrum_values(
     header: &Value,
     unspent: &Value,
 ) -> Result<LiveJob, String> {
+    live_job_from_fulcrum_values_for_deployment(
+        url,
+        server_version,
+        header,
+        unspent,
+        &MAINNET_PHOTON,
+    )
+}
+
+/// Constructs a PHOTON job using the selected deployment's category.
+pub(crate) fn live_job_from_fulcrum_values_for_deployment(
+    url: &str,
+    server_version: Value,
+    header: &Value,
+    unspent: &Value,
+    deployment: &PhotonDeployment,
+) -> Result<LiveJob, String> {
     let height = header
         .get("height")
         .and_then(Value::as_u64)
@@ -401,7 +441,7 @@ pub(crate) fn live_job_from_fulcrum_values(
                 .pointer("/token_data/nft/capability")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            category == MAINNET_CATEGORY_HEX && capability == "mutable"
+            category == deployment.category_hex && capability == "mutable"
         })
         .collect::<Vec<_>>();
 
@@ -433,6 +473,15 @@ pub(crate) fn live_job_from_fulcrum_values(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
+    if deployment.category_hex == crate::protocol::CHIPNET_CATEGORY_HEX
+        && commitment_hex.len() >= 72
+    {
+        let previous_target = hex::decode(&commitment_hex[8..72])
+            .map_err(|error| format!("invalid Chipnet PHOTON target: {error}"))?;
+        if previous_target.iter().all(|byte| *byte == 0) || previous_target[31] & 0x80 != 0 {
+            return Err("Chipnet PHOTON target must be a positive ScriptNum".into());
+        }
+    }
     let token_amount_str = baton
         .pointer("/token_data/amount")
         .and_then(Value::as_str)
@@ -467,6 +516,75 @@ fn id_matches(v: &Value, id: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chipnet_job_accepts_only_chipnet_baton_category() {
+        let header = json!({
+            "height": 10,
+            "hex": "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c"
+        });
+        let baton = |category: &str, txid: &str| {
+            json!({
+                "tx_hash": txid,
+                "tx_pos": 0,
+                "height": 9,
+                "value": 1000,
+                "token_data": {
+                    "category": category,
+                    "amount": "840001",
+                    "nft": {"capability": "mutable", "commitment": format!("00000000{}", "01".repeat(32))}
+                }
+            })
+        };
+        let mainnet_txid = "11".repeat(32);
+        let chipnet_txid = "22".repeat(32);
+        let unspent = json!([
+            baton(crate::protocol::MAINNET_CATEGORY_HEX, &mainnet_txid),
+            baton(crate::protocol::CHIPNET_CATEGORY_HEX, &chipnet_txid)
+        ]);
+        let chipnet_job = live_job_from_fulcrum_values_for_deployment(
+            "wss://fixture.invalid",
+            json!(["Fulcrum", "1.5"]),
+            &header,
+            &unspent,
+            &crate::protocol::CHIPNET_PHOTON,
+        )
+        .unwrap();
+        assert_eq!(chipnet_job.baton_txid, chipnet_txid);
+        let mainnet_job = live_job_from_fulcrum_values(
+            "wss://fixture.invalid",
+            json!(["Fulcrum", "1.5"]),
+            &header,
+            &unspent,
+        )
+        .unwrap();
+        assert_eq!(mainnet_job.baton_txid, mainnet_txid);
+
+        let mut invalid_target =
+            json!([baton(crate::protocol::CHIPNET_CATEGORY_HEX, &chipnet_txid)]);
+        invalid_target[0]["token_data"]["nft"]["commitment"] =
+            json!(format!("00000000{}80", "00".repeat(31)));
+        let error = live_job_from_fulcrum_values_for_deployment(
+            "wss://fixture.invalid",
+            Value::Null,
+            &header,
+            &invalid_target,
+            &crate::protocol::CHIPNET_PHOTON,
+        )
+        .unwrap_err();
+        assert!(error.contains("positive ScriptNum"), "{error}");
+        invalid_target[0]["token_data"]["nft"]["commitment"] =
+            json!(format!("00000000{}", "00".repeat(32)));
+        let error = live_job_from_fulcrum_values_for_deployment(
+            "wss://fixture.invalid",
+            Value::Null,
+            &header,
+            &invalid_target,
+            &crate::protocol::CHIPNET_PHOTON,
+        )
+        .unwrap_err();
+        assert!(error.contains("positive ScriptNum"), "{error}");
+    }
 
     #[test]
     fn live_job_summary_reports_compiled_donation_policy() {

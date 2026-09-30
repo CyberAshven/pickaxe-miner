@@ -6,8 +6,9 @@
 //! an immutable generation change at the worker's next batch boundary.
 
 use crate::backend::BackendKind;
-use crate::config::{JobSource, RuntimeConfig};
+use crate::config::{JobSource, MiningNetwork, RuntimeConfig};
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
+use crate::funding::FundingWallet;
 use crate::reward;
 use crate::search::VerifiedWinner;
 use crate::search::{
@@ -166,7 +167,9 @@ fn next_periodic_deadline(previous_deadline: Instant, now: Instant, interval: Du
         .unwrap_or_else(|| now + interval)
 }
 const SUBMISSION_JOURNAL_VERSION: u8 = 3;
+const CHIPNET_SUBMISSION_JOURNAL_VERSION: u8 = 4;
 const SUBMISSION_RESOLUTION_VERSION: u8 = 1;
+const CHIPNET_SUBMISSION_RESOLUTION_VERSION: u8 = 2;
 const BATON_LINEAGE_MAX_STEPS: usize = 256;
 const VERIFIED_WINNER_DURABILITY_READY: bool = true;
 
@@ -347,6 +350,12 @@ impl SettlementState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingSubmission {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    funding_outpoint: Option<String>,
     generation_id: u64,
     expected_height: u32,
     expected_baton_txid: String,
@@ -366,6 +375,12 @@ struct PendingSubmission {
 struct ResolvedSubmission {
     version: u8,
     journal_version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    funding_outpoint: Option<String>,
     generation_id: u64,
     expected_height: u32,
     expected_baton_txid: String,
@@ -514,6 +529,9 @@ impl PendingSubmission {
         }
         let pending = Self {
             version: SUBMISSION_JOURNAL_VERSION,
+            network: None,
+            mode: None,
+            funding_outpoint: None,
             generation_id: winner.generation_id,
             expected_height: winner.height,
             expected_baton_txid: winner.baton_txid.clone(),
@@ -532,9 +550,67 @@ impl PendingSubmission {
         Ok(pending)
     }
 
+    /// Builds the chipnet journal only after both signed transactions exist.
+    fn from_funded_split(
+        winner: &VerifiedWinner,
+        split: &reward::PreparedFundedRewardSplit,
+        live: &LiveJob,
+    ) -> Result<Self, String> {
+        let parent_txid = reward::transaction_id(&winner.transaction);
+        if parent_txid != split.parent_txid {
+            return Err("funded split parent txid does not match verified winner".into());
+        }
+        let baton_value = live
+            .baton_value_sats
+            .checked_sub(crate::protocol::CHIPNET_PHOTON.single_input_max_baton_decrease_sats()?)
+            .ok_or("chipnet parent baton value underflow")?;
+        let pending = Self {
+            version: CHIPNET_SUBMISSION_JOURNAL_VERSION,
+            network: Some("chipnet".into()),
+            mode: Some("funded_reward_split".into()),
+            funding_outpoint: Some(format!("{}:{}", split.funding_txid, split.funding_vout)),
+            generation_id: winner.generation_id,
+            expected_height: winner.height,
+            expected_baton_txid: winner.baton_txid.clone(),
+            expected_baton_vout: winner.baton_vout,
+            parent_txid,
+            parent_hex: hex::encode(&winner.transaction),
+            settlement_txid: split.settlement_txid.clone(),
+            settlement_hex: hex::encode(&split.raw_settlement),
+            resulting_baton_txid: split.parent_txid.clone(),
+            resulting_baton_vout: 0,
+            resulting_baton_value_sats: baton_value,
+            miner_token_amount: split.miner_token_amount,
+            donation_token_amount: split
+                .original_donation_token_amount
+                .checked_add(split.shrec_donation_token_amount)
+                .ok_or("chipnet donation token amount overflow")?,
+        };
+        pending.validate()?;
+        Ok(pending)
+    }
+
+    fn is_chipnet_funded(&self) -> bool {
+        self.version == CHIPNET_SUBMISSION_JOURNAL_VERSION
+            && self.network.as_deref() == Some("chipnet")
+            && self.mode.as_deref() == Some("funded_reward_split")
+    }
+
+    fn require_network(&self, network: MiningNetwork) -> Result<(), String> {
+        match network {
+            MiningNetwork::Mainnet if self.version == SUBMISSION_JOURNAL_VERSION => Ok(()),
+            MiningNetwork::Chipnet if self.is_chipnet_funded() => Ok(()),
+            _ => Err(
+                "pending PHOTON submission network or mode does not match mining network".into(),
+            ),
+        }
+    }
+
     /// Validates PendingSubmission state before use by the live mining runtime.
     fn validate(&self) -> Result<(), String> {
-        if self.version != SUBMISSION_JOURNAL_VERSION {
+        if self.version != SUBMISSION_JOURNAL_VERSION
+            && self.version != CHIPNET_SUBMISSION_JOURNAL_VERSION
+        {
             return Err(format!(
                 "unsupported pending-submission journal version {}",
                 self.version
@@ -554,10 +630,39 @@ impl PendingSubmission {
         if self.resulting_baton_vout != 0 {
             return Err("pending submission resulting PHOTON baton must be output 0".into());
         }
-        if self.resulting_baton_txid != self.settlement_txid {
+        if self.version == SUBMISSION_JOURNAL_VERSION
+            && self.resulting_baton_txid != self.settlement_txid
+        {
             return Err(
                 "pending submission resulting baton txid must equal settlement txid".into(),
             );
+        }
+        if self.version == CHIPNET_SUBMISSION_JOURNAL_VERSION {
+            if !self.is_chipnet_funded()
+                || self.resulting_baton_txid != self.parent_txid
+                || self
+                    .funding_outpoint
+                    .as_deref()
+                    .is_none_or(|value| value.is_empty())
+            {
+                return Err(
+                    "chipnet funded journal has invalid network, mode, or funding outpoint".into(),
+                );
+            }
+            let (child_funding_txid, child_funding_vout) =
+                second_input_outpoint(&self.settlement_hex)?;
+            let expected = format!("{child_funding_txid}:{child_funding_vout}");
+            if self.funding_outpoint.as_deref() != Some(expected.as_str()) {
+                return Err(
+                    "chipnet funded journal funding outpoint disagrees with signed child".into(),
+                );
+            }
+            let (first_txid, first_vout) = first_input_outpoint(&self.settlement_hex)?;
+            if first_txid != self.parent_txid || first_vout != 1 {
+                return Err("chipnet funded child must spend the parent reward output 1".into());
+            }
+        } else if self.network.is_some() || self.mode.is_some() || self.funding_outpoint.is_some() {
+            return Err("legacy mainnet journal cannot select chipnet funding".into());
         }
         let reward_amount = self
             .miner_token_amount
@@ -804,8 +909,15 @@ impl ResolvedSubmission {
         }
 
         Ok(Self {
-            version: SUBMISSION_RESOLUTION_VERSION,
+            version: if pending.is_chipnet_funded() {
+                CHIPNET_SUBMISSION_RESOLUTION_VERSION
+            } else {
+                SUBMISSION_RESOLUTION_VERSION
+            },
             journal_version: pending.version,
+            network: pending.network.clone(),
+            mode: pending.mode.clone(),
+            funding_outpoint: pending.funding_outpoint.clone(),
             generation_id: pending.generation_id,
             expected_height: pending.expected_height,
             expected_baton_txid: pending.expected_baton_txid.clone(),
@@ -825,8 +937,15 @@ impl ResolvedSubmission {
     fn from_confirmed(pending: &PendingSubmission, fresh: &LiveJob) -> Result<Self, String> {
         pending.validate()?;
         Ok(Self {
-            version: SUBMISSION_RESOLUTION_VERSION,
+            version: if pending.is_chipnet_funded() {
+                CHIPNET_SUBMISSION_RESOLUTION_VERSION
+            } else {
+                SUBMISSION_RESOLUTION_VERSION
+            },
             journal_version: pending.version,
+            network: pending.network.clone(),
+            mode: pending.mode.clone(),
+            funding_outpoint: pending.funding_outpoint.clone(),
             generation_id: pending.generation_id,
             expected_height: pending.expected_height,
             expected_baton_txid: pending.expected_baton_txid.clone(),
@@ -844,17 +963,34 @@ impl ResolvedSubmission {
 
     /// Validates ResolvedSubmission state before use by the live mining runtime.
     fn validate(&self) -> Result<(), String> {
-        if self.version != SUBMISSION_RESOLUTION_VERSION {
+        if self.version != SUBMISSION_RESOLUTION_VERSION
+            && self.version != CHIPNET_SUBMISSION_RESOLUTION_VERSION
+        {
             return Err(format!(
                 "unsupported resolved-submission version {}",
                 self.version
             ));
         }
-        if self.journal_version != SUBMISSION_JOURNAL_VERSION {
+        if self.journal_version != SUBMISSION_JOURNAL_VERSION
+            && self.journal_version != CHIPNET_SUBMISSION_JOURNAL_VERSION
+        {
             return Err(format!(
                 "resolved submission references unsupported journal version {}",
                 self.journal_version
             ));
+        }
+        if (self.journal_version == SUBMISSION_JOURNAL_VERSION
+            && (self.version != SUBMISSION_RESOLUTION_VERSION
+                || self.network.is_some()
+                || self.mode.is_some()
+                || self.funding_outpoint.is_some()))
+            || (self.journal_version == CHIPNET_SUBMISSION_JOURNAL_VERSION
+                && (self.version != CHIPNET_SUBMISSION_RESOLUTION_VERSION
+                    || self.network.as_deref() != Some("chipnet")
+                    || self.mode.as_deref() != Some("funded_reward_split")
+                    || self.funding_outpoint.is_none()))
+        {
+            return Err("resolved submission network, mode, or version mismatch".into());
         }
         for (label, txid) in [
             ("expected baton", self.expected_baton_txid.as_str()),
@@ -996,33 +1132,31 @@ fn resolve_confirmed_submission(
 }
 
 /// Returns the durable path used for pending submission recovery.
-fn submission_journal_path() -> PathBuf {
+fn submission_journal_path(network: MiningNetwork) -> PathBuf {
+    let file = match network {
+        MiningNetwork::Mainnet => "pending-reward.json",
+        MiningNetwork::Chipnet => "pending-reward-chipnet.json",
+    };
     #[cfg(target_os = "windows")]
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(base)
-            .join("Pickaxe Miner")
-            .join("pending-reward.json");
+        return PathBuf::from(base).join("Pickaxe Miner").join(file);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         if let Some(base) = std::env::var_os("XDG_STATE_HOME") {
-            return PathBuf::from(base)
-                .join("pickaxe-miner")
-                .join("pending-reward.json");
+            return PathBuf::from(base).join("pickaxe-miner").join(file);
         }
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home)
                 .join(".local")
                 .join("state")
                 .join("pickaxe-miner")
-                .join("pending-reward.json");
+                .join(file);
         }
     }
 
-    std::env::temp_dir()
-        .join("pickaxe-miner")
-        .join("pending-reward.json")
+    std::env::temp_dir().join("pickaxe-miner").join(file)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1127,6 +1261,43 @@ fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
         hex::encode(display_hash),
         u32::from_le_bytes([prev_vout[0], prev_vout[1], prev_vout[2], prev_vout[3]]),
     ))
+}
+
+/// Reads the second input of a signed funded reward child.
+fn second_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
+    let raw = hex::decode(raw_tx_hex.trim())
+        .map_err(|error| format!("decode funded child transaction: {error}"))?;
+    let mut offset = 4usize;
+    if read_compact_size(&raw, &mut offset)? != 2 {
+        return Err("funded reward child must have exactly two inputs".into());
+    }
+    for input_index in 0..2 {
+        let txid_wire = raw
+            .get(offset..offset + 32)
+            .ok_or("funded child input txid is truncated")?;
+        offset += 32;
+        let vout_bytes: [u8; 4] = raw
+            .get(offset..offset + 4)
+            .ok_or("funded child input vout is truncated")?
+            .try_into()
+            .map_err(|_| "funded child input vout length error")?;
+        offset += 4;
+        let script_len = usize::try_from(read_compact_size(&raw, &mut offset)?)
+            .map_err(|_| "funded child input script is too long")?;
+        offset = offset
+            .checked_add(script_len)
+            .and_then(|position| position.checked_add(4))
+            .ok_or("funded child input cursor overflow")?;
+        if offset > raw.len() {
+            return Err("funded child input script or sequence is truncated".into());
+        }
+        if input_index == 1 {
+            let mut display = txid_wire.to_vec();
+            display.reverse();
+            return Ok((hex::encode(display), u32::from_le_bytes(vout_bytes)));
+        }
+    }
+    unreachable!("the second input was required above")
 }
 
 /// Follows transaction ancestry to prove descent from the expected baton.
@@ -1353,6 +1524,16 @@ fn broadcast_settlement(
     }
 }
 
+fn require_parent_known_for_child(
+    pending: &PendingSubmission,
+    parent_known: bool,
+) -> Result<(), String> {
+    if pending.is_chipnet_funded() && !parent_known {
+        return Err("chipnet reward child is known but parent acceptance is not yet proven".into());
+    }
+    Ok(())
+}
+
 /// Attempts the journaled parent and settlement submission safely.
 fn attempt_pending_submission(
     session: &mut ElectrumSession,
@@ -1361,11 +1542,20 @@ fn attempt_pending_submission(
     journal_path: &Path,
 ) -> Result<SubmissionAttempt, String> {
     pending.validate()?;
+    pending.require_network(cfg.network)?;
 
     let settlement_known = session.transaction_known(&pending.settlement_txid)?;
     if settlement_known {
+        let parent_known = if pending.is_chipnet_funded() {
+            session.transaction_known(&pending.parent_txid)?
+        } else {
+            true
+        };
+        require_parent_known_for_child(pending, parent_known)?;
         let fresh = session.fetch_live_job()?;
-        if pending.live_baton_precedes_settlement(&fresh) {
+        if pending.expected_baton_is_current(&fresh)
+            || (!pending.is_chipnet_funded() && pending.live_baton_precedes_settlement(&fresh))
+        {
             return Err(
                 "settlement transaction is known; waiting for the live PHOTON baton to advance past this winner"
                     .into(),
@@ -1462,6 +1652,87 @@ fn prepare_pending_submission(
     Ok(pending)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn prepare_chipnet_pending_submission(
+    session: &mut ElectrumSession,
+    winner: &VerifiedWinner,
+    cfg: &RuntimeConfig,
+    live: &LiveJob,
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    settlement: &SettlementState,
+    journal_path: &Path,
+    wallet: &FundingWallet,
+) -> Result<PendingSubmission, String> {
+    if cfg.network != MiningNetwork::Chipnet {
+        return Err("chipnet funded submission cannot run on mainnet".into());
+    }
+    if !winner_matches_live(winner, cfg.generation_id, live) {
+        return Err("verified chipnet winner is stale before funded reward preparation".into());
+    }
+    settlement.ensure_current(cfg.generation_id, live)?;
+    let deployment = cfg.token.photon_deployment(cfg.network);
+    validate_verified_parent_for_deployment(winner, live, reward_public_key, deployment)?;
+    let actual_reward =
+        tx::t2_parent_reward_amount(&winner.transaction, live.token_amount, live.reward_raw)?;
+    let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(cfg)?;
+    let required = chipnet_funding_floor(actual_reward, relay_fee_sats_per_kb)?;
+    let funding = wallet.select_confirmed_utxo(session, required).map_err(|error| {
+        format!("chipnet 98/1/1 reward split needs at least {required} confirmed sats at funding address {}: {error}", wallet.address())
+    })?;
+    ensure_funding_not_previously_spent(journal_path, &funding)?;
+    let split = reward::build_funded_reward_split_with_relay_fee(
+        deployment,
+        &winner.transaction,
+        reward_secret,
+        reward_public_key,
+        &cfg.payout_address,
+        actual_reward,
+        &funding,
+        wallet.secret_key(),
+        relay_fee_sats_per_kb,
+    )?;
+    let pending = PendingSubmission::from_funded_split(winner, &split, live)?;
+    pending.persist_new(journal_path)?;
+    Ok(pending)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_submission_for_network(
+    session: &mut ElectrumSession,
+    winner: &VerifiedWinner,
+    cfg: &RuntimeConfig,
+    live: &LiveJob,
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    settlement: &SettlementState,
+    journal_path: &Path,
+    funding_wallet: Option<&FundingWallet>,
+) -> Result<PendingSubmission, String> {
+    match cfg.network {
+        MiningNetwork::Mainnet => prepare_pending_submission(
+            winner,
+            cfg,
+            live,
+            reward_secret,
+            reward_public_key,
+            settlement,
+            journal_path,
+        ),
+        MiningNetwork::Chipnet => prepare_chipnet_pending_submission(
+            session,
+            winner,
+            cfg,
+            live,
+            reward_secret,
+            reward_public_key,
+            settlement,
+            journal_path,
+            funding_wallet.ok_or("chipnet funding wallet is unavailable")?,
+        ),
+    }
+}
+
 /// Resolves any outstanding submission before allowing new GPU work.
 fn resolve_pending_before_search(
     session: &mut ElectrumSession,
@@ -1471,6 +1742,7 @@ fn resolve_pending_before_search(
     let Some(pending) = PendingSubmission::load(journal_path)? else {
         return Ok(());
     };
+    pending.require_network(cfg.network)?;
 
     match attempt_pending_submission(session, cfg, &pending, journal_path)? {
         SubmissionAttempt::Complete(fresh) => {
@@ -1505,6 +1777,38 @@ fn production_relay_fee_sats_per_kb(cfg: &RuntimeConfig) -> Result<u64, String> 
             "native-node relay-policy preflight failed: {error}"
         )),
     }
+}
+
+/// Exact no-change BCH floor for the two P2PKH inputs and three token outputs.
+fn chipnet_funding_floor(reward_amount: u128, relay_fee_sats_per_kb: u64) -> Result<u64, String> {
+    fn amount_width(value: u128) -> Result<u64, String> {
+        let value = u64::try_from(value).map_err(|_| "reward amount exceeds token encoding")?;
+        Ok(if value < 0xfd {
+            1
+        } else if value <= u16::MAX.into() {
+            3
+        } else if value <= u32::MAX.into() {
+            5
+        } else {
+            9
+        })
+    }
+    let (miner, donation) = RuntimeConfig::split_reward(reward_amount);
+    let (original, shrec) = RuntimeConfig::split_donation(donation);
+    if original == 0 || shrec == 0 {
+        return Err("reward too small for two nonzero 1% donation outputs".into());
+    }
+    // 4-byte version, 2 inputs with fixed 100-byte Schnorr P2PKH scripts,
+    // 3 token P2PKH outputs, output count, and 4-byte locktime.
+    let child_len = 496u64 + amount_width(miner)? + amount_width(original)? + amount_width(shrec)?;
+    let relay_fee = child_len
+        .checked_mul(relay_fee_sats_per_kb)
+        .and_then(|value| value.checked_add(999))
+        .ok_or("funded reward relay fee overflow")?
+        / 1000;
+    (2 * reward::TOKEN_OUTPUT_SATS)
+        .checked_add(relay_fee)
+        .ok_or("funded reward BCH floor overflow".into())
 }
 
 /// Checks the submission journal for recovery hazards on startup.
@@ -1593,6 +1897,7 @@ fn production_preflight(
     reward_public_key: &[u8; 33],
     mining_payout_address: &str,
     journal_path: &Path,
+    funding_wallet: Option<&FundingWallet>,
 ) -> Result<(), String> {
     if !session.transaction_known(&live.baton_txid)? {
         return Err(
@@ -1609,7 +1914,22 @@ fn production_preflight(
         mining_payout_address,
         journal_path,
         relay_fee_sats_per_kb,
-    )
+    )?;
+    if cfg.network == MiningNetwork::Chipnet {
+        let wallet = funding_wallet.ok_or("chipnet funding wallet is unavailable")?;
+        production_preflight_funding(
+            session,
+            cfg,
+            live,
+            reward_secret,
+            reward_public_key,
+            mining_payout_address,
+            wallet,
+            journal_path,
+            relay_fee_sats_per_kb,
+        )?;
+    }
+    Ok(())
 }
 
 /// Requires complete winner recovery support before live mining.
@@ -1644,6 +1964,10 @@ fn production_preflight_local(
         .map_err(|error| format!("compiled donation address is invalid: {error}"))?;
     tx::cashaddr_to_p2pkh_locking(crate::config::SHREC_DONATION_ADDRESS)
         .map_err(|error| format!("compiled shrec donation address is invalid: {error}"))?;
+    if cfg.network == MiningNetwork::Chipnet {
+        tx::cashaddr_to_p2pkh_locking(crate::config::CHIPNET_DONATION_ADDRESS)
+            .map_err(|error| format!("compiled chipnet donation address is invalid: {error}"))?;
+    }
     if crate::config::DONATION_BPS != 200 {
         return Err("compiled donation policy must be exactly 200 basis points".into());
     }
@@ -1659,9 +1983,15 @@ fn production_preflight_local(
         contract_token_amount: live.token_amount,
         reward_raw: live.reward_raw,
     };
-    let layout = tx::PhotonLayout::for_age(live.age)?;
+    let deployment = cfg.token.photon_deployment(cfg.network);
+    deployment.verify()?;
+    let layout = tx::PhotonLayout::for_age_with_deployment(live.age, deployment)?;
     tx::require_covenant_hash_preimage(live.token_amount, live.reward_raw)?;
-    let parent_preview = tx::build_unsigned_reference_preview(&context, mining_payout_address)?;
+    let parent_preview = tx::build_unsigned_reference_preview_for_deployment(
+        &context,
+        mining_payout_address,
+        deployment,
+    )?;
     if parent_preview.len() != layout.tx_bytes() {
         return Err(format!(
             "PHOTON parent builder produced {} bytes; age {} needs {}",
@@ -1674,6 +2004,30 @@ fn production_preflight_local(
     let target_offset = layout.target_offset();
     if parent_preview[target_offset..target_offset + 32] != target {
         return Err("PHOTON parent builder target placement disagrees with the live target".into());
+    }
+
+    if cfg.network == MiningNetwork::Chipnet {
+        if tx::payout_value_sats(&parent_preview)? != reward::TOKEN_OUTPUT_SATS as u16 {
+            return Err(
+                "chipnet parent must pay exactly 700 sats to the intermediate reward key".into(),
+            );
+        }
+        let spend_budget = deployment.single_input_max_baton_decrease_sats()?;
+        let parent_fee = spend_budget
+            .checked_sub(reward::TOKEN_OUTPUT_SATS)
+            .ok_or("chipnet parent reward exceeds covenant spend budget")?;
+        let minimum_fee = u64::try_from(parent_preview.len())
+            .map_err(|_| "parent length overflow")?
+            .checked_mul(relay_fee_sats_per_kb)
+            .and_then(|value| value.checked_add(999))
+            .ok_or("parent relay fee overflow")?
+            / 1000;
+        if parent_fee < minimum_fee {
+            return Err(format!(
+                "chipnet parent relay fee {parent_fee} sats is below required {minimum_fee} sats"
+            ));
+        }
+        return Ok(());
     }
 
     let split = reward::build_self_funded_settlement_with_relay_fee(
@@ -1711,11 +2065,105 @@ fn production_preflight_local(
     Ok(())
 }
 
+fn production_preflight_funding(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    live: &LiveJob,
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    mining_payout_address: &str,
+    wallet: &FundingWallet,
+    journal_path: &Path,
+    relay_fee_sats_per_kb: u64,
+) -> Result<(), String> {
+    let required = chipnet_funding_floor(live.reward_raw, relay_fee_sats_per_kb)?;
+    let funding = wallet.select_confirmed_utxo(session, required).map_err(|error| {
+        format!("chipnet 98/1/1 reward split needs a confirmed token-free BCH UTXO of at least {required} sats at funding address {}: {error}", wallet.address())
+    })?;
+    ensure_funding_not_previously_spent(journal_path, &funding)?;
+    let context = tx::ReferenceJobContext {
+        prev_txid: live.baton_txid.clone(),
+        prev_vout: live.baton_vout,
+        age: live.age,
+        target_le_hex: live.target_le_hex.clone(),
+        contract_value_sats: live.baton_value_sats,
+        contract_token_amount: live.token_amount,
+        reward_raw: live.reward_raw,
+    };
+    let preview = tx::build_unsigned_reference_preview_for_deployment(
+        &context,
+        mining_payout_address,
+        cfg.token.photon_deployment(cfg.network),
+    )?;
+    let split = reward::build_funded_reward_split_with_relay_fee(
+        cfg.token.photon_deployment(cfg.network),
+        &preview,
+        reward_secret,
+        reward_public_key,
+        &cfg.payout_address,
+        live.reward_raw,
+        &funding,
+        wallet.secret_key(),
+        relay_fee_sats_per_kb,
+    )
+    .map_err(|error| {
+        format!(
+            "chipnet funding preflight at {} failed: {error}",
+            wallet.address()
+        )
+    })?;
+    let (miner, donation) = RuntimeConfig::split_reward(live.reward_raw);
+    let (original, shrec) = RuntimeConfig::split_donation(donation);
+    if split.miner_token_amount != miner
+        || split.original_donation_token_amount != original
+        || split.shrec_donation_token_amount != shrec
+        || split.fee_sats < split.required_relay_fee_sats
+    {
+        return Err(
+            "chipnet funded reward preflight failed exact 98/1/1 or relay fee accounting".into(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_funding_not_previously_spent(
+    journal_path: &Path,
+    funding: &reward::ConfirmedFundingUtxo,
+) -> Result<(), String> {
+    let Some(resolved) = ResolvedSubmission::load(journal_path)? else {
+        return Ok(());
+    };
+    let selected = format!("{}:{}", funding.txid, funding.vout);
+    if resolved.network.as_deref() == Some("chipnet")
+        && resolved.reason == "confirmed"
+        && resolved.funding_outpoint.as_deref() == Some(selected.as_str())
+    {
+        return Err(format!(
+            "chipnet funding UTXO {selected} was spent by the last reward split; waiting for a fresh confirmed UTXO"
+        ));
+    }
+    Ok(())
+}
+
 /// Checks that the parent transaction matches verified baton evidence.
 fn validate_verified_parent(
     winner: &VerifiedWinner,
     live: &LiveJob,
     reward_public_key: &[u8; 33],
+) -> Result<(), String> {
+    validate_verified_parent_for_deployment(
+        winner,
+        live,
+        reward_public_key,
+        &crate::protocol::MAINNET_PHOTON,
+    )
+}
+
+fn validate_verified_parent_for_deployment(
+    winner: &VerifiedWinner,
+    live: &LiveJob,
+    reward_public_key: &[u8; 33],
+    deployment: &crate::protocol::PhotonDeployment,
 ) -> Result<(), String> {
     if winner.job_reward_raw != live.reward_raw {
         return Err("verified winner belongs to a different PHOTON reward job".into());
@@ -1738,12 +2186,13 @@ fn validate_verified_parent(
             "verified PHOTON parent BCH value must remain 700 sats (got {payout_sats})"
         ));
     }
-    let rebuilt = tx::apply_reference_signature(
+    let rebuilt = tx::apply_reference_signature_for_deployment(
         &context,
         &intermediate_payout,
         &hex::encode(winner.public_key),
         winner.nonce,
         &hex::encode(winner.signature),
+        deployment,
     )?;
     if rebuilt != winner.transaction {
         return Err("verified PHOTON parent bytes do not match current live job".into());
@@ -1907,8 +2356,28 @@ impl RuntimeSupervisor {
             None,
             ReconnectPreference::RotateAway,
         );
-        let mut session = ElectrumSession::connect_failover(&endpoints)?;
-        let journal_path = submission_journal_path();
+        let mut session = ElectrumSession::connect_failover_for_deployment(
+            &endpoints,
+            cfg.token.photon_deployment(cfg.network),
+        )?;
+        let journal_path = submission_journal_path(cfg.network);
+        let funding_wallet = if cfg.network == MiningNetwork::Chipnet {
+            let state_dir = journal_path
+                .parent()
+                .ok_or("chipnet submission journal has no parent directory")?;
+            fs::create_dir_all(state_dir).map_err(|error| {
+                format!(
+                    "create chipnet funding state directory {}: {error}",
+                    state_dir.display()
+                )
+            })?;
+            Some(FundingWallet::load_or_create(
+                &state_dir.join("chipnet-funding.key"),
+                cfg.network,
+            )?)
+        } else {
+            None
+        };
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
         let initial = session.fetch_live_job()?;
         let (reward_secret, reward_public_key, mining_payout_address) =
@@ -1921,6 +2390,7 @@ impl RuntimeSupervisor {
             &reward_public_key,
             &mining_payout_address,
             &journal_path,
+            funding_wallet.as_ref(),
         )?;
         println!(
             "{}",
@@ -1937,7 +2407,11 @@ impl RuntimeSupervisor {
         cfg.bump_generation();
         let initial_settlement = SettlementState::new(cfg.generation_id, &initial)?;
 
-        let initial_job = initial.to_mining_job(cfg.generation_id, &mining_payout_address);
+        let initial_job = initial.to_mining_job_for_network(
+            cfg.generation_id,
+            &mining_payout_address,
+            cfg.network,
+        );
         let search = SearchHandle::start_supervised_on_backend_device(
             backend,
             device_ordinal as usize,
@@ -1997,6 +2471,7 @@ impl RuntimeSupervisor {
                     mining_payout_address,
                     initial_settlement,
                     journal_path,
+                    funding_wallet,
                     None,
                     command_rx,
                     event_tx,
@@ -2129,6 +2604,7 @@ fn run_supervisor(
     mining_payout_address: String,
     mut settlement: SettlementState,
     journal_path: PathBuf,
+    funding_wallet: Option<FundingWallet>,
     mut pending_submission: Option<PendingSubmission>,
     command_rx: Receiver<SupervisorCommand>,
     event_tx: SyncSender<RuntimeEvent>,
@@ -2232,10 +2708,27 @@ fn run_supervisor(
                             &journal_path,
                             relay_fee_sats_per_kb,
                         )?;
+                        if next_cfg.network == MiningNetwork::Chipnet {
+                            production_preflight_funding(
+                                session.as_mut().ok_or("chipnet source is disconnected")?,
+                                &next_cfg,
+                                &live,
+                                &reward_secret,
+                                &reward_public_key,
+                                &mining_payout_address,
+                                funding_wallet
+                                    .as_ref()
+                                    .ok_or("chipnet funding wallet is unavailable")?,
+                                &journal_path,
+                                relay_fee_sats_per_kb,
+                            )?;
+                        }
                         let next_settlement = settlement.restamp(next_cfg.generation_id, &live)?;
-                        search.replace_job(
-                            live.to_mining_job(next_cfg.generation_id, &mining_payout_address),
-                        )?;
+                        search.replace_job(live.to_mining_job_for_network(
+                            next_cfg.generation_id,
+                            &mining_payout_address,
+                            next_cfg.network,
+                        ))?;
                         cfg = next_cfg;
                         settlement = next_settlement;
                         job_changes = job_changes.saturating_add(1);
@@ -2268,13 +2761,31 @@ fn run_supervisor(
                                         &journal_path,
                                         relay_fee_sats_per_kb,
                                     )?;
+                                    if next_cfg.network == MiningNetwork::Chipnet {
+                                        production_preflight_funding(
+                                            session
+                                                .as_mut()
+                                                .ok_or("chipnet source is disconnected")?,
+                                            &next_cfg,
+                                            &live,
+                                            &reward_secret,
+                                            &reward_public_key,
+                                            &mining_payout_address,
+                                            funding_wallet
+                                                .as_ref()
+                                                .ok_or("chipnet funding wallet is unavailable")?,
+                                            &journal_path,
+                                            relay_fee_sats_per_kb,
+                                        )?;
+                                    }
                                     Ok(next_settlement)
                                 });
                             next_settlement.and_then(|next_settlement| {
                                 let next_sources = SourceCatalog::configured(&next_cfg)?;
-                                search.replace_job(live.to_mining_job(
+                                search.replace_job(live.to_mining_job_for_network(
                                     next_cfg.generation_id,
                                     &mining_payout_address,
+                                    next_cfg.network,
                                 ))?;
                                 cfg = next_cfg;
                                 sources = next_sources;
@@ -2386,8 +2897,11 @@ fn run_supervisor(
                             .to_string(),
                     )
                 } else {
-                    ElectrumSession::connect_failover(&endpoints)
-                        .and_then(|mut next| next.fetch_live_job().map(|job| (next, job)))
+                    ElectrumSession::connect_failover_for_deployment(
+                        &endpoints,
+                        cfg.token.photon_deployment(cfg.network),
+                    )
+                    .and_then(|mut next| next.fetch_live_job().map(|job| (next, job)))
                 };
                 match reconnect_result {
                     Ok((next_session, next_job)) => {
@@ -2432,6 +2946,7 @@ fn run_supervisor(
                                 &reward_public_key,
                                 &mining_payout_address,
                                 &journal_path,
+                                funding_wallet.as_ref(),
                                 next_job,
                             ) {
                                 Ok(changed) => {
@@ -2495,7 +3010,8 @@ fn run_supervisor(
         } else if pending_winner.is_some() {
             if Instant::now() >= next_submission_retry {
                 let winner = pending_winner.as_ref().expect("checked above");
-                match prepare_pending_submission(
+                match prepare_submission_for_network(
+                    session.as_mut().expect("checked session above"),
                     winner,
                     &cfg,
                     &live,
@@ -2503,6 +3019,7 @@ fn run_supervisor(
                     &reward_public_key,
                     &settlement,
                     &journal_path,
+                    funding_wallet.as_ref(),
                 ) {
                     Ok(pending) => {
                         pending_submission = Some(pending);
@@ -2565,6 +3082,7 @@ fn run_supervisor(
                                         &reward_public_key,
                                         &mining_payout_address,
                                         &journal_path,
+                                        funding_wallet.as_ref(),
                                         next_job,
                                     )
                                 }) {
@@ -2627,6 +3145,7 @@ fn run_supervisor(
                                     &reward_public_key,
                                     &mining_payout_address,
                                     &journal_path,
+                                    funding_wallet.as_ref(),
                                     *next_job,
                                 ) {
                                     Ok(changed) => {
@@ -2724,6 +3243,7 @@ fn run_supervisor(
                         &reward_public_key,
                         &mining_payout_address,
                         &journal_path,
+                        funding_wallet.as_ref(),
                         boundary.job,
                     ) {
                         Ok(changed) => {
@@ -2748,7 +3268,8 @@ fn run_supervisor(
                                             &event_tx,
                                             RuntimeEvent::VerifiedWinner(winner.clone()),
                                         );
-                                        match prepare_pending_submission(
+                                        match prepare_submission_for_network(
+                                            session.as_mut().expect("checked session above"),
                                             &winner,
                                             &cfg,
                                             &live,
@@ -2756,6 +3277,7 @@ fn run_supervisor(
                                             &reward_public_key,
                                             &settlement,
                                             &journal_path,
+                                            funding_wallet.as_ref(),
                                         ) {
                                             Ok(pending) => {
                                                 pending_submission = Some(pending);
@@ -3248,6 +3770,7 @@ fn apply_refreshed_job(
     reward_public_key: &[u8; 33],
     mining_payout_address: &str,
     journal_path: &Path,
+    funding_wallet: Option<&FundingWallet>,
     next: LiveJob,
 ) -> Result<bool, String> {
     let staged =
@@ -3260,10 +3783,15 @@ fn apply_refreshed_job(
                 reward_public_key,
                 mining_payout_address,
                 journal_path,
+                funding_wallet,
             )
         })?;
     if let Some((next_cfg, next_settlement)) = staged {
-        search.replace_job(next.to_mining_job(next_cfg.generation_id, mining_payout_address))?;
+        search.replace_job(next.to_mining_job_for_network(
+            next_cfg.generation_id,
+            mining_payout_address,
+            next_cfg.network,
+        ))?;
         *cfg = next_cfg;
         *settlement = next_settlement;
         *live = next;
@@ -5017,6 +5545,9 @@ mod tests {
         let settlement_txid = reward::transaction_id(&[2]);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            network: None,
+            mode: None,
+            funding_outpoint: None,
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: job.baton_txid.clone(),
@@ -5142,6 +5673,9 @@ mod tests {
         let job = live_job();
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            network: None,
+            mode: None,
+            funding_outpoint: None,
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: "11".repeat(32),
@@ -5526,6 +6060,9 @@ mod tests {
         let settlement_txid = reward::transaction_id(&settlement);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            network: None,
+            mode: None,
+            funding_outpoint: None,
             generation_id: 1,
             expected_height: 1_000,
             expected_baton_txid: "11".repeat(32),
@@ -5799,6 +6336,9 @@ mod tests {
         let settlement_txid = reward::transaction_id(&[2]);
         let pending = PendingSubmission {
             version: SUBMISSION_JOURNAL_VERSION,
+            network: None,
+            mode: None,
+            funding_outpoint: None,
             generation_id: 1,
             expected_height: job.height,
             expected_baton_txid: job.baton_txid.clone(),
@@ -5872,7 +6412,8 @@ mod tests {
         assert_eq!(next.generation_id, original_generation + 1);
         assert_eq!(next.fulcrum_url.as_deref(), Some(custom));
         assert_eq!(endpoints.first().map(String::as_str), Some(custom));
-        let replacement = live_job().to_mining_job(next.generation_id, "");
+        let replacement =
+            live_job().to_mining_job_for_network(next.generation_id, "", next.network);
         assert_eq!(replacement.generation_id, next.generation_id);
 
         assert!(prepare_fulcrum_endpoint_change(&next, Some(custom))
@@ -5885,5 +6426,143 @@ mod tests {
         assert_eq!(cleared.generation_id, next.generation_id + 1);
         assert!(cleared.fulcrum_url.is_none());
         assert!(!cleared_endpoints.iter().any(|value| value == custom));
+    }
+
+    fn synthetic_chipnet_pending() -> PendingSubmission {
+        let job = live_job();
+        let parent_raw = vec![2u8];
+        let parent_txid = reward::transaction_id(&parent_raw);
+        let funding_txid = "33".repeat(32);
+        let mut raw_child = Vec::new();
+        raw_child.extend_from_slice(&2u32.to_le_bytes());
+        raw_child.push(2);
+        for (txid, vout) in [(&parent_txid, 1u32), (&funding_txid, 3u32)] {
+            let mut wire_txid = hex::decode(txid).unwrap();
+            wire_txid.reverse();
+            raw_child.extend_from_slice(&wire_txid);
+            raw_child.extend_from_slice(&vout.to_le_bytes());
+            raw_child.push(0);
+            raw_child.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        raw_child.push(0);
+        raw_child.extend_from_slice(&0u32.to_le_bytes());
+        let (miner, donation) = RuntimeConfig::split_reward(job.reward_raw);
+        PendingSubmission {
+            version: CHIPNET_SUBMISSION_JOURNAL_VERSION,
+            network: Some("chipnet".into()),
+            mode: Some("funded_reward_split".into()),
+            funding_outpoint: Some(format!("{funding_txid}:3")),
+            generation_id: 1,
+            expected_height: job.height,
+            expected_baton_txid: job.baton_txid,
+            expected_baton_vout: 0,
+            parent_txid: parent_txid.clone(),
+            parent_hex: hex::encode(parent_raw),
+            settlement_txid: reward::transaction_id(&raw_child),
+            settlement_hex: hex::encode(raw_child),
+            resulting_baton_txid: parent_txid,
+            resulting_baton_vout: 0,
+            resulting_baton_value_sats: 15_970_000,
+            miner_token_amount: miner,
+            donation_token_amount: donation,
+        }
+    }
+
+    #[test]
+    fn chipnet_funded_journal_is_network_bound_and_recovers_after_restart() {
+        let pending = synthetic_chipnet_pending();
+        pending.validate().unwrap();
+        pending.require_network(MiningNetwork::Chipnet).unwrap();
+        assert!(pending.require_network(MiningNetwork::Mainnet).is_err());
+        assert_eq!(
+            first_input_outpoint(&pending.settlement_hex).unwrap(),
+            (pending.parent_txid.clone(), 1)
+        );
+        assert_eq!(
+            second_input_outpoint(&pending.settlement_hex).unwrap(),
+            ("33".repeat(32), 3)
+        );
+        let journal = std::env::temp_dir().join(format!(
+            "pickaxe-chipnet-pending-{}-{}.json",
+            std::process::id(),
+            PREFLIGHT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        pending.persist_new(&journal).unwrap();
+        let restarted = PendingSubmission::load(&journal).unwrap().unwrap();
+        assert_eq!(restarted, pending);
+        assert!(!restarted.parent_attempted(&journal).unwrap());
+        let mut fresh = live_job();
+        fresh.baton_txid = pending.parent_txid.clone();
+        assert!(resulting_baton_is_authoritative(&pending, &fresh));
+        resolve_confirmed_submission(&restarted, &fresh, &journal).unwrap();
+        assert!(!journal.exists());
+        let resolved = ResolvedSubmission::load(&journal).unwrap().unwrap();
+        assert_eq!(resolved.version, CHIPNET_SUBMISSION_RESOLUTION_VERSION);
+        assert_eq!(resolved.network.as_deref(), Some("chipnet"));
+        let spent = reward::ConfirmedFundingUtxo {
+            txid: "33".repeat(32),
+            raw_transaction: Vec::new(),
+            vout: 3,
+            value_sats: 2_300,
+            confirmations: 1,
+        };
+        assert!(ensure_funding_not_previously_spent(&journal, &spent).is_err());
+        let different = reward::ConfirmedFundingUtxo { vout: 4, ..spent };
+        ensure_funding_not_previously_spent(&journal, &different).unwrap();
+        fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
+    }
+
+    #[test]
+    fn chipnet_child_cannot_complete_without_parent_and_preserves_mainnet_v3() {
+        let chipnet = synthetic_chipnet_pending();
+        assert!(require_parent_known_for_child(&chipnet, false).is_err());
+        require_parent_known_for_child(&chipnet, true).unwrap();
+        let mut malformed = chipnet.clone();
+        malformed.funding_outpoint = Some("00".repeat(32) + ":3");
+        assert!(malformed.validate().is_err());
+
+        let (cfg, job, secret, public, payout, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let winner = signed_winner(cfg.generation_id, &job, &payout);
+        let mainnet = prepare_pending_submission(
+            &winner,
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &settlement,
+            &journal,
+        )
+        .unwrap();
+        mainnet.require_network(MiningNetwork::Mainnet).unwrap();
+        assert!(mainnet.require_network(MiningNetwork::Chipnet).is_err());
+        require_parent_known_for_child(&mainnet, false).unwrap();
+        let json = serde_json::to_string(&mainnet).unwrap();
+        assert!(!json.contains("network"));
+        assert!(!json.contains("funding_outpoint"));
+        PendingSubmission::remove(&journal).unwrap();
+    }
+
+    #[test]
+    fn chipnet_local_preflight_proves_parent_fee_and_funding_floor() {
+        let (mut cfg, job, secret, public, payout, journal) = preflight_fixture();
+        cfg.set_network(MiningNetwork::Chipnet);
+        cfg.set_payout(crate::config::CHIPNET_DONATION_ADDRESS.into())
+            .unwrap();
+        production_preflight_local(
+            &cfg,
+            &job,
+            &secret,
+            &public,
+            &payout,
+            &journal,
+            reward::MIN_RELAY_FEE_SATS_PER_KB,
+        )
+        .unwrap();
+        assert_eq!(chipnet_funding_floor(job.reward_raw, 1_000).unwrap(), 1_915);
+        assert_eq!(chipnet_funding_floor(199, 1_000).unwrap(), 1_899);
+        assert!(submission_journal_path(MiningNetwork::Chipnet)
+            .ends_with("pending-reward-chipnet.json"));
+        assert!(submission_journal_path(MiningNetwork::Mainnet).ends_with("pending-reward.json"));
     }
 }

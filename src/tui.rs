@@ -3177,7 +3177,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_rejects_unknown_token_and_unsupported_chipnet_settlement() {
+    fn setup_rejects_unknown_token_and_accepts_chipnet_photon() {
         let devices = test_devices();
         let mut setup =
             SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
@@ -3191,12 +3191,16 @@ mod tests {
         setup.handle_key(key(KeyCode::Down));
         assert_eq!(setup.config.network, MiningNetwork::Chipnet);
         setup.handle_key(key(KeyCode::Enter));
-        setup.token_input = "PHOTON".into();
+        setup.token_input = crate::protocol::MAINNET_CATEGORY_HEX.into();
         setup.handle_key(key(KeyCode::Enter));
         assert_eq!(setup.step, SetupStep::Token);
-        assert!(setup
-            .status_line
-            .contains("payout splitting is not supported"));
+        assert!(setup.status_line.contains("unknown token"));
+        setup.token_input = "PHOTON".into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Gpu);
+        assert!(setup.status_line.is_empty());
+        assert_eq!(setup.config.network, MiningNetwork::Chipnet);
+        assert_eq!(setup.config.token, crate::config::MiningToken::Photon);
     }
 
     #[test]

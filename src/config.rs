@@ -43,6 +43,15 @@ impl MiningNetwork {
             Self::Chipnet => "bchtest",
         }
     }
+
+    /// Prevents a selected chain from using a published endpoint of the other chain.
+    pub(crate) fn accepts_known_electrum_endpoint(self, url: &str) -> bool {
+        let foreign = match self {
+            Self::Mainnet => crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP,
+            Self::Chipnet => crate::protocol::FULCRUM_WSS_BOOTSTRAP,
+        };
+        !foreign.iter().any(|entry| entry.eq_ignore_ascii_case(url))
+    }
 }
 
 /// Supported GPU-minable token identities, in alphabetical display order.
@@ -89,10 +98,7 @@ impl MiningToken {
 
     pub fn ensure_supported(self, network: MiningNetwork) -> Result<(), String> {
         match (self, network) {
-            (Self::Photon, MiningNetwork::Mainnet) => Ok(()),
-            (Self::Photon, MiningNetwork::Chipnet) => {
-                Err("PHOTON Chipnet payout splitting is not supported by this build yet".into())
-            }
+            (Self::Photon, MiningNetwork::Mainnet | MiningNetwork::Chipnet) => Ok(()),
         }
     }
 }
@@ -177,6 +183,14 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     pub fn set_network(&mut self, network: MiningNetwork) {
         if self.network != network {
+            if !self.payout_address.is_empty() {
+                if let Ok(converted) = reprefix_p2pkh_payout(&self.payout_address, network) {
+                    self.payout_address = converted;
+                }
+            }
+            // Configured sources are chain-specific. CLI overrides are applied after the network.
+            self.fulcrum_url = None;
+            self.node_url = None;
             self.network = network;
             self.bump_generation();
         }
@@ -245,17 +259,22 @@ impl RuntimeConfig {
         };
         crate::tx::cashaddr_to_p2pkh_locking(&canonical)
             .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
-        if !canonical.starts_with(&format!("{}:", self.network.cashaddr_prefix())) {
+        let selected = if canonical.starts_with(&format!("{}:", self.network.cashaddr_prefix())) {
+            canonical
+        } else if self.network == MiningNetwork::Chipnet && canonical.starts_with("bitcoincash:") {
+            reprefix_p2pkh_payout(&canonical, self.network)
+                .map_err(|e| format!("invalid payout CashAddr: {e}"))?
+        } else {
             return Err(format!(
                 "payout address must use {}: on {}",
                 self.network.cashaddr_prefix(),
                 self.network.as_str()
             ));
-        }
-        if self.payout_address != canonical {
+        };
+        if self.payout_address != selected {
             self.bump_generation();
         }
-        self.payout_address = canonical;
+        self.payout_address = selected;
         Ok(())
     }
 
@@ -265,6 +284,16 @@ impl RuntimeConfig {
             self.clear_fulcrum_url();
             return Ok(());
         };
+        if endpoints.split(',').any(|endpoint| {
+            !self
+                .network
+                .accepts_known_electrum_endpoint(endpoint.trim())
+        }) {
+            return Err(format!(
+                "a published Fulcrum endpoint belongs to another network, not {}",
+                self.network.as_str()
+            ));
+        }
         if self.fulcrum_url.as_deref() != Some(endpoints.as_str()) {
             self.bump_generation();
             self.fulcrum_url = Some(endpoints);
@@ -288,17 +317,19 @@ impl RuntimeConfig {
 
     /// Endpoint try-order: custom (if set), then public bootstrap.
     pub fn electrum_endpoints(&self) -> Vec<String> {
-        use crate::protocol::FULCRUM_WSS_BOOTSTRAP;
+        use crate::protocol::{CHIPNET_FULCRUM_WSS_BOOTSTRAP, FULCRUM_WSS_BOOTSTRAP};
         let mut out = Vec::new();
         for url in self.custom_fulcrum_endpoints() {
-            out.push(url.to_string());
+            if self.network.accepts_known_electrum_endpoint(url) {
+                out.push(url.to_string());
+            }
         }
-        for u in FULCRUM_WSS_BOOTSTRAP
-            .iter()
-            .copied()
-            .filter(|_| self.network == MiningNetwork::Mainnet)
-        {
-            if !out.iter().any(|x| x.as_str() == u) {
+        let bootstrap = match self.network {
+            MiningNetwork::Mainnet => FULCRUM_WSS_BOOTSTRAP,
+            MiningNetwork::Chipnet => CHIPNET_FULCRUM_WSS_BOOTSTRAP,
+        };
+        for u in bootstrap {
+            if !out.iter().any(|x| x.as_str() == *u) {
                 out.push((*u).to_string());
             }
         }
@@ -382,6 +413,25 @@ impl RuntimeConfig {
     pub fn split_donation(donation_raw: u128) -> (u128, u128) {
         let shrec = donation_raw / 2;
         (donation_raw - shrec, shrec)
+    }
+}
+
+/// Re-encodes a validated P2PKH payout for another chain without changing its key hash.
+fn reprefix_p2pkh_payout(address: &str, network: MiningNetwork) -> Result<String, String> {
+    let locking = crate::tx::cashaddr_to_p2pkh_locking(address)?;
+    let hash: [u8; 20] = locking
+        .get(3..23)
+        .ok_or("P2PKH locking bytecode omitted its 20-byte hash")?
+        .try_into()
+        .map_err(|_| "P2PKH locking bytecode has an invalid hash length")?;
+    let payload = address
+        .split_once(':')
+        .map(|(_, payload)| payload)
+        .ok_or("P2PKH CashAddr omitted its network prefix")?;
+    if payload.starts_with('z') {
+        crate::tx::token_p2pkh_hash_to_cashaddr_for_network(&hash, network)
+    } else {
+        crate::tx::p2pkh_hash_to_cashaddr_for_network(&hash, network)
     }
 }
 
@@ -845,10 +895,7 @@ mod tests {
         let mut cfg = RuntimeConfig::default();
         assert!(cfg.ensure_mining_supported().is_ok());
         cfg.set_network(MiningNetwork::Chipnet);
-        assert!(cfg
-            .ensure_mining_supported()
-            .unwrap_err()
-            .contains("payout splitting is not supported"));
+        assert!(cfg.ensure_mining_supported().is_ok());
         for query in [
             "PHOTON",
             crate::protocol::CHIPNET_CATEGORY_HEX,
@@ -861,19 +908,97 @@ mod tests {
             );
         }
         assert!(MiningToken::parse(crate::protocol::MAINNET_CATEGORY_HEX, cfg.network).is_err());
-        assert!(cfg.electrum_endpoints().is_empty());
+        assert_eq!(
+            cfg.electrum_endpoints(),
+            vec![crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0].to_string()]
+        );
+        assert!(cfg.electrum_endpoints().iter().all(|endpoint| {
+            !crate::protocol::FULCRUM_WSS_BOOTSTRAP.contains(&endpoint.as_str())
+        }));
         assert!(cfg.node_endpoints().is_empty());
+    }
+
+    #[test]
+    fn network_switch_never_routes_to_foreign_published_fulcrum() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_fulcrum_url(crate::protocol::FULCRUM_WSS_BOOTSTRAP[0])
+            .unwrap();
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg.fulcrum_url.is_none());
+        assert_eq!(
+            cfg.electrum_endpoints(),
+            vec![crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0].to_string()]
+        );
+        assert!(cfg
+            .set_fulcrum_url(crate::protocol::FULCRUM_WSS_BOOTSTRAP[0])
+            .is_err());
+    }
+
+    #[test]
+    fn network_switch_clears_old_sources_and_accepts_new_explicit_overrides() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_fulcrum_url("wss://old-network.invalid:50004")
+            .unwrap();
+        cfg.set_node_url("http://old-network.invalid:8332").unwrap();
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg.custom_fulcrum_endpoints().is_empty());
+        assert!(cfg.custom_node_endpoints().is_empty());
+        assert_eq!(
+            cfg.electrum_endpoints(),
+            vec![crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0].to_string()]
+        );
+        cfg.set_fulcrum_url("wss://explicit-chipnet.invalid:50004")
+            .unwrap();
+        cfg.set_node_url("http://explicit-chipnet.invalid:18332")
+            .unwrap();
+        assert_eq!(
+            cfg.custom_fulcrum_endpoints(),
+            ["wss://explicit-chipnet.invalid:50004"]
+        );
+        assert_eq!(
+            cfg.custom_node_endpoints(),
+            ["http://explicit-chipnet.invalid:18332"]
+        );
     }
 
     #[test]
     fn payout_address_must_match_selected_network() {
         let mut cfg = RuntimeConfig::default();
         cfg.set_network(MiningNetwork::Chipnet);
-        assert!(cfg.set_payout(PAYOUT.into()).is_err());
+        cfg.set_payout(SHREC_DONATION_ADDRESS.into()).unwrap();
+        assert!(cfg.payout_address.starts_with("bchtest:z"));
+        assert_eq!(
+            crate::tx::cashaddr_to_p2pkh_locking(&cfg.payout_address).unwrap(),
+            crate::tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS).unwrap()
+        );
+        let chipnet_address = cfg.payout_address.clone();
         cfg.set_network(MiningNetwork::Mainnet);
+        assert!(cfg.payout_address.starts_with("bitcoincash:z"));
+        assert!(cfg.set_payout(chipnet_address).is_err());
         cfg.set_payout(PAYOUT.into()).unwrap();
         cfg.set_network(MiningNetwork::Chipnet);
-        assert!(cfg.validate_payout_network().is_err());
+        assert!(cfg.validate_payout_network().is_ok());
+        assert!(cfg.payout_address.starts_with("bchtest:"));
+        assert!(cfg
+            .set_payout("bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv4".into())
+            .is_err());
+        assert!(cfg
+            .set_payout("bchreg:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3".into())
+            .is_err());
+    }
+
+    #[test]
+    fn chipnet_saved_config_reprefixes_mainnet_token_payout() {
+        let saved = SavedConfig {
+            network: Some("chipnet".into()),
+            address: Some(SHREC_DONATION_ADDRESS.into()),
+            ..SavedConfig::default()
+        };
+        let mut cfg = RuntimeConfig::default();
+        saved.apply_to_runtime(&mut cfg).unwrap();
+        assert_eq!(cfg.network, MiningNetwork::Chipnet);
+        assert!(cfg.payout_address.starts_with("bchtest:z"));
+        assert!(cfg.validate_payout_network().is_ok());
     }
 
     #[test]

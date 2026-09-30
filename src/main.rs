@@ -24,6 +24,7 @@ mod cuda_stage_b;
 mod cuda_stage_c;
 #[allow(dead_code)]
 mod electrum;
+mod funding;
 mod hip_photon;
 #[allow(dead_code)]
 mod m29_table;

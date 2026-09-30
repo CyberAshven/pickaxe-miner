@@ -90,11 +90,38 @@ fn cashaddr_polymod(values: &[u8]) -> u64 {
 
 /// Encode a mainnet P2PKH hash as a canonical CashAddr.
 pub fn p2pkh_hash_to_cashaddr(hash: &[u8; 20]) -> Result<String, String> {
+    p2pkh_hash_to_cashaddr_for_network(hash, crate::config::MiningNetwork::Mainnet)
+}
+
+/// Encodes a P2PKH hash with the selected chain's canonical CashAddr prefix.
+pub fn p2pkh_hash_to_cashaddr_for_network(
+    hash: &[u8; 20],
+    network: crate::config::MiningNetwork,
+) -> Result<String, String> {
+    p2pkh_hash_to_cashaddr_with_type(hash, network, 0)
+}
+
+/// Encodes a token-aware P2PKH payout with the selected chain's prefix.
+pub fn token_p2pkh_hash_to_cashaddr_for_network(
+    hash: &[u8; 20],
+    network: crate::config::MiningNetwork,
+) -> Result<String, String> {
+    p2pkh_hash_to_cashaddr_with_type(hash, network, 2)
+}
+
+fn p2pkh_hash_to_cashaddr_with_type(
+    hash: &[u8; 20],
+    network: crate::config::MiningNetwork,
+    address_type: u8,
+) -> Result<String, String> {
     let mut decoded = Vec::with_capacity(21);
-    decoded.push(0); // P2PKH, 160-bit hash
+    decoded.push(address_type << 3); // 160-bit P2PKH or token-aware P2PKH
     decoded.extend_from_slice(hash);
     let payload = convert_bits(&decoded, 8, 5, true)?;
-    let prefix = "bitcoincash";
+    let prefix = match network {
+        crate::config::MiningNetwork::Mainnet => "bitcoincash",
+        crate::config::MiningNetwork::Chipnet => "bchtest",
+    };
     let mut checksum_input: Vec<u8> = prefix.bytes().map(|c| c & 31).collect();
     checksum_input.push(0);
     checksum_input.extend_from_slice(&payload);
@@ -253,6 +280,30 @@ impl PhotonLayout {
         })
     }
 
+    /// Includes the selected redeem script's byte width in the GPU offsets.
+    /// Current CUDA binaries provide shifts 0..=3, so wider layouts fail
+    /// before a job reaches a GPU kernel.
+    pub fn for_age_with_deployment(
+        age: u32,
+        deployment: &PhotonDeployment,
+    ) -> Result<Self, String> {
+        let age_shift = Self::for_age(age)?.shift;
+        deployment.verify()?;
+        let redeem_len = deployment.redeem_script_hex.trim().len() / 2;
+        let mainnet_len = MAINNET_PHOTON.redeem_script_hex.trim().len() / 2;
+        let redeem_shift = redeem_len
+            .checked_sub(mainnet_len)
+            .ok_or("PHOTON deployment redeem script is shorter than CUDA's base layout")?;
+        let shift = age_shift + redeem_shift;
+        if shift > Self::MAX_SHIFT {
+            return Err(format!(
+                "PHOTON deployment at baton age {age} needs GPU layout shift {shift}; available CUDA kernels support 0..={} only",
+                Self::MAX_SHIFT
+            ));
+        }
+        Ok(Self { shift })
+    }
+
     /// Returns the layout of a serialized mining transaction of `len` bytes.
     pub fn for_tx_len(len: usize) -> Result<Self, String> {
         let shift = len
@@ -384,6 +435,7 @@ pub fn build_photon_template_bytes_for_deployment(
     deployment: &PhotonDeployment,
 ) -> Result<Vec<u8>, String> {
     deployment.verify()?;
+    let layout = PhotonLayout::for_age_with_deployment(p.age, deployment)?;
     let public_key = parse_hex(&p.public_key_hex)?;
     let target = parse_hex(&p.target_hex)?;
     let signature = parse_hex(&p.signature_hex)?;
@@ -469,6 +521,14 @@ pub fn build_photon_template_bytes_for_deployment(
     tx.extend_from_slice(&compact_uint(output1.len() as u64));
     tx.extend_from_slice(&output1);
     tx.extend_from_slice(&u32_le(0)); // locktime
+    if tx.len() != layout.tx_bytes() {
+        return Err(format!(
+            "PHOTON deployment serialized {} bytes; expected {} at age {}",
+            tx.len(),
+            layout.tx_bytes(),
+            p.age
+        ));
+    }
     Ok(tx)
 }
 
@@ -604,13 +664,33 @@ pub fn apply_reference_signature(
     nonce: u32,
     signature_hex: &str,
 ) -> Result<Vec<u8>, String> {
-    apply_reference_signature_with_payout_sats(
+    apply_reference_signature_for_deployment(
+        job,
+        miner_payout,
+        public_key_hex,
+        nonce,
+        signature_hex,
+        &MAINNET_PHOTON,
+    )
+}
+
+/// Rebuilds and validates a signed parent against its selected covenant.
+pub fn apply_reference_signature_for_deployment(
+    job: &ReferenceJobContext,
+    miner_payout: &str,
+    public_key_hex: &str,
+    nonce: u32,
+    signature_hex: &str,
+    deployment: &PhotonDeployment,
+) -> Result<Vec<u8>, String> {
+    apply_reference_signature_with_payout_sats_for_deployment(
         job,
         miner_payout,
         public_key_hex,
         nonce,
         signature_hex,
         None,
+        deployment,
     )
 }
 
@@ -622,6 +702,26 @@ pub fn apply_reference_signature_with_payout_sats(
     nonce: u32,
     signature_hex: &str,
     payout_sats: Option<u16>,
+) -> Result<Vec<u8>, String> {
+    apply_reference_signature_with_payout_sats_for_deployment(
+        job,
+        miner_payout,
+        public_key_hex,
+        nonce,
+        signature_hex,
+        payout_sats,
+        &MAINNET_PHOTON,
+    )
+}
+
+fn apply_reference_signature_with_payout_sats_for_deployment(
+    job: &ReferenceJobContext,
+    miner_payout: &str,
+    public_key_hex: &str,
+    nonce: u32,
+    signature_hex: &str,
+    payout_sats: Option<u16>,
+    deployment: &PhotonDeployment,
 ) -> Result<Vec<u8>, String> {
     let sig = parse_hex(signature_hex)?;
     if sig.len() != 64 {
@@ -650,13 +750,18 @@ pub fn apply_reference_signature_with_payout_sats(
         reward_amount: job.reward_raw,
         payout_locking: payout,
     };
-    let mut tx = build_photon_template_bytes(&p)?;
+    let mut tx = build_photon_template_bytes_for_deployment(&p, deployment)?;
     if let Some(sats) = payout_sats {
         set_payout_value_sats(&mut tx, sats)?;
     }
     let target = crate::search::parse_hex32(&job.target_le_hex)?;
     let digest = crate::search::hash256(&tx);
-    if !crate::search::meets_target_le(&digest, &target) {
+    let network = match deployment.category_hex {
+        crate::protocol::MAINNET_CATEGORY_HEX => crate::config::MiningNetwork::Mainnet,
+        crate::protocol::CHIPNET_CATEGORY_HEX => crate::config::MiningNetwork::Chipnet,
+        _ => return Err("unsupported PHOTON deployment for proof validation".into()),
+    };
+    if !crate::search::meets_target_le_for_network(&digest, &target, network) {
         return Err(format!(
             "candidate HASH256 {} does not meet PHOTON target {}",
             hex::encode(digest),
@@ -670,6 +775,15 @@ pub fn apply_reference_signature_with_payout_sats(
 pub fn build_unsigned_reference_preview(
     job: &ReferenceJobContext,
     miner_payout: &str,
+) -> Result<Vec<u8>, String> {
+    build_unsigned_reference_preview_for_deployment(job, miner_payout, &MAINNET_PHOTON)
+}
+
+/// Builds an unsigned parent preview for the selected contract deployment.
+pub fn build_unsigned_reference_preview_for_deployment(
+    job: &ReferenceJobContext,
+    miner_payout: &str,
+    deployment: &PhotonDeployment,
 ) -> Result<Vec<u8>, String> {
     let payout = cashaddr_to_p2pkh_locking(miner_payout)?;
     // Placeholder compressed pubkey (secp order-2 style) + zero Schnorr — not a valid win.
@@ -686,7 +800,7 @@ pub fn build_unsigned_reference_preview(
         reward_amount: job.reward_raw,
         payout_locking: payout,
     };
-    build_photon_template_bytes(&p)
+    build_photon_template_bytes_for_deployment(&p, deployment)
 }
 
 #[cfg(test)]
@@ -725,6 +839,78 @@ mod tests {
             crate::reward::transaction_id(&built),
             "00024a4b0073d8429b3f4796bbfcfcdadd3d938a1c704f68da77d2bdc9e78ad0"
         );
+    }
+
+    #[test]
+    fn chipnet_layout_tracks_the_longer_redeem_script_and_gpu_limit() {
+        for (age, bytes, shift) in [(10, 617, 2), (38, 618, 3)] {
+            let layout =
+                PhotonLayout::for_age_with_deployment(age, &crate::protocol::CHIPNET_PHOTON)
+                    .unwrap();
+            assert_eq!(layout.tx_bytes(), bytes);
+            assert_eq!(layout.shift(), shift);
+        }
+        assert!(
+            PhotonLayout::for_age_with_deployment(128, &crate::protocol::CHIPNET_PHOTON,).is_err()
+        );
+    }
+
+    #[test]
+    fn chipnet_signed_parent_reconstruction_uses_its_redeem_script_and_hash_rule() {
+        let sk = [0x11; 32];
+        let public_key = crate::crypto::compressed_pubkey(&sk).unwrap();
+        let payout = crate::config::CHIPNET_DONATION_ADDRESS;
+        let job = ReferenceJobContext {
+            prev_txid: "aa".repeat(32),
+            prev_vout: 0,
+            age: 38,
+            target_le_hex: format!("{}7f", "ff".repeat(31)),
+            contract_value_sats: 49_080_500,
+            contract_token_amount: 2_096_937_231_989_870,
+            reward_raw: 4_992_707_694,
+        };
+        let target = crate::search::parse_hex32(&job.target_le_hex).unwrap();
+        for nonce in 0..32 {
+            let message = photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+            let signature = crate::crypto::bch_schnorr_sign(&sk, &message).unwrap();
+            let raw = build_photon_template_bytes_for_deployment(
+                &TemplateParams {
+                    prev_tx_hash_hex: job.prev_txid.clone(),
+                    prev_index: job.prev_vout,
+                    age: job.age,
+                    public_key_hex: hex::encode(public_key),
+                    target_hex: job.target_le_hex.clone(),
+                    signature_hex: hex::encode(signature),
+                    nonce,
+                    contract_value_sats: job.contract_value_sats,
+                    contract_token_amount: job.contract_token_amount,
+                    reward_amount: job.reward_raw,
+                    payout_locking: cashaddr_to_p2pkh_locking(payout).unwrap(),
+                },
+                &crate::protocol::CHIPNET_PHOTON,
+            )
+            .unwrap();
+            if crate::search::meets_target_le_for_network(
+                &crate::search::hash256(&raw),
+                &target,
+                crate::config::MiningNetwork::Chipnet,
+            ) {
+                assert_eq!(
+                    apply_reference_signature_for_deployment(
+                        &job,
+                        payout,
+                        &hex::encode(public_key),
+                        nonce,
+                        &hex::encode(signature),
+                        &crate::protocol::CHIPNET_PHOTON,
+                    )
+                    .unwrap(),
+                    raw
+                );
+                return;
+            }
+        }
+        panic!("no positive chipnet HASH256 found in 32 signed nonces");
     }
 
     #[test]
@@ -783,6 +969,48 @@ mod tests {
             hex::encode(&lock),
             "76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac"
         );
+    }
+
+    #[test]
+    fn chipnet_p2pkh_cashaddr_encoder_round_trips() {
+        let hash = [0x42u8; 20];
+        let address =
+            p2pkh_hash_to_cashaddr_for_network(&hash, crate::config::MiningNetwork::Chipnet)
+                .unwrap();
+        assert!(address.starts_with("bchtest:"));
+        assert_eq!(
+            cashaddr_to_p2pkh_locking(&address).unwrap(),
+            [&[0x76, 0xa9, 0x14][..], &hash, &[0x88, 0xac]].concat(),
+        );
+        assert_eq!(
+            p2pkh_hash_to_cashaddr(&hash).unwrap(),
+            p2pkh_hash_to_cashaddr_for_network(&hash, crate::config::MiningNetwork::Mainnet,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn token_aware_payout_keeps_its_type_when_converted_to_chipnet() {
+        let mainnet = "bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3";
+        let locking = cashaddr_to_p2pkh_locking(mainnet).unwrap();
+        let hash: [u8; 20] = locking[3..23].try_into().unwrap();
+        assert_eq!(
+            token_p2pkh_hash_to_cashaddr_for_network(&hash, crate::config::MiningNetwork::Mainnet,)
+                .unwrap(),
+            mainnet,
+        );
+        let chipnet =
+            token_p2pkh_hash_to_cashaddr_for_network(&hash, crate::config::MiningNetwork::Chipnet)
+                .unwrap();
+        assert!(chipnet.starts_with("bchtest:z"));
+        assert_eq!(cashaddr_to_p2pkh_locking(&chipnet).unwrap(), locking);
+        let mut invalid = chipnet.into_bytes();
+        *invalid.last_mut().unwrap() = if *invalid.last().unwrap() == b'q' {
+            b'p'
+        } else {
+            b'q'
+        };
+        assert!(cashaddr_to_p2pkh_locking(&String::from_utf8(invalid).unwrap()).is_err());
     }
 
     #[test]

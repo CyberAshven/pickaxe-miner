@@ -691,6 +691,31 @@ mod tests {
     }
 
     #[test]
+    fn t2_gpu_hash_matches_confirmed_chipnet_parent_if_cuda_present() {
+        let template =
+            hex::decode(include_str!("../reference/photon_chipnet_confirmed_parent.hex").trim())
+                .unwrap();
+        let layout =
+            PhotonLayout::for_age_with_deployment(38, &crate::protocol::CHIPNET_PHOTON).unwrap();
+        assert_eq!(layout.shift(), 3);
+        let target: [u8; 32] = template[layout.target_offset()..layout.target_offset() + 32]
+            .try_into()
+            .unwrap();
+        let mut engine = match T2Engine::new(0, 65_536, 8) {
+            Ok(engine) => engine,
+            Err(error) if cuda_unavailable_for_tests(&error) => {
+                eprintln!("skip chipnet T2 GPU vector: {error}");
+                return;
+            }
+            Err(error) => panic!("chipnet T2 GPU setup failed: {error}"),
+        };
+        engine
+            .set_template(&template, &target, 2_096_937_231_989_870, 4_992_707_694)
+            .unwrap();
+        assert_eq!(engine.probe(0).unwrap(), search::hash256(&template));
+    }
+
+    #[test]
     fn t2_gpu_all_pass_readback_is_bounded_and_reconstructable_if_cuda_present() {
         let mut engine = T2Engine::new(0, 65_536, 8).unwrap();
         let target = [0xff; 32];
@@ -933,6 +958,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tail-grind")]
     #[ignore = "serial offline SHA throughput benchmark; requires CUDA and matching local PTX"]
     fn t2_sha_filter_group_benchmark() {
         let target = [0u8; 32];

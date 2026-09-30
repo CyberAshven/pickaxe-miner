@@ -4,9 +4,13 @@
 //! together, preserves the baton at output 0, and splits the exact winning
 //! reward 98/2 without any external funding input.
 
-use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, SHREC_DONATION_ADDRESS};
+use crate::config::{
+    RuntimeConfig, CHIPNET_DONATION_ADDRESS, DONATION_ADDRESS, DONATION_BPS, SHREC_DONATION_ADDRESS,
+};
 use crate::crypto;
-use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
+use crate::protocol::{
+    PhotonDeployment, CHIPNET_CATEGORY_HEX, COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX,
+};
 use crate::tx;
 use ripemd::Ripemd160;
 use secp256k1::{PublicKey, SecretKey};
@@ -32,6 +36,33 @@ pub struct PreparedSelfFundedSettlement {
     pub shrec_output_value_sats: u64,
     pub miner_token_amount: u128,
     pub donation_token_amount: u128,
+    pub original_donation_token_amount: u128,
+    pub shrec_donation_token_amount: u128,
+    pub required_relay_fee_sats: u64,
+    pub fee_sats: u64,
+}
+
+/// An externally verified confirmed BCH UTXO. The raw transaction lets the
+/// splitter independently check the selected output and its token status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedFundingUtxo {
+    pub txid: String,
+    pub raw_transaction: Vec<u8>,
+    pub vout: u32,
+    pub value_sats: u64,
+    pub confirmations: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedFundedRewardSplit {
+    pub parent_txid: String,
+    pub settlement_txid: String,
+    pub raw_settlement: Vec<u8>,
+    pub funding_txid: String,
+    pub funding_vout: u32,
+    pub funding_input_value_sats: u64,
+    pub funding_change_value_sats: Option<u64>,
+    pub miner_token_amount: u128,
     pub original_donation_token_amount: u128,
     pub shrec_donation_token_amount: u128,
     pub required_relay_fee_sats: u64,
@@ -345,6 +376,156 @@ fn encode_input(txid: &str, vout: u32, unlocking: &[u8]) -> Result<Vec<u8>, Stri
     out.extend_from_slice(unlocking);
     out.extend_from_slice(&0u32.to_le_bytes());
     Ok(out)
+}
+
+/// Reads a conventional BCH transaction output from an untrusted raw transaction.
+fn transaction_output(raw: &[u8], selected_vout: u32) -> Result<ParsedOutput, String> {
+    if raw.len() < 10 {
+        return Err("funding transaction is truncated".into());
+    }
+    let mut cursor = 4usize;
+    let input_count = read_canonical_compact_uint(raw, &mut cursor)?;
+    if input_count == 0 || input_count > 100_000 {
+        return Err("funding transaction has an invalid input count".into());
+    }
+    for _ in 0..input_count {
+        cursor = cursor
+            .checked_add(36)
+            .ok_or("funding input cursor overflow")?;
+        if cursor > raw.len() {
+            return Err("funding input outpoint is truncated".into());
+        }
+        let script_len = usize::try_from(read_canonical_compact_uint(raw, &mut cursor)?)
+            .map_err(|_| "funding input script exceeds usize")?;
+        cursor = cursor
+            .checked_add(script_len)
+            .and_then(|value| value.checked_add(4))
+            .ok_or("funding input cursor overflow")?;
+        if cursor > raw.len() {
+            return Err("funding input is truncated".into());
+        }
+    }
+    let output_count = read_canonical_compact_uint(raw, &mut cursor)?;
+    if output_count == 0 || output_count > 100_000 || u64::from(selected_vout) >= output_count {
+        return Err("funding vout is outside transaction outputs".into());
+    }
+    let mut selected = None;
+    for index in 0..output_count {
+        let value_end = cursor
+            .checked_add(8)
+            .ok_or("funding output cursor overflow")?;
+        let value_bytes: [u8; 8] = raw
+            .get(cursor..value_end)
+            .ok_or("funding output value is truncated")?
+            .try_into()
+            .map_err(|_| "funding output value length error")?;
+        cursor = value_end;
+        let script_len = usize::try_from(read_canonical_compact_uint(raw, &mut cursor)?)
+            .map_err(|_| "funding output script exceeds usize")?;
+        let script_end = cursor
+            .checked_add(script_len)
+            .ok_or("funding output cursor overflow")?;
+        let bytecode = raw
+            .get(cursor..script_end)
+            .ok_or("funding output bytecode is truncated")?;
+        cursor = script_end;
+        if index == u64::from(selected_vout) {
+            selected = Some(ParsedOutput {
+                value_sats: u64::from_le_bytes(value_bytes),
+                token_and_locking_bytecode: bytecode.to_vec(),
+            });
+        }
+    }
+    if cursor.checked_add(4) != Some(raw.len()) {
+        return Err("funding transaction has trailing or truncated bytes".into());
+    }
+    selected.ok_or_else(|| "funding output was not found".into())
+}
+
+fn deployment_token_prefix(deployment: &PhotonDeployment, amount: u128) -> Result<Vec<u8>, String> {
+    let category = hex::decode(deployment.category_hex).map_err(|error| error.to_string())?;
+    if category.len() != 32 {
+        return Err("PHOTON category must be 32 bytes".into());
+    }
+    let mut out = Vec::with_capacity(43);
+    out.push(0xef);
+    out.extend(category.into_iter().rev());
+    out.push(0x10);
+    out.extend_from_slice(&compact_token_amount(amount)?);
+    Ok(out)
+}
+
+fn validate_deployment_baton_token(
+    deployment: &PhotonDeployment,
+    token_and_locking_bytecode: &[u8],
+) -> Result<(), String> {
+    let category = hex::decode(deployment.category_hex).map_err(|error| error.to_string())?;
+    let covenant_lock =
+        hex::decode(deployment.covenant_lock_hex).map_err(|error| error.to_string())?;
+    if token_and_locking_bytecode.first() != Some(&0xef)
+        || token_and_locking_bytecode.get(1..33) != Some(reverse(&category).as_slice())
+    {
+        return Err("parent baton has the wrong PHOTON token category".into());
+    }
+    if token_and_locking_bytecode.get(33) != Some(&0x71) {
+        return Err("parent baton is not a mutable PHOTON NFT with amount".into());
+    }
+    let mut cursor = 34usize;
+    let commitment_len = usize::try_from(read_canonical_compact_uint(
+        token_and_locking_bytecode,
+        &mut cursor,
+    )?)
+    .map_err(|_| "PHOTON baton commitment exceeds usize")?;
+    if commitment_len < 36 {
+        return Err("parent baton commitment is too short".into());
+    }
+    cursor = cursor
+        .checked_add(commitment_len)
+        .ok_or("PHOTON baton commitment cursor overflow")?;
+    token_and_locking_bytecode
+        .get(..cursor)
+        .ok_or("parent baton commitment is truncated")?;
+    read_canonical_compact_uint(token_and_locking_bytecode, &mut cursor)?;
+    if token_and_locking_bytecode.get(cursor..) != Some(covenant_lock.as_slice()) {
+        return Err("parent baton does not end in the selected PHOTON covenant".into());
+    }
+    Ok(())
+}
+
+fn funded_p2pkh_sighash(
+    parent_txid: &str,
+    funding_txid: &str,
+    funding_vout: u32,
+    input_index: u32,
+    value_sats: u64,
+    token_prefix: Option<&[u8]>,
+    locking_bytecode: &[u8],
+    outputs: &[u8],
+) -> Result<[u8; 32], String> {
+    let reward_outpoint = serialized_outpoint(parent_txid, 1)?;
+    let funding_outpoint = serialized_outpoint(funding_txid, funding_vout)?;
+    let mut outpoints = reward_outpoint.clone();
+    outpoints.extend_from_slice(&funding_outpoint);
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(&2u32.to_le_bytes());
+    preimage.extend_from_slice(&hash256(&outpoints));
+    preimage.extend_from_slice(&hash256(&[0u8; 8]));
+    preimage.extend_from_slice(if input_index == 0 {
+        &reward_outpoint
+    } else {
+        &funding_outpoint
+    });
+    if let Some(prefix) = token_prefix {
+        preimage.extend_from_slice(prefix);
+    }
+    preimage.extend_from_slice(&compact_uint(locking_bytecode.len() as u64));
+    preimage.extend_from_slice(locking_bytecode);
+    preimage.extend_from_slice(&value_sats.to_le_bytes());
+    preimage.extend_from_slice(&0u32.to_le_bytes());
+    preimage.extend_from_slice(&hash256(outputs));
+    preimage.extend_from_slice(&0u32.to_le_bytes());
+    preimage.extend_from_slice(&(u32::from(SIGHASH_ALL_FORKID)).to_le_bytes());
+    Ok(hash256(&preimage))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -726,9 +907,318 @@ pub fn build_self_funded_settlement_with_relay_fee(
     })
 }
 
+const P2PKH_CHANGE_DUST_SATS: u64 = 546;
+
+/// Preserve the established 2% donation and odd-token rounding policy.
+fn funded_split_amounts(reward_token_amount: u128) -> Result<(u128, u128, u128), String> {
+    let (miner, donation) = RuntimeConfig::split_reward(reward_token_amount);
+    let (original, shrec) = RuntimeConfig::split_donation(donation);
+    if original == 0 || shrec == 0 {
+        return Err("reward donation is too small for two nonzero token outputs".into());
+    }
+    if miner
+        .checked_add(original)
+        .and_then(|amount| amount.checked_add(shrec))
+        != Some(reward_token_amount)
+    {
+        return Err("funded reward split failed token conservation".into());
+    }
+    Ok((miner, original, shrec))
+}
+
+fn funded_split_outputs(
+    deployment: &PhotonDeployment,
+    miner_lock: &[u8],
+    original_lock: &[u8],
+    shrec_lock: &[u8],
+    funding_lock: &[u8],
+    miner_amount: u128,
+    original_amount: u128,
+    shrec_amount: u128,
+    change_sats: Option<u64>,
+) -> Result<(Vec<u8>, u8), String> {
+    let mut outputs = Vec::new();
+    for (amount, lock) in [
+        (miner_amount, miner_lock),
+        (original_amount, original_lock),
+        (shrec_amount, shrec_lock),
+    ] {
+        let mut bytecode = deployment_token_prefix(deployment, amount)?;
+        bytecode.extend_from_slice(lock);
+        outputs.extend_from_slice(&encode_raw_output(TOKEN_OUTPUT_SATS, &bytecode));
+    }
+    if let Some(change) = change_sats {
+        outputs.extend_from_slice(&encode_raw_output(change, funding_lock));
+    }
+    Ok((outputs, if change_sats.is_some() { 4 } else { 3 }))
+}
+
+fn funded_split_raw(
+    parent_txid: &str,
+    funding_txid: &str,
+    funding_vout: u32,
+    reward_unlocking: &[u8],
+    funding_unlocking: &[u8],
+    outputs: &[u8],
+    output_count: u8,
+) -> Result<Vec<u8>, String> {
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&2u32.to_le_bytes());
+    raw.push(2);
+    raw.extend_from_slice(&encode_input(parent_txid, 1, reward_unlocking)?);
+    raw.extend_from_slice(&encode_input(
+        funding_txid,
+        funding_vout,
+        funding_unlocking,
+    )?);
+    raw.push(output_count);
+    raw.extend_from_slice(outputs);
+    raw.extend_from_slice(&0u32.to_le_bytes());
+    Ok(raw)
+}
+
+/// Builds the corrected-deployment 98/1/1 child without spending the baton.
+/// The caller must supply a confirmed unspent funding output; this function
+/// verifies its raw transaction, ownership, BCH value, and absence of tokens.
+#[allow(clippy::too_many_arguments)]
+pub fn build_funded_reward_split_with_relay_fee(
+    deployment: &PhotonDeployment,
+    parent_raw: &[u8],
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    miner_payout: &str,
+    reward_token_amount: u128,
+    funding: &ConfirmedFundingUtxo,
+    funding_secret: &[u8; 32],
+    relay_fee_sats_per_kb: u64,
+) -> Result<PreparedFundedRewardSplit, String> {
+    deployment.verify()?;
+    if reward_token_amount == 0 {
+        return Err("reward token amount must be positive".into());
+    }
+    if funding.confirmations == 0 {
+        return Err("funding UTXO must have at least one confirmation".into());
+    }
+    if funding.txid != transaction_id(&funding.raw_transaction) {
+        return Err("funding raw transaction does not match its txid".into());
+    }
+    let funding_output = transaction_output(&funding.raw_transaction, funding.vout)?;
+    if funding_output.value_sats != funding.value_sats {
+        return Err("funding UTXO value does not match its raw transaction".into());
+    }
+    if funding_output.token_and_locking_bytecode.first() == Some(&0xef) {
+        return Err("funding UTXO must not contain a CashToken prefix".into());
+    }
+
+    let reward_public_derived = PublicKey::from_secret_key(
+        &SecretKey::from_secret_bytes(*reward_secret).map_err(|error| error.to_string())?,
+    )
+    .serialize();
+    if &reward_public_derived != reward_public_key {
+        return Err("reward public key does not match reward secret".into());
+    }
+    let funding_public_key = PublicKey::from_secret_key(
+        &SecretKey::from_secret_bytes(*funding_secret).map_err(|error| error.to_string())?,
+    )
+    .serialize();
+    if &funding_public_key == reward_public_key {
+        return Err("funding secret must be separate from the reward secret".into());
+    }
+    let funding_lock = p2pkh_locking_from_public_key(&funding_public_key);
+    if funding_output.token_and_locking_bytecode != funding_lock {
+        return Err("funding UTXO is not token-free P2PKH owned by funding key".into());
+    }
+
+    let [baton, reward] = parse_parent_outputs(parent_raw)?;
+    validate_deployment_baton_token(deployment, &baton.token_and_locking_bytecode)?;
+    if reward.value_sats != TOKEN_OUTPUT_SATS {
+        return Err(format!(
+            "parent reward BCH value must be the proven {TOKEN_OUTPUT_SATS} sats (got {})",
+            reward.value_sats
+        ));
+    }
+    let reward_lock = p2pkh_locking_from_public_key(reward_public_key);
+    let reward_token_prefix = deployment_token_prefix(deployment, reward_token_amount)?;
+    let mut expected_reward = reward_token_prefix.clone();
+    expected_reward.extend_from_slice(&reward_lock);
+    if reward.token_and_locking_bytecode != expected_reward {
+        return Err("parent reward output does not match the signed runtime reward state".into());
+    }
+
+    let original_address = if deployment.category_hex == CHIPNET_CATEGORY_HEX {
+        CHIPNET_DONATION_ADDRESS
+    } else {
+        DONATION_ADDRESS
+    };
+    let miner_lock = tx::cashaddr_to_p2pkh_locking(miner_payout)?;
+    let original_lock = tx::cashaddr_to_p2pkh_locking(original_address)?;
+    let shrec_lock = tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS)?;
+    let (miner_amount, original_amount, shrec_amount) = funded_split_amounts(reward_token_amount)?;
+    let parent_txid = transaction_id(parent_raw);
+    if funding.txid == parent_txid {
+        return Err("funding UTXO cannot come from the unconfirmed winning parent".into());
+    }
+    let mut placeholder_unlocking = push_data(&[0u8; 65])?;
+    placeholder_unlocking.extend_from_slice(&push_data(reward_public_key)?);
+    let mut placeholder_funding_unlocking = push_data(&[0u8; 65])?;
+    placeholder_funding_unlocking.extend_from_slice(&push_data(&funding_public_key)?);
+
+    let (no_change_outputs, no_change_count) = funded_split_outputs(
+        deployment,
+        &miner_lock,
+        &original_lock,
+        &shrec_lock,
+        &funding_lock,
+        miner_amount,
+        original_amount,
+        shrec_amount,
+        None,
+    )?;
+    let no_change_len = funded_split_raw(
+        &parent_txid,
+        &funding.txid,
+        funding.vout,
+        &placeholder_unlocking,
+        &placeholder_funding_unlocking,
+        &no_change_outputs,
+        no_change_count,
+    )?
+    .len();
+    let no_change_fee = required_relay_fee_sats(no_change_len, relay_fee_sats_per_kb)?;
+    let total_input_sats = funding
+        .value_sats
+        .checked_add(reward.value_sats)
+        .ok_or("input BCH value overflow")?;
+    let three_output_sats = TOKEN_OUTPUT_SATS
+        .checked_mul(3)
+        .ok_or("output BCH value overflow")?;
+    let no_change_actual_fee = total_input_sats
+        .checked_sub(three_output_sats)
+        .ok_or("funding UTXO cannot cover three token outputs")?;
+    if no_change_actual_fee < no_change_fee {
+        return Err(format!(
+            "funding UTXO cannot cover the required {no_change_fee}-sat relay fee"
+        ));
+    }
+
+    let (change_sizing_outputs, change_sizing_count) = funded_split_outputs(
+        deployment,
+        &miner_lock,
+        &original_lock,
+        &shrec_lock,
+        &funding_lock,
+        miner_amount,
+        original_amount,
+        shrec_amount,
+        Some(P2PKH_CHANGE_DUST_SATS),
+    )?;
+    let change_len = funded_split_raw(
+        &parent_txid,
+        &funding.txid,
+        funding.vout,
+        &placeholder_unlocking,
+        &placeholder_funding_unlocking,
+        &change_sizing_outputs,
+        change_sizing_count,
+    )?
+    .len();
+    let change_fee = required_relay_fee_sats(change_len, relay_fee_sats_per_kb)?;
+    let change = no_change_actual_fee
+        .checked_sub(change_fee)
+        .filter(|amount| *amount >= P2PKH_CHANGE_DUST_SATS);
+    let (outputs, output_count) = if let Some(change_sats) = change {
+        funded_split_outputs(
+            deployment,
+            &miner_lock,
+            &original_lock,
+            &shrec_lock,
+            &funding_lock,
+            miner_amount,
+            original_amount,
+            shrec_amount,
+            Some(change_sats),
+        )?
+    } else {
+        (no_change_outputs, no_change_count)
+    };
+
+    let reward_sighash = funded_p2pkh_sighash(
+        &parent_txid,
+        &funding.txid,
+        funding.vout,
+        0,
+        reward.value_sats,
+        Some(&reward_token_prefix),
+        &reward_lock,
+        &outputs,
+    )?;
+    let funding_sighash = funded_p2pkh_sighash(
+        &parent_txid,
+        &funding.txid,
+        funding.vout,
+        1,
+        funding.value_sats,
+        None,
+        &funding_lock,
+        &outputs,
+    )?;
+    let mut reward_signature = crypto::bch_schnorr_sign(reward_secret, &reward_sighash)?.to_vec();
+    let mut funding_signature =
+        crypto::bch_schnorr_sign(funding_secret, &funding_sighash)?.to_vec();
+    reward_signature.push(SIGHASH_ALL_FORKID);
+    funding_signature.push(SIGHASH_ALL_FORKID);
+    let mut reward_unlocking = push_data(&reward_signature)?;
+    reward_unlocking.extend_from_slice(&push_data(reward_public_key)?);
+    let mut funding_unlocking = push_data(&funding_signature)?;
+    funding_unlocking.extend_from_slice(&push_data(&funding_public_key)?);
+    let raw_settlement = funded_split_raw(
+        &parent_txid,
+        &funding.txid,
+        funding.vout,
+        &reward_unlocking,
+        &funding_unlocking,
+        &outputs,
+        output_count,
+    )?;
+    let expected_len = if change.is_some() {
+        change_len
+    } else {
+        no_change_len
+    };
+    if raw_settlement.len() != expected_len {
+        return Err("funded split relay-fee sizing changed after signing".into());
+    }
+    let required_relay_fee_sats = if change.is_some() {
+        change_fee
+    } else {
+        no_change_fee
+    };
+    let fee_sats = no_change_actual_fee
+        .checked_sub(change.unwrap_or(0))
+        .ok_or("funded split BCH accounting underflow")?;
+    if fee_sats < required_relay_fee_sats {
+        return Err("funded split fee is below required relay fee".into());
+    }
+    Ok(PreparedFundedRewardSplit {
+        parent_txid,
+        settlement_txid: transaction_id(&raw_settlement),
+        raw_settlement,
+        funding_txid: funding.txid.clone(),
+        funding_vout: funding.vout,
+        funding_input_value_sats: funding.value_sats,
+        funding_change_value_sats: change,
+        miner_token_amount: miner_amount,
+        original_donation_token_amount: original_amount,
+        shrec_donation_token_amount: shrec_amount,
+        required_relay_fee_sats,
+        fee_sats,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::CHIPNET_PHOTON;
 
     const VECTOR_BATON_TXID: &str =
         "000000124712ae4765fe9789372faebca19c99cc1d59f43df2508bf5c42ea042";
@@ -756,6 +1246,376 @@ mod tests {
         .unwrap()
     }
 
+    fn chipnet_parent(reward_lock: Vec<u8>) -> Vec<u8> {
+        tx::build_photon_template_bytes_for_deployment(
+            &tx::TemplateParams {
+                prev_tx_hash_hex: VECTOR_BATON_TXID.into(),
+                prev_index: 0,
+                age: 10,
+                public_key_hex:
+                    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                        .into(),
+                target_hex:
+                    "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
+                        .into(),
+                signature_hex:
+                    "5b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604fc6e8cc2b6b38de1c5630da8356e2e07a403ddeba8835caba0b80d75a5ac471e4"
+                        .into(),
+                nonce: 0x1234_5678,
+                contract_value_sats: 49_079_000,
+                contract_token_amount: 2_099_905_002_035_715,
+                reward_amount: 4_999_773_813,
+                payout_locking: reward_lock,
+            },
+            &CHIPNET_PHOTON,
+        )
+        .unwrap()
+    }
+
+    fn funding_fixture(secret: [u8; 32], value_sats: u64) -> ConfirmedFundingUtxo {
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(secret).unwrap()).serialize();
+        let locking = p2pkh_locking_from_public_key(&public);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.push(1);
+        raw.extend_from_slice(&[0x42; 32]);
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.push(0);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        raw.push(1);
+        raw.extend_from_slice(&encode_raw_output(value_sats, &locking));
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        ConfirmedFundingUtxo {
+            txid: transaction_id(&raw),
+            raw_transaction: raw,
+            vout: 0,
+            value_sats,
+            confirmations: 3,
+        }
+    }
+
+    fn funded_split_fixture(
+        value_sats: u64,
+    ) -> (
+        Vec<u8>,
+        [u8; 32],
+        [u8; 33],
+        [u8; 32],
+        ConfirmedFundingUtxo,
+        String,
+    ) {
+        let mut reward_secret = [0u8; 32];
+        reward_secret[31] = 1;
+        let reward_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
+                .serialize();
+        let mut funding_secret = [0u8; 32];
+        funding_secret[31] = 2;
+        let parent = chipnet_parent(p2pkh_locking_from_public_key(&reward_public));
+        let funding = funding_fixture(funding_secret, value_sats);
+        let miner_payout = p2pkh_cashaddr_from_public_key(&reward_public).unwrap();
+        (
+            parent,
+            reward_secret,
+            reward_public,
+            funding_secret,
+            funding,
+            miner_payout,
+        )
+    }
+
+    #[test]
+    fn chipnet_funded_split_spends_only_reward_and_funding_with_valid_signatures() {
+        let (parent, reward_secret, reward_public, funding_secret, funding, miner_payout) =
+            funded_split_fixture(10_000);
+        let amount = 4_999_773_813u128;
+        let split = build_funded_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            amount,
+            &funding,
+            &funding_secret,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(split.original_donation_token_amount, amount / 100);
+        assert_eq!(split.shrec_donation_token_amount, amount / 100);
+        assert_eq!(
+            split.miner_token_amount
+                + split.original_donation_token_amount
+                + split.shrec_donation_token_amount,
+            amount
+        );
+        assert!(split.funding_change_value_sats.unwrap() >= P2PKH_CHANGE_DUST_SATS);
+        assert_eq!(split.fee_sats, split.required_relay_fee_sats);
+        assert_eq!(
+            split.required_relay_fee_sats,
+            split.raw_settlement.len() as u64
+        );
+
+        let raw = &split.raw_settlement;
+        let mut cursor = 4usize;
+        assert_eq!(read_compact_uint(raw, &mut cursor).unwrap(), 2);
+        let mut outpoints = Vec::new();
+        let mut signatures = Vec::new();
+        for (expected_txid, expected_vout, expected_pubkey) in [
+            (&split.parent_txid, 1u32, reward_public),
+            (
+                &split.funding_txid,
+                split.funding_vout,
+                PublicKey::from_secret_key(&SecretKey::from_secret_bytes(funding_secret).unwrap())
+                    .serialize(),
+            ),
+        ] {
+            let outpoint = raw[cursor..cursor + 36].to_vec();
+            assert_eq!(
+                outpoint,
+                serialized_outpoint(expected_txid, expected_vout).unwrap()
+            );
+            outpoints.extend_from_slice(&outpoint);
+            cursor += 36;
+            let script_len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            let script = &raw[cursor..cursor + script_len];
+            assert_eq!(script[0], 65);
+            assert_eq!(script[65], SIGHASH_ALL_FORKID);
+            assert_eq!(script[66], 33);
+            assert_eq!(&script[67..100], &expected_pubkey);
+            signatures.push(script[1..65].to_vec());
+            cursor += script_len;
+            assert_eq!(&raw[cursor..cursor + 4], &[0u8; 4]);
+            cursor += 4;
+        }
+        assert_eq!(read_compact_uint(raw, &mut cursor).unwrap(), 4);
+        let outputs_start = cursor;
+        let expected_locks = [
+            tx::cashaddr_to_p2pkh_locking(&miner_payout).unwrap(),
+            tx::cashaddr_to_p2pkh_locking(CHIPNET_DONATION_ADDRESS).unwrap(),
+            tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS).unwrap(),
+        ];
+        for (index, amount) in [
+            split.miner_token_amount,
+            split.original_donation_token_amount,
+            split.shrec_donation_token_amount,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                u64::from_le_bytes(raw[cursor..cursor + 8].try_into().unwrap()),
+                TOKEN_OUTPUT_SATS
+            );
+            cursor += 8;
+            let len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            let mut expected = deployment_token_prefix(&CHIPNET_PHOTON, amount).unwrap();
+            expected.extend_from_slice(&expected_locks[index]);
+            assert_eq!(&raw[cursor..cursor + len], expected);
+            cursor += len;
+        }
+        assert_eq!(
+            u64::from_le_bytes(raw[cursor..cursor + 8].try_into().unwrap()),
+            split.funding_change_value_sats.unwrap()
+        );
+        cursor += 8;
+        let change_len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+        let funding_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(funding_secret).unwrap())
+                .serialize();
+        assert_eq!(
+            &raw[cursor..cursor + change_len],
+            p2pkh_locking_from_public_key(&funding_public)
+        );
+        cursor += change_len;
+        assert_eq!(cursor + 4, raw.len());
+        let outputs = &raw[outputs_start..cursor];
+
+        // Reconstruct the BCH signing preimage from parsed wire bytes, without
+        // calling the production sighash helper used to create either signature.
+        for (index, (value, token, lock, public)) in [
+            (
+                TOKEN_OUTPUT_SATS,
+                Some(deployment_token_prefix(&CHIPNET_PHOTON, amount).unwrap()),
+                p2pkh_locking_from_public_key(&reward_public),
+                reward_public,
+            ),
+            (
+                funding.value_sats,
+                None,
+                p2pkh_locking_from_public_key(&funding_public),
+                funding_public,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut preimage = Vec::new();
+            preimage.extend_from_slice(&2u32.to_le_bytes());
+            preimage.extend_from_slice(&hash256(&outpoints));
+            preimage.extend_from_slice(&hash256(&[0u8; 8]));
+            preimage.extend_from_slice(&outpoints[index * 36..index * 36 + 36]);
+            if let Some(token) = token {
+                preimage.extend_from_slice(&token);
+            }
+            preimage.push(lock.len() as u8);
+            preimage.extend_from_slice(&lock);
+            preimage.extend_from_slice(&value.to_le_bytes());
+            preimage.extend_from_slice(&0u32.to_le_bytes());
+            preimage.extend_from_slice(&hash256(outputs));
+            preimage.extend_from_slice(&0u32.to_le_bytes());
+            preimage.extend_from_slice(&0x41u32.to_le_bytes());
+            let signature: [u8; 64] = signatures[index].as_slice().try_into().unwrap();
+            assert!(crypto::bch_schnorr_verify(&public, &hash256(&preimage), &signature).unwrap());
+        }
+    }
+
+    #[test]
+    fn chipnet_funded_split_rejects_unconfirmed_tokenized_or_wrong_funding() {
+        let (parent, reward_secret, reward_public, funding_secret, funding, miner_payout) =
+            funded_split_fixture(10_000);
+        let build = |funding: &ConfirmedFundingUtxo, funding_secret: &[u8; 32]| {
+            build_funded_reward_split_with_relay_fee(
+                &CHIPNET_PHOTON,
+                &parent,
+                &reward_secret,
+                &reward_public,
+                &miner_payout,
+                4_999_773_813,
+                funding,
+                funding_secret,
+                1_000,
+            )
+        };
+        let mut unconfirmed = funding.clone();
+        unconfirmed.confirmations = 0;
+        assert!(build(&unconfirmed, &funding_secret)
+            .unwrap_err()
+            .contains("confirmation"));
+        let mut wrong_txid = funding.clone();
+        wrong_txid.txid.replace_range(0..1, "0");
+        assert!(build(&wrong_txid, &funding_secret)
+            .unwrap_err()
+            .contains("does not match its txid"));
+        let mut wrong_value = funding.clone();
+        wrong_value.value_sats += 1;
+        assert!(build(&wrong_value, &funding_secret)
+            .unwrap_err()
+            .contains("value does not match"));
+        let mut tokenized = funding.clone();
+        let locking = p2pkh_locking_from_public_key(
+            &PublicKey::from_secret_key(&SecretKey::from_secret_bytes(funding_secret).unwrap())
+                .serialize(),
+        );
+        let mut raw = tokenized.raw_transaction[..47].to_vec();
+        raw.extend_from_slice(&encode_output(10_000, Some(1), &locking).unwrap());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        tokenized.raw_transaction = raw;
+        tokenized.txid = transaction_id(&tokenized.raw_transaction);
+        assert!(build(&tokenized, &funding_secret)
+            .unwrap_err()
+            .contains("CashToken prefix"));
+        let mut other_secret = [0u8; 32];
+        other_secret[31] = 3;
+        assert!(build(&funding, &other_secret)
+            .unwrap_err()
+            .contains("owned by funding key"));
+    }
+
+    #[test]
+    fn chipnet_funded_split_rejects_old_parent_and_insufficient_funding() {
+        let (parent, reward_secret, reward_public, funding_secret, funding, miner_payout) =
+            funded_split_fixture(1_800);
+        let error = build_funded_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+            &funding,
+            &funding_secret,
+            1_000,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot cover"));
+        let mainnet_parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
+        let rich_funding = funding_fixture(funding_secret, 10_000);
+        let error = build_funded_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &mainnet_parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+            &rich_funding,
+            &funding_secret,
+            1_000,
+        )
+        .unwrap_err();
+        assert!(error.contains("wrong PHOTON token category"));
+    }
+
+    #[test]
+    fn chipnet_funded_split_omits_dust_change_and_meets_relay_fee() {
+        let (parent, reward_secret, reward_public, funding_secret, funding, miner_payout) =
+            funded_split_fixture(2_300);
+        let split = build_funded_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+            &funding,
+            &funding_secret,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(split.funding_change_value_sats, None);
+        assert!(split.fee_sats >= split.required_relay_fee_sats);
+        assert_eq!(split.fee_sats, 900);
+        let raw = &split.raw_settlement;
+        let mut cursor = 4usize;
+        assert_eq!(read_compact_uint(raw, &mut cursor).unwrap(), 2);
+        for _ in 0..2 {
+            cursor += 36;
+            let script_len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            cursor += script_len + 4;
+        }
+        assert_eq!(read_compact_uint(raw, &mut cursor).unwrap(), 3);
+    }
+
+    #[test]
+    fn chipnet_funded_split_rejects_non_700_parent_reward() {
+        let (mut parent, reward_secret, reward_public, funding_secret, funding, miner_payout) =
+            funded_split_fixture(10_000);
+        let [_, reward] = parse_parent_outputs(&parent).unwrap();
+        let mut reward_bytes =
+            encode_raw_output(reward.value_sats, &reward.token_and_locking_bytecode);
+        reward_bytes[..8].copy_from_slice(&707u64.to_le_bytes());
+        let original = encode_raw_output(reward.value_sats, &reward.token_and_locking_bytecode);
+        let offset = parent
+            .windows(original.len())
+            .position(|window| window == original)
+            .unwrap();
+        parent[offset..offset + reward_bytes.len()].copy_from_slice(&reward_bytes);
+        let error = build_funded_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &parent,
+            &reward_secret,
+            &reward_public,
+            &miner_payout,
+            4_999_773_813,
+            &funding,
+            &funding_secret,
+            1_000,
+        )
+        .unwrap_err();
+        assert!(error.contains("proven 700 sats"));
+    }
+
     #[test]
     /// Checks that runtime intermediate key matches standard p2pkh vector.
     fn runtime_intermediate_key_matches_standard_p2pkh_vector() {
@@ -781,6 +1641,25 @@ mod tests {
         assert_eq!(RuntimeConfig::split_reward(49), (49, 0));
         assert_eq!(RuntimeConfig::split_reward(50), (49, 1));
         assert_eq!(RuntimeConfig::split_reward(100), (98, 2));
+    }
+
+    #[test]
+    fn funded_split_preserves_existing_odd_donation_rounding() {
+        for amount in [100u128, 199, 4_999_773_850] {
+            let (miner, original, shrec) = funded_split_amounts(amount).unwrap();
+            let (expected_miner, donation) = RuntimeConfig::split_reward(amount);
+            let (expected_original, expected_shrec) = RuntimeConfig::split_donation(donation);
+            assert_eq!(
+                (miner, original, shrec),
+                (expected_miner, expected_original, expected_shrec)
+            );
+            assert_eq!(miner + original + shrec, amount);
+        }
+        assert_eq!(funded_split_amounts(199).unwrap(), (196, 2, 1));
+        assert_eq!(
+            funded_split_amounts(99).unwrap_err(),
+            "reward donation is too small for two nonzero token outputs"
+        );
     }
 
     #[test]

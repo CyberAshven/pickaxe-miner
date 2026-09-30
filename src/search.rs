@@ -3,6 +3,7 @@
 //! CPU cryptography is limited to job setup and rare returned-winner verification.
 
 use crate::backend::BackendKind;
+use crate::config::{MiningNetwork, MiningToken};
 use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::hip_photon::HipPhotonEngine;
 #[cfg(feature = "portable-wgpu")]
@@ -176,6 +177,7 @@ pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32
 
 #[derive(Debug, Clone, Default)]
 pub struct MiningJob {
+    pub network: MiningNetwork,
     pub height: u32,
     pub baton_txid: String,
     pub baton_vout: u32,
@@ -303,6 +305,23 @@ pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
     false
 }
 
+/// Applies the selected covenant's signed ScriptNum proof rule.
+pub fn meets_target_le_for_network(
+    digest: &[u8; 32],
+    target_le: &[u8; 32],
+    network: MiningNetwork,
+) -> bool {
+    if network == MiningNetwork::Chipnet
+        && (digest[31] & 0x80 != 0
+            || digest.iter().all(|byte| *byte == 0)
+            || target_le[31] & 0x80 != 0
+            || target_le.iter().all(|byte| *byte == 0))
+    {
+        return false;
+    }
+    meets_target_le(digest, target_le)
+}
+
 struct PreparedJob {
     job: MiningJob,
     template: Vec<u8>,
@@ -321,12 +340,21 @@ fn validate_job(job: &MiningJob) -> Result<[u8; 32], String> {
     if job.generation_id == 0 {
         return Err("mining job generation_id must be nonzero".into());
     }
-    tx::PhotonLayout::for_age(job.age)?;
+    tx::PhotonLayout::for_age_with_deployment(
+        job.age,
+        MiningToken::Photon.photon_deployment(job.network),
+    )?;
     tx::require_covenant_hash_preimage(job.token_amount, job.reward_raw)?;
     if job.payout_address.trim().is_empty() {
         return Err("mining payout address is required".into());
     }
-    parse_hex32(&job.target_le_hex)
+    let target = parse_hex32(&job.target_le_hex)?;
+    if job.network == MiningNetwork::Chipnet
+        && (target[31] & 0x80 != 0 || target.iter().all(|byte| *byte == 0))
+    {
+        return Err("chipnet PHOTON target must be a positive ScriptNum".into());
+    }
+    Ok(target)
 }
 
 /// Prepares validated job bytes and target for GPU search.
@@ -360,8 +388,9 @@ fn prepare_job(
         reward_amount: job.reward_raw,
         payout_locking,
     };
-    let template = tx::build_photon_template_bytes(&params)?;
-    let layout = tx::PhotonLayout::for_age(job.age)?;
+    let deployment = MiningToken::Photon.photon_deployment(job.network);
+    let template = tx::build_photon_template_bytes_for_deployment(&params, deployment)?;
+    let layout = tx::PhotonLayout::for_age_with_deployment(job.age, deployment)?;
     if template.len() != layout.tx_bytes() {
         return Err(format!(
             "PHOTON live template is {} bytes; age {} needs {}",
@@ -430,12 +459,13 @@ fn verify_gpu_winner(
         contract_token_amount: prepared.job.token_amount,
         reward_raw: actual_reward,
     };
-    let transaction = tx::apply_reference_signature(
+    let transaction = tx::apply_reference_signature_for_deployment(
         &context,
         &prepared.job.payout_address,
         &hex::encode(public_key),
         winner.nonce,
         &hex::encode(signature),
+        MiningToken::Photon.photon_deployment(prepared.job.network),
     )?;
     let digest = hash256(&transaction);
     if digest != winner.digest {
@@ -445,7 +475,7 @@ fn verify_gpu_winner(
             hex::encode(digest)
         ));
     }
-    if !meets_target_le(&digest, &prepared.target) {
+    if !meets_target_le_for_network(&digest, &prepared.target, prepared.job.network) {
         return Err("returned GPU winner failed strict host hash < target verification".into());
     }
     Ok(VerifiedWinner {
@@ -1602,6 +1632,73 @@ mod tests {
     }
 
     #[test]
+    fn chipnet_signed_hash_requires_positive_nonzero_digest() {
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        let mut positive = [1; 32];
+        positive[31] = 0;
+        assert!(meets_target_le_for_network(
+            &positive,
+            &target,
+            crate::config::MiningNetwork::Chipnet,
+        ));
+        let mut negative = positive;
+        negative[31] = 0x80;
+        assert!(!meets_target_le_for_network(
+            &negative,
+            &target,
+            crate::config::MiningNetwork::Chipnet,
+        ));
+        assert!(!meets_target_le_for_network(
+            &[0; 32],
+            &target,
+            crate::config::MiningNetwork::Chipnet,
+        ));
+        assert!(meets_target_le_for_network(
+            &negative,
+            &target,
+            crate::config::MiningNetwork::Mainnet,
+        ));
+        let mut invalid_target = target;
+        invalid_target[31] = 0xff;
+        assert!(!meets_target_le_for_network(
+            &positive,
+            &invalid_target,
+            crate::config::MiningNetwork::Chipnet,
+        ));
+    }
+
+    #[test]
+    fn prepared_chipnet_job_uses_confirmed_deployment_layout() {
+        let sk = [1u8; 32];
+        let public_key =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
+        let mut job = integration_job(8);
+        job.network = MiningNetwork::Chipnet;
+        job.age = 38;
+        job.baton_value_sats = 49_080_500;
+        job.payout_address = crate::config::CHIPNET_DONATION_ADDRESS.into();
+        let prepared = prepare_job(job.clone(), &sk, &public_key).unwrap();
+        let layout = tx::PhotonLayout::for_age_with_deployment(
+            job.age,
+            MiningToken::Photon.photon_deployment(job.network),
+        )
+        .unwrap();
+        assert_eq!(prepared.template.len(), 618);
+        assert_eq!(layout.shift(), 3);
+        assert_eq!(
+            &prepared.template[layout.target_offset()..layout.target_offset() + 32],
+            &prepared.target,
+        );
+        let mut unsupported = job;
+        unsupported.age = 128;
+        assert!(prepare_job(unsupported, &sk, &public_key)
+            .err()
+            .unwrap()
+            .contains("GPU layout shift 4"));
+    }
+
+    #[test]
     fn t2_winner_reconstructs_the_actual_reduced_reward() {
         let sk = [0x11; 32];
         let public =
@@ -1662,6 +1759,7 @@ mod tests {
 
     fn integration_job(generation_id: u64) -> MiningJob {
         MiningJob {
+            network: MiningNetwork::Mainnet,
             height: 1_000,
             baton_txid: "42a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae124712000000".into(),
             baton_vout: 0,

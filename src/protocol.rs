@@ -266,6 +266,9 @@ pub const FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://fulcrum.kronbit.com:50004",
 ];
 
+/// Chipnet WSS bootstrap for PHOTON baton discovery.
+pub const CHIPNET_FULCRUM_WSS_BOOTSTRAP: &[&str] = &["wss://electrum-chipnet.optnlabs.com"];
+
 /// Electron Cash mainnet servers published with the `s` (TLS) transport.
 /// These are catalog metadata until Pickaxe grows a native Electrum TLS client.
 pub const ELECTRON_CASH_TLS_BOOTSTRAP: &[(&str, u16)] = &[
