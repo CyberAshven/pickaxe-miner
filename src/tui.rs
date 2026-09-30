@@ -2978,6 +2978,15 @@ fn event_log_text(event: &RuntimeEvent) -> String {
             parent_txid,
             child_txid,
         } => format!("submission accepted: parent={parent_txid} reward={child_txid}"),
+        RuntimeEvent::RewardAccrued { parent_txid } => format!(
+            "chipnet reward accrued: parent={parent_txid}; 98/1/1 split awaits confirmed rewards"
+        ),
+        RuntimeEvent::RewardSplit { child_txid, reward_count } => format!(
+            "chipnet 98/1/1 split accepted: child={child_txid} rewards={reward_count}"
+        ),
+        RuntimeEvent::RewardInventory { confirmed_at_least } => format!(
+            "chipnet confirmed unsplit rewards: at least {confirmed_at_least}; split starts at five when fees fit"
+        ),
         RuntimeEvent::Error(error) => format!("error: {error}"),
     }
 }

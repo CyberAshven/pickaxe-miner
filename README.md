@@ -59,7 +59,9 @@ Use a build containing Chipnet support (the v0.0.2 download above predates it). 
 
 Replace the quoted address with your valid token-aware P2PKH payout CashAddr. The miner converts a valid mainnet payout CashAddr to the equivalent `bchtest:` address with the same key hash. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoint; mainnet remains the default without `--chipnet`.
 
-Chipnet's 98% / 1% / 1% token split needs a separate confirmed, token-free BCH UTXO to fund the reward child transaction. On first start, Pickaxe creates a local funding key and shows its `bchtest:` funding address if the preflight needs BCH. Send Chipnet BCH to that address, wait for confirmation, then restart the miner. The error states the minimum amount needed for the current reward and relay fee. Keep the funding key safe: on Linux it is stored under `${XDG_STATE_HOME:-$HOME/.local/state}/pickaxe-miner/chipnet-funding.key`; on Windows, under `%LOCALAPPDATA%\Pickaxe Miner\chipnet-funding.key`. Each reward spends a confirmed funding UTXO; wait for another confirmed UTXO, including a confirmed change output, before the next reward.
+Chipnet mining starts without an external BCH deposit. Pickaxe derives a persistent intermediate reward key from its local `chipnet-funding.key` root. Early wins pay that intermediate token address, so tokens do not reach your configured payout address on the first win. Once roughly five wins are confirmed, Pickaxe can automatically combine them and send the exact 98% / 1% / 1% token split. Higher relay fees may require more confirmed wins.
+
+Optionally, a confirmed token-free Chipnet BCH UTXO at Pickaxe's separate funding address can enable the split immediately. Keep `chipnet-funding.key` safe until all rewards are settled: on Linux it is stored under `${XDG_STATE_HOME:-$HOME/.local/state}/pickaxe-miner/chipnet-funding.key`; on Windows, under `%LOCALAPPDATA%\Pickaxe Miner\chipnet-funding.key`.
 
 ## Diagnostic logging
 

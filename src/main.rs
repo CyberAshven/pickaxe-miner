@@ -852,6 +852,24 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
                 "parent_txid": parent_txid,
                 "child_txid": child_txid,
             }),
+            runtime::RuntimeEvent::RewardAccrued { parent_txid } => serde_json::json!({
+                "event": "reward_accrued",
+                "parent_txid": parent_txid,
+                "split_pending": true,
+            }),
+            runtime::RuntimeEvent::RewardSplit {
+                child_txid,
+                reward_count,
+            } => serde_json::json!({
+                "event": "reward_split",
+                "child_txid": child_txid,
+                "reward_count": reward_count,
+            }),
+            runtime::RuntimeEvent::RewardInventory { confirmed_at_least } => serde_json::json!({
+                "event": "reward_inventory",
+                "confirmed_at_least": confirmed_at_least,
+                "minimum_for_split": 5,
+            }),
             runtime::RuntimeEvent::Error(error) => {
                 serde_json::json!({"event": "error", "error": error})
             }
@@ -907,6 +925,15 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             child_txid,
         } => println!(
             "winner submission accepted: parent={parent_txid} reward={child_txid}"
+        ),
+        runtime::RuntimeEvent::RewardAccrued { parent_txid } => println!(
+            "chipnet reward accrued: parent={parent_txid}; 98/1/1 split awaits enough confirmed rewards"
+        ),
+        runtime::RuntimeEvent::RewardSplit { child_txid, reward_count } => println!(
+            "chipnet 98/1/1 reward split accepted: child={child_txid} rewards={reward_count}"
+        ),
+        runtime::RuntimeEvent::RewardInventory { confirmed_at_least } => println!(
+            "chipnet confirmed unsplit rewards: at least {confirmed_at_least}; batch split starts at five if the relay fee is covered"
         ),
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
     }

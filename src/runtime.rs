@@ -170,6 +170,9 @@ const SUBMISSION_JOURNAL_VERSION: u8 = 3;
 const CHIPNET_SUBMISSION_JOURNAL_VERSION: u8 = 4;
 const SUBMISSION_RESOLUTION_VERSION: u8 = 1;
 const CHIPNET_SUBMISSION_RESOLUTION_VERSION: u8 = 2;
+const CHIPNET_BATCH_JOURNAL_VERSION: u8 = 1;
+const CHIPNET_BATCH_MIN_REWARDS: usize = 5;
+const CHIPNET_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const BATON_LINEAGE_MAX_STEPS: usize = 256;
 const VERIFIED_WINNER_DURABILITY_READY: bool = true;
 
@@ -395,6 +398,292 @@ struct ResolvedSubmission {
     reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingBatchSweep {
+    version: u8,
+    network: String,
+    mode: String,
+    settlement_txid: String,
+    settlement_hex: String,
+    input_outpoints: Vec<(String, u32)>,
+    miner_token_amount: u128,
+    original_donation_token_amount: u128,
+    shrec_donation_token_amount: u128,
+}
+
+impl PendingBatchSweep {
+    fn from_prepared(split: &reward::PreparedBatchedRewardSplit) -> Result<Self, String> {
+        let pending = Self {
+            version: CHIPNET_BATCH_JOURNAL_VERSION,
+            network: "chipnet".into(),
+            mode: "batch_reward_split".into(),
+            settlement_txid: split.settlement_txid.clone(),
+            settlement_hex: hex::encode(&split.raw_settlement),
+            input_outpoints: split.input_outpoints.clone(),
+            miner_token_amount: split.miner_token_amount,
+            original_donation_token_amount: split.original_donation_token_amount,
+            shrec_donation_token_amount: split.shrec_donation_token_amount,
+        };
+        pending.validate()?;
+        Ok(pending)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.version != CHIPNET_BATCH_JOURNAL_VERSION
+            || self.network != "chipnet"
+            || self.mode != "batch_reward_split"
+        {
+            return Err("batch sweep journal is not bound to chipnet reward split".into());
+        }
+        if self.input_outpoints.len() < CHIPNET_BATCH_MIN_REWARDS {
+            return Err("batch sweep journal has fewer than five reward inputs".into());
+        }
+        let raw = hex::decode(&self.settlement_hex)
+            .map_err(|error| format!("batch sweep transaction hex: {error}"))?;
+        if reward::transaction_id(&raw) != self.settlement_txid {
+            return Err("batch sweep transaction txid does not match signed bytes".into());
+        }
+        if transaction_input_outpoints(&raw)? != self.input_outpoints {
+            return Err("batch sweep journal inputs do not match signed child".into());
+        }
+        let mut unique = std::collections::HashSet::new();
+        if !self
+            .input_outpoints
+            .iter()
+            .all(|outpoint| unique.insert(outpoint))
+        {
+            return Err("batch sweep journal has duplicate reward inputs".into());
+        }
+        if self.miner_token_amount == 0
+            || self.original_donation_token_amount == 0
+            || self.shrec_donation_token_amount == 0
+        {
+            return Err("batch sweep journal has zero-valued token allocation".into());
+        }
+        Ok(())
+    }
+
+    fn load(path: &Path) -> Result<Option<Self>, String> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "read chipnet batch journal {}: {error}",
+                    path.display()
+                ))
+            }
+        };
+        let pending: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse chipnet batch journal {}: {error}", path.display()))?;
+        pending.validate()?;
+        Ok(Some(pending))
+    }
+
+    fn persist_new(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
+        let parent = path
+            .parent()
+            .ok_or("chipnet batch journal lacks parent directory")?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create chipnet batch journal directory: {error}"))?;
+        if path.exists() {
+            return if Self::load(path)?.as_ref() == Some(self) {
+                PendingSubmission::sync_committed(path, parent)
+            } else {
+                Err("a different chipnet batch sweep is already pending".into())
+            };
+        }
+        let temporary = PendingSubmission::marker_path(path, ".tmp");
+        if temporary.exists() {
+            fs::remove_file(&temporary)
+                .map_err(|error| format!("remove interrupted chipnet batch journal: {error}"))?;
+        }
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| format!("serialize chipnet batch journal: {error}"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("create chipnet batch temporary journal: {error}"))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write chipnet batch temporary journal: {error}"))?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .map_err(|error| format!("commit chipnet batch journal: {error}"))?;
+        PendingSubmission::sync_committed(path, parent)
+    }
+
+    fn resolved_dir(journal_path: &Path) -> PathBuf {
+        PendingSubmission::marker_path(journal_path, ".resolved.d")
+    }
+
+    fn path(&self, journal_path: &Path) -> PathBuf {
+        Self::resolved_dir(journal_path).join(format!("{}.json", self.settlement_txid))
+    }
+
+    fn resolve(&self, journal_path: &Path) -> Result<Self, String> {
+        self.validate()?;
+        let directory = Self::resolved_dir(journal_path);
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("create resolved chipnet batch directory: {error}"))?;
+        let resolved_path = self.path(journal_path);
+        let temporary = PendingSubmission::marker_path(&resolved_path, ".tmp");
+        if temporary.exists() {
+            fs::remove_file(&temporary)
+                .map_err(|error| format!("remove interrupted resolved chipnet batch: {error}"))?;
+        }
+        if !resolved_path.exists() {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| {
+                    format!("create resolved chipnet batch temporary record: {error}")
+                })?;
+            let bytes = serde_json::to_vec(self)
+                .map_err(|error| format!("serialize resolved chipnet batch: {error}"))?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| format!("write resolved chipnet batch: {error}"))?;
+            drop(file);
+            fs::rename(&temporary, &resolved_path)
+                .map_err(|error| format!("commit resolved chipnet batch: {error}"))?;
+        } else {
+            let recorded = Self::load(&resolved_path)?;
+            if recorded.as_ref() != Some(self) {
+                return Err("resolved chipnet batch record differs from pending sweep".into());
+            }
+        }
+        #[cfg(unix)]
+        fs::File::open(&directory)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| format!("sync resolved chipnet batch directory: {error}"))?;
+        fs::remove_file(journal_path)
+            .map_err(|error| format!("remove resolved chipnet batch journal: {error}"))?;
+        Ok(self.clone())
+    }
+}
+
+fn batch_sweep_journal_path(parent_journal_path: &Path) -> PathBuf {
+    parent_journal_path.with_file_name("pending-sweep-chipnet.json")
+}
+
+fn reward_input_previously_spent(
+    journal_path: &Path,
+    outpoint: &(String, u32),
+) -> Result<bool, String> {
+    let directory = PendingBatchSweep::resolved_dir(journal_path);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("read resolved chipnet batches: {error}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read resolved chipnet batch entry: {error}"))?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            return Err("unexpected file in resolved chipnet batch directory".into());
+        }
+        let recorded = PendingBatchSweep::load(&entry.path())?
+            .ok_or("resolved chipnet batch record vanished during read")?;
+        if recorded.input_outpoints.contains(outpoint) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn prepare_chipnet_batch_sweep(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    wallet: &FundingWallet,
+    journal_path: &Path,
+) -> Result<(Option<PendingBatchSweep>, usize), String> {
+    if cfg.network != MiningNetwork::Chipnet {
+        return Err("batch reward sweep cannot run outside chipnet".into());
+    }
+    if PendingBatchSweep::load(journal_path)?.is_some() {
+        return Err("chipnet batch reward sweep is already pending".into());
+    }
+    let deployment = cfg.token.photon_deployment(cfg.network);
+    let mut rewards = wallet.confirmed_reward_utxos(session, deployment)?;
+    rewards.sort_by(|left, right| (&left.txid, left.vout).cmp(&(&right.txid, right.vout)));
+    let confirmed_count = rewards.len();
+    for reward in &rewards {
+        let outpoint = (reward.txid.clone(), reward.vout);
+        if reward_input_previously_spent(journal_path, &outpoint)? {
+            return Err(format!(
+                "chipnet source reported already split reward {}:{} as unspent",
+                reward.txid, reward.vout
+            ));
+        }
+    }
+    if rewards.len() < CHIPNET_BATCH_MIN_REWARDS {
+        return Ok((None, confirmed_count));
+    }
+    let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(cfg)?;
+    let max_inputs = rewards.len().min(32);
+    for count in CHIPNET_BATCH_MIN_REWARDS..=max_inputs {
+        match reward::build_batched_reward_split_with_relay_fee(
+            deployment,
+            &rewards[..count],
+            wallet.reward_secret_key(),
+            wallet.reward_public_key(),
+            &cfg.payout_address,
+            relay_fee_sats_per_kb,
+            wallet.address(),
+        ) {
+            Ok(split) => {
+                let pending = PendingBatchSweep::from_prepared(&split)?;
+                pending.persist_new(journal_path)?;
+                return Ok((Some(pending), confirmed_count));
+            }
+            Err(error) if error.contains("cannot cover the required") => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((None, confirmed_count))
+}
+
+fn attempt_chipnet_batch_sweep(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    wallet: &FundingWallet,
+    pending: &PendingBatchSweep,
+    journal_path: &Path,
+) -> Result<(), String> {
+    if cfg.network != MiningNetwork::Chipnet {
+        return Err("chipnet batch sweep journal cannot broadcast on mainnet".into());
+    }
+    pending.validate()?;
+    if session.transaction_known(&pending.settlement_txid)? {
+        pending.resolve(journal_path)?;
+        return Ok(());
+    }
+    wallet.verify_confirmed_reward_outpoints(
+        session,
+        cfg.token.photon_deployment(cfg.network),
+        &pending.input_outpoints,
+    )?;
+    for outpoint in &pending.input_outpoints {
+        if reward_input_previously_spent(journal_path, outpoint)? {
+            return Err("pending chipnet batch reuses an already resolved reward input".into());
+        }
+    }
+    let returned = session.broadcast_raw(&pending.settlement_hex)?;
+    ensure_broadcast_txid(
+        "chipnet batch reward child",
+        &pending.settlement_txid,
+        &returned,
+    )?;
+    // Fulcrum's accepted txid is authoritative evidence that this chipnet
+    // server knows the signed child. The durable resolved record is written
+    // before the pending journal is removed.
+    pending.resolve(journal_path)?;
+    Ok(())
+}
+
 impl PendingSubmission {
     /// Derives a durable submission marker path from the journal path.
     fn marker_path(journal_path: &Path, suffix: &str) -> PathBuf {
@@ -590,16 +879,55 @@ impl PendingSubmission {
         Ok(pending)
     }
 
+    fn from_parent_only(winner: &VerifiedWinner, live: &LiveJob) -> Result<Self, String> {
+        let parent_txid = reward::transaction_id(&winner.transaction);
+        let baton_value = live
+            .baton_value_sats
+            .checked_sub(crate::protocol::CHIPNET_PHOTON.single_input_max_baton_decrease_sats()?)
+            .ok_or("chipnet parent baton value underflow")?;
+        let reward_amount =
+            tx::t2_parent_reward_amount(&winner.transaction, live.token_amount, live.reward_raw)?;
+        let pending = Self {
+            version: CHIPNET_SUBMISSION_JOURNAL_VERSION,
+            network: Some("chipnet".into()),
+            mode: Some("parent_only".into()),
+            funding_outpoint: None,
+            generation_id: winner.generation_id,
+            expected_height: winner.height,
+            expected_baton_txid: winner.baton_txid.clone(),
+            expected_baton_vout: winner.baton_vout,
+            parent_txid: parent_txid.clone(),
+            parent_hex: hex::encode(&winner.transaction),
+            settlement_txid: parent_txid.clone(),
+            settlement_hex: hex::encode(&winner.transaction),
+            resulting_baton_txid: parent_txid,
+            resulting_baton_vout: 0,
+            resulting_baton_value_sats: baton_value,
+            miner_token_amount: reward_amount,
+            donation_token_amount: 0,
+        };
+        pending.validate()?;
+        Ok(pending)
+    }
+
     fn is_chipnet_funded(&self) -> bool {
         self.version == CHIPNET_SUBMISSION_JOURNAL_VERSION
             && self.network.as_deref() == Some("chipnet")
             && self.mode.as_deref() == Some("funded_reward_split")
     }
 
+    fn is_chipnet_parent_only(&self) -> bool {
+        self.version == CHIPNET_SUBMISSION_JOURNAL_VERSION
+            && self.network.as_deref() == Some("chipnet")
+            && self.mode.as_deref() == Some("parent_only")
+    }
+
     fn require_network(&self, network: MiningNetwork) -> Result<(), String> {
         match network {
             MiningNetwork::Mainnet if self.version == SUBMISSION_JOURNAL_VERSION => Ok(()),
-            MiningNetwork::Chipnet if self.is_chipnet_funded() => Ok(()),
+            MiningNetwork::Chipnet if self.is_chipnet_funded() || self.is_chipnet_parent_only() => {
+                Ok(())
+            }
             _ => Err(
                 "pending PHOTON submission network or mode does not match mining network".into(),
             ),
@@ -638,28 +966,38 @@ impl PendingSubmission {
             );
         }
         if self.version == CHIPNET_SUBMISSION_JOURNAL_VERSION {
-            if !self.is_chipnet_funded()
-                || self.resulting_baton_txid != self.parent_txid
-                || self
-                    .funding_outpoint
-                    .as_deref()
-                    .is_none_or(|value| value.is_empty())
-            {
-                return Err(
-                    "chipnet funded journal has invalid network, mode, or funding outpoint".into(),
-                );
+            if self.resulting_baton_txid != self.parent_txid {
+                return Err("chipnet resulting baton must be parent output 0".into());
             }
-            let (child_funding_txid, child_funding_vout) =
-                second_input_outpoint(&self.settlement_hex)?;
-            let expected = format!("{child_funding_txid}:{child_funding_vout}");
-            if self.funding_outpoint.as_deref() != Some(expected.as_str()) {
-                return Err(
-                    "chipnet funded journal funding outpoint disagrees with signed child".into(),
-                );
-            }
-            let (first_txid, first_vout) = first_input_outpoint(&self.settlement_hex)?;
-            if first_txid != self.parent_txid || first_vout != 1 {
-                return Err("chipnet funded child must spend the parent reward output 1".into());
+            if self.is_chipnet_funded() {
+                if self.funding_outpoint.as_deref().is_none_or(str::is_empty) {
+                    return Err("chipnet funded journal requires funding outpoint".into());
+                }
+                let (child_funding_txid, child_funding_vout) =
+                    second_input_outpoint(&self.settlement_hex)?;
+                let expected = format!("{child_funding_txid}:{child_funding_vout}");
+                if self.funding_outpoint.as_deref() != Some(expected.as_str()) {
+                    return Err(
+                        "chipnet funded journal funding outpoint disagrees with signed child"
+                            .into(),
+                    );
+                }
+                let (first_txid, first_vout) = first_input_outpoint(&self.settlement_hex)?;
+                if first_txid != self.parent_txid || first_vout != 1 {
+                    return Err("chipnet funded child must spend the parent reward output 1".into());
+                }
+            } else if self.is_chipnet_parent_only() {
+                if self.funding_outpoint.is_some()
+                    || self.settlement_txid != self.parent_txid
+                    || self.settlement_hex != self.parent_hex
+                    || self.donation_token_amount != 0
+                {
+                    return Err(
+                        "chipnet parent-only journal contains a child or funding input".into(),
+                    );
+                }
+            } else {
+                return Err("chipnet journal has unsupported network or mode".into());
             }
         } else if self.network.is_some() || self.mode.is_some() || self.funding_outpoint.is_some() {
             return Err("legacy mainnet journal cannot select chipnet funding".into());
@@ -670,8 +1008,9 @@ impl PendingSubmission {
             .ok_or("pending submission reward token amount overflow")?;
         let expected_donation =
             reward_amount.saturating_mul(u128::from(crate::config::DONATION_BPS)) / 10_000;
-        if self.donation_token_amount != expected_donation
-            || self.miner_token_amount != reward_amount - expected_donation
+        if !self.is_chipnet_parent_only()
+            && (self.donation_token_amount != expected_donation
+                || self.miner_token_amount != reward_amount - expected_donation)
         {
             return Err("pending submission does not encode the exact 98/2 reward split".into());
         }
@@ -909,7 +1248,7 @@ impl ResolvedSubmission {
         }
 
         Ok(Self {
-            version: if pending.is_chipnet_funded() {
+            version: if pending.version == CHIPNET_SUBMISSION_JOURNAL_VERSION {
                 CHIPNET_SUBMISSION_RESOLUTION_VERSION
             } else {
                 SUBMISSION_RESOLUTION_VERSION
@@ -937,7 +1276,7 @@ impl ResolvedSubmission {
     fn from_confirmed(pending: &PendingSubmission, fresh: &LiveJob) -> Result<Self, String> {
         pending.validate()?;
         Ok(Self {
-            version: if pending.is_chipnet_funded() {
+            version: if pending.version == CHIPNET_SUBMISSION_JOURNAL_VERSION {
                 CHIPNET_SUBMISSION_RESOLUTION_VERSION
             } else {
                 SUBMISSION_RESOLUTION_VERSION
@@ -987,8 +1326,12 @@ impl ResolvedSubmission {
             || (self.journal_version == CHIPNET_SUBMISSION_JOURNAL_VERSION
                 && (self.version != CHIPNET_SUBMISSION_RESOLUTION_VERSION
                     || self.network.as_deref() != Some("chipnet")
-                    || self.mode.as_deref() != Some("funded_reward_split")
-                    || self.funding_outpoint.is_none()))
+                    || !matches!(
+                        self.mode.as_deref(),
+                        Some("funded_reward_split" | "parent_only")
+                    )
+                    || (self.mode.as_deref() == Some("funded_reward_split"))
+                        != self.funding_outpoint.is_some()))
         {
             return Err("resolved submission network, mode, or version mismatch".into());
         }
@@ -1263,6 +1606,44 @@ fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
     ))
 }
 
+fn transaction_input_outpoints(raw: &[u8]) -> Result<Vec<(String, u32)>, String> {
+    if raw.len() < 5 {
+        return Err("batch sweep transaction is too short".into());
+    }
+    let mut offset = 4usize;
+    let count = usize::try_from(read_compact_size(raw, &mut offset)?)
+        .map_err(|_| "batch sweep input count overflows usize")?;
+    if count == 0 || count > 128 {
+        return Err("batch sweep input count is outside safe bounds".into());
+    }
+    let mut outpoints = Vec::with_capacity(count);
+    for _ in 0..count {
+        let wire_txid = raw
+            .get(offset..offset + 32)
+            .ok_or("batch sweep input txid is truncated")?;
+        offset += 32;
+        let vout: [u8; 4] = raw
+            .get(offset..offset + 4)
+            .ok_or("batch sweep input vout is truncated")?
+            .try_into()
+            .map_err(|_| "batch sweep input vout length error")?;
+        offset += 4;
+        let script_len = usize::try_from(read_compact_size(raw, &mut offset)?)
+            .map_err(|_| "batch sweep input script length overflows usize")?;
+        offset = offset
+            .checked_add(script_len)
+            .and_then(|position| position.checked_add(4))
+            .ok_or("batch sweep input offset overflows")?;
+        if offset > raw.len() {
+            return Err("batch sweep input script or sequence is truncated".into());
+        }
+        let mut display_txid = wire_txid.to_vec();
+        display_txid.reverse();
+        outpoints.push((hex::encode(display_txid), u32::from_le_bytes(vout)));
+    }
+    Ok(outpoints)
+}
+
 /// Reads the second input of a signed funded reward child.
 fn second_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
     let raw = hex::decode(raw_tx_hex.trim())
@@ -1438,6 +1819,10 @@ fn broadcast_pending_transaction(
     cfg: &RuntimeConfig,
     raw_tx_hex: &str,
 ) -> Result<String, String> {
+    if cfg.network == MiningNetwork::Chipnet {
+        // The active Fulcrum session is bound to the chipnet deployment.
+        return session.broadcast_raw(raw_tx_hex);
+    }
     let node_endpoints = cfg.node_endpoints();
     let node_configured = !node_endpoints.is_empty();
     broadcast_with_preference(
@@ -1486,6 +1871,9 @@ fn preflight_pending_transaction(
     expected_txid: &str,
     raw_tx_hex: &str,
 ) -> Result<(), String> {
+    if cfg.network == MiningNetwork::Chipnet {
+        return Ok(());
+    }
     // Bootstrap node RPCs stay off this gate. A public node that lacks
     // testmempoolaccept, or rejects a valid PHOTON tx, must not block the
     // Fulcrum broadcast the miner already uses.
@@ -1534,6 +1922,53 @@ fn require_parent_known_for_child(
     Ok(())
 }
 
+fn attempt_parent_only_submission(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    pending: &PendingSubmission,
+    journal_path: &Path,
+) -> Result<SubmissionAttempt, String> {
+    if !pending.is_chipnet_parent_only() {
+        return Err("parent-only submission requires chipnet parent-only journal".into());
+    }
+    let parent_known = session.transaction_known(&pending.parent_txid)?;
+    let fresh = session.fetch_live_job()?;
+    if parent_known || resulting_baton_is_authoritative(pending, &fresh) {
+        pending.mark_parent_accepted(journal_path)?;
+        if pending.expected_baton_is_current(&fresh) {
+            return Err("chipnet parent is known; waiting for authoritative baton advance".into());
+        }
+        if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
+            return Ok(SubmissionAttempt::Complete(Box::new(fresh)));
+        }
+        return Err("chipnet parent is known but live baton is not proven descendant".into());
+    }
+    if pending.parent_attempted(journal_path)? {
+        return Err(
+            "chipnet parent broadcast was attempted; awaiting authoritative acceptance".into(),
+        );
+    }
+    if !pending.expected_baton_is_current(&fresh) {
+        return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
+    }
+    preflight_pending_transaction(
+        cfg,
+        "PHOTON parent",
+        &pending.parent_txid,
+        &pending.parent_hex,
+    )?;
+    pending.mark_parent_attempted(journal_path)?;
+    let returned = broadcast_pending_transaction(session, cfg, &pending.parent_hex)?;
+    ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned)?;
+    pending.mark_parent_accepted(journal_path)?;
+    let next = session.fetch_live_job()?;
+    if resulting_baton_is_authoritative_or_descendant(session, pending, &next)? {
+        Ok(SubmissionAttempt::Complete(Box::new(next)))
+    } else {
+        Err("chipnet parent was accepted; waiting for authoritative baton advance".into())
+    }
+}
+
 /// Attempts the journaled parent and settlement submission safely.
 fn attempt_pending_submission(
     session: &mut ElectrumSession,
@@ -1543,6 +1978,10 @@ fn attempt_pending_submission(
 ) -> Result<SubmissionAttempt, String> {
     pending.validate()?;
     pending.require_network(cfg.network)?;
+
+    if pending.is_chipnet_parent_only() {
+        return attempt_parent_only_submission(session, cfg, pending, journal_path);
+    }
 
     let settlement_known = session.transaction_known(&pending.settlement_txid)?;
     if settlement_known {
@@ -1677,9 +2116,12 @@ fn prepare_chipnet_pending_submission(
         tx::t2_parent_reward_amount(&winner.transaction, live.token_amount, live.reward_raw)?;
     let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(cfg)?;
     let required = chipnet_funding_floor(actual_reward, relay_fee_sats_per_kb)?;
-    let funding = wallet.select_confirmed_utxo(session, required).map_err(|error| {
-        format!("chipnet 98/1/1 reward split needs at least {required} confirmed sats at funding address {}: {error}", wallet.address())
-    })?;
+    let funding = wallet.select_optional_confirmed_utxo(session, required)?;
+    let Some(funding) = funding else {
+        let pending = PendingSubmission::from_parent_only(winner, live)?;
+        pending.persist_new(journal_path)?;
+        return Ok(pending);
+    };
     ensure_funding_not_previously_spent(journal_path, &funding)?;
     let split = reward::build_funded_reward_split_with_relay_fee(
         deployment,
@@ -1917,7 +2359,7 @@ fn production_preflight(
     )?;
     if cfg.network == MiningNetwork::Chipnet {
         let wallet = funding_wallet.ok_or("chipnet funding wallet is unavailable")?;
-        production_preflight_funding(
+        let _ = production_preflight_funding(
             session,
             cfg,
             live,
@@ -2075,11 +2517,11 @@ fn production_preflight_funding(
     wallet: &FundingWallet,
     journal_path: &Path,
     relay_fee_sats_per_kb: u64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let required = chipnet_funding_floor(live.reward_raw, relay_fee_sats_per_kb)?;
-    let funding = wallet.select_confirmed_utxo(session, required).map_err(|error| {
-        format!("chipnet 98/1/1 reward split needs a confirmed token-free BCH UTXO of at least {required} sats at funding address {}: {error}", wallet.address())
-    })?;
+    let Some(funding) = wallet.select_optional_confirmed_utxo(session, required)? else {
+        return Ok(false);
+    };
     ensure_funding_not_previously_spent(journal_path, &funding)?;
     let context = tx::ReferenceJobContext {
         prev_txid: live.baton_txid.clone(),
@@ -2123,7 +2565,7 @@ fn production_preflight_funding(
             "chipnet funded reward preflight failed exact 98/1/1 or relay fee accounting".into(),
         );
     }
-    Ok(())
+    Ok(true)
 }
 
 fn ensure_funding_not_previously_spent(
@@ -2268,6 +2710,16 @@ pub enum RuntimeEvent {
         parent_txid: String,
         child_txid: String,
     },
+    RewardAccrued {
+        parent_txid: String,
+    },
+    RewardSplit {
+        child_txid: String,
+        reward_count: usize,
+    },
+    RewardInventory {
+        confirmed_at_least: usize,
+    },
     Error(String),
 }
 
@@ -2379,9 +2831,24 @@ impl RuntimeSupervisor {
             None
         };
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
+        let batch_journal_path = batch_sweep_journal_path(&journal_path);
+        if let Some(pending) = PendingBatchSweep::load(&batch_journal_path)? {
+            let wallet = funding_wallet
+                .as_ref()
+                .ok_or("chipnet batch journal exists without chipnet reward wallet")?;
+            attempt_chipnet_batch_sweep(&mut session, &cfg, wallet, &pending, &batch_journal_path)?;
+        }
         let initial = session.fetch_live_job()?;
         let (reward_secret, reward_public_key, mining_payout_address) =
-            reward::new_intermediate_identity()?;
+            if let Some(wallet) = funding_wallet.as_ref() {
+                (
+                    *wallet.reward_secret_key(),
+                    *wallet.reward_public_key(),
+                    wallet.reward_token_address().to_string(),
+                )
+            } else {
+                reward::new_intermediate_identity()?
+            };
         production_preflight(
             &mut session,
             &cfg,
@@ -2392,6 +2859,22 @@ impl RuntimeSupervisor {
             &journal_path,
             funding_wallet.as_ref(),
         )?;
+        if cfg.network == MiningNetwork::Chipnet {
+            let wallet = funding_wallet
+                .as_ref()
+                .ok_or("chipnet reward wallet is unavailable")?;
+            if let (Some(pending), _) =
+                prepare_chipnet_batch_sweep(&mut session, &cfg, wallet, &batch_journal_path)?
+            {
+                attempt_chipnet_batch_sweep(
+                    &mut session,
+                    &cfg,
+                    wallet,
+                    &pending,
+                    &batch_journal_path,
+                )?;
+            }
+        }
         println!(
             "{}",
             serde_json::json!({
@@ -2471,6 +2954,7 @@ impl RuntimeSupervisor {
                     mining_payout_address,
                     initial_settlement,
                     journal_path,
+                    batch_journal_path,
                     funding_wallet,
                     None,
                     command_rx,
@@ -2604,6 +3088,7 @@ fn run_supervisor(
     mining_payout_address: String,
     mut settlement: SettlementState,
     journal_path: PathBuf,
+    batch_journal_path: PathBuf,
     funding_wallet: Option<FundingWallet>,
     mut pending_submission: Option<PendingSubmission>,
     command_rx: Receiver<SupervisorCommand>,
@@ -2629,6 +3114,9 @@ fn run_supervisor(
     let mut stale_winners = 0u64;
     let mut verified_winners = 0u64;
     let mut pending_winners = u64::from(pending_submission.is_some());
+    let mut pending_batch_sweep: Option<PendingBatchSweep> = None;
+    let mut sweep_discovery_degraded = false;
+    let mut next_sweep_check = Instant::now() + CHIPNET_SWEEP_INTERVAL;
     let mut last_error = None;
     let mut reconnect_backoff = RECONNECT_MIN;
     let mut next_reconnect = Instant::now();
@@ -2676,7 +3164,7 @@ fn run_supervisor(
                     let result = resume_search_if_safe(
                         &shutdown,
                         session.is_some(),
-                        pending_winners,
+                        pending_winners.saturating_add(u64::from(sweep_discovery_degraded)),
                         unacknowledged,
                         &mut user_paused,
                         || search.apply_control(SearchCommand::Resume).map(|_| ()),
@@ -2687,7 +3175,7 @@ fn run_supervisor(
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::SetPayout(payout, reply)) => {
-                    if pending_winners != 0 {
+                    if pending_winners != 0 || sweep_discovery_degraded {
                         let _ = reply.send(Err(
                             "payout change unavailable while a verified winner is pending".into(),
                         ));
@@ -2737,7 +3225,7 @@ fn run_supervisor(
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::SetFulcrum(endpoint, reply)) => {
-                    if pending_winners != 0 {
+                    if pending_winners != 0 || sweep_discovery_degraded {
                         let _ = reply.send(Err(
                             "endpoint change unavailable while runtime work is pending".into(),
                         ));
@@ -2811,7 +3299,7 @@ fn run_supervisor(
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Reconnect(reply)) => {
-                    let result = if pending_winners != 0 {
+                    let result = if pending_winners != 0 || sweep_discovery_degraded {
                         Err("reconnect unavailable while runtime work is pending".into())
                     } else {
                         session = None;
@@ -2924,7 +3412,10 @@ fn run_supervisor(
                         reconnect_backoff = RECONNECT_MIN;
                         last_error = None;
                         session = Some(next_session);
-                        if pending_submission.is_some() {
+                        if pending_submission.is_some()
+                            || pending_batch_sweep.is_some()
+                            || sweep_discovery_degraded
+                        {
                             // Finish or resolve the journaled winner on this
                             // session first. The next job's preflight refuses
                             // to start while that journal exists, so applying
@@ -2934,6 +3425,7 @@ fn run_supervisor(
                                 RuntimeEvent::Reconnected(active_fulcrum_endpoint.clone()),
                             );
                             next_submission_retry = Instant::now();
+                            next_sweep_check = Instant::now();
                             state = SupervisorState::Paused;
                         } else {
                             match apply_refreshed_job(
@@ -2958,7 +3450,8 @@ fn run_supervisor(
                                     if search_resume_allowed(
                                         &shutdown,
                                         user_paused,
-                                        pending_winners,
+                                        pending_winners
+                                            .saturating_add(u64::from(sweep_discovery_degraded)),
                                     ) {
                                         let _ = search.apply_control(SearchCommand::Resume);
                                         state = SupervisorState::Mining;
@@ -3054,13 +3547,22 @@ fn run_supervisor(
                     Ok(SubmissionAttempt::Complete(fresh)) => {
                         match resolve_confirmed_submission(&pending, &fresh, &journal_path) {
                             Ok(()) => {
-                                emit(
-                                    &event_tx,
-                                    RuntimeEvent::SubmissionAccepted {
-                                        parent_txid: pending.parent_txid,
-                                        child_txid: pending.settlement_txid,
-                                    },
-                                );
+                                if pending.is_chipnet_parent_only() {
+                                    emit(
+                                        &event_tx,
+                                        RuntimeEvent::RewardAccrued {
+                                            parent_txid: pending.parent_txid.clone(),
+                                        },
+                                    );
+                                } else {
+                                    emit(
+                                        &event_tx,
+                                        RuntimeEvent::SubmissionAccepted {
+                                            parent_txid: pending.parent_txid.clone(),
+                                            child_txid: pending.settlement_txid.clone(),
+                                        },
+                                    );
+                                }
                                 pending_submission = None;
                                 pending_winners = 0;
                                 last_error = None;
@@ -3094,7 +3596,9 @@ fn run_supervisor(
                                         if !search_resume_allowed(
                                             &shutdown,
                                             user_paused,
-                                            pending_winners,
+                                            pending_winners.saturating_add(u64::from(
+                                                sweep_discovery_degraded,
+                                            )),
                                         ) {
                                             state = SupervisorState::Paused;
                                         } else {
@@ -3156,7 +3660,9 @@ fn run_supervisor(
                                         if !search_resume_allowed(
                                             &shutdown,
                                             user_paused,
-                                            pending_winners,
+                                            pending_winners.saturating_add(u64::from(
+                                                sweep_discovery_degraded,
+                                            )),
                                         ) {
                                             state = SupervisorState::Paused;
                                         } else {
@@ -3197,6 +3703,64 @@ fn run_supervisor(
                         emit(
                             &event_tx,
                             RuntimeEvent::Reconnecting(format!("winner submission retry: {error}")),
+                        );
+                        let _ = search.apply_control(SearchCommand::Pause);
+                        session = None;
+                        reconnect_preference = ReconnectPreference::PreferActive;
+                        next_reconnect = Instant::now() + submission_backoff;
+                        submission_backoff = submission_backoff
+                            .checked_mul(2)
+                            .unwrap_or(RECONNECT_MAX)
+                            .min(RECONNECT_MAX);
+                    }
+                }
+            }
+        } else if pending_batch_sweep.is_some() {
+            if Instant::now() >= next_submission_retry {
+                let pending = pending_batch_sweep.as_ref().expect("checked above").clone();
+                let result = attempt_chipnet_batch_sweep(
+                    session.as_mut().expect("checked session above"),
+                    &cfg,
+                    funding_wallet
+                        .as_ref()
+                        .expect("chipnet reward wallet is retained"),
+                    &pending,
+                    &batch_journal_path,
+                );
+                match result {
+                    Ok(()) => {
+                        emit(
+                            &event_tx,
+                            RuntimeEvent::RewardSplit {
+                                child_txid: pending.settlement_txid,
+                                reward_count: pending.input_outpoints.len(),
+                            },
+                        );
+                        pending_batch_sweep = None;
+                        pending_winners = 0;
+                        last_error = None;
+                        submission_backoff = RECONNECT_MIN;
+                        next_sweep_check = Instant::now() + CHIPNET_SWEEP_INTERVAL;
+                        if !winner_refresh_pending
+                            && search.snapshot().winners <= observed_search_winners
+                            && search_resume_allowed(
+                                &shutdown,
+                                user_paused,
+                                pending_winners.saturating_add(u64::from(sweep_discovery_degraded)),
+                            )
+                        {
+                            let _ = search.apply_control(SearchCommand::Resume);
+                            state = SupervisorState::Mining;
+                        }
+                    }
+                    Err(error) => {
+                        last_error = Some(error.clone());
+                        state = SupervisorState::Reconnecting;
+                        emit(
+                            &event_tx,
+                            RuntimeEvent::Reconnecting(format!(
+                                "chipnet batch split recovery: {error}"
+                            )),
                         );
                         let _ = search.apply_control(SearchCommand::Pause);
                         session = None;
@@ -3328,7 +3892,10 @@ fn run_supervisor(
                                 }
                             }
 
-                            if pending_winners == 0 && boundary.route_warning.is_none() {
+                            if pending_winners == 0
+                                && !sweep_discovery_degraded
+                                && boundary.route_warning.is_none()
+                            {
                                 last_error = None;
                             }
                             if (changed || force_winner_refresh)
@@ -3417,6 +3984,77 @@ fn run_supervisor(
                                 .min(RECONNECT_MAX);
                         }
                     }
+                }
+            }
+        }
+
+        if cfg.network == MiningNetwork::Chipnet
+            && pending_winners == 0
+            && pending_winner.is_none()
+            && pending_submission.is_none()
+            && pending_batch_sweep.is_none()
+            && session.is_some()
+            && Instant::now() >= next_sweep_check
+        {
+            next_sweep_check = Instant::now() + CHIPNET_SWEEP_INTERVAL;
+            match prepare_chipnet_batch_sweep(
+                session.as_mut().expect("checked session above"),
+                &cfg,
+                funding_wallet
+                    .as_ref()
+                    .expect("chipnet reward wallet is retained"),
+                &batch_journal_path,
+            ) {
+                Ok((Some(pending), confirmed_count)) => {
+                    emit(
+                        &event_tx,
+                        RuntimeEvent::RewardInventory {
+                            confirmed_at_least: confirmed_count,
+                        },
+                    );
+                    sweep_discovery_degraded = false;
+                    let _ = search.apply_control(SearchCommand::Pause);
+                    pending_winners = 1;
+                    pending_batch_sweep = Some(pending);
+                    next_submission_retry = Instant::now();
+                    state = SupervisorState::Paused;
+                }
+                Ok((None, confirmed_count)) => {
+                    emit(
+                        &event_tx,
+                        RuntimeEvent::RewardInventory {
+                            confirmed_at_least: confirmed_count,
+                        },
+                    );
+                    if sweep_discovery_degraded {
+                        sweep_discovery_degraded = false;
+                        if search_resume_allowed(&shutdown, user_paused, pending_winners)
+                            && !winner_refresh_pending
+                            && search.snapshot().winners <= observed_search_winners
+                        {
+                            let _ = search.apply_control(SearchCommand::Resume);
+                            state = SupervisorState::Mining;
+                        }
+                    }
+                }
+                Err(error) => {
+                    sweep_discovery_degraded = true;
+                    last_error = Some(error.clone());
+                    state = SupervisorState::Reconnecting;
+                    emit(
+                        &event_tx,
+                        RuntimeEvent::Reconnecting(format!(
+                            "chipnet reward sweep discovery retry: {error}"
+                        )),
+                    );
+                    let _ = search.apply_control(SearchCommand::Pause);
+                    session = None;
+                    reconnect_preference = ReconnectPreference::PreferActive;
+                    next_reconnect = Instant::now() + submission_backoff;
+                    submission_backoff = submission_backoff
+                        .checked_mul(2)
+                        .unwrap_or(RECONNECT_MAX)
+                        .min(RECONNECT_MAX);
                 }
             }
         }
@@ -6510,6 +7148,101 @@ mod tests {
         let different = reward::ConfirmedFundingUtxo { vout: 4, ..spent };
         ensure_funding_not_previously_spent(&journal, &different).unwrap();
         fs::remove_file(ResolvedSubmission::path(&journal)).unwrap();
+    }
+
+    #[test]
+    fn chipnet_parent_only_journal_needs_no_external_funding_child() {
+        let mut pending = synthetic_chipnet_pending();
+        pending.mode = Some("parent_only".into());
+        pending.funding_outpoint = None;
+        pending.settlement_txid = pending.parent_txid.clone();
+        pending.settlement_hex = pending.parent_hex.clone();
+        pending.miner_token_amount = 100;
+        pending.donation_token_amount = 0;
+        pending.validate().unwrap();
+        pending.require_network(MiningNetwork::Chipnet).unwrap();
+        assert!(pending.require_network(MiningNetwork::Mainnet).is_err());
+        assert_eq!(pending.resulting_baton_txid, pending.parent_txid);
+    }
+
+    #[test]
+    fn chipnet_batch_journal_is_durable_and_rejects_reused_inputs() {
+        let outpoints = (0..5)
+            .map(|index| (format!("{index:02x}").repeat(32), 1u32))
+            .collect::<Vec<_>>();
+        let outpoint = outpoints[2].clone();
+        let mut raw = 2u32.to_le_bytes().to_vec();
+        raw.push(5);
+        for (txid, vout) in &outpoints {
+            let mut wire = hex::decode(txid).unwrap();
+            wire.reverse();
+            raw.extend(wire);
+            raw.extend(vout.to_le_bytes());
+            raw.push(0);
+            raw.extend(u32::MAX.to_le_bytes());
+        }
+        raw.push(1);
+        raw.extend(0u64.to_le_bytes());
+        raw.push(0);
+        raw.extend(0u32.to_le_bytes());
+        let pending = PendingBatchSweep {
+            version: 1,
+            network: "chipnet".into(),
+            mode: "batch_reward_split".into(),
+            settlement_txid: reward::transaction_id(&raw),
+            settlement_hex: hex::encode(raw),
+            input_outpoints: outpoints.clone(),
+            miner_token_amount: 98,
+            original_donation_token_amount: 1,
+            shrec_donation_token_amount: 1,
+        };
+        let journal = std::env::temp_dir().join(format!(
+            "pickaxe-batch-{}-{}.json",
+            std::process::id(),
+            PREFLIGHT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            PendingSubmission::marker_path(&journal, ".tmp"),
+            b"interrupted prepare",
+        )
+        .unwrap();
+        pending.persist_new(&journal).unwrap();
+        assert_eq!(
+            PendingBatchSweep::load(&journal).unwrap(),
+            Some(pending.clone())
+        );
+        let mut wrong_network = pending.clone();
+        wrong_network.network = "mainnet".into();
+        assert!(wrong_network.validate().is_err());
+        fs::create_dir_all(PendingBatchSweep::resolved_dir(&journal)).unwrap();
+        fs::write(
+            PendingSubmission::marker_path(&pending.path(&journal), ".tmp"),
+            b"interrupted resolve",
+        )
+        .unwrap();
+        let resolved = pending.resolve(&journal).unwrap();
+        assert!(!journal.exists());
+        assert!(resolved.input_outpoints.contains(&outpoint));
+        assert!(reward_input_previously_spent(&journal, &outpoint).unwrap());
+        pending.persist_new(&journal).unwrap();
+        let restarted = PendingBatchSweep::load(&journal).unwrap().unwrap();
+        restarted.resolve(&journal).unwrap();
+        assert!(!journal.exists());
+        let mut later = pending.clone();
+        let mut later_raw = hex::decode(&later.settlement_hex).unwrap();
+        for index in 0..5 {
+            later_raw[5 + index * 41..37 + index * 41].fill(0xab + index as u8);
+            later.input_outpoints[index] = (format!("{:02x}", 0xab + index).repeat(32), 1);
+        }
+        later.settlement_txid = reward::transaction_id(&later_raw);
+        later.settlement_hex = hex::encode(later_raw);
+        later.persist_new(&journal).unwrap();
+        let later_resolved = later.resolve(&journal).unwrap();
+        assert!(reward_input_previously_spent(&journal, &outpoint).unwrap());
+        assert!(reward_input_previously_spent(&journal, &later.input_outpoints[0]).unwrap());
+        let _ = fs::remove_file(later_resolved.path(&journal));
+        let _ = fs::remove_file(resolved.path(&journal));
+        let _ = fs::remove_dir(PendingBatchSweep::resolved_dir(&journal));
     }
 
     #[test]

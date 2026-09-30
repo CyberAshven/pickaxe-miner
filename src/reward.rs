@@ -53,6 +53,30 @@ pub struct ConfirmedFundingUtxo {
     pub confirmations: u32,
 }
 
+/// A confirmed, independently verifiable PHOTON reward owned by the batch key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedRewardUtxo {
+    pub txid: String,
+    pub raw_transaction: Vec<u8>,
+    pub vout: u32,
+    pub value_sats: u64,
+    pub token_amount: u128,
+    pub confirmations: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedBatchedRewardSplit {
+    pub settlement_txid: String,
+    pub raw_settlement: Vec<u8>,
+    pub input_outpoints: Vec<(String, u32)>,
+    pub miner_token_amount: u128,
+    pub original_donation_token_amount: u128,
+    pub shrec_donation_token_amount: u128,
+    pub reward_change_value_sats: Option<u64>,
+    pub required_relay_fee_sats: u64,
+    pub fee_sats: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedFundedRewardSplit {
     pub parent_txid: String,
@@ -1215,6 +1239,254 @@ pub fn build_funded_reward_split_with_relay_fee(
     })
 }
 
+/// Signs one CashToken P2PKH input in an N-input BCH transaction.
+fn batched_reward_sighash(
+    outpoints: &[u8],
+    sequences: &[u8],
+    outpoint: &[u8],
+    token_prefix: &[u8],
+    reward_lock: &[u8],
+    value_sats: u64,
+    outputs: &[u8],
+) -> [u8; 32] {
+    let mut preimage = Vec::with_capacity(180);
+    preimage.extend_from_slice(&2u32.to_le_bytes());
+    preimage.extend_from_slice(&hash256(outpoints));
+    preimage.extend_from_slice(&hash256(sequences));
+    preimage.extend_from_slice(outpoint);
+    preimage.extend_from_slice(token_prefix);
+    preimage.extend_from_slice(&compact_uint(reward_lock.len() as u64));
+    preimage.extend_from_slice(reward_lock);
+    preimage.extend_from_slice(&value_sats.to_le_bytes());
+    preimage.extend_from_slice(&0u32.to_le_bytes());
+    preimage.extend_from_slice(&hash256(outputs));
+    preimage.extend_from_slice(&0u32.to_le_bytes());
+    preimage.extend_from_slice(&u32::from(SIGHASH_ALL_FORKID).to_le_bytes());
+    hash256(&preimage)
+}
+
+fn batched_reward_raw(
+    rewards: &[ConfirmedRewardUtxo],
+    unlockings: &[Vec<u8>],
+    outputs: &[u8],
+    output_count: u8,
+) -> Result<Vec<u8>, String> {
+    if rewards.len() != unlockings.len() {
+        return Err("batch input and unlocking counts differ".into());
+    }
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&2u32.to_le_bytes());
+    raw.extend_from_slice(&compact_uint(rewards.len() as u64));
+    for (reward, unlocking) in rewards.iter().zip(unlockings) {
+        raw.extend_from_slice(&encode_input(&reward.txid, reward.vout, unlocking)?);
+    }
+    raw.extend_from_slice(&compact_uint(u64::from(output_count)));
+    raw.extend_from_slice(outputs);
+    raw.extend_from_slice(&0u32.to_le_bytes());
+    Ok(raw)
+}
+
+/// Spends confirmed reward outputs together so their BCH value pays the
+/// three 700-sat token outputs and relay fee, without a separate BCH UTXO.
+pub fn build_batched_reward_split_with_relay_fee(
+    deployment: &PhotonDeployment,
+    rewards: &[ConfirmedRewardUtxo],
+    reward_secret: &[u8; 32],
+    reward_public_key: &[u8; 33],
+    miner_payout: &str,
+    relay_fee_sats_per_kb: u64,
+    change_payout: &str,
+) -> Result<PreparedBatchedRewardSplit, String> {
+    deployment.verify()?;
+    if rewards.len() < 5 {
+        return Err("batch split needs at least five confirmed rewards".into());
+    }
+    let derived_public = PublicKey::from_secret_key(
+        &SecretKey::from_secret_bytes(*reward_secret).map_err(|error| error.to_string())?,
+    )
+    .serialize();
+    if &derived_public != reward_public_key {
+        return Err("reward public key does not match reward secret".into());
+    }
+    let reward_lock = p2pkh_locking_from_public_key(reward_public_key);
+    let mut seen = std::collections::HashSet::with_capacity(rewards.len());
+    let mut input_outpoints = Vec::with_capacity(rewards.len());
+    let mut outpoints = Vec::with_capacity(rewards.len() * 36);
+    let mut sequences = Vec::with_capacity(rewards.len() * 4);
+    let (mut miner_amount, mut original_amount, mut shrec_amount) = (0u128, 0u128, 0u128);
+    let mut total_input_sats = 0u64;
+    for reward in rewards {
+        if reward.confirmations == 0 {
+            return Err("batch reward must have at least one confirmation".into());
+        }
+        if !seen.insert((reward.txid.clone(), reward.vout)) {
+            return Err("batch reward has a duplicate outpoint".into());
+        }
+        if transaction_id(&reward.raw_transaction) != reward.txid {
+            return Err("batch reward raw transaction does not match its txid".into());
+        }
+        let output = transaction_output(&reward.raw_transaction, reward.vout)?;
+        if reward.value_sats != TOKEN_OUTPUT_SATS || output.value_sats != TOKEN_OUTPUT_SATS {
+            return Err("batch reward BCH value must be the proven 700 sats".into());
+        }
+        if reward.token_amount == 0 {
+            return Err("batch reward token amount must be positive".into());
+        }
+        let mut expected = deployment_token_prefix(deployment, reward.token_amount)?;
+        expected.extend_from_slice(&reward_lock);
+        if output.token_and_locking_bytecode != expected {
+            return Err("batch reward token category, amount, or owner does not match".into());
+        }
+        let (miner, donation) = RuntimeConfig::split_reward(reward.token_amount);
+        let (original, shrec) = RuntimeConfig::split_donation(donation);
+        miner_amount = miner_amount
+            .checked_add(miner)
+            .ok_or("miner token total overflow")?;
+        original_amount = original_amount
+            .checked_add(original)
+            .ok_or("original donation token total overflow")?;
+        shrec_amount = shrec_amount
+            .checked_add(shrec)
+            .ok_or("shrec donation token total overflow")?;
+        total_input_sats = total_input_sats
+            .checked_add(reward.value_sats)
+            .ok_or("batch reward BCH input total overflow")?;
+        input_outpoints.push((reward.txid.clone(), reward.vout));
+        outpoints.extend_from_slice(&serialized_outpoint(&reward.txid, reward.vout)?);
+        sequences.extend_from_slice(&0u32.to_le_bytes());
+    }
+    if miner_amount == 0 || original_amount == 0 || shrec_amount == 0 {
+        return Err("batch reward donation is too small for three token outputs".into());
+    }
+    let miner_lock = tx::cashaddr_to_p2pkh_locking(miner_payout)?;
+    let change_lock = tx::cashaddr_to_p2pkh_locking(change_payout)?;
+    let original_address = if deployment.category_hex == CHIPNET_CATEGORY_HEX {
+        CHIPNET_DONATION_ADDRESS
+    } else {
+        DONATION_ADDRESS
+    };
+    let original_lock = tx::cashaddr_to_p2pkh_locking(original_address)?;
+    let shrec_lock = tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS)?;
+    let (no_change_outputs, no_change_count) = funded_split_outputs(
+        deployment,
+        &miner_lock,
+        &original_lock,
+        &shrec_lock,
+        &change_lock,
+        miner_amount,
+        original_amount,
+        shrec_amount,
+        None,
+    )?;
+    let mut placeholder = push_data(&[0u8; 65])?;
+    placeholder.extend_from_slice(&push_data(reward_public_key)?);
+    let placeholders = vec![placeholder; rewards.len()];
+    let no_change_len =
+        batched_reward_raw(rewards, &placeholders, &no_change_outputs, no_change_count)?.len();
+    let no_change_fee = required_relay_fee_sats(no_change_len, relay_fee_sats_per_kb)?;
+    let token_output_sats = TOKEN_OUTPUT_SATS
+        .checked_mul(3)
+        .ok_or("batch output BCH overflow")?;
+    let available_fee = total_input_sats
+        .checked_sub(token_output_sats)
+        .ok_or("batch rewards cannot fund three token outputs")?;
+    if available_fee < no_change_fee {
+        return Err(format!(
+            "batch rewards cannot cover the required {no_change_fee}-sat relay fee"
+        ));
+    }
+    let (change_sizing_outputs, change_sizing_count) = funded_split_outputs(
+        deployment,
+        &miner_lock,
+        &original_lock,
+        &shrec_lock,
+        &change_lock,
+        miner_amount,
+        original_amount,
+        shrec_amount,
+        Some(P2PKH_CHANGE_DUST_SATS),
+    )?;
+    let change_len = batched_reward_raw(
+        rewards,
+        &placeholders,
+        &change_sizing_outputs,
+        change_sizing_count,
+    )?
+    .len();
+    let change_fee = required_relay_fee_sats(change_len, relay_fee_sats_per_kb)?;
+    let change = available_fee
+        .checked_sub(change_fee)
+        .filter(|amount| *amount >= P2PKH_CHANGE_DUST_SATS);
+    let (outputs, output_count) = if let Some(change_sats) = change {
+        funded_split_outputs(
+            deployment,
+            &miner_lock,
+            &original_lock,
+            &shrec_lock,
+            &change_lock,
+            miner_amount,
+            original_amount,
+            shrec_amount,
+            Some(change_sats),
+        )?
+    } else {
+        (no_change_outputs, no_change_count)
+    };
+    let mut unlockings = Vec::with_capacity(rewards.len());
+    for (index, reward) in rewards.iter().enumerate() {
+        let prefix = deployment_token_prefix(deployment, reward.token_amount)?;
+        let signature_hash = batched_reward_sighash(
+            &outpoints,
+            &sequences,
+            &outpoints[index * 36..(index + 1) * 36],
+            &prefix,
+            &reward_lock,
+            reward.value_sats,
+            &outputs,
+        );
+        let signature = crypto::bch_schnorr_sign(reward_secret, &signature_hash)?;
+        if !crypto::bch_schnorr_verify(reward_public_key, &signature_hash, &signature)? {
+            return Err("batch reward signature failed self-verification".into());
+        }
+        let mut signature_with_type = signature.to_vec();
+        signature_with_type.push(SIGHASH_ALL_FORKID);
+        let mut unlocking = push_data(&signature_with_type)?;
+        unlocking.extend_from_slice(&push_data(reward_public_key)?);
+        unlockings.push(unlocking);
+    }
+    let raw_settlement = batched_reward_raw(rewards, &unlockings, &outputs, output_count)?;
+    let expected_len = if change.is_some() {
+        change_len
+    } else {
+        no_change_len
+    };
+    if raw_settlement.len() != expected_len {
+        return Err("batch relay-fee sizing changed after signing".into());
+    }
+    let required_relay_fee_sats = if change.is_some() {
+        change_fee
+    } else {
+        no_change_fee
+    };
+    let fee_sats = available_fee
+        .checked_sub(change.unwrap_or(0))
+        .ok_or("batch BCH accounting underflow")?;
+    if fee_sats < required_relay_fee_sats {
+        return Err("batch fee is below required relay fee".into());
+    }
+    Ok(PreparedBatchedRewardSplit {
+        settlement_txid: transaction_id(&raw_settlement),
+        raw_settlement,
+        input_outpoints,
+        miner_token_amount: miner_amount,
+        original_donation_token_amount: original_amount,
+        shrec_donation_token_amount: shrec_amount,
+        reward_change_value_sats: change,
+        required_relay_fee_sats,
+        fee_sats,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,6 +1595,350 @@ mod tests {
             funding,
             miner_payout,
         )
+    }
+
+    fn confirmed_reward_fixture(
+        secret: [u8; 32],
+        input_marker: u8,
+        amount: u128,
+    ) -> ConfirmedRewardUtxo {
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(secret).unwrap()).serialize();
+        let lock = p2pkh_locking_from_public_key(&public);
+        let mut bytecode = deployment_token_prefix(&CHIPNET_PHOTON, amount).unwrap();
+        bytecode.extend_from_slice(&lock);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.push(1);
+        raw.extend_from_slice(&[input_marker; 32]);
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.push(0);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        raw.push(1);
+        raw.extend_from_slice(&encode_raw_output(TOKEN_OUTPUT_SATS, &bytecode));
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        ConfirmedRewardUtxo {
+            txid: transaction_id(&raw),
+            raw_transaction: raw,
+            vout: 0,
+            value_sats: TOKEN_OUTPUT_SATS,
+            token_amount: amount,
+            confirmations: 2,
+        }
+    }
+
+    #[test]
+    fn chipnet_batch_five_rewards_fund_exact_split_and_fee() {
+        let mut secret = [0u8; 32];
+        secret[31] = 7;
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(secret).unwrap()).serialize();
+        let amounts = [100u128, 149, 150, 199, 200];
+        let rewards: Vec<_> = (1..=5)
+            .zip(amounts)
+            .map(|(marker, amount)| confirmed_reward_fixture(secret, marker, amount))
+            .collect();
+        let payout = p2pkh_cashaddr_from_public_key(&public).unwrap();
+        let batch = build_batched_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &rewards,
+            &secret,
+            &public,
+            &payout,
+            1_000,
+            &payout,
+        )
+        .unwrap();
+        assert_eq!(batch.input_outpoints.len(), 5);
+        assert_eq!(batch.reward_change_value_sats, None);
+        assert_eq!(batch.fee_sats, 1_400);
+        assert!(batch.fee_sats >= batch.required_relay_fee_sats);
+        assert_eq!(batch.miner_token_amount, 784);
+        assert_eq!(batch.original_donation_token_amount, 8);
+        assert_eq!(batch.shrec_donation_token_amount, 6);
+        assert_eq!(batch.settlement_txid, transaction_id(&batch.raw_settlement));
+        let raw = &batch.raw_settlement;
+        let mut cursor = 4usize;
+        assert_eq!(read_compact_uint(raw, &mut cursor).unwrap(), 5);
+        let mut outpoints = Vec::new();
+        let mut signatures = Vec::new();
+        for reward in &rewards {
+            let expected = serialized_outpoint(&reward.txid, reward.vout).unwrap();
+            assert_eq!(&raw[cursor..cursor + 36], expected);
+            outpoints.extend_from_slice(&expected);
+            cursor += 36;
+            let script_len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            let script = &raw[cursor..cursor + script_len];
+            assert_eq!(script[0], 65);
+            assert_eq!(script[65], SIGHASH_ALL_FORKID);
+            assert_eq!(script[66], 33);
+            assert_eq!(&script[67..100], &public);
+            signatures.push(script[1..65].to_vec());
+            cursor += script_len;
+            assert_eq!(&raw[cursor..cursor + 4], &[0u8; 4]);
+            cursor += 4;
+        }
+        assert_eq!(read_compact_uint(raw, &mut cursor).unwrap(), 3);
+        let outputs_start = cursor;
+        let locks = [
+            tx::cashaddr_to_p2pkh_locking(&payout).unwrap(),
+            tx::cashaddr_to_p2pkh_locking(CHIPNET_DONATION_ADDRESS).unwrap(),
+            tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS).unwrap(),
+        ];
+        for (index, amount) in [
+            batch.miner_token_amount,
+            batch.original_donation_token_amount,
+            batch.shrec_donation_token_amount,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                u64::from_le_bytes(raw[cursor..cursor + 8].try_into().unwrap()),
+                TOKEN_OUTPUT_SATS
+            );
+            cursor += 8;
+            let len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            let mut expected = deployment_token_prefix(&CHIPNET_PHOTON, amount).unwrap();
+            expected.extend_from_slice(&locks[index]);
+            assert_eq!(&raw[cursor..cursor + len], expected);
+            cursor += len;
+        }
+        assert_eq!(cursor + 4, raw.len());
+        let outputs = &raw[outputs_start..cursor];
+        let reward_lock = p2pkh_locking_from_public_key(&public);
+        for (index, reward) in rewards.iter().enumerate() {
+            let mut preimage = Vec::new();
+            preimage.extend_from_slice(&2u32.to_le_bytes());
+            preimage.extend_from_slice(&hash256(&outpoints));
+            preimage.extend_from_slice(&hash256(&[0u8; 20]));
+            preimage.extend_from_slice(&outpoints[index * 36..(index + 1) * 36]);
+            preimage.extend_from_slice(
+                &deployment_token_prefix(&CHIPNET_PHOTON, reward.token_amount).unwrap(),
+            );
+            preimage.push(reward_lock.len() as u8);
+            preimage.extend_from_slice(&reward_lock);
+            preimage.extend_from_slice(&TOKEN_OUTPUT_SATS.to_le_bytes());
+            preimage.extend_from_slice(&0u32.to_le_bytes());
+            preimage.extend_from_slice(&hash256(outputs));
+            preimage.extend_from_slice(&0u32.to_le_bytes());
+            preimage.extend_from_slice(&u32::from(SIGHASH_ALL_FORKID).to_le_bytes());
+            let signature: [u8; 64] = signatures[index].as_slice().try_into().unwrap();
+            assert!(crypto::bch_schnorr_verify(&public, &hash256(&preimage), &signature).unwrap());
+        }
+        if let Ok(path) = std::env::var("PICKAXE_BATCH_FIXTURE_OUT") {
+            let parents: Vec<_> = rewards
+                .iter()
+                .map(|reward| {
+                    serde_json::json!({
+                        "txid": reward.txid,
+                        "raw_transaction": hex::encode(&reward.raw_transaction),
+                        "vout": reward.vout,
+                        "value_sats": reward.value_sats,
+                        "token_amount": reward.token_amount.to_string(),
+                    })
+                })
+                .collect();
+            let fixture = serde_json::json!({
+                "network": "chipnet",
+                "category_hex": CHIPNET_CATEGORY_HEX,
+                "parent_rewards": parents,
+                "child_txid": batch.settlement_txid,
+                "child_raw": hex::encode(&batch.raw_settlement),
+                "public_key_hex": hex::encode(public),
+                "expected_output_values_sats": [700, 700, 700],
+                "expected_output_token_amounts": [
+                    batch.miner_token_amount.to_string(),
+                    batch.original_donation_token_amount.to_string(),
+                    batch.shrec_donation_token_amount.to_string(),
+                ],
+                "expected_output_locks_hex": locks.iter().map(hex::encode).collect::<Vec<_>>(),
+                "fee_sats": batch.fee_sats,
+            });
+            std::fs::write(path, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn chipnet_batch_rejects_four_rewards_and_duplicate_outpoints() {
+        let mut secret = [0u8; 32];
+        secret[31] = 7;
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(secret).unwrap()).serialize();
+        let mut rewards: Vec<_> = (1..=4)
+            .map(|marker| confirmed_reward_fixture(secret, marker, 1000))
+            .collect();
+        let payout = p2pkh_cashaddr_from_public_key(&public).unwrap();
+        let build = |rewards: &[ConfirmedRewardUtxo]| {
+            build_batched_reward_split_with_relay_fee(
+                &CHIPNET_PHOTON,
+                rewards,
+                &secret,
+                &public,
+                &payout,
+                1_000,
+                &payout,
+            )
+        };
+        assert!(build(&rewards).unwrap_err().contains("at least five"));
+        rewards.push(rewards[0].clone());
+        assert!(build(&rewards).unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn chipnet_batch_rejects_wrong_key_category_amount_and_unconfirmed_rewards() {
+        let mut secret = [0u8; 32];
+        secret[31] = 7;
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(secret).unwrap()).serialize();
+        let payout = p2pkh_cashaddr_from_public_key(&public).unwrap();
+        let rewards: Vec<_> = (1..=5)
+            .map(|marker| confirmed_reward_fixture(secret, marker, 1000))
+            .collect();
+        let build = |rewards: &[ConfirmedRewardUtxo], key: &[u8; 32]| {
+            build_batched_reward_split_with_relay_fee(
+                &CHIPNET_PHOTON,
+                rewards,
+                key,
+                &public,
+                &payout,
+                1_000,
+                &payout,
+            )
+        };
+        let mut wrong_secret = [0u8; 32];
+        wrong_secret[31] = 8;
+        assert!(build(&rewards, &wrong_secret)
+            .unwrap_err()
+            .contains("does not match reward secret"));
+        let mut changed = rewards.clone();
+        changed[0].confirmations = 0;
+        assert!(build(&changed, &secret)
+            .unwrap_err()
+            .contains("confirmation"));
+        changed = rewards.clone();
+        changed[0].token_amount += 1;
+        assert!(build(&changed, &secret)
+            .unwrap_err()
+            .contains("category, amount, or owner"));
+        changed = rewards.clone();
+        let wrong_category =
+            deployment_token_prefix(&crate::protocol::MAINNET_PHOTON, 1000).unwrap();
+        let right_category = deployment_token_prefix(&CHIPNET_PHOTON, 1000).unwrap();
+        let offset = changed[0]
+            .raw_transaction
+            .windows(right_category.len())
+            .position(|window| window == right_category)
+            .unwrap();
+        changed[0].raw_transaction[offset..offset + wrong_category.len()]
+            .copy_from_slice(&wrong_category);
+        changed[0].txid = transaction_id(&changed[0].raw_transaction);
+        assert!(build(&changed, &secret)
+            .unwrap_err()
+            .contains("category, amount, or owner"));
+    }
+
+    #[test]
+    fn chipnet_batch_uses_six_rewards_for_high_fee_and_returns_change() {
+        let mut secret = [0u8; 32];
+        secret[31] = 7;
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(secret).unwrap()).serialize();
+        let payout = p2pkh_cashaddr_from_public_key(&public).unwrap();
+        let mut funding_secret = [0u8; 32];
+        funding_secret[31] = 8;
+        let funding_public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(funding_secret).unwrap())
+                .serialize();
+        let change_payout = p2pkh_cashaddr_from_public_key(&funding_public).unwrap();
+        let mut rewards: Vec<_> = (1..=5)
+            .map(|marker| confirmed_reward_fixture(secret, marker, 1000))
+            .collect();
+        assert!(build_batched_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &rewards,
+            &secret,
+            &public,
+            &payout,
+            2_000,
+            &change_payout,
+        )
+        .unwrap_err()
+        .contains("relay fee"));
+        rewards.push(confirmed_reward_fixture(secret, 6, 1000));
+        assert!(build_batched_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &rewards,
+            &secret,
+            &public,
+            &payout,
+            1_000,
+            "not-a-cashaddr",
+        )
+        .is_err());
+        let batch = build_batched_reward_split_with_relay_fee(
+            &CHIPNET_PHOTON,
+            &rewards,
+            &secret,
+            &public,
+            &payout,
+            1_000,
+            &change_payout,
+        )
+        .unwrap();
+        assert!(batch.reward_change_value_sats.unwrap() >= P2PKH_CHANGE_DUST_SATS);
+        assert_eq!(batch.fee_sats, batch.required_relay_fee_sats);
+        let raw = &batch.raw_settlement;
+        let mut cursor = 4usize;
+        assert_eq!(read_compact_uint(raw, &mut cursor).unwrap(), 6);
+        for _ in 0..6 {
+            cursor += 36;
+            let script_len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            cursor += script_len + 4;
+        }
+        assert_eq!(read_compact_uint(raw, &mut cursor).unwrap(), 4);
+        for _ in 0..3 {
+            cursor += 8;
+            let len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+            cursor += len;
+        }
+        assert_eq!(
+            u64::from_le_bytes(raw[cursor..cursor + 8].try_into().unwrap()),
+            batch.reward_change_value_sats.unwrap()
+        );
+        cursor += 8;
+        let len = read_compact_uint(raw, &mut cursor).unwrap() as usize;
+        assert_eq!(
+            &raw[cursor..cursor + len],
+            p2pkh_locking_from_public_key(&funding_public)
+        );
+        cursor += len;
+        assert_eq!(cursor + 4, raw.len());
+        if let Ok(path) = std::env::var("PICKAXE_BATCH_CHANGE_FIXTURE_OUT") {
+            let fixture = serde_json::json!({
+                "network": "chipnet",
+                "category_hex": CHIPNET_CATEGORY_HEX,
+                "parent_rewards": rewards.iter().map(|reward| serde_json::json!({
+                    "txid": reward.txid,
+                    "raw_transaction": hex::encode(&reward.raw_transaction),
+                    "vout": reward.vout,
+                    "value_sats": reward.value_sats,
+                    "token_amount": reward.token_amount.to_string(),
+                })).collect::<Vec<_>>(),
+                "child_txid": batch.settlement_txid,
+                "child_raw": hex::encode(&batch.raw_settlement),
+                "public_key_hex": hex::encode(public),
+                "expected_output_values_sats": [700, 700, 700, batch.reward_change_value_sats.unwrap()],
+                "expected_output_token_amounts": [
+                    batch.miner_token_amount.to_string(),
+                    batch.original_donation_token_amount.to_string(),
+                    batch.shrec_donation_token_amount.to_string(),
+                ],
+                "expected_change_lock_hex": hex::encode(p2pkh_locking_from_public_key(&funding_public)),
+                "fee_sats": batch.fee_sats,
+            });
+            std::fs::write(path, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+        }
     }
 
     #[test]
