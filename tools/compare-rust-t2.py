@@ -11,7 +11,12 @@ def main():
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--output", type=Path, default=Path("artifacts/rust-t2-comparison"))
+    parser.add_argument("--seconds", type=int, default=20)
+    parser.add_argument("--warmup", type=int, default=15)
+    parser.add_argument("--reverse", action="store_true")
     args = parser.parse_args()
+    if args.seconds < 1 or args.warmup < 1:
+        parser.error("Trial and warmup durations must be positive")
     bins = {"cpp": args.baseline.resolve(), "rust": args.candidate.resolve()}
     for exe in bins.values():
         if not exe.is_file():
@@ -31,7 +36,7 @@ def main():
         result = subprocess.run(
             [str(exe), "benchmark", "--backend", "cuda", "--intensity", "100",
              "--seconds", str(seconds), "--json"],
-            cwd=exe.parent, capture_output=True, encoding="utf-8", timeout=180,
+            cwd=exe.parent, capture_output=True, encoding="utf-8", timeout=max(180, seconds + 120),
         )
         (args.output / f"{label}.stdout.json").write_text(result.stdout, encoding="utf-8")
         (args.output / f"{label}.stderr.log").write_text(result.stderr, encoding="utf-8")
@@ -43,11 +48,14 @@ def main():
         print(f"{label}: {sample['candidates_per_second'] / 1e6:.2f} MH/s", flush=True)
         return {"backend": name, "label": label, "report": report}
 
-    run("cpp", 15, "warmup-cpp")
-    run("rust", 15, "warmup-rust")
+    for name in (["rust", "cpp"] if args.reverse else ["cpp", "rust"]):
+        run(name, args.warmup, f"warmup-{name}")
+    order = ["cpp", "rust", "rust", "cpp", "cpp", "rust"]
+    if args.reverse:
+        order.reverse()
     trials = []
-    for i, name in enumerate(["cpp", "rust", "rust", "cpp", "cpp", "rust"], 1):
-        trials.append(run(name, 20, f"{i}-{name}"))
+    for i, name in enumerate(order, 1):
+        trials.append(run(name, args.seconds, f"{i}-{name}"))
         (args.output / "comparison.json").write_text(json.dumps(trials, indent=2), encoding="utf-8")
 
 

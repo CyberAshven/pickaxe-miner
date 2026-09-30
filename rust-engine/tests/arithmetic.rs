@@ -47,6 +47,13 @@ fn gpu_sha256_matches_rustcrypto() {
         assert_eq!(state, expected);
         let expected: [u8; 32] = Sha256::digest(sha256::bytes(state)).into();
         assert_eq!(sha256::hash_state(state), expected);
+        let top = expected[31] & 0x7f;
+        for limit in [0, 7, 127, 255, top, top.saturating_sub(1)] {
+            assert_eq!(
+                sha256::hash_state_filtered(state, limit),
+                (top <= limit).then_some(expected),
+            );
+        }
     }
 }
 

@@ -1,7 +1,10 @@
 //! Experimental Rust mining arithmetic. Not a wallet signing library.
 //! GPU and CPU checks compile the same arithmetic source.
 #![cfg_attr(target_os = "cuda", no_std)]
-#![cfg_attr(target_os = "cuda", feature(abi_ptx, stdarch_nvptx))]
+#![cfg_attr(
+    target_os = "cuda",
+    feature(abi_ptx, stdarch_nvptx, asm_experimental_arch)
+)]
 
 pub mod field;
 #[cfg(target_os = "cuda")]

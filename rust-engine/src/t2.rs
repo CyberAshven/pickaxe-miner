@@ -168,6 +168,20 @@ unsafe fn group<const SHIFT: usize>(
     winner_j: *mut u32,
     hashes: *mut u8,
 ) {
+    // SAFETY: one 64-word array per block. Each word has one writer;
+    // all threads reach the barrier before any thread reads or returns.
+    let shared: *mut u32;
+    core::arch::asm!(
+        "{{ .shared .align 4 .b32 schedule[64];",
+        "cvta.shared.u64 {ptr}, schedule; }}",
+        ptr = out(reg64) shared,
+        options(nostack),
+    );
+    let lane = core::arch::nvptx::_thread_idx_x() as usize;
+    if lane < 64 {
+        *shared.add(lane) = *middle.add(lane);
+    }
+    core::arch::nvptx::_syncthreads();
     let index = index();
     if index >= count {
         return;
@@ -179,10 +193,12 @@ unsafe fn group<const SHIFT: usize>(
     let mut state = read(prefixes.add(window * 8));
     let head = read(prefixes.add(HEAD_OFFSET + window * 8));
     sha256::compress_from::<10>(&mut state, block::<SHIFT, 7>(tx, baton, reward, j), head);
-    // The schedule is identical for every candidate and stays in the device cache.
-    sha256::compress_scheduled(&mut state, &*middle.cast::<[u32; 64]>());
+    // Broadcast the fixed schedule from block-local shared memory.
+    sha256::compress_scheduled(&mut state, &*shared.cast::<[u32; 64]>());
     sha256::compress(&mut state, block::<SHIFT, 9>(tx, baton, reward, j));
-    let digest = sha256::hash_state(state);
+    let Some(digest) = sha256::hash_state_filtered(state, *target.add(31)) else {
+        return;
+    };
     if !meets(&digest, &read(target)) {
         return;
     }

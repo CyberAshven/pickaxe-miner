@@ -402,6 +402,9 @@ impl T2Engine {
         self.stream
             .memset_zeros(&mut self.count_gpu)
             .map_err(|error| error.to_string())?;
+        // Use eight-warp blocks for the Rust group kernel.
+        // Keep the released native kernel's measured launch geometry.
+        let threads = if cfg!(feature = "rust-t2") { 256 } else { 128 };
         unsafe {
             self.stream
                 .launch_builder(&self.filter_group[self.layout.shift()])
@@ -420,8 +423,8 @@ impl T2Engine {
                 .arg(&mut self.winner_j_gpu)
                 .arg(&mut self.winner_hashes_gpu)
                 .launch(LaunchConfig {
-                    grid_dim: (count.div_ceil(128), 1, 1),
-                    block_dim: (128, 1, 1),
+                    grid_dim: (count.div_ceil(threads), 1, 1),
+                    block_dim: (threads, 1, 1),
                     shared_mem_bytes: 0,
                 })
                 .map_err(|error| format!("filter T2 GPU group: {error}"))?;
@@ -817,6 +820,48 @@ mod tests {
                         winner.nonce,
                     );
                     assert_eq!(winner.digest, search::hash256(&tx), "age={age} base={base}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tail-grind")]
+    fn t2_gpu_filter_has_no_missing_winners_across_targets_and_partial_blocks_if_cuda_present() {
+        let mut engine = CudaPhotonEngine::new(0, 65_536, 1024).unwrap();
+        engine.enable_t2_search().unwrap();
+        for age in [10, 17, 128, 32_768] {
+            for high_byte in [0, 0x3f, 0x7f, 0xff] {
+                let mut target = [0xff; 32];
+                target[31] = high_byte;
+                engine
+                    .set_job(
+                        &signed_template_with_nonce(age, target, REWARD, 0),
+                        &target,
+                        &[0x11; 32],
+                    )
+                    .unwrap();
+                for base in [0, 65_280] {
+                    let result = engine.search_batch(base, 513).unwrap();
+                    let mut expected = Vec::new();
+                    for position in base..base + 513 {
+                        let nonce = position >> 16;
+                        let j = (position & 0xffff) as u16;
+                        let tx =
+                            signed_template_with_nonce(age, target, REWARD - u128::from(j), nonce);
+                        let digest = search::hash256(&tx);
+                        if search::meets_target_le(&digest, &target) {
+                            expected.push((nonce, j, digest));
+                        }
+                    }
+                    let mut actual: Vec<_> = result
+                        .winners
+                        .into_iter()
+                        .map(|winner| (winner.nonce, winner.tail_j.unwrap(), winner.digest))
+                        .collect();
+                    actual.sort_unstable();
+                    assert_eq!(result.total_winners as usize, expected.len());
+                    assert_eq!(actual, expected, "age={age} high={high_byte} base={base}");
                 }
             }
         }
