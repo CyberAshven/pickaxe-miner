@@ -1769,6 +1769,31 @@ fn resulting_baton_is_authoritative_or_descendant(
     )
 }
 
+/// Classifies a refreshed job after broadcast without walking ancestry from
+/// the still-live input baton toward a transaction that has just spent it.
+fn resolve_post_broadcast_baton<F>(
+    pending: &PendingSubmission,
+    fresh: LiveJob,
+    waiting_message: &str,
+    unproven_message: &str,
+    prove_result: F,
+) -> Result<SubmissionAttempt, String>
+where
+    F: FnOnce(&LiveJob) -> Result<bool, String>,
+{
+    if resulting_baton_is_authoritative(pending, &fresh) {
+        return Ok(SubmissionAttempt::Complete(Box::new(fresh)));
+    }
+    if pending.live_baton_precedes_settlement(&fresh) {
+        return Err(waiting_message.into());
+    }
+    if prove_result(&fresh)? {
+        Ok(SubmissionAttempt::Complete(Box::new(fresh)))
+    } else {
+        Err(unproven_message.into())
+    }
+}
+
 /// Rejects a broadcast result whose transaction ID differs from the expected ID.
 fn ensure_broadcast_txid(label: &str, expected: &str, returned: &str) -> Result<(), String> {
     if returned.eq_ignore_ascii_case(expected) {
@@ -1903,13 +1928,13 @@ fn broadcast_settlement(
     let returned = broadcast_pending_transaction(session, cfg, &pending.settlement_hex)?;
     ensure_broadcast_txid("PHOTON settlement", &pending.settlement_txid, &returned)?;
     let fresh = session.fetch_live_job()?;
-    if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
-        Ok(SubmissionAttempt::Complete(Box::new(fresh)))
-    } else {
-        Err(
-            "settlement broadcast is known but the resulting PHOTON baton is neither authoritative nor a proven ancestor of the live baton".into(),
-        )
-    }
+    resolve_post_broadcast_baton(
+        pending,
+        fresh,
+        "settlement broadcast is known; waiting for the live PHOTON baton to advance past this winner",
+        "settlement broadcast is known but the resulting PHOTON baton is neither authoritative nor a proven ancestor of the live baton",
+        |fresh| resulting_baton_is_authoritative_or_descendant(session, pending, fresh),
+    )
 }
 
 fn require_parent_known_for_child(
@@ -1962,11 +1987,13 @@ fn attempt_parent_only_submission(
     ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned)?;
     pending.mark_parent_accepted(journal_path)?;
     let next = session.fetch_live_job()?;
-    if resulting_baton_is_authoritative_or_descendant(session, pending, &next)? {
-        Ok(SubmissionAttempt::Complete(Box::new(next)))
-    } else {
-        Err("chipnet parent was accepted; waiting for authoritative baton advance".into())
-    }
+    resolve_post_broadcast_baton(
+        pending,
+        next,
+        "chipnet parent was accepted; waiting for authoritative baton advance",
+        "chipnet parent was accepted but live baton is not proven descendant",
+        |fresh| resulting_baton_is_authoritative_or_descendant(session, pending, fresh),
+    )
 }
 
 /// Attempts the journaled parent and settlement submission safely.
@@ -7202,6 +7229,94 @@ mod tests {
         pending.require_network(MiningNetwork::Chipnet).unwrap();
         assert!(pending.require_network(MiningNetwork::Mainnet).is_err());
         assert_eq!(pending.resulting_baton_txid, pending.parent_txid);
+    }
+
+    #[test]
+    fn post_broadcast_stale_live_baton_waits_without_lineage_lookup() {
+        let funded = synthetic_chipnet_pending();
+        let mut parent_only = funded.clone();
+        parent_only.mode = Some("parent_only".into());
+        parent_only.funding_outpoint = None;
+        parent_only.settlement_txid = parent_only.parent_txid.clone();
+        parent_only.settlement_hex = parent_only.parent_hex.clone();
+        parent_only.miner_token_amount = 100;
+        parent_only.donation_token_amount = 0;
+
+        for pending in [&parent_only, &funded] {
+            let mut stale = live_job();
+            stale.baton_txid = pending.expected_baton_txid.to_uppercase();
+            stale.baton_vout = pending.expected_baton_vout;
+            let error = resolve_post_broadcast_baton(
+                pending,
+                stale,
+                "waiting for authoritative baton advance",
+                "unproven baton",
+                |_| panic!("stale live baton must not trigger a lineage lookup"),
+            )
+            .err()
+            .expect("stale live baton must retain the pending submission");
+            assert!(error.contains("waiting for authoritative baton advance"));
+        }
+    }
+
+    #[test]
+    fn post_broadcast_parent_output_completes_without_lineage_lookup() {
+        let funded = synthetic_chipnet_pending();
+        let mut parent_only = funded.clone();
+        parent_only.mode = Some("parent_only".into());
+        parent_only.funding_outpoint = None;
+        parent_only.settlement_txid = parent_only.parent_txid.clone();
+        parent_only.settlement_hex = parent_only.parent_hex.clone();
+        parent_only.miner_token_amount = 100;
+        parent_only.donation_token_amount = 0;
+
+        for pending in [&parent_only, &funded] {
+            let mut live = live_job();
+            live.baton_txid = pending.parent_txid.to_uppercase();
+            live.baton_vout = 0;
+            let result = resolve_post_broadcast_baton(
+                pending,
+                live,
+                "waiting for authoritative baton advance",
+                "unproven baton",
+                |_| panic!("authoritative baton must not trigger a lineage lookup"),
+            )
+            .unwrap();
+            assert!(matches!(result, SubmissionAttempt::Complete(_)));
+        }
+    }
+
+    #[test]
+    fn post_broadcast_proves_only_a_forward_baton_descendant() {
+        let pending = synthetic_chipnet_pending();
+        let child_raw = transaction_spending(&pending.resulting_baton_txid, 0);
+        let child_txid = reward::transaction_id(&hex::decode(&child_raw).unwrap());
+        let mut descendant = live_job();
+        descendant.baton_txid = child_txid.clone();
+        descendant.baton_vout = 0;
+        let mut fetches = 0;
+        let result = resolve_post_broadcast_baton(
+            &pending,
+            descendant,
+            "waiting for authoritative baton advance",
+            "unproven baton",
+            |_| {
+                prove_baton_descends_from(
+                    &child_txid,
+                    0,
+                    &pending.resulting_baton_txid,
+                    0,
+                    &[&pending.parent_txid, &pending.expected_baton_txid],
+                    |_| {
+                        fetches += 1;
+                        Ok(child_raw.clone())
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, SubmissionAttempt::Complete(_)));
+        assert_eq!(fetches, 1);
     }
 
     #[test]
