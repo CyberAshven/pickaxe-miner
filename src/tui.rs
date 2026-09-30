@@ -1,6 +1,6 @@
 use crate::{
     backend::{BackendKind, GpuDevice},
-    config::RuntimeConfig,
+    config::{MiningNetwork, MiningProfiles, RuntimeConfig, SavedConfig},
     runtime::{RuntimeEvent, RuntimeSnapshot, RuntimeSupervisor, SupervisorState},
 };
 use crossterm::{
@@ -23,6 +23,7 @@ use ratatui::{
 use std::{
     collections::VecDeque,
     io::{self, Stdout},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -58,14 +59,62 @@ pub(crate) struct SetupResult {
     pub config: RuntimeConfig,
     pub backend: BackendKind,
     pub device: u32,
+    pub profile_name: String,
+}
+
+#[derive(Default)]
+pub(crate) struct SetupOverrides {
+    pub network: Option<MiningNetwork>,
+    pub token: Option<String>,
+    pub intensity: Option<u8>,
+    pub fulcrum: Option<String>,
+    pub node_rpc: Option<String>,
+    pub source: Option<String>,
+    pub device: Option<(BackendKind, u32)>,
+}
+
+impl SetupOverrides {
+    fn apply(&self, config: &mut RuntimeConfig) -> Result<(), String> {
+        if let Some(network) = self.network {
+            config.set_network(network);
+        }
+        if let Some(token) = &self.token {
+            config.set_token(token)?;
+        }
+        if let Some(intensity) = self.intensity {
+            config.set_intensity(intensity)?;
+        }
+        if let Some(url) = &self.fulcrum {
+            config.set_fulcrum_url(url)?;
+        }
+        if let Some(url) = &self.node_rpc {
+            config.set_node_url(url)?;
+        }
+        if let Some(source) = &self.source {
+            config.set_source(source)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupStep {
+    Profiles,
+    Mode,
+    Network,
+    Token,
+    Asic,
     Gpu,
     Payout,
     Intensity,
+    Advanced,
     Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiningMode {
+    Gpu,
+    Asic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +126,20 @@ enum SetupAction {
 
 struct SetupFlow {
     step: SetupStep,
+    profiles: MiningProfiles,
+    profile_path: Option<PathBuf>,
+    profile_selected: usize,
+    active_profile: Option<usize>,
+    profile_name_input: String,
+    profile_renaming: bool,
+    base_config: RuntimeConfig,
+    overrides: SetupOverrides,
+    mode: MiningMode,
+    asic_choice: usize,
+    token_input: String,
+    advanced_selected: usize,
+    advanced_editing: bool,
+    advanced_input: String,
     devices: Vec<GpuDevice>,
     selected: usize,
     config: RuntimeConfig,
@@ -102,7 +165,21 @@ impl SetupFlow {
             .unwrap_or(0);
         let payout_input = config.payout_address.clone();
         Ok(Self {
-            step: SetupStep::Gpu,
+            step: SetupStep::Mode,
+            profiles: MiningProfiles::default(),
+            profile_path: None,
+            profile_selected: 0,
+            active_profile: None,
+            profile_name_input: String::new(),
+            profile_renaming: false,
+            base_config: config.clone(),
+            overrides: SetupOverrides::default(),
+            mode: MiningMode::Gpu,
+            asic_choice: 0,
+            token_input: String::new(),
+            advanced_selected: 3,
+            advanced_editing: false,
+            advanced_input: String::new(),
             devices,
             selected,
             config,
@@ -123,8 +200,224 @@ impl SetupFlow {
         }
 
         match self.step {
-            SetupStep::Gpu => match key.code {
+            SetupStep::Profiles => {
+                if self.profile_renaming {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.profile_renaming = false;
+                            self.status_line.clear();
+                        }
+                        KeyCode::Enter => {
+                            let mut updated = self.profiles.clone();
+                            let result = updated
+                                .rename(self.profile_selected, &self.advanced_input)
+                                .and_then(|()| {
+                                    self.profile_path
+                                        .as_deref()
+                                        .map_or(Ok(()), |path| updated.save(path))
+                                });
+                            match result {
+                                Ok(()) => {
+                                    self.profiles = updated;
+                                    self.profile_renaming = false;
+                                    self.status_line = "Profile renamed".into();
+                                }
+                                Err(error) => self.status_line = error,
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            self.advanced_input.pop();
+                            self.status_line.clear();
+                        }
+                        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.advanced_input.push(ch);
+                            self.status_line.clear();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc => return SetupAction::Cancel,
+                        KeyCode::Up => {
+                            self.profile_selected = (self.profile_selected
+                                + self.profiles.profiles.len())
+                                % (self.profiles.profiles.len() + 1);
+                        }
+                        KeyCode::Down => {
+                            self.profile_selected =
+                                (self.profile_selected + 1) % (self.profiles.profiles.len() + 1);
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R')
+                            if self.profile_selected < self.profiles.profiles.len() =>
+                        {
+                            self.advanced_input =
+                                self.profiles.profiles[self.profile_selected].name.clone();
+                            self.profile_renaming = true;
+                            self.status_line.clear();
+                        }
+                        KeyCode::Enter => {
+                            if let Some(profile) = self.profiles.profiles.get(self.profile_selected)
+                            {
+                                let mut config = RuntimeConfig::default();
+                                if let Err(error) = profile.settings.apply_to_runtime(&mut config) {
+                                    self.status_line = error;
+                                    return SetupAction::Continue;
+                                }
+                                if let Err(error) = self.overrides.apply(&mut config) {
+                                    self.status_line = error;
+                                    return SetupAction::Continue;
+                                }
+                                if let (Some(backend), Some(index)) =
+                                    (profile.settings.backend.as_deref(), profile.settings.device)
+                                {
+                                    if let Ok(backend) = BackendKind::parse(backend) {
+                                        if let Some(selected) =
+                                            self.devices.iter().position(|device| {
+                                                device.backend == backend && device.index == index
+                                            })
+                                        {
+                                            self.selected = selected;
+                                        }
+                                    }
+                                }
+                                if let Some((backend, index)) = self.overrides.device {
+                                    if let Some(selected) = self.devices.iter().position(|device| {
+                                        device.backend == backend && device.index == index
+                                    }) {
+                                        self.selected = selected;
+                                    }
+                                }
+                                self.config = config;
+                                self.active_profile = Some(self.profile_selected);
+                                self.profile_name_input = profile.name.clone();
+                            } else {
+                                self.config = self.base_config.clone();
+                                self.active_profile = None;
+                                self.profile_name_input.clear();
+                            }
+                            self.payout_input = self.config.payout_address.clone();
+                            self.step = SetupStep::Mode;
+                            self.status_line.clear();
+                        }
+                        _ => {}
+                    }
+                }
+                SetupAction::Continue
+            }
+            SetupStep::Mode => match key.code {
+                KeyCode::Esc if !self.profiles.profiles.is_empty() => {
+                    self.step = SetupStep::Profiles;
+                    SetupAction::Continue
+                }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => SetupAction::Cancel,
+                KeyCode::Up | KeyCode::Down => {
+                    self.mode = match self.mode {
+                        MiningMode::Gpu => MiningMode::Asic,
+                        MiningMode::Asic => MiningMode::Gpu,
+                    };
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Enter => {
+                    self.step = SetupStep::Network;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                _ => SetupAction::Continue,
+            },
+            SetupStep::Network => match key.code {
+                KeyCode::Esc => {
+                    self.step = SetupStep::Mode;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    let next = match self.config.network {
+                        MiningNetwork::Mainnet => MiningNetwork::Chipnet,
+                        MiningNetwork::Chipnet => MiningNetwork::Mainnet,
+                    };
+                    self.config.set_network(next);
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Enter => {
+                    self.step = if self.mode == MiningMode::Gpu {
+                        SetupStep::Token
+                    } else {
+                        SetupStep::Asic
+                    };
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                _ => SetupAction::Continue,
+            },
+            SetupStep::Asic => match key.code {
+                KeyCode::Esc => {
+                    self.step = SetupStep::Network;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    self.asic_choice = 1 - self.asic_choice;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Enter => {
+                    self.status_line = if self.asic_choice == 0 {
+                        "BCH + merge-minable token proxy is not supported yet".into()
+                    } else {
+                        format!(
+                            "No ASIC-minable CashToken is supported on {} yet",
+                            self.config.network.as_str()
+                        )
+                    };
+                    SetupAction::Continue
+                }
+                _ => SetupAction::Continue,
+            },
+            SetupStep::Token => match key.code {
+                KeyCode::Esc => {
+                    self.step = SetupStep::Network;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Enter => {
+                    let query = if self.token_input.trim().is_empty() {
+                        "PHOTON"
+                    } else {
+                        self.token_input.as_str()
+                    };
+                    match self
+                        .config
+                        .set_token(query)
+                        .and_then(|()| self.config.token.ensure_supported(self.config.network))
+                    {
+                        Ok(()) => {
+                            self.step = SetupStep::Gpu;
+                            self.status_line.clear();
+                        }
+                        Err(error) => self.status_line = error,
+                    }
+                    SetupAction::Continue
+                }
+                KeyCode::Backspace => {
+                    self.token_input.pop();
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.token_input.push(ch);
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
+                _ => SetupAction::Continue,
+            },
+            SetupStep::Gpu => match key.code {
+                KeyCode::Esc => {
+                    self.step = SetupStep::Token;
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
                 KeyCode::Up => {
                     self.selected = self
                         .selected
@@ -179,7 +472,7 @@ impl SetupFlow {
                     SetupAction::Continue
                 }
                 KeyCode::Enter => {
-                    self.step = SetupStep::Review;
+                    self.step = SetupStep::Advanced;
                     self.status_line.clear();
                     SetupAction::Continue
                 }
@@ -195,9 +488,69 @@ impl SetupFlow {
                 }
                 _ => SetupAction::Continue,
             },
+            SetupStep::Advanced => {
+                if self.advanced_editing {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.advanced_editing = false;
+                            self.status_line.clear();
+                        }
+                        KeyCode::Enter => {
+                            let result = match self.advanced_selected {
+                                0 => self.config.set_fulcrum_url(&self.advanced_input),
+                                1 => self.config.set_node_url(&self.advanced_input),
+                                _ => {
+                                    self.profile_name_input = self.advanced_input.clone();
+                                    Ok(())
+                                }
+                            };
+                            match result {
+                                Ok(()) => {
+                                    self.advanced_editing = false;
+                                    self.status_line.clear();
+                                }
+                                Err(error) => self.status_line = error,
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            self.advanced_input.pop();
+                            self.status_line.clear();
+                        }
+                        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.advanced_input.push(ch);
+                            self.status_line.clear();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.step = SetupStep::Intensity;
+                            self.status_line.clear();
+                        }
+                        KeyCode::Up => self.advanced_selected = (self.advanced_selected + 3) % 4,
+                        KeyCode::Down => self.advanced_selected = (self.advanced_selected + 1) % 4,
+                        KeyCode::Enter if self.advanced_selected == 3 => {
+                            self.step = SetupStep::Review;
+                            self.status_line.clear();
+                        }
+                        KeyCode::Enter => {
+                            self.advanced_input = match self.advanced_selected {
+                                0 => self.config.fulcrum_url.clone().unwrap_or_default(),
+                                1 => self.config.node_url.clone().unwrap_or_default(),
+                                _ => self.profile_name_input.clone(),
+                            };
+                            self.advanced_editing = true;
+                            self.status_line.clear();
+                        }
+                        _ => {}
+                    }
+                }
+                SetupAction::Continue
+            }
             SetupStep::Review => match key.code {
                 KeyCode::Esc => {
-                    self.step = SetupStep::Intensity;
+                    self.step = SetupStep::Advanced;
                     self.status_line.clear();
                     SetupAction::Continue
                 }
@@ -638,8 +991,18 @@ pub(crate) fn run_setup(
     config: RuntimeConfig,
     devices: Vec<GpuDevice>,
     default_device: &GpuDevice,
+    profile_path: &Path,
+    profiles: MiningProfiles,
+    overrides: SetupOverrides,
 ) -> Result<Option<SetupResult>, String> {
-    run_setup_terminal(SetupFlow::new(config, devices, default_device)?)
+    let mut state = SetupFlow::new(config, devices, default_device)?;
+    if !profiles.profiles.is_empty() {
+        state.step = SetupStep::Profiles;
+    }
+    state.profiles = profiles;
+    state.profile_path = Some(profile_path.to_path_buf());
+    state.overrides = overrides;
+    run_setup_terminal(state)
 }
 
 /// Draws and processes setup screens in the terminal.
@@ -664,11 +1027,28 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
             SetupAction::Cancel => return Ok(None),
             SetupAction::Complete => {
                 let selected = state.selected_device();
-                return Ok(Some(SetupResult {
-                    config: state.config.clone(),
-                    backend: selected.backend,
-                    device: selected.index,
-                }));
+                let (backend, device) = (selected.backend, selected.index);
+                let settings =
+                    SavedConfig::from_effective(backend.as_str(), Some(device), &state.config);
+                let mut profiles = state.profiles.clone();
+                let saved = profiles
+                    .upsert(state.active_profile, &state.profile_name_input, settings)
+                    .and_then(|name| {
+                        profiles
+                            .save(state.profile_path.as_deref().expect("setup profile path"))?;
+                        Ok(name)
+                    });
+                match saved {
+                    Ok(profile_name) => {
+                        return Ok(Some(SetupResult {
+                            config: state.config.clone(),
+                            backend,
+                            device,
+                            profile_name,
+                        }));
+                    }
+                    Err(error) => state.status_line = error,
+                }
             }
         }
     }
@@ -1289,10 +1669,16 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         ])
         .split(area);
     let step = match state.step {
-        SetupStep::Gpu => "1/4 GPU",
-        SetupStep::Payout => "2/4 Payout",
-        SetupStep::Intensity => "3/4 Intensity",
-        SetupStep::Review => "4/4 Review",
+        SetupStep::Profiles => "Profiles",
+        SetupStep::Mode => "1/8 Mining mode",
+        SetupStep::Network => "2/8 Network",
+        SetupStep::Token => "3/8 Token",
+        SetupStep::Asic => "3/3 ASIC choice",
+        SetupStep::Gpu => "4/8 GPU",
+        SetupStep::Payout => "5/8 Payout",
+        SetupStep::Intensity => "6/8 Intensity",
+        SetupStep::Advanced => "7/8 Advanced",
+        SetupStep::Review => "8/8 Review",
     };
     frame.render_widget(
         Paragraph::new(format!("PICKAXE MINER   Setup   {step}"))
@@ -1300,15 +1686,29 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         rows[0],
     );
     match state.step {
+        SetupStep::Profiles => render_setup_profiles(frame, rows[1], state),
+        SetupStep::Mode => render_setup_mode(frame, rows[1], state),
+        SetupStep::Network => render_setup_network(frame, rows[1], state),
+        SetupStep::Token => render_setup_token(frame, rows[1], state),
+        SetupStep::Asic => render_setup_asic(frame, rows[1], state),
         SetupStep::Gpu => render_setup_gpu(frame, rows[1], state),
         SetupStep::Payout => render_setup_payout(frame, rows[1], state),
         SetupStep::Intensity => render_setup_intensity(frame, rows[1], state),
+        SetupStep::Advanced => render_setup_advanced(frame, rows[1], state),
         SetupStep::Review => render_setup_review(frame, rows[1], state),
     }
     let keys = match state.step {
-        SetupStep::Gpu => "[Up/Down] choose   [Enter] accept default   [Esc] cancel",
-        SetupStep::Payout => "[Type] payout address   [Enter] continue   [Esc] Back",
-        SetupStep::Intensity => "[+/- or arrows] adjust   [Enter] continue   [Esc] Back",
+        SetupStep::Profiles if state.profile_renaming => {
+            "[Type] profile name   [Enter] save name   [Esc] Cancel"
+        }
+        SetupStep::Profiles => "[Up/Down] choose   [Enter] open   [R] rename   [Esc] Quit",
+        SetupStep::Mode | SetupStep::Network | SetupStep::Asic | SetupStep::Gpu => {
+            "[Up/Down] choose   [Enter] next   [Esc] Back"
+        }
+        SetupStep::Token => "[Type] name, category ID or covenant   [Enter] select   [Esc] Back",
+        SetupStep::Payout => "[Type] payout address   [Enter] next   [Esc] Back",
+        SetupStep::Intensity => "[+/- or arrows] adjust   [Enter] next   [Esc] Back",
+        SetupStep::Advanced => "[Up/Down] choose   [Enter] edit/review   [Esc] Back",
         SetupStep::Review => "[Enter] start mining   [Esc] Back",
     };
     let message = if state.status_line.is_empty() {
@@ -1321,6 +1721,159 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
             .block(Block::default().borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
         rows[2],
+    );
+}
+
+fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let mut lines = state
+        .profiles
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            let marker = if state.profile_selected == index {
+                ">"
+            } else {
+                " "
+            };
+            Line::from(format!("{marker} {}", profile.name))
+        })
+        .collect::<Vec<_>>();
+    let marker = if state.profile_selected == state.profiles.profiles.len() {
+        ">"
+    } else {
+        " "
+    };
+    lines.push(Line::from(format!("{marker} New profile")));
+    lines.push(Line::from(""));
+    if state.profile_renaming {
+        lines.push(Line::from(format!("Rename: {}", state.advanced_input)));
+    } else {
+        lines.push(Line::from(
+            "Your saved address and settings load with the profile.",
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Mining profiles ")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_setup_mode(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let gpu = if state.mode == MiningMode::Gpu {
+        ">"
+    } else {
+        " "
+    };
+    let asic = if state.mode == MiningMode::Asic {
+        ">"
+    } else {
+        " "
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("{gpu} GPU mining")),
+            Line::from(format!("{asic} ASIC mining proxy")),
+            Line::from(""),
+            Line::from("ASIC setup is visible; mining waits for a supported protocol."),
+        ])
+        .block(
+            Block::default()
+                .title(" Mining mode ")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn render_setup_network(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let mainnet = if state.config.network == MiningNetwork::Mainnet {
+        ">"
+    } else {
+        " "
+    };
+    let chipnet = if state.config.network == MiningNetwork::Chipnet {
+        ">"
+    } else {
+        " "
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("{mainnet} Mainnet")),
+            Line::from(Span::styled(
+                format!("{chipnet} Chipnet"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("Available tokens and contracts depend on the network."),
+        ])
+        .block(
+            Block::default()
+                .title(" Bitcoin Cash network ")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let availability = if state.config.network == MiningNetwork::Mainnet {
+        "available"
+    } else {
+        "deployed; payout split pending"
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("PHOTON  GPU  {availability}"),
+                Style::default().fg(if state.config.network == MiningNetwork::Mainnet {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                }),
+            )),
+            Line::from(""),
+            Line::from("Tokens are listed alphabetically."),
+            Line::from("Future compatible tokens will share work; others require a choice."),
+            Line::from(""),
+            Line::from(format!("Search/select: {}", state.token_input)),
+            Line::from("Leave blank and press Enter to select the listed token."),
+        ])
+        .block(Block::default().title(" CashToken ").borders(Borders::ALL))
+        .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_setup_asic(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let merged = if state.asic_choice == 0 { ">" } else { " " };
+    let specific = if state.asic_choice == 1 { ">" } else { " " };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("{merged} BCH + all compatible merge-minable tokens"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                format!("{specific} Specific CashToken (exclusive mining)"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("No ASIC mining proxy is supported yet."),
+        ])
+        .block(
+            Block::default()
+                .title(" ASIC mining ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false }),
+        area,
     );
 }
 
@@ -1368,11 +1921,98 @@ fn render_setup_intensity(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) 
     );
 }
 
+fn render_setup_advanced(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let marker = |index| {
+        if state.advanced_selected == index {
+            ">"
+        } else {
+            " "
+        }
+    };
+    let endpoint_line = |index, label: &str, configured: bool, example: &str| {
+        let (text, hint) = if state.advanced_editing && state.advanced_selected == index {
+            if state.advanced_input.is_empty() {
+                (example, true)
+            } else {
+                (state.advanced_input.as_str(), false)
+            }
+        } else if configured {
+            ("Custom endpoints set", false)
+        } else {
+            ("Automatic", true)
+        };
+        Line::from(vec![
+            Span::raw(format!("{} {label}: ", marker(index))),
+            Span::styled(
+                text.to_string(),
+                if hint {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                },
+            ),
+        ])
+    };
+    let (profile_name, profile_hint) = if state.advanced_editing && state.advanced_selected == 2 {
+        if state.advanced_input.is_empty() {
+            ("Random name if blank", true)
+        } else {
+            (state.advanced_input.as_str(), false)
+        }
+    } else if state.profile_name_input.trim().is_empty() {
+        ("Random name if blank", true)
+    } else {
+        (state.profile_name_input.as_str(), false)
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            endpoint_line(0, "Fulcrum", state.config.fulcrum_url.is_some(), "wss://server1:50004, wss://server2:50004"),
+            endpoint_line(1, "BCH node", state.config.node_url.is_some(), "http://node1:8332, http://node2:8332"),
+            Line::from(vec![
+                Span::raw(format!("{} Profile name: ", marker(2))),
+                Span::styled(profile_name.to_string(), if profile_hint { Style::default().fg(Color::DarkGray) } else { Style::default() }),
+            ]),
+            Line::from(format!("{} Review & start mining", marker(3))),
+            Line::from(""),
+            Line::from("Automatic uses healthy available connections. Add a node URL to include your node."),
+            Line::from("Separate multiple URLs with commas. Empty restores automatic selection."),
+        ])
+        .block(
+            Block::default()
+                .title(" Advanced connections ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 /// Renders a review of the configured mining settings.
 fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let device = state.selected_device();
+    let donation = if state.config.network == MiningNetwork::Chipnet {
+        format!(
+            "Donation: 2% -> {}",
+            crate::config::CHIPNET_DONATION_ADDRESS
+        )
+    } else {
+        "Donation: 2%".to_string()
+    };
     frame.render_widget(
         Paragraph::new(vec![
+            Line::from(format!(
+                "Profile: {}",
+                if state.profile_name_input.trim().is_empty() {
+                    "random name on first save"
+                } else {
+                    state.profile_name_input.as_str()
+                }
+            )),
+            Line::from(format!("Network: {}", state.config.network.as_str())),
+            Line::from(format!(
+                "Token: {}  (100% GPU work)",
+                state.config.token.as_str()
+            )),
             Line::from(format!(
                 "GPU: {}:{}  {}",
                 device.backend.as_str().to_ascii_uppercase(),
@@ -1381,9 +2021,22 @@ fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             )),
             Line::from(format!("Address: {}", state.config.payout_address)),
             Line::from(format!("Intensity: {}%", state.config.intensity)),
-            Line::from("Donation: 2%"),
+            Line::from(format!(
+                "Connection: automatic  Fulcrum: {}  BCH node: {}",
+                if state.config.fulcrum_url.is_some() {
+                    "custom"
+                } else {
+                    "built-in"
+                },
+                if state.config.node_url.is_some() {
+                    "custom"
+                } else {
+                    "add URL to include"
+                }
+            )),
+            Line::from(donation),
             Line::from(""),
-            Line::from("Press Enter to start mining."),
+            Line::from("> Start mining"),
         ])
         .block(Block::default().title(" Review ").borders(Borders::ALL))
         .wrap(Wrap { trim: false }),
@@ -2431,11 +3084,25 @@ mod tests {
         let default_device = devices[0].clone();
         let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
         assert_eq!(setup.selected, 0);
+        assert_eq!(setup.step, SetupStep::Mode);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Network);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Token);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Gpu);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
         assert_eq!(setup.step, SetupStep::Payout);
         setup.handle_key(key(KeyCode::Esc));
         setup.handle_key(key(KeyCode::Down));
         assert_eq!(setup.selected, 1);
+    }
+
+    fn advance_to_gpu(setup: &mut SetupFlow) {
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Gpu);
     }
 
     #[test]
@@ -2444,6 +3111,7 @@ mod tests {
         let devices = test_devices();
         let default_device = devices[0].clone();
         let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
+        advance_to_gpu(&mut setup);
         setup.handle_key(key(KeyCode::Enter));
         setup.payout_input = "x".into();
         setup.handle_key(key(KeyCode::Enter));
@@ -2456,6 +3124,7 @@ mod tests {
         let devices = test_devices();
         let default_device = devices[0].clone();
         let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
+        advance_to_gpu(&mut setup);
         setup.handle_key(key(KeyCode::Enter));
         setup.payout_input = crate::config::DONATION_ADDRESS.into();
         setup.handle_key(key(KeyCode::Enter));
@@ -2473,6 +3142,7 @@ mod tests {
             .set_payout(crate::config::DONATION_ADDRESS.into())
             .unwrap();
         let mut setup = SetupFlow::new(config, devices, &default_device).unwrap();
+        advance_to_gpu(&mut setup);
         setup.handle_key(key(KeyCode::Enter));
         setup.handle_key(key(KeyCode::Enter));
         for _ in 0..20 {
@@ -2491,6 +3161,7 @@ mod tests {
         let devices = test_devices();
         let default_device = devices[0].clone();
         let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
+        advance_to_gpu(&mut setup);
         setup.handle_key(key(KeyCode::Down));
         assert_eq!(setup.selected, 1);
         setup.handle_key(key(KeyCode::Enter));
@@ -2498,9 +3169,173 @@ mod tests {
         setup.handle_key(key(KeyCode::Enter));
         setup.config.set_intensity(70).unwrap();
         setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Advanced);
+        setup.handle_key(key(KeyCode::Enter));
         assert_eq!(setup.step, SetupStep::Review);
         assert_eq!(setup.config.intensity, 70);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+    }
+
+    #[test]
+    fn setup_rejects_unknown_token_and_unsupported_chipnet_settlement() {
+        let devices = test_devices();
+        let mut setup =
+            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Enter));
+        setup.token_input = "wrong-token".into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Token);
+        assert!(setup.status_line.contains("unknown token"));
+        setup.handle_key(key(KeyCode::Esc));
+        setup.handle_key(key(KeyCode::Down));
+        assert_eq!(setup.config.network, MiningNetwork::Chipnet);
+        setup.handle_key(key(KeyCode::Enter));
+        setup.token_input = "PHOTON".into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Token);
+        assert!(setup
+            .status_line
+            .contains("payout splitting is not supported"));
+    }
+
+    #[test]
+    fn asic_setup_shows_both_paths_but_cannot_start() {
+        let devices = test_devices();
+        let mut setup =
+            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        setup.handle_key(key(KeyCode::Down));
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Asic);
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.status_line.contains("proxy is not supported"));
+        setup.handle_key(key(KeyCode::Down));
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.status_line.contains("No ASIC-minable CashToken"));
+        assert_eq!(setup.step, SetupStep::Asic);
+    }
+
+    #[test]
+    fn setup_renders_network_token_and_asic_choices() {
+        let devices = test_devices();
+        let mut setup =
+            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        for (step, expected) in [
+            (SetupStep::Mode, "ASIC mining proxy"),
+            (SetupStep::Network, "Mainnet"),
+            (SetupStep::Token, "PHOTON  GPU  available"),
+            (SetupStep::Asic, "BCH + all compatible merge-minable tokens"),
+            (SetupStep::Advanced, "Fulcrum: Automatic"),
+        ] {
+            setup.step = step;
+            terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains(expected), "{step:?} missing {expected}");
+        }
+    }
+
+    #[test]
+    fn advanced_setup_rejects_bad_endpoint_and_accepts_custom_connection() {
+        let devices = test_devices();
+        let mut setup =
+            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        setup.step = SetupStep::Advanced;
+        setup.handle_key(key(KeyCode::Down));
+        assert_eq!(setup.advanced_selected, 0);
+        setup.handle_key(key(KeyCode::Enter));
+        setup.advanced_input = "https://wrong".into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.advanced_editing);
+        assert!(setup.status_line.contains("fulcrum URL"));
+        setup.advanced_input = "wss://example.test:50004".into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(!setup.advanced_editing);
+        assert_eq!(
+            setup.config.fulcrum_url.as_deref(),
+            Some("wss://example.test:50004")
+        );
+        setup.handle_key(key(KeyCode::Down));
+        setup.handle_key(key(KeyCode::Enter));
+        setup.advanced_input = "http://127.0.0.1:8332".into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            setup.config.node_url.as_deref(),
+            Some("http://127.0.0.1:8332")
+        );
+    }
+
+    #[test]
+    fn automatic_connection_hint_is_not_entered_text() {
+        let devices = test_devices();
+        let mut setup =
+            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        setup.step = SetupStep::Advanced;
+        setup.advanced_selected = 1;
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.advanced_input.is_empty());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 26)).unwrap();
+        terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+        let before = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(before.contains("http://node1:8332"));
+        setup.handle_key(key(KeyCode::Char('h')));
+        terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+        let after = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!after.contains("http://node1:8332"));
+        assert!(setup.config.node_url.is_none());
+    }
+
+    #[test]
+    fn saved_profile_can_be_renamed_and_reloaded_in_setup() {
+        let devices = test_devices();
+        let mut setup =
+            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut saved = RuntimeConfig::default();
+        saved
+            .set_payout("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh".into())
+            .unwrap();
+        saved.set_intensity(70).unwrap();
+        setup
+            .profiles
+            .upsert(
+                None,
+                "Rig A",
+                SavedConfig::from_effective("cuda", Some(0), &saved),
+            )
+            .unwrap();
+        setup.step = SetupStep::Profiles;
+        setup.handle_key(key(KeyCode::Char('r')));
+        setup.advanced_input = "Rig B".into();
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.profiles.profiles[0].name, "Rig B");
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Mode);
+        assert_eq!(setup.profile_name_input, "Rig B");
+        assert_eq!(setup.config.intensity, 70);
+        assert_eq!(setup.config.payout_address, saved.payout_address);
+        setup.step = SetupStep::Profiles;
+        setup.overrides.intensity = Some(90);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.config.intensity, 90);
     }
 
     #[test]

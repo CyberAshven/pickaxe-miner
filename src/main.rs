@@ -27,6 +27,7 @@ mod electrum;
 mod hip_photon;
 #[allow(dead_code)]
 mod m29_table;
+mod mining_lock;
 #[allow(dead_code)]
 mod node;
 #[allow(dead_code)]
@@ -131,7 +132,7 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
     }
     println!("Donation: 2%");
     match &cfg.fulcrum_url {
-        Some(u) => println!("fulcrum:       {u} (custom, tried first)"),
+        Some(u) => println!("fulcrum:       {} (custom, tried first)", redact_url(u)),
         None => println!("fulcrum:       (bootstrap only)"),
     }
     if let Some(j) = job {
@@ -157,15 +158,10 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
 
 /// Removes credentials before displaying an endpoint URL.
 fn redact_url(url: &str) -> String {
-    // Strip userinfo so passwords never hit the terminal/logs.
-    if let Some(scheme_end) = url.find("://") {
-        let scheme = &url[..scheme_end + 3];
-        let rest = &url[scheme_end + 3..];
-        if let Some(at) = rest.find('@') {
-            return format!("{scheme}***@{}", &rest[at + 1..]);
-        }
-    }
-    url.to_string()
+    url.split(',')
+        .map(|endpoint| crate::node::redact_url(endpoint.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Displays the newly fetched live PHOTON job.
@@ -444,12 +440,12 @@ fn handle_line(
                 println!("  (empty)");
             }
             for (i, u) in fe.iter().enumerate() {
-                let tag = if cfg.fulcrum_url.as_ref() == Some(u) {
+                let tag = if cfg.custom_fulcrum_endpoints().contains(&u.as_str()) {
                     " custom"
                 } else {
                     " bootstrap"
                 };
-                println!("  {}. {}{}", i + 1, u, tag);
+                println!("  {}. {}{}", i + 1, redact_url(u), tag);
             }
             println!("Native node JSON-RPC try-order (sequential, ban-safe backoff):");
             let ne = cfg.node_endpoints();
@@ -457,7 +453,7 @@ fn handle_line(
                 println!("  (none - set node http://127.0.0.1:8332 for Start9/bitcoincashd)");
             }
             for (i, u) in ne.iter().enumerate() {
-                let tag = if cfg.node_url.as_ref() == Some(u) {
+                let tag = if cfg.custom_node_endpoints().contains(&u.as_str()) {
                     " custom"
                 } else {
                     " bootstrap"
@@ -471,7 +467,7 @@ fn handle_line(
             let rest: Vec<&str> = parts.collect();
             if rest.is_empty() {
                 match &cfg.fulcrum_url {
-                    Some(u) => println!("fulcrum (custom): {u}"),
+                    Some(u) => println!("fulcrum (custom): {}", redact_url(u)),
                     None => println!("fulcrum: (not set - using bootstrap). usage: fulcrum <wss://...> | fulcrum clear"),
                 }
             } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("clear") {
@@ -481,7 +477,7 @@ fn handle_line(
                 match cfg.set_fulcrum_url(&rest.join(" ")) {
                     Ok(()) => println!(
                         "fulcrum set to {}",
-                        cfg.fulcrum_url.as_deref().unwrap_or("")
+                        redact_url(cfg.fulcrum_url.as_deref().unwrap_or(""))
                     ),
                     Err(e) => println!("error: {e}"),
                 }
@@ -745,6 +741,14 @@ fn runtime_config_from_cli_with_base(
     args: &cli::Cli,
     mut cfg: RuntimeConfig,
 ) -> Result<RuntimeConfig, String> {
+    if args.chipnet {
+        cfg.set_network(config::MiningNetwork::Chipnet);
+    } else if let Some(network) = &args.network {
+        cfg.set_network(config::MiningNetwork::parse(network)?);
+    }
+    if let Some(token) = &args.token {
+        cfg.set_token(token)?;
+    }
     if let Some(intensity) = args.intensity {
         cfg.set_intensity(intensity)?;
     }
@@ -776,8 +780,8 @@ enum MineStartup {
 }
 
 /// Starts mining after the configured runtime checks.
-fn mine_startup(args: &cli::Cli, cfg: &RuntimeConfig) -> MineStartup {
-    if !(args.no_tui || args.json) && cfg.payout_address.trim().is_empty() {
+fn mine_startup(args: &cli::Cli) -> MineStartup {
+    if !(args.no_tui || args.json) && args.address.is_none() {
         MineStartup::InteractiveSetup
     } else {
         MineStartup::Direct
@@ -1032,7 +1036,9 @@ fn run_headless_mining(
     device_ordinal: u32,
     json: bool,
     use_tui: bool,
-) -> Result<(), String> {
+) -> Result<Option<(u8, String)>, String> {
+    cfg.ensure_mining_supported()?;
+    let _gpu_lock = mining_lock::acquire_gpu_lock()?;
     // Cache device information before the live miner starts so `/devices` never
     // probes drivers or creates temporary GPU contexts in the mining hot path.
     let tui_devices = if use_tui {
@@ -1045,7 +1051,10 @@ fn run_headless_mining(
     if use_tui {
         let final_snapshot = tui::run(supervisor, tui_devices)?;
         print_runtime_snapshot(&final_snapshot, false);
-        return Ok(());
+        return Ok(Some((
+            final_snapshot.search.intensity,
+            final_snapshot.payout_address,
+        )));
     }
     let intensity_rx = spawn_intensity_commands();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1085,7 +1094,24 @@ fn run_headless_mining(
     let final_snapshot = supervisor.stop();
     print_runtime_snapshot(&final_snapshot, json);
     let _ = std::io::stdout().flush();
-    Ok(())
+    Ok(None)
+}
+
+fn persist_session_profile(
+    path: &std::path::Path,
+    name: &str,
+    intensity: u8,
+    address: &str,
+) -> Result<(), String> {
+    let mut profiles = config::MiningProfiles::load_optional(path)?;
+    let profile = profiles
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.name.eq_ignore_ascii_case(name))
+        .ok_or("mining profile was renamed or removed during this session")?;
+    profile.settings.intensity = Some(intensity);
+    profile.settings.address = Some(address.to_string());
+    profiles.save(path)
 }
 
 /// Dispatches the requested CLI command and mining mode.
@@ -1196,6 +1222,8 @@ fn main() {
                         "{}",
                         serde_json::json!({
                             "backend": effective_backend,
+                            "network": cfg.network.as_str(),
+                            "token": cfg.token.as_str(),
                             "device": effective_device,
                             "intensity": cfg.intensity,
                             "address": cfg.payout_address,
@@ -1208,6 +1236,8 @@ fn main() {
                     );
                 } else {
                     println!("backend: {}", effective_backend);
+                    println!("network: {}", cfg.network.as_str());
+                    println!("token: {}", cfg.token.as_str());
                     println!("device: {:?}", effective_device);
                     println!("intensity: {}%", cfg.intensity);
                     println!("address: {}", cfg.payout_address);
@@ -1243,13 +1273,20 @@ fn main() {
             }
         },
         cli::Commands::Mine => {
-            let startup = mine_startup(&args, &cfg);
+            let profiles_path = config::profiles_path(&config_path);
+            let startup = mine_startup(&args);
             if matches!(startup, MineStartup::Direct)
                 && (args.no_tui || args.json)
                 && cfg.payout_address.trim().is_empty()
             {
                 eprintln!("error: --address is required with --no-tui or --json");
                 std::process::exit(2);
+            }
+            if matches!(startup, MineStartup::Direct) {
+                if let Err(error) = cfg.ensure_mining_supported() {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
             }
             let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
                 Ok(device) => device,
@@ -1258,7 +1295,7 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            let (cfg, selected_backend, selected_device) = match startup {
+            let (cfg, selected_backend, selected_device, profile_name) = match startup {
                 MineStartup::InteractiveSetup => {
                     let devices = match backend::list_devices(backend_kind) {
                         Ok(devices) => devices,
@@ -1267,7 +1304,37 @@ fn main() {
                             std::process::exit(2);
                         }
                     };
-                    let setup = match tui::run_setup(cfg, devices, &selected) {
+                    let profiles = match config::MiningProfiles::load_optional(&profiles_path) {
+                        Ok(profiles) => profiles,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(2);
+                        }
+                    };
+                    let overrides = tui::SetupOverrides {
+                        network: if args.chipnet {
+                            Some(config::MiningNetwork::Chipnet)
+                        } else {
+                            args.network.as_deref().map(|value| {
+                                config::MiningNetwork::parse(value).expect("validated CLI network")
+                            })
+                        },
+                        token: args.token.clone(),
+                        intensity: args.intensity,
+                        fulcrum: args.fulcrum.clone(),
+                        node_rpc: args.node_rpc.clone(),
+                        source: args.source.clone(),
+                        device: (args.backend.is_some() || args.device.is_some())
+                            .then_some((selected.backend, selected.index)),
+                    };
+                    let setup = match tui::run_setup(
+                        cfg,
+                        devices,
+                        &selected,
+                        &profiles_path,
+                        profiles,
+                        overrides,
+                    ) {
                         Ok(Some(setup)) => setup,
                         Ok(None) => return,
                         Err(error) => {
@@ -1275,16 +1342,32 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    (setup.config, setup.backend, setup.device)
+                    (
+                        setup.config,
+                        setup.backend,
+                        setup.device,
+                        Some(setup.profile_name),
+                    )
                 }
-                MineStartup::Direct => (cfg, selected.backend, selected.index),
+                MineStartup::Direct => (cfg, selected.backend, selected.index, None),
             };
             let use_tui = !(args.no_tui || args.json);
-            if let Err(error) =
-                run_headless_mining(cfg, selected_backend, selected_device, args.json, use_tui)
-            {
-                eprintln!("error: {error}");
-                std::process::exit(1);
+            match run_headless_mining(cfg, selected_backend, selected_device, args.json, use_tui) {
+                Ok(Some((intensity, address))) => {
+                    if let Some(name) = profile_name {
+                        if let Err(error) =
+                            persist_session_profile(&profiles_path, &name, intensity, &address)
+                        {
+                            eprintln!("error: save mining profile: {error}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         cli::Commands::Repl => run_repl(cfg),
@@ -1334,6 +1417,31 @@ fn run_repl(mut cfg: RuntimeConfig) {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn normal_session_exit_saves_the_latest_profile_intensity() {
+        let path = std::env::temp_dir().join(format!(
+            "pickaxe-session-profile-{}.json",
+            std::process::id()
+        ));
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_payout(config::DONATION_ADDRESS.into()).unwrap();
+        runtime.set_intensity(70).unwrap();
+        let mut profiles = config::MiningProfiles::default();
+        profiles
+            .upsert(
+                None,
+                "Rig A",
+                config::SavedConfig::from_effective("cuda", Some(0), &runtime),
+            )
+            .unwrap();
+        profiles.save(&path).unwrap();
+
+        persist_session_profile(&path, "Rig A", 40, config::DONATION_ADDRESS).unwrap();
+        let saved = config::MiningProfiles::load_optional(&path).unwrap();
+        assert_eq!(saved.profiles[0].settings.intensity, Some(40));
+        let _ = std::fs::remove_file(path);
+    }
 
     fn live_job() -> LiveJob {
         LiveJob {
@@ -1434,15 +1542,13 @@ mod tests {
     #[test]
     fn startup_enters_setup_by_default() {
         let args = cli::Cli::try_parse_from(["pickaxe", "mine"]).unwrap();
-        let cfg = runtime_config_from_cli(&args).unwrap();
-        assert_eq!(mine_startup(&args, &cfg), MineStartup::InteractiveSetup);
+        assert_eq!(mine_startup(&args), MineStartup::InteractiveSetup);
     }
 
     #[test]
     fn startup_flag_keeps_direct_mode() {
         let args = cli::Cli::try_parse_from(["pickaxe", "mine", "--no-tui"]).unwrap();
-        let cfg = runtime_config_from_cli(&args).unwrap();
-        assert_eq!(mine_startup(&args, &cfg), MineStartup::Direct);
+        assert_eq!(mine_startup(&args), MineStartup::Direct);
     }
 
     #[test]
@@ -1533,7 +1639,7 @@ mod tests {
         ])
         .unwrap();
         let cfg = runtime_config_from_cli(&args).unwrap();
-        assert_eq!(mine_startup(&args, &cfg), MineStartup::Direct);
+        assert_eq!(mine_startup(&args), MineStartup::Direct);
         assert_eq!(args.device, Some(0));
         assert_eq!(cfg.intensity, 60);
         assert_eq!(cfg.payout_address, crate::config::DONATION_ADDRESS);

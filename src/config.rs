@@ -11,6 +11,91 @@ pub const DONATION_BPS: u16 = 200;
 
 /// Locked donation payout for distribution builds (BCH cashaddr).
 pub const DONATION_ADDRESS: &str = "bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3";
+pub const CHIPNET_DONATION_ADDRESS: &str = "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp";
+
+/// Chain selected for mining. Each token resolves its own deployment on this chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MiningNetwork {
+    #[default]
+    Mainnet,
+    Chipnet,
+}
+
+impl MiningNetwork {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mainnet" => Ok(Self::Mainnet),
+            "chipnet" => Ok(Self::Chipnet),
+            _ => Err("network must be mainnet or chipnet".into()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Chipnet => "chipnet",
+        }
+    }
+
+    fn cashaddr_prefix(self) -> &'static str {
+        match self {
+            Self::Mainnet => "bitcoincash",
+            Self::Chipnet => "bchtest",
+        }
+    }
+}
+
+/// Supported GPU-minable token identities, in alphabetical display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MiningToken {
+    #[default]
+    Photon,
+}
+
+impl MiningToken {
+    pub fn photon_deployment(
+        self,
+        network: MiningNetwork,
+    ) -> &'static crate::protocol::PhotonDeployment {
+        match (self, network) {
+            (Self::Photon, MiningNetwork::Mainnet) => &crate::protocol::MAINNET_PHOTON,
+            (Self::Photon, MiningNetwork::Chipnet) => &crate::protocol::CHIPNET_PHOTON,
+        }
+    }
+
+    pub fn parse(query: &str, network: MiningNetwork) -> Result<Self, String> {
+        let query = query.trim();
+        let hex = query
+            .strip_prefix("0x")
+            .or_else(|| query.strip_prefix("0X"))
+            .unwrap_or(query);
+        let deployment = Self::Photon.photon_deployment(network);
+        if query.eq_ignore_ascii_case("photon")
+            || hex.eq_ignore_ascii_case(deployment.category_hex)
+            || hex.eq_ignore_ascii_case(deployment.covenant_lock_hex)
+            || query.eq_ignore_ascii_case(deployment.covenant_address)
+        {
+            Ok(Self::Photon)
+        } else {
+            Err("unknown token name, category ID, or covenant bytecode; try PHOTON".into())
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Photon => "PHOTON",
+        }
+    }
+
+    pub fn ensure_supported(self, network: MiningNetwork) -> Result<(), String> {
+        match (self, network) {
+            (Self::Photon, MiningNetwork::Mainnet) => Ok(()),
+            (Self::Photon, MiningNetwork::Chipnet) => {
+                Err("PHOTON Chipnet payout splitting is not supported by this build yet".into())
+            }
+        }
+    }
+}
 
 /// shrec's share of the existing 2% donation.
 pub const SHREC_DONATION_ADDRESS: &str = "bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3";
@@ -48,6 +133,10 @@ impl JobSource {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    /// Mining chain; mainnet is the safe default.
+    pub network: MiningNetwork,
+    /// Selected token. PHOTON is currently the only supported GPU token.
+    pub token: MiningToken,
     /// GPU work intensity 10..=100. Pause is a separate runtime state.
     pub intensity: u8,
     /// Miner reward cashaddr (user). Empty until set.
@@ -72,6 +161,8 @@ impl Default for RuntimeConfig {
     /// Creates the default runtime configuration.
     fn default() -> Self {
         Self {
+            network: MiningNetwork::Mainnet,
+            token: MiningToken::Photon,
             intensity: 100,
             payout_address: String::new(),
             fulcrum_url: None,
@@ -84,6 +175,43 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    pub fn set_network(&mut self, network: MiningNetwork) {
+        if self.network != network {
+            self.network = network;
+            self.bump_generation();
+        }
+    }
+
+    pub fn set_token(&mut self, query: &str) -> Result<(), String> {
+        let token = MiningToken::parse(query, self.network)?;
+        if self.token != token {
+            self.token = token;
+            self.bump_generation();
+        }
+        Ok(())
+    }
+
+    pub fn validate_payout_network(&self) -> Result<(), String> {
+        if self.payout_address.is_empty()
+            || self
+                .payout_address
+                .starts_with(&format!("{}:", self.network.cashaddr_prefix()))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "payout address must use {}: on {}",
+                self.network.cashaddr_prefix(),
+                self.network.as_str()
+            ))
+        }
+    }
+
+    pub fn ensure_mining_supported(&self) -> Result<(), String> {
+        self.validate_payout_network()?;
+        self.token.ensure_supported(self.network)
+    }
+
     /// Updates the configured GPU intensity within the accepted range.
     pub fn set_intensity(&mut self, value: u8) -> Result<(), String> {
         if !(10..=100).contains(&value) {
@@ -99,13 +227,31 @@ impl RuntimeConfig {
         if trimmed.is_empty() {
             return Err("payout address required".into());
         }
-        crate::tx::cashaddr_to_p2pkh_locking(&trimmed)
-            .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
+        if trimmed.chars().any(|ch| ch.is_ascii_lowercase())
+            && trimmed.chars().any(|ch| ch.is_ascii_uppercase())
+        {
+            return Err(
+                "invalid payout CashAddr: CashAddr must not mix upper and lower case".into(),
+            );
+        }
         let canonical = if trimmed.contains(':') {
             trimmed.to_ascii_lowercase()
         } else {
-            format!("bitcoincash:{}", trimmed.to_ascii_lowercase())
+            format!(
+                "{}:{}",
+                self.network.cashaddr_prefix(),
+                trimmed.to_ascii_lowercase()
+            )
         };
+        crate::tx::cashaddr_to_p2pkh_locking(&canonical)
+            .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
+        if !canonical.starts_with(&format!("{}:", self.network.cashaddr_prefix())) {
+            return Err(format!(
+                "payout address must use {}: on {}",
+                self.network.cashaddr_prefix(),
+                self.network.as_str()
+            ));
+        }
         if self.payout_address != canonical {
             self.bump_generation();
         }
@@ -115,20 +261,22 @@ impl RuntimeConfig {
 
     /// Set custom Fulcrum/Electrum endpoint (`ws://` or `wss://`). Empty clears.
     pub fn set_fulcrum_url(&mut self, url: &str) -> Result<(), String> {
-        let trimmed = url.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(endpoints) = normalize_endpoint_list(url, "fulcrum", &["wss://", "ws://"])? else {
             self.clear_fulcrum_url();
             return Ok(());
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if !(lower.starts_with("wss://") || lower.starts_with("ws://")) {
-            return Err("fulcrum URL must start with wss:// or ws://".into());
-        }
-        if self.fulcrum_url.as_deref() != Some(trimmed.as_str()) {
+        };
+        if self.fulcrum_url.as_deref() != Some(endpoints.as_str()) {
             self.bump_generation();
-            self.fulcrum_url = Some(trimmed);
+            self.fulcrum_url = Some(endpoints);
         }
         Ok(())
+    }
+
+    pub fn custom_fulcrum_endpoints(&self) -> Vec<&str> {
+        self.fulcrum_url
+            .as_deref()
+            .map(|value| value.split(',').map(str::trim).collect())
+            .unwrap_or_default()
     }
 
     /// Removes the custom Fulcrum endpoint.
@@ -142,11 +290,15 @@ impl RuntimeConfig {
     pub fn electrum_endpoints(&self) -> Vec<String> {
         use crate::protocol::FULCRUM_WSS_BOOTSTRAP;
         let mut out = Vec::new();
-        if let Some(u) = &self.fulcrum_url {
-            out.push(u.clone());
+        for url in self.custom_fulcrum_endpoints() {
+            out.push(url.to_string());
         }
-        for u in FULCRUM_WSS_BOOTSTRAP {
-            if !out.iter().any(|x| x == *u) {
+        for u in FULCRUM_WSS_BOOTSTRAP
+            .iter()
+            .copied()
+            .filter(|_| self.network == MiningNetwork::Mainnet)
+        {
+            if !out.iter().any(|x| x.as_str() == u) {
                 out.push((*u).to_string());
             }
         }
@@ -155,21 +307,23 @@ impl RuntimeConfig {
 
     /// Validates and stores the native node endpoint.
     pub fn set_node_url(&mut self, url: &str) -> Result<(), String> {
-        let trimmed = url.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(endpoints) = normalize_endpoint_list(url, "node", &["https://", "http://"])?
+        else {
             self.clear_node_url();
             return Ok(());
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-            return Err("node URL must start with http:// or https://".into());
-        }
-        // Never require embedding user:pass in chat logs — accept URL as given.
-        if self.node_url.as_deref() != Some(trimmed.as_str()) {
+        };
+        if self.node_url.as_deref() != Some(endpoints.as_str()) {
             self.bump_generation();
-            self.node_url = Some(trimmed);
+            self.node_url = Some(endpoints);
         }
         Ok(())
+    }
+
+    pub fn custom_node_endpoints(&self) -> Vec<&str> {
+        self.node_url
+            .as_deref()
+            .map(|value| value.split(',').map(str::trim).collect())
+            .unwrap_or_default()
     }
 
     /// Removes the custom native node endpoint.
@@ -202,11 +356,15 @@ impl RuntimeConfig {
     pub fn node_endpoints(&self) -> Vec<String> {
         use crate::protocol::NODE_RPC_BOOTSTRAP;
         let mut out = Vec::new();
-        if let Some(u) = &self.node_url {
-            out.push(u.clone());
+        for url in self.custom_node_endpoints() {
+            out.push(url.to_string());
         }
-        for u in NODE_RPC_BOOTSTRAP {
-            if !out.iter().any(|x| x == *u) {
+        for u in NODE_RPC_BOOTSTRAP
+            .iter()
+            .copied()
+            .filter(|_| self.network == MiningNetwork::Mainnet)
+        {
+            if !out.iter().any(|x| x.as_str() == u) {
                 out.push((*u).to_string());
             }
         }
@@ -227,9 +385,43 @@ impl RuntimeConfig {
     }
 }
 
+fn normalize_endpoint_list(
+    input: &str,
+    kind: &str,
+    schemes: &[&str],
+) -> Result<Option<String>, String> {
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+    let urls = input.split(',').map(str::trim).collect::<Vec<_>>();
+    if urls.len() > 8 || urls.iter().any(|url| url.is_empty()) {
+        return Err(format!("{kind} needs 1–8 URLs separated by commas"));
+    }
+    for url in &urls {
+        let lower = url.to_ascii_lowercase();
+        if !schemes.iter().any(|scheme| lower.starts_with(scheme))
+            || url.contains([';', ' ', '\n', '\r', '\t'])
+        {
+            return Err(format!(
+                "invalid {kind} URL; separate URLs with commas and use {}",
+                schemes.join(" or ")
+            ));
+        }
+    }
+    let mut unique = Vec::new();
+    for url in urls {
+        if !unique.contains(&url) {
+            unique.push(url);
+        }
+    }
+    Ok(Some(unique.join(", ")))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SavedConfig {
+    pub network: Option<String>,
+    pub token: Option<String>,
     pub backend: Option<String>,
     pub device: Option<u32>,
     pub intensity: Option<u8>,
@@ -242,6 +434,12 @@ pub struct SavedConfig {
 impl SavedConfig {
     /// Applies saved configuration values to a running miner.
     pub fn apply_to_runtime(&self, cfg: &mut RuntimeConfig) -> Result<(), String> {
+        if let Some(value) = &self.network {
+            cfg.set_network(MiningNetwork::parse(value)?);
+        }
+        if let Some(value) = &self.token {
+            cfg.set_token(value)?;
+        }
         if let Some(value) = self.intensity {
             cfg.set_intensity(value)?;
         }
@@ -266,7 +464,8 @@ impl SavedConfig {
             crate::backend::BackendKind::parse(value)?;
         }
         let mut runtime = RuntimeConfig::default();
-        self.apply_to_runtime(&mut runtime)
+        self.apply_to_runtime(&mut runtime)?;
+        runtime.validate_payout_network()
     }
 
     /// Loads and validates the saved miner configuration.
@@ -313,6 +512,8 @@ impl SavedConfig {
             Some(runtime.payout_address.clone())
         };
         Self {
+            network: Some(runtime.network.as_str().to_string()),
+            token: Some(runtime.token.as_str().to_string()),
             backend: Some(backend.to_string()),
             device,
             intensity: Some(runtime.intensity),
@@ -321,6 +522,136 @@ impl SavedConfig {
             node_rpc: runtime.node_url.clone(),
             source: Some(runtime.source.as_str().to_string()),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MiningProfile {
+    pub name: String,
+    pub settings: SavedConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MiningProfiles {
+    pub profiles: Vec<MiningProfile>,
+}
+
+pub fn profiles_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("profiles.json")
+}
+
+fn valid_profile_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
+        Err("profile name must contain 1–40 printable characters".into())
+    } else {
+        Ok(name)
+    }
+}
+
+impl MiningProfiles {
+    pub fn load_optional(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes =
+            fs::read(path).map_err(|error| format!("read profiles {}: {error}", path.display()))?;
+        let store: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse profiles {}: {error}", path.display()))?;
+        if store.profiles.len() > 64 {
+            return Err("too many mining profiles (maximum 64)".into());
+        }
+        for (index, profile) in store.profiles.iter().enumerate() {
+            valid_profile_name(&profile.name)?;
+            profile.settings.validate()?;
+            if store.profiles[..index]
+                .iter()
+                .any(|other| other.name.eq_ignore_ascii_case(&profile.name))
+            {
+                return Err("duplicate mining profile name".into());
+            }
+        }
+        Ok(store)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("create profiles directory {}: {error}", parent.display())
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize profiles: {error}"))?;
+        write_private_config(path, &bytes)
+    }
+
+    pub fn rename(&mut self, index: usize, name: &str) -> Result<(), String> {
+        let name = valid_profile_name(name)?;
+        if self
+            .profiles
+            .iter()
+            .enumerate()
+            .any(|(other_index, profile)| {
+                other_index != index && profile.name.eq_ignore_ascii_case(name)
+            })
+        {
+            return Err("a mining profile already has that name".into());
+        }
+        self.profiles
+            .get_mut(index)
+            .ok_or("profile no longer exists")?
+            .name = name.into();
+        Ok(())
+    }
+
+    pub fn upsert(
+        &mut self,
+        index: Option<usize>,
+        name: &str,
+        settings: SavedConfig,
+    ) -> Result<String, String> {
+        settings.validate()?;
+        let name = if !name.trim().is_empty() {
+            valid_profile_name(name)?.to_string()
+        } else if let Some(existing) = index.and_then(|index| self.profiles.get(index)) {
+            existing.name.clone()
+        } else {
+            loop {
+                let candidate = format!("Miner {:08X}", rand::random::<u32>());
+                if !self
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.name == candidate)
+                {
+                    break candidate;
+                }
+            }
+        };
+        if let Some(index) = index {
+            self.rename(index, &name)?;
+            self.profiles[index].settings = settings;
+        } else {
+            if self.profiles.len() >= 64 {
+                return Err("too many mining profiles (maximum 64)".into());
+            }
+            if self
+                .profiles
+                .iter()
+                .any(|profile| profile.name.eq_ignore_ascii_case(&name))
+            {
+                return Err("a mining profile already has that name".into());
+            }
+            self.profiles.push(MiningProfile {
+                name: name.clone(),
+                settings,
+            });
+        }
+        Ok(name)
     }
 }
 
@@ -443,6 +774,109 @@ mod tests {
     const PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
 
     #[test]
+    fn comma_separated_connections_keep_order_and_reject_bad_entries() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_fulcrum_url("wss://one.test:50004, wss://two.test:50004")
+            .unwrap();
+        cfg.set_node_url("http://one.test:8332, https://two.test:8332")
+            .unwrap();
+        assert_eq!(
+            cfg.custom_fulcrum_endpoints(),
+            ["wss://one.test:50004", "wss://two.test:50004"]
+        );
+        assert_eq!(
+            cfg.custom_node_endpoints(),
+            ["http://one.test:8332", "https://two.test:8332"]
+        );
+        assert_eq!(cfg.node_endpoints().len(), 2);
+        assert!(cfg.set_node_url("http://one.test:8332,").is_err());
+        assert!(cfg
+            .set_fulcrum_url("wss://one.test:50004;wss://two.test:50004")
+            .is_err());
+    }
+
+    #[test]
+    fn mining_profiles_save_settings_and_support_rename() {
+        let path =
+            std::env::temp_dir().join(format!("pickaxe-profiles-{}.json", std::process::id()));
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_payout(PAYOUT.into()).unwrap();
+        runtime.set_intensity(70).unwrap();
+        runtime
+            .set_node_url("http://127.0.0.1:8332, http://localhost:8332")
+            .unwrap();
+        let mut profiles = MiningProfiles::default();
+        let random_name = profiles
+            .upsert(
+                None,
+                "",
+                SavedConfig::from_effective("cuda", Some(0), &runtime),
+            )
+            .unwrap();
+        assert!(random_name.starts_with("Miner "));
+        profiles.save(&path).unwrap();
+        let mut loaded = MiningProfiles::load_optional(&path).unwrap();
+        loaded.rename(0, "Home rig").unwrap();
+        loaded.save(&path).unwrap();
+        let loaded = MiningProfiles::load_optional(&path).unwrap();
+        assert_eq!(loaded.profiles[0].name, "Home rig");
+        assert_eq!(loaded.profiles[0].settings.address.as_deref(), Some(PAYOUT));
+        assert_eq!(loaded.profiles[0].settings.intensity, Some(70));
+        assert_eq!(
+            loaded.profiles[0].settings.node_rpc.as_deref(),
+            Some("http://127.0.0.1:8332, http://localhost:8332")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mining_selection_uses_the_token_deployment_on_each_chain() {
+        for query in [
+            "photon",
+            crate::protocol::MAINNET_CATEGORY_HEX,
+            crate::protocol::COVENANT_LOCKING_BYTECODE_HEX,
+        ] {
+            assert_eq!(
+                MiningToken::parse(query, MiningNetwork::Mainnet).unwrap(),
+                MiningToken::Photon
+            );
+        }
+        assert!(MiningToken::parse("wrong", MiningNetwork::Mainnet).is_err());
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.ensure_mining_supported().is_ok());
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg
+            .ensure_mining_supported()
+            .unwrap_err()
+            .contains("payout splitting is not supported"));
+        for query in [
+            "PHOTON",
+            crate::protocol::CHIPNET_CATEGORY_HEX,
+            crate::protocol::CHIPNET_COVENANT_LOCKING_BYTECODE_HEX,
+            crate::protocol::CHIPNET_COVENANT_ADDRESS,
+        ] {
+            assert_eq!(
+                MiningToken::parse(query, cfg.network).unwrap(),
+                MiningToken::Photon
+            );
+        }
+        assert!(MiningToken::parse(crate::protocol::MAINNET_CATEGORY_HEX, cfg.network).is_err());
+        assert!(cfg.electrum_endpoints().is_empty());
+        assert!(cfg.node_endpoints().is_empty());
+    }
+
+    #[test]
+    fn payout_address_must_match_selected_network() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg.set_payout(PAYOUT.into()).is_err());
+        cfg.set_network(MiningNetwork::Mainnet);
+        cfg.set_payout(PAYOUT.into()).unwrap();
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg.validate_payout_network().is_err());
+    }
+
+    #[test]
     fn saved_config_node_credentials_are_owner_only() {
         let dir = std::env::temp_dir().join(format!("pickaxe-config-mode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -532,6 +966,7 @@ mod tests {
     fn payout_requires_valid_cashaddr_checksum() {
         let mut cfg = RuntimeConfig::default();
         assert!(cfg.set_payout(PAYOUT.into()).is_ok());
+        assert!(cfg.set_payout(PAYOUT.replace(":z", ":Z")).is_err());
         assert!(cfg
             .set_payout("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frq".into())
             .is_err());

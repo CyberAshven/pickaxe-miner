@@ -19,6 +19,94 @@ pub const EXPECTED_SCRIPT_HASH_HEX: &str =
 /// Redeem script hex (P2SH32 / covenant spend path) — from postcorps miner.js.
 pub const REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_redeem.hex");
 
+/// The corrected PHOTON deployment currently live on Chipnet.
+pub const CHIPNET_CATEGORY_HEX: &str =
+    "18ae09cfc783ec83ada4e642c00a22015866609d319e33c73a7c13948bc2832a";
+pub const CHIPNET_COVENANT_LOCKING_BYTECODE_HEX: &str =
+    "aa201e48761db52818690bd86be385113a822af4acdf6211115d3375620ddf660c8d87";
+pub const CHIPNET_EXPECTED_SCRIPT_HASH_HEX: &str =
+    "689bc502b36ef792153c7dcda756f800b325dd2677e2552dcb7e67bf89cd6850";
+pub const CHIPNET_REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_chipnet_redeem.hex");
+pub const CHIPNET_COVENANT_ADDRESS: &str =
+    "bchtest:rv0ysasak55ps6gtmp478pg382pz4a9vma3pzy2axd6kyrwlvcxg6ayasygal";
+
+#[derive(Debug, Clone, Copy)]
+pub struct PhotonDeployment {
+    pub category_hex: &'static str,
+    pub covenant_lock_hex: &'static str,
+    pub script_hash_hex: &'static str,
+    pub redeem_script_hex: &'static str,
+    pub covenant_address: &'static str,
+}
+
+pub const MAINNET_PHOTON: PhotonDeployment = PhotonDeployment {
+    category_hex: MAINNET_CATEGORY_HEX,
+    covenant_lock_hex: COVENANT_LOCKING_BYTECODE_HEX,
+    script_hash_hex: EXPECTED_SCRIPT_HASH_HEX,
+    redeem_script_hex: REDEEM_SCRIPT_HEX,
+    covenant_address: "bitcoincash:rwdzcre3z37a59cwtx420xpwfl3lcfvj30cf7907reuh5txtqhrwqtx8rf5ms",
+};
+
+pub const CHIPNET_PHOTON: PhotonDeployment = PhotonDeployment {
+    category_hex: CHIPNET_CATEGORY_HEX,
+    covenant_lock_hex: CHIPNET_COVENANT_LOCKING_BYTECODE_HEX,
+    script_hash_hex: CHIPNET_EXPECTED_SCRIPT_HASH_HEX,
+    redeem_script_hex: CHIPNET_REDEEM_SCRIPT_HEX,
+    covenant_address: CHIPNET_COVENANT_ADDRESS,
+};
+
+impl PhotonDeployment {
+    /// Refuses any deployment whose redeem script, P2SH32 lock, or Fulcrum hash disagree.
+    pub fn verify(self) -> Result<(), String> {
+        let redeem = hex::decode(self.redeem_script_hex.trim())
+            .map_err(|error| format!("invalid PHOTON redeem script: {error}"))?;
+        let lock = hex::decode(self.covenant_lock_hex)
+            .map_err(|error| format!("invalid PHOTON covenant: {error}"))?;
+        let category = hex::decode(self.category_hex)
+            .map_err(|error| format!("invalid PHOTON category: {error}"))?;
+        if category.len() != 32
+            || lock.len() != 35
+            || lock[0] != 0xaa
+            || lock[1] != 0x20
+            || lock[34] != 0x87
+        {
+            return Err("PHOTON deployment has invalid category or P2SH32 lock".into());
+        }
+        if lock[2..34] != hash256(&redeem) {
+            return Err("PHOTON deployment redeem script does not match its lock".into());
+        }
+        let script_hash = Sha256::digest(&lock);
+        if hex::encode(script_hash.into_iter().rev().collect::<Vec<_>>()) != self.script_hash_hex {
+            return Err("PHOTON deployment Fulcrum script hash does not match its lock".into());
+        }
+        Ok(())
+    }
+
+    pub fn single_input_max_baton_decrease_sats(self) -> Result<u64, String> {
+        self.verify()?;
+        let redeem =
+            hex::decode(self.redeem_script_hex.trim()).map_err(|error| error.to_string())?;
+        extract_baton_decrease_rule(
+            &redeem,
+            &[0xc0, 0xcc, 0xc0, 0xc6],
+            &[0x94, 0xa2, 0x69],
+            "single-input",
+        )
+    }
+
+    pub fn multi_input_min_baton_increase_sats(self) -> Result<u64, String> {
+        self.verify()?;
+        let redeem =
+            hex::decode(self.redeem_script_hex.trim()).map_err(|error| error.to_string())?;
+        extract_baton_decrease_rule(
+            &redeem,
+            &[0xc0, 0xcc, 0xc0, 0xc6],
+            &[0x93, 0xa2, 0x69],
+            "multi-input increase",
+        )
+    }
+}
+
 /// Computes double SHA-256 over the protocol bytes.
 fn hash256(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
@@ -311,6 +399,28 @@ fn biguint_to_le_hex32(value: &BigUint) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn photon_deployments_match_their_redeem_scripts_and_fulcrum_hashes() {
+        MAINNET_PHOTON.verify().unwrap();
+        CHIPNET_PHOTON.verify().unwrap();
+        assert_eq!(
+            hex::decode(CHIPNET_REDEEM_SCRIPT_HEX.trim()).unwrap().len(),
+            261
+        );
+        assert_eq!(
+            CHIPNET_PHOTON
+                .single_input_max_baton_decrease_sats()
+                .unwrap(),
+            1_500
+        );
+        assert_eq!(
+            CHIPNET_PHOTON
+                .multi_input_min_baton_increase_sats()
+                .unwrap(),
+            8_000
+        );
+    }
 
     #[test]
     fn photon_target_derivation_preserves_reference_little_endian_math() {

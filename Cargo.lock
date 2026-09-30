@@ -1077,6 +1077,7 @@ dependencies = [
  "sha2",
  "tungstenite",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

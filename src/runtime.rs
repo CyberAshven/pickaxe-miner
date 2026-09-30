@@ -1891,6 +1891,7 @@ impl RuntimeSupervisor {
         backend: BackendKind,
         device_ordinal: u32,
     ) -> Result<Self, String> {
+        cfg.ensure_mining_supported()?;
         crate::backend::require_production_mining_backend(backend)?;
         if cfg.payout_address.trim().is_empty() {
             return Err("mining payout address is required".into());
@@ -2936,26 +2937,39 @@ struct PhotonBoundaryRefresh {
 
 /// Chooses a PHOTON job at the verified source boundary.
 fn select_boundary_photon_job(
-    cfg: &RuntimeConfig,
+    _cfg: &RuntimeConfig,
     sources: &SourceCatalog,
     native_snapshot: Option<&LiveStateSnapshot>,
     canonical_snapshot: &LiveStateSnapshot,
     now_ms: u64,
 ) -> LiveJob {
-    let node_endpoint = cfg.node_url.as_deref().map(crate::node::redact_url);
-    if let (Some(endpoint), Some(native), Some(selected)) = (
-        node_endpoint.as_deref(),
+    if let (Some(native), Some(selected)) = (
         native_snapshot,
         sources.router().select_photon_route(now_ms),
     ) {
-        if selected.kind == SourceKind::NativeNode
-            && selected.endpoint == endpoint
-            && native.job.url == endpoint
-        {
+        if selected.kind == SourceKind::NativeNode && native.job.url == selected.endpoint {
             return native.job.clone();
         }
     }
     canonical_snapshot.job.clone()
+}
+
+fn eligible_native_endpoints(
+    cfg: &RuntimeConfig,
+    sources: &SourceCatalog,
+    now_ms: u64,
+) -> Vec<String> {
+    cfg.custom_node_endpoints()
+        .into_iter()
+        .filter(|url| {
+            sources.available_at(
+                SourceKind::NativeNode,
+                &crate::node::redact_url(url),
+                now_ms,
+            )
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Records a canonical Fulcrum capability probe.
@@ -3090,26 +3104,25 @@ fn refresh_photon_job_on_cadence(
     let canonical_snapshot = match canonical_result {
         Ok(snapshot) => snapshot,
         Err(canonical_error) => {
-            let endpoint = cfg.node_url.as_deref().ok_or_else(|| {
+            let endpoint = cfg.custom_node_endpoints().into_iter().find(|url| {
+                sources.supports_at(
+                    SourceKind::NativeNode,
+                    &crate::node::redact_url(url),
+                    SourceCapability::PhotonState,
+                    now_ms,
+                )
+            }).ok_or_else(|| {
                 format!(
-                    "canonical Fulcrum PHOTON refresh failed and no native node is configured: {canonical_error}"
+                    "canonical Fulcrum PHOTON refresh failed and no proven native node is available: {canonical_error}"
                 )
             })?;
-            let endpoint_identity = crate::node::redact_url(endpoint);
-            if !sources.supports_at(
-                SourceKind::NativeNode,
-                &endpoint_identity,
-                SourceCapability::PhotonState,
-                now_ms,
-            ) {
-                return Err(format!(
-                    "canonical Fulcrum PHOTON refresh failed and native equivalence proof is unavailable or expired: {canonical_error}"
-                ));
-            }
 
             let probe_started = Instant::now();
             let native_result = (|| {
-                if native_session.is_none() {
+                if native_session
+                    .as_ref()
+                    .is_none_or(|session| session.endpoint() != endpoint)
+                {
                     *native_session = Some(crate::node::NativePhotonSession::connect_failover(&[
                         endpoint.to_string(),
                     ])?);
@@ -3120,6 +3133,9 @@ fn refresh_photon_job_on_cadence(
                     .refresh()
             })();
             let latency_ms = u32::try_from(probe_started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            if native_result.is_err() {
+                *native_session = None;
+            }
             let native_snapshot = refresh_native_with_current_proof(
                 sources,
                 endpoint,
@@ -3136,41 +3152,53 @@ fn refresh_photon_job_on_cadence(
         }
     };
     record_canonical_fulcrum_probe(sources, &canonical_snapshot, now_ms, canonical_latency_ms)?;
-    let Some(endpoint) = cfg.node_url.as_deref() else {
+    let node_endpoints = eligible_native_endpoints(cfg, sources, now_ms);
+    if node_endpoints.is_empty() {
+        *native_session = None;
         return Ok(PhotonBoundaryRefresh {
             job: canonical_snapshot.job,
             route_warning: None,
         });
     };
-    let endpoint_identity = crate::node::redact_url(endpoint);
-    if !sources.available_at(SourceKind::NativeNode, &endpoint_identity, now_ms) {
-        return Ok(PhotonBoundaryRefresh {
-            job: canonical_snapshot.job,
-            route_warning: None,
-        });
+
+    if native_session.as_ref().is_some_and(|session| {
+        !node_endpoints
+            .iter()
+            .any(|endpoint| endpoint == session.endpoint())
+    }) {
+        *native_session = None;
     }
 
     let probe_started = Instant::now();
     let native_result = (|| {
         if native_session.is_none() {
-            *native_session = Some(crate::node::NativePhotonSession::connect_failover(&[
-                endpoint.to_string(),
-            ])?);
+            *native_session = Some(crate::node::NativePhotonSession::connect_failover(
+                &node_endpoints,
+            )?);
         }
         native_session
             .as_mut()
             .expect("native PHOTON session was initialized above")
             .refresh()
     })();
+    let endpoint = native_session
+        .as_ref()
+        .map(|session| session.endpoint().to_string());
+    if native_result.is_err() {
+        *native_session = None;
+    }
     let latency_ms = u32::try_from(probe_started.elapsed().as_millis()).unwrap_or(u32::MAX);
     let (native_snapshot, native_error) = record_native_photon_probe(
         sources,
-        endpoint,
+        endpoint.as_deref().unwrap_or(&node_endpoints[0]),
         &canonical_snapshot,
         native_result,
         now_ms,
         latency_ms,
     );
+    if native_error.is_some() {
+        *native_session = None;
+    }
     Ok(PhotonBoundaryRefresh {
         job: select_boundary_photon_job(
             cfg,
@@ -4056,6 +4084,22 @@ mod tests {
         let selected = router.select_photon_route(1_000).unwrap();
         assert_eq!(selected.kind, SourceKind::Fulcrum);
         assert_eq!(selected.endpoint, "wss://fulcrum.invalid");
+    }
+
+    #[test]
+    fn node_failover_skips_a_cooling_endpoint() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_node_url("http://node1.invalid, http://node2.invalid")
+            .unwrap();
+        let mut sources = SourceCatalog::configured(&cfg).unwrap();
+        assert_eq!(eligible_native_endpoints(&cfg, &sources, 1_000).len(), 2);
+        sources
+            .record_failure(SourceKind::NativeNode, "http://node1.invalid", 1_000)
+            .unwrap();
+        assert_eq!(
+            eligible_native_endpoints(&cfg, &sources, 1_000),
+            ["http://node2.invalid"]
+        );
     }
 
     #[test]

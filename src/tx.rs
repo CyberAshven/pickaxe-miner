@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 use crate::config::DONATION_ADDRESS;
-use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX, REDEEM_SCRIPT_HEX};
+use crate::protocol::{PhotonDeployment, MAINNET_PHOTON};
 use sha2::Digest;
 
 const CASHADDR_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -375,12 +375,21 @@ pub struct TemplateParams {
 
 /// Reference layout from miner.js `buildPhotonTemplateBytes` (single reward output).
 pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String> {
+    build_photon_template_bytes_for_deployment(p, &MAINNET_PHOTON)
+}
+
+/// Builds a PHOTON parent for its selected contract deployment.
+pub fn build_photon_template_bytes_for_deployment(
+    p: &TemplateParams,
+    deployment: &PhotonDeployment,
+) -> Result<Vec<u8>, String> {
+    deployment.verify()?;
     let public_key = parse_hex(&p.public_key_hex)?;
     let target = parse_hex(&p.target_hex)?;
     let signature = parse_hex(&p.signature_hex)?;
-    let redeem_script = parse_hex(REDEEM_SCRIPT_HEX.trim())?;
-    let category = parse_hex(MAINNET_CATEGORY_HEX)?;
-    let covenant_lock = parse_hex(COVENANT_LOCKING_BYTECODE_HEX)?;
+    let redeem_script = parse_hex(deployment.redeem_script_hex.trim())?;
+    let category = parse_hex(deployment.category_hex)?;
+    let covenant_lock = parse_hex(deployment.covenant_lock_hex)?;
 
     if public_key.len() != 33 {
         return Err("Compressed public key must be 33 bytes.".into());
@@ -391,22 +400,18 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
     if signature.len() != 64 {
         return Err("PHOTON commitment signature must be 64 bytes.".into());
     }
-    if redeem_script.len() != 259 {
-        return Err(format!(
-            "PHOTON redeem script must be 259 bytes (got {}).",
-            redeem_script.len()
-        ));
-    }
     if p.payout_locking.len() != 25 {
         return Err("Payout locking bytecode must be P2PKH (25 bytes).".into());
     }
 
     let age_push = encode_positive_script_number_push(p.age)?;
+    let redeem_len = u16::try_from(redeem_script.len())
+        .map_err(|_| "PHOTON redeem script exceeds PUSHDATA2 length")?;
     let input_script = concat(&[
         &[0x21],
         &public_key,
         &age_push,
-        &[0x4d, 0x03, 0x01],
+        &[0x4d, redeem_len as u8, (redeem_len >> 8) as u8],
         &redeem_script,
     ]);
 
@@ -442,7 +447,7 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
         return Err("prev tx hash must be 32 bytes".into());
     }
 
-    let max_baton_decrease_sats = crate::protocol::photon_single_input_max_baton_decrease_sats()?;
+    let max_baton_decrease_sats = deployment.single_input_max_baton_decrease_sats()?;
     let baton_sats = p
         .contract_value_sats
         .checked_sub(max_baton_decrease_sats)
@@ -687,6 +692,40 @@ pub fn build_unsigned_reference_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chipnet_parent_matches_a_confirmed_on_chain_mining_transaction() {
+        // Confirmed on Chipnet as txid 00024a4b0073d8429b3f4796bbfcfcdadd3d938a1c704f68da77d2bdc9e78ad0.
+        let confirmed =
+            hex::decode(include_str!("../reference/photon_chipnet_confirmed_parent.hex").trim())
+                .unwrap();
+        let commitment = "286900003b2994b1562930e68115f321cab63a2a055557b82ddce73921b525f6e34104004ef6abff0cd8c4d8f2c11aa3914762e2224e9e4b8a9c785cafce11088eed0f3d5d3c0c25c731f1c454bc292fc307f0506090d2ae3b42470fc1c38e267de29053";
+        let built = build_photon_template_bytes_for_deployment(
+            &TemplateParams {
+                prev_tx_hash_hex:
+                    "0000502a821307c5159e2e2033957f12046d8b35dc3e5d4a0e1a9a4619746d77".into(),
+                prev_index: 0,
+                age: 38,
+                public_key_hex:
+                    "02789e85a48dccf23f768b2e5c2ce71855a21493558760d54e2b61ef72cdeaced5".into(),
+                target_hex: commitment[8..72].into(),
+                signature_hex: commitment[72..].into(),
+                nonce: 0x6928,
+                contract_value_sats: 49_080_500,
+                contract_token_amount: 2_096_937_231_989_870,
+                reward_amount: 4_992_707_694,
+                payout_locking: hex::decode("76a9149d6a0da70e78df8b9d166f330a5e04c15676d42a88ac")
+                    .unwrap(),
+            },
+            &crate::protocol::CHIPNET_PHOTON,
+        )
+        .unwrap();
+        assert_eq!(built, confirmed);
+        assert_eq!(
+            crate::reward::transaction_id(&built),
+            "00024a4b0073d8429b3f4796bbfcfcdadd3d938a1c704f68da77d2bdc9e78ad0"
+        );
+    }
 
     #[test]
     fn t2_reward_preserves_token_supply_and_fixed_width_encoding() {
