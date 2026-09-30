@@ -254,8 +254,15 @@ jobs:
       - name: Release tests
         run: cargo test --locked --release --all-features --no-fail-fast -- --skip if_cuda
 
+      - name: Build Rust CUDA kernels
+        shell: pwsh
+        run: |
+          rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
+          if ($LASTEXITCODE -ne 0) { throw "Rust GPU compiler installation failed" }
+          ./tools/build-rust-kernels.ps1 -Architecture sm_120
+
       - name: Build release
-        run: cargo build --locked --release --features tail-grind
+        run: cargo build --locked --release
 
       - name: Verify interactive TUI binary
         shell: bash
@@ -301,6 +308,7 @@ jobs:
 
           mkdir -p "dist/${package}/cuda/build"
           for artifact in \
+            photon_rust.ptx \
             stage_a_rfc6979.ptx \
             photon_stage_b16.ptx \
             photon_c1_schnorr.ptx \
@@ -329,7 +337,7 @@ jobs:
             echo "Platform: Linux x86_64. This archive is not ARM, ARM64, or macOS."
             echo "Interactive TUI: ./pickaxe mine. Headless: ./pickaxe mine --no-tui."
             echo "NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required."
-            echo "NVIDIA CUDA T2 mining is enabled."
+            echo "NVIDIA CUDA T2 mining uses the Rust backend."
             echo "AMD HIP code objects in hip/build/gfx1036 are gfx1036 only and were built by this workflow."
             echo "No CPU mining fallback. wgpu is not a verified production mining backend in this asset."
           } > "dist/${package}/BACKENDS.txt"
@@ -391,6 +399,7 @@ jobs:
           $cudaDir = Join-Path $packageDir 'cuda\build'
           New-Item -ItemType Directory -Force -Path $cudaDir | Out-Null
           $requiredPtx = @(
+            'photon_rust.ptx',
             'stage_a_rfc6979.ptx',
             'photon_stage_b16.ptx',
             'photon_c1_schnorr.ptx',
@@ -433,7 +442,7 @@ jobs:
             'Platform: Windows x86_64. This archive is not ARM, ARM64, or macOS.'
             'Interactive TUI: .\pickaxe.exe mine. Headless: .\pickaxe.exe mine --no-tui.'
             'NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required.'
-            'NVIDIA CUDA T2 mining is enabled.'
+            'NVIDIA CUDA T2 mining uses the Rust backend.'
             'AMD HIP code objects in hip/build/gfx1036 are gfx1036 only and were built by this workflow.'
             'No CPU mining fallback. wgpu is not a verified production mining backend in this asset.'
           ) | Set-Content -LiteralPath (Join-Path $packageDir 'BACKENDS.txt') -Encoding utf8
@@ -497,7 +506,7 @@ jobs:
             echo "Verified assets are Windows x86_64 and Linux x86_64 only."
             echo "No ARM or ARM64 binary is published."
             echo "Bundled NVIDIA CUDA PTX is sm_120 only."
-            echo "NVIDIA CUDA T2 mining is enabled."
+            echo "NVIDIA CUDA T2 mining uses the Rust backend."
             echo "Bundled AMD HIP code objects are gfx1036 only."
             echo "The default interface is the interactive TUI. Headless mode is --no-tui."
             echo "There is no CPU mining fallback."

@@ -1,7 +1,8 @@
 # Rust T2 experiment
 
-`perf/rust-t2` ports the v0.0.2 CUDA T2 mining algorithm to Rust. Enable it
-with `--features rust-t2`; the default build remains the released CUDA C++ path.
+`perf/rust-t2` ports the v0.0.2 CUDA T2 mining algorithm to Rust. Rust is now
+the default CUDA backend on this branch. Build the legacy CUDA C++ backend with
+`--no-default-features --features tail-grind`.
 This experiment builds on `pickaxe-miner-v0.0.2` (`1d34584`).
 
 The Rust path includes signature preparation, point multiplication, transaction
@@ -72,8 +73,8 @@ isolate compiler effects from hardware behavior.
 
 Both versions passed the 24 GPU checks. Full timed reports, temperatures,
 clocks and artifact hashes are in [rust-t2-results.json](rust-t2-results.json).
-The released miner was restored after testing. This experiment changes neither
-the default backend nor the release packaging.
+The released miner was restored after the initial tests. That initial port
+was opt-in; the tuning and default-backend change below followed later.
 
 ## September 30 tuning
 
@@ -82,7 +83,9 @@ It rejects an impossible target prefix after round 60 (zero-based) of the final
 SHA-256 compression; surviving hashes still receive the complete strict target
 comparison. Rust emits a single `LOP3` instruction for SHA's choose operation,
 preventing the split boolean/add sequence observed in the previous GPU assembly.
-The native backend and default feature selection are unchanged.
+The native backend remains available as a legacy build. After validation,
+Rust became the default on this branch, and release packaging was updated
+to build and include its PTX with the same pinned compiler.
 
 Each row compares against the released v0.0.2 executable on the same GPU.
 Clocks were not locked. The final row uses three one-minute trials per backend,
@@ -102,7 +105,7 @@ The final candidate is faster in this matched run.
 Raw trials, telemetry and executable/PTX hashes are in
 [rust-t2-tuning-results.json](rust-t2-tuning-results.json). These are offline
 pipeline measurements on one Windows/NVIDIA system, not an across-hardware or
-live-settlement claim. Master and release packaging have not been promoted.
+live-settlement claim. Master and published releases have not been changed.
 
 The retained code passes all 25 serial CUDA tests and four arithmetic tests.
 The new GPU regression test compares every winner against 16,416 independently

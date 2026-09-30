@@ -86,9 +86,18 @@ Log files are appended to without automatic rotation or a size limit. After an i
 
 ## Build
 
-```bash
-cargo build --release --locked --features tail-grind
+Rust is the default CUDA mining backend. Build its GPU kernels with the pinned
+compiler (PowerShell 7), then build the executable with stable Rust:
+
+```powershell
+rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
+./tools/build-rust-kernels.ps1 -Architecture sm_120
+cargo build --release --locked
 ```
+
+The legacy CUDA C++ backend remains available with
+`cargo build --release --locked --no-default-features --features tail-grind`.
+Use a separate output directory when comparing the two builds.
 
 The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.2`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
 
@@ -97,13 +106,13 @@ The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing back
 Interactive TUI:
 
 ```bash
-cargo run --release --features tail-grind -- mine
+cargo run --release -- mine
 ```
 
 Headless:
 
 ```bash
-cargo run --release --features tail-grind -- mine --no-tui
+cargo run --release -- mine --no-tui
 ```
 
 List GPUs:

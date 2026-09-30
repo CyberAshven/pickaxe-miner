@@ -5,10 +5,11 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [features]
-default = ["tail-grind"]
+default = ["rust-t2"]
 incremental-k = []
 tail-grind = []
-# Experimental Rust implementation of the complete CUDA T2 mining path.
+# Default Rust implementation of the complete CUDA T2 mining path.
+# Legacy CUDA C++: --no-default-features --features tail-grind.
 rust-t2 = ["tail-grind"]
 # GPU V-coordinate diagnostic only; live mining keeps the reward at 700 sats.
 tail-value-grind = ["tail-grind"]

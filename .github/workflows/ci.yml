@@ -153,6 +153,9 @@ jobs:
       - name: Check
         run: cargo check --locked --all-targets
 
+      - name: Check legacy CUDA backend
+        run: cargo check --locked --all-targets --no-default-features --features tail-grind
+
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
