@@ -223,6 +223,8 @@ pub struct VerifiedWinner {
 #[derive(Debug, Clone, Default)]
 pub struct SearchStats {
     pub candidates: u64,
+    /// Completed live candidate hashes for miner, project and collaborator.
+    pub work_candidates: [u64; 3],
     pub batches: u64,
     pub intensity: u8,
     pub state: MiningState,
@@ -683,6 +685,7 @@ struct WorkerDiagnostics {
     job_exhausted: AtomicBool,
     key_rotations: AtomicU64,
     active_rate_bits: AtomicU64,
+    work_candidates: [AtomicU64; 3],
 }
 
 impl WorkerDiagnostics {
@@ -693,6 +696,7 @@ impl WorkerDiagnostics {
             job_exhausted: AtomicBool::new(false),
             key_rotations: AtomicU64::new(0),
             active_rate_bits: AtomicU64::new(0),
+            work_candidates: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -786,9 +790,26 @@ fn run_worker(
     diagnostics: Arc<WorkerDiagnostics>,
     job_rx: Receiver<WorkerCommand>,
     winner_tx: SyncSender<VerifiedWinner>,
+    work_fee: Option<crate::work_fee::Policy>,
 ) {
     let t2_coordinate = cfg!(feature = "tail-grind") && matches!(&engine, PhotonEngine::Cuda(_));
     let mut rng = rand::rng();
+    let quantum = u64::from(engine.scheduled_batch_candidates(100)) * 64;
+    let allocation = work_fee
+        .map(|policy| {
+            let schedule = crate::work_fee::Schedule::new(policy.scheme, quantum, rng.random())?;
+            let payouts = policy.payouts(prepared.job.network, &prepared.job.payout_address)?;
+            Ok::<_, String>((schedule, payouts, policy))
+        })
+        .transpose();
+    let mut allocation = match allocation {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            diagnostics.record_batch_error(error);
+            stop.store(true, Ordering::Relaxed);
+            return;
+        }
+    };
     let mut nonce_base = if t2_coordinate {
         0
     } else {
@@ -799,7 +820,21 @@ fn run_worker(
     while !stop.load(Ordering::Relaxed) {
         loop {
             match job_rx.try_recv() {
-                Ok(WorkerCommand::ReplaceJob { job, reply }) => {
+                Ok(WorkerCommand::ReplaceJob { mut job, reply }) => {
+                    let next_payouts = if let Some((schedule, _, policy)) = &allocation {
+                        match policy.payouts(job.network, &job.payout_address) {
+                            Ok(payouts) => {
+                                job.payout_address = payouts[schedule.recipient() as usize].clone();
+                                Some(payouts)
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let result = prepare_job(job, &sk, &public_key).and_then(|next| {
                         engine.set_job_for_network(
                             &next.template,
@@ -809,6 +844,10 @@ fn run_worker(
                         )?;
                         generation_id.store(next.job.generation_id, Ordering::Release);
                         prepared = next;
+                        if let (Some((_, payouts, _)), Some(next)) = (&mut allocation, next_payouts)
+                        {
+                            *payouts = next;
+                        }
                         nonce_base = if t2_coordinate {
                             0
                         } else {
@@ -840,6 +879,43 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
+        if let Some((schedule, payouts, _)) = &allocation {
+            let address = &payouts[schedule.recipient() as usize];
+            let next = (|| {
+                if address == &prepared.job.payout_address {
+                    return Ok(None);
+                }
+                let mut job = prepared.job.clone();
+                job.payout_address = address.clone();
+                // A fresh identity prevents duplicate work when returning to
+                // a recipient before the chain job changes.
+                rotate_search_identity(&mut engine, &job).map(Some)
+            })();
+            match next {
+                Ok(Some((next, next_sk, next_public_key))) => {
+                    prepared = next;
+                    sk.fill(0);
+                    sk = next_sk;
+                    public_key = next_public_key;
+                    nonce_base = if t2_coordinate {
+                        0
+                    } else {
+                        rng.random::<u32>()
+                    };
+                    sweep = NonceSweep::default();
+                    diagnostics.key_rotations.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    diagnostics.record_batch_error(format!(
+                        "mining-work recipient change failed: {error}"
+                    ));
+                    batch_in_flight.store(false, Ordering::SeqCst);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
         let Some(batch_size) =
             sweep.next_batch(engine.scheduled_batch_candidates(active_intensity))
         else {
@@ -875,6 +951,9 @@ fn run_worker(
         // Incremental scalar indexes must not cross u32::MAX inside a batch.
         // The next batch wraps to zero; NonceSweep still counts each index once.
         let batch_size = batch_before_wrap(nonce_base, batch_size);
+        let batch_size = allocation.as_ref().map_or(batch_size, |(schedule, _, _)| {
+            schedule.limit_batch(batch_size)
+        });
         let batch_started = Instant::now();
         let batch = engine.search_batch(nonce_base, batch_size);
         let gpu_elapsed = batch_started.elapsed();
@@ -893,6 +972,17 @@ fn run_worker(
             BatchControl::Continue(accepted) => accepted,
         };
         let compute_time = batch_started.elapsed();
+        if let Some((schedule, _, _)) = &mut allocation {
+            let recipient = schedule.recipient();
+            if let Err(error) = schedule.record(accepted.candidates) {
+                diagnostics.record_batch_error(error);
+                batch_in_flight.store(false, Ordering::SeqCst);
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            diagnostics.work_candidates[recipient as usize]
+                .fetch_add(u64::from(accepted.candidates), Ordering::Relaxed);
+        }
         candidates.fetch_add(u64::from(accepted.candidates), Ordering::Relaxed);
         batches.fetch_add(1, Ordering::Release);
 
@@ -966,7 +1056,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, false)
+        Self::start_inner(backend, device_ordinal, intensity, job, false, None)
     }
 
     /// Start exact GPU search under the live runtime supervisor. The GPU keeps
@@ -993,7 +1083,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, false)
+        Self::start_inner(backend, device_ordinal, intensity, job, false, None)
     }
 
     /// Start supervised search in a paused state. This is used while a
@@ -1024,7 +1114,19 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, true)
+        Self::start_inner(backend, device_ordinal, intensity, job, true, None)
+    }
+
+    /// Starts production PHOTON mining with direct 96/2/2 work allocation.
+    pub fn start_with_work_fee(
+        backend: BackendKind,
+        device_ordinal: usize,
+        intensity: u8,
+        job: MiningJob,
+        policy: crate::work_fee::Policy,
+    ) -> Result<Self, String> {
+        policy.payouts(job.network, &job.payout_address)?;
+        Self::start_inner(backend, device_ordinal, intensity, job, false, Some(policy))
     }
 
     /// Creates the shared GPU worker and its control channels.
@@ -1034,6 +1136,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
         initially_paused: bool,
+        work_fee: Option<crate::work_fee::Policy>,
     ) -> Result<Self, String> {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
@@ -1111,6 +1214,7 @@ impl SearchHandle {
                         worker_diagnostics,
                         job_rx,
                         winner_tx,
+                        work_fee,
                     )
                 }
             })
@@ -1226,6 +1330,9 @@ impl SearchHandle {
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
         let mut stats = SearchStats {
             candidates,
+            work_candidates: std::array::from_fn(|i| {
+                self.diagnostics.work_candidates[i].load(Ordering::Relaxed)
+            }),
             batches: self.batches.load(Ordering::Acquire),
             intensity: self.intensity.load(Ordering::Relaxed),
             state: self.state(),
@@ -1955,6 +2062,112 @@ mod tests {
         MiningJob {
             target_le_hex: "00".repeat(32),
             ..integration_job(generation_id)
+        }
+    }
+
+    #[test]
+    fn direct_work_fee_pays_each_recipient_across_controls_if_cuda_present() {
+        let _lock = crate::mining_lock::acquire_gpu_lock().unwrap();
+        let mut samples = Vec::new();
+        for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            let policy = crate::config::MiningToken::Photon.fee_policy(network);
+            let mut job = integration_job(1);
+            job.network = network;
+            job.age = 1;
+            let mut target = [0u8; 32];
+            target[28] = 0x80;
+            job.target_le_hex = hex::encode(target);
+            let payouts = policy.payouts(network, &job.payout_address).unwrap();
+            let handle = match SearchHandle::start_with_work_fee(
+                BackendKind::Cuda,
+                0,
+                100,
+                job.clone(),
+                policy,
+            ) {
+                Ok(handle) => handle,
+                Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => {
+                    eprintln!("skip direct fee CUDA test: {error}");
+                    return;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            let mut seen = [false; 3];
+            let mut changed = false;
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while Instant::now() < deadline && !seen.iter().all(|seen| *seen) {
+                for winner in handle.drain_winners() {
+                    let amount = tx::t2_parent_reward_amount(
+                        &winner.transaction,
+                        job.token_amount,
+                        job.reward_raw,
+                    )
+                    .unwrap();
+                    let context = tx::ReferenceJobContext {
+                        prev_txid: job.baton_txid.clone(),
+                        prev_vout: job.baton_vout,
+                        age: job.age,
+                        target_le_hex: job.target_le_hex.clone(),
+                        contract_value_sats: job.baton_value_sats,
+                        contract_token_amount: job.token_amount,
+                        reward_raw: amount,
+                    };
+                    let index = payouts
+                        .iter()
+                        .position(|payout| {
+                            tx::apply_reference_signature_for_deployment(
+                                &context,
+                                payout,
+                                &hex::encode(winner.public_key),
+                                winner.nonce,
+                                &hex::encode(winner.signature),
+                                crate::config::MiningToken::Photon.photon_deployment(network),
+                            )
+                            .is_ok_and(|raw| raw == winner.transaction)
+                        })
+                        .expect("GPU winner paid an unauthorized recipient");
+                    if !seen[index] {
+                        samples.push(serde_json::json!({
+                            "raw": hex::encode(&winner.transaction), "network": network.as_str(),
+                            "recipient": format!("{:?}", crate::work_fee::Recipient::ALL[index]),
+                            "payout": payouts[index], "age": 1, "old_target_le": job.target_le_hex,
+                            "value": job.baton_value_sats, "amount": job.token_amount.to_string(), "reward": amount.to_string(),
+                        }));
+                    }
+                    seen[index] = true;
+                }
+                if !changed && handle.snapshot().batches >= 5 {
+                    handle.apply_control(RuntimeCommand::Pause).unwrap();
+                    let pause_deadline = Instant::now() + Duration::from_secs(20);
+                    while handle.batch_in_flight() && Instant::now() < pause_deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(!handle.batch_in_flight());
+                    let before = handle.snapshot().work_candidates;
+                    job.generation_id += 1;
+                    handle.replace_job(job.clone()).unwrap();
+                    handle.set_intensity(95).unwrap();
+                    assert_eq!(handle.snapshot().work_candidates, before);
+                    changed = true;
+                }
+                handle.apply_control(RuntimeCommand::Resume).unwrap();
+                thread::sleep(Duration::from_millis(5));
+            }
+            let stats = handle.stop();
+            assert!(
+                seen.iter().all(|seen| *seen),
+                "{network:?}: recipients={seen:?} {stats:?}"
+            );
+            assert_eq!(stats.candidates, stats.work_candidates.iter().sum::<u64>());
+            assert_eq!(stats.rejected_winners, 0);
+            assert!(stats.last_error.is_none());
+            eprintln!(
+                "direct fee {network:?}: candidates={} recipient_counts={:?}, rotations={}",
+                stats.candidates, stats.work_candidates, stats.key_rotations
+            );
+        }
+        if let Ok(path) = std::env::var("PICKAXE_DIRECT_GPU_PROOF") {
+            std::fs::write(path, serde_json::to_vec(&samples).unwrap()).unwrap();
         }
     }
 

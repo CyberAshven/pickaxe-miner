@@ -10,7 +10,7 @@ Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken bat
 
 Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
 
-Each mined PHOTON reward gives 98% of its tokens to the miner. The existing 2% donation is split equally: 1% to the original project address (`bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3`) and 1% to shrec (`bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3`).
+PHOTON uses a **4% mining-work fee**: 96% of completed candidate hashes mine for your wallet, 2% for the project and 2% for shrec. Each win pays its selected recipient directly. There is no additional reward split, minimum withdrawal, or deposit required. These percentages describe work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
 
 ## Supported platforms
 
@@ -59,9 +59,9 @@ Use a build containing Chipnet support (the v0.0.2 download above predates it). 
 
 Replace the quoted address with your valid token-aware P2PKH payout CashAddr. The miner converts a valid mainnet payout CashAddr to the equivalent `bchtest:` address with the same key hash. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoint; mainnet remains the default without `--chipnet`.
 
-Chipnet mining starts without an external BCH deposit. Pickaxe derives a persistent intermediate reward key from its local `chipnet-funding.key` root. Early wins pay that intermediate token address, so tokens do not reach your configured payout address on the first win. Once roughly five wins are confirmed, Pickaxe can automatically combine them and send the exact 98% / 1% / 1% token split. Higher relay fees may require more confirmed wins.
+New Chipnet wins pay the selected wallet directly, using the same work-fee policy. No local reward wallet or payout batching is created for new mining.
 
-Optionally, a confirmed token-free Chipnet BCH UTXO at Pickaxe's separate funding address can enable the split immediately. Keep `chipnet-funding.key` safe until all rewards are settled: on Linux it is stored under `${XDG_STATE_HOME:-$HOME/.local/state}/pickaxe-miner/chipnet-funding.key`; on Windows, under `%LOCALAPPDATA%\Pickaxe Miner\chipnet-funding.key`.
+If you used the earlier Chipnet batch-payout preview, retain its `chipnet-funding.key` until its existing rewards are recovered. Recovery retains the historical 98% / 1% / 1% split and can still need enough confirmed rewards to cover its existing transaction costs. It does not apply the new work fee to those old rewards.
 
 In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
 

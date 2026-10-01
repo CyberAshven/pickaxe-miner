@@ -695,6 +695,7 @@ pub fn apply_reference_signature_for_deployment(
 }
 
 /// Rebuilds a V-coordinate winner with its exact unsigned BCH payout value.
+#[cfg(test)]
 pub fn apply_reference_signature_with_payout_sats(
     job: &ReferenceJobContext,
     miner_payout: &str,

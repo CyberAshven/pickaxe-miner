@@ -61,6 +61,11 @@ jobs:
         working-directory: tools/reward-policy-vm
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Install Rust for direct payout lifecycle proof
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Verify BCH 2026 settlement
         working-directory: tools/reward-policy-vm
         run: npm test

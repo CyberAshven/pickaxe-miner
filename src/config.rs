@@ -1,15 +1,14 @@
-//! Distribution and runtime config. Donation is split from each PHOTON win by the
-//! protocol-valid reward child path; the PHOTON mining transaction remains the
-//! authoritative two-output covenant transaction.
+//! Distribution and runtime config. Each token selects its own fee policy.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Donation share in basis points (200 = 2%). Never call this a "dev fee".
+/// Historical reward split, retained to recover older pending payouts.
+/// New PHOTON mining uses the separate 4% policy in `work_fee`.
 pub const DONATION_BPS: u16 = 200;
 
-/// Locked donation payout for distribution builds (BCH cashaddr).
+/// Historical addresses: frozen for legacy payout recovery and its VM proof.
 pub const DONATION_ADDRESS: &str = "bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3";
 pub const CHIPNET_DONATION_ADDRESS: &str = "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp";
 
@@ -62,6 +61,28 @@ pub enum MiningToken {
 }
 
 impl MiningToken {
+    /// Maintainer-editable mode, shares and recipients. The protocol must support
+    /// its selected payout scheme before mining starts.
+    pub fn fee_policy(self, network: MiningNetwork) -> crate::work_fee::Policy {
+        use crate::work_fee::{Policy, Scheme};
+        match self {
+            Self::Photon => Policy {
+                scheme: Scheme::Work([200, 200]),
+                addresses: [
+                    match network {
+                        MiningNetwork::Mainnet => {
+                            "bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3"
+                        }
+                        MiningNetwork::Chipnet => {
+                            "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp"
+                        }
+                    },
+                    "bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3",
+                ],
+            },
+        }
+    }
+
     pub fn photon_deployment(
         self,
         network: MiningNetwork,
@@ -417,7 +438,10 @@ impl RuntimeConfig {
 }
 
 /// Re-encodes a validated P2PKH payout for another chain without changing its key hash.
-fn reprefix_p2pkh_payout(address: &str, network: MiningNetwork) -> Result<String, String> {
+pub(crate) fn reprefix_p2pkh_payout(
+    address: &str,
+    network: MiningNetwork,
+) -> Result<String, String> {
     let locking = crate::tx::cashaddr_to_p2pkh_locking(address)?;
     let hash: [u8; 20] = locking
         .get(3..23)

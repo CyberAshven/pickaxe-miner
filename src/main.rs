@@ -1,7 +1,7 @@
 //! Pickaxe Miner - interactive CLI (Stage 2/3).
 //!
 //! Runtime controls preserve the authoritative PHOTON reference semantics.
-//! Donation: 2%.
+//! Each supported token declares its fee policy.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 mod backend;
@@ -46,6 +46,7 @@ mod tui;
 mod tx;
 #[cfg(feature = "portable-wgpu")]
 mod wgpu_photon;
+mod work_fee;
 
 use config::RuntimeConfig;
 use electrum::{ElectrumSession, LiveJob};
@@ -62,7 +63,13 @@ fn print_banner() {
         "Pickaxe Miner {} - interactive CLI",
         env!("CARGO_PKG_VERSION")
     );
-    println!("Donation: 2%");
+    println!(
+        "{}",
+        config::MiningToken::Photon
+            .fee_policy(config::MiningNetwork::Mainnet)
+            .scheme
+            .description()
+    );
     println!("Type `help` for commands.\n");
 }
 
@@ -89,7 +96,7 @@ fn print_help() {
   applysig <nonce> <pk33hex> <sig64hex>  verify+arm proven 2-output winner (no broadcast)
   quit | exit                  Leave
 
-Donation: 2%"#
+Use `donation` to display the token fee policy."#
     );
 }
 
@@ -131,7 +138,13 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
             crate::telemetry::format_hash_rate(s.rate)
         );
     }
-    println!("Donation: 2%");
+    println!(
+        "{}",
+        config::MiningToken::Photon
+            .fee_policy(config::MiningNetwork::Mainnet)
+            .scheme
+            .description()
+    );
     match &cfg.fulcrum_url {
         Some(u) => println!("fulcrum:       {} (custom, tried first)", redact_url(u)),
         None => println!("fulcrum:       (bootstrap only)"),
@@ -355,8 +368,8 @@ fn process_gpu_winners(
 }
 
 /// Prints the compiled miner donation policy.
-fn print_donation() {
-    println!("Donation: 2%");
+fn print_donation(cfg: &RuntimeConfig) {
+    println!("{}", cfg.token.fee_policy(cfg.network).scheme.description());
 }
 
 /// Parses and executes one interactive command.
@@ -378,7 +391,7 @@ fn handle_line(
     match cmd.as_str() {
         "help" | "?" => print_help(),
         "status" => print_status(cfg, handle, live),
-        "donation" => print_donation(),
+        "donation" => print_donation(cfg),
 
         "broadcast" => println!(
             "legacy REPL submission is unavailable; use pickaxe mine --backend cuda --no-tui"
@@ -852,6 +865,9 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
                 "parent_txid": parent_txid,
                 "child_txid": child_txid,
             }),
+            runtime::RuntimeEvent::DirectRewardAccepted { txid, recipient } => serde_json::json!({
+                "event": "direct_reward_accepted", "txid": txid, "recipient": recipient,
+            }),
             runtime::RuntimeEvent::RewardAccrued { parent_txid } => serde_json::json!({
                 "event": "reward_accrued",
                 "parent_txid": parent_txid,
@@ -926,11 +942,14 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
         } => println!(
             "winner submission accepted: parent={parent_txid} reward={child_txid}"
         ),
+        runtime::RuntimeEvent::DirectRewardAccepted { txid, recipient } => println!(
+            "direct reward accepted: {recipient} tx={txid}"
+        ),
         runtime::RuntimeEvent::RewardAccrued { parent_txid } => println!(
-            "chipnet reward accrued: parent={parent_txid}; 98/1/1 split awaits enough confirmed rewards"
+            "legacy chipnet reward accrued: parent={parent_txid}; 98/1/1 split awaits enough confirmed rewards"
         ),
         runtime::RuntimeEvent::RewardSplit { child_txid, reward_count } => println!(
-            "chipnet 98/1/1 reward split accepted: child={child_txid} rewards={reward_count}"
+            "legacy chipnet 98/1/1 reward split accepted: child={child_txid} rewards={reward_count}"
         ),
         runtime::RuntimeEvent::RewardInventory { confirmed_at_least } => println!(
             "chipnet confirmed unsplit rewards: at least {confirmed_at_least}; batch split starts at five if the relay fee is covered"
@@ -960,6 +979,8 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "payout_address": snapshot.payout_address,
         "intensity": snapshot.search.intensity,
         "candidates": snapshot.search.candidates,
+        "fee_policy": snapshot.fee_scheme.description(),
+        "work_candidates": { "miner": snapshot.search.work_candidates[0], "project": snapshot.search.work_candidates[1], "collaborator": snapshot.search.work_candidates[2] },
         "batches": snapshot.search.batches,
         "rate": snapshot.search.rate,
         "current_rate": snapshot.search.current_rate,
@@ -1587,6 +1608,9 @@ mod tests {
             gpu_device: 0,
             generation_id: 2,
             network: config::MiningNetwork::Mainnet,
+            fee_scheme: config::MiningToken::Photon
+                .fee_policy(config::MiningNetwork::Mainnet)
+                .scheme,
             payout_address: crate::config::DONATION_ADDRESS.into(),
             endpoint: "wss://fulcrum.invalid".into(),
             height: 1_000,
@@ -1607,6 +1631,7 @@ mod tests {
             last_error: None,
             search: search::SearchStats {
                 candidates: 65_536,
+                work_candidates: [65_536, 0, 0],
                 batches: 1,
                 intensity: 30,
                 state: search::MiningState::Mining,

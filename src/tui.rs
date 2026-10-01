@@ -774,7 +774,7 @@ struct TuiState {
 
 impl TuiState {
     /// Creates a TuiState for the terminal interface.
-    fn new(_snapshot: &RuntimeSnapshot) -> Self {
+    fn new(snapshot: &RuntimeSnapshot) -> Self {
         let mut events = VecDeque::with_capacity(EVENT_HISTORY_CAP);
         events.push_back("started; supervising PHOTON state".into());
         Self {
@@ -786,7 +786,7 @@ impl TuiState {
             show_help: false,
             settings_mode: false,
             logs_mode: false,
-            status_line: "Donation: 2%".into(),
+            status_line: snapshot.fee_scheme.description(),
             events,
             devices: Vec::new(),
             history: VecDeque::with_capacity(HISTORY_CAP),
@@ -1205,6 +1205,9 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         gpu_device: 0,
         generation_id: 1,
         network: MiningNetwork::Mainnet,
+        fee_scheme: crate::config::MiningToken::Photon
+            .fee_policy(MiningNetwork::Mainnet)
+            .scheme,
         payout_address: "bitcoincash:qbenchmark".into(),
         endpoint: "offline-benchmark".into(),
         height: 1,
@@ -1489,12 +1492,13 @@ fn apply_palette_command(
         }
         PaletteCommand::Config => {
             let config = format!(
-                "config: backend={}:{} intensity={} payout={} endpoint={} donation=2%-fixed generation={}",
+                "config: backend={}:{} intensity={} payout={} endpoint={} fee={} generation={}",
                 snapshot.gpu_backend,
                 snapshot.gpu_device,
                 snapshot.search.intensity,
                 shorten(&snapshot.payout_address, 42),
                 shorten(&redact_endpoint(&snapshot.endpoint), 42),
+                snapshot.fee_scheme.description(),
                 snapshot.generation_id,
             );
             state.status_line = "Effective configuration added to runtime log".into();
@@ -1999,14 +2003,12 @@ fn render_setup_advanced(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
 /// Renders a review of the configured mining settings.
 fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let device = state.selected_device();
-    let donation = if state.config.network == MiningNetwork::Chipnet {
-        format!(
-            "Donation: 2% -> {}",
-            crate::config::CHIPNET_DONATION_ADDRESS
-        )
-    } else {
-        "Donation: 2%".to_string()
-    };
+    let donation = state
+        .config
+        .token
+        .fee_policy(state.config.network)
+        .scheme
+        .description();
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(format!(
@@ -2178,9 +2180,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) 
     let line = Line::from(vec![
         Span::styled(" PICKAXE ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "PHOTON   {state_text}   {} device {}   Donation: 2%",
+            "PHOTON   {state_text}   {} device {}   {}",
             snapshot.gpu_backend.to_ascii_uppercase(),
-            snapshot.gpu_device
+            snapshot.gpu_device,
+            snapshot.fee_scheme.description()
         )),
     ]);
     frame.render_widget(
@@ -2995,11 +2998,12 @@ fn event_log_text(event: &RuntimeEvent) -> String {
             parent_txid,
             child_txid,
         } => format!("submission accepted: parent={parent_txid} reward={child_txid}"),
+        RuntimeEvent::DirectRewardAccepted { txid, recipient } => format!("direct reward accepted: {recipient} tx={txid}"),
         RuntimeEvent::RewardAccrued { parent_txid } => format!(
-            "chipnet reward accrued: parent={parent_txid}; 98/1/1 split awaits confirmed rewards"
+            "legacy chipnet reward accrued: parent={parent_txid}; 98/1/1 split awaits confirmed rewards"
         ),
         RuntimeEvent::RewardSplit { child_txid, reward_count } => format!(
-            "chipnet 98/1/1 split accepted: child={child_txid} rewards={reward_count}"
+            "legacy chipnet 98/1/1 split accepted: child={child_txid} rewards={reward_count}"
         ),
         RuntimeEvent::RewardInventory { confirmed_at_least } => format!(
             "chipnet confirmed unsplit rewards: at least {confirmed_at_least}; split starts at five when fees fit"
@@ -3081,6 +3085,9 @@ mod tests {
             gpu_device: 0,
             generation_id: 1,
             network: MiningNetwork::Mainnet,
+            fee_scheme: crate::config::MiningToken::Photon
+                .fee_policy(MiningNetwork::Mainnet)
+                .scheme,
             payout_address: "bitcoincash:qexample".into(),
             endpoint: "wss://example.test".into(),
             height: 1,
@@ -4040,6 +4047,9 @@ mod tests {
             gpu_device: 2,
             generation_id: 1,
             network: MiningNetwork::Mainnet,
+            fee_scheme: crate::config::MiningToken::Photon
+                .fee_policy(MiningNetwork::Mainnet)
+                .scheme,
             payout_address: "bitcoincash:qexample".into(),
             endpoint: "wss://example.test".into(),
             height: 1,

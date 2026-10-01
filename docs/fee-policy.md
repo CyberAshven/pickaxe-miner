@@ -1,0 +1,67 @@
+# Maintainer fee policy
+
+Edit `MiningToken::fee_policy` in `src/config.rs` to select a token's mode,
+percentages and project/collaborator addresses. This is compiled policy, not a
+user preference. Saved profiles and command-line arguments cannot change it.
+Addresses are validated before mining; each network may use different recipients.
+Do not edit the historical address/percentage constants used by legacy recovery.
+
+`src/work_fee.rs` defines three modes. Shares are basis points, in project /
+collaborator order:
+
+```rust
+Scheme::Work([200, 200]) // 4% work; no reward split (current PHOTON)
+Scheme::RewardSplit([100, 100]) // 2% from personal rewards, no work fee
+Scheme::Hybrid { work: [100, 100], reward: [100, 100] }
+```
+
+In a hybrid, the reward split applies only to personal-work wins. Developer-work
+wins go entirely to that developer. With 2% work plus 2% reward, the expected
+combined fee is 3.96%, not 4%; the stages are explicit rather than added together.
+Integer reward allocations always conserve the full amount, including rounding.
+
+A payout adapter must implement the selected mode and prove its transaction
+funding and covenant rules. PHOTON's direct two-output claim currently accepts
+work fees only. Selecting a reward split or hybrid for it fails before hashing;
+it does not silently request a deposit, batch rewards, or ignore the split.
+Future tokens may select any supported mode independently. BCH coinbase payouts
+and token claims remain different transaction builders. No ASIC proxy or new
+token is enabled by selecting a fee mode.
+
+The work scheduler counts completed candidate hashes, not uptime, wins or peak
+hashrate. It keeps its position across pauses, intensity changes, job updates and
+key rotations, and randomizes the starting position. Each complete allocation
+cycle implements the configured shares; short sessions have variance. The
+recipient is committed before hashing. Changing recipients creates a fresh search
+identity so returning to a recipient does not repeat its previous search.
+
+The runtime independently rebuilds each winner for an authorized recipient and
+journals the exact transaction before broadcast. Recovery uses those bytes even
+if a later build changes recipient addresses. Journal versions 3 and 4 remain
+readable; new direct rewards use version 5. Existing Chipnet local-key rewards
+retain their previous recovery rules; new claims do not use that wallet.
+
+Validation:
+
+```powershell
+cargo test --locked --all-features -- --skip if_cuda --skip if_wgpu --test-threads=1
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cd tools/reward-policy-vm
+npm ci --ignore-scripts --no-audit --no-fund
+npm test
+```
+
+`npm test` runs the Rust direct-payout lifecycle and independently checks its
+transactions in the BCH 2026 standardness and consensus VMs. With the live miner
+stopped, the serial CUDA test also exercises recipient changes, job replacement,
+pause/resume and intensity:
+
+```powershell
+$env:PICKAXE_DIRECT_GPU_PROOF = "$PWD/artifacts/direct-gpu-proof.json"
+cargo test --locked --features rust-t2 search::tests::direct_work_fee_pays_each_recipient_across_controls_if_cuda_present -- --exact --nocapture --test-threads=1
+node tools/reward-policy-vm/direct-reward.mjs "$env:PICKAXE_DIRECT_GPU_PROOF"
+```
+
+Create the `artifacts` directory first and build the Rust PTX for your GPU using
+`tools/build-rust-kernels.ps1`. These offline checks do not claim a live-network
+payout or a measured performance improvement.

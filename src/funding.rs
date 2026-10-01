@@ -3,7 +3,9 @@
 use crate::config::MiningNetwork;
 use crate::electrum::ElectrumSession;
 use crate::protocol::{PhotonDeployment, CHIPNET_CATEGORY_HEX};
-use crate::reward::{ConfirmedFundingUtxo, ConfirmedRewardUtxo};
+#[cfg(test)]
+use crate::reward::ConfirmedFundingUtxo;
+use crate::reward::ConfirmedRewardUtxo;
 use ripemd::Ripemd160;
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -23,29 +25,44 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 pub struct FundingWallet {
     _key_lock: File,
     network: MiningNetwork,
+    #[cfg(test)]
     secret_key: [u8; 32],
+    #[cfg(test)]
     public_key: [u8; 33],
     address: String,
+    #[cfg(test)]
     locking_bytecode: Vec<u8>,
+    #[cfg(test)]
     electrum_scripthash: String,
     reward_secret_key: [u8; 32],
     reward_public_key: [u8; 33],
+    #[cfg(test)]
     reward_token_address: String,
     reward_locking_bytecode: Vec<u8>,
     reward_electrum_scripthash: String,
 }
 
 impl FundingWallet {
+    /// Recovery must never replace a missing legacy key with a new identity.
+    pub fn load_existing(path: &Path, network: MiningNetwork) -> Result<Self, String> {
+        Self::load(path, network, false)
+    }
+
     /// Loads a 32-byte raw key or atomically creates one with private permissions.
     /// The parent directory must already exist; the key is never printed.
+    #[cfg(test)]
     pub fn load_or_create(path: &Path, network: MiningNetwork) -> Result<Self, String> {
+        Self::load(path, network, true)
+    }
+
+    fn load(path: &Path, network: MiningNetwork, create: bool) -> Result<Self, String> {
         if path.file_name().is_none() || path.parent().is_none_or(|p| !p.is_dir()) {
             return Err("funding key parent directory does not exist".into());
         }
         reject_symlink_components(path)?;
         let (secret_bytes, key_lock) = match fs::symlink_metadata(path) {
             Ok(_) => read_private_key(path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
                 let secret = SecretKey::new(&mut rand::rng()).to_secret_bytes();
                 match create_private_key(path, &secret) {
                     Ok(key_lock) => (secret, key_lock),
@@ -81,6 +98,7 @@ impl FundingWallet {
         let reward_hash = Ripemd160::digest(reward_sha);
         let mut reward_hash160 = [0u8; 20];
         reward_hash160.copy_from_slice(&reward_hash);
+        #[cfg(test)]
         let reward_token_address =
             crate::tx::token_p2pkh_hash_to_cashaddr_for_network(&reward_hash160, network)?;
         let mut reward_locking_bytecode = Vec::with_capacity(25);
@@ -92,13 +110,18 @@ impl FundingWallet {
         Ok(Self {
             _key_lock: key_lock,
             network,
+            #[cfg(test)]
             secret_key: secret_bytes,
+            #[cfg(test)]
             public_key,
             address,
+            #[cfg(test)]
             locking_bytecode,
+            #[cfg(test)]
             electrum_scripthash: hex::encode(script_hash),
             reward_secret_key,
             reward_public_key,
+            #[cfg(test)]
             reward_token_address,
             reward_locking_bytecode,
             reward_electrum_scripthash: hex::encode(reward_scripthash),
@@ -108,15 +131,19 @@ impl FundingWallet {
     pub fn address(&self) -> &str {
         &self.address
     }
+    #[cfg(test)]
     pub fn public_key(&self) -> &[u8; 33] {
         &self.public_key
     }
+    #[cfg(test)]
     pub fn secret_key(&self) -> &[u8; 32] {
         &self.secret_key
     }
+    #[cfg(test)]
     pub fn locking_bytecode(&self) -> &[u8] {
         &self.locking_bytecode
     }
+    #[cfg(test)]
     pub fn electrum_scripthash(&self) -> &str {
         &self.electrum_scripthash
     }
@@ -127,6 +154,7 @@ impl FundingWallet {
     pub fn reward_public_key(&self) -> &[u8; 33] {
         &self.reward_public_key
     }
+    #[cfg(test)]
     pub fn reward_token_address(&self) -> &str {
         &self.reward_token_address
     }
@@ -308,6 +336,7 @@ impl FundingWallet {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn select_optional_confirmed_utxo(
         &self,
         session: &mut ElectrumSession,
@@ -357,6 +386,7 @@ fn derive_reward_key(root: &[u8; 32]) -> Result<[u8; 32], String> {
     Ok(candidate)
 }
 
+#[cfg(test)]
 struct FundingCandidate {
     txid: String,
     vout: u32,
@@ -364,6 +394,7 @@ struct FundingCandidate {
     confirmations: u32,
 }
 
+#[cfg(test)]
 fn parse_confirmed_candidates(
     unspent: &Value,
     tip_height: u32,
@@ -605,6 +636,7 @@ fn verify_reward_transaction(
     })
 }
 
+#[cfg(test)]
 fn verify_funding_transaction(
     candidate: &FundingCandidate,
     raw: &[u8],

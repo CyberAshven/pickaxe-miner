@@ -45,6 +45,7 @@ pub struct PreparedSelfFundedSettlement {
 /// An externally verified confirmed BCH UTXO. The raw transaction lets the
 /// splitter independently check the selected output and its token status.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ConfirmedFundingUtxo {
     pub txid: String,
     pub raw_transaction: Vec<u8>,
@@ -78,6 +79,7 @@ pub struct PreparedBatchedRewardSplit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct PreparedFundedRewardSplit {
     pub parent_txid: String,
     pub settlement_txid: String,
@@ -516,6 +518,35 @@ fn validate_deployment_baton_token(
     Ok(())
 }
 
+/// Bind direct-reward recovery metadata to the immutable transaction bytes.
+pub fn validate_direct_reward_record(
+    raw: &[u8],
+    deployment: &PhotonDeployment,
+    baton_value: u64,
+    reward_amount: u128,
+) -> Result<(), String> {
+    let [baton, reward] = parse_parent_outputs(raw)?;
+    validate_deployment_baton_token(deployment, &baton.token_and_locking_bytecode)?;
+    let prefix = deployment_token_prefix(deployment, reward_amount)?;
+    let locking = reward
+        .token_and_locking_bytecode
+        .strip_prefix(prefix.as_slice())
+        .ok_or("direct reward journal token amount or category disagrees with transaction")?;
+    if baton.value_sats != baton_value
+        || reward.value_sats != TOKEN_OUTPUT_SATS
+        || locking.len() != 25
+        || locking[..3] != [0x76, 0xa9, 0x14]
+        || locking[23..] != [0x88, 0xac]
+    {
+        return Err(
+            "direct reward journal value or payout shape disagrees with transaction".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn funded_p2pkh_sighash(
     parent_txid: &str,
     funding_txid: &str,
@@ -604,16 +635,6 @@ pub fn p2pkh_cashaddr_from_public_key(public_key: &[u8; 33]) -> Result<String, S
 }
 
 /// Creates an ephemeral identity for the self-funded settlement.
-pub fn new_intermediate_identity() -> Result<([u8; 32], [u8; 33], String), String> {
-    let secret = SecretKey::new(&mut rand::rng());
-    let secret_bytes = secret.to_secret_bytes();
-    let public_key = PublicKey::from_secret_key(&secret).serialize();
-    let address = p2pkh_cashaddr_from_public_key(&public_key)?;
-    Ok((secret_bytes, public_key, address))
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-/// Calculates the relay fee required for the serialized transaction.
 fn required_relay_fee_sats(
     serialized_bytes: usize,
     relay_fee_sats_per_kb: u64,
@@ -934,6 +955,7 @@ pub fn build_self_funded_settlement_with_relay_fee(
 const P2PKH_CHANGE_DUST_SATS: u64 = 546;
 
 /// Preserve the established 2% donation and odd-token rounding policy.
+#[cfg(test)]
 fn funded_split_amounts(reward_token_amount: u128) -> Result<(u128, u128, u128), String> {
     let (miner, donation) = RuntimeConfig::split_reward(reward_token_amount);
     let (original, shrec) = RuntimeConfig::split_donation(donation);
@@ -950,6 +972,7 @@ fn funded_split_amounts(reward_token_amount: u128) -> Result<(u128, u128, u128),
     Ok((miner, original, shrec))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn funded_split_outputs(
     deployment: &PhotonDeployment,
     miner_lock: &[u8],
@@ -977,6 +1000,7 @@ fn funded_split_outputs(
     Ok((outputs, if change_sats.is_some() { 4 } else { 3 }))
 }
 
+#[cfg(test)]
 fn funded_split_raw(
     parent_txid: &str,
     funding_txid: &str,
@@ -1005,6 +1029,7 @@ fn funded_split_raw(
 /// The caller must supply a confirmed unspent funding output; this function
 /// verifies its raw transaction, ownership, BCH value, and absence of tokens.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn build_funded_reward_split_with_relay_fee(
     deployment: &PhotonDeployment,
     parent_raw: &[u8],
