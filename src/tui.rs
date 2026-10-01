@@ -137,6 +137,7 @@ struct SetupFlow {
     mode: MiningMode,
     asic_choice: usize,
     token_input: String,
+    token_selected: usize,
     advanced_selected: usize,
     advanced_editing: bool,
     advanced_input: String,
@@ -177,6 +178,7 @@ impl SetupFlow {
             mode: MiningMode::Gpu,
             asic_choice: 0,
             token_input: String::new(),
+            token_selected: 0,
             advanced_selected: 3,
             advanced_editing: false,
             advanced_input: String::new(),
@@ -191,6 +193,25 @@ impl SetupFlow {
     /// Returns the GPU device selected in the setup wizard.
     fn selected_device(&self) -> &GpuDevice {
         &self.devices[self.selected]
+    }
+
+    fn matching_tokens(&self) -> Vec<crate::config::MiningToken> {
+        let query = self.token_input.trim();
+        let mut tokens = crate::config::MiningToken::GPU_SUPPORTED
+            .iter()
+            .copied()
+            .filter(|token| {
+                query.is_empty()
+                    || token
+                        .as_str()
+                        .to_ascii_lowercase()
+                        .contains(&query.to_ascii_lowercase())
+                    || crate::config::MiningToken::parse(query, self.config.network).ok()
+                        == Some(*token)
+            })
+            .collect::<Vec<_>>();
+        tokens.sort_unstable_by_key(|token| token.as_str());
+        tokens
     }
 
     /// Handles keyboard input for the active terminal view.
@@ -337,6 +358,7 @@ impl SetupFlow {
                         MiningNetwork::Chipnet => MiningNetwork::Mainnet,
                     };
                     self.config.set_network(next);
+                    self.token_selected = 0;
                     self.status_line.clear();
                     SetupAction::Continue
                 }
@@ -382,11 +404,11 @@ impl SetupFlow {
                     SetupAction::Continue
                 }
                 KeyCode::Enter => {
-                    let query = if self.token_input.trim().is_empty() {
-                        "PHOTON"
-                    } else {
-                        self.token_input.as_str()
-                    };
+                    let matches = self.matching_tokens();
+                    let query = matches
+                        .get(self.token_selected)
+                        .map(|token| token.as_str())
+                        .unwrap_or(self.token_input.as_str());
                     match self
                         .config
                         .set_token(query)
@@ -400,13 +422,27 @@ impl SetupFlow {
                     }
                     SetupAction::Continue
                 }
+                KeyCode::Up | KeyCode::Down => {
+                    let count = self.matching_tokens().len();
+                    if count > 0 {
+                        self.token_selected = if key.code == KeyCode::Up {
+                            (self.token_selected + count - 1) % count
+                        } else {
+                            (self.token_selected + 1) % count
+                        };
+                    }
+                    self.status_line.clear();
+                    SetupAction::Continue
+                }
                 KeyCode::Backspace => {
                     self.token_input.pop();
+                    self.token_selected = 0;
                     self.status_line.clear();
                     SetupAction::Continue
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.token_input.push(ch);
+                    self.token_selected = 0;
                     self.status_line.clear();
                     SetupAction::Continue
                 }
@@ -530,6 +566,10 @@ impl SetupFlow {
                         }
                         KeyCode::Up => self.advanced_selected = (self.advanced_selected + 3) % 4,
                         KeyCode::Down => self.advanced_selected = (self.advanced_selected + 1) % 4,
+                        KeyCode::Delete if self.advanced_selected == 0 => {
+                            self.config.clear_fulcrum_url();
+                            self.status_line = "Automatic Fulcrum selection restored".into();
+                        }
                         KeyCode::Enter if self.advanced_selected == 3 => {
                             self.step = SetupStep::Review;
                             self.status_line.clear();
@@ -1718,10 +1758,10 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         SetupStep::Mode | SetupStep::Network | SetupStep::Asic | SetupStep::Gpu => {
             "[Up/Down] choose   [Enter] next   [Esc] Back"
         }
-        SetupStep::Token => "[Type] name, category ID or covenant   [Enter] select   [Esc] Back",
+        SetupStep::Token => "[Up/Down] choose   [Type] search name, category or covenant   [Enter] select   [Esc] Back",
         SetupStep::Payout => "[Type] payout address   [Enter] next   [Esc] Back",
         SetupStep::Intensity => "[+/- or arrows] adjust   [Enter] next   [Esc] Back",
-        SetupStep::Advanced => "[Up/Down] choose   [Enter] edit/review   [Esc] Back",
+        SetupStep::Advanced => "[Up/Down] choose   [Enter] edit/review   [Del] automatic Fulcrum   [Esc] Back",
         SetupStep::Review => "[Enter] start mining   [Esc] Back",
     };
     let message = if state.status_line.is_empty() {
@@ -1819,10 +1859,7 @@ fn render_setup_network(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(format!("{mainnet} Mainnet")),
-            Line::from(Span::styled(
-                format!("{chipnet} Chipnet"),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(format!("{chipnet} Chipnet")),
             Line::from(""),
             Line::from("Available tokens and contracts depend on the network."),
         ])
@@ -1836,30 +1873,31 @@ fn render_setup_network(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
 }
 
 fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
-    let availability = if state.config.network == MiningNetwork::Mainnet {
-        "available"
-    } else {
-        "deployed; payout split pending"
-    };
+    let matches = state.matching_tokens();
+    let mut lines = matches
+        .iter()
+        .enumerate()
+        .map(|(index, token)| {
+            let marker = if index == state.token_selected {
+                ">"
+            } else {
+                " "
+            };
+            Line::from(format!("{marker} {}  GPU  available", token.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::from("No matching token"));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(format!("Search: {}", state.token_input)),
+        Line::from("Use arrows to choose, or type a token name, category ID or covenant."),
+    ]);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                format!("PHOTON  GPU  {availability}"),
-                Style::default().fg(if state.config.network == MiningNetwork::Mainnet {
-                    Color::White
-                } else {
-                    Color::DarkGray
-                }),
-            )),
-            Line::from(""),
-            Line::from("Tokens are listed alphabetically."),
-            Line::from("Future compatible tokens will share work; others require a choice."),
-            Line::from(""),
-            Line::from(format!("Search/select: {}", state.token_input)),
-            Line::from("Leave blank and press Enter to select the listed token."),
-        ])
-        .block(Block::default().title(" CashToken ").borders(Borders::ALL))
-        .wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(Block::default().title(" CashToken ").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -1942,22 +1980,32 @@ fn render_setup_advanced(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             " "
         }
     };
-    let endpoint_line = |index, label: &str, configured: bool, example: &str| {
+    let automatic = match state.config.network {
+        MiningNetwork::Mainnet => format!(
+            "Automatic ({} public servers)",
+            crate::protocol::FULCRUM_WSS_BOOTSTRAP.len()
+        ),
+        MiningNetwork::Chipnet => format!(
+            "Automatic ({} Chipnet servers)",
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len()
+        ),
+    };
+    let endpoint_line = |index, label: &str, configured: bool, example: &str, fallback: &str| {
         let (text, hint) = if state.advanced_editing && state.advanced_selected == index {
             if state.advanced_input.is_empty() {
-                (example, true)
+                (example.to_string(), true)
             } else {
-                (state.advanced_input.as_str(), false)
+                (state.advanced_input.clone(), false)
             }
         } else if configured {
-            ("Custom endpoints set", false)
+            ("Custom + automatic fallback".to_string(), false)
         } else {
-            ("Automatic", true)
+            (fallback.to_string(), false)
         };
         Line::from(vec![
             Span::raw(format!("{} {label}: ", marker(index))),
             Span::styled(
-                text.to_string(),
+                text,
                 if hint {
                     Style::default().fg(Color::DarkGray)
                 } else {
@@ -1979,16 +2027,44 @@ fn render_setup_advanced(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     };
     frame.render_widget(
         Paragraph::new(vec![
-            endpoint_line(0, "Fulcrum", state.config.fulcrum_url.is_some(), "wss://server1:50004, wss://server2:50004"),
-            endpoint_line(1, "BCH node", state.config.node_url.is_some(), "http://node1:8332, http://node2:8332"),
+            endpoint_line(
+                0,
+                "Fulcrum",
+                state.config.fulcrum_url.is_some(),
+                "wss://server1:50004, wss://server2:50004",
+                &automatic,
+            ),
+            endpoint_line(
+                1,
+                "BCH node",
+                state.config.node_url.is_some(),
+                "http://node1:8332, http://node2:8332",
+                "Not configured (optional)",
+            ),
             Line::from(vec![
                 Span::raw(format!("{} Profile name: ", marker(2))),
-                Span::styled(profile_name.to_string(), if profile_hint { Style::default().fg(Color::DarkGray) } else { Style::default() }),
+                Span::styled(
+                    profile_name.to_string(),
+                    if profile_hint {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    },
+                ),
             ]),
             Line::from(format!("{} Review & start mining", marker(3))),
             Line::from(""),
-            Line::from("Automatic uses healthy available connections. Add a node URL to include your node."),
-            Line::from("Separate multiple URLs with commas. Empty restores automatic selection."),
+            Line::from("Available custom URLs are tried before the automatic server list."),
+            Line::from(
+                "Separate URLs with commas. Clear the field to restore automatic selection.",
+            ),
+            Line::from(match state.config.network {
+                MiningNetwork::Chipnet => format!(
+                    "Chipnet automatic list: {}",
+                    crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.join(", ")
+                ),
+                MiningNetwork::Mainnet => automatic,
+            }),
         ])
         .block(
             Block::default()
@@ -2033,16 +2109,16 @@ fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             Line::from(format!("Address: {}", state.config.payout_address)),
             Line::from(format!("Intensity: {}%", state.config.intensity)),
             Line::from(format!(
-                "Connection: automatic  Fulcrum: {}  BCH node: {}",
+                "Fulcrum: {}  BCH node: {}",
                 if state.config.fulcrum_url.is_some() {
-                    "custom"
+                    "custom + automatic"
                 } else {
-                    "built-in"
+                    "automatic"
                 },
                 if state.config.node_url.is_some() {
                     "custom"
                 } else {
-                    "add URL to include"
+                    "not configured"
                 }
             )),
             Line::from(donation),
@@ -2173,7 +2249,11 @@ fn render_chart_options(frame: &mut Frame<'_>, area: Rect, state: &TuiState, cur
 
 /// Renders the dashboard header and live connection state.
 fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
-    let mut state_text = format!("{:?}", snapshot.state).to_ascii_uppercase();
+    let mut state_text = if snapshot.pending_winners > 0 {
+        "WINNER PENDING (GPU PAUSED)".to_string()
+    } else {
+        format!("{:?}", snapshot.state).to_ascii_uppercase()
+    };
     if snapshot.search.waiting_for_job {
         state_text.push_str(" (all nonces tried, waiting for next job)");
     }
@@ -2442,6 +2522,10 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
         win_probability(&snapshot.photon_target_le, snapshot.network),
         expected_winner_seconds(&snapshot.photon_target_le, search.rate, snapshot.network),
     ) {
+        (Some(probability), _) if snapshot.pending_winners > 0 => format!(
+            "1 win per {} hashes · waiting for winner resolution",
+            format_si_count(1.0 / probability)
+        ),
         (Some(probability), Some(seconds)) => format!(
             "1 win per {} hashes · ~{} at avg rate",
             format_si_count(1.0 / probability),
@@ -3238,6 +3322,47 @@ mod tests {
     }
 
     #[test]
+    fn chipnet_token_search_and_automatic_servers_are_clear() {
+        let devices = test_devices();
+        let mut setup =
+            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        setup.config.set_network(MiningNetwork::Chipnet);
+        setup.step = SetupStep::Token;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 26)).unwrap();
+        terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+        let token_screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(token_screen.contains("> PHOTON  GPU  available"));
+        assert!(!token_screen.contains("payout split pending"));
+        setup.handle_key(key(KeyCode::Down));
+        setup.handle_key(key(KeyCode::Char('p')));
+        setup.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(
+            setup.matching_tokens(),
+            vec![crate::config::MiningToken::Photon]
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Gpu);
+
+        setup.step = SetupStep::Advanced;
+        terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+        let connection_screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(connection_screen.contains("Automatic (2 Chipnet servers)"));
+        assert!(connection_screen.contains("chipnet.bch.ninja"));
+    }
+
+    #[test]
     fn asic_setup_shows_both_paths_but_cannot_start() {
         let devices = test_devices();
         let mut setup =
@@ -3263,7 +3388,7 @@ mod tests {
         for (step, expected) in [
             (SetupStep::Mode, "ASIC mining proxy"),
             (SetupStep::Network, "Mainnet"),
-            (SetupStep::Token, "PHOTON  GPU  available"),
+            (SetupStep::Token, "> PHOTON  GPU  available"),
             (SetupStep::Asic, "BCH + all compatible merge-minable tokens"),
             (SetupStep::Advanced, "Fulcrum: Automatic"),
         ] {
@@ -3308,6 +3433,10 @@ mod tests {
             setup.config.node_url.as_deref(),
             Some("http://127.0.0.1:8332")
         );
+        setup.handle_key(key(KeyCode::Up));
+        setup.handle_key(key(KeyCode::Delete));
+        assert!(setup.config.fulcrum_url.is_none());
+        assert!(setup.status_line.contains("Automatic Fulcrum"));
     }
 
     #[test]
@@ -3595,6 +3724,17 @@ mod tests {
             .collect::<String>();
         assert!(displayed.contains("avg 928.4 KH/s · peak 0.00 H/s"));
         assert!(!displayed.contains("active GPU"));
+
+        snapshot.network = MiningNetwork::Chipnet;
+        snapshot.pending_winners = 1;
+        snapshot.photon_target_le = "01".repeat(32);
+        let rows = rendered_rows(&snapshot, 120, 40);
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("WINNER PENDING (GPU PAUSED)")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("waiting for winner resolution")));
     }
 
     #[test]

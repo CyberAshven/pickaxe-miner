@@ -61,6 +61,8 @@ pub enum MiningToken {
 }
 
 impl MiningToken {
+    pub const GPU_SUPPORTED: &[Self] = &[Self::Photon];
+
     /// Maintainer-editable mode, shares and recipients. The protocol must support
     /// its selected payout scheme before mining starts.
     pub fn fee_policy(self, network: MiningNetwork) -> crate::work_fee::Policy {
@@ -934,7 +936,10 @@ mod tests {
         assert!(MiningToken::parse(crate::protocol::MAINNET_CATEGORY_HEX, cfg.network).is_err());
         assert_eq!(
             cfg.electrum_endpoints(),
-            vec![crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0].to_string()]
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+                .iter()
+                .map(|url| (*url).to_string())
+                .collect::<Vec<_>>()
         );
         assert!(cfg.electrum_endpoints().iter().all(|endpoint| {
             !crate::protocol::FULCRUM_WSS_BOOTSTRAP.contains(&endpoint.as_str())
@@ -951,7 +956,10 @@ mod tests {
         assert!(cfg.fulcrum_url.is_none());
         assert_eq!(
             cfg.electrum_endpoints(),
-            vec![crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0].to_string()]
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+                .iter()
+                .map(|url| (*url).to_string())
+                .collect::<Vec<_>>()
         );
         assert!(cfg
             .set_fulcrum_url(crate::protocol::FULCRUM_WSS_BOOTSTRAP[0])
@@ -969,7 +977,10 @@ mod tests {
         assert!(cfg.custom_node_endpoints().is_empty());
         assert_eq!(
             cfg.electrum_endpoints(),
-            vec![crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0].to_string()]
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+                .iter()
+                .map(|url| (*url).to_string())
+                .collect::<Vec<_>>()
         );
         cfg.set_fulcrum_url("wss://explicit-chipnet.invalid:50004")
             .unwrap();
