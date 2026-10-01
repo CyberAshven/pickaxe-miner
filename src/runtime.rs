@@ -2237,15 +2237,23 @@ fn resolve_pending_before_search(
         return Ok(());
     };
     pending.require_network(cfg.network)?;
-
-    match attempt_pending_submission(session, cfg, &pending, journal_path)? {
-        SubmissionAttempt::Complete(fresh) => {
-            resolve_confirmed_submission(&pending, &fresh, journal_path)
+    let mut reported_wait = false;
+    loop {
+        match attempt_pending_submission(session, cfg, &pending, journal_path)? {
+            SubmissionAttempt::Complete(fresh) => {
+                return resolve_confirmed_submission(&pending, &fresh, journal_path);
+            }
+            SubmissionAttempt::StaleUnbroadcast(fresh) => {
+                return resolve_stale_submission(&pending, &fresh, journal_path);
+            }
+            SubmissionAttempt::AwaitingBaton(message) => {
+                if !reported_wait {
+                    eprintln!("{message}");
+                    reported_wait = true;
+                }
+                thread::sleep(ACCEPTED_BATON_RECHECK);
+            }
         }
-        SubmissionAttempt::StaleUnbroadcast(fresh) => {
-            resolve_stale_submission(&pending, &fresh, journal_path)
-        }
-        SubmissionAttempt::AwaitingBaton(message) => Err(message),
     }
 }
 
