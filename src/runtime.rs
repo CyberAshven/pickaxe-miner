@@ -4946,6 +4946,7 @@ mod tests {
         use num_bigint::BigUint;
         let mut samples = Vec::new();
         for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            let policy = crate::config::MiningToken::Photon.fee_policy(network);
             let ages = if network == MiningNetwork::Mainnet {
                 [0, 16, 17, 128, 32768]
             } else {
@@ -4953,6 +4954,11 @@ mod tests {
             };
             for age in ages {
                 for recipient in Recipient::ALL {
+                    if recipient != Recipient::Miner
+                        && policy.scheme.work()[recipient as usize - 1] == 0
+                    {
+                        continue;
+                    }
                     let (mut cfg, mut job, _, _, _, journal) = preflight_fixture();
                     cfg.network = network;
                     cfg.payout_address =

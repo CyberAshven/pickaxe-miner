@@ -23,7 +23,7 @@ try {
   const protocol = readFileSync(join(root, 'src/protocol.rs'), 'utf8');
   const constant = name => hexToBin(protocol.match(new RegExp(`pub const ${name}: &str =\\s*"([a-f0-9]+)"`))[1]);
   const samples = JSON.parse(readFileSync(path, 'utf8'));
-  assert.equal(samples.length, process.argv[2] ? 6 : 30);
+  assert.equal(samples.length, process.argv[2] ? 5 : 25);
   for (const sample of samples) {
     const chipnet = sample.network === 'chipnet';
     const tx = decodeTransactionBch(hexToBin(sample.raw));
@@ -52,7 +52,7 @@ try {
       assert.notEqual(vm.verify({ sourceOutputs: [source], transaction: altered }), true);
     }
   }
-  console.log(`PASS direct payout lifecycle: ${samples.length} mainnet/Chipnet claims, all recipients, standard and consensus VM; altered rewards rejected.`);
+  console.log(`PASS direct payout lifecycle: ${samples.length} mainnet/Chipnet claims, all active recipients, standard and consensus VM; altered rewards rejected.`);
 } finally {
   rmSync(temp, { recursive: true });
 }

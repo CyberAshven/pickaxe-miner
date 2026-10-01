@@ -68,19 +68,15 @@ impl MiningToken {
     pub fn fee_policy(self, network: MiningNetwork) -> crate::donation::Policy {
         use crate::donation::{Policy, Scheme};
         match self {
-            Self::Photon => Policy {
-                scheme: Scheme::Work([200, 200]),
-                addresses: [
-                    match network {
-                        MiningNetwork::Mainnet => {
-                            "bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3"
-                        }
-                        MiningNetwork::Chipnet => {
-                            "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp"
-                        }
-                    },
-                    "bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3",
-                ],
+            Self::Photon => match network {
+                MiningNetwork::Mainnet => Policy {
+                    scheme: Scheme::Work([200, 200]),
+                    addresses: [DONATION_ADDRESS, SHREC_DONATION_ADDRESS],
+                },
+                MiningNetwork::Chipnet => Policy {
+                    scheme: Scheme::Work([400, 0]),
+                    addresses: [CHIPNET_DONATION_ADDRESS, CHIPNET_DONATION_ADDRESS],
+                },
             },
         }
     }
@@ -848,6 +844,25 @@ mod tests {
     use super::*;
 
     const PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
+
+    #[test]
+    fn photon_donation_routes_by_network() {
+        let mainnet = MiningToken::Photon.fee_policy(MiningNetwork::Mainnet);
+        assert_eq!(mainnet.scheme.work(), [200, 200]);
+        assert_eq!(
+            mainnet.addresses,
+            [DONATION_ADDRESS, SHREC_DONATION_ADDRESS]
+        );
+        let chipnet = MiningToken::Photon.fee_policy(MiningNetwork::Chipnet);
+        assert_eq!(chipnet.scheme.work(), [400, 0]);
+        assert_eq!(
+            chipnet.addresses,
+            [CHIPNET_DONATION_ADDRESS, CHIPNET_DONATION_ADDRESS]
+        );
+        let payouts = chipnet.payouts(MiningNetwork::Chipnet, PAYOUT).unwrap();
+        assert_eq!(payouts[1], CHIPNET_DONATION_ADDRESS);
+        assert_eq!(payouts[2], CHIPNET_DONATION_ADDRESS);
+    }
 
     #[test]
     fn comma_separated_connections_keep_order_and_reject_bad_entries() {

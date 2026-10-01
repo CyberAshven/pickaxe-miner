@@ -170,6 +170,7 @@ mod tests {
     fn policy_modes_conserve_rewards_and_actual_work() {
         for scheme in [
             Scheme::Work([200, 200]),
+            Scheme::Work([400, 0]),
             Scheme::RewardSplit([100, 100]),
             Scheme::Hybrid {
                 work: [200, 100],

@@ -2092,7 +2092,11 @@ mod tests {
                 }
                 Err(error) => panic!("{error}"),
             };
-            let mut seen = [false; 3];
+            let mut seen = [
+                false,
+                policy.scheme.work()[0] == 0,
+                policy.scheme.work()[1] == 0,
+            ];
             let mut changed = false;
             let deadline = Instant::now() + Duration::from_secs(180);
             while Instant::now() < deadline && !seen.iter().all(|seen| *seen) {
