@@ -10,7 +10,7 @@ Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken bat
 
 Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
 
-PHOTON uses a **4% mining-work fee**: 96% of completed candidate hashes mine for your wallet, 2% for the project and 2% for shrec. Each win pays its selected recipient directly. There is no additional reward split, minimum withdrawal, or deposit required. These percentages describe work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
+PHOTON uses a **4% mining-work fee**: 96% of completed candidate hashes mine for your wallet. Each win pays directly. There is no additional reward split, minimum withdrawal, or deposit required. The fee is based on work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
 
 ## Supported platforms
 
@@ -61,7 +61,7 @@ Replace the quoted address with your valid token-aware P2PKH payout CashAddr. Th
 
 New Chipnet wins pay the selected wallet directly, using the same work-fee policy. No local reward wallet or payout batching is created for new mining.
 
-If you used the earlier Chipnet batch-payout preview, retain its `chipnet-funding.key` until its existing rewards are recovered. Recovery retains the historical 98% / 1% / 1% split and can still need enough confirmed rewards to cover its existing transaction costs. It does not apply the new work fee to those old rewards.
+If you used the earlier Chipnet batch-payout preview, retain its `chipnet-funding.key` until its existing rewards are recovered. Recovery retains its historical fee rules and can still need enough confirmed rewards to cover its existing transaction costs. It does not apply the new work fee to those old rewards.
 
 In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
 

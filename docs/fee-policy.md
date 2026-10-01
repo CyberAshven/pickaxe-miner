@@ -1,23 +1,15 @@
 # Maintainer fee policy
 
 Edit `MiningToken::fee_policy` in `src/config.rs` to select a token's mode,
-percentages and project/collaborator addresses. This is compiled policy, not a
+fee shares and payout addresses. This is compiled policy, not a
 user preference. Saved profiles and command-line arguments cannot change it.
 Addresses are validated before mining; each network may use different recipients.
 Do not edit the historical address/percentage constants used by legacy recovery.
 
-`src/work_fee.rs` defines three modes. Shares are basis points, in project /
-collaborator order:
-
-```rust
-Scheme::Work([200, 200]) // 4% work; no reward split (current PHOTON)
-Scheme::RewardSplit([100, 100]) // 2% from personal rewards, no work fee
-Scheme::Hybrid { work: [100, 100], reward: [100, 100] }
-```
-
-In a hybrid, the reward split applies only to personal-work wins. Developer-work
-wins go entirely to that developer. With 2% work plus 2% reward, the expected
-combined fee is 3.96%, not 4%; the stages are explicit rather than added together.
+`src/work_fee.rs` defines work, reward-split and hybrid modes. Shares are
+configured in basis points. PHOTON currently uses a 4% work
+fee without a reward split. In a hybrid, the reward split applies only to
+personal-work wins; work-fee wins pay their selected destination directly.
 Integer reward allocations always conserve the full amount, including rounding.
 
 A payout adapter must implement the selected mode and prove its transaction

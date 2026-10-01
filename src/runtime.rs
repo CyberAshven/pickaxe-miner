@@ -38,6 +38,7 @@ const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const PHOTON_STATE_RECHECK: Duration = Duration::from_millis(500);
+const ACCEPTED_BATON_RECHECK: Duration = Duration::from_secs(2);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const REFRESH_RECONNECT_THRESHOLD: u8 = 3;
@@ -1578,6 +1579,7 @@ fn submission_decision(
 enum SubmissionAttempt {
     Complete(Box<LiveJob>),
     StaleUnbroadcast(Box<LiveJob>),
+    AwaitingBaton(String),
 }
 
 /// Checks whether the live job directly names the resulting baton.
@@ -1833,7 +1835,7 @@ where
         return Ok(SubmissionAttempt::Complete(Box::new(fresh)));
     }
     if pending.live_baton_precedes_settlement(&fresh) {
-        return Err(waiting_message.into());
+        return Ok(SubmissionAttempt::AwaitingBaton(waiting_message.into()));
     }
     if prove_result(&fresh)? {
         Ok(SubmissionAttempt::Complete(Box::new(fresh)))
@@ -2011,7 +2013,9 @@ fn attempt_parent_only_submission(
     if parent_known || resulting_baton_is_authoritative(pending, &fresh) {
         pending.mark_parent_accepted(journal_path)?;
         if pending.expected_baton_is_current(&fresh) {
-            return Err("PHOTON parent is known; waiting for authoritative baton advance".into());
+            return Ok(SubmissionAttempt::AwaitingBaton(
+                "PHOTON parent is known; waiting for authoritative baton advance".into(),
+            ));
         }
         if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
             return Ok(SubmissionAttempt::Complete(Box::new(fresh)));
@@ -2072,10 +2076,10 @@ fn attempt_pending_submission(
         if pending.expected_baton_is_current(&fresh)
             || (!pending.is_chipnet_funded() && pending.live_baton_precedes_settlement(&fresh))
         {
-            return Err(
+            return Ok(SubmissionAttempt::AwaitingBaton(
                 "settlement transaction is known; waiting for the live PHOTON baton to advance past this winner"
                     .into(),
-            );
+            ));
         }
         if resulting_baton_is_authoritative_or_descendant(session, pending, &fresh)? {
             return Ok(SubmissionAttempt::Complete(Box::new(fresh)));
@@ -2241,6 +2245,7 @@ fn resolve_pending_before_search(
         SubmissionAttempt::StaleUnbroadcast(fresh) => {
             resolve_stale_submission(&pending, &fresh, journal_path)
         }
+        SubmissionAttempt::AwaitingBaton(message) => Err(message),
     }
 }
 
@@ -3407,6 +3412,11 @@ fn run_supervisor(
                     &journal_path,
                 );
                 match attempt {
+                    Ok(SubmissionAttempt::AwaitingBaton(_)) => {
+                        last_error = None;
+                        state = SupervisorState::Paused;
+                        next_submission_retry = Instant::now() + ACCEPTED_BATON_RECHECK;
+                    }
                     Ok(SubmissionAttempt::Complete(fresh)) => {
                         match resolve_confirmed_submission(&pending, &fresh, &journal_path) {
                             Ok(()) => {
@@ -7207,16 +7217,15 @@ mod tests {
             let mut stale = live_job();
             stale.baton_txid = pending.expected_baton_txid.to_uppercase();
             stale.baton_vout = pending.expected_baton_vout;
-            let error = resolve_post_broadcast_baton(
+            let result = resolve_post_broadcast_baton(
                 pending,
                 stale,
                 "waiting for authoritative baton advance",
                 "unproven baton",
                 |_| panic!("stale live baton must not trigger a lineage lookup"),
             )
-            .err()
-            .expect("stale live baton must retain the pending submission");
-            assert!(error.contains("waiting for authoritative baton advance"));
+            .unwrap();
+            assert!(matches!(result, SubmissionAttempt::AwaitingBaton(_)));
         }
     }
 

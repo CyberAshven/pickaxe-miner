@@ -51,10 +51,8 @@ impl Scheme {
     pub fn description(self) -> String {
         let format = |shares: [u16; 2]| {
             format!(
-                "{:.2}% ({:.2}% project / {:.2}% collaborator)",
-                (u32::from(shares[0]) + u32::from(shares[1])) as f64 / 100.0,
-                f64::from(shares[0]) / 100.0,
-                f64::from(shares[1]) / 100.0
+                "{}%",
+                (u32::from(shares[0]) + u32::from(shares[1])) as f64 / 100.0
             )
         };
         match self {
@@ -155,6 +153,19 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fee_description_reports_only_totals() {
+        assert_eq!(Scheme::Work([200, 200]).description(), "Work fee: 4%");
+        assert_eq!(
+            Scheme::Hybrid {
+                work: [150, 100],
+                reward: [100, 50],
+            }
+            .description(),
+            "Work fee: 2.5%; personal-reward fee: 1.5%"
+        );
+    }
+
     #[test]
     fn policy_modes_conserve_rewards_and_actual_work() {
         for scheme in [

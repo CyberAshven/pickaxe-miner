@@ -592,8 +592,6 @@ pub fn win_tx_preview_lines(
     let miner_lock = cashaddr_to_p2pkh_locking(miner_payout)?;
     let (miner_tokens, donation_tokens) =
         crate::config::RuntimeConfig::split_reward(job_reward_raw);
-    let (original_tokens, shrec_tokens) =
-        crate::config::RuntimeConfig::split_donation(donation_tokens);
     Ok(vec![
         "win-tx preview (unsigned two-output parent; no mining or broadcast):".into(),
         format!(
@@ -601,14 +599,7 @@ pub fn win_tx_preview_lines(
             miner_lock.len()
         ),
         "  this template has no donation output".into(),
-        format!(
-            "  mine settlement pays FT={miner_tokens} -> {miner_payout}; FT={original_tokens} (~1%) -> {}",
-            crate::config::DONATION_ADDRESS
-        ),
-        format!(
-            "  mine settlement pays FT={shrec_tokens} (~1%) -> {}",
-            crate::config::SHREC_DONATION_ADDRESS
-        ),
+        format!("  mine settlement pays FT={miner_tokens} -> {miner_payout}; total fee FT={donation_tokens}"),
     ])
 }
 
@@ -1149,15 +1140,7 @@ mod tests {
         assert_ne!(miner_tokens, reward);
         assert!(text.contains(&format!("FT={reward}")));
         assert!(text.contains(&format!("FT={miner_tokens} -> {payout}")));
-        let (original, shrec) = crate::config::RuntimeConfig::split_donation(donation_tokens);
-        assert!(text.contains(&format!(
-            "FT={original} (~1%) -> {}",
-            crate::config::DONATION_ADDRESS
-        )));
-        assert!(text.contains(&format!(
-            "FT={shrec} (~1%) -> {}",
-            crate::config::SHREC_DONATION_ADDRESS
-        )));
+        assert!(text.contains(&format!("total fee FT={donation_tokens}")));
         assert!(text.contains("this template has no donation output"));
         assert!(!text.contains("10000 bps"));
         print_win_tx_preview(reward, payout, None).expect("preview prints the same report");

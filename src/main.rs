@@ -942,17 +942,17 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
         } => println!(
             "winner submission accepted: parent={parent_txid} reward={child_txid}"
         ),
-        runtime::RuntimeEvent::DirectRewardAccepted { txid, recipient } => println!(
-            "direct reward accepted: {recipient} tx={txid}"
-        ),
+        runtime::RuntimeEvent::DirectRewardAccepted { txid, .. } => {
+            println!("direct reward accepted: tx={txid}")
+        }
         runtime::RuntimeEvent::RewardAccrued { parent_txid } => println!(
-            "legacy chipnet reward accrued: parent={parent_txid}; 98/1/1 split awaits enough confirmed rewards"
+            "legacy Chipnet reward awaiting recovery: parent={parent_txid}"
         ),
         runtime::RuntimeEvent::RewardSplit { child_txid, reward_count } => println!(
-            "legacy chipnet 98/1/1 reward split accepted: child={child_txid} rewards={reward_count}"
+            "legacy Chipnet reward recovery accepted: child={child_txid} rewards={reward_count}"
         ),
         runtime::RuntimeEvent::RewardInventory { confirmed_at_least } => println!(
-            "chipnet confirmed unsplit rewards: at least {confirmed_at_least}; batch split starts at five if the relay fee is covered"
+            "legacy Chipnet rewards awaiting recovery: at least {confirmed_at_least}"
         ),
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
     }
@@ -980,7 +980,7 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "intensity": snapshot.search.intensity,
         "candidates": snapshot.search.candidates,
         "fee_policy": snapshot.fee_scheme.description(),
-        "work_candidates": { "miner": snapshot.search.work_candidates[0], "project": snapshot.search.work_candidates[1], "collaborator": snapshot.search.work_candidates[2] },
+        "work_candidates": { "miner": snapshot.search.work_candidates[0], "fee": snapshot.search.work_candidates[1].saturating_add(snapshot.search.work_candidates[2]) },
         "batches": snapshot.search.batches,
         "rate": snapshot.search.rate,
         "current_rate": snapshot.search.current_rate,
@@ -1670,6 +1670,11 @@ mod tests {
         assert_eq!(status["reconnects"], 0);
         assert_eq!(status["endpoint_rotations"], 1);
         assert_eq!(status["rejected_winners"], 2);
+        assert_eq!(status["fee_policy"], "Work fee: 4%");
+        assert_eq!(status["work_candidates"]["miner"], 65_536);
+        assert_eq!(status["work_candidates"]["fee"], 0);
+        assert!(status["work_candidates"].get("project").is_none());
+        assert!(status["work_candidates"].get("collaborator").is_none());
         assert_eq!(status["photon_target_le"], "ff".repeat(32));
         assert!(status.get("refreshes").is_none());
         assert!(status.get("stale_rebuilds").is_none());
