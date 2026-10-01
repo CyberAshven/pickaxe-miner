@@ -10,7 +10,7 @@ Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken bat
 
 Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
 
-PHOTON uses a **4% mining-work fee**: 96% of completed candidate hashes mine for your wallet. Each win pays directly. There is no additional reward split, minimum withdrawal, or deposit required. The fee is based on work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
+PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes mine for your wallet. Each win pays directly. There is no additional reward split, minimum withdrawal, or deposit required. The donation is based on work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
 
 ## Supported platforms
 
@@ -59,9 +59,9 @@ Use a build containing Chipnet support (the v0.0.2 download above predates it). 
 
 Replace the quoted address with your valid token-aware P2PKH payout CashAddr. The miner converts a valid mainnet payout CashAddr to the equivalent `bchtest:` address with the same key hash. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoint; mainnet remains the default without `--chipnet`.
 
-New Chipnet wins pay the selected wallet directly, using the same work-fee policy. No local reward wallet or payout batching is created for new mining.
+New Chipnet wins pay the selected wallet directly, using the same donation policy. No local reward wallet or payout batching is created for new mining.
 
-If you used the earlier Chipnet batch-payout preview, retain its `chipnet-funding.key` until its existing rewards are recovered. Recovery retains its historical fee rules and can still need enough confirmed rewards to cover its existing transaction costs. It does not apply the new work fee to those old rewards.
+If you used the earlier Chipnet batch-payout preview, retain its `chipnet-funding.key` until its existing rewards are recovered. Recovery retains its historical fee rules and can still need enough confirmed rewards to cover its existing transaction costs. It does not apply the new donation policy to those old rewards.
 
 In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
 

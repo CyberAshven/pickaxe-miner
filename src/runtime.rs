@@ -847,7 +847,7 @@ impl PendingSubmission {
         winner: &VerifiedWinner,
         live: &LiveJob,
         cfg: &RuntimeConfig,
-        recipient: crate::work_fee::Recipient,
+        recipient: crate::donation::Recipient,
     ) -> Result<Self, String> {
         let parent_txid = reward::transaction_id(&winner.transaction);
         let amount =
@@ -857,9 +857,9 @@ impl PendingSubmission {
             network: Some(cfg.network.as_str().into()),
             mode: Some(
                 match recipient {
-                    crate::work_fee::Recipient::Miner => "direct_miner",
-                    crate::work_fee::Recipient::Project => "direct_project",
-                    crate::work_fee::Recipient::Collaborator => "direct_collaborator",
+                    crate::donation::Recipient::Miner => "direct_miner",
+                    crate::donation::Recipient::Project => "direct_project",
+                    crate::donation::Recipient::Collaborator => "direct_collaborator",
                 }
                 .into(),
             ),
@@ -882,12 +882,12 @@ impl PendingSubmission {
                         .single_input_max_baton_decrease_sats()?,
                 )
                 .ok_or("direct reward baton value underflow")?,
-            miner_token_amount: if recipient == crate::work_fee::Recipient::Miner {
+            miner_token_amount: if recipient == crate::donation::Recipient::Miner {
                 amount
             } else {
                 0
             },
-            donation_token_amount: if recipient == crate::work_fee::Recipient::Miner {
+            donation_token_amount: if recipient == crate::donation::Recipient::Miner {
                 0
             } else {
                 amount
@@ -2190,8 +2190,8 @@ fn prepare_submission_for_network(
     let payouts = policy.payouts(cfg.network, &cfg.payout_address)?;
     let deployment = cfg.token.photon_deployment(cfg.network);
     let mut accepted = None;
-    for (recipient, payout) in crate::work_fee::Recipient::ALL.into_iter().zip(payouts) {
-        if recipient != crate::work_fee::Recipient::Miner
+    for (recipient, payout) in crate::donation::Recipient::ALL.into_iter().zip(payouts) {
+        if recipient != crate::donation::Recipient::Miner
             && policy.scheme.work()[recipient as usize - 1] == 0
         {
             continue;
@@ -2216,7 +2216,7 @@ fn prepare_submission_for_network(
 
 /// The current PHOTON direct claim cannot fund extra reward outputs. Other
 /// protocols provide their own split builder; changing a policy must fail closed.
-fn require_direct_reward_policy(scheme: crate::work_fee::Scheme) -> Result<(), String> {
+fn require_direct_reward_policy(scheme: crate::donation::Scheme) -> Result<(), String> {
     scheme.validate()?;
     if scheme.reward() != [0, 0] {
         return Err(
@@ -2604,7 +2604,7 @@ pub enum SupervisorState {
 pub struct RuntimeSnapshot {
     pub state: SupervisorState,
     pub network: MiningNetwork,
-    pub fee_scheme: crate::work_fee::Scheme,
+    pub fee_scheme: crate::donation::Scheme,
     pub gpu_backend: String,
     pub gpu_device: u32,
     pub generation_id: u64,
@@ -4942,7 +4942,7 @@ mod tests {
 
     #[test]
     fn direct_reward_lifecycle_and_recovery() {
-        use crate::work_fee::{Recipient, Scheme};
+        use crate::donation::{Recipient, Scheme};
         use num_bigint::BigUint;
         let mut samples = Vec::new();
         for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {

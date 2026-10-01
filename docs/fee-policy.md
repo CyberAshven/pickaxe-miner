@@ -6,7 +6,7 @@ user preference. Saved profiles and command-line arguments cannot change it.
 Addresses are validated before mining; each network may use different recipients.
 Do not edit the historical address/percentage constants used by legacy recovery.
 
-`src/work_fee.rs` defines work, reward-split and hybrid modes. Shares are
+`src/donation.rs` defines work, reward-split and hybrid modes. Shares are
 configured in basis points. PHOTON currently uses a 4% work
 fee without a reward split. In a hybrid, the reward split applies only to
 personal-work wins; work-fee wins pay their selected destination directly.

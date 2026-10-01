@@ -790,14 +790,14 @@ fn run_worker(
     diagnostics: Arc<WorkerDiagnostics>,
     job_rx: Receiver<WorkerCommand>,
     winner_tx: SyncSender<VerifiedWinner>,
-    work_fee: Option<crate::work_fee::Policy>,
+    work_fee: Option<crate::donation::Policy>,
 ) {
     let t2_coordinate = cfg!(feature = "tail-grind") && matches!(&engine, PhotonEngine::Cuda(_));
     let mut rng = rand::rng();
     let quantum = u64::from(engine.scheduled_batch_candidates(100)) * 64;
     let allocation = work_fee
         .map(|policy| {
-            let schedule = crate::work_fee::Schedule::new(policy.scheme, quantum, rng.random())?;
+            let schedule = crate::donation::Schedule::new(policy.scheme, quantum, rng.random())?;
             let payouts = policy.payouts(prepared.job.network, &prepared.job.payout_address)?;
             Ok::<_, String>((schedule, payouts, policy))
         })
@@ -1123,7 +1123,7 @@ impl SearchHandle {
         device_ordinal: usize,
         intensity: u8,
         job: MiningJob,
-        policy: crate::work_fee::Policy,
+        policy: crate::donation::Policy,
     ) -> Result<Self, String> {
         policy.payouts(job.network, &job.payout_address)?;
         Self::start_inner(backend, device_ordinal, intensity, job, false, Some(policy))
@@ -1136,7 +1136,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
         initially_paused: bool,
-        work_fee: Option<crate::work_fee::Policy>,
+        work_fee: Option<crate::donation::Policy>,
     ) -> Result<Self, String> {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
@@ -2129,7 +2129,7 @@ mod tests {
                     if !seen[index] {
                         samples.push(serde_json::json!({
                             "raw": hex::encode(&winner.transaction), "network": network.as_str(),
-                            "recipient": format!("{:?}", crate::work_fee::Recipient::ALL[index]),
+                            "recipient": format!("{:?}", crate::donation::Recipient::ALL[index]),
                             "payout": payouts[index], "age": 1, "old_target_le": job.target_le_hex,
                             "value": job.baton_value_sats, "amount": job.token_amount.to_string(), "reward": amount.to_string(),
                         }));

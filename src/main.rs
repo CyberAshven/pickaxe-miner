@@ -22,6 +22,7 @@ mod cuda_stage_a_ref;
 mod cuda_stage_b;
 #[allow(dead_code)]
 mod cuda_stage_c;
+mod donation;
 #[allow(dead_code)]
 mod electrum;
 mod funding;
@@ -46,7 +47,6 @@ mod tui;
 mod tx;
 #[cfg(feature = "portable-wgpu")]
 mod wgpu_photon;
-mod work_fee;
 
 use config::RuntimeConfig;
 use electrum::{ElectrumSession, LiveJob};
@@ -57,18 +57,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Prints the miner startup banner and donation policy.
+/// Prints the miner startup banner.
 fn print_banner() {
     println!(
         "Pickaxe Miner {} - interactive CLI",
         env!("CARGO_PKG_VERSION")
-    );
-    println!(
-        "{}",
-        config::MiningToken::Photon
-            .fee_policy(config::MiningNetwork::Mainnet)
-            .scheme
-            .description()
     );
     println!("Type `help` for commands.\n");
 }
@@ -78,7 +71,7 @@ fn print_help() {
     println!(
         r#"Commands:
   help                         Show this help
-  status                       Show intensity, payout, mining, donation, job, rate
+  status                       Show intensity, payout, mining, job, rate
   intensity <10-100>           Set live GPU intensity (default 100)
   pause | p                    Pause/resume GPU mining
   payout <cashaddr>            Set miner payout address
@@ -138,13 +131,6 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
             crate::telemetry::format_hash_rate(s.rate)
         );
     }
-    println!(
-        "{}",
-        config::MiningToken::Photon
-            .fee_policy(config::MiningNetwork::Mainnet)
-            .scheme
-            .description()
-    );
     match &cfg.fulcrum_url {
         Some(u) => println!("fulcrum:       {} (custom, tried first)", redact_url(u)),
         None => println!("fulcrum:       (bootstrap only)"),
@@ -1670,7 +1656,7 @@ mod tests {
         assert_eq!(status["reconnects"], 0);
         assert_eq!(status["endpoint_rotations"], 1);
         assert_eq!(status["rejected_winners"], 2);
-        assert_eq!(status["fee_policy"], "Work fee: 4%");
+        assert_eq!(status["fee_policy"], "Donation: 4%");
         assert_eq!(status["work_candidates"]["miner"], 65_536);
         assert_eq!(status["work_candidates"]["fee"], 0);
         assert!(status["work_candidates"].get("project").is_none());

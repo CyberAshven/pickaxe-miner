@@ -56,7 +56,7 @@ impl Scheme {
             )
         };
         match self {
-            Self::Work(shares) => format!("Work fee: {}", format(shares)),
+            Self::Work(shares) => format!("Donation: {}", format(shares)),
             Self::RewardSplit(shares) => format!("Reward fee: {}", format(shares)),
             Self::Hybrid { work, reward } => format!(
                 "Work fee: {}; personal-reward fee: {}",
@@ -155,7 +155,7 @@ mod tests {
     use super::*;
     #[test]
     fn fee_description_reports_only_totals() {
-        assert_eq!(Scheme::Work([200, 200]).description(), "Work fee: 4%");
+        assert_eq!(Scheme::Work([200, 200]).description(), "Donation: 4%");
         assert_eq!(
             Scheme::Hybrid {
                 work: [150, 100],

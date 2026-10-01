@@ -814,7 +814,7 @@ struct TuiState {
 
 impl TuiState {
     /// Creates a TuiState for the terminal interface.
-    fn new(snapshot: &RuntimeSnapshot) -> Self {
+    fn new(_snapshot: &RuntimeSnapshot) -> Self {
         let mut events = VecDeque::with_capacity(EVENT_HISTORY_CAP);
         events.push_back("started; supervising PHOTON state".into());
         Self {
@@ -826,7 +826,7 @@ impl TuiState {
             show_help: false,
             settings_mode: false,
             logs_mode: false,
-            status_line: snapshot.fee_scheme.description(),
+            status_line: String::new(),
             events,
             devices: Vec::new(),
             history: VecDeque::with_capacity(HISTORY_CAP),
@@ -1532,13 +1532,12 @@ fn apply_palette_command(
         }
         PaletteCommand::Config => {
             let config = format!(
-                "config: backend={}:{} intensity={} payout={} endpoint={} fee={} generation={}",
+                "config: backend={}:{} intensity={} payout={} endpoint={} generation={}",
                 snapshot.gpu_backend,
                 snapshot.gpu_device,
                 snapshot.search.intensity,
                 shorten(&snapshot.payout_address, 42),
                 shorten(&redact_endpoint(&snapshot.endpoint), 42),
-                snapshot.fee_scheme.description(),
                 snapshot.generation_id,
             );
             state.status_line = "Effective configuration added to runtime log".into();
@@ -2079,12 +2078,6 @@ fn render_setup_advanced(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
 /// Renders a review of the configured mining settings.
 fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let device = state.selected_device();
-    let donation = state
-        .config
-        .token
-        .fee_policy(state.config.network)
-        .scheme
-        .description();
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(format!(
@@ -2121,7 +2114,6 @@ fn render_setup_review(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     "not configured"
                 }
             )),
-            Line::from(donation),
             Line::from(""),
             Line::from("> Start mining"),
         ])
@@ -2260,10 +2252,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) 
     let line = Line::from(vec![
         Span::styled(" PICKAXE ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "PHOTON   {state_text}   {} device {}   {}",
+            "PHOTON   {state_text}   {} device {}",
             snapshot.gpu_backend.to_ascii_uppercase(),
             snapshot.gpu_device,
-            snapshot.fee_scheme.description()
         )),
     ]);
     frame.render_widget(

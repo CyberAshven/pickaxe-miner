@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Historical reward split, retained to recover older pending payouts.
-/// New PHOTON mining uses the separate 4% policy in `work_fee`.
+/// New PHOTON mining uses the separate 4% policy in `donation`.
 pub const DONATION_BPS: u16 = 200;
 
 /// Historical addresses: frozen for legacy payout recovery and its VM proof.
@@ -65,8 +65,8 @@ impl MiningToken {
 
     /// Maintainer-editable mode, shares and recipients. The protocol must support
     /// its selected payout scheme before mining starts.
-    pub fn fee_policy(self, network: MiningNetwork) -> crate::work_fee::Policy {
-        use crate::work_fee::{Policy, Scheme};
+    pub fn fee_policy(self, network: MiningNetwork) -> crate::donation::Policy {
+        use crate::donation::{Policy, Scheme};
         match self {
             Self::Photon => Policy {
                 scheme: Scheme::Work([200, 200]),
