@@ -2261,7 +2261,10 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
 fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let network = state.config.network;
     let saved = state.sources.list(network, state.connection_kind);
-    let mut lines = vec![Line::from(vec![Span::raw("Yours "), dim("(tried first):")])];
+    let mut lines = vec![Line::from(vec![
+        Span::raw("Yours "),
+        dim("(tried first, unless also built in):"),
+    ])];
     for (index, entry) in saved.iter().enumerate() {
         let selected = state.connection_selected == index;
         let shown = if selected && state.editing == Some(TextField::Connection) {

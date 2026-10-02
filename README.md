@@ -59,7 +59,7 @@ Without `--no-tui`, the miner opens a short setup:
 4. **Token**: the GPU tokens for that network, or for ASIC, "BCH + all merge-mined tokens" or an ASIC-exclusive token. ASIC mining is not supported yet.
 5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page.
 
-Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. They are tried before the built-in servers. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session.
+Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session.
 
 ## Chipnet PHOTON test
 
