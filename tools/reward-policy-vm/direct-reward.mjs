@@ -23,17 +23,24 @@ try {
   const protocol = readFileSync(join(root, 'src/protocol.rs'), 'utf8');
   const constant = name => hexToBin(protocol.match(new RegExp(`pub const ${name}: &str =\\s*"([a-f0-9]+)"`))[1]);
   const samples = JSON.parse(readFileSync(path, 'utf8'));
-  assert.equal(samples.length, process.argv[2] ? 5 : 25);
+  // Each claim is followed by a chained claim that spends the claim's own
+  // unconfirmed successor baton, as the miner does before Fulcrum lists it.
+  assert.equal(samples.length, process.argv[2] ? 5 : 50);
+  if (!process.argv[2]) {
+    assert.equal(samples.filter(sample => sample.chained).length, 25);
+  }
   for (const sample of samples) {
     const chipnet = sample.network === 'chipnet';
     const tx = decodeTransactionBch(hexToBin(sample.raw));
     assert.notEqual(typeof tx, 'string');
+    const commitment = sample.commitment
+      ? hexToBin(sample.commitment)
+      : Uint8Array.from([...new Uint8Array(4), ...hexToBin(sample.old_target_le), ...new Uint8Array(64)]);
     const source = {
       lockingBytecode: constant(chipnet ? 'CHIPNET_COVENANT_LOCKING_BYTECODE_HEX' : 'COVENANT_LOCKING_BYTECODE_HEX'),
       valueSatoshis: BigInt(sample.value),
       token: { category: constant(chipnet ? 'CHIPNET_CATEGORY_HEX' : 'MAINNET_CATEGORY_HEX'),
-        amount: BigInt(sample.amount), nft: { capability: 'mutable',
-          commitment: Uint8Array.from([...new Uint8Array(4), ...hexToBin(sample.old_target_le), ...new Uint8Array(64)]) } },
+        amount: BigInt(sample.amount), nft: { capability: 'mutable', commitment } },
     };
     const payout = cashAddressToLockingBytecode(sample.payout);
     assert.notEqual(typeof payout, 'string');
@@ -46,13 +53,13 @@ try {
     for (const standard of [false, true]) {
       const vm = createVirtualMachineBch2026(standard);
       assert.equal(vm.verify({ sourceOutputs: [source], transaction: tx }), true,
-        `${sample.network} ${sample.recipient} age=${sample.age}`);
+        `${sample.network} ${sample.recipient} age=${sample.age}${sample.chained ? ' chained' : ''}`);
       const altered = structuredClone(tx);
       altered.outputs[1].token.amount += 1n;
       assert.notEqual(vm.verify({ sourceOutputs: [source], transaction: altered }), true);
     }
   }
-  console.log(`PASS direct payout lifecycle: ${samples.length} mainnet/Chipnet claims, all active recipients, standard and consensus VM; altered rewards rejected.`);
+  console.log(`PASS direct payout lifecycle: ${samples.length} mainnet/Chipnet claims (including chained claims on unconfirmed successor batons), all active recipients, standard and consensus VM; altered rewards rejected.`);
 } finally {
   rmSync(temp, { recursive: true });
 }

@@ -65,6 +65,8 @@ If you used the earlier Chipnet batch-payout preview, retain its `chipnet-fundin
 
 In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
 
+After a verified direct win, the GPU mines the baton that win creates while the claim is broadcast, instead of waiting for Fulcrum to list the unconfirmed claim. The remaining pause is the short live-state check after each win. If the claim turns out stale, that work is discarded and mining continues on the baton Fulcrum reports.
+
 ## Diagnostic logging
 
 Optional file logging is disabled by default. Set `PICKAXE_TUI_LOG` before starting the interactive TUI to append timestamped events and status snapshots (about every 10 seconds) to a local file. Choose a writable location; its parent directory must already exist. This option does not apply to `--no-tui` mode.

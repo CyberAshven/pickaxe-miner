@@ -545,6 +545,41 @@ pub fn validate_direct_reward_record(
     Ok(())
 }
 
+/// The PHOTON baton a winning parent creates at output 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessorBaton {
+    pub value_sats: u64,
+    pub commitment_hex: String,
+    pub token_amount: u128,
+}
+
+/// Reads the successor baton from a signed winning parent so mining can
+/// continue on it before an indexer lists the unconfirmed parent.
+pub fn successor_baton(
+    raw: &[u8],
+    deployment: &PhotonDeployment,
+) -> Result<SuccessorBaton, String> {
+    let [baton, _reward] = parse_parent_outputs(raw)?;
+    let bytes = &baton.token_and_locking_bytecode;
+    validate_deployment_baton_token(deployment, bytes)?;
+    let mut cursor = 34usize;
+    let commitment_len = usize::try_from(read_canonical_compact_uint(bytes, &mut cursor)?)
+        .map_err(|_| "PHOTON baton commitment exceeds usize")?;
+    let commitment_end = cursor
+        .checked_add(commitment_len)
+        .ok_or("PHOTON baton commitment cursor overflow")?;
+    let commitment = bytes
+        .get(cursor..commitment_end)
+        .ok_or("parent baton commitment is truncated")?;
+    cursor = commitment_end;
+    let token_amount = read_canonical_compact_uint(bytes, &mut cursor)?;
+    Ok(SuccessorBaton {
+        value_sats: baton.value_sats,
+        commitment_hex: hex::encode(commitment),
+        token_amount: u128::from(token_amount),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn funded_p2pkh_sighash(

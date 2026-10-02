@@ -39,6 +39,10 @@ const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const PHOTON_STATE_RECHECK: Duration = Duration::from_millis(500);
 const ACCEPTED_BATON_RECHECK: Duration = PHOTON_STATE_RECHECK;
+/// How long an indexer may keep listing a baton this miner already spent
+/// before its view is trusted again.
+const UNINDEXED_SPEND_GRACE: Duration = Duration::from_secs(30);
+const UNINDEXED_SPEND_CAP: usize = 64;
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const REFRESH_RECONNECT_THRESHOLD: u8 = 3;
@@ -167,6 +171,39 @@ fn next_periodic_deadline(previous_deadline: Instant, now: Instant, interval: Du
         .filter(|deadline| *deadline > now)
         .unwrap_or_else(|| now + interval)
 }
+
+/// Batons spent by this miner's accepted or in-flight winners that the
+/// indexer may still list while its mempool view catches up.
+#[derive(Debug, Default)]
+struct UnindexedSpends {
+    spent: Vec<(String, u32, Instant)>,
+}
+
+impl UnindexedSpends {
+    /// Records a baton consumed by a winner this miner is submitting.
+    fn record(&mut self, txid: &str, vout: u32, now: Instant) {
+        if self.spent.len() == UNINDEXED_SPEND_CAP {
+            self.spent.remove(0);
+        }
+        self.spent.push((txid.to_ascii_lowercase(), vout, now));
+    }
+
+    /// Reports whether `job` is a baton this miner already spent recently,
+    /// meaning the indexer lags rather than reporting a competing chain.
+    fn indexer_lags(&self, job: &LiveJob, now: Instant) -> bool {
+        self.spent.iter().any(|(txid, vout, at)| {
+            txid.eq_ignore_ascii_case(&job.baton_txid)
+                && *vout == job.baton_vout
+                && now.saturating_duration_since(*at) < UNINDEXED_SPEND_GRACE
+        })
+    }
+
+    /// Forgets recorded spends once the indexer view is authoritative again.
+    fn clear(&mut self) {
+        self.spent.clear();
+    }
+}
+
 const DIRECT_SUBMISSION_JOURNAL_VERSION: u8 = 5;
 const DIRECT_SUBMISSION_RESOLUTION_VERSION: u8 = 3;
 const SUBMISSION_JOURNAL_VERSION: u8 = 3;
@@ -1819,6 +1856,47 @@ fn resulting_baton_is_authoritative_or_descendant(
     )
 }
 
+/// Builds the job for the baton a journaled direct winner creates. `chain`
+/// supplies the tip context; the baton fields come from the signed parent, so
+/// they match what an indexer reports once it lists the unconfirmed parent.
+fn successor_live_job(
+    pending: &PendingSubmission,
+    chain: &LiveJob,
+    cfg: &RuntimeConfig,
+) -> Result<LiveJob, String> {
+    if !pending.is_direct() {
+        return Err("only direct PHOTON rewards can mine their successor baton early".into());
+    }
+    let raw = hex::decode(&pending.parent_hex)
+        .map_err(|error| format!("pending submission parent hex: {error}"))?;
+    let baton = reward::successor_baton(&raw, cfg.token.photon_deployment(cfg.network))?;
+    if baton.value_sats != pending.resulting_baton_value_sats {
+        return Err("successor baton value disagrees with the journaled winner".into());
+    }
+    // An unconfirmed baton has age 0 regardless of the current tip height.
+    let derived = crate::protocol::derive_photon_state(
+        &baton.commitment_hex,
+        baton.token_amount,
+        chain.height,
+        0,
+    )?;
+    Ok(LiveJob {
+        url: chain.url.clone(),
+        server_version: chain.server_version.clone(),
+        height: chain.height,
+        tip_hash: chain.tip_hash.clone(),
+        baton_txid: pending.parent_txid.to_ascii_lowercase(),
+        baton_vout: pending.resulting_baton_vout,
+        baton_height: 0,
+        baton_value_sats: baton.value_sats,
+        commitment_hex: baton.commitment_hex,
+        token_amount: baton.token_amount,
+        age: derived.age,
+        target_le_hex: derived.target_le_hex,
+        reward_raw: derived.reward_raw,
+    })
+}
+
 /// Classifies a refreshed job after broadcast without walking ancestry from
 /// the still-live input baton toward a transaction that has just spent it.
 fn resolve_post_broadcast_baton<F>(
@@ -2002,6 +2080,7 @@ fn attempt_parent_only_submission(
     cfg: &RuntimeConfig,
     pending: &PendingSubmission,
     journal_path: &Path,
+    unindexed: Option<&UnindexedSpends>,
 ) -> Result<SubmissionAttempt, String> {
     if !pending.is_parent_only() {
         return Err(
@@ -2010,9 +2089,17 @@ fn attempt_parent_only_submission(
     }
     let parent_known = session.transaction_known(&pending.parent_txid)?;
     let fresh = session.fetch_live_job()?;
+    // With a spend tracker, an accepted direct parent hands its successor
+    // baton straight to the GPU instead of waiting for the indexer.
+    let mine_successor = unindexed.is_some() && pending.is_direct();
+    let indexer_lags = unindexed.is_some_and(|spent| spent.indexer_lags(&fresh, Instant::now()));
     if parent_known || resulting_baton_is_authoritative(pending, &fresh) {
         pending.mark_parent_accepted(journal_path)?;
-        if pending.expected_baton_is_current(&fresh) {
+        if pending.expected_baton_is_current(&fresh) || indexer_lags {
+            if mine_successor {
+                let successor = successor_live_job(pending, &fresh, cfg)?;
+                return Ok(SubmissionAttempt::Complete(Box::new(successor)));
+            }
             return Ok(SubmissionAttempt::AwaitingBaton(
                 "PHOTON parent is known; waiting for authoritative baton advance".into(),
             ));
@@ -2027,7 +2114,9 @@ fn attempt_parent_only_submission(
             "PHOTON parent broadcast was attempted; awaiting authoritative acceptance".into(),
         );
     }
-    if !pending.expected_baton_is_current(&fresh) {
+    // A lagging indexer still lists an older baton this miner spent; the
+    // expected baton is then this miner's own unconfirmed successor.
+    if !pending.expected_baton_is_current(&fresh) && !indexer_lags {
         return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
     }
     preflight_pending_transaction(
@@ -2040,6 +2129,11 @@ fn attempt_parent_only_submission(
     let returned = broadcast_pending_transaction(session, cfg, &pending.parent_hex)?;
     ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned)?;
     pending.mark_parent_accepted(journal_path)?;
+    if mine_successor {
+        // The server accepted the parent, so its output-0 baton is spendable.
+        let successor = successor_live_job(pending, &fresh, cfg)?;
+        return Ok(SubmissionAttempt::Complete(Box::new(successor)));
+    }
     let next = session.fetch_live_job()?;
     resolve_post_broadcast_baton(
         pending,
@@ -2056,12 +2150,13 @@ fn attempt_pending_submission(
     cfg: &RuntimeConfig,
     pending: &PendingSubmission,
     journal_path: &Path,
+    unindexed: Option<&UnindexedSpends>,
 ) -> Result<SubmissionAttempt, String> {
     pending.validate()?;
     pending.require_network(cfg.network)?;
 
     if pending.is_parent_only() {
-        return attempt_parent_only_submission(session, cfg, pending, journal_path);
+        return attempt_parent_only_submission(session, cfg, pending, journal_path, unindexed);
     }
 
     let settlement_known = session.transaction_known(&pending.settlement_txid)?;
@@ -2239,7 +2334,7 @@ fn resolve_pending_before_search(
     pending.require_network(cfg.network)?;
     let mut reported_wait = false;
     loop {
-        match attempt_pending_submission(session, cfg, &pending, journal_path)? {
+        match attempt_pending_submission(session, cfg, &pending, journal_path, None)? {
             SubmissionAttempt::Complete(fresh) => {
                 return resolve_confirmed_submission(&pending, &fresh, journal_path);
             }
@@ -2430,6 +2525,17 @@ fn production_preflight_local(
     journal_path: &Path,
     relay_fee_sats_per_kb: u64,
 ) -> Result<(), String> {
+    preflight_live_job(cfg, live, Some(journal_path), relay_fee_sats_per_kb)
+}
+
+/// Validates a job locally. `journal_path` is `None` only for the successor
+/// of the winner whose journal is still being submitted.
+fn preflight_live_job(
+    cfg: &RuntimeConfig,
+    live: &LiveJob,
+    journal_path: Option<&Path>,
+    relay_fee_sats_per_kb: u64,
+) -> Result<(), String> {
     if cfg.payout_address.trim().is_empty() {
         return Err("mining payout address is required".into());
     }
@@ -2441,7 +2547,9 @@ fn production_preflight_local(
         tx::cashaddr_to_p2pkh_locking(&payout)?;
     }
 
-    probe_submission_journal(journal_path)?;
+    if let Some(journal_path) = journal_path {
+        probe_submission_journal(journal_path)?;
+    }
 
     let context = tx::ReferenceJobContext {
         prev_txid: live.baton_txid.clone(),
@@ -3051,6 +3159,8 @@ fn run_supervisor(
     // thread is scheduled still triggers the authoritative freshness gate.
     let mut observed_search_winners = 0;
     let mut winner_refresh_pending = false;
+    let mut unindexed = UnindexedSpends::default();
+    let mut successor_parent: Option<String> = None;
     let mut throughput = ThroughputTracker::new(
         Instant::now(),
         initial_search_stats.candidates,
@@ -3312,15 +3422,21 @@ fn run_supervisor(
                             next_sweep_check = Instant::now();
                             state = SupervisorState::Paused;
                         } else {
-                            match apply_refreshed_job(
-                                session.as_mut().expect("session was just installed"),
-                                &mut cfg,
-                                &mut live,
-                                &mut settlement,
-                                &search,
-                                &journal_path,
-                                next_job,
-                            ) {
+                            let applied = if unindexed.indexer_lags(&next_job, Instant::now()) {
+                                Ok(false)
+                            } else {
+                                unindexed.clear();
+                                apply_refreshed_job(
+                                    session.as_mut().expect("session was just installed"),
+                                    &mut cfg,
+                                    &mut live,
+                                    &mut settlement,
+                                    &search,
+                                    &journal_path,
+                                    next_job,
+                                )
+                            };
+                            match applied {
                                 Ok(changed) => {
                                     if changed {
                                         job_changes = job_changes.saturating_add(1);
@@ -3411,13 +3527,44 @@ fn run_supervisor(
                 }
             }
         } else if pending_submission.is_some() {
+            let pending = pending_submission.as_ref().expect("checked above").clone();
+            if successor_parent.as_deref() != Some(pending.parent_txid.as_str()) {
+                // Keep the GPU busy on this winner's own successor baton while
+                // the parent is broadcast; the journal still gates recovery.
+                successor_parent = Some(pending.parent_txid.clone());
+                match begin_successor_generation(
+                    &pending,
+                    &mut cfg,
+                    &mut live,
+                    &mut settlement,
+                    &search,
+                    &mut unindexed,
+                ) {
+                    Ok(true) => {
+                        job_changes = job_changes.saturating_add(1);
+                        emit_job_change_if_changed(&event_tx, true, cfg.generation_id, &live);
+                        if search_resume_allowed(&shutdown, user_paused, 0) {
+                            pending_winners = 0;
+                            let _ = search.apply_control(SearchCommand::Resume);
+                            state = SupervisorState::Mining;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => emit(
+                        &event_tx,
+                        RuntimeEvent::Error(format!(
+                            "successor mining unavailable until the parent resolves: {error}"
+                        )),
+                    ),
+                }
+            }
             if Instant::now() >= next_submission_retry {
-                let pending = pending_submission.as_ref().expect("checked above").clone();
                 let attempt = attempt_pending_submission(
                     session.as_mut().expect("checked session above"),
                     &cfg,
                     &pending,
                     &journal_path,
+                    Some(&unindexed),
                 );
                 match attempt {
                     Ok(SubmissionAttempt::AwaitingBaton(_)) => {
@@ -3523,6 +3670,9 @@ fn run_supervisor(
                                 pending_winners = 0;
                                 stale_winners = stale_winners.saturating_add(1);
                                 last_error = None;
+                                // The parent never spent its baton, so the
+                                // indexer's view replaces any successor work.
+                                unindexed.clear();
                                 match apply_refreshed_job(
                                     session.as_mut().expect("checked session above"),
                                     &mut cfg,
@@ -3677,15 +3827,23 @@ fn run_supervisor(
                         last_error = Some(warning.clone());
                     }
                     state_checks = state_checks.saturating_add(1);
-                    match apply_refreshed_job(
-                        session.as_mut().expect("checked session above"),
-                        &mut cfg,
-                        &mut live,
-                        &mut settlement,
-                        &search,
-                        &journal_path,
-                        boundary.job,
-                    ) {
+                    // An indexer still listing a baton this miner spent keeps
+                    // the current successor generation mining.
+                    let applied = if unindexed.indexer_lags(&boundary.job, Instant::now()) {
+                        Ok(false)
+                    } else {
+                        unindexed.clear();
+                        apply_refreshed_job(
+                            session.as_mut().expect("checked session above"),
+                            &mut cfg,
+                            &mut live,
+                            &mut settlement,
+                            &search,
+                            &journal_path,
+                            boundary.job,
+                        )
+                    };
+                    match applied {
                         Ok(changed) => {
                             if changed {
                                 job_changes = job_changes.saturating_add(1);
@@ -4295,6 +4453,45 @@ fn apply_refreshed_job(
         *live = next;
         Ok(false)
     }
+}
+
+/// Starts mining the baton a just-journaled direct winner creates while its
+/// parent is broadcast. If the parent turns out stale, the next authoritative
+/// job replaces this generation and its winners are discarded as stale.
+fn begin_successor_generation(
+    pending: &PendingSubmission,
+    cfg: &mut RuntimeConfig,
+    live: &mut LiveJob,
+    settlement: &mut SettlementState,
+    search: &SearchHandle,
+    unindexed: &mut UnindexedSpends,
+) -> Result<bool, String> {
+    if !pending.is_direct() || !pending.expected_baton_is_current(live) {
+        return Ok(false);
+    }
+    let next = successor_live_job(pending, live, cfg)?;
+    let staged =
+        prepare_generation_transition(cfg, live, settlement, &next, |next_cfg, next_live| {
+            let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(next_cfg)?;
+            preflight_live_job(next_cfg, next_live, None, relay_fee_sats_per_kb)
+        })?;
+    let Some((next_cfg, next_settlement)) = staged else {
+        return Ok(false);
+    };
+    search.replace_job(next.to_mining_job_for_network(
+        next_cfg.generation_id,
+        &next_cfg.payout_address,
+        next_cfg.network,
+    ))?;
+    unindexed.record(
+        &pending.expected_baton_txid,
+        pending.expected_baton_vout,
+        Instant::now(),
+    );
+    *cfg = next_cfg;
+    *settlement = next_settlement;
+    *live = next;
+    Ok(true)
 }
 
 /// Prepares a safe transition to a different Fulcrum endpoint.
@@ -4973,53 +5170,58 @@ mod tests {
                         .payouts(network, &cfg.payout_address)
                         .unwrap()[recipient as usize]
                         .clone();
-                    let context = tx::ReferenceJobContext {
-                        prev_txid: job.baton_txid.clone(),
-                        prev_vout: job.baton_vout,
-                        age,
-                        target_le_hex: job.target_le_hex.clone(),
-                        contract_value_sats: job.baton_value_sats,
-                        contract_token_amount: job.token_amount,
-                        reward_raw: job.reward_raw,
-                    };
                     let secret = [1u8; 32]; // Synthetic offline signer, never a reward key.
                     let public = secp256k1::PublicKey::from_secret_key(
                         &secp256k1::SecretKey::from_secret_bytes(secret).unwrap(),
                     )
                     .serialize();
-                    let mut last_error = String::new();
-                    let winner = (0..1024)
-                        .find_map(|nonce| {
-                            let message =
-                                tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
-                            let signature =
-                                crate::crypto::bch_schnorr_sign(&secret, &message).unwrap();
-                            tx::apply_reference_signature_for_deployment(
-                                &context,
-                                &payout,
-                                &hex::encode(public),
-                                nonce,
-                                &hex::encode(signature),
-                                deployment,
-                            )
-                            .inspect_err(|error| last_error = error.clone())
-                            .ok()
-                            .map(|transaction| VerifiedWinner {
-                                generation_id: cfg.generation_id,
-                                height: job.height,
-                                baton_txid: job.baton_txid.clone(),
-                                baton_vout: job.baton_vout,
-                                job_reward_raw: job.reward_raw,
-                                nonce,
-                                public_key: public,
-                                signature,
-                                digest: crate::search::hash256(&transaction),
-                                transaction,
+                    let sign_winner = |job: &LiveJob, generation_id: u64| {
+                        let context = tx::ReferenceJobContext {
+                            prev_txid: job.baton_txid.clone(),
+                            prev_vout: job.baton_vout,
+                            age: job.age,
+                            target_le_hex: job.target_le_hex.clone(),
+                            contract_value_sats: job.baton_value_sats,
+                            contract_token_amount: job.token_amount,
+                            reward_raw: job.reward_raw,
+                        };
+                        let mut last_error = String::new();
+                        (0..1024)
+                            .find_map(|nonce| {
+                                let message =
+                                    tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+                                let signature =
+                                    crate::crypto::bch_schnorr_sign(&secret, &message).unwrap();
+                                tx::apply_reference_signature_for_deployment(
+                                    &context,
+                                    &payout,
+                                    &hex::encode(public),
+                                    nonce,
+                                    &hex::encode(signature),
+                                    deployment,
+                                )
+                                .inspect_err(|error| last_error = error.clone())
+                                .ok()
+                                .map(|transaction| {
+                                    VerifiedWinner {
+                                        generation_id,
+                                        height: job.height,
+                                        baton_txid: job.baton_txid.clone(),
+                                        baton_vout: job.baton_vout,
+                                        job_reward_raw: job.reward_raw,
+                                        nonce,
+                                        public_key: public,
+                                        signature,
+                                        digest: crate::search::hash256(&transaction),
+                                        transaction,
+                                    }
+                                })
                             })
-                        })
-                        .unwrap_or_else(|| {
-                            panic!("{network:?} {recipient:?} age={age}: {last_error}")
-                        });
+                            .unwrap_or_else(|| {
+                                panic!("{network:?} {recipient:?} age={}: {last_error}", job.age)
+                            })
+                    };
+                    let winner = sign_winner(&job, cfg.generation_id);
                     let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
                     production_preflight_local(&cfg, &job, &journal, 1_000).unwrap();
                     let pending =
@@ -5111,6 +5313,72 @@ mod tests {
                     let resolved = ResolvedSubmission::load(&journal).unwrap().unwrap();
                     resolved.validate().unwrap();
                     assert_eq!(resolved.parent_txid, pending.parent_txid);
+
+                    // The successor job built from the signed parent is exactly
+                    // what Fulcrum reports once it lists the unconfirmed parent.
+                    let successor = successor_live_job(&pending, &job, &cfg).unwrap();
+                    assert_eq!(successor.baton_txid, pending.parent_txid);
+                    assert_eq!(successor.baton_vout, 0);
+                    assert_eq!((successor.baton_height, successor.age), (0, 0));
+                    assert_eq!(
+                        successor.baton_value_sats,
+                        pending.resulting_baton_value_sats
+                    );
+                    let header = serde_json::json!({
+                        "height": job.height,
+                        "hex": "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c"
+                    });
+                    let unspent = serde_json::json!([{
+                        "tx_hash": successor.baton_txid,
+                        "tx_pos": 0,
+                        "height": 0,
+                        "value": successor.baton_value_sats,
+                        "token_data": {
+                            "category": deployment.category_hex,
+                            "amount": successor.token_amount.to_string(),
+                            "nft": {
+                                "capability": "mutable",
+                                "commitment": successor.commitment_hex,
+                            },
+                        },
+                    }]);
+                    let indexed = crate::electrum::live_job_from_fulcrum_values_for_deployment(
+                        &job.url,
+                        job.server_version.clone(),
+                        &header,
+                        &unspent,
+                        deployment,
+                    )
+                    .unwrap();
+                    assert!(!live_job_changed(&successor, &indexed));
+
+                    // A winner on the unconfirmed successor passes the job
+                    // checks and journals a parent that spends it.
+                    preflight_live_job(&cfg, &successor, None, 1_000).unwrap();
+                    let mut chained_cfg = cfg.clone();
+                    chained_cfg.bump_generation();
+                    let chained_settlement =
+                        SettlementState::new(chained_cfg.generation_id, &successor).unwrap();
+                    let chained_winner = sign_winner(&successor, chained_cfg.generation_id);
+                    let chained = prepare_submission_for_network(
+                        &chained_winner,
+                        &chained_cfg,
+                        &successor,
+                        &chained_settlement,
+                        &journal,
+                    )
+                    .unwrap();
+                    assert!(chained.expected_baton_is_current(&successor));
+                    assert!(successor_live_job(&chained, &successor, &chained_cfg).is_ok());
+                    PendingSubmission::remove(&journal).unwrap();
+                    samples.push(serde_json::json!({
+                        "raw": chained.parent_hex, "network": network.as_str(), "recipient": format!("{recipient:?}"),
+                        "payout": payout, "age": successor.age, "old_target_le": &successor.commitment_hex[8..72],
+                        "commitment": successor.commitment_hex,
+                        "value": successor.baton_value_sats, "amount": successor.token_amount.to_string(),
+                        "reward": successor.reward_raw.to_string(), "chained": true,
+                    }));
+
                     samples.push(serde_json::json!({
                         "raw": pending.parent_hex, "network": network.as_str(), "recipient": format!("{recipient:?}"),
                         "payout": payout, "age": age, "old_target_le": le32(&old_target),
@@ -5128,6 +5396,41 @@ mod tests {
         if let Ok(path) = std::env::var("PICKAXE_DIRECT_REWARD_PROOF") {
             fs::write(path, serde_json::to_vec(&samples).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    /// Checks that only recently spent batons count as indexer lag.
+    fn unindexed_spends_mark_recent_own_batons_as_indexer_lag() {
+        let start = Instant::now();
+        let spent = live_job();
+        let mut successor = live_job();
+        successor.baton_txid = "33".repeat(32);
+        let mut competing = live_job();
+        competing.baton_txid = "44".repeat(32);
+
+        let mut unindexed = UnindexedSpends::default();
+        assert!(!unindexed.indexer_lags(&spent, start));
+        unindexed.record(
+            &spent.baton_txid.to_ascii_uppercase(),
+            spent.baton_vout,
+            start,
+        );
+        assert!(unindexed.indexer_lags(&spent, start + Duration::from_secs(1)));
+        assert!(!unindexed.indexer_lags(&successor, start));
+        assert!(!unindexed.indexer_lags(&competing, start));
+        let mut other_output = spent.clone();
+        other_output.baton_vout = 1;
+        assert!(!unindexed.indexer_lags(&other_output, start));
+        // A spend the indexer still lists after the grace period is trusted again.
+        assert!(!unindexed.indexer_lags(&spent, start + UNINDEXED_SPEND_GRACE));
+
+        for index in 0..UNINDEXED_SPEND_CAP {
+            unindexed.record(&format!("{index:064x}"), 0, start);
+        }
+        assert_eq!(unindexed.spent.len(), UNINDEXED_SPEND_CAP);
+        assert!(!unindexed.indexer_lags(&spent, start));
+        unindexed.clear();
+        assert!(unindexed.spent.is_empty());
     }
 
     #[test]
