@@ -4530,14 +4530,13 @@ fn prepare_fulcrum_endpoint_change(
 
 /// Reports whether the refreshed job changes search-relevant material.
 fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
-    // Tip hash and route metadata are not the resident GPU job. A same-height
-    // reorg that leaves baton, height, target, and source work unchanged must
-    // keep the current generation mining.
+    // Tip hash and route metadata are not the resident GPU job. The signed
+    // claim depends on the chain only through `age`, so a block that confirms
+    // the baton or extends the tip without changing age, target, or baton
+    // fields leaves every candidate and every found winner valid.
     current.baton_txid != next.baton_txid
         || current.baton_vout != next.baton_vout
-        || current.baton_height != next.baton_height
         || current.baton_value_sats != next.baton_value_sats
-        || current.height != next.height
         || current.age != next.age
         || current.commitment_hex != next.commitment_hex
         || current.target_le_hex != next.target_le_hex
@@ -4545,10 +4544,10 @@ fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
         || current.reward_raw != next.reward_raw
 }
 
-/// Checks whether a GPU winner belongs to the current live baton.
+/// Checks whether a GPU winner belongs to the current live baton. Any change
+/// to the signed work bumps the generation; a height-only change does not.
 fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJob) -> bool {
     winner.generation_id == generation_id
-        && winner.height == live.height
         && winner.baton_txid == live.baton_txid
         && winner.baton_vout == live.baton_vout
 }
@@ -5470,6 +5469,19 @@ mod tests {
         next.age += 1;
         assert!(live_job_changed(&current, &next));
 
+        // A block that confirms an unconfirmed baton, or extends the tip
+        // without changing age, leaves the signed work unchanged.
+        let mut unconfirmed = current.clone();
+        unconfirmed.baton_height = 0;
+        unconfirmed.age = 0;
+        let mut confirmed = unconfirmed.clone();
+        confirmed.height += 1;
+        confirmed.baton_height = confirmed.height;
+        assert!(
+            !live_job_changed(&unconfirmed, &confirmed),
+            "confirming the baton without changing age must keep the GPU job"
+        );
+
         let mut baton = current.clone();
         baton.baton_txid = "22".repeat(32);
         assert!(live_job_changed(&current, &baton));
@@ -5875,9 +5887,11 @@ mod tests {
         let old_generation = winner(3, &job);
         assert!(!winner_matches_live(&old_generation, 4, &job));
 
+        // Height alone does not change the signed claim; a work change bumps
+        // the generation and is rejected above.
         let mut next_height = job.clone();
         next_height.height += 1;
-        assert!(!winner_matches_live(&current, 4, &next_height));
+        assert!(winner_matches_live(&current, 4, &next_height));
 
         let mut next_baton = job;
         next_baton.baton_vout = 1;
