@@ -3805,13 +3805,24 @@ fn run_supervisor(
             }
         } else if Instant::now() >= next_state_refresh {
             let previous_state_refresh = next_state_refresh;
-            let refreshed = refresh_photon_job_on_cadence(
-                &cfg,
-                session.as_mut().expect("checked session above"),
-                &mut sources,
-                &mut native_photon_session,
-                source_capability_epoch,
-            );
+            let refreshed = if force_winner_refresh {
+                // Every new claim is a direct claim, which re-checks the live
+                // baton before broadcast while the GPU mines its successor.
+                // Match the winner against the current job without another
+                // round trip; a stale claim resolves through its journal.
+                Ok(PhotonBoundaryRefresh {
+                    job: live.clone(),
+                    route_warning: None,
+                })
+            } else {
+                refresh_photon_job_on_cadence(
+                    &cfg,
+                    session.as_mut().expect("checked session above"),
+                    &mut sources,
+                    &mut native_photon_session,
+                    source_capability_epoch,
+                )
+            };
             next_state_refresh = next_periodic_deadline(
                 previous_state_refresh,
                 Instant::now(),
