@@ -614,6 +614,232 @@ pub fn profiles_path(config_path: &Path) -> PathBuf {
     config_path.with_extension("profiles.json")
 }
 
+pub fn sources_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("sources.json")
+}
+
+/// Most user-added connections kept per network and kind.
+const MAX_SHARED_SOURCES: usize = 16;
+
+/// A user-added connection type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionKind {
+    Fulcrum,
+    Node,
+}
+
+/// Fulcrum servers and nodes the user added for one network.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkSources {
+    pub fulcrum: Vec<String>,
+    pub node_rpc: Vec<String>,
+}
+
+/// User-added connections, kept per network and shared by every profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SharedSources {
+    pub mainnet: NetworkSources,
+    pub chipnet: NetworkSources,
+}
+
+impl SharedSources {
+    /// Loads the shared connections, or none when the file does not exist.
+    pub fn load_optional(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes = fs::read(path)
+            .map_err(|error| format!("read connections {}: {error}", path.display()))?;
+        let store: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse connections {}: {error}", path.display()))?;
+        for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            for kind in [ConnectionKind::Fulcrum, ConnectionKind::Node] {
+                let list = store.list(network, kind);
+                if list.len() > MAX_SHARED_SOURCES {
+                    return Err(format!("too many saved connections in {}", path.display()));
+                }
+                for entry in list {
+                    Self::validate_entry(network, kind, entry)?;
+                }
+            }
+        }
+        Ok(store)
+    }
+
+    /// Persists the shared connections with private file permissions, since
+    /// node URLs may carry credentials.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("create connections directory {}: {error}", parent.display())
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize connections: {error}"))?;
+        write_private_config(path, &bytes)
+    }
+
+    fn sources(&self, network: MiningNetwork) -> &NetworkSources {
+        match network {
+            MiningNetwork::Mainnet => &self.mainnet,
+            MiningNetwork::Chipnet => &self.chipnet,
+        }
+    }
+
+    /// Returns the user-added connections of one kind for a network.
+    pub fn list(&self, network: MiningNetwork, kind: ConnectionKind) -> &[String] {
+        let sources = self.sources(network);
+        match kind {
+            ConnectionKind::Fulcrum => &sources.fulcrum,
+            ConnectionKind::Node => &sources.node_rpc,
+        }
+    }
+
+    fn list_mut(&mut self, network: MiningNetwork, kind: ConnectionKind) -> &mut Vec<String> {
+        let sources = match network {
+            MiningNetwork::Mainnet => &mut self.mainnet,
+            MiningNetwork::Chipnet => &mut self.chipnet,
+        };
+        match kind {
+            ConnectionKind::Fulcrum => &mut sources.fulcrum,
+            ConnectionKind::Node => &mut sources.node_rpc,
+        }
+    }
+
+    /// Validates one connection for a network and returns its normalized form.
+    pub fn validate_entry(
+        network: MiningNetwork,
+        kind: ConnectionKind,
+        value: &str,
+    ) -> Result<String, String> {
+        let value = value.trim();
+        if value.contains(',') {
+            return Err("enter one connection at a time".into());
+        }
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_network(network);
+        let normalized = match kind {
+            ConnectionKind::Fulcrum => {
+                runtime.set_fulcrum_url(value)?;
+                runtime.fulcrum_url
+            }
+            ConnectionKind::Node => {
+                runtime.set_node_url(value)?;
+                runtime.node_url
+            }
+        };
+        normalized.ok_or_else(|| "connection URL is empty".into())
+    }
+
+    /// Adds a connection, or replaces the one at `index`, for every profile on
+    /// that network.
+    pub fn put(
+        &mut self,
+        network: MiningNetwork,
+        kind: ConnectionKind,
+        index: Option<usize>,
+        value: &str,
+    ) -> Result<(), String> {
+        let entry = Self::validate_entry(network, kind, value)?;
+        let list = self.list_mut(network, kind);
+        if list
+            .iter()
+            .enumerate()
+            .any(|(other, existing)| Some(other) != index && existing.eq_ignore_ascii_case(&entry))
+        {
+            return Err("that connection is already saved".into());
+        }
+        match index.filter(|index| *index < list.len()) {
+            Some(index) => list[index] = entry,
+            None if list.len() >= MAX_SHARED_SOURCES => {
+                return Err(format!(
+                    "at most {MAX_SHARED_SOURCES} saved connections per network"
+                ))
+            }
+            None => list.push(entry),
+        }
+        Ok(())
+    }
+
+    /// Removes a saved connection from every profile on that network.
+    pub fn remove(&mut self, network: MiningNetwork, kind: ConnectionKind, index: usize) {
+        let list = self.list_mut(network, kind);
+        if index < list.len() {
+            list.remove(index);
+        }
+    }
+
+    /// Puts this network's saved connections on `cfg`, tried before the
+    /// built-in servers; clears them when none are saved.
+    pub fn apply_to_runtime(&self, cfg: &mut RuntimeConfig) -> Result<(), String> {
+        cfg.set_fulcrum_url(&self.list(cfg.network, ConnectionKind::Fulcrum).join(","))?;
+        cfg.set_node_url(&self.list(cfg.network, ConnectionKind::Node).join(","))
+    }
+
+    /// Adds each entry of a comma-separated legacy list; returns whether any
+    /// was new. Invalid or duplicate entries are skipped rather than blocking
+    /// startup.
+    fn adopt_list(&mut self, network: MiningNetwork, kind: ConnectionKind, list: &str) -> bool {
+        let mut added = false;
+        for entry in list
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            added |= self.put(network, kind, None, entry).is_ok();
+        }
+        added
+    }
+
+    /// Moves servers and nodes saved inside profiles into the shared lists of
+    /// each profile's network. Returns whether any profile changed.
+    pub fn adopt_profile_sources(&mut self, profiles: &mut MiningProfiles) -> bool {
+        let mut moved = false;
+        for profile in &mut profiles.profiles {
+            let network = profile
+                .settings
+                .network
+                .as_deref()
+                .and_then(|value| MiningNetwork::parse(value).ok())
+                .unwrap_or(MiningNetwork::Mainnet);
+            for (kind, field) in [
+                (ConnectionKind::Fulcrum, profile.settings.fulcrum.take()),
+                (ConnectionKind::Node, profile.settings.node_rpc.take()),
+            ] {
+                if let Some(field) = field {
+                    moved = true;
+                    self.adopt_list(network, kind, &field);
+                }
+            }
+        }
+        moved
+    }
+
+    /// Copies servers and nodes from the saved base configuration into the
+    /// shared lists. Returns whether any entry was new.
+    pub fn adopt_saved_config(&mut self, saved: &SavedConfig) -> bool {
+        let network = saved
+            .network
+            .as_deref()
+            .and_then(|value| MiningNetwork::parse(value).ok())
+            .unwrap_or(MiningNetwork::Mainnet);
+        let fulcrum = saved
+            .fulcrum
+            .as_deref()
+            .is_some_and(|list| self.adopt_list(network, ConnectionKind::Fulcrum, list));
+        let node = saved
+            .node_rpc
+            .as_deref()
+            .is_some_and(|list| self.adopt_list(network, ConnectionKind::Node, list));
+        fulcrum || node
+    }
+}
+
 fn valid_profile_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
@@ -679,6 +905,14 @@ impl MiningProfiles {
             .ok_or("profile no longer exists")?
             .name = name.into();
         Ok(())
+    }
+
+    /// Deletes a saved profile and returns its name.
+    pub fn remove(&mut self, index: usize) -> Result<String, String> {
+        if index >= self.profiles.len() {
+            return Err("profile no longer exists".into());
+        }
+        Ok(self.profiles.remove(index).name)
     }
 
     pub fn upsert(
@@ -862,6 +1096,163 @@ mod tests {
         let payouts = chipnet.payouts(MiningNetwork::Chipnet, PAYOUT).unwrap();
         assert_eq!(payouts[1], CHIPNET_DONATION_ADDRESS);
         assert_eq!(payouts[2], CHIPNET_DONATION_ADDRESS);
+    }
+
+    #[test]
+    fn shared_connections_are_validated_kept_per_network_and_persisted() {
+        let mut sources = SharedSources::default();
+        sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "wss://one.test:50004",
+            )
+            .unwrap();
+        assert!(sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "WSS://ONE.test:50004"
+            )
+            .unwrap_err()
+            .contains("already saved"));
+        assert!(sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "https://one.test"
+            )
+            .is_err());
+        assert!(sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "wss://a.test, wss://b.test"
+            )
+            .unwrap_err()
+            .contains("one connection at a time"));
+        // A published server of the other chain is refused.
+        assert!(sources
+            .put(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Fulcrum,
+                None,
+                crate::protocol::FULCRUM_WSS_BOOTSTRAP[0],
+            )
+            .is_err());
+        sources
+            .put(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Node,
+                None,
+                "http://127.0.0.1:18332",
+            )
+            .unwrap();
+        sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                Some(0),
+                "wss://two.test:50004",
+            )
+            .unwrap();
+        assert_eq!(
+            sources.list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum),
+            ["wss://two.test:50004"]
+        );
+
+        let mut mainnet = RuntimeConfig::default();
+        sources.apply_to_runtime(&mut mainnet).unwrap();
+        assert_eq!(mainnet.fulcrum_url.as_deref(), Some("wss://two.test:50004"));
+        assert!(mainnet.node_url.is_none());
+        let mut chipnet = RuntimeConfig::default();
+        chipnet.set_network(MiningNetwork::Chipnet);
+        sources.apply_to_runtime(&mut chipnet).unwrap();
+        assert!(chipnet.fulcrum_url.is_none());
+        assert_eq!(chipnet.node_url.as_deref(), Some("http://127.0.0.1:18332"));
+
+        let path =
+            std::env::temp_dir().join(format!("pickaxe-sources-{}.json", std::process::id()));
+        sources.save(&path).unwrap();
+        assert_eq!(SharedSources::load_optional(&path).unwrap(), sources);
+        sources.remove(MiningNetwork::Mainnet, ConnectionKind::Fulcrum, 0);
+        assert!(sources
+            .list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum)
+            .is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_and_base_config_connections_move_to_the_shared_lists() {
+        let mut chipnet = RuntimeConfig::default();
+        chipnet.set_network(MiningNetwork::Chipnet);
+        chipnet
+            .set_fulcrum_url("wss://mine.test:50004, wss://second.test:50004")
+            .unwrap();
+        let mut mainnet = RuntimeConfig::default();
+        mainnet.set_node_url("http://127.0.0.1:8332").unwrap();
+        let mut profiles = MiningProfiles::default();
+        profiles
+            .upsert(
+                None,
+                "Chip",
+                SavedConfig::from_effective("cuda", Some(0), &chipnet),
+            )
+            .unwrap();
+        profiles
+            .upsert(
+                None,
+                "Main",
+                SavedConfig::from_effective("cuda", Some(0), &mainnet),
+            )
+            .unwrap();
+
+        let mut sources = SharedSources::default();
+        assert!(sources.adopt_profile_sources(&mut profiles));
+        assert_eq!(
+            sources.list(MiningNetwork::Chipnet, ConnectionKind::Fulcrum),
+            ["wss://mine.test:50004", "wss://second.test:50004"]
+        );
+        assert_eq!(
+            sources.list(MiningNetwork::Mainnet, ConnectionKind::Node),
+            ["http://127.0.0.1:8332"]
+        );
+        assert!(profiles.profiles.iter().all(
+            |profile| profile.settings.fulcrum.is_none() && profile.settings.node_rpc.is_none()
+        ));
+        assert!(!sources.adopt_profile_sources(&mut profiles));
+
+        let base = SavedConfig::from_effective("cuda", Some(0), &chipnet);
+        assert!(
+            !sources.adopt_saved_config(&base),
+            "already saved entries add nothing"
+        );
+        let mut other = mainnet.clone();
+        other.set_fulcrum_url("wss://base.test:50004").unwrap();
+        assert!(sources.adopt_saved_config(&SavedConfig::from_effective("cuda", Some(0), &other)));
+        assert_eq!(
+            sources.list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum),
+            ["wss://base.test:50004"]
+        );
+    }
+
+    #[test]
+    fn profiles_can_be_removed_by_index() {
+        let mut profiles = MiningProfiles::default();
+        profiles
+            .upsert(
+                None,
+                "Only",
+                SavedConfig::from_effective("cuda", Some(0), &RuntimeConfig::default()),
+            )
+            .unwrap();
+        assert!(profiles.remove(1).is_err());
+        assert_eq!(profiles.remove(0).unwrap(), "Only");
+        assert!(profiles.profiles.is_empty());
     }
 
     #[test]

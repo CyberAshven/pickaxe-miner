@@ -1309,7 +1309,47 @@ fn main() {
         },
         cli::Commands::Mine => {
             let profiles_path = config::profiles_path(&config_path);
+            let sources_path = config::sources_path(&config_path);
+            let mut sources = match config::SharedSources::load_optional(&sources_path) {
+                Ok(sources) => sources,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            };
+            if saved_config
+                .as_ref()
+                .is_some_and(|saved| sources.adopt_saved_config(saved))
+            {
+                if let Err(error) = sources.save(&sources_path) {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            }
             let startup = mine_startup(&args);
+            let mut cfg = cfg;
+            if matches!(startup, MineStartup::Direct) {
+                // Saved per-network connections apply unless the command line
+                // or the base configuration named its own.
+                let fulcrum = sources.list(cfg.network, config::ConnectionKind::Fulcrum);
+                let node = sources.list(cfg.network, config::ConnectionKind::Node);
+                let applied = (if cfg.fulcrum_url.is_none() {
+                    cfg.set_fulcrum_url(&fulcrum.join(","))
+                } else {
+                    Ok(())
+                })
+                .and_then(|()| {
+                    if cfg.node_url.is_none() {
+                        cfg.set_node_url(&node.join(","))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = applied {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            }
             if matches!(startup, MineStartup::Direct)
                 && (args.no_tui || args.json)
                 && cfg.payout_address.trim().is_empty()
@@ -1339,13 +1379,24 @@ fn main() {
                             std::process::exit(2);
                         }
                     };
-                    let profiles = match config::MiningProfiles::load_optional(&profiles_path) {
+                    let mut profiles = match config::MiningProfiles::load_optional(&profiles_path) {
                         Ok(profiles) => profiles,
                         Err(error) => {
                             eprintln!("error: {error}");
                             std::process::exit(2);
                         }
                     };
+                    // Servers and nodes once saved inside profiles move to the
+                    // shared per-network lists; save those before the profiles.
+                    if sources.adopt_profile_sources(&mut profiles) {
+                        if let Err(error) = sources
+                            .save(&sources_path)
+                            .and_then(|()| profiles.save(&profiles_path))
+                        {
+                            eprintln!("error: {error}");
+                            std::process::exit(2);
+                        }
+                    }
                     let overrides = tui::SetupOverrides {
                         network: if args.chipnet {
                             Some(config::MiningNetwork::Chipnet)
@@ -1368,6 +1419,8 @@ fn main() {
                         &selected,
                         &profiles_path,
                         profiles,
+                        &sources_path,
+                        sources,
                         overrides,
                     ) {
                         Ok(Some(setup)) => setup,

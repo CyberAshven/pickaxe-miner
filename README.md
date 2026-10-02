@@ -49,6 +49,18 @@ Headless, from the same directory:
 .\pickaxe.exe mine --no-tui
 ```
 
+## Setup and profiles
+
+Without `--no-tui`, the miner opens a short setup:
+
+1. **Profiles**: your saved profiles. Enter on one opens its settings with Start selected, so a second Enter mines. `R` renames and `D` deletes (with a confirmation).
+2. **Hardware**: GPU or ASIC.
+3. **Network**: Mainnet or Chipnet.
+4. **Token**: the GPU tokens for that network, or for ASIC, "BCH + all merge-mined tokens" or an ASIC-exclusive token. ASIC mining is not supported yet.
+5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page.
+
+Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. They are tried before the built-in servers. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session.
+
 ## Chipnet PHOTON test
 
 Use a build containing Chipnet support (the v0.0.2 download above predates it). After building this branch, run from the project root with the GPU files in place:
