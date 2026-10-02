@@ -2102,7 +2102,7 @@ fn resolve_pending_before_search(
         return Ok(());
     };
     pending.require_network(cfg.network)?;
-    let mut reported_wait = false;
+    let mut next_wait_report = Instant::now();
     loop {
         match attempt_pending_submission(session, cfg, &pending, journal_path, None)? {
             SubmissionAttempt::Complete(fresh) => {
@@ -2112,9 +2112,10 @@ fn resolve_pending_before_search(
                 return resolve_stale_submission(&pending, &fresh, journal_path);
             }
             SubmissionAttempt::AwaitingBaton(message) => {
-                if !reported_wait {
+                let now = Instant::now();
+                if now >= next_wait_report {
                     eprintln!("{message}");
-                    reported_wait = true;
+                    next_wait_report = now + Duration::from_secs(30);
                 }
                 thread::sleep(ACCEPTED_BATON_RECHECK);
             }
@@ -2830,7 +2831,7 @@ fn run_supervisor(
     let mut successor_parent: Option<String> = None;
     // The relay draws on the whole network catalog, not the probe-limited
     // connection candidates, so it reaches servers beyond the active one.
-    let relay = ClaimRelay::spawn(
+    let mut relay = ClaimRelay::spawn(
         relay_fulcrum_endpoints(&sources, &active_fulcrum_endpoint),
         cfg.token.photon_deployment(cfg.network),
     );
@@ -3074,6 +3075,12 @@ fn run_supervisor(
                             );
                         }
                         active_fulcrum_endpoint = connected_endpoint;
+                        // A reconnect may select a different active server or
+                        // follow a source-catalog change from Settings.
+                        relay = ClaimRelay::spawn(
+                            relay_fulcrum_endpoints(&sources, &active_fulcrum_endpoint),
+                            cfg.token.photon_deployment(cfg.network),
+                        );
                         reconnects = reconnects.saturating_add(1);
                         refresh_failures.reconnect_success(rotated);
                         reconnect_backoff = RECONNECT_MIN;
