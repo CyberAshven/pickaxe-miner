@@ -266,9 +266,17 @@ pub const FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://fulcrum.kronbit.com:50004",
 ];
 
-/// Chipnet WSS bootstrap for PHOTON baton discovery.
+/// Chipnet WSS bootstrap for PHOTON baton discovery. Public Chipnet Fulcrum
+/// servers (Electron Cash's Chipnet list plus OPTN) that answered a live
+/// Chipnet PHOTON baton query over WSS on 2026-10-02; the source health policy
+/// picks among them. `blackie.c3-soft.com` serves mainnet on 50004 and
+/// Chipnet on 64004.
 pub const CHIPNET_FULCRUM_WSS_BOOTSTRAP: &[&str] = &[
     "wss://chipnet.bch.ninja:50004",
+    "wss://chipnet.imaginary.cash:50004",
+    "wss://blackie.c3-soft.com:64004",
+    "wss://chipnet.c3-soft.com:64004",
+    "wss://cbch.loping.net:62104",
     "wss://electrum-chipnet.optnlabs.com",
 ];
 

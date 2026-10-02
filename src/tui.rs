@@ -3354,7 +3354,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(connection_screen.contains("Automatic (2 Chipnet servers)"));
+        assert!(connection_screen.contains(&format!(
+            "Automatic ({} Chipnet servers)",
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len()
+        )));
         assert!(connection_screen.contains("chipnet.bch.ninja"));
     }
 
