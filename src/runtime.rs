@@ -289,6 +289,23 @@ impl ClaimRelay {
     }
 }
 
+/// Picks enabled Fulcrum servers of the mining network, other than the active
+/// one, to receive relayed claims.
+fn relay_fulcrum_endpoints(sources: &SourceCatalog, active_endpoint: &str) -> Vec<String> {
+    sources
+        .entries()
+        .iter()
+        .filter(|entry| {
+            entry.kind == SourceKind::Fulcrum
+                && entry.enabled
+                && !entry.banned
+                && !entry.endpoint.eq_ignore_ascii_case(active_endpoint)
+        })
+        .map(|entry| entry.endpoint.clone())
+        .take(CLAIM_RELAY_ENDPOINTS)
+        .collect()
+}
+
 /// Supervisor state that lets a direct claim broadcast first and hand its
 /// successor baton to the GPU without waiting for the indexer.
 #[derive(Clone, Copy)]
@@ -3333,13 +3350,10 @@ fn run_supervisor(
     let mut winner_refresh_pending = false;
     let mut unindexed = UnindexedSpends::default();
     let mut successor_parent: Option<String> = None;
+    // The relay draws on the whole network catalog, not the probe-limited
+    // connection candidates, so it reaches servers beyond the active one.
     let relay = ClaimRelay::spawn(
-        endpoints
-            .iter()
-            .filter(|endpoint| !endpoint.eq_ignore_ascii_case(&active_fulcrum_endpoint))
-            .take(CLAIM_RELAY_ENDPOINTS)
-            .cloned()
-            .collect(),
+        relay_fulcrum_endpoints(&sources, &active_fulcrum_endpoint),
         cfg.token.photon_deployment(cfg.network),
     );
     let mut throughput = ThroughputTracker::new(
@@ -5613,6 +5627,29 @@ mod tests {
         if let Ok(path) = std::env::var("PICKAXE_DIRECT_REWARD_PROOF") {
             fs::write(path, serde_json::to_vec(&samples).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    /// Checks that claims relay to catalog servers of the same network only.
+    fn relay_uses_other_catalog_servers_of_the_mining_network() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_network(MiningNetwork::Chipnet);
+        cfg.set_fulcrum_url("wss://custom-chipnet.invalid:50004")
+            .unwrap();
+        let sources = SourceCatalog::configured(&cfg).unwrap();
+        let relay = relay_fulcrum_endpoints(&sources, "wss://custom-chipnet.invalid:50004");
+        assert_eq!(
+            relay.len(),
+            CLAIM_RELAY_ENDPOINTS.min(crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len())
+        );
+        assert!(relay.iter().all(|endpoint| {
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.contains(&endpoint.as_str())
+        }));
+        let active = crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0];
+        assert!(!relay_fulcrum_endpoints(&sources, active)
+            .iter()
+            .any(|endpoint| endpoint == active));
+        assert!(ClaimRelay::spawn(Vec::new(), cfg.token.photon_deployment(cfg.network)).is_none());
     }
 
     #[test]
