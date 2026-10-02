@@ -43,6 +43,10 @@ const ACCEPTED_BATON_RECHECK: Duration = PHOTON_STATE_RECHECK;
 /// before its view is trusted again.
 const UNINDEXED_SPEND_GRACE: Duration = Duration::from_secs(30);
 const UNINDEXED_SPEND_CAP: usize = 64;
+/// Extra Fulcrum servers that receive each claim alongside the active one.
+const CLAIM_RELAY_ENDPOINTS: usize = 2;
+const CLAIM_RELAY_CAP: usize = 16;
+const CLAIM_RELAY_RETRY: Duration = Duration::from_secs(60);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const REFRESH_RECONNECT_THRESHOLD: u8 = 3;
@@ -202,6 +206,110 @@ impl UnindexedSpends {
     fn clear(&mut self) {
         self.spent.clear();
     }
+}
+
+/// Best-effort background broadcast of claims to extra Fulcrum servers, so a
+/// claim reaches more of the network at once. It never decides a claim's
+/// outcome; the active session's broadcast and checks still do.
+struct ClaimRelay {
+    claims: SyncSender<String>,
+}
+
+impl ClaimRelay {
+    /// Starts the relay thread; `None` when there is no other server.
+    fn spawn(
+        endpoints: Vec<String>,
+        deployment: &'static crate::protocol::PhotonDeployment,
+    ) -> Option<Self> {
+        if endpoints.is_empty() {
+            return None;
+        }
+        let (claims, inbox) = mpsc::sync_channel::<String>(CLAIM_RELAY_CAP);
+        thread::Builder::new()
+            .name("pickaxe-claim-relay".into())
+            .spawn(move || {
+                let connect = |url: &String| {
+                    ElectrumSession::connect_failover_for_deployment(
+                        std::slice::from_ref(url),
+                        deployment,
+                    )
+                    .ok()
+                };
+                let mut sessions: Vec<Option<ElectrumSession>> =
+                    endpoints.iter().map(connect).collect();
+                let mut retry_at: Vec<Instant> = sessions
+                    .iter()
+                    .map(|session| {
+                        Instant::now()
+                            + if session.is_some() {
+                                Duration::ZERO
+                            } else {
+                                CLAIM_RELAY_RETRY
+                            }
+                    })
+                    .collect();
+                while let Ok(raw_tx_hex) = inbox.recv() {
+                    // Connected servers first, so one unreachable server
+                    // cannot delay the claim on the others.
+                    for slot in sessions.iter_mut() {
+                        if let Some(session) = slot.as_mut() {
+                            if let Err(error) = session.broadcast_raw(&raw_tx_hex) {
+                                if !error.starts_with("rpc error") {
+                                    *slot = None;
+                                }
+                            }
+                        }
+                    }
+                    let now = Instant::now();
+                    for ((url, slot), retry) in endpoints
+                        .iter()
+                        .zip(sessions.iter_mut())
+                        .zip(retry_at.iter_mut())
+                    {
+                        if slot.is_some() || now < *retry {
+                            continue;
+                        }
+                        *slot = connect(url);
+                        match slot.as_mut() {
+                            Some(session) => {
+                                let _ = session.broadcast_raw(&raw_tx_hex);
+                            }
+                            None => *retry = Instant::now() + CLAIM_RELAY_RETRY,
+                        }
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { claims })
+    }
+
+    /// Queues a claim for the extra servers without blocking the miner.
+    fn submit(&self, raw_tx_hex: &str) {
+        let _ = self.claims.try_send(raw_tx_hex.to_owned());
+    }
+}
+
+/// Supervisor state that lets a direct claim broadcast first and hand its
+/// successor baton to the GPU without waiting for the indexer.
+#[derive(Clone, Copy)]
+struct ClaimContext<'a> {
+    unindexed: &'a UnindexedSpends,
+    live: &'a LiveJob,
+    relay: Option<&'a ClaimRelay>,
+}
+
+/// Reports whether a broadcast error says the node already has the claim,
+/// for example because a relayed copy reached it first.
+fn broadcast_reports_known(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "txn-already-known",
+        "txn-already-in-mempool",
+        "already in block chain",
+        "already in the block chain",
+    ]
+    .iter()
+    .any(|known| lower.contains(known))
 }
 
 const DIRECT_SUBMISSION_JOURNAL_VERSION: u8 = 5;
@@ -1294,12 +1402,17 @@ impl ResolvedSubmission {
         pending.validate()?;
         let parent_attempted = pending.parent_attempted(journal_path)?;
         let parent_accepted = pending.parent_accepted(journal_path)?;
-        if parent_accepted {
+        // A direct claim pays its reward inside the parent itself, so if it
+        // still confirms, the recipient is paid regardless of this record.
+        // The caller only reports it stale once the server does not know the
+        // parent and the baton it spent belongs to another transaction.
+        let conflicted = pending.is_direct() && parent_attempted;
+        if parent_accepted && !conflicted {
             return Err(
                 "refusing to resolve a PHOTON winner as stale after parent acceptance".into(),
             );
         }
-        if parent_attempted {
+        if parent_attempted && !conflicted {
             return Err(
                 "refusing to resolve a PHOTON winner as stale after a parent broadcast attempt; the durable journal must be retained until the parent outcome is proven"
                     .into(),
@@ -1341,7 +1454,12 @@ impl ResolvedSubmission {
             observed_height: fresh.height,
             observed_baton_txid: fresh.baton_txid.clone(),
             observed_baton_vout: fresh.baton_vout,
-            reason: "stale-unbroadcast".into(),
+            reason: if conflicted {
+                "conflicted"
+            } else {
+                "stale-unbroadcast"
+            }
+            .into(),
         })
     }
 
@@ -1435,6 +1553,13 @@ impl ResolvedSubmission {
             "stale-unbroadcast" => {
                 if self.parent_accepted {
                     return Err("resolved stale submission cannot have an accepted parent".into());
+                }
+            }
+            "conflicted" => {
+                if self.journal_version != DIRECT_SUBMISSION_JOURNAL_VERSION
+                    || !self.parent_attempted
+                {
+                    return Err("only an attempted direct claim can resolve as conflicted".into());
                 }
             }
             "confirmed" => {
@@ -2080,19 +2205,57 @@ fn attempt_parent_only_submission(
     cfg: &RuntimeConfig,
     pending: &PendingSubmission,
     journal_path: &Path,
-    unindexed: Option<&UnindexedSpends>,
+    claim: Option<ClaimContext<'_>>,
 ) -> Result<SubmissionAttempt, String> {
     if !pending.is_parent_only() {
         return Err(
             "parent-only submission requires a direct or legacy parent-only journal".into(),
         );
     }
+    // With a claim context, a direct claim broadcasts first and hands its
+    // successor baton straight to the GPU instead of waiting for the indexer.
+    let claim = claim.filter(|_| pending.is_direct());
+    let mut broadcast_error = None;
+    if let Some(context) = claim {
+        if !pending.parent_attempted(journal_path)? {
+            // A never-broadcast claim cannot be known yet, and a stale one is
+            // rejected by the server anyway, so no state round trip is needed
+            // before racing it onto the network.
+            preflight_pending_transaction(
+                cfg,
+                "PHOTON parent",
+                &pending.parent_txid,
+                &pending.parent_hex,
+            )?;
+            pending.mark_parent_attempted(journal_path)?;
+            if let Some(relay) = context.relay {
+                relay.submit(&pending.parent_hex);
+            }
+            let accepted = match broadcast_pending_transaction(session, cfg, &pending.parent_hex) {
+                Ok(returned) => {
+                    ensure_broadcast_txid("PHOTON parent", &pending.parent_txid, &returned)?;
+                    true
+                }
+                Err(error) => {
+                    let known = broadcast_reports_known(&error);
+                    broadcast_error = Some(error);
+                    known
+                }
+            };
+            if accepted {
+                pending.mark_parent_accepted(journal_path)?;
+                let successor = successor_live_job(pending, context.live, cfg)?;
+                return Ok(SubmissionAttempt::Complete(Box::new(successor)));
+            }
+            // Rejected or unknown outcome: the checks below prove acceptance
+            // or a conflicting spend, or keep the journal for retry.
+        }
+    }
     let parent_known = session.transaction_known(&pending.parent_txid)?;
     let fresh = session.fetch_live_job()?;
-    // With a spend tracker, an accepted direct parent hands its successor
-    // baton straight to the GPU instead of waiting for the indexer.
-    let mine_successor = unindexed.is_some() && pending.is_direct();
-    let indexer_lags = unindexed.is_some_and(|spent| spent.indexer_lags(&fresh, Instant::now()));
+    let mine_successor = claim.is_some();
+    let indexer_lags =
+        claim.is_some_and(|context| context.unindexed.indexer_lags(&fresh, Instant::now()));
     if parent_known || resulting_baton_is_authoritative(pending, &fresh) {
         pending.mark_parent_accepted(journal_path)?;
         if pending.expected_baton_is_current(&fresh) || indexer_lags {
@@ -2110,9 +2273,18 @@ fn attempt_parent_only_submission(
         return Err("PHOTON parent is known but live baton is not proven descendant".into());
     }
     if pending.parent_attempted(journal_path)? {
-        return Err(
-            "PHOTON parent broadcast was attempted; awaiting authoritative acceptance".into(),
-        );
+        // The server does not know this direct claim and the baton it spent
+        // now belongs to another transaction, so it cannot confirm. Its
+        // reward output pays the recipient directly if it ever does.
+        if pending.is_direct() && !pending.expected_baton_is_current(&fresh) && !indexer_lags {
+            return Ok(SubmissionAttempt::StaleUnbroadcast(Box::new(fresh)));
+        }
+        return Err(match broadcast_error {
+            Some(error) => format!("PHOTON parent broadcast was not accepted: {error}"),
+            None => {
+                "PHOTON parent broadcast was attempted; awaiting authoritative acceptance".into()
+            }
+        });
     }
     // A lagging indexer still lists an older baton this miner spent; the
     // expected baton is then this miner's own unconfirmed successor.
@@ -2150,13 +2322,13 @@ fn attempt_pending_submission(
     cfg: &RuntimeConfig,
     pending: &PendingSubmission,
     journal_path: &Path,
-    unindexed: Option<&UnindexedSpends>,
+    claim: Option<ClaimContext<'_>>,
 ) -> Result<SubmissionAttempt, String> {
     pending.validate()?;
     pending.require_network(cfg.network)?;
 
     if pending.is_parent_only() {
-        return attempt_parent_only_submission(session, cfg, pending, journal_path, unindexed);
+        return attempt_parent_only_submission(session, cfg, pending, journal_path, claim);
     }
 
     let settlement_known = session.transaction_known(&pending.settlement_txid)?;
@@ -3161,6 +3333,15 @@ fn run_supervisor(
     let mut winner_refresh_pending = false;
     let mut unindexed = UnindexedSpends::default();
     let mut successor_parent: Option<String> = None;
+    let relay = ClaimRelay::spawn(
+        endpoints
+            .iter()
+            .filter(|endpoint| !endpoint.eq_ignore_ascii_case(&active_fulcrum_endpoint))
+            .take(CLAIM_RELAY_ENDPOINTS)
+            .cloned()
+            .collect(),
+        cfg.token.photon_deployment(cfg.network),
+    );
     let mut throughput = ThroughputTracker::new(
         Instant::now(),
         initial_search_stats.candidates,
@@ -3564,7 +3745,11 @@ fn run_supervisor(
                     &cfg,
                     &pending,
                     &journal_path,
-                    Some(&unindexed),
+                    Some(ClaimContext {
+                        unindexed: &unindexed,
+                        live: &live,
+                        relay: relay.as_ref(),
+                    }),
                 );
                 match attempt {
                     Ok(SubmissionAttempt::AwaitingBaton(_)) => {
@@ -5380,6 +5565,28 @@ mod tests {
                     .unwrap();
                     assert!(chained.expected_baton_is_current(&successor));
                     assert!(successor_live_job(&chained, &successor, &chained_cfg).is_ok());
+
+                    // An attempted direct claim whose baton another
+                    // transaction spent resolves as conflicted, never stuck.
+                    let mut taken = successor.clone();
+                    taken.baton_txid = "44".repeat(32);
+                    assert!(
+                        ResolvedSubmission::from_stale(&chained, &successor, &journal)
+                            .unwrap_err()
+                            .contains("expected baton is live")
+                    );
+                    chained.mark_parent_attempted(&journal).unwrap();
+                    let conflicted =
+                        ResolvedSubmission::from_stale(&chained, &taken, &journal).unwrap();
+                    assert_eq!(conflicted.reason, "conflicted");
+                    assert!(conflicted.parent_attempted);
+                    conflicted.validate().unwrap();
+                    let mut legacy = conflicted.clone();
+                    legacy.journal_version = SUBMISSION_JOURNAL_VERSION;
+                    legacy.version = SUBMISSION_RESOLUTION_VERSION;
+                    legacy.network = None;
+                    legacy.mode = None;
+                    assert!(legacy.validate().is_err());
                     PendingSubmission::remove(&journal).unwrap();
                     samples.push(serde_json::json!({
                         "raw": chained.parent_hex, "network": network.as_str(), "recipient": format!("{recipient:?}"),
@@ -5405,6 +5612,26 @@ mod tests {
         .is_err());
         if let Ok(path) = std::env::var("PICKAXE_DIRECT_REWARD_PROOF") {
             fs::write(path, serde_json::to_vec(&samples).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    /// Checks that only "already have it" broadcast errors count as accepted.
+    fn broadcast_known_errors_are_distinguished_from_rejections() {
+        for known in [
+            "rpc error: {\"code\":1,\"message\":\"txn-already-known\"}",
+            "rpc error: the transaction was rejected by network rules.\n\ntxn-already-in-mempool",
+            "rpc error: Transaction already in block chain",
+        ] {
+            assert!(broadcast_reports_known(known), "{known}");
+        }
+        for rejected in [
+            "rpc error: txn-mempool-conflict (code 18)",
+            "rpc error: bad-txns-inputs-missingorspent",
+            "rpc error: missing-inputs",
+            "transport: socket closed",
+        ] {
+            assert!(!broadcast_reports_known(rejected), "{rejected}");
         }
     }
 

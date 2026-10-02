@@ -65,7 +65,7 @@ If you used the earlier Chipnet batch-payout preview, retain its `chipnet-fundin
 
 In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
 
-After a verified direct win, the GPU mines the baton that win creates while the claim is broadcast, instead of waiting for Fulcrum to list the unconfirmed claim. The remaining pause is the short live-state check after each win. If the claim turns out stale, that work is discarded and mining continues on the baton Fulcrum reports.
+After a verified direct win, the GPU mines the baton that win creates while the claim is broadcast, instead of waiting for Fulcrum to list the unconfirmed claim. A new claim is broadcast before any further state check, and also sent in the background to up to two other configured Fulcrum servers so it reaches more of the network at once. If the claim turns out stale, or another transaction already spent its baton, that work is discarded and mining continues on the baton Fulcrum reports. A direct claim pays its reward inside the claim transaction, so if a claim recorded as stale still confirms, the recipient is paid.
 
 ## Diagnostic logging
 
