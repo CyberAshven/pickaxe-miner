@@ -38,7 +38,7 @@ const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const PHOTON_STATE_RECHECK: Duration = Duration::from_millis(500);
-const ACCEPTED_BATON_RECHECK: Duration = Duration::from_secs(2);
+const ACCEPTED_BATON_RECHECK: Duration = PHOTON_STATE_RECHECK;
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const REFRESH_RECONNECT_THRESHOLD: u8 = 3;
@@ -3463,21 +3463,15 @@ fn run_supervisor(
                                 submission_backoff = RECONNECT_MIN;
                                 next_submission_retry = Instant::now();
 
-                                let refreshed = session
-                                    .as_mut()
-                                    .expect("checked session above")
-                                    .fetch_live_job();
-                                match refreshed.and_then(|next_job| {
-                                    apply_refreshed_job(
-                                        session.as_mut().expect("checked session above"),
-                                        &mut cfg,
-                                        &mut live,
-                                        &mut settlement,
-                                        &search,
-                                        &journal_path,
-                                        next_job,
-                                    )
-                                }) {
+                                match apply_refreshed_job(
+                                    session.as_mut().expect("checked session above"),
+                                    &mut cfg,
+                                    &mut live,
+                                    &mut settlement,
+                                    &search,
+                                    &journal_path,
+                                    *fresh,
+                                ) {
                                     Ok(changed) => {
                                         if changed {
                                             job_changes = job_changes.saturating_add(1);
