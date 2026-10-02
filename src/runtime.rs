@@ -46,6 +46,8 @@ const UNINDEXED_SPEND_CAP: usize = 64;
 const CLAIM_RELAY_ENDPOINTS: usize = 2;
 const CLAIM_RELAY_CAP: usize = 16;
 const CLAIM_RELAY_RETRY: Duration = Duration::from_secs(60);
+/// Public servers drop idle WebSocket clients within about a minute.
+const CLAIM_RELAY_KEEPALIVE: Duration = Duration::from_secs(30);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const REFRESH_RECONNECT_THRESHOLD: u8 = 3;
@@ -247,7 +249,34 @@ impl ClaimRelay {
                             }
                     })
                     .collect();
-                while let Ok(raw_tx_hex) = inbox.recv() {
+                loop {
+                    let raw_tx_hex = match inbox.recv_timeout(CLAIM_RELAY_KEEPALIVE) {
+                        Ok(raw_tx_hex) => raw_tx_hex,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // Keep every relay connection ready, and replace
+                            // a dropped one now rather than while a claim races.
+                            let now = Instant::now();
+                            for ((url, slot), retry) in endpoints
+                                .iter()
+                                .zip(sessions.iter_mut())
+                                .zip(retry_at.iter_mut())
+                            {
+                                if let Some(session) = slot.as_mut() {
+                                    if session.rpc("server.ping", serde_json::json!([])).is_err() {
+                                        *slot = None;
+                                    }
+                                }
+                                if slot.is_none() && now >= *retry {
+                                    *slot = connect(url);
+                                    if slot.is_none() {
+                                        *retry = Instant::now() + CLAIM_RELAY_RETRY;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     // Connected servers first, so one unreachable server
                     // cannot delay the claim on the others.
                     for slot in sessions.iter_mut() {
