@@ -3311,18 +3311,6 @@ fn event_log_text(event: &RuntimeEvent) -> String {
         RuntimeEvent::DirectRewardAccepted { txid, .. } => {
             format!("direct reward accepted: tx={txid}")
         }
-        RuntimeEvent::RewardAccrued { parent_txid } => {
-            format!("legacy Chipnet reward awaiting recovery: parent={parent_txid}")
-        }
-        RuntimeEvent::RewardSplit {
-            child_txid,
-            reward_count,
-        } => format!(
-            "legacy Chipnet reward recovery accepted: child={child_txid} rewards={reward_count}"
-        ),
-        RuntimeEvent::RewardInventory { confirmed_at_least } => {
-            format!("legacy Chipnet rewards awaiting recovery: at least {confirmed_at_least}")
-        }
         RuntimeEvent::Error(error) => format!("error: {error}"),
     }
 }

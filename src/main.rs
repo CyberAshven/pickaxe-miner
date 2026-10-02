@@ -25,7 +25,6 @@ mod cuda_stage_c;
 mod donation;
 #[allow(dead_code)]
 mod electrum;
-mod funding;
 mod hip_photon;
 #[allow(dead_code)]
 mod m29_table;
@@ -854,24 +853,6 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             runtime::RuntimeEvent::DirectRewardAccepted { txid, recipient } => serde_json::json!({
                 "event": "direct_reward_accepted", "txid": txid, "recipient": recipient,
             }),
-            runtime::RuntimeEvent::RewardAccrued { parent_txid } => serde_json::json!({
-                "event": "reward_accrued",
-                "parent_txid": parent_txid,
-                "split_pending": true,
-            }),
-            runtime::RuntimeEvent::RewardSplit {
-                child_txid,
-                reward_count,
-            } => serde_json::json!({
-                "event": "reward_split",
-                "child_txid": child_txid,
-                "reward_count": reward_count,
-            }),
-            runtime::RuntimeEvent::RewardInventory { confirmed_at_least } => serde_json::json!({
-                "event": "reward_inventory",
-                "confirmed_at_least": confirmed_at_least,
-                "minimum_for_split": 5,
-            }),
             runtime::RuntimeEvent::Error(error) => {
                 serde_json::json!({"event": "error", "error": error})
             }
@@ -931,15 +912,6 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
         runtime::RuntimeEvent::DirectRewardAccepted { txid, .. } => {
             println!("direct reward accepted: tx={txid}")
         }
-        runtime::RuntimeEvent::RewardAccrued { parent_txid } => println!(
-            "legacy Chipnet reward awaiting recovery: parent={parent_txid}"
-        ),
-        runtime::RuntimeEvent::RewardSplit { child_txid, reward_count } => println!(
-            "legacy Chipnet reward recovery accepted: child={child_txid} rewards={reward_count}"
-        ),
-        runtime::RuntimeEvent::RewardInventory { confirmed_at_least } => println!(
-            "legacy Chipnet rewards awaiting recovery: at least {confirmed_at_least}"
-        ),
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
     }
 }

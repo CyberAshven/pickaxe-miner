@@ -73,7 +73,7 @@ Replace the quoted address with your valid token-aware P2PKH payout CashAddr. Th
 
 New Chipnet wins pay the selected wallet directly, using the same donation policy. No local reward wallet or payout batching is created for new mining.
 
-If you used the earlier Chipnet batch-payout preview, retain its `chipnet-funding.key` until its existing rewards are recovered. Recovery retains its historical fee rules and can still need enough confirmed rewards to cover its existing transaction costs. It does not apply the new donation policy to those old rewards.
+The earlier Chipnet batch-payout preview is no longer supported. Rewards it held under `chipnet-funding.key` are Chipnet test coins and are not recovered; you can delete that file. If the preview left a pending `pending-reward-chipnet.json`, the miner says so and asks you to delete it.
 
 In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
 
