@@ -412,6 +412,9 @@ pub(crate) fn live_job_from_fulcrum_values(
     )
 }
 
+/// Reported while a contract holds no baton, as before its token launches.
+pub(crate) const NO_LIVE_BATON: &str = "the PHOTON contract holds no live baton yet";
+
 /// Constructs a PHOTON job using the selected deployment's category.
 pub(crate) fn live_job_from_fulcrum_values_for_deployment(
     url: &str,
@@ -446,6 +449,9 @@ pub(crate) fn live_job_from_fulcrum_values_for_deployment(
         })
         .collect::<Vec<_>>();
 
+    if batons.is_empty() {
+        return Err(NO_LIVE_BATON.into());
+    }
     if batons.len() != 1 {
         return Err(format!(
             "Expected exactly one live PHOTON baton; found {}",
@@ -559,6 +565,24 @@ mod tests {
         .unwrap();
         assert_eq!(mainnet_job.baton_txid, mainnet_txid);
 
+        // No baton yet (before a launch) is distinct from an ambiguous state.
+        let fetch = |unspent: Value| {
+            live_job_from_fulcrum_values_for_deployment(
+                "wss://fixture.invalid",
+                json!(["Fulcrum", "1.5"]),
+                &header,
+                &unspent,
+                &crate::protocol::CHIPNET_PHOTON,
+            )
+            .unwrap_err()
+        };
+        assert_eq!(fetch(json!([])), NO_LIVE_BATON);
+        let two = fetch(json!([
+            baton(crate::protocol::CHIPNET_CATEGORY_HEX, &chipnet_txid),
+            baton(crate::protocol::CHIPNET_CATEGORY_HEX, &mainnet_txid)
+        ]));
+        assert!(two.contains("found 2"), "{two}");
+
         let mut invalid_target =
             json!([baton(crate::protocol::CHIPNET_CATEGORY_HEX, &chipnet_txid)]);
         invalid_target[0]["token_data"]["nft"]["commitment"] =
@@ -633,7 +657,7 @@ mod tests {
             &gbt_shaped_utxo,
         )
         .expect_err("compact bits must not become a PHOTON target");
-        assert!(error.contains("exactly one live PHOTON baton"), "{error}");
+        assert_eq!(error, NO_LIVE_BATON);
     }
 
     #[test]

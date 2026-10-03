@@ -48,6 +48,10 @@ const CLAIM_RELAY_CAP: usize = 16;
 const CLAIM_RELAY_RETRY: Duration = Duration::from_secs(60);
 /// Public servers drop idle WebSocket clients within about a minute.
 const CLAIM_RELAY_KEEPALIVE: Duration = Duration::from_secs(30);
+/// How often a miner started before its token launches looks for the baton.
+const LAUNCH_BATON_RECHECK: Duration = Duration::from_secs(3);
+/// How often a miner waiting for a launch says it is still waiting.
+const LAUNCH_WAIT_REPORT: Duration = Duration::from_secs(600);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const REFRESH_RECONNECT_THRESHOLD: u8 = 3;
@@ -138,6 +142,52 @@ impl RefreshFailureTracker {
     /// Reports whether refresh failures have degraded the live source.
     fn degraded(&self) -> bool {
         self.consecutive != 0
+    }
+}
+
+/// Returns the first live job. While the contract holds no baton yet, as
+/// before its token launches, the miner keeps looking, so it can be started
+/// early and mine from the moment the baton appears.
+fn wait_for_live_baton(
+    session: &mut ElectrumSession,
+    endpoints: &[String],
+    cfg: &RuntimeConfig,
+) -> Result<LiveJob, String> {
+    let deployment = cfg.token.photon_deployment(cfg.network);
+    let mut next_report: Option<Instant> = None;
+    loop {
+        match session.fetch_live_job() {
+            Err(error) if error == crate::electrum::NO_LIVE_BATON => {
+                let now = Instant::now();
+                if next_report.is_none_or(|at| now >= at) {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "waiting_for_baton",
+                            "network": cfg.network.as_str(),
+                            "category": deployment.category_hex,
+                            "message": "no live baton yet; mining starts when it appears",
+                        })
+                    );
+                    let _ = std::io::stdout().flush();
+                    next_report = Some(now + LAUNCH_WAIT_REPORT);
+                }
+                thread::sleep(LAUNCH_BATON_RECHECK);
+            }
+            // Keep waiting on a fresh connection if a server drops this one.
+            Err(error)
+                if next_report.is_some()
+                    && classify_refresh_failure(&error) == RefreshFailureKind::Transport =>
+            {
+                thread::sleep(LAUNCH_BATON_RECHECK);
+                if let Ok(fresh) =
+                    ElectrumSession::connect_failover_for_deployment(endpoints, deployment)
+                {
+                    *session = fresh;
+                }
+            }
+            result => return result,
+        }
     }
 }
 
@@ -2583,7 +2633,7 @@ impl RuntimeSupervisor {
         )?;
         let journal_path = submission_journal_path(cfg.network);
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
-        let initial = session.fetch_live_job()?;
+        let initial = wait_for_live_baton(&mut session, &endpoints, &cfg)?;
         production_preflight(&mut session, &cfg, &initial, &journal_path)?;
         println!(
             "{}",
