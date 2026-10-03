@@ -372,7 +372,10 @@ fn benchmark_fixture() -> Result<BenchmarkFixture, String> {
         reward_amount: VECTOR_REWARD_RAW,
         payout_locking,
     };
-    let bytes = tx::build_photon_template_bytes(&params)?;
+    let bytes = tx::build_photon_template_bytes_for_deployment(
+        &params,
+        &crate::protocol::MAINNET_V0_PHOTON,
+    )?;
     let template: [u8; TX_BYTES] = bytes.try_into().map_err(|bytes: Vec<u8>| {
         format!(
             "benchmark PHOTON template is {} bytes; expected {TX_BYTES}",

@@ -8,7 +8,8 @@
 
 namespace {
 
-constexpr uint32_t T2_WINDOW_BYTES = TX_BYTES + 3u;
+// Widest transaction (TX_BYTES + PhotonLayout::MAX_SHIFT); must match cuda_t2.rs.
+constexpr uint32_t T2_WINDOW_BYTES = TX_BYTES + 16u;
 constexpr uint32_t T2_POINT_WORDS = 24u;
 
 __device__ __forceinline__ void t2_middle_compress(
@@ -298,6 +299,9 @@ T2_EXPORT(0)
 T2_EXPORT(1)
 T2_EXPORT(2)
 T2_EXPORT(3)
+T2_EXPORT(14)
+T2_EXPORT(15)
+T2_EXPORT(16)
 
 #define T2_GROUP_EXPORT(SHIFT)                                                 \
 extern "C" __global__ void pickaxe_t2_prepare_shift##SHIFT(                    \
@@ -323,3 +327,6 @@ T2_GROUP_EXPORT(0)
 T2_GROUP_EXPORT(1)
 T2_GROUP_EXPORT(2)
 T2_GROUP_EXPORT(3)
+T2_GROUP_EXPORT(14)
+T2_GROUP_EXPORT(15)
+T2_GROUP_EXPORT(16)

@@ -855,9 +855,19 @@ mod tests {
         cfg.set_fulcrum_url("wss://custom-chipnet.invalid:50004")
             .unwrap();
         let catalog = SourceCatalog::configured(&cfg).unwrap();
-        assert_eq!(catalog.entries().len(), 2);
-        assert_eq!(catalog.entries()[0].provenance, SourceProvenance::BuiltIn);
-        assert_eq!(catalog.entries()[1].provenance, SourceProvenance::User);
+        assert_eq!(
+            catalog.entries().len(),
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len() + 1
+        );
+        assert!(catalog
+            .entries()
+            .iter()
+            .take(crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len())
+            .all(|entry| entry.provenance == SourceProvenance::BuiltIn));
+        assert_eq!(
+            catalog.entries().last().unwrap().provenance,
+            SourceProvenance::User
+        );
 
         let mut switched = crate::config::RuntimeConfig::default();
         switched
@@ -865,7 +875,10 @@ mod tests {
             .unwrap();
         switched.set_network(crate::config::MiningNetwork::Chipnet);
         let catalog = SourceCatalog::configured(&switched).unwrap();
-        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(
+            catalog.entries().len(),
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len()
+        );
         assert_eq!(
             catalog.entries()[0].endpoint,
             crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0]

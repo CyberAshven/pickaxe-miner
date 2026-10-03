@@ -3,18 +3,13 @@
 use super::*;
 use crate::tx;
 
-fn load_filters(engine: &CudaPhotonEngine, file: &str) -> Result<[CudaFunction; 4], String> {
-    Ok([
-        load_function(&engine._ctx, file, STAGE_C3_FUNCTIONS[0])?,
-        load_function(&engine._ctx, file, STAGE_C3_FUNCTIONS[1])?,
-        load_function(&engine._ctx, file, STAGE_C3_FUNCTIONS[2])?,
-        load_function(&engine._ctx, file, STAGE_C3_FUNCTIONS[3])?,
-    ])
+fn load_filters(engine: &CudaPhotonEngine, file: &str) -> Result<ShiftKernels, String> {
+    load_shift_functions(&engine._ctx, file, stage_c3_function)
 }
 
 pub(super) struct Incremental {
     walk: CudaFunction,
-    filters: [CudaFunction; 4],
+    filters: ShiftKernels,
     message: CudaSlice<u8>,
     step: CudaSlice<u32>,
     stride: u32,

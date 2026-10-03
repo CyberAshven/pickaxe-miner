@@ -17,8 +17,9 @@
 // and the second SHA-256 are hashed once per variant.
 //
 // The baton age is a minimal script-number push in the input script, so the
-// transaction is 615 bytes for age 0..=16 and SHIFT = 1, 2 or 3 bytes longer
-// for wider ages (the covenant requires age < 65535). Everything after the
+// v0 transaction is 615 bytes for age 0..=16 and SHIFT = 1, 2 or 3 bytes
+// longer for wider ages (the covenant requires age < 65535). A longer redeem
+// script adds its extra bytes to SHIFT (v3.2: 14..=16). Everything after the
 // age push moves by SHIFT. One kernel is instantiated per SHIFT so every
 // byte position stays a compile-time constant.
 
@@ -27,7 +28,7 @@ namespace {
 constexpr uint32_t DUAL_MIDSTATE_BLOCKS = 6u;
 constexpr uint32_t DUAL_TOTAL_BLOCKS = 10u;
 constexpr uint32_t DUAL_POINT_WORDS = 24u;
-constexpr uint32_t DUAL_MAX_SHIFT = 3u;
+constexpr uint32_t DUAL_MAX_SHIFT = 16u;
 
 static_assert(DUAL_MIDSTATE_BLOCKS * 64u <= NONCE_OFFSET, "midstate must end before the nonce");
 static_assert(SIGNATURE_OFFSET + 32u >= (DUAL_MIDSTATE_BLOCKS + 1u) * 64u,
@@ -210,8 +211,12 @@ __device__ __forceinline__ void stage_c_dual_filter(
             winner_cap, winner_count, winner_nonces, winner_hashes);      \
     }
 
-// Age 0..=16 (615 bytes), 17..=127 (616), 128..=32767 (617), 32768..=65534 (618).
+// v0 age 0..=16 (615 bytes), 17..=127 (616), 128..=32767 (617),
+// 32768..=65534 (618); v3.2 age 0..=16 (629), 17..=127 (630), 128..=32767 (631).
 PICKAXE_DUAL_FILTER_ENTRY(pickaxe_stage_c_dual_filter, 0u)
 PICKAXE_DUAL_FILTER_ENTRY(pickaxe_stage_c_dual_filter_shift1, 1u)
 PICKAXE_DUAL_FILTER_ENTRY(pickaxe_stage_c_dual_filter_shift2, 2u)
 PICKAXE_DUAL_FILTER_ENTRY(pickaxe_stage_c_dual_filter_shift3, 3u)
+PICKAXE_DUAL_FILTER_ENTRY(pickaxe_stage_c_dual_filter_shift14, 14u)
+PICKAXE_DUAL_FILTER_ENTRY(pickaxe_stage_c_dual_filter_shift15, 15u)
+PICKAXE_DUAL_FILTER_ENTRY(pickaxe_stage_c_dual_filter_shift16, 16u)

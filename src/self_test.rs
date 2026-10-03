@@ -98,7 +98,10 @@ fn build_reference_shaped_template(
         reward_amount: context.reward_raw,
         payout_locking,
     };
-    let bytes = tx::build_photon_template_bytes(&params)?;
+    let bytes = tx::build_photon_template_bytes_for_deployment(
+        &params,
+        &crate::protocol::MAINNET_V0_PHOTON,
+    )?;
     bytes.try_into().map_err(|bytes: Vec<u8>| {
         format!(
             "self-test PHOTON template is {} bytes; expected {TX_BYTES}",
@@ -123,12 +126,13 @@ fn validate_gpu_winner_and_reward(
         return Err("host BCH Schnorr verification rejected self-test signature".into());
     }
 
-    let completed = tx::apply_reference_signature(
+    let completed = tx::apply_reference_signature_for_deployment(
         &context,
         &reward_address,
         &hex::encode(reward_public_key),
         nonce,
         &hex::encode(signature),
+        &crate::protocol::MAINNET_V0_PHOTON,
     )?;
     if completed.len() != TX_BYTES {
         return Err(format!(

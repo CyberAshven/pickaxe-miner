@@ -10,15 +10,17 @@ typedef unsigned long long uint64_t;
 
 // PHOTON Stage C correctness kernel.
 //
-// The immutable job template is exactly 615 bytes. Per candidate we override:
-//   nonce     bytes 390..393 (u32 little-endian)
-//   signature bytes 426..489 (64-byte BCH Schnorr R||s)
-// The target at bytes 394..425 remains part of the transaction being hashed.
+// The immutable job template is 615 bytes plus the layout shift: the v0
+// contract's age push adds 0..=3 bytes and the 273-byte v3.2 redeem script
+// 14 more. Per candidate we override:
+//   nonce     bytes 390..393 + shift (u32 little-endian)
+//   signature bytes 426..489 + shift (64-byte BCH Schnorr R||s)
+// The target at bytes 394..425 + shift remains part of the transaction.
 //
-// The production entry point performs completed-transaction HASH256 and a
-// strict little-endian integer comparison (hash < target). Only bounded winner
-// records cross the device/host boundary. Probe entry points exist for vector
-// verification and are not used by the production search path.
+// The production entry point performs completed-transaction HASH256 and the
+// selected contract's proof rule. Only bounded winner records cross the
+// device/host boundary. Probe entry points exist for vector verification and
+// are not used by the production search path.
 
 namespace {
 
@@ -125,6 +127,7 @@ __device__ void sha256_small(const uint8_t* data, uint32_t len, uint8_t out[32])
     sha256_store(state, out);
 }
 
+template <uint32_t SHIFT>
 __device__ __forceinline__ uint8_t completed_tx_byte(
     const uint8_t* tx_template,
     const uint8_t* signatures,
@@ -132,15 +135,19 @@ __device__ __forceinline__ uint8_t completed_tx_byte(
     uint32_t nonce,
     uint32_t byte_index
 ) {
-    if (byte_index >= NONCE_OFFSET && byte_index < NONCE_OFFSET + 4u) {
-        return (uint8_t)(nonce >> ((byte_index - NONCE_OFFSET) * 8u));
+    constexpr uint32_t nonce_offset = NONCE_OFFSET + SHIFT;
+    constexpr uint32_t signature_offset = SIGNATURE_OFFSET + SHIFT;
+    if (byte_index >= nonce_offset && byte_index < nonce_offset + 4u) {
+        return (uint8_t)(nonce >> ((byte_index - nonce_offset) * 8u));
     }
-    if (byte_index >= SIGNATURE_OFFSET && byte_index < SIGNATURE_OFFSET + SIGNATURE_BYTES) {
-        return signatures[(uint64_t)candidate * SIGNATURE_BYTES + (byte_index - SIGNATURE_OFFSET)];
+    if (byte_index >= signature_offset && byte_index < signature_offset + SIGNATURE_BYTES) {
+        return signatures[(uint64_t)candidate * SIGNATURE_BYTES + (byte_index - signature_offset)];
     }
     return tx_template[byte_index];
 }
 
+// Ten SHA-256 blocks hold every built layout (615 + 16 + 9 <= 640 bytes).
+template <uint32_t SHIFT>
 __device__ void photon_transaction_hashes(
     const uint8_t* tx_template,
     const uint8_t* signatures,
@@ -152,7 +159,9 @@ __device__ void photon_transaction_hashes(
     uint32_t state[8];
     sha256_init(state);
     constexpr uint32_t TOTAL_BLOCKS = 10u;
-    constexpr uint64_t BIT_LENGTH = (uint64_t)TX_BYTES * 8ull;
+    constexpr uint32_t tx_bytes = TX_BYTES + SHIFT;
+    constexpr uint64_t BIT_LENGTH = (uint64_t)tx_bytes * 8ull;
+    static_assert(tx_bytes + 9u <= TOTAL_BLOCKS * 64u, "layout must fit ten SHA-256 blocks");
 
     for (uint32_t block_index = 0u; block_index < TOTAL_BLOCKS; ++block_index) {
         uint8_t block[64];
@@ -160,9 +169,9 @@ __device__ void photon_transaction_hashes(
         for (uint32_t j = 0u; j < 64u; ++j) {
             const uint32_t byte_index = block_start + j;
             uint8_t value = 0u;
-            if (byte_index < TX_BYTES) {
-                value = completed_tx_byte(tx_template, signatures, candidate, nonce, byte_index);
-            } else if (byte_index == TX_BYTES) {
+            if (byte_index < tx_bytes) {
+                value = completed_tx_byte<SHIFT>(tx_template, signatures, candidate, nonce, byte_index);
+            } else if (byte_index == tx_bytes) {
                 value = 0x80u;
             } else if (byte_index >= TOTAL_BLOCKS * 64u - 8u) {
                 const uint32_t length_offset = byte_index - (TOTAL_BLOCKS * 64u - 8u);
@@ -176,6 +185,29 @@ __device__ void photon_transaction_hashes(
     sha256_small(first_hash, 32u, final_hash);
 }
 
+// Hashes with the built layout for `shift` (PhotonLayout::GPU_SHIFTS);
+// returns false for any other shift.
+__device__ bool photon_transaction_hashes_for_shift(
+    uint32_t shift,
+    const uint8_t* tx_template,
+    const uint8_t* signatures,
+    uint32_t candidate,
+    uint32_t nonce,
+    uint8_t first_hash[32],
+    uint8_t final_hash[32]
+) {
+    switch (shift) {
+    case 0u: photon_transaction_hashes<0u>(tx_template, signatures, candidate, nonce, first_hash, final_hash); return true;
+    case 1u: photon_transaction_hashes<1u>(tx_template, signatures, candidate, nonce, first_hash, final_hash); return true;
+    case 2u: photon_transaction_hashes<2u>(tx_template, signatures, candidate, nonce, first_hash, final_hash); return true;
+    case 3u: photon_transaction_hashes<3u>(tx_template, signatures, candidate, nonce, first_hash, final_hash); return true;
+    case 14u: photon_transaction_hashes<14u>(tx_template, signatures, candidate, nonce, first_hash, final_hash); return true;
+    case 15u: photon_transaction_hashes<15u>(tx_template, signatures, candidate, nonce, first_hash, final_hash); return true;
+    case 16u: photon_transaction_hashes<16u>(tx_template, signatures, candidate, nonce, first_hash, final_hash); return true;
+    default: return false;
+    }
+}
+
 __device__ __forceinline__ bool hash_below_target_le(
     const uint8_t hash[32],
     const uint8_t target[32]
@@ -185,6 +217,26 @@ __device__ __forceinline__ bool hash_below_target_le(
         if (hash[i] > target[i]) return false;
     }
     return false;
+}
+
+// v0 compares ABS(BIN2NUM(hash)), so the sign bit is dropped. v3.2 requires
+// a positive, nonzero hash; the host validates that the target is positive.
+__device__ __forceinline__ bool hash_meets_target_le(
+    const uint8_t hash[32],
+    const uint8_t target[32],
+    uint32_t positive_rule
+) {
+    uint8_t value[32];
+    copy_bytes(value, hash, 32u);
+    if (positive_rule) {
+        if (value[31] & 0x80u) return false;
+        uint8_t any = 0u;
+        for (int i = 0; i < 32; ++i) any |= value[i];
+        if (any == 0u) return false;
+    } else {
+        value[31] &= 0x7fu;
+    }
+    return hash_below_target_le(value, target);
 }
 
 } // namespace
@@ -198,7 +250,9 @@ extern "C" __global__ void pickaxe_stage_c_hash_filter(
     uint32_t winner_cap,
     uint32_t* __restrict__ winner_count,
     uint32_t* __restrict__ winner_nonces,
-    uint8_t* __restrict__ winner_hashes
+    uint8_t* __restrict__ winner_hashes,
+    uint32_t shift,
+    uint32_t positive_rule
 ) {
     const uint32_t candidate = blockIdx.x * blockDim.x + threadIdx.x;
     if (candidate >= candidate_count) return;
@@ -206,9 +260,12 @@ extern "C" __global__ void pickaxe_stage_c_hash_filter(
     const uint32_t nonce = nonce_base + candidate;
     uint8_t first_hash[32];
     uint8_t final_hash[32];
-    photon_transaction_hashes(tx_template, signatures, candidate, nonce, first_hash, final_hash);
+    if (!photon_transaction_hashes_for_shift(
+            shift, tx_template, signatures, candidate, nonce, first_hash, final_hash)) {
+        return;
+    }
 
-    if (!hash_below_target_le(final_hash, target)) return;
+    if (!hash_meets_target_le(final_hash, target, positive_rule)) return;
 
     const uint32_t slot = atomicAdd(winner_count, 1u);
     if (slot >= winner_cap) return;
@@ -226,7 +283,7 @@ extern "C" __global__ void pickaxe_stage_c_probe(
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     uint8_t first_hash[32];
     uint8_t final_hash[32];
-    photon_transaction_hashes(tx_template, signature, 0u, nonce, first_hash, final_hash);
+    photon_transaction_hashes<0u>(tx_template, signature, 0u, nonce, first_hash, final_hash);
     copy_bytes(first_hash_out, first_hash, 32u);
     copy_bytes(final_hash_out, final_hash, 32u);
 }
