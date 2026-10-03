@@ -49,7 +49,8 @@ try {
     assert.deepEqual(tx.outputs[1].lockingBytecode, payout.bytecode);
     assert.equal(tx.outputs[1].token.amount, BigInt(sample.reward));
     assert.equal(tx.outputs[1].valueSatoshis, 700n);
-    assert.equal(source.valueSatoshis - tx.outputs.reduce((sum, o) => sum + o.valueSatoshis, 0n), 800n);
+    const fee = (BigInt(sample.raw.length / 2) * BigInt(sample.relay_fee_sats_per_kb ?? 1000) + 999n) / 1000n;
+    assert.equal(source.valueSatoshis - tx.outputs.reduce((sum, o) => sum + o.valueSatoshis, 0n), fee, 'exact rounded policy fee');
     for (const standard of [false, true]) {
       const vm = createVirtualMachineBch2026(standard);
       assert.equal(vm.verify({ sourceOutputs: [source], transaction: tx }), true,

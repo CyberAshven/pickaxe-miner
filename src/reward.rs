@@ -513,8 +513,8 @@ pub fn p2pkh_cashaddr_from_public_key(public_key: &[u8; 33]) -> Result<String, S
     tx::p2pkh_hash_to_cashaddr(&hash)
 }
 
-/// Creates an ephemeral identity for the self-funded settlement.
-fn required_relay_fee_sats(
+/// Rounds a fee rate up to the integral satoshis required for these bytes.
+pub(crate) fn required_relay_fee_sats(
     serialized_bytes: usize,
     relay_fee_sats_per_kb: u64,
 ) -> Result<u64, String> {
@@ -872,6 +872,7 @@ mod tests {
                     .into(),
             nonce: 0x1234_5678,
             contract_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
             contract_token_amount: 2_099_905_002_035_715,
             reward_amount: 4_999_773_813,
             payout_locking: reward_lock,

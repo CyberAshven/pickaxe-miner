@@ -183,6 +183,7 @@ fn template(age: u32, target: &[u8; 32], key: &[u8; 32]) -> Vec<u8> {
         signature_hex: "00".repeat(64),
         nonce: NONCE,
         contract_value_sats: 15_971_500,
+        relay_fee_sats_per_kb: 1_000,
         contract_token_amount: 2_099_905_002_035_715,
         reward_amount: 4_999_773_813,
         payout_locking: hex::decode("76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac").unwrap(),
