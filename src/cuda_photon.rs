@@ -28,13 +28,16 @@ pub(crate) use t2::T2_GROUP_CANDIDATES;
 /// Template buffer size: the widest layout the covenant's age bound allows.
 const MAX_TX_BYTES: usize = 615 + PhotonLayout::MAX_SHIFT;
 const SIGNATURE_BYTES: usize = 64;
-/// C2/C3 entry points by layout shift (age push width minus one).
-const STAGE_C3_FUNCTIONS: [&str; PhotonLayout::MAX_SHIFT + 1] = [
-    "pickaxe_stage_c_dual_filter",
-    "pickaxe_stage_c_dual_filter_shift1",
-    "pickaxe_stage_c_dual_filter_shift2",
-    "pickaxe_stage_c_dual_filter_shift3",
-];
+/// One kernel per GPU layout shift, indexed by `PhotonLayout::kernel_index`.
+type ShiftKernels = [CudaFunction; PhotonLayout::GPU_SHIFTS.len()];
+
+/// C2/C3 entry point for one layout shift.
+fn stage_c3_function(shift: usize) -> String {
+    match shift {
+        0 => "pickaxe_stage_c_dual_filter".to_owned(),
+        _ => format!("pickaxe_stage_c_dual_filter_shift{shift}"),
+    }
+}
 const POINT_WORDS: usize = 24;
 const FIXED_D_WORDS: usize = 32 * 256 * 8;
 /// Candidates per C1 thread that share one field inversion.
@@ -83,7 +86,7 @@ pub struct CudaPhotonEngine {
     stage_a: CudaFunction,
     stage_b: [CudaFunction; 4],
     stage_c1: CudaFunction,
-    stage_c3: [CudaFunction; PhotonLayout::MAX_SHIFT + 1],
+    stage_c3: ShiftKernels,
     layout: PhotonLayout,
     table_gpu: CudaSlice<u8>,
     target_gpu: CudaSlice<u8>,
@@ -104,7 +107,7 @@ pub struct CudaPhotonEngine {
     winner_cap: u32,
     table_source: M29TableSource,
     job_ready: bool,
-    chipnet_signed_target: bool,
+    positive_target: bool,
     incremental: Option<incremental::Incremental>,
     #[cfg(any(feature = "tail-grind", test))]
     t2: Option<t2::T2Live>,
@@ -160,14 +163,31 @@ fn load_function(
     ptx_name: &str,
     function_name: &str,
 ) -> Result<CudaFunction, String> {
+    let [function] = load_functions(ctx, ptx_name, [function_name.to_owned()])?;
+    Ok(function)
+}
+
+/// Loads one kernel per GPU layout shift with a single module load.
+fn load_shift_functions(
+    ctx: &Arc<CudaContext>,
+    ptx_name: &str,
+    function_name: impl Fn(usize) -> String,
+) -> Result<ShiftKernels, String> {
+    load_functions(ctx, ptx_name, PhotonLayout::GPU_SHIFTS.map(function_name))
+}
+
+/// Loads kernels that share one PTX module.
+fn load_functions<const N: usize>(
+    ctx: &Arc<CudaContext>,
+    ptx_name: &str,
+    function_names: [String; N],
+) -> Result<[CudaFunction; N], String> {
     #[cfg(feature = "rust-t2")]
-    let rust_function = if ptx_name == "photon_c3_dual.ptx" {
-        function_name.replacen("dual_filter", "dual_filter_rfc", 1)
+    let function_names = if ptx_name == "photon_c3_dual.ptx" {
+        function_names.map(|name| name.replacen("dual_filter", "dual_filter_rfc", 1))
     } else {
-        function_name.to_owned()
+        function_names
     };
-    #[cfg(feature = "rust-t2")]
-    let function_name = rust_function.as_str();
     // Diagnostic value grinding retains its native kernel. Ordinary T2 mining
     // and its fallback load only Rust-generated kernels with this feature.
     #[cfg(feature = "rust-t2")]
@@ -182,9 +202,15 @@ fn load_function(
     let module = ctx
         .load_module(Ptx::from_src(source))
         .map_err(|error| format!("load {ptx_name}: {error}"))?;
-    module
-        .load_function(function_name)
-        .map_err(|error| format!("load {function_name}: {error}"))
+    let mut functions = Vec::with_capacity(N);
+    for function_name in &function_names {
+        functions.push(
+            module
+                .load_function(function_name)
+                .map_err(|error| format!("load {function_name}: {error}"))?,
+        );
+    }
+    Ok(functions.try_into().ok().unwrap())
 }
 
 /// Reports whether a CUDA test error means no usable CUDA device or driver,
@@ -266,12 +292,7 @@ impl CudaPhotonEngine {
             "photon_c1_schnorr.ptx",
             "pickaxe_photon_c1_schnorr_dual_batched",
         )?;
-        let stage_c3 = [
-            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[0])?,
-            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[1])?,
-            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[2])?,
-            load_function(&ctx, "photon_c3_dual.ptx", STAGE_C3_FUNCTIONS[3])?,
-        ];
+        let stage_c3 = load_shift_functions(&ctx, "photon_c3_dual.ptx", stage_c3_function)?;
 
         let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
         let table_gpu = stream
@@ -280,7 +301,7 @@ impl CudaPhotonEngine {
         drop(table_bytes);
 
         let target_gpu = stream
-            // The 33rd byte selects chipnet's positive ScriptNum rule.
+            // The 33rd byte selects the positive ScriptNum proof rule.
             .alloc_zeros::<u8>(33)
             .map_err(|error| format!("alloc target: {error}"))?;
         let private_key_gpu = stream
@@ -350,7 +371,7 @@ impl CudaPhotonEngine {
             winner_cap,
             table_source,
             job_ready: false,
-            chipnet_signed_target: false,
+            positive_target: false,
             incremental: None,
             #[cfg(any(feature = "tail-grind", test))]
             t2: None,
@@ -431,9 +452,9 @@ impl CudaPhotonEngine {
             + if self.incremental.is_some() { 96 } else { 0 }
     }
 
-    /// Selects chipnet's positive ScriptNum proof rule for the next job.
-    pub fn set_chipnet_target_rule(&mut self, enabled: bool) {
-        self.chipnet_signed_target = enabled;
+    /// Selects the positive ScriptNum proof rule for the next job.
+    pub fn set_positive_target_rule(&mut self, enabled: bool) {
+        self.positive_target = enabled;
         self.job_ready = false;
     }
 
@@ -467,7 +488,7 @@ impl CudaPhotonEngine {
 
         let mut gpu_target = [0u8; 33];
         gpu_target[..32].copy_from_slice(target);
-        gpu_target[32] = u8::from(self.chipnet_signed_target);
+        gpu_target[32] = u8::from(self.positive_target);
         self.stream
             .memcpy_htod(&gpu_target, &mut self.target_gpu)
             .map_err(|error| format!("upload target: {error}"))?;
@@ -514,7 +535,7 @@ impl CudaPhotonEngine {
                     template,
                     target,
                     private_key,
-                    self.chipnet_signed_target,
+                    self.positive_target,
                 )?;
             } else {
                 self.t2 = None;
@@ -642,7 +663,7 @@ impl CudaPhotonEngine {
         };
         let mut c3 = self
             .stream
-            .launch_builder(&self.stage_c3[self.layout.shift()]);
+            .launch_builder(&self.stage_c3[self.layout.kernel_index()]);
         unsafe {
             c3.arg(&self.template_gpu)
                 .arg(&self.midstate_gpu)
@@ -1034,17 +1055,17 @@ mod tests {
             }
             Err(error) => panic!("chipnet GPU setup failed: {error}"),
         };
-        engine.set_chipnet_target_rule(true);
+        engine.set_positive_target_rule(true);
         engine.set_job(&template, &target, &private_key).unwrap();
         let result = engine.search_batch(base, count).unwrap();
         let expected: Vec<_> = (base..base + count)
             .filter_map(|nonce| {
                 let (digest, _) =
                     real_and_other_sign_hashes(&template, &target, &private_key, nonce);
-                search::meets_target_le_for_network(
+                search::meets_target_le_for_rule(
                     &digest,
                     &target,
-                    crate::config::MiningNetwork::Chipnet,
+                    crate::protocol::ProofRule::Positive,
                 )
                 .then_some((nonce, digest))
             })
@@ -1127,9 +1148,8 @@ mod tests {
             }
             Err(error) => panic!("PHOTON CUDA init failed: {error}"),
         };
-        for age in [16u32, 17, 128, 40_000] {
-            let layout = PhotonLayout::for_age(age).unwrap();
-            let template = tx::build_photon_template_bytes(&tx::TemplateParams {
+        for shift in PhotonLayout::GPU_SHIFTS {
+            let template = tx::template_for_shift(shift, |age| tx::TemplateParams {
                 prev_tx_hash_hex:
                     "42a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae124712000000".into(),
                 prev_index: 0,
@@ -1142,11 +1162,10 @@ mod tests {
                 contract_token_amount: 2_099_905_002_035_715,
                 reward_amount: 4_999_773_813,
                 payout_locking: payout.clone(),
-            })
-            .unwrap();
-            assert_eq!(template.len(), layout.tx_bytes());
+            });
+            let layout = PhotonLayout::for_tx_len(template.len()).unwrap();
             engine.set_job(&template, &target, &private_key).unwrap();
-            let nonce_base = 0x7700_0000 + age;
+            let nonce_base = 0x7700_0000 + shift as u32;
             let result = engine.search_batch(nonce_base, candidate_count).unwrap();
 
             let mut expected = std::collections::BTreeMap::new();
@@ -1168,9 +1187,13 @@ mod tests {
                 .iter()
                 .map(|winner| (winner.nonce, winner.digest))
                 .collect::<std::collections::BTreeMap<_, _>>();
-            assert!(!expected.is_empty(), "age {age}: no host winners");
-            assert_eq!(result.total_winners as usize, expected.len(), "age {age}");
-            assert_eq!(found, expected, "age {age}");
+            assert!(!expected.is_empty(), "shift {shift}: no host winners");
+            assert_eq!(
+                result.total_winners as usize,
+                expected.len(),
+                "shift {shift}"
+            );
+            assert_eq!(found, expected, "shift {shift}");
         }
     }
 }

@@ -48,7 +48,7 @@ impl T2Engine {
         }
         unsafe {
             self.stream
-                .launch_builder(&self.prepare_group[self.layout.shift()])
+                .launch_builder(&self.prepare_group[self.layout.kernel_index()])
                 .arg(&self.template_gpu)
                 .arg(&parent.midstate_gpu)
                 .arg(&parent.signatures_gpu)
@@ -77,7 +77,7 @@ impl T2Engine {
             .ok_or("V kernel is not loaded")?;
         unsafe {
             self.stream
-                .launch_builder(&filter[self.layout.shift()])
+                .launch_builder(&filter[self.layout.kernel_index()])
                 .arg(&self.window_txs_gpu)
                 .arg(&self.window_prefixes_gpu)
                 .arg(&self.baton)

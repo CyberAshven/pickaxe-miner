@@ -4,31 +4,62 @@
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
 
-/// CashToken category id (hex, 32 bytes).
+/// Mainnet PHOTON relaunch category (genesis
+/// 248ef0474ac9cdf5cf1fe7abd325864f6d82891db682ec4437a77d77a24c1c30 at
+/// height 971212), the author's `PHOTON_CATEGORY` in 2qx/vox
+/// packages/photon/src/index.ts. Mainnet and Chipnet run the identical v3.2
+/// contract (`template.v3.2.json`, v20260930); only the category differs.
+/// A different contract replaces the lock, script hash, redeem script,
+/// addresses and proof rule below together.
 pub const MAINNET_CATEGORY_HEX: &str =
-    "29972959d6f0dc766cdcb81bfaf8171c5605a64dd0a81fa46080f84ac87c9bef";
+    "53bd86e3f123918d2d7040449f88f7ed1bbddc309b66f2ac67cd429278f5ea58";
 
-/// Covenant locking bytecode (hex).
+/// Covenant locking bytecode (hex): P2SH32 of the v3.2 redeem script.
 pub const COVENANT_LOCKING_BYTECODE_HEX: &str =
-    "aa209a2c0f31147dda170e59aaa7982e4fe3fc25928bf09f15fe1e797a2ccb05c6e087";
+    "aa200ab476a6dab00ba11118a11c078f871c5060a66e18140368425202772d0e80c287";
 
 /// Expected Electrum script hash for the covenant (hex, reversed-SHA256 of lock).
 pub const EXPECTED_SCRIPT_HASH_HEX: &str =
+    "0cea1bfb91d50a9a3fb88bdf4f9d466c15738d7feba0873a5e85313d42035261";
+
+/// Redeem script hex (P2SH32 / covenant spend path): the compiled 273-byte
+/// `lock` script of the v3.2 template.
+pub const REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_v32_redeem.hex");
+
+pub const MAINNET_COVENANT_ADDRESS: &str =
+    "bitcoincash:rv9tga4xm2cqhgg3rzs3cpu0suw9qc9xdcvpgqmggffqyaedp6qvynuy0nm8t";
+
+/// The original mainnet PHOTON (v0), retired by its author for the
+/// relaunch. Kept as the GPU kernels' base layout, the reference test
+/// vectors and the legacy self-funded settlement.
+pub const MAINNET_V0_CATEGORY_HEX: &str =
+    "29972959d6f0dc766cdcb81bfaf8171c5605a64dd0a81fa46080f84ac87c9bef";
+pub const MAINNET_V0_COVENANT_LOCKING_BYTECODE_HEX: &str =
+    "aa209a2c0f31147dda170e59aaa7982e4fe3fc25928bf09f15fe1e797a2ccb05c6e087";
+pub const MAINNET_V0_EXPECTED_SCRIPT_HASH_HEX: &str =
     "720bad85599cd504b114c65caedb76098cab45df5553be1c7cf260c4c2954031";
-
 /// Redeem script hex (P2SH32 / covenant spend path) — from postcorps miner.js.
-pub const REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_redeem.hex");
+pub const MAINNET_V0_REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_redeem.hex");
 
-/// The corrected PHOTON deployment currently live on Chipnet.
+/// The author's Chipnet PHOTON (`tPHOTON_CATEGORY`) on the same v3.2 contract.
 pub const CHIPNET_CATEGORY_HEX: &str =
-    "18ae09cfc783ec83ada4e642c00a22015866609d319e33c73a7c13948bc2832a";
+    "a852635be88f7291bc42e427b8107546f943e73636945a2f6cc9532af71896c0";
 pub const CHIPNET_COVENANT_LOCKING_BYTECODE_HEX: &str =
-    "aa201e48761db52818690bd86be385113a822af4acdf6211115d3375620ddf660c8d87";
+    "aa200ab476a6dab00ba11118a11c078f871c5060a66e18140368425202772d0e80c287";
 pub const CHIPNET_EXPECTED_SCRIPT_HASH_HEX: &str =
-    "689bc502b36ef792153c7dcda756f800b325dd2677e2552dcb7e67bf89cd6850";
-pub const CHIPNET_REDEEM_SCRIPT_HEX: &str = include_str!("../reference/photon_chipnet_redeem.hex");
+    "0cea1bfb91d50a9a3fb88bdf4f9d466c15738d7feba0873a5e85313d42035261";
+pub const CHIPNET_REDEEM_SCRIPT_HEX: &str = REDEEM_SCRIPT_HEX;
 pub const CHIPNET_COVENANT_ADDRESS: &str =
-    "bchtest:rv0ysasak55ps6gtmp478pg382pz4a9vma3pzy2axd6kyrwlvcxg6ayasygal";
+    "bchtest:rv9tga4xm2cqhgg3rzs3cpu0suw9qc9xdcvpgqmggffqyaedp6qvysm43tgje";
+
+/// How a covenant compares `HASH256(tx)` with its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofRule {
+    /// v0: `ABS(BIN2NUM(hash)) < target`, so the sign bit never matters.
+    Absolute,
+    /// v3.2: the hash and the target must both be positive script numbers.
+    Positive,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PhotonDeployment {
@@ -37,6 +68,7 @@ pub struct PhotonDeployment {
     pub script_hash_hex: &'static str,
     pub redeem_script_hex: &'static str,
     pub covenant_address: &'static str,
+    pub proof_rule: ProofRule,
 }
 
 pub const MAINNET_PHOTON: PhotonDeployment = PhotonDeployment {
@@ -44,7 +76,18 @@ pub const MAINNET_PHOTON: PhotonDeployment = PhotonDeployment {
     covenant_lock_hex: COVENANT_LOCKING_BYTECODE_HEX,
     script_hash_hex: EXPECTED_SCRIPT_HASH_HEX,
     redeem_script_hex: REDEEM_SCRIPT_HEX,
+    covenant_address: MAINNET_COVENANT_ADDRESS,
+    proof_rule: ProofRule::Positive,
+};
+
+/// Retired mainnet v0 deployment; see [`MAINNET_V0_CATEGORY_HEX`].
+pub const MAINNET_V0_PHOTON: PhotonDeployment = PhotonDeployment {
+    category_hex: MAINNET_V0_CATEGORY_HEX,
+    covenant_lock_hex: MAINNET_V0_COVENANT_LOCKING_BYTECODE_HEX,
+    script_hash_hex: MAINNET_V0_EXPECTED_SCRIPT_HASH_HEX,
+    redeem_script_hex: MAINNET_V0_REDEEM_SCRIPT_HEX,
     covenant_address: "bitcoincash:rwdzcre3z37a59cwtx420xpwfl3lcfvj30cf7907reuh5txtqhrwqtx8rf5ms",
+    proof_rule: ProofRule::Absolute,
 };
 
 pub const CHIPNET_PHOTON: PhotonDeployment = PhotonDeployment {
@@ -53,6 +96,7 @@ pub const CHIPNET_PHOTON: PhotonDeployment = PhotonDeployment {
     script_hash_hex: CHIPNET_EXPECTED_SCRIPT_HASH_HEX,
     redeem_script_hex: CHIPNET_REDEEM_SCRIPT_HEX,
     covenant_address: CHIPNET_COVENANT_ADDRESS,
+    proof_rule: ProofRule::Positive,
 };
 
 impl PhotonDeployment {
@@ -140,9 +184,11 @@ fn decode_positive_script_number(bytes: &[u8]) -> Result<u64, String> {
     Ok(value)
 }
 
-/// Returns the authoritative PHOTON baton redeem script.
+/// Returns the v0 PHOTON baton redeem script the self-funded settlement
+/// budgets were proven against.
 fn authoritative_redeem_script() -> Result<Vec<u8>, String> {
-    let redeem_script = hex::decode(REDEEM_SCRIPT_HEX.trim()).map_err(|error| error.to_string())?;
+    let redeem_script =
+        hex::decode(MAINNET_V0_REDEEM_SCRIPT_HEX.trim()).map_err(|error| error.to_string())?;
     if redeem_script.len() != 259 {
         return Err(format!(
             "PHOTON redeem script must be 259 bytes (got {})",
@@ -151,7 +197,7 @@ fn authoritative_redeem_script() -> Result<Vec<u8>, String> {
     }
 
     let covenant_lock =
-        hex::decode(COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
+        hex::decode(MAINNET_V0_COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
     if covenant_lock.len() != 35
         || covenant_lock[0] != 0xaa
         || covenant_lock[1] != 0x20
@@ -420,7 +466,7 @@ mod tests {
         CHIPNET_PHOTON.verify().unwrap();
         assert_eq!(
             hex::decode(CHIPNET_REDEEM_SCRIPT_HEX.trim()).unwrap().len(),
-            261
+            273
         );
         assert_eq!(
             CHIPNET_PHOTON
@@ -433,6 +479,47 @@ mod tests {
                 .multi_input_min_baton_increase_sats()
                 .unwrap(),
             8_000
+        );
+    }
+
+    #[test]
+    fn mainnet_relaunch_runs_the_chipnet_contract() {
+        MAINNET_V0_PHOTON.verify().unwrap();
+        assert_eq!(
+            MAINNET_PHOTON.covenant_lock_hex,
+            CHIPNET_PHOTON.covenant_lock_hex
+        );
+        assert_eq!(
+            MAINNET_PHOTON.script_hash_hex,
+            CHIPNET_PHOTON.script_hash_hex
+        );
+        assert_eq!(
+            MAINNET_PHOTON.redeem_script_hex,
+            CHIPNET_PHOTON.redeem_script_hex
+        );
+        assert_ne!(MAINNET_PHOTON.category_hex, CHIPNET_PHOTON.category_hex);
+        assert_eq!(MAINNET_PHOTON.proof_rule, ProofRule::Positive);
+        assert_eq!(CHIPNET_PHOTON.proof_rule, ProofRule::Positive);
+        assert_eq!(MAINNET_V0_PHOTON.proof_rule, ProofRule::Absolute);
+    }
+
+    #[test]
+    fn mainnet_initial_baton_derives_positive_targets() {
+        // The relaunch's initial baton commitment, published by the author.
+        let commitment = "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000";
+        let unconfirmed =
+            derive_photon_state(commitment, 2_100_000_000_000_000, 971_300, 0).unwrap();
+        assert_eq!(unconfirmed.age, 0);
+        assert_eq!(
+            unconfirmed.target_le_hex,
+            "e2388ee3388ee3388ee3388ee3388ee3388ee3388ee3388ee338fe0000000000"
+        );
+        let aged =
+            derive_photon_state(commitment, 2_100_000_000_000_000, 971_400, 971_300).unwrap();
+        assert_eq!(aged.age, 100);
+        assert_eq!(
+            aged.target_le_hex,
+            "feffffffffffffffffffffffffffffffffffffffffffffffffffaf0100000000"
         );
     }
 

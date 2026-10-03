@@ -243,7 +243,10 @@ fn reference_job_context(job: &LiveJob) -> tx::ReferenceJobContext {
 
 /// Fetches and validates a refreshed live PHOTON job.
 fn refresh_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>) -> Result<(), String> {
-    let mut session = ElectrumSession::connect_failover(&cfg.electrum_endpoints())?;
+    let mut session = ElectrumSession::connect_failover_for_deployment(
+        &cfg.electrum_endpoints(),
+        cfg.token.photon_deployment(cfg.network),
+    )?;
     let job = session.fetch_live_job()?;
     publish_live_job(cfg, live, job);
     Ok(())
@@ -565,7 +568,10 @@ fn handle_line(
             }
             Err(e) => println!("error: {e}"),
         },
-        "connect" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+        "connect" => match ElectrumSession::connect_failover_for_deployment(
+            &cfg.electrum_endpoints(),
+            cfg.token.photon_deployment(cfg.network),
+        ) {
             Ok(s) => {
                 println!("connected: {}", s.url);
                 println!("server.version: {}", s.server_version);
@@ -574,7 +580,10 @@ fn handle_line(
             }
             Err(e) => println!("error: {e}"),
         },
-        "job" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+        "job" => match ElectrumSession::connect_failover_for_deployment(
+            &cfg.electrum_endpoints(),
+            cfg.token.photon_deployment(cfg.network),
+        ) {
             Ok(mut s) => match s.fetch_live_job() {
                 Ok(j) => {
                     j.print_summary();
@@ -592,7 +601,10 @@ fn handle_line(
             if cfg.payout_address.is_empty() {
                 println!("set payout first: payout bitcoincash:...");
             } else {
-                match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                match ElectrumSession::connect_failover_for_deployment(
+                    &cfg.electrum_endpoints(),
+                    cfg.token.photon_deployment(cfg.network),
+                ) {
                     Err(e) => println!("error: {e}"),
                     Ok(mut s) => match s.fetch_live_job() {
                         Err(e) => println!("error: {e}"),
@@ -606,9 +618,10 @@ fn handle_line(
                                 Err(e) => println!("error: {e}"),
                             }
                             let job_ctx = reference_job_context(&j);
-                            match tx::build_unsigned_reference_preview(
+                            match tx::build_unsigned_reference_preview_for_deployment(
                                 &job_ctx,
                                 &cfg.payout_address,
+                                cfg.token.photon_deployment(cfg.network),
                             ) {
                                 Ok(bytes) => {
                                     let hx = hex::encode(&bytes);
@@ -645,12 +658,13 @@ fn handle_line(
                     None => println!("run job or arm first to cache LiveJob"),
                     Some(j) => {
                         let job_ctx = reference_job_context(j);
-                        match tx::apply_reference_signature(
+                        match tx::apply_reference_signature_for_deployment(
                             &job_ctx,
                             &cfg.payout_address,
                             args[1],
                             nonce,
                             args[2],
+                            cfg.token.photon_deployment(cfg.network),
                         ) {
                             Ok(bytes) => {
                                 let hx = hex::encode(&bytes);
@@ -682,14 +696,18 @@ fn handle_line(
             if cfg.payout_address.is_empty() {
                 println!("error: set payout first (payout bitcoincash:...)");
             } else {
-                match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                match ElectrumSession::connect_failover_for_deployment(
+                    &cfg.electrum_endpoints(),
+                    cfg.token.photon_deployment(cfg.network),
+                ) {
                     Ok(mut s) => match s.fetch_live_job() {
                         Ok(j) => {
                             j.print_summary();
                             let job_ctx = reference_job_context(&j);
-                            match tx::build_unsigned_reference_preview(
+                            match tx::build_unsigned_reference_preview_for_deployment(
                                 &job_ctx,
                                 &cfg.payout_address,
+                                cfg.token.photon_deployment(cfg.network),
                             ) {
                                 Ok(bytes) => {
                                     let hx = hex::encode(&bytes);

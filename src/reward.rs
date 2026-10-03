@@ -6,7 +6,9 @@
 
 use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, SHREC_DONATION_ADDRESS};
 use crate::crypto;
-use crate::protocol::{PhotonDeployment, COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
+use crate::protocol::{
+    PhotonDeployment, MAINNET_V0_CATEGORY_HEX, MAINNET_V0_COVENANT_LOCKING_BYTECODE_HEX,
+};
 use crate::tx;
 use ripemd::Ripemd160;
 use secp256k1::{PublicKey, SecretKey};
@@ -125,9 +127,9 @@ fn push_data(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Serializes a CashToken prefix for a transaction output.
+/// Serializes a v0 PHOTON CashToken prefix for a self-funded settlement output.
 fn token_prefix(amount: u128) -> Result<Vec<u8>, String> {
-    let category = hex::decode(MAINNET_CATEGORY_HEX).map_err(|error| error.to_string())?;
+    let category = hex::decode(MAINNET_V0_CATEGORY_HEX).map_err(|error| error.to_string())?;
     if category.len() != 32 {
         return Err("PHOTON category must be 32 bytes".into());
     }
@@ -197,19 +199,20 @@ fn read_canonical_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, 
     Ok(value)
 }
 
-/// Checks a parent token against the authoritative PHOTON baton.
+/// Checks a parent token against the v0 PHOTON baton the self-funded
+/// settlement was proven against.
 fn validate_authoritative_baton_token(token_and_locking_bytecode: &[u8]) -> Result<(), String> {
     const TOKEN_PREFIX_MARKER: u8 = 0xef;
     const MUTABLE_NFT_WITH_COMMITMENT_AND_AMOUNT: u8 = 0x71;
     const MIN_REFERENCE_COMMITMENT_BYTES: usize = 36;
 
-    let category = hex::decode(MAINNET_CATEGORY_HEX).map_err(|error| error.to_string())?;
+    let category = hex::decode(MAINNET_V0_CATEGORY_HEX).map_err(|error| error.to_string())?;
     if category.len() != 32 {
         return Err("PHOTON category must be 32 bytes".into());
     }
     let category_le = reverse(&category);
     let covenant_lock =
-        hex::decode(COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
+        hex::decode(MAINNET_V0_COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
 
     let marker = token_and_locking_bytecode
         .first()
@@ -1114,7 +1117,7 @@ mod tests {
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
                 .serialize();
         let mut parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
-        let category_le = reverse(&hex::decode(MAINNET_CATEGORY_HEX).unwrap());
+        let category_le = reverse(&hex::decode(MAINNET_V0_CATEGORY_HEX).unwrap());
         let prefix = [vec![0xef], category_le.clone(), vec![0x71]].concat();
         let offset = parent
             .windows(prefix.len())
@@ -1144,7 +1147,7 @@ mod tests {
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
                 .serialize();
         let mut parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
-        let category_le = reverse(&hex::decode(MAINNET_CATEGORY_HEX).unwrap());
+        let category_le = reverse(&hex::decode(MAINNET_V0_CATEGORY_HEX).unwrap());
         let prefix = [vec![0xef], category_le, vec![0x71]].concat();
         let offset = parent
             .windows(prefix.len())

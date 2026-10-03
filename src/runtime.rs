@@ -2355,11 +2355,12 @@ fn validate_verified_parent(
     live: &LiveJob,
     reward_public_key: &[u8; 33],
 ) -> Result<(), String> {
+    // Only the retired v0 contract admits a self-funded settlement.
     validate_verified_parent_for_deployment(
         winner,
         live,
         reward_public_key,
-        &crate::protocol::MAINNET_PHOTON,
+        &crate::protocol::MAINNET_V0_PHOTON,
     )
 }
 
@@ -3859,9 +3860,10 @@ fn refresh_photon_job_on_cadence(
                     .as_ref()
                     .is_none_or(|session| session.endpoint() != endpoint)
                 {
-                    *native_session = Some(crate::node::NativePhotonSession::connect_failover(&[
-                        endpoint.to_string(),
-                    ])?);
+                    *native_session = Some(crate::node::NativePhotonSession::connect_failover(
+                        &[endpoint.to_string()],
+                        cfg.token.photon_deployment(cfg.network),
+                    )?);
                 }
                 native_session
                     .as_mut()
@@ -3910,6 +3912,7 @@ fn refresh_photon_job_on_cadence(
         if native_session.is_none() {
             *native_session = Some(crate::node::NativePhotonSession::connect_failover(
                 &node_endpoints,
+                cfg.token.photon_deployment(cfg.network),
             )?);
         }
         native_session
@@ -4686,7 +4689,7 @@ mod tests {
         for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
             let policy = crate::config::MiningToken::Photon.fee_policy(network);
             let ages = if network == MiningNetwork::Mainnet {
-                [0, 16, 17, 128, 32768]
+                [0, 16, 17, 128, 32767]
             } else {
                 [0, 1, 16, 17, 127]
             };
