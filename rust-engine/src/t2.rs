@@ -5,7 +5,8 @@ use super::{index, meets, point_at, read, write};
 use crate::sha256;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-const WINDOW_BYTES: usize = 618;
+// Widest transaction (615 + PhotonLayout::MAX_SHIFT); must match cuda_t2.rs.
+const WINDOW_BYTES: usize = 631;
 // Must match cuda_t2.rs: 256 full windows plus one partial boundary window.
 const HEAD_OFFSET: usize = 257 * 8;
 
@@ -339,4 +340,25 @@ kernels!(
     pickaxe_t2_filter_shift3,
     pickaxe_t2_probe_shift3,
     3
+);
+kernels!(
+    pickaxe_t2_prepare_shift14,
+    pickaxe_t2_filter_group_shift14,
+    pickaxe_t2_filter_shift14,
+    pickaxe_t2_probe_shift14,
+    14
+);
+kernels!(
+    pickaxe_t2_prepare_shift15,
+    pickaxe_t2_filter_group_shift15,
+    pickaxe_t2_filter_shift15,
+    pickaxe_t2_probe_shift15,
+    15
+);
+kernels!(
+    pickaxe_t2_prepare_shift16,
+    pickaxe_t2_filter_group_shift16,
+    pickaxe_t2_filter_shift16,
+    pickaxe_t2_probe_shift16,
+    16
 );

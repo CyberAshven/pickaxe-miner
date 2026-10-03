@@ -1,5 +1,6 @@
-// BCH 2026 VM proof for the PHOTON mining transaction layout at every age
-// push width, and for the covenant's proof-of-work comparison.
+// BCH 2026 VM proof for the v0 PHOTON mining transaction layout at every
+// age push width, and for the v0 covenant's proof-of-work comparison.
+// direct-reward.mjs proves the live v3.2 contract on mainnet and Chipnet.
 //
 // The covenant pushes the baton age as a minimal script number, so the
 // mining transaction is 615 bytes for age 0..=16 and grows by one byte per

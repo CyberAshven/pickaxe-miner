@@ -126,6 +126,7 @@ pub struct ElectrumSession {
 impl ElectrumSession {
     /// Ban-safe connect: **one endpoint at a time**, exponential backoff between
     /// tries, never parallel fan-out. Custom URL should already be first in `endpoints`.
+    #[cfg(test)]
     pub fn connect_failover(endpoints: &[String]) -> Result<Self, String> {
         Self::connect_failover_for_deployment(endpoints, &MAINNET_PHOTON)
     }
@@ -473,13 +474,11 @@ pub(crate) fn live_job_from_fulcrum_values_for_deployment(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
-    if deployment.category_hex == crate::protocol::CHIPNET_CATEGORY_HEX
-        && commitment_hex.len() >= 72
-    {
+    if deployment.proof_rule == crate::protocol::ProofRule::Positive && commitment_hex.len() >= 72 {
         let previous_target = hex::decode(&commitment_hex[8..72])
-            .map_err(|error| format!("invalid Chipnet PHOTON target: {error}"))?;
+            .map_err(|error| format!("invalid PHOTON target: {error}"))?;
         if previous_target.iter().all(|byte| *byte == 0) || previous_target[31] & 0x80 != 0 {
-            return Err("Chipnet PHOTON target must be a positive ScriptNum".into());
+            return Err("PHOTON target must be a positive ScriptNum".into());
         }
     }
     let token_amount_str = baton

@@ -6,6 +6,7 @@ use crate::backend::BackendKind;
 use crate::config::{MiningNetwork, MiningToken};
 use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::hip_photon::HipPhotonEngine;
+use crate::protocol::ProofRule;
 #[cfg(feature = "portable-wgpu")]
 use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, tx};
@@ -113,11 +114,18 @@ impl PhotonEngine {
     ) -> Result<(), String> {
         match self {
             Self::Cuda(engine) => {
-                engine.set_chipnet_target_rule(network == MiningNetwork::Chipnet);
+                engine.set_positive_target_rule(
+                    MiningToken::Photon.photon_deployment(network).proof_rule
+                        == ProofRule::Positive,
+                );
                 engine.set_job(template, target, private_key)
             }
             Self::Hip(engine) => {
-                engine.set_job(base_layout_template(template, "HIP")?, target, private_key)
+                engine.set_positive_target_rule(
+                    MiningToken::Photon.photon_deployment(network).proof_rule
+                        == ProofRule::Positive,
+                );
+                engine.set_job(template, target, private_key)
             }
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => {
@@ -292,7 +300,7 @@ pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Returns the 615-byte template the HIP and wgpu kernels are built for.
+/// Returns the 615-byte template the wgpu kernels are built for.
 fn base_layout_template<'a>(template: &'a [u8], backend: &str) -> Result<&'a [u8; 615], String> {
     template.try_into().map_err(|_| {
         format!(
@@ -323,13 +331,9 @@ pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
     false
 }
 
-/// Applies the selected covenant's signed ScriptNum proof rule.
-pub fn meets_target_le_for_network(
-    digest: &[u8; 32],
-    target_le: &[u8; 32],
-    network: MiningNetwork,
-) -> bool {
-    if network == MiningNetwork::Chipnet
+/// Applies the selected covenant's proof rule.
+pub fn meets_target_le_for_rule(digest: &[u8; 32], target_le: &[u8; 32], rule: ProofRule) -> bool {
+    if rule == ProofRule::Positive
         && (digest[31] & 0x80 != 0
             || digest.iter().all(|byte| *byte == 0)
             || target_le[31] & 0x80 != 0
@@ -367,10 +371,13 @@ fn validate_job(job: &MiningJob) -> Result<[u8; 32], String> {
         return Err("mining payout address is required".into());
     }
     let target = parse_hex32(&job.target_le_hex)?;
-    if job.network == MiningNetwork::Chipnet
+    if MiningToken::Photon
+        .photon_deployment(job.network)
+        .proof_rule
+        == ProofRule::Positive
         && (target[31] & 0x80 != 0 || target.iter().all(|byte| *byte == 0))
     {
-        return Err("chipnet PHOTON target must be a positive ScriptNum".into());
+        return Err("PHOTON target must be a positive ScriptNum".into());
     }
     Ok(target)
 }
@@ -498,7 +505,13 @@ fn verify_gpu_winner(
             hex::encode(digest)
         ));
     }
-    if !meets_target_le_for_network(&digest, &prepared.target, prepared.job.network) {
+    if !meets_target_le_for_rule(
+        &digest,
+        &prepared.target,
+        MiningToken::Photon
+            .photon_deployment(prepared.job.network)
+            .proof_rule,
+    ) {
         return Err("returned GPU winner failed strict host hash < target verification".into());
     }
     Ok(VerifiedWinner {
@@ -1782,57 +1795,65 @@ mod tests {
             generation_id: 1,
             ..MiningJob::default()
         };
-        let prepared = prepare_job(job.clone(), &sk, &public_key).unwrap();
-        assert_eq!(prepared.template.len(), 615);
-        assert_eq!(&prepared.template[390..394], &[0u8; 4]);
-        assert_eq!(&prepared.template[394..426], &prepared.target);
-        assert_eq!(&prepared.template[45..78], &public_key);
-
-        for (age, bytes) in [(17u32, 616usize), (128, 617), (40_000, 618)] {
+        // Mainnet runs the 273-byte v3.2 contract: fourteen bytes past v0.
+        for (age, bytes) in [(10u32, 629usize), (17, 630), (128, 631), (32_767, 631)] {
             let prepared = prepare_job(MiningJob { age, ..job.clone() }, &sk, &public_key).unwrap();
-            let layout = tx::PhotonLayout::for_age(age).unwrap();
+            let layout =
+                tx::PhotonLayout::for_age_with_deployment(age, &crate::protocol::MAINNET_PHOTON)
+                    .unwrap();
             assert_eq!(prepared.template.len(), bytes);
+            let n = layout.nonce_offset();
+            assert_eq!(&prepared.template[n..n + 4], &[0u8; 4]);
             let t = layout.target_offset();
             assert_eq!(&prepared.template[t..t + 32], &prepared.target);
             assert_eq!(&prepared.template[45..78], &public_key);
         }
+        assert!(prepare_job(
+            MiningJob {
+                age: 32_768,
+                ..job.clone()
+            },
+            &sk,
+            &public_key
+        )
+        .is_err());
         assert!(prepare_job(MiningJob { age: 65_535, ..job }, &sk, &public_key).is_err());
     }
 
     #[test]
-    fn chipnet_signed_hash_requires_positive_nonzero_digest() {
+    fn positive_proof_rule_requires_positive_nonzero_digest() {
         let mut target = [0xff; 32];
         target[31] = 0x7f;
         let mut positive = [1; 32];
         positive[31] = 0;
-        assert!(meets_target_le_for_network(
+        assert!(meets_target_le_for_rule(
             &positive,
             &target,
-            crate::config::MiningNetwork::Chipnet,
+            crate::protocol::ProofRule::Positive,
         ));
         let mut negative = positive;
         negative[31] = 0x80;
-        assert!(!meets_target_le_for_network(
+        assert!(!meets_target_le_for_rule(
             &negative,
             &target,
-            crate::config::MiningNetwork::Chipnet,
+            crate::protocol::ProofRule::Positive,
         ));
-        assert!(!meets_target_le_for_network(
+        assert!(!meets_target_le_for_rule(
             &[0; 32],
             &target,
-            crate::config::MiningNetwork::Chipnet,
+            crate::protocol::ProofRule::Positive,
         ));
-        assert!(meets_target_le_for_network(
+        assert!(meets_target_le_for_rule(
             &negative,
             &target,
-            crate::config::MiningNetwork::Mainnet,
+            crate::protocol::ProofRule::Absolute,
         ));
         let mut invalid_target = target;
         invalid_target[31] = 0xff;
-        assert!(!meets_target_le_for_network(
+        assert!(!meets_target_le_for_rule(
             &positive,
             &invalid_target,
-            crate::config::MiningNetwork::Chipnet,
+            crate::protocol::ProofRule::Positive,
         ));
     }
 
@@ -1852,18 +1873,28 @@ mod tests {
             MiningToken::Photon.photon_deployment(job.network),
         )
         .unwrap();
-        assert_eq!(prepared.template.len(), 618);
-        assert_eq!(layout.shift(), 3);
+        assert_eq!(prepared.template.len(), 630);
+        assert_eq!(layout.shift(), 15);
         assert_eq!(
             &prepared.template[layout.target_offset()..layout.target_offset() + 32],
             &prepared.target,
         );
+        let prepared = prepare_job(
+            MiningJob {
+                age: 128,
+                ..job.clone()
+            },
+            &sk,
+            &public_key,
+        )
+        .unwrap();
+        assert_eq!(prepared.template.len(), 631);
         let mut unsupported = job;
-        unsupported.age = 128;
+        unsupported.age = 32_768;
         assert!(prepare_job(unsupported, &sk, &public_key)
             .err()
             .unwrap()
-            .contains("GPU layout shift 4"));
+            .contains("GPU layout shift 17"));
     }
 
     #[test]
@@ -1872,14 +1903,11 @@ mod tests {
         let public =
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
         let job = MiningJob {
-            target_le_hex: "ff".repeat(32),
+            target_le_hex: format!("{}7f", "ff".repeat(31)),
             payout_address: "zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3".into(),
             ..integration_job(12)
         };
         let prepared = prepare_job(job.clone(), &sk, &public).unwrap();
-        let nonce = 7;
-        let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
-        let signature = crypto::bch_schnorr_sign(&sk, &message).unwrap();
         let context = tx::ReferenceJobContext {
             prev_txid: job.baton_txid.clone(),
             prev_vout: job.baton_vout,
@@ -1889,14 +1917,23 @@ mod tests {
             contract_token_amount: job.token_amount,
             reward_raw: job.reward_raw - 31,
         };
-        let tx = tx::apply_reference_signature(
-            &context,
-            &job.payout_address,
-            &hex::encode(public),
-            nonce,
-            &hex::encode(signature),
-        )
-        .unwrap();
+        // The positive proof rule rejects about half the digests.
+        let (nonce, signature, tx) = (0..64)
+            .find_map(|nonce| {
+                let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+                let signature = crypto::bch_schnorr_sign(&sk, &message).unwrap();
+                tx::apply_reference_signature_for_deployment(
+                    &context,
+                    &job.payout_address,
+                    &hex::encode(public),
+                    nonce,
+                    &hex::encode(signature),
+                    &crate::protocol::MAINNET_PHOTON,
+                )
+                .ok()
+                .map(|tx| (nonce, signature, tx))
+            })
+            .unwrap();
         let gpu = PhotonCudaWinner {
             nonce,
             digest: hash256(&tx),
@@ -1980,7 +2017,7 @@ mod tests {
         };
         cuda.enable_incremental_search().unwrap();
         let mut engine = PhotonEngine::Cuda(Box::new(cuda));
-        for age in [0, 17, 128, 65534] {
+        for age in [0, 17, 128, 32_767] {
             job.age = age;
             job.generation_id += 1;
             let prepared = prepare_job(job.clone(), &sk, &public).unwrap();
@@ -1988,7 +2025,8 @@ mod tests {
                 .set_job(&prepared.template, &prepared.target, &sk)
                 .unwrap();
             let result = engine.search_batch(u32::MAX - 64, 65).unwrap();
-            assert_eq!(result.total_winners, 65);
+            // Mainnet's positive proof rule admits about half the digests.
+            assert!(result.total_winners > 0 && result.total_winners <= 65);
             for winner in &result.winners {
                 assert_eq!(winner.nonce, 0);
                 assert!(winner.schnorr_k.unwrap() >= (1u64 << 32) - 64);
@@ -2060,7 +2098,8 @@ mod tests {
     // separate GPU winner tests retain their real targets and verification.
     fn control_job(generation_id: u64) -> MiningJob {
         MiningJob {
-            target_le_hex: "00".repeat(32),
+            // The smallest positive target: only a zero digest could meet it.
+            target_le_hex: format!("01{}", "00".repeat(31)),
             ..integration_job(generation_id)
         }
     }

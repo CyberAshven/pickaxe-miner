@@ -25,7 +25,6 @@ mod cuda_stage_c;
 mod donation;
 #[allow(dead_code)]
 mod electrum;
-mod funding;
 mod hip_photon;
 #[allow(dead_code)]
 mod m29_table;
@@ -244,7 +243,10 @@ fn reference_job_context(job: &LiveJob) -> tx::ReferenceJobContext {
 
 /// Fetches and validates a refreshed live PHOTON job.
 fn refresh_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>) -> Result<(), String> {
-    let mut session = ElectrumSession::connect_failover(&cfg.electrum_endpoints())?;
+    let mut session = ElectrumSession::connect_failover_for_deployment(
+        &cfg.electrum_endpoints(),
+        cfg.token.photon_deployment(cfg.network),
+    )?;
     let job = session.fetch_live_job()?;
     publish_live_job(cfg, live, job);
     Ok(())
@@ -566,7 +568,10 @@ fn handle_line(
             }
             Err(e) => println!("error: {e}"),
         },
-        "connect" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+        "connect" => match ElectrumSession::connect_failover_for_deployment(
+            &cfg.electrum_endpoints(),
+            cfg.token.photon_deployment(cfg.network),
+        ) {
             Ok(s) => {
                 println!("connected: {}", s.url);
                 println!("server.version: {}", s.server_version);
@@ -575,7 +580,10 @@ fn handle_line(
             }
             Err(e) => println!("error: {e}"),
         },
-        "job" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+        "job" => match ElectrumSession::connect_failover_for_deployment(
+            &cfg.electrum_endpoints(),
+            cfg.token.photon_deployment(cfg.network),
+        ) {
             Ok(mut s) => match s.fetch_live_job() {
                 Ok(j) => {
                     j.print_summary();
@@ -593,7 +601,10 @@ fn handle_line(
             if cfg.payout_address.is_empty() {
                 println!("set payout first: payout bitcoincash:...");
             } else {
-                match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                match ElectrumSession::connect_failover_for_deployment(
+                    &cfg.electrum_endpoints(),
+                    cfg.token.photon_deployment(cfg.network),
+                ) {
                     Err(e) => println!("error: {e}"),
                     Ok(mut s) => match s.fetch_live_job() {
                         Err(e) => println!("error: {e}"),
@@ -607,9 +618,10 @@ fn handle_line(
                                 Err(e) => println!("error: {e}"),
                             }
                             let job_ctx = reference_job_context(&j);
-                            match tx::build_unsigned_reference_preview(
+                            match tx::build_unsigned_reference_preview_for_deployment(
                                 &job_ctx,
                                 &cfg.payout_address,
+                                cfg.token.photon_deployment(cfg.network),
                             ) {
                                 Ok(bytes) => {
                                     let hx = hex::encode(&bytes);
@@ -646,12 +658,13 @@ fn handle_line(
                     None => println!("run job or arm first to cache LiveJob"),
                     Some(j) => {
                         let job_ctx = reference_job_context(j);
-                        match tx::apply_reference_signature(
+                        match tx::apply_reference_signature_for_deployment(
                             &job_ctx,
                             &cfg.payout_address,
                             args[1],
                             nonce,
                             args[2],
+                            cfg.token.photon_deployment(cfg.network),
                         ) {
                             Ok(bytes) => {
                                 let hx = hex::encode(&bytes);
@@ -683,14 +696,18 @@ fn handle_line(
             if cfg.payout_address.is_empty() {
                 println!("error: set payout first (payout bitcoincash:...)");
             } else {
-                match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                match ElectrumSession::connect_failover_for_deployment(
+                    &cfg.electrum_endpoints(),
+                    cfg.token.photon_deployment(cfg.network),
+                ) {
                     Ok(mut s) => match s.fetch_live_job() {
                         Ok(j) => {
                             j.print_summary();
                             let job_ctx = reference_job_context(&j);
-                            match tx::build_unsigned_reference_preview(
+                            match tx::build_unsigned_reference_preview_for_deployment(
                                 &job_ctx,
                                 &cfg.payout_address,
+                                cfg.token.photon_deployment(cfg.network),
                             ) {
                                 Ok(bytes) => {
                                     let hx = hex::encode(&bytes);
@@ -854,24 +871,6 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             runtime::RuntimeEvent::DirectRewardAccepted { txid, recipient } => serde_json::json!({
                 "event": "direct_reward_accepted", "txid": txid, "recipient": recipient,
             }),
-            runtime::RuntimeEvent::RewardAccrued { parent_txid } => serde_json::json!({
-                "event": "reward_accrued",
-                "parent_txid": parent_txid,
-                "split_pending": true,
-            }),
-            runtime::RuntimeEvent::RewardSplit {
-                child_txid,
-                reward_count,
-            } => serde_json::json!({
-                "event": "reward_split",
-                "child_txid": child_txid,
-                "reward_count": reward_count,
-            }),
-            runtime::RuntimeEvent::RewardInventory { confirmed_at_least } => serde_json::json!({
-                "event": "reward_inventory",
-                "confirmed_at_least": confirmed_at_least,
-                "minimum_for_split": 5,
-            }),
             runtime::RuntimeEvent::Error(error) => {
                 serde_json::json!({"event": "error", "error": error})
             }
@@ -931,15 +930,6 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
         runtime::RuntimeEvent::DirectRewardAccepted { txid, .. } => {
             println!("direct reward accepted: tx={txid}")
         }
-        runtime::RuntimeEvent::RewardAccrued { parent_txid } => println!(
-            "legacy Chipnet reward awaiting recovery: parent={parent_txid}"
-        ),
-        runtime::RuntimeEvent::RewardSplit { child_txid, reward_count } => println!(
-            "legacy Chipnet reward recovery accepted: child={child_txid} rewards={reward_count}"
-        ),
-        runtime::RuntimeEvent::RewardInventory { confirmed_at_least } => println!(
-            "legacy Chipnet rewards awaiting recovery: at least {confirmed_at_least}"
-        ),
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
     }
 }
@@ -1309,7 +1299,47 @@ fn main() {
         },
         cli::Commands::Mine => {
             let profiles_path = config::profiles_path(&config_path);
+            let sources_path = config::sources_path(&config_path);
+            let mut sources = match config::SharedSources::load_optional(&sources_path) {
+                Ok(sources) => sources,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            };
+            if saved_config
+                .as_ref()
+                .is_some_and(|saved| sources.adopt_saved_config(saved))
+            {
+                if let Err(error) = sources.save(&sources_path) {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            }
             let startup = mine_startup(&args);
+            let mut cfg = cfg;
+            if matches!(startup, MineStartup::Direct) {
+                // Saved per-network connections apply unless the command line
+                // or the base configuration named its own.
+                let fulcrum = sources.list(cfg.network, config::ConnectionKind::Fulcrum);
+                let node = sources.list(cfg.network, config::ConnectionKind::Node);
+                let applied = (if cfg.fulcrum_url.is_none() {
+                    cfg.set_fulcrum_url(&fulcrum.join(","))
+                } else {
+                    Ok(())
+                })
+                .and_then(|()| {
+                    if cfg.node_url.is_none() {
+                        cfg.set_node_url(&node.join(","))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = applied {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            }
             if matches!(startup, MineStartup::Direct)
                 && (args.no_tui || args.json)
                 && cfg.payout_address.trim().is_empty()
@@ -1339,13 +1369,24 @@ fn main() {
                             std::process::exit(2);
                         }
                     };
-                    let profiles = match config::MiningProfiles::load_optional(&profiles_path) {
+                    let mut profiles = match config::MiningProfiles::load_optional(&profiles_path) {
                         Ok(profiles) => profiles,
                         Err(error) => {
                             eprintln!("error: {error}");
                             std::process::exit(2);
                         }
                     };
+                    // Servers and nodes once saved inside profiles move to the
+                    // shared per-network lists; save those before the profiles.
+                    if sources.adopt_profile_sources(&mut profiles) {
+                        if let Err(error) = sources
+                            .save(&sources_path)
+                            .and_then(|()| profiles.save(&profiles_path))
+                        {
+                            eprintln!("error: {error}");
+                            std::process::exit(2);
+                        }
+                    }
                     let overrides = tui::SetupOverrides {
                         network: if args.chipnet {
                             Some(config::MiningNetwork::Chipnet)
@@ -1368,6 +1409,8 @@ fn main() {
                         &selected,
                         &profiles_path,
                         profiles,
+                        &sources_path,
+                        sources,
                         overrides,
                     ) {
                         Ok(Some(setup)) => setup,
