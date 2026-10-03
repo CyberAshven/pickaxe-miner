@@ -14,7 +14,7 @@ use rand::Rng;
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -671,6 +671,21 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     Duration::from_nanos(u64::try_from(rest_ns).unwrap_or(u64::MAX))
 }
 
+// #### PR #11: winner delivery never blocks ####
+// What: the GPU worker hands host-verified winners to the supervisor through
+// a bounded queue (WINNER_CHANNEL_CAP). When the queue is full it stops and
+// drops the rest of this batch's winners instead of waiting.
+// Why: a blocking send kept `batch_in_flight` set while the supervisor waited
+// for `!batch_in_flight` before draining the queue. With a winner in nearly
+// every batch the miner froze for good ("WINNER PENDING (GPU PAUSED)"), as in
+// the first live Chipnet v3.2 run on 2026-10-03.
+// Safe because: winners still queued already cover the job, and only one of
+// them becomes a claim. If they belong to an older generation (stale), the
+// next batch finds fresh winners again.
+// If something looks wrong here: GPU winners found but never claimed, or
+// `stale_winners` jumping by up to 8 at once. Review this function together
+// with `drain_winners` (search.rs) and `winner_refresh_ready` (runtime.rs).
+
 /// Publishes only GPU batches that pass host verification.
 fn deliver_verified_batch(
     verified_batch: Vec<VerifiedWinner>,
@@ -684,13 +699,18 @@ fn deliver_verified_batch(
 
     paused.store(true, Ordering::SeqCst);
     for verified in verified_batch {
-        if winner_tx.send(verified).is_err() {
-            return false;
+        match winner_tx.try_send(verified) {
+            Ok(()) => {
+                winners.fetch_add(1, Ordering::Release);
+            }
+            // Full: the queued winners already cover this job (see above).
+            Err(TrySendError::Full(_)) => break,
+            Err(TrySendError::Disconnected(_)) => return false,
         }
-        winners.fetch_add(1, Ordering::Release);
     }
     true
 }
+// #### end PR #11 ####
 
 struct WorkerDiagnostics {
     last_error: Mutex<Option<String>>,
@@ -1697,7 +1717,7 @@ mod tests {
         let paused = AtomicBool::new(false);
         let winners = AtomicU64::new(0);
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
-        let batch = (0..WINNER_BUFFER_CAP)
+        let batch: Vec<_> = (0..WINNER_BUFFER_CAP)
             .map(|nonce| VerifiedWinner {
                 generation_id: 1,
                 height: 1_000,
@@ -1712,13 +1732,28 @@ mod tests {
             })
             .collect();
 
+        let second = batch.clone();
         assert!(deliver_verified_batch(batch, &paused, &winners, &winner_tx));
         assert!(paused.load(Ordering::SeqCst));
         assert_eq!(
             winners.load(Ordering::Acquire),
             u64::from(WINNER_BUFFER_CAP)
         );
+
+        // #### PR #11 test: a second winning batch into a full queue ####
+        // The GPU resumed while a claim resolved, before the supervisor
+        // drained the queue. The old blocking send hung here forever.
+        paused.store(false, Ordering::SeqCst);
+        assert!(deliver_verified_batch(
+            second, &paused, &winners, &winner_tx
+        ));
+        assert!(paused.load(Ordering::SeqCst));
+        assert_eq!(
+            winners.load(Ordering::Acquire),
+            u64::from(WINNER_BUFFER_CAP)
+        );
         assert_eq!(winner_rx.try_iter().count(), WINNER_BUFFER_CAP as usize);
+        // #### end PR #11 test ####
     }
 
     #[test]
