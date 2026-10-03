@@ -48,8 +48,9 @@ const CLAIM_RELAY_CAP: usize = 16;
 const CLAIM_RELAY_RETRY: Duration = Duration::from_secs(60);
 /// Public servers drop idle WebSocket clients within about a minute.
 const CLAIM_RELAY_KEEPALIVE: Duration = Duration::from_secs(30);
-/// How often a miner started before its token launches looks for the baton.
-const LAUNCH_BATON_RECHECK: Duration = Duration::from_secs(3);
+/// How often a miner started before its token launches looks for the baton:
+/// the same cadence as the live state recheck while mining.
+const LAUNCH_BATON_RECHECK: Duration = PHOTON_STATE_RECHECK;
 /// How often a miner waiting for a launch says it is still waiting.
 const LAUNCH_WAIT_REPORT: Duration = Duration::from_secs(600);
 const RECONNECT_MIN: Duration = Duration::from_millis(400);
