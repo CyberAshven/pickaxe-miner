@@ -1,16 +1,129 @@
-//! Distribution and runtime config. Donation is split from each PHOTON win by the
-//! protocol-valid reward child path; the PHOTON mining transaction remains the
-//! authoritative two-output covenant transaction.
+//! Distribution and runtime config. Each token selects its own fee policy.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Donation share in basis points (200 = 2%). Never call this a "dev fee".
+/// Historical reward split, retained to recover older pending payouts.
+/// New PHOTON mining uses the separate 4% policy in `donation`.
 pub const DONATION_BPS: u16 = 200;
 
-/// Locked donation payout for distribution builds (BCH cashaddr).
+/// Historical addresses: frozen for legacy payout recovery and its VM proof.
 pub const DONATION_ADDRESS: &str = "bitcoincash:qqn3aqnrarpvecss9vned5v9693j9p37w5pmzz4mn3";
+pub const CHIPNET_DONATION_ADDRESS: &str = "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp";
+
+/// Chain selected for mining. Each token resolves its own deployment on this chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MiningNetwork {
+    #[default]
+    Mainnet,
+    Chipnet,
+}
+
+impl MiningNetwork {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mainnet" => Ok(Self::Mainnet),
+            "chipnet" => Ok(Self::Chipnet),
+            _ => Err("network must be mainnet or chipnet".into()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Chipnet => "chipnet",
+        }
+    }
+
+    fn cashaddr_prefix(self) -> &'static str {
+        match self {
+            Self::Mainnet => "bitcoincash",
+            Self::Chipnet => "bchtest",
+        }
+    }
+
+    /// Prevents a selected chain from using a published endpoint of the other chain.
+    pub(crate) fn accepts_known_electrum_endpoint(self, url: &str) -> bool {
+        let foreign = match self {
+            Self::Mainnet => crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP,
+            Self::Chipnet => crate::protocol::FULCRUM_WSS_BOOTSTRAP,
+        };
+        !foreign.iter().any(|entry| entry.eq_ignore_ascii_case(url))
+    }
+}
+
+/// Supported GPU-minable token identities, in alphabetical display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MiningToken {
+    #[default]
+    Photon,
+}
+
+impl MiningToken {
+    pub const GPU_SUPPORTED: &[Self] = &[Self::Photon];
+
+    /// Maintainer-editable mode, shares and recipients. The protocol must support
+    /// its selected payout scheme before mining starts.
+    pub fn fee_policy(self, network: MiningNetwork) -> crate::donation::Policy {
+        use crate::donation::{Policy, Scheme};
+        match self {
+            Self::Photon => match network {
+                MiningNetwork::Mainnet => Policy {
+                    scheme: Scheme::Work([200, 200]),
+                    addresses: [DONATION_ADDRESS, SHREC_DONATION_ADDRESS],
+                },
+                MiningNetwork::Chipnet => Policy {
+                    scheme: Scheme::Work([400, 0]),
+                    addresses: [CHIPNET_DONATION_ADDRESS, CHIPNET_DONATION_ADDRESS],
+                },
+            },
+        }
+    }
+
+    pub fn photon_deployment(
+        self,
+        network: MiningNetwork,
+    ) -> &'static crate::protocol::PhotonDeployment {
+        match (self, network) {
+            (Self::Photon, MiningNetwork::Mainnet) => &crate::protocol::MAINNET_PHOTON,
+            (Self::Photon, MiningNetwork::Chipnet) => &crate::protocol::CHIPNET_PHOTON,
+        }
+    }
+
+    pub fn parse(query: &str, network: MiningNetwork) -> Result<Self, String> {
+        let query = query.trim();
+        let hex = query
+            .strip_prefix("0x")
+            .or_else(|| query.strip_prefix("0X"))
+            .unwrap_or(query);
+        let deployment = Self::Photon.photon_deployment(network);
+        if query.eq_ignore_ascii_case("photon")
+            || hex.eq_ignore_ascii_case(deployment.category_hex)
+            || hex.eq_ignore_ascii_case(deployment.covenant_lock_hex)
+            || query.eq_ignore_ascii_case(deployment.covenant_address)
+        {
+            Ok(Self::Photon)
+        } else {
+            Err("unknown token name, category ID, or covenant bytecode; try PHOTON".into())
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Photon => "PHOTON",
+        }
+    }
+
+    pub fn ensure_supported(self, network: MiningNetwork) -> Result<(), String> {
+        match (self, network) {
+            (Self::Photon, MiningNetwork::Mainnet | MiningNetwork::Chipnet) => Ok(()),
+        }
+    }
+}
+
+/// shrec's share of the existing 2% donation.
+pub const SHREC_DONATION_ADDRESS: &str = "bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3";
 
 /// Preferred network transport for explicit submission/diagnostic operations.
 /// PHOTON mining jobs come from the covenant CashToken baton through Fulcrum
@@ -45,6 +158,10 @@ impl JobSource {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    /// Mining chain; mainnet is the safe default.
+    pub network: MiningNetwork,
+    /// Selected token. PHOTON is currently the only supported GPU token.
+    pub token: MiningToken,
     /// GPU work intensity 10..=100. Pause is a separate runtime state.
     pub intensity: u8,
     /// Miner reward cashaddr (user). Empty until set.
@@ -69,6 +186,8 @@ impl Default for RuntimeConfig {
     /// Creates the default runtime configuration.
     fn default() -> Self {
         Self {
+            network: MiningNetwork::Mainnet,
+            token: MiningToken::Photon,
             intensity: 100,
             payout_address: String::new(),
             fulcrum_url: None,
@@ -81,6 +200,51 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    pub fn set_network(&mut self, network: MiningNetwork) {
+        if self.network != network {
+            if !self.payout_address.is_empty() {
+                if let Ok(converted) = reprefix_p2pkh_payout(&self.payout_address, network) {
+                    self.payout_address = converted;
+                }
+            }
+            // Configured sources are chain-specific. CLI overrides are applied after the network.
+            self.fulcrum_url = None;
+            self.node_url = None;
+            self.network = network;
+            self.bump_generation();
+        }
+    }
+
+    pub fn set_token(&mut self, query: &str) -> Result<(), String> {
+        let token = MiningToken::parse(query, self.network)?;
+        if self.token != token {
+            self.token = token;
+            self.bump_generation();
+        }
+        Ok(())
+    }
+
+    pub fn validate_payout_network(&self) -> Result<(), String> {
+        if self.payout_address.is_empty()
+            || self
+                .payout_address
+                .starts_with(&format!("{}:", self.network.cashaddr_prefix()))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "payout address must use {}: on {}",
+                self.network.cashaddr_prefix(),
+                self.network.as_str()
+            ))
+        }
+    }
+
+    pub fn ensure_mining_supported(&self) -> Result<(), String> {
+        self.validate_payout_network()?;
+        self.token.ensure_supported(self.network)
+    }
+
     /// Updates the configured GPU intensity within the accepted range.
     pub fn set_intensity(&mut self, value: u8) -> Result<(), String> {
         if !(10..=100).contains(&value) {
@@ -96,36 +260,71 @@ impl RuntimeConfig {
         if trimmed.is_empty() {
             return Err("payout address required".into());
         }
-        crate::tx::cashaddr_to_p2pkh_locking(&trimmed)
-            .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
+        if trimmed.chars().any(|ch| ch.is_ascii_lowercase())
+            && trimmed.chars().any(|ch| ch.is_ascii_uppercase())
+        {
+            return Err(
+                "invalid payout CashAddr: CashAddr must not mix upper and lower case".into(),
+            );
+        }
         let canonical = if trimmed.contains(':') {
             trimmed.to_ascii_lowercase()
         } else {
-            format!("bitcoincash:{}", trimmed.to_ascii_lowercase())
+            format!(
+                "{}:{}",
+                self.network.cashaddr_prefix(),
+                trimmed.to_ascii_lowercase()
+            )
         };
-        if self.payout_address != canonical {
+        crate::tx::cashaddr_to_p2pkh_locking(&canonical)
+            .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
+        let selected = if canonical.starts_with(&format!("{}:", self.network.cashaddr_prefix())) {
+            canonical
+        } else if self.network == MiningNetwork::Chipnet && canonical.starts_with("bitcoincash:") {
+            reprefix_p2pkh_payout(&canonical, self.network)
+                .map_err(|e| format!("invalid payout CashAddr: {e}"))?
+        } else {
+            return Err(format!(
+                "payout address must use {}: on {}",
+                self.network.cashaddr_prefix(),
+                self.network.as_str()
+            ));
+        };
+        if self.payout_address != selected {
             self.bump_generation();
         }
-        self.payout_address = canonical;
+        self.payout_address = selected;
         Ok(())
     }
 
     /// Set custom Fulcrum/Electrum endpoint (`ws://` or `wss://`). Empty clears.
     pub fn set_fulcrum_url(&mut self, url: &str) -> Result<(), String> {
-        let trimmed = url.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(endpoints) = normalize_endpoint_list(url, "fulcrum", &["wss://", "ws://"])? else {
             self.clear_fulcrum_url();
             return Ok(());
+        };
+        if endpoints.split(',').any(|endpoint| {
+            !self
+                .network
+                .accepts_known_electrum_endpoint(endpoint.trim())
+        }) {
+            return Err(format!(
+                "a published Fulcrum endpoint belongs to another network, not {}",
+                self.network.as_str()
+            ));
         }
-        let lower = trimmed.to_ascii_lowercase();
-        if !(lower.starts_with("wss://") || lower.starts_with("ws://")) {
-            return Err("fulcrum URL must start with wss:// or ws://".into());
-        }
-        if self.fulcrum_url.as_deref() != Some(trimmed.as_str()) {
+        if self.fulcrum_url.as_deref() != Some(endpoints.as_str()) {
             self.bump_generation();
-            self.fulcrum_url = Some(trimmed);
+            self.fulcrum_url = Some(endpoints);
         }
         Ok(())
+    }
+
+    pub fn custom_fulcrum_endpoints(&self) -> Vec<&str> {
+        self.fulcrum_url
+            .as_deref()
+            .map(|value| value.split(',').map(str::trim).collect())
+            .unwrap_or_default()
     }
 
     /// Removes the custom Fulcrum endpoint.
@@ -137,13 +336,19 @@ impl RuntimeConfig {
 
     /// Endpoint try-order: custom (if set), then public bootstrap.
     pub fn electrum_endpoints(&self) -> Vec<String> {
-        use crate::protocol::FULCRUM_WSS_BOOTSTRAP;
+        use crate::protocol::{CHIPNET_FULCRUM_WSS_BOOTSTRAP, FULCRUM_WSS_BOOTSTRAP};
         let mut out = Vec::new();
-        if let Some(u) = &self.fulcrum_url {
-            out.push(u.clone());
+        for url in self.custom_fulcrum_endpoints() {
+            if self.network.accepts_known_electrum_endpoint(url) {
+                out.push(url.to_string());
+            }
         }
-        for u in FULCRUM_WSS_BOOTSTRAP {
-            if !out.iter().any(|x| x == *u) {
+        let bootstrap = match self.network {
+            MiningNetwork::Mainnet => FULCRUM_WSS_BOOTSTRAP,
+            MiningNetwork::Chipnet => CHIPNET_FULCRUM_WSS_BOOTSTRAP,
+        };
+        for u in bootstrap {
+            if !out.iter().any(|x| x.as_str() == *u) {
                 out.push((*u).to_string());
             }
         }
@@ -152,21 +357,23 @@ impl RuntimeConfig {
 
     /// Validates and stores the native node endpoint.
     pub fn set_node_url(&mut self, url: &str) -> Result<(), String> {
-        let trimmed = url.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(endpoints) = normalize_endpoint_list(url, "node", &["https://", "http://"])?
+        else {
             self.clear_node_url();
             return Ok(());
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-            return Err("node URL must start with http:// or https://".into());
-        }
-        // Never require embedding user:pass in chat logs — accept URL as given.
-        if self.node_url.as_deref() != Some(trimmed.as_str()) {
+        };
+        if self.node_url.as_deref() != Some(endpoints.as_str()) {
             self.bump_generation();
-            self.node_url = Some(trimmed);
+            self.node_url = Some(endpoints);
         }
         Ok(())
+    }
+
+    pub fn custom_node_endpoints(&self) -> Vec<&str> {
+        self.node_url
+            .as_deref()
+            .map(|value| value.split(',').map(str::trim).collect())
+            .unwrap_or_default()
     }
 
     /// Removes the custom native node endpoint.
@@ -199,11 +406,15 @@ impl RuntimeConfig {
     pub fn node_endpoints(&self) -> Vec<String> {
         use crate::protocol::NODE_RPC_BOOTSTRAP;
         let mut out = Vec::new();
-        if let Some(u) = &self.node_url {
-            out.push(u.clone());
+        for url in self.custom_node_endpoints() {
+            out.push(url.to_string());
         }
-        for u in NODE_RPC_BOOTSTRAP {
-            if !out.iter().any(|x| x == *u) {
+        for u in NODE_RPC_BOOTSTRAP
+            .iter()
+            .copied()
+            .filter(|_| self.network == MiningNetwork::Mainnet)
+        {
+            if !out.iter().any(|x| x.as_str() == u) {
                 out.push((*u).to_string());
             }
         }
@@ -216,11 +427,73 @@ impl RuntimeConfig {
         let miner = reward_raw.saturating_sub(donation);
         (miner, donation)
     }
+
+    /// Divide the existing donation equally; the original recipient gets an odd remainder.
+    pub fn split_donation(donation_raw: u128) -> (u128, u128) {
+        let shrec = donation_raw / 2;
+        (donation_raw - shrec, shrec)
+    }
+}
+
+/// Re-encodes a validated P2PKH payout for another chain without changing its key hash.
+pub(crate) fn reprefix_p2pkh_payout(
+    address: &str,
+    network: MiningNetwork,
+) -> Result<String, String> {
+    let locking = crate::tx::cashaddr_to_p2pkh_locking(address)?;
+    let hash: [u8; 20] = locking
+        .get(3..23)
+        .ok_or("P2PKH locking bytecode omitted its 20-byte hash")?
+        .try_into()
+        .map_err(|_| "P2PKH locking bytecode has an invalid hash length")?;
+    let payload = address
+        .split_once(':')
+        .map(|(_, payload)| payload)
+        .ok_or("P2PKH CashAddr omitted its network prefix")?;
+    if payload.starts_with('z') {
+        crate::tx::token_p2pkh_hash_to_cashaddr_for_network(&hash, network)
+    } else {
+        crate::tx::p2pkh_hash_to_cashaddr_for_network(&hash, network)
+    }
+}
+
+fn normalize_endpoint_list(
+    input: &str,
+    kind: &str,
+    schemes: &[&str],
+) -> Result<Option<String>, String> {
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+    let urls = input.split(',').map(str::trim).collect::<Vec<_>>();
+    if urls.len() > 8 || urls.iter().any(|url| url.is_empty()) {
+        return Err(format!("{kind} needs 1–8 URLs separated by commas"));
+    }
+    for url in &urls {
+        let lower = url.to_ascii_lowercase();
+        if !schemes.iter().any(|scheme| lower.starts_with(scheme))
+            || url.contains([';', ' ', '\n', '\r', '\t'])
+        {
+            return Err(format!(
+                "invalid {kind} URL; separate URLs with commas and use {}",
+                schemes.join(" or ")
+            ));
+        }
+    }
+    let mut unique = Vec::new();
+    for url in urls {
+        if !unique.contains(&url) {
+            unique.push(url);
+        }
+    }
+    Ok(Some(unique.join(", ")))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SavedConfig {
+    pub network: Option<String>,
+    pub token: Option<String>,
     pub backend: Option<String>,
     pub device: Option<u32>,
     pub intensity: Option<u8>,
@@ -233,6 +506,12 @@ pub struct SavedConfig {
 impl SavedConfig {
     /// Applies saved configuration values to a running miner.
     pub fn apply_to_runtime(&self, cfg: &mut RuntimeConfig) -> Result<(), String> {
+        if let Some(value) = &self.network {
+            cfg.set_network(MiningNetwork::parse(value)?);
+        }
+        if let Some(value) = &self.token {
+            cfg.set_token(value)?;
+        }
         if let Some(value) = self.intensity {
             cfg.set_intensity(value)?;
         }
@@ -257,7 +536,8 @@ impl SavedConfig {
             crate::backend::BackendKind::parse(value)?;
         }
         let mut runtime = RuntimeConfig::default();
-        self.apply_to_runtime(&mut runtime)
+        self.apply_to_runtime(&mut runtime)?;
+        runtime.validate_payout_network()
     }
 
     /// Loads and validates the saved miner configuration.
@@ -304,6 +584,8 @@ impl SavedConfig {
             Some(runtime.payout_address.clone())
         };
         Self {
+            network: Some(runtime.network.as_str().to_string()),
+            token: Some(runtime.token.as_str().to_string()),
             backend: Some(backend.to_string()),
             device,
             intensity: Some(runtime.intensity),
@@ -312,6 +594,370 @@ impl SavedConfig {
             node_rpc: runtime.node_url.clone(),
             source: Some(runtime.source.as_str().to_string()),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MiningProfile {
+    pub name: String,
+    pub settings: SavedConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MiningProfiles {
+    pub profiles: Vec<MiningProfile>,
+}
+
+pub fn profiles_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("profiles.json")
+}
+
+pub fn sources_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("sources.json")
+}
+
+/// Most user-added connections kept per network and kind.
+const MAX_SHARED_SOURCES: usize = 16;
+
+/// A user-added connection type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionKind {
+    Fulcrum,
+    Node,
+}
+
+/// Fulcrum servers and nodes the user added for one network.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkSources {
+    pub fulcrum: Vec<String>,
+    pub node_rpc: Vec<String>,
+}
+
+/// User-added connections, kept per network and shared by every profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SharedSources {
+    pub mainnet: NetworkSources,
+    pub chipnet: NetworkSources,
+}
+
+impl SharedSources {
+    /// Loads the shared connections, or none when the file does not exist.
+    pub fn load_optional(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes = fs::read(path)
+            .map_err(|error| format!("read connections {}: {error}", path.display()))?;
+        let store: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse connections {}: {error}", path.display()))?;
+        for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            for kind in [ConnectionKind::Fulcrum, ConnectionKind::Node] {
+                let list = store.list(network, kind);
+                if list.len() > MAX_SHARED_SOURCES {
+                    return Err(format!("too many saved connections in {}", path.display()));
+                }
+                for entry in list {
+                    Self::validate_entry(network, kind, entry)?;
+                }
+            }
+        }
+        Ok(store)
+    }
+
+    /// Persists the shared connections with private file permissions, since
+    /// node URLs may carry credentials.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("create connections directory {}: {error}", parent.display())
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize connections: {error}"))?;
+        write_private_config(path, &bytes)
+    }
+
+    fn sources(&self, network: MiningNetwork) -> &NetworkSources {
+        match network {
+            MiningNetwork::Mainnet => &self.mainnet,
+            MiningNetwork::Chipnet => &self.chipnet,
+        }
+    }
+
+    /// Returns the user-added connections of one kind for a network.
+    pub fn list(&self, network: MiningNetwork, kind: ConnectionKind) -> &[String] {
+        let sources = self.sources(network);
+        match kind {
+            ConnectionKind::Fulcrum => &sources.fulcrum,
+            ConnectionKind::Node => &sources.node_rpc,
+        }
+    }
+
+    fn list_mut(&mut self, network: MiningNetwork, kind: ConnectionKind) -> &mut Vec<String> {
+        let sources = match network {
+            MiningNetwork::Mainnet => &mut self.mainnet,
+            MiningNetwork::Chipnet => &mut self.chipnet,
+        };
+        match kind {
+            ConnectionKind::Fulcrum => &mut sources.fulcrum,
+            ConnectionKind::Node => &mut sources.node_rpc,
+        }
+    }
+
+    /// Validates one connection for a network and returns its normalized form.
+    pub fn validate_entry(
+        network: MiningNetwork,
+        kind: ConnectionKind,
+        value: &str,
+    ) -> Result<String, String> {
+        let value = value.trim();
+        if value.contains(',') {
+            return Err("enter one connection at a time".into());
+        }
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_network(network);
+        let normalized = match kind {
+            ConnectionKind::Fulcrum => {
+                runtime.set_fulcrum_url(value)?;
+                runtime.fulcrum_url
+            }
+            ConnectionKind::Node => {
+                runtime.set_node_url(value)?;
+                runtime.node_url
+            }
+        };
+        normalized.ok_or_else(|| "connection URL is empty".into())
+    }
+
+    /// Adds a connection, or replaces the one at `index`, for every profile on
+    /// that network.
+    pub fn put(
+        &mut self,
+        network: MiningNetwork,
+        kind: ConnectionKind,
+        index: Option<usize>,
+        value: &str,
+    ) -> Result<(), String> {
+        let entry = Self::validate_entry(network, kind, value)?;
+        let list = self.list_mut(network, kind);
+        if list
+            .iter()
+            .enumerate()
+            .any(|(other, existing)| Some(other) != index && existing.eq_ignore_ascii_case(&entry))
+        {
+            return Err("that connection is already saved".into());
+        }
+        match index.filter(|index| *index < list.len()) {
+            Some(index) => list[index] = entry,
+            None if list.len() >= MAX_SHARED_SOURCES => {
+                return Err(format!(
+                    "at most {MAX_SHARED_SOURCES} saved connections per network"
+                ))
+            }
+            None => list.push(entry),
+        }
+        Ok(())
+    }
+
+    /// Removes a saved connection from every profile on that network.
+    pub fn remove(&mut self, network: MiningNetwork, kind: ConnectionKind, index: usize) {
+        let list = self.list_mut(network, kind);
+        if index < list.len() {
+            list.remove(index);
+        }
+    }
+
+    /// Puts this network's saved connections on `cfg`, tried before the
+    /// built-in servers; clears them when none are saved.
+    pub fn apply_to_runtime(&self, cfg: &mut RuntimeConfig) -> Result<(), String> {
+        cfg.set_fulcrum_url(&self.list(cfg.network, ConnectionKind::Fulcrum).join(","))?;
+        cfg.set_node_url(&self.list(cfg.network, ConnectionKind::Node).join(","))
+    }
+
+    /// Adds each entry of a comma-separated legacy list; returns whether any
+    /// was new. Invalid or duplicate entries are skipped rather than blocking
+    /// startup.
+    fn adopt_list(&mut self, network: MiningNetwork, kind: ConnectionKind, list: &str) -> bool {
+        let mut added = false;
+        for entry in list
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            added |= self.put(network, kind, None, entry).is_ok();
+        }
+        added
+    }
+
+    /// Moves servers and nodes saved inside profiles into the shared lists of
+    /// each profile's network. Returns whether any profile changed.
+    pub fn adopt_profile_sources(&mut self, profiles: &mut MiningProfiles) -> bool {
+        let mut moved = false;
+        for profile in &mut profiles.profiles {
+            let network = profile
+                .settings
+                .network
+                .as_deref()
+                .and_then(|value| MiningNetwork::parse(value).ok())
+                .unwrap_or(MiningNetwork::Mainnet);
+            for (kind, field) in [
+                (ConnectionKind::Fulcrum, profile.settings.fulcrum.take()),
+                (ConnectionKind::Node, profile.settings.node_rpc.take()),
+            ] {
+                if let Some(field) = field {
+                    moved = true;
+                    self.adopt_list(network, kind, &field);
+                }
+            }
+        }
+        moved
+    }
+
+    /// Copies servers and nodes from the saved base configuration into the
+    /// shared lists. Returns whether any entry was new.
+    pub fn adopt_saved_config(&mut self, saved: &SavedConfig) -> bool {
+        let network = saved
+            .network
+            .as_deref()
+            .and_then(|value| MiningNetwork::parse(value).ok())
+            .unwrap_or(MiningNetwork::Mainnet);
+        let fulcrum = saved
+            .fulcrum
+            .as_deref()
+            .is_some_and(|list| self.adopt_list(network, ConnectionKind::Fulcrum, list));
+        let node = saved
+            .node_rpc
+            .as_deref()
+            .is_some_and(|list| self.adopt_list(network, ConnectionKind::Node, list));
+        fulcrum || node
+    }
+}
+
+fn valid_profile_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
+        Err("profile name must contain 1–40 printable characters".into())
+    } else {
+        Ok(name)
+    }
+}
+
+impl MiningProfiles {
+    pub fn load_optional(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes =
+            fs::read(path).map_err(|error| format!("read profiles {}: {error}", path.display()))?;
+        let store: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse profiles {}: {error}", path.display()))?;
+        if store.profiles.len() > 64 {
+            return Err("too many mining profiles (maximum 64)".into());
+        }
+        for (index, profile) in store.profiles.iter().enumerate() {
+            valid_profile_name(&profile.name)?;
+            profile.settings.validate()?;
+            if store.profiles[..index]
+                .iter()
+                .any(|other| other.name.eq_ignore_ascii_case(&profile.name))
+            {
+                return Err("duplicate mining profile name".into());
+            }
+        }
+        Ok(store)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("create profiles directory {}: {error}", parent.display())
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize profiles: {error}"))?;
+        write_private_config(path, &bytes)
+    }
+
+    pub fn rename(&mut self, index: usize, name: &str) -> Result<(), String> {
+        let name = valid_profile_name(name)?;
+        if self
+            .profiles
+            .iter()
+            .enumerate()
+            .any(|(other_index, profile)| {
+                other_index != index && profile.name.eq_ignore_ascii_case(name)
+            })
+        {
+            return Err("a mining profile already has that name".into());
+        }
+        self.profiles
+            .get_mut(index)
+            .ok_or("profile no longer exists")?
+            .name = name.into();
+        Ok(())
+    }
+
+    /// Deletes a saved profile and returns its name.
+    pub fn remove(&mut self, index: usize) -> Result<String, String> {
+        if index >= self.profiles.len() {
+            return Err("profile no longer exists".into());
+        }
+        Ok(self.profiles.remove(index).name)
+    }
+
+    pub fn upsert(
+        &mut self,
+        index: Option<usize>,
+        name: &str,
+        settings: SavedConfig,
+    ) -> Result<String, String> {
+        settings.validate()?;
+        let name = if !name.trim().is_empty() {
+            valid_profile_name(name)?.to_string()
+        } else if let Some(existing) = index.and_then(|index| self.profiles.get(index)) {
+            existing.name.clone()
+        } else {
+            loop {
+                let candidate = format!("Miner {:08X}", rand::random::<u32>());
+                if !self
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.name == candidate)
+                {
+                    break candidate;
+                }
+            }
+        };
+        if let Some(index) = index {
+            self.rename(index, &name)?;
+            self.profiles[index].settings = settings;
+        } else {
+            if self.profiles.len() >= 64 {
+                return Err("too many mining profiles (maximum 64)".into());
+            }
+            if self
+                .profiles
+                .iter()
+                .any(|profile| profile.name.eq_ignore_ascii_case(&name))
+            {
+                return Err("a mining profile already has that name".into());
+            }
+            self.profiles.push(MiningProfile {
+                name: name.clone(),
+                settings,
+            });
+        }
+        Ok(name)
     }
 }
 
@@ -434,6 +1080,369 @@ mod tests {
     const PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
 
     #[test]
+    fn photon_donation_routes_by_network() {
+        let mainnet = MiningToken::Photon.fee_policy(MiningNetwork::Mainnet);
+        assert_eq!(mainnet.scheme.work(), [200, 200]);
+        assert_eq!(
+            mainnet.addresses,
+            [DONATION_ADDRESS, SHREC_DONATION_ADDRESS]
+        );
+        let chipnet = MiningToken::Photon.fee_policy(MiningNetwork::Chipnet);
+        assert_eq!(chipnet.scheme.work(), [400, 0]);
+        assert_eq!(
+            chipnet.addresses,
+            [CHIPNET_DONATION_ADDRESS, CHIPNET_DONATION_ADDRESS]
+        );
+        let payouts = chipnet.payouts(MiningNetwork::Chipnet, PAYOUT).unwrap();
+        assert_eq!(payouts[1], CHIPNET_DONATION_ADDRESS);
+        assert_eq!(payouts[2], CHIPNET_DONATION_ADDRESS);
+    }
+
+    #[test]
+    fn shared_connections_are_validated_kept_per_network_and_persisted() {
+        let mut sources = SharedSources::default();
+        sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "wss://one.test:50004",
+            )
+            .unwrap();
+        assert!(sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "WSS://ONE.test:50004"
+            )
+            .unwrap_err()
+            .contains("already saved"));
+        assert!(sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "https://one.test"
+            )
+            .is_err());
+        assert!(sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "wss://a.test, wss://b.test"
+            )
+            .unwrap_err()
+            .contains("one connection at a time"));
+        // A published server of the other chain is refused.
+        assert!(sources
+            .put(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Fulcrum,
+                None,
+                crate::protocol::FULCRUM_WSS_BOOTSTRAP[0],
+            )
+            .is_err());
+        sources
+            .put(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Node,
+                None,
+                "http://127.0.0.1:18332",
+            )
+            .unwrap();
+        sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                Some(0),
+                "wss://two.test:50004",
+            )
+            .unwrap();
+        assert_eq!(
+            sources.list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum),
+            ["wss://two.test:50004"]
+        );
+
+        let mut mainnet = RuntimeConfig::default();
+        sources.apply_to_runtime(&mut mainnet).unwrap();
+        assert_eq!(mainnet.fulcrum_url.as_deref(), Some("wss://two.test:50004"));
+        assert!(mainnet.node_url.is_none());
+        let mut chipnet = RuntimeConfig::default();
+        chipnet.set_network(MiningNetwork::Chipnet);
+        sources.apply_to_runtime(&mut chipnet).unwrap();
+        assert!(chipnet.fulcrum_url.is_none());
+        assert_eq!(chipnet.node_url.as_deref(), Some("http://127.0.0.1:18332"));
+
+        let path =
+            std::env::temp_dir().join(format!("pickaxe-sources-{}.json", std::process::id()));
+        sources.save(&path).unwrap();
+        assert_eq!(SharedSources::load_optional(&path).unwrap(), sources);
+        sources.remove(MiningNetwork::Mainnet, ConnectionKind::Fulcrum, 0);
+        assert!(sources
+            .list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum)
+            .is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_and_base_config_connections_move_to_the_shared_lists() {
+        let mut chipnet = RuntimeConfig::default();
+        chipnet.set_network(MiningNetwork::Chipnet);
+        chipnet
+            .set_fulcrum_url("wss://mine.test:50004, wss://second.test:50004")
+            .unwrap();
+        let mut mainnet = RuntimeConfig::default();
+        mainnet.set_node_url("http://127.0.0.1:8332").unwrap();
+        let mut profiles = MiningProfiles::default();
+        profiles
+            .upsert(
+                None,
+                "Chip",
+                SavedConfig::from_effective("cuda", Some(0), &chipnet),
+            )
+            .unwrap();
+        profiles
+            .upsert(
+                None,
+                "Main",
+                SavedConfig::from_effective("cuda", Some(0), &mainnet),
+            )
+            .unwrap();
+
+        let mut sources = SharedSources::default();
+        assert!(sources.adopt_profile_sources(&mut profiles));
+        assert_eq!(
+            sources.list(MiningNetwork::Chipnet, ConnectionKind::Fulcrum),
+            ["wss://mine.test:50004", "wss://second.test:50004"]
+        );
+        assert_eq!(
+            sources.list(MiningNetwork::Mainnet, ConnectionKind::Node),
+            ["http://127.0.0.1:8332"]
+        );
+        assert!(profiles.profiles.iter().all(
+            |profile| profile.settings.fulcrum.is_none() && profile.settings.node_rpc.is_none()
+        ));
+        assert!(!sources.adopt_profile_sources(&mut profiles));
+
+        let base = SavedConfig::from_effective("cuda", Some(0), &chipnet);
+        assert!(
+            !sources.adopt_saved_config(&base),
+            "already saved entries add nothing"
+        );
+        let mut other = mainnet.clone();
+        other.set_fulcrum_url("wss://base.test:50004").unwrap();
+        assert!(sources.adopt_saved_config(&SavedConfig::from_effective("cuda", Some(0), &other)));
+        assert_eq!(
+            sources.list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum),
+            ["wss://base.test:50004"]
+        );
+    }
+
+    #[test]
+    fn profiles_can_be_removed_by_index() {
+        let mut profiles = MiningProfiles::default();
+        profiles
+            .upsert(
+                None,
+                "Only",
+                SavedConfig::from_effective("cuda", Some(0), &RuntimeConfig::default()),
+            )
+            .unwrap();
+        assert!(profiles.remove(1).is_err());
+        assert_eq!(profiles.remove(0).unwrap(), "Only");
+        assert!(profiles.profiles.is_empty());
+    }
+
+    #[test]
+    fn comma_separated_connections_keep_order_and_reject_bad_entries() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_fulcrum_url("wss://one.test:50004, wss://two.test:50004")
+            .unwrap();
+        cfg.set_node_url("http://one.test:8332, https://two.test:8332")
+            .unwrap();
+        assert_eq!(
+            cfg.custom_fulcrum_endpoints(),
+            ["wss://one.test:50004", "wss://two.test:50004"]
+        );
+        assert_eq!(
+            cfg.custom_node_endpoints(),
+            ["http://one.test:8332", "https://two.test:8332"]
+        );
+        assert_eq!(cfg.node_endpoints().len(), 2);
+        assert!(cfg.set_node_url("http://one.test:8332,").is_err());
+        assert!(cfg
+            .set_fulcrum_url("wss://one.test:50004;wss://two.test:50004")
+            .is_err());
+    }
+
+    #[test]
+    fn mining_profiles_save_settings_and_support_rename() {
+        let path =
+            std::env::temp_dir().join(format!("pickaxe-profiles-{}.json", std::process::id()));
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_payout(PAYOUT.into()).unwrap();
+        runtime.set_intensity(70).unwrap();
+        runtime
+            .set_node_url("http://127.0.0.1:8332, http://localhost:8332")
+            .unwrap();
+        let mut profiles = MiningProfiles::default();
+        let random_name = profiles
+            .upsert(
+                None,
+                "",
+                SavedConfig::from_effective("cuda", Some(0), &runtime),
+            )
+            .unwrap();
+        assert!(random_name.starts_with("Miner "));
+        profiles.save(&path).unwrap();
+        let mut loaded = MiningProfiles::load_optional(&path).unwrap();
+        loaded.rename(0, "Home rig").unwrap();
+        loaded.save(&path).unwrap();
+        let loaded = MiningProfiles::load_optional(&path).unwrap();
+        assert_eq!(loaded.profiles[0].name, "Home rig");
+        assert_eq!(loaded.profiles[0].settings.address.as_deref(), Some(PAYOUT));
+        assert_eq!(loaded.profiles[0].settings.intensity, Some(70));
+        assert_eq!(
+            loaded.profiles[0].settings.node_rpc.as_deref(),
+            Some("http://127.0.0.1:8332, http://localhost:8332")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mining_selection_uses_the_token_deployment_on_each_chain() {
+        for query in [
+            "photon",
+            crate::protocol::MAINNET_CATEGORY_HEX,
+            crate::protocol::COVENANT_LOCKING_BYTECODE_HEX,
+        ] {
+            assert_eq!(
+                MiningToken::parse(query, MiningNetwork::Mainnet).unwrap(),
+                MiningToken::Photon
+            );
+        }
+        assert!(MiningToken::parse("wrong", MiningNetwork::Mainnet).is_err());
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.ensure_mining_supported().is_ok());
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg.ensure_mining_supported().is_ok());
+        for query in [
+            "PHOTON",
+            crate::protocol::CHIPNET_CATEGORY_HEX,
+            crate::protocol::CHIPNET_COVENANT_LOCKING_BYTECODE_HEX,
+            crate::protocol::CHIPNET_COVENANT_ADDRESS,
+        ] {
+            assert_eq!(
+                MiningToken::parse(query, cfg.network).unwrap(),
+                MiningToken::Photon
+            );
+        }
+        assert!(MiningToken::parse(crate::protocol::MAINNET_CATEGORY_HEX, cfg.network).is_err());
+        assert_eq!(
+            cfg.electrum_endpoints(),
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+                .iter()
+                .map(|url| (*url).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(cfg.electrum_endpoints().iter().all(|endpoint| {
+            !crate::protocol::FULCRUM_WSS_BOOTSTRAP.contains(&endpoint.as_str())
+        }));
+        assert!(cfg.node_endpoints().is_empty());
+    }
+
+    #[test]
+    fn network_switch_never_routes_to_foreign_published_fulcrum() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_fulcrum_url(crate::protocol::FULCRUM_WSS_BOOTSTRAP[0])
+            .unwrap();
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg.fulcrum_url.is_none());
+        assert_eq!(
+            cfg.electrum_endpoints(),
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+                .iter()
+                .map(|url| (*url).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(cfg
+            .set_fulcrum_url(crate::protocol::FULCRUM_WSS_BOOTSTRAP[0])
+            .is_err());
+    }
+
+    #[test]
+    fn network_switch_clears_old_sources_and_accepts_new_explicit_overrides() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_fulcrum_url("wss://old-network.invalid:50004")
+            .unwrap();
+        cfg.set_node_url("http://old-network.invalid:8332").unwrap();
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg.custom_fulcrum_endpoints().is_empty());
+        assert!(cfg.custom_node_endpoints().is_empty());
+        assert_eq!(
+            cfg.electrum_endpoints(),
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+                .iter()
+                .map(|url| (*url).to_string())
+                .collect::<Vec<_>>()
+        );
+        cfg.set_fulcrum_url("wss://explicit-chipnet.invalid:50004")
+            .unwrap();
+        cfg.set_node_url("http://explicit-chipnet.invalid:18332")
+            .unwrap();
+        assert_eq!(
+            cfg.custom_fulcrum_endpoints(),
+            ["wss://explicit-chipnet.invalid:50004"]
+        );
+        assert_eq!(
+            cfg.custom_node_endpoints(),
+            ["http://explicit-chipnet.invalid:18332"]
+        );
+    }
+
+    #[test]
+    fn payout_address_must_match_selected_network() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_network(MiningNetwork::Chipnet);
+        cfg.set_payout(SHREC_DONATION_ADDRESS.into()).unwrap();
+        assert!(cfg.payout_address.starts_with("bchtest:z"));
+        assert_eq!(
+            crate::tx::cashaddr_to_p2pkh_locking(&cfg.payout_address).unwrap(),
+            crate::tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS).unwrap()
+        );
+        let chipnet_address = cfg.payout_address.clone();
+        cfg.set_network(MiningNetwork::Mainnet);
+        assert!(cfg.payout_address.starts_with("bitcoincash:z"));
+        assert!(cfg.set_payout(chipnet_address).is_err());
+        cfg.set_payout(PAYOUT.into()).unwrap();
+        cfg.set_network(MiningNetwork::Chipnet);
+        assert!(cfg.validate_payout_network().is_ok());
+        assert!(cfg.payout_address.starts_with("bchtest:"));
+        assert!(cfg
+            .set_payout("bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv4".into())
+            .is_err());
+        assert!(cfg
+            .set_payout("bchreg:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3".into())
+            .is_err());
+    }
+
+    #[test]
+    fn chipnet_saved_config_reprefixes_mainnet_token_payout() {
+        let saved = SavedConfig {
+            network: Some("chipnet".into()),
+            address: Some(SHREC_DONATION_ADDRESS.into()),
+            ..SavedConfig::default()
+        };
+        let mut cfg = RuntimeConfig::default();
+        saved.apply_to_runtime(&mut cfg).unwrap();
+        assert_eq!(cfg.network, MiningNetwork::Chipnet);
+        assert!(cfg.payout_address.starts_with("bchtest:z"));
+        assert!(cfg.validate_payout_network().is_ok());
+    }
+
+    #[test]
     fn saved_config_node_credentials_are_owner_only() {
         let dir = std::env::temp_dir().join(format!("pickaxe-config-mode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -523,6 +1532,7 @@ mod tests {
     fn payout_requires_valid_cashaddr_checksum() {
         let mut cfg = RuntimeConfig::default();
         assert!(cfg.set_payout(PAYOUT.into()).is_ok());
+        assert!(cfg.set_payout(PAYOUT.replace(":z", ":Z")).is_err());
         assert!(cfg
             .set_payout("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frq".into())
             .is_err());
@@ -582,5 +1592,16 @@ mod tests {
             (4_899_778_337, 99_995_476)
         );
         assert_eq!(applied.intensity, 100);
+    }
+
+    #[test]
+    fn donation_is_shared_equally_with_odd_remainder_to_original_recipient() {
+        assert_eq!(RuntimeConfig::split_donation(0), (0, 0));
+        assert_eq!(RuntimeConfig::split_donation(2), (1, 1));
+        assert_eq!(RuntimeConfig::split_donation(5), (3, 2));
+        let (_, total_donation) = RuntimeConfig::split_reward(4_999_773_813);
+        let (original, shrec) = RuntimeConfig::split_donation(total_donation);
+        assert_eq!(original + shrec, total_donation);
+        assert_eq!(original, shrec);
     }
 }

@@ -62,6 +62,11 @@ jobs:
         working-directory: tools/reward-policy-vm
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Install Rust for direct payout lifecycle proof
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Verify BCH 2026 settlement
         working-directory: tools/reward-policy-vm
         run: npm test
@@ -157,6 +162,9 @@ jobs:
 
       - name: Check
         run: cargo check --locked --all-targets
+
+      - name: Check legacy CUDA backend
+        run: cargo check --locked --all-targets --no-default-features --features tail-grind
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings

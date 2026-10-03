@@ -1,21 +1,25 @@
 [package]
 name = "pickaxe_miner"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "AGPL-3.0-only"
 
 [features]
-default = ["upstream-rust-engine"]
+default = ["rust-t2"]
 incremental-k = []
-rust-engine = ["incremental-k"]
-upstream-rust-engine = ["rust-engine", "pickaxe-rust-engine/upstream-rust"]
+tail-grind = []
+# Default Rust implementation of the complete CUDA T2 mining path.
+# Legacy CUDA C++: --no-default-features --features tail-grind.
+rust-t2 = ["tail-grind"]
+# GPU V-coordinate diagnostic only; live mining keeps the reward at 700 sats.
+tail-value-grind = ["tail-grind"]
 portable-wgpu = ["dep:pollster", "dep:wgpu"]
 
 [dependencies]
 sha2 = { version = "0.10", features = ["compress"] }
 ripemd = "0.1"
 hex = "0.4"
-k256 = { version = "0.13.4", default-features = false, features = ["arithmetic", "std"] }
+secp256k1 = { version = "0.33.1", features = ["global-context", "rand"] }
 tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -24,7 +28,7 @@ num-bigint = "0.4"
 num-traits = "0.2"
 cudarc = { version = "0.19.9", features = ["cuda-12000"] }
 clap = { version = "4.6.7", features = ["derive"] }
-pickaxe-rust-engine = { path = "rust-engine", version = "0.0.1" }
+hmac = "0.12"
 rand = "0.9"
 ctrlc = "3.4"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_28", "layout-cache", "underline-color"] }
@@ -33,11 +37,5 @@ libloading = "0.9"
 pollster = { version = "0.4", optional = true }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"], optional = true }
 
-[dev-dependencies]
-secp256k1 = { version = "0.33.1", features = ["global-context", "rand"] }
-
-[build-dependencies]
-hex = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }

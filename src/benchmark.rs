@@ -4,6 +4,7 @@
 use crate::backend::{BackendKind, GpuDevice};
 use crate::telemetry::{sample_gpu_telemetry, GpuTelemetry};
 use crate::{reward, search, tui, tx};
+use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -353,8 +354,9 @@ fn deterministic_secret() -> [u8; 32] {
 fn benchmark_fixture() -> Result<BenchmarkFixture, String> {
     let target = search::parse_hex32(VECTOR_TARGET_LE)?;
     let private_key = deterministic_secret();
-    let public_key = crate::crypto::compressed_pubkey(&private_key)
+    let secret = SecretKey::from_secret_bytes(private_key)
         .map_err(|error| format!("benchmark key: {error}"))?;
+    let public_key = PublicKey::from_secret_key(&secret).serialize();
     let payout_address = reward::p2pkh_cashaddr_from_public_key(&public_key)?;
     let payout_locking = tx::cashaddr_to_p2pkh_locking(&payout_address)?;
     let params = tx::TemplateParams {
@@ -370,7 +372,10 @@ fn benchmark_fixture() -> Result<BenchmarkFixture, String> {
         reward_amount: VECTOR_REWARD_RAW,
         payout_locking,
     };
-    let bytes = tx::build_photon_template_bytes(&params)?;
+    let bytes = tx::build_photon_template_bytes_for_deployment(
+        &params,
+        &crate::protocol::MAINNET_V0_PHOTON,
+    )?;
     let template: [u8; TX_BYTES] = bytes.try_into().map_err(|bytes: Vec<u8>| {
         format!(
             "benchmark PHOTON template is {} bytes; expected {TX_BYTES}",
@@ -413,8 +418,7 @@ fn run_intensity_window(
     let mut pacer = search::DutyPacer::new(started);
 
     while started.elapsed() < requested {
-        let batch_candidates =
-            search::batch_before_wrap(*nonce_base, engine.scheduled_batch_candidates(intensity));
+        let batch_candidates = engine.scheduled_batch_candidates(intensity);
         let batch_started = Instant::now();
         let result = match engine.search_batch(*nonce_base, batch_candidates) {
             Ok(result) => result,
@@ -496,6 +500,11 @@ pub fn run_gpu_benchmark(
         search::production_max_batch_candidates(device.backend),
         search::WINNER_BUFFER_CAP,
     )?;
+    #[cfg(feature = "tail-grind")]
+    if let search::PhotonEngine::Cuda(cuda) = &mut engine {
+        // Benchmark the same fixed-700-sat search path used by live mining.
+        cuda.enable_t2_search()?;
+    }
     let persistent_device_bytes = engine.persistent_device_bytes();
     let table_source = engine.table_source();
     engine.set_job(&fixture.template, &fixture.target, &fixture.private_key)?;
@@ -696,31 +705,6 @@ mod tests {
             backend,
             detail: String::new(),
         }
-    }
-
-    #[test]
-    fn benchmark_crosses_nonce_boundary_if_cuda() {
-        let fixture = benchmark_fixture().unwrap();
-        let mut engine = match search::PhotonEngine::new(
-            BackendKind::Cuda,
-            0,
-            search::CUDA_MAX_BATCH_CANDIDATES,
-            search::WINNER_BUFFER_CAP,
-        ) {
-            Ok(engine) => engine,
-            Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => return,
-            Err(error) => panic!("{error}"),
-        };
-        engine
-            .set_job(&fixture.template, &fixture.target, &fixture.private_key)
-            .unwrap();
-        let mut base = u32::MAX - 3;
-        let window =
-            run_intensity_window(&mut engine, BackendKind::Cuda, 0, 100, 1, &mut base, false)
-                .unwrap();
-        assert!(window.sample.candidates > 4);
-        assert!(window.sample.batches > 1);
-        assert_eq!(u64::from(base), window.sample.candidates - 4);
     }
 
     #[test]

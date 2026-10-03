@@ -1,5 +1,6 @@
-// BCH 2026 VM proof for the PHOTON mining transaction layout at every age
-// push width, and for the covenant's proof-of-work comparison.
+// BCH 2026 VM proof for the v0 PHOTON mining transaction layout at every
+// age push width, and for the v0 covenant's proof-of-work comparison.
+// direct-reward.mjs proves the live v3.2 contract on mainnet and Chipnet.
 //
 // The covenant pushes the baton age as a minimal script number, so the
 // mining transaction is 615 bytes for age 0..=16 and grows by one byte per
@@ -10,6 +11,7 @@
 // Offline and deterministic: no network, no production key, no broadcast.
 import { readFileSync } from 'node:fs';
 import {
+  cashAddressToLockingBytecode,
   createVirtualMachineBch2026,
   decodeTransactionBch,
   hash256,
@@ -71,16 +73,16 @@ const agePush = (age) => {
   return Uint8Array.of(bytes.length, ...bytes);
 };
 
-const profile = JSON.parse(readFileSync(new URL('../../protocol/photon.json', import.meta.url), 'utf8'));
-const redeem = hexToBin(profile.redeem_script_hex);
-const vector = decodeTransactionBch(hexToBin(profile.mining_vector_hex));
+const read = (name) => readFileSync(new URL(`../../reference/${name}`, import.meta.url), 'utf8').trim();
+const redeem = hexToBin(read('photon_redeem.hex'));
+const vector = decodeTransactionBch(hexToBin(read('photon_vector_tx.hex')));
 if (typeof vector === 'string') throw new Error(vector);
 const covenantLock = vector.outputs[0].lockingBytecode;
 const category = vector.outputs[0].token.category;
 const payoutLock = hexToBin('76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac');
 
 // Mirrors src/tx.rs build_photon_template_bytes.
-const buildMiningTx = ({ prevTxid, age, publicKey, target, signature, nonce, value, amount, reward }) => {
+const buildMiningTx = ({ prevTxid, age, publicKey, target, signature, nonce, value, amount, reward, payout = payoutLock }) => {
   const inputScript = concat(Uint8Array.of(0x21), publicKey, agePush(age), Uint8Array.of(0x4d, 0x03, 0x01), redeem);
   const commitment = concat(u32le(nonce), target, signature);
   const catRev = reverse(category);
@@ -88,7 +90,7 @@ const buildMiningTx = ({ prevTxid, age, publicKey, target, signature, nonce, val
     Uint8Array.of(0xef), catRev, Uint8Array.of(0x71), compactUint(commitment.length), commitment,
     compactUint(amount - reward), covenantLock,
   );
-  const output1 = concat(Uint8Array.of(0xef), catRev, Uint8Array.of(0x10), compactUint(reward), payoutLock);
+  const output1 = concat(Uint8Array.of(0xef), catRev, Uint8Array.of(0x10), compactUint(reward), payout);
   return concat(
     u32le(2), Uint8Array.of(1), reverse(hexToBin(prevTxid)), u32le(0),
     compactUint(inputScript.length), inputScript, u32le(age), Uint8Array.of(2),
@@ -111,7 +113,7 @@ const buildMiningTx = ({ prevTxid, age, publicKey, target, signature, nonce, val
     amount: 2_099_905_002_035_715n,
     reward: 4_999_773_813n,
   });
-  if (Buffer.compare(Buffer.from(rebuilt), Buffer.from(hexToBin(profile.mining_vector_hex))) !== 0) {
+  if (Buffer.compare(Buffer.from(rebuilt), Buffer.from(hexToBin(read('photon_vector_tx.hex')))) !== 0) {
     throw new Error('JS mirror of the Rust PHOTON serializer drifted from the reference vector');
   }
 }
@@ -223,3 +225,159 @@ for (const age of [10, 16, 17, 127, 128, 32767, 32768, 65534]) {
 
 console.log('PASS BCH 2026 VM PHOTON mining layout proof');
 for (const line of results) console.log(line);
+
+// T2: keep one valid commitment signature while varying unsigned token amounts.
+// The payout is the mining address supplied for this offline test.
+{
+  const decodedPayout = cashAddressToLockingBytecode('bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3');
+  if (typeof decodedPayout === 'string') throw new Error(decodedPayout);
+  const payout = decodedPayout.bytecode;
+  for (const age of [10, 17, 128, 32768]) {
+    const oldTarget = (1n << 250n) * 144n / BigInt(age + 143);
+    const nextTarget = oldTarget * BigInt(age + 143) / 144n;
+    const target = numToLe32(nextTarget);
+    const nonce = 0x12345678;
+    const message = sha256.hash(concat(u32le(nonce), target));
+    const signature = secp256k1.signMessageHashSchnorr(secret, message);
+    if (typeof signature === 'string') throw new Error(signature);
+    const source = {
+      lockingBytecode: covenantLock, valueSatoshis: value,
+      token: { category, amount, nft: {
+        capability: 'mutable', commitment: concat(u32le(0), numToLe32(oldTarget), new Uint8Array(64)),
+      } },
+    };
+    let wins = 0;
+    let misses = 0;
+    for (let j = 0; j < 1024 && (wins < 2 || misses < 2); j += 1) {
+      const adjustedReward = reward - BigInt(j);
+      const raw = buildMiningTx({
+        prevTxid: 'aa'.repeat(32), age, publicKey, target, signature, nonce, value, amount,
+        reward: adjustedReward, payout,
+      });
+      const tx = decodeTransactionBch(raw);
+      if (typeof tx === 'string') throw new Error(tx);
+      if (Buffer.compare(Buffer.from(tx.outputs[1].lockingBytecode), Buffer.from(payout)) !== 0) {
+        throw new Error('T2 payout differs from the requested mining address');
+      }
+      if (tx.outputs[0].token.amount + tx.outputs[1].token.amount !== amount) {
+        throw new Error('T2 token supply changed');
+      }
+      const digest = hash256(raw);
+      const masked = Uint8Array.from(digest);
+      masked[31] &= 0x7f;
+      const meets = le32ToNum(masked) < nextTarget;
+      for (const vm of vms) {
+        const verdict = vm.verify({ sourceOutputs: [source], transaction: tx });
+        if ((verdict === true) !== meets) throw new Error(`T2 age=${age} j=${j}: ${verdict}`);
+      }
+      if (meets) wins += 1; else misses += 1;
+    }
+    if (wins < 2 || misses < 2) throw new Error(`T2 age=${age}: insufficient wins or misses`);
+    console.log(`PASS T2 age=${age}: ${wins} wins, ${misses} misses, requested payout`);
+  }
+}
+
+// B-coordinate probe: roll the baton BCH value while the reward stays 700 sats.
+{
+  const decodedPayout = cashAddressToLockingBytecode('bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3');
+  if (typeof decodedPayout === 'string') throw new Error(decodedPayout);
+  const payout = decodedPayout.bytecode;
+  for (const age of [10, 17, 128, 32768]) {
+    const oldTarget = (1n << 250n) * 144n / BigInt(age + 143);
+    const nextTarget = oldTarget * BigInt(age + 143) / 144n;
+    const target = numToLe32(nextTarget);
+    const nonce = 0x12345678;
+    const signature = secp256k1.signMessageHashSchnorr(secret, sha256.hash(concat(u32le(nonce), target)));
+    if (typeof signature === 'string') throw new Error(signature);
+    const source = {
+      lockingBytecode: covenantLock, valueSatoshis: value,
+      token: { category, amount, nft: {
+        capability: 'mutable', commitment: concat(u32le(0), numToLe32(oldTarget), new Uint8Array(64)),
+      } },
+    };
+    const shift = agePush(age).length - 1;
+    const deltas = [700 + expectedBytes(age), 1400, 1500];
+    for (const delta of deltas) {
+      let win = false;
+      let miss = false;
+      for (let j = 0; j < 1024 && !(win && miss); j += 1) {
+        const raw = buildMiningTx({
+          prevTxid: 'aa'.repeat(32), age, publicKey, target, signature, nonce, value, amount,
+          reward: reward - BigInt(j), payout,
+        });
+        raw.set(u64le(value - BigInt(delta)), 346 + shift);
+        const digest = hash256(raw);
+        const masked = Uint8Array.from(digest);
+        masked[31] &= 0x7f;
+        const meets = le32ToNum(masked) < nextTarget;
+        if ((meets && win) || (!meets && miss)) continue;
+        const tx = decodeTransactionBch(raw);
+        if (typeof tx === 'string') throw new Error(tx);
+        if (tx.outputs[0].valueSatoshis !== value - BigInt(delta)) throw new Error('B baton value drifted');
+        if (tx.outputs[1].valueSatoshis !== 700n) throw new Error('B reward value must stay 700 sats');
+        if (Buffer.compare(Buffer.from(tx.outputs[1].lockingBytecode), Buffer.from(payout)) !== 0) {
+          throw new Error('B payout differs from the requested mining address');
+        }
+        if (tx.outputs[0].token.amount + tx.outputs[1].token.amount !== amount) {
+          throw new Error('B token supply changed');
+        }
+        for (const vm of vms) {
+          const verdict = vm.verify({ sourceOutputs: [source], transaction: tx });
+          if ((verdict === true) !== meets) throw new Error(`B age=${age} delta=${delta} j=${j}: ${verdict}`);
+        }
+        if (meets) win = true; else miss = true;
+      }
+      if (!win || !miss) throw new Error(`B age=${age} delta=${delta}: insufficient wins or misses`);
+      console.log(`PASS B age=${age} delta=${delta}: reward=700, win and miss, standard and consensus`);
+    }
+  }
+}
+
+// L-coordinate probe: roll nLockTime while the reward stays 700 sats.
+{
+  const decodedPayout = cashAddressToLockingBytecode('bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3');
+  if (typeof decodedPayout === 'string') throw new Error(decodedPayout);
+  const payout = decodedPayout.bytecode;
+  for (const age of [10, 17, 128, 32768]) {
+    const oldTarget = (1n << 250n) * 144n / BigInt(age + 143);
+    const nextTarget = oldTarget * BigInt(age + 143) / 144n;
+    const target = numToLe32(nextTarget);
+    const nonce = 0x12345678;
+    const signature = secp256k1.signMessageHashSchnorr(secret, sha256.hash(concat(u32le(nonce), target)));
+    if (typeof signature === 'string') throw new Error(signature);
+    const source = {
+      lockingBytecode: covenantLock, valueSatoshis: value,
+      token: { category, amount, nft: {
+        capability: 'mutable', commitment: concat(u32le(0), numToLe32(oldTarget), new Uint8Array(64)),
+      } },
+    };
+    for (const locktime of [1, 1000, 500000]) {
+      let rejectedWin = false;
+      for (let j = 0; j < 1024 && !rejectedWin; j += 1) {
+        const raw = buildMiningTx({
+          prevTxid: 'aa'.repeat(32), age, publicKey, target, signature, nonce, value, amount,
+          reward: reward - BigInt(j), payout,
+        });
+        raw.set(u32le(locktime), raw.length - 4);
+        const digest = hash256(raw);
+        const masked = Uint8Array.from(digest);
+        masked[31] &= 0x7f;
+        if (le32ToNum(masked) >= nextTarget) continue;
+        const tx = decodeTransactionBch(raw);
+        if (typeof tx === 'string') throw new Error(tx);
+        if (tx.locktime !== locktime) throw new Error('L locktime drifted');
+        if (tx.outputs[1].valueSatoshis !== 700n) throw new Error('L reward value must stay 700 sats');
+        if (Buffer.compare(Buffer.from(tx.outputs[1].lockingBytecode), Buffer.from(payout)) !== 0) {
+          throw new Error('L payout differs from the requested mining address');
+        }
+        for (const vm of vms) {
+          const verdict = vm.verify({ sourceOutputs: [source], transaction: tx });
+          if (verdict === true) throw new Error(`L age=${age} locktime=${locktime}: covenant accepted nonzero locktime`);
+        }
+        rejectedWin = true;
+      }
+      if (!rejectedWin) throw new Error(`L age=${age} locktime=${locktime}: no PoW winner tested`);
+      console.log(`PASS L age=${age} locktime=${locktime}: PoW win rejected by covenant`);
+    }
+  }
+}

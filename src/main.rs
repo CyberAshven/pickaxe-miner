@@ -1,7 +1,7 @@
 //! Pickaxe Miner - interactive CLI (Stage 2/3).
 //!
 //! Runtime controls preserve the authoritative PHOTON reference semantics.
-//! Donation: 2%.
+//! Each supported token declares its fee policy.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 mod backend;
@@ -22,11 +22,13 @@ mod cuda_stage_a_ref;
 mod cuda_stage_b;
 #[allow(dead_code)]
 mod cuda_stage_c;
+mod donation;
 #[allow(dead_code)]
 mod electrum;
 mod hip_photon;
 #[allow(dead_code)]
 mod m29_table;
+mod mining_lock;
 #[allow(dead_code)]
 mod node;
 #[allow(dead_code)]
@@ -42,8 +44,6 @@ mod telemetry;
 #[allow(dead_code)]
 mod tui;
 mod tx;
-#[cfg(test)]
-mod ultrafast_probe;
 #[cfg(feature = "portable-wgpu")]
 mod wgpu_photon;
 
@@ -56,13 +56,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Prints the miner startup banner and donation policy.
+/// Prints the miner startup banner.
 fn print_banner() {
     println!(
         "Pickaxe Miner {} - interactive CLI",
         env!("CARGO_PKG_VERSION")
     );
-    println!("Donation: 2%");
     println!("Type `help` for commands.\n");
 }
 
@@ -71,7 +70,7 @@ fn print_help() {
     println!(
         r#"Commands:
   help                         Show this help
-  status                       Show intensity, payout, mining, donation, job, rate
+  status                       Show intensity, payout, mining, job, rate
   intensity <10-100>           Set live GPU intensity (default 100)
   pause | p                    Pause/resume GPU mining
   payout <cashaddr>            Set miner payout address
@@ -89,7 +88,7 @@ fn print_help() {
   applysig <nonce> <pk33hex> <sig64hex>  verify+arm proven 2-output winner (no broadcast)
   quit | exit                  Leave
 
-Donation: 2%"#
+Use `donation` to display the token fee policy."#
     );
 }
 
@@ -131,9 +130,8 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
             crate::telemetry::format_hash_rate(s.rate)
         );
     }
-    println!("Donation: 2%");
     match &cfg.fulcrum_url {
-        Some(u) => println!("fulcrum:       {u} (custom, tried first)"),
+        Some(u) => println!("fulcrum:       {} (custom, tried first)", redact_url(u)),
         None => println!("fulcrum:       (bootstrap only)"),
     }
     if let Some(j) = job {
@@ -159,15 +157,10 @@ fn print_status(cfg: &RuntimeConfig, handle: &Option<SearchHandle>, job: &Option
 
 /// Removes credentials before displaying an endpoint URL.
 fn redact_url(url: &str) -> String {
-    // Strip userinfo so passwords never hit the terminal/logs.
-    if let Some(scheme_end) = url.find("://") {
-        let scheme = &url[..scheme_end + 3];
-        let rest = &url[scheme_end + 3..];
-        if let Some(at) = rest.find('@') {
-            return format!("{scheme}***@{}", &rest[at + 1..]);
-        }
-    }
-    url.to_string()
+    url.split(',')
+        .map(|endpoint| crate::node::redact_url(endpoint.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Displays the newly fetched live PHOTON job.
@@ -250,7 +243,10 @@ fn reference_job_context(job: &LiveJob) -> tx::ReferenceJobContext {
 
 /// Fetches and validates a refreshed live PHOTON job.
 fn refresh_live_job(cfg: &mut RuntimeConfig, live: &mut Option<LiveJob>) -> Result<(), String> {
-    let mut session = ElectrumSession::connect_failover(&cfg.electrum_endpoints())?;
+    let mut session = ElectrumSession::connect_failover_for_deployment(
+        &cfg.electrum_endpoints(),
+        cfg.token.photon_deployment(cfg.network),
+    )?;
     let job = session.fetch_live_job()?;
     publish_live_job(cfg, live, job);
     Ok(())
@@ -301,6 +297,9 @@ fn validate_verified_winner_current(
     }
     if winner.baton_txid != live.baton_txid || winner.baton_vout != live.baton_vout {
         return Err("winner PHOTON baton outpoint is stale".into());
+    }
+    if winner.job_reward_raw != live.reward_raw {
+        return Err("winner PHOTON reward job is stale".into());
     }
     Ok(())
 }
@@ -357,8 +356,8 @@ fn process_gpu_winners(
 }
 
 /// Prints the compiled miner donation policy.
-fn print_donation() {
-    println!("Donation: 2%");
+fn print_donation(cfg: &RuntimeConfig) {
+    println!("{}", cfg.token.fee_policy(cfg.network).scheme.description());
 }
 
 /// Parses and executes one interactive command.
@@ -380,7 +379,7 @@ fn handle_line(
     match cmd.as_str() {
         "help" | "?" => print_help(),
         "status" => print_status(cfg, handle, live),
-        "donation" => print_donation(),
+        "donation" => print_donation(cfg),
 
         "broadcast" => println!(
             "legacy REPL submission is unavailable; use pickaxe mine --backend cuda --no-tui"
@@ -443,12 +442,12 @@ fn handle_line(
                 println!("  (empty)");
             }
             for (i, u) in fe.iter().enumerate() {
-                let tag = if cfg.fulcrum_url.as_ref() == Some(u) {
+                let tag = if cfg.custom_fulcrum_endpoints().contains(&u.as_str()) {
                     " custom"
                 } else {
                     " bootstrap"
                 };
-                println!("  {}. {}{}", i + 1, u, tag);
+                println!("  {}. {}{}", i + 1, redact_url(u), tag);
             }
             println!("Native node JSON-RPC try-order (sequential, ban-safe backoff):");
             let ne = cfg.node_endpoints();
@@ -456,7 +455,7 @@ fn handle_line(
                 println!("  (none - set node http://127.0.0.1:8332 for Start9/bitcoincashd)");
             }
             for (i, u) in ne.iter().enumerate() {
-                let tag = if cfg.node_url.as_ref() == Some(u) {
+                let tag = if cfg.custom_node_endpoints().contains(&u.as_str()) {
                     " custom"
                 } else {
                     " bootstrap"
@@ -470,7 +469,7 @@ fn handle_line(
             let rest: Vec<&str> = parts.collect();
             if rest.is_empty() {
                 match &cfg.fulcrum_url {
-                    Some(u) => println!("fulcrum (custom): {u}"),
+                    Some(u) => println!("fulcrum (custom): {}", redact_url(u)),
                     None => println!("fulcrum: (not set - using bootstrap). usage: fulcrum <wss://...> | fulcrum clear"),
                 }
             } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("clear") {
@@ -480,7 +479,7 @@ fn handle_line(
                 match cfg.set_fulcrum_url(&rest.join(" ")) {
                     Ok(()) => println!(
                         "fulcrum set to {}",
-                        cfg.fulcrum_url.as_deref().unwrap_or("")
+                        redact_url(cfg.fulcrum_url.as_deref().unwrap_or(""))
                     ),
                     Err(e) => println!("error: {e}"),
                 }
@@ -569,7 +568,10 @@ fn handle_line(
             }
             Err(e) => println!("error: {e}"),
         },
-        "connect" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+        "connect" => match ElectrumSession::connect_failover_for_deployment(
+            &cfg.electrum_endpoints(),
+            cfg.token.photon_deployment(cfg.network),
+        ) {
             Ok(s) => {
                 println!("connected: {}", s.url);
                 println!("server.version: {}", s.server_version);
@@ -578,7 +580,10 @@ fn handle_line(
             }
             Err(e) => println!("error: {e}"),
         },
-        "job" => match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+        "job" => match ElectrumSession::connect_failover_for_deployment(
+            &cfg.electrum_endpoints(),
+            cfg.token.photon_deployment(cfg.network),
+        ) {
             Ok(mut s) => match s.fetch_live_job() {
                 Ok(j) => {
                     j.print_summary();
@@ -596,7 +601,10 @@ fn handle_line(
             if cfg.payout_address.is_empty() {
                 println!("set payout first: payout bitcoincash:...");
             } else {
-                match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                match ElectrumSession::connect_failover_for_deployment(
+                    &cfg.electrum_endpoints(),
+                    cfg.token.photon_deployment(cfg.network),
+                ) {
                     Err(e) => println!("error: {e}"),
                     Ok(mut s) => match s.fetch_live_job() {
                         Err(e) => println!("error: {e}"),
@@ -610,9 +618,10 @@ fn handle_line(
                                 Err(e) => println!("error: {e}"),
                             }
                             let job_ctx = reference_job_context(&j);
-                            match tx::build_unsigned_reference_preview(
+                            match tx::build_unsigned_reference_preview_for_deployment(
                                 &job_ctx,
                                 &cfg.payout_address,
+                                cfg.token.photon_deployment(cfg.network),
                             ) {
                                 Ok(bytes) => {
                                     let hx = hex::encode(&bytes);
@@ -649,12 +658,13 @@ fn handle_line(
                     None => println!("run job or arm first to cache LiveJob"),
                     Some(j) => {
                         let job_ctx = reference_job_context(j);
-                        match tx::apply_reference_signature(
+                        match tx::apply_reference_signature_for_deployment(
                             &job_ctx,
                             &cfg.payout_address,
                             args[1],
                             nonce,
                             args[2],
+                            cfg.token.photon_deployment(cfg.network),
                         ) {
                             Ok(bytes) => {
                                 let hx = hex::encode(&bytes);
@@ -686,14 +696,18 @@ fn handle_line(
             if cfg.payout_address.is_empty() {
                 println!("error: set payout first (payout bitcoincash:...)");
             } else {
-                match ElectrumSession::connect_failover(&cfg.electrum_endpoints()) {
+                match ElectrumSession::connect_failover_for_deployment(
+                    &cfg.electrum_endpoints(),
+                    cfg.token.photon_deployment(cfg.network),
+                ) {
                     Ok(mut s) => match s.fetch_live_job() {
                         Ok(j) => {
                             j.print_summary();
                             let job_ctx = reference_job_context(&j);
-                            match tx::build_unsigned_reference_preview(
+                            match tx::build_unsigned_reference_preview_for_deployment(
                                 &job_ctx,
                                 &cfg.payout_address,
+                                cfg.token.photon_deployment(cfg.network),
                             ) {
                                 Ok(bytes) => {
                                     let hx = hex::encode(&bytes);
@@ -744,6 +758,14 @@ fn runtime_config_from_cli_with_base(
     args: &cli::Cli,
     mut cfg: RuntimeConfig,
 ) -> Result<RuntimeConfig, String> {
+    if args.chipnet {
+        cfg.set_network(config::MiningNetwork::Chipnet);
+    } else if let Some(network) = &args.network {
+        cfg.set_network(config::MiningNetwork::parse(network)?);
+    }
+    if let Some(token) = &args.token {
+        cfg.set_token(token)?;
+    }
     if let Some(intensity) = args.intensity {
         cfg.set_intensity(intensity)?;
     }
@@ -775,8 +797,8 @@ enum MineStartup {
 }
 
 /// Starts mining after the configured runtime checks.
-fn mine_startup(args: &cli::Cli, cfg: &RuntimeConfig) -> MineStartup {
-    if !(args.no_tui || args.json) && cfg.payout_address.trim().is_empty() {
+fn mine_startup(args: &cli::Cli) -> MineStartup {
+    if !(args.no_tui || args.json) && args.address.is_none() {
         MineStartup::InteractiveSetup
     } else {
         MineStartup::Direct
@@ -846,6 +868,9 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
                 "parent_txid": parent_txid,
                 "child_txid": child_txid,
             }),
+            runtime::RuntimeEvent::DirectRewardAccepted { txid, recipient } => serde_json::json!({
+                "event": "direct_reward_accepted", "txid": txid, "recipient": recipient,
+            }),
             runtime::RuntimeEvent::Error(error) => {
                 serde_json::json!({"event": "error", "error": error})
             }
@@ -902,6 +927,9 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
         } => println!(
             "winner submission accepted: parent={parent_txid} reward={child_txid}"
         ),
+        runtime::RuntimeEvent::DirectRewardAccepted { txid, .. } => {
+            println!("direct reward accepted: tx={txid}")
+        }
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
     }
 }
@@ -927,6 +955,8 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "payout_address": snapshot.payout_address,
         "intensity": snapshot.search.intensity,
         "candidates": snapshot.search.candidates,
+        "fee_policy": snapshot.fee_scheme.description(),
+        "work_candidates": { "miner": snapshot.search.work_candidates[0], "fee": snapshot.search.work_candidates[1].saturating_add(snapshot.search.work_candidates[2]) },
         "batches": snapshot.search.batches,
         "rate": snapshot.search.rate,
         "current_rate": snapshot.search.current_rate,
@@ -1031,7 +1061,9 @@ fn run_headless_mining(
     device_ordinal: u32,
     json: bool,
     use_tui: bool,
-) -> Result<(), String> {
+) -> Result<Option<(u8, String)>, String> {
+    cfg.ensure_mining_supported()?;
+    let _gpu_lock = mining_lock::acquire_gpu_lock()?;
     // Cache device information before the live miner starts so `/devices` never
     // probes drivers or creates temporary GPU contexts in the mining hot path.
     let tui_devices = if use_tui {
@@ -1044,7 +1076,10 @@ fn run_headless_mining(
     if use_tui {
         let final_snapshot = tui::run(supervisor, tui_devices)?;
         print_runtime_snapshot(&final_snapshot, false);
-        return Ok(());
+        return Ok(Some((
+            final_snapshot.search.intensity,
+            final_snapshot.payout_address,
+        )));
     }
     let intensity_rx = spawn_intensity_commands();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1084,7 +1119,24 @@ fn run_headless_mining(
     let final_snapshot = supervisor.stop();
     print_runtime_snapshot(&final_snapshot, json);
     let _ = std::io::stdout().flush();
-    Ok(())
+    Ok(None)
+}
+
+fn persist_session_profile(
+    path: &std::path::Path,
+    name: &str,
+    intensity: u8,
+    address: &str,
+) -> Result<(), String> {
+    let mut profiles = config::MiningProfiles::load_optional(path)?;
+    let profile = profiles
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.name.eq_ignore_ascii_case(name))
+        .ok_or("mining profile was renamed or removed during this session")?;
+    profile.settings.intensity = Some(intensity);
+    profile.settings.address = Some(address.to_string());
+    profiles.save(path)
 }
 
 /// Dispatches the requested CLI command and mining mode.
@@ -1195,6 +1247,8 @@ fn main() {
                         "{}",
                         serde_json::json!({
                             "backend": effective_backend,
+                            "network": cfg.network.as_str(),
+                            "token": cfg.token.as_str(),
                             "device": effective_device,
                             "intensity": cfg.intensity,
                             "address": cfg.payout_address,
@@ -1207,6 +1261,8 @@ fn main() {
                     );
                 } else {
                     println!("backend: {}", effective_backend);
+                    println!("network: {}", cfg.network.as_str());
+                    println!("token: {}", cfg.token.as_str());
                     println!("device: {:?}", effective_device);
                     println!("intensity: {}%", cfg.intensity);
                     println!("address: {}", cfg.payout_address);
@@ -1242,13 +1298,60 @@ fn main() {
             }
         },
         cli::Commands::Mine => {
-            let startup = mine_startup(&args, &cfg);
+            let profiles_path = config::profiles_path(&config_path);
+            let sources_path = config::sources_path(&config_path);
+            let mut sources = match config::SharedSources::load_optional(&sources_path) {
+                Ok(sources) => sources,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            };
+            if saved_config
+                .as_ref()
+                .is_some_and(|saved| sources.adopt_saved_config(saved))
+            {
+                if let Err(error) = sources.save(&sources_path) {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            }
+            let startup = mine_startup(&args);
+            let mut cfg = cfg;
+            if matches!(startup, MineStartup::Direct) {
+                // Saved per-network connections apply unless the command line
+                // or the base configuration named its own.
+                let fulcrum = sources.list(cfg.network, config::ConnectionKind::Fulcrum);
+                let node = sources.list(cfg.network, config::ConnectionKind::Node);
+                let applied = (if cfg.fulcrum_url.is_none() {
+                    cfg.set_fulcrum_url(&fulcrum.join(","))
+                } else {
+                    Ok(())
+                })
+                .and_then(|()| {
+                    if cfg.node_url.is_none() {
+                        cfg.set_node_url(&node.join(","))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = applied {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            }
             if matches!(startup, MineStartup::Direct)
                 && (args.no_tui || args.json)
                 && cfg.payout_address.trim().is_empty()
             {
                 eprintln!("error: --address is required with --no-tui or --json");
                 std::process::exit(2);
+            }
+            if matches!(startup, MineStartup::Direct) {
+                if let Err(error) = cfg.ensure_mining_supported() {
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
             }
             let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
                 Ok(device) => device,
@@ -1257,7 +1360,7 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            let (cfg, selected_backend, selected_device) = match startup {
+            let (cfg, selected_backend, selected_device, profile_name) = match startup {
                 MineStartup::InteractiveSetup => {
                     let devices = match backend::list_devices(backend_kind) {
                         Ok(devices) => devices,
@@ -1266,7 +1369,50 @@ fn main() {
                             std::process::exit(2);
                         }
                     };
-                    let setup = match tui::run_setup(cfg, devices, &selected) {
+                    let mut profiles = match config::MiningProfiles::load_optional(&profiles_path) {
+                        Ok(profiles) => profiles,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(2);
+                        }
+                    };
+                    // Servers and nodes once saved inside profiles move to the
+                    // shared per-network lists; save those before the profiles.
+                    if sources.adopt_profile_sources(&mut profiles) {
+                        if let Err(error) = sources
+                            .save(&sources_path)
+                            .and_then(|()| profiles.save(&profiles_path))
+                        {
+                            eprintln!("error: {error}");
+                            std::process::exit(2);
+                        }
+                    }
+                    let overrides = tui::SetupOverrides {
+                        network: if args.chipnet {
+                            Some(config::MiningNetwork::Chipnet)
+                        } else {
+                            args.network.as_deref().map(|value| {
+                                config::MiningNetwork::parse(value).expect("validated CLI network")
+                            })
+                        },
+                        token: args.token.clone(),
+                        intensity: args.intensity,
+                        fulcrum: args.fulcrum.clone(),
+                        node_rpc: args.node_rpc.clone(),
+                        source: args.source.clone(),
+                        device: (args.backend.is_some() || args.device.is_some())
+                            .then_some((selected.backend, selected.index)),
+                    };
+                    let setup = match tui::run_setup(
+                        cfg,
+                        devices,
+                        &selected,
+                        &profiles_path,
+                        profiles,
+                        &sources_path,
+                        sources,
+                        overrides,
+                    ) {
                         Ok(Some(setup)) => setup,
                         Ok(None) => return,
                         Err(error) => {
@@ -1274,16 +1420,32 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    (setup.config, setup.backend, setup.device)
+                    (
+                        setup.config,
+                        setup.backend,
+                        setup.device,
+                        Some(setup.profile_name),
+                    )
                 }
-                MineStartup::Direct => (cfg, selected.backend, selected.index),
+                MineStartup::Direct => (cfg, selected.backend, selected.index, None),
             };
             let use_tui = !(args.no_tui || args.json);
-            if let Err(error) =
-                run_headless_mining(cfg, selected_backend, selected_device, args.json, use_tui)
-            {
-                eprintln!("error: {error}");
-                std::process::exit(1);
+            match run_headless_mining(cfg, selected_backend, selected_device, args.json, use_tui) {
+                Ok(Some((intensity, address))) => {
+                    if let Some(name) = profile_name {
+                        if let Err(error) =
+                            persist_session_profile(&profiles_path, &name, intensity, &address)
+                        {
+                            eprintln!("error: save mining profile: {error}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         cli::Commands::Repl => run_repl(cfg),
@@ -1334,6 +1496,31 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn normal_session_exit_saves_the_latest_profile_intensity() {
+        let path = std::env::temp_dir().join(format!(
+            "pickaxe-session-profile-{}.json",
+            std::process::id()
+        ));
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_payout(config::DONATION_ADDRESS.into()).unwrap();
+        runtime.set_intensity(70).unwrap();
+        let mut profiles = config::MiningProfiles::default();
+        profiles
+            .upsert(
+                None,
+                "Rig A",
+                config::SavedConfig::from_effective("cuda", Some(0), &runtime),
+            )
+            .unwrap();
+        profiles.save(&path).unwrap();
+
+        persist_session_profile(&path, "Rig A", 40, config::DONATION_ADDRESS).unwrap();
+        let saved = config::MiningProfiles::load_optional(&path).unwrap();
+        assert_eq!(saved.profiles[0].settings.intensity, Some(40));
+        let _ = std::fs::remove_file(path);
+    }
+
     fn live_job() -> LiveJob {
         LiveJob {
             url: "wss://fulcrum.invalid".into(),
@@ -1382,29 +1569,29 @@ mod tests {
     }
 
     #[test]
-    fn release_workflow_prepares_pickaxe_miner_v0_0_1() {
+    fn release_workflow_prepares_pickaxe_miner_v0_0_2() {
         let workflow = include_str!("../.github/workflows/release.yml");
         let version = cargo_package_version(include_str!("../Cargo.toml"));
-        assert_eq!(version, "0.0.1");
+        assert_eq!(version, "0.0.2");
 
         let pattern = release_tag_pattern(workflow);
         assert!(
-            release_tag_matches(&pattern, "pickaxe-miner-v0.0.1"),
+            release_tag_matches(&pattern, "pickaxe-miner-v0.0.2"),
             "{pattern}"
         );
-        assert!(!release_tag_matches(&pattern, "v0.0.1"), "{pattern}");
-        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.1-rc.1"));
+        assert!(!release_tag_matches(&pattern, "v0.0.2"), "{pattern}");
+        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.2-rc.1"));
         assert!(workflow.contains("pickaxe-miner-v*.*.*"));
         assert!(!workflow.lines().any(|line| line.trim() == "- \"v*.*.*\""));
         assert!(workflow.contains("if [[ \"pickaxe-miner-v${version}\" != \"${TAG}\" ]]; then"));
         let tag = format!("pickaxe-miner-v{version}");
-        assert_eq!(tag, "pickaxe-miner-v0.0.1");
+        assert_eq!(tag, "pickaxe-miner-v0.0.2");
         assert_ne!(tag, format!("v{version}"));
 
         assert!(workflow.contains("release_title=\"Pickaxe Miner v${version}\""));
         assert!(workflow.contains("--title \"${release_title}\""));
         let title = format!("Pickaxe Miner v{version}");
-        assert_eq!(title, "Pickaxe Miner v0.0.1");
+        assert_eq!(title, "Pickaxe Miner v0.0.2");
 
         assert!(workflow.contains("pickaxe-miner-v${version}-linux-x86_64"));
         assert!(workflow.contains("pickaxe-miner-v$version-windows-x86_64"));
@@ -1433,15 +1620,13 @@ mod tests {
     #[test]
     fn startup_enters_setup_by_default() {
         let args = cli::Cli::try_parse_from(["pickaxe", "mine"]).unwrap();
-        let cfg = runtime_config_from_cli(&args).unwrap();
-        assert_eq!(mine_startup(&args, &cfg), MineStartup::InteractiveSetup);
+        assert_eq!(mine_startup(&args), MineStartup::InteractiveSetup);
     }
 
     #[test]
     fn startup_flag_keeps_direct_mode() {
         let args = cli::Cli::try_parse_from(["pickaxe", "mine", "--no-tui"]).unwrap();
-        let cfg = runtime_config_from_cli(&args).unwrap();
-        assert_eq!(mine_startup(&args, &cfg), MineStartup::Direct);
+        assert_eq!(mine_startup(&args), MineStartup::Direct);
     }
 
     #[test]
@@ -1451,6 +1636,10 @@ mod tests {
             gpu_backend: "cuda".into(),
             gpu_device: 0,
             generation_id: 2,
+            network: config::MiningNetwork::Mainnet,
+            fee_scheme: config::MiningToken::Photon
+                .fee_policy(config::MiningNetwork::Mainnet)
+                .scheme,
             payout_address: crate::config::DONATION_ADDRESS.into(),
             endpoint: "wss://fulcrum.invalid".into(),
             height: 1_000,
@@ -1471,12 +1660,14 @@ mod tests {
             last_error: None,
             search: search::SearchStats {
                 candidates: 65_536,
+                work_candidates: [65_536, 0, 0],
                 batches: 1,
                 intensity: 30,
                 state: search::MiningState::Mining,
                 elapsed_secs: 1,
                 rate: 65_536.0,
                 current_rate: 65_536.0,
+                active_rate: 65_536.0,
                 peak_rate: 65_536.0,
                 winners: 0,
                 rejected_winners: 2,
@@ -1508,6 +1699,11 @@ mod tests {
         assert_eq!(status["reconnects"], 0);
         assert_eq!(status["endpoint_rotations"], 1);
         assert_eq!(status["rejected_winners"], 2);
+        assert_eq!(status["fee_policy"], "Donation: 4%");
+        assert_eq!(status["work_candidates"]["miner"], 65_536);
+        assert_eq!(status["work_candidates"]["fee"], 0);
+        assert!(status["work_candidates"].get("project").is_none());
+        assert!(status["work_candidates"].get("collaborator").is_none());
         assert_eq!(status["photon_target_le"], "ff".repeat(32));
         assert!(status.get("refreshes").is_none());
         assert!(status.get("stale_rebuilds").is_none());
@@ -1532,7 +1728,7 @@ mod tests {
         ])
         .unwrap();
         let cfg = runtime_config_from_cli(&args).unwrap();
-        assert_eq!(mine_startup(&args, &cfg), MineStartup::Direct);
+        assert_eq!(mine_startup(&args), MineStartup::Direct);
         assert_eq!(args.device, Some(0));
         assert_eq!(cfg.intensity, 60);
         assert_eq!(cfg.payout_address, crate::config::DONATION_ADDRESS);
@@ -1637,6 +1833,7 @@ mod tests {
             height: job.height,
             baton_txid: job.baton_txid.clone(),
             baton_vout: job.baton_vout,
+            job_reward_raw: job.reward_raw,
             nonce: 7,
             digest: [0u8; 32],
             public_key: [0u8; 33],
@@ -1644,6 +1841,10 @@ mod tests {
             transaction: Vec::new(),
         };
         assert!(validate_verified_winner_current(&winner, &cfg, live.as_ref()).is_ok());
+
+        let mut stale_reward = winner.clone();
+        stale_reward.job_reward_raw += 1;
+        assert!(validate_verified_winner_current(&stale_reward, &cfg, live.as_ref()).is_err());
 
         let mut stale_generation = winner.clone();
         stale_generation.generation_id += 1;

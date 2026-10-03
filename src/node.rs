@@ -5,7 +5,7 @@
 //! until the native capability is explicitly promoted after equivalence review.
 
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
-use crate::protocol::{derive_photon_state, COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
+use crate::protocol::{derive_photon_state, PhotonDeployment};
 use native_tls::TlsConnector;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -189,6 +189,7 @@ struct NativePhotonBootstrap {
 
 pub struct NativePhotonSession {
     url: String,
+    deployment: PhotonDeployment,
     baton: NativePhotonBaton,
     snapshot: LiveStateSnapshot,
 }
@@ -201,8 +202,15 @@ pub struct NativePhotonSession {
 /// Runtime capability remains fail-closed until the normalized state is proven
 /// equivalent to the canonical Fulcrum path.
 impl NativePhotonSession {
+    pub fn endpoint(&self) -> &str {
+        &self.url
+    }
+
     /// Connects to a native node using the configured failover order.
-    pub fn connect_failover(endpoints: &[String]) -> Result<Self, String> {
+    pub fn connect_failover(
+        endpoints: &[String],
+        deployment: &PhotonDeployment,
+    ) -> Result<Self, String> {
         if endpoints.is_empty() {
             return Err("no native node endpoints configured for PHOTON state".into());
         }
@@ -214,10 +222,11 @@ impl NativePhotonSession {
                 thread::sleep(Duration::from_millis(backoff_ms));
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);
             }
-            match bootstrap_native_photon(url) {
+            match bootstrap_native_photon(url, deployment) {
                 Ok(bootstrap) => {
                     return Ok(Self {
                         url: url.clone(),
+                        deployment: *deployment,
                         baton: bootstrap.baton,
                         snapshot: bootstrap.snapshot,
                     });
@@ -250,10 +259,10 @@ impl NativePhotonSession {
         )?;
 
         let observed_baton = if txout.is_null() {
-            match resolve_native_mempool_baton(&self.url, &self.baton) {
+            match resolve_native_mempool_baton(&self.url, &self.baton, &self.deployment) {
                 Ok(successor) => successor,
                 Err(refresh_error) => {
-                    let bootstrap = bootstrap_native_photon(&self.url).map_err(|bootstrap_error| {
+                    let bootstrap = bootstrap_native_photon(&self.url, &self.deployment).map_err(|bootstrap_error| {
                         format!(
                             "cached native PHOTON baton refresh failed: {refresh_error}; rebootstrap failed: {bootstrap_error}"
                         )
@@ -270,11 +279,17 @@ impl NativePhotonSession {
                 height,
                 &bestblock,
                 &txout,
+                &self.deployment,
             )?
         };
 
-        let snapshot =
-            finalize_native_photon_snapshot(&self.url, height, &bestblock, observed_baton)?;
+        let snapshot = finalize_native_photon_snapshot(
+            &self.url,
+            height,
+            &bestblock,
+            observed_baton,
+            &self.deployment,
+        )?;
         self.baton = baton_from_live_job(&snapshot.job);
         self.snapshot = snapshot.clone();
         Ok(snapshot)
@@ -286,14 +301,20 @@ impl NativePhotonSession {
 /// This compatibility wrapper performs a single bootstrap. Production callers
 /// that refresh repeatedly should retain NativePhotonSession.
 #[allow(dead_code)]
-pub fn fetch_photon_live_job(endpoints: &[String]) -> Result<LiveJob, String> {
-    let session = NativePhotonSession::connect_failover(endpoints)?;
+pub fn fetch_photon_live_job(
+    endpoints: &[String],
+    deployment: &PhotonDeployment,
+) -> Result<LiveJob, String> {
+    let session = NativePhotonSession::connect_failover(endpoints, deployment)?;
     Ok(session.snapshot().job.clone())
 }
 
 /// Initializes native PHOTON state from canonical source evidence.
-fn bootstrap_native_photon(url: &str) -> Result<NativePhotonBootstrap, String> {
-    let descriptor = format!("raw({COVENANT_LOCKING_BYTECODE_HEX})");
+fn bootstrap_native_photon(
+    url: &str,
+    deployment: &PhotonDeployment,
+) -> Result<NativePhotonBootstrap, String> {
+    let descriptor = format!("raw({})", deployment.covenant_lock_hex);
     let scan = rpc_call(url, "scantxoutset", json!(["start", [descriptor]]))?;
     if scan.get("success").and_then(Value::as_bool) != Some(true) {
         return Err("scantxoutset did not complete successfully".into());
@@ -316,7 +337,7 @@ fn bootstrap_native_photon(url: &str) -> Result<NativePhotonBootstrap, String> {
 
     let candidates = unspents
         .iter()
-        .filter(|utxo| native_scan_entry_is_photon_baton(utxo))
+        .filter(|utxo| native_scan_entry_is_photon_baton(utxo, deployment))
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
         return Err(format!(
@@ -325,14 +346,14 @@ fn bootstrap_native_photon(url: &str) -> Result<NativePhotonBootstrap, String> {
         ));
     }
 
-    let scan_baton = parse_native_scan_baton(candidates[0])?;
+    let scan_baton = parse_native_scan_baton(candidates[0], deployment)?;
     let first = rpc_call(
         url,
         "gettxout",
         json!([scan_baton.txid.clone(), scan_baton.vout, true]),
     )?;
     let observed_baton = if first.is_null() {
-        resolve_native_mempool_baton(url, &scan_baton)?
+        resolve_native_mempool_baton(url, &scan_baton, deployment)?
     } else {
         let baton = parse_native_gettxout_baton(
             &scan_baton.txid,
@@ -340,6 +361,7 @@ fn bootstrap_native_photon(url: &str) -> Result<NativePhotonBootstrap, String> {
             height,
             bestblock,
             &first,
+            deployment,
         )?;
         if baton != scan_baton {
             return Err("native PHOTON scantxoutset/gettxout baton mismatch".into());
@@ -347,7 +369,8 @@ fn bootstrap_native_photon(url: &str) -> Result<NativePhotonBootstrap, String> {
         baton
     };
 
-    let snapshot = finalize_native_photon_snapshot(url, height, bestblock, observed_baton)?;
+    let snapshot =
+        finalize_native_photon_snapshot(url, height, bestblock, observed_baton, deployment)?;
     let baton = baton_from_live_job(&snapshot.job);
     Ok(NativePhotonBootstrap { snapshot, baton })
 }
@@ -375,6 +398,7 @@ fn finalize_native_photon_snapshot(
     height: u32,
     bestblock: &str,
     observed_baton: NativePhotonBaton,
+    deployment: &PhotonDeployment,
 ) -> Result<LiveStateSnapshot, String> {
     let observed_bestblock = rpc_call(url, "getbestblockhash", json!([]))?;
     let observed_bestblock = observed_bestblock
@@ -400,6 +424,7 @@ fn finalize_native_photon_snapshot(
         height,
         bestblock,
         &second,
+        deployment,
     )?;
     if observed_baton != second_baton {
         return Err("native PHOTON baton changed during consistency check".into());
@@ -505,6 +530,7 @@ fn mempool_entry<'a>(entries: &'a serde_json::Map<String, Value>, txid: &str) ->
 fn resolve_native_mempool_baton(
     url: &str,
     confirmed_baton: &NativePhotonBaton,
+    deployment: &PhotonDeployment,
 ) -> Result<NativePhotonBaton, String> {
     let mempool = rpc_call(url, "getrawmempool", json!([true]))?;
     let entries = mempool
@@ -515,9 +541,9 @@ fn resolve_native_mempool_baton(
     // scan: the transaction that spends it has a non-empty `depends` list.
     let first_successor = if let Some(parent_entry) = mempool_entry(entries, &confirmed_baton.txid)
     {
-        unique_spentby_successor(url, parent_entry, confirmed_baton)?
+        unique_spentby_successor(url, parent_entry, confirmed_baton, deployment)?
     } else {
-        first_confirmed_root_successor(url, entries, confirmed_baton)?
+        first_confirmed_root_successor(url, entries, confirmed_baton, deployment)?
     };
 
     let mut current = first_successor.ok_or(
@@ -527,7 +553,7 @@ fn resolve_native_mempool_baton(
     for _ in 0..MAX_NATIVE_PHOTON_MEMPOOL_DESCENDANT_DEPTH {
         let entry = mempool_entry(entries, &current.txid)
             .ok_or("native PHOTON successor disappeared from mempool snapshot")?;
-        match unique_spentby_successor(url, entry, &current)? {
+        match unique_spentby_successor(url, entry, &current, deployment)? {
             Some(successor) => current = successor,
             None => return Ok(current),
         }
@@ -543,6 +569,7 @@ fn first_confirmed_root_successor(
     url: &str,
     entries: &serde_json::Map<String, Value>,
     confirmed_baton: &NativePhotonBaton,
+    deployment: &PhotonDeployment,
 ) -> Result<Option<NativePhotonBaton>, String> {
     let mut roots = entries
         .iter()
@@ -568,7 +595,7 @@ fn first_confirmed_root_successor(
     for (_, txid) in roots {
         let transaction = rpc_call(url, "getrawtransaction", json!([txid, 1]))?;
         if let Some(successor) =
-            parse_native_mempool_successor(txid, &transaction, confirmed_baton)?
+            parse_native_mempool_successor(txid, &transaction, confirmed_baton, deployment)?
         {
             return Ok(Some(successor));
         }
@@ -580,6 +607,7 @@ fn unique_spentby_successor(
     url: &str,
     entry: &Value,
     spent_baton: &NativePhotonBaton,
+    deployment: &PhotonDeployment,
 ) -> Result<Option<NativePhotonBaton>, String> {
     let spent_by = entry
         .get("spentby")
@@ -595,7 +623,9 @@ fn unique_spentby_successor(
             .as_str()
             .ok_or("native mempool spentby entry is not a transaction id")?;
         let transaction = rpc_call(url, "getrawtransaction", json!([child_txid, 1]))?;
-        if let Some(next) = parse_native_mempool_successor(child_txid, &transaction, spent_baton)? {
+        if let Some(next) =
+            parse_native_mempool_successor(child_txid, &transaction, spent_baton, deployment)?
+        {
             if successor.replace(next).is_some() {
                 return Err("multiple mempool transactions spend the PHOTON baton output".into());
             }
@@ -609,6 +639,7 @@ fn parse_native_mempool_successor(
     expected_txid: &str,
     transaction: &Value,
     spent_baton: &NativePhotonBaton,
+    deployment: &PhotonDeployment,
 ) -> Result<Option<NativePhotonBaton>, String> {
     let transaction_txid = transaction
         .get("txid")
@@ -640,7 +671,7 @@ fn parse_native_mempool_successor(
         .ok_or("getrawtransaction omitted vout")?;
     let successors = outputs
         .iter()
-        .filter(|output| native_transaction_output_is_photon_baton(output))
+        .filter(|output| native_transaction_output_is_photon_baton(output, deployment))
         .collect::<Vec<_>>();
     if successors.len() != 1 {
         return Err(format!(
@@ -649,19 +680,22 @@ fn parse_native_mempool_successor(
         ));
     }
 
-    parse_native_transaction_output_baton(transaction_txid, successors[0]).map(Some)
+    parse_native_transaction_output_baton(transaction_txid, successors[0], deployment).map(Some)
 }
 
 /// Checks whether an output preserves the PHOTON baton contract.
-fn native_transaction_output_is_photon_baton(output: &Value) -> bool {
+fn native_transaction_output_is_photon_baton(
+    output: &Value,
+    deployment: &PhotonDeployment,
+) -> bool {
     let script_matches = output
         .pointer("/scriptPubKey/hex")
         .and_then(Value::as_str)
-        .is_some_and(|script| script.eq_ignore_ascii_case(COVENANT_LOCKING_BYTECODE_HEX));
+        .is_some_and(|script| script.eq_ignore_ascii_case(deployment.covenant_lock_hex));
     let category_matches = output
         .pointer("/tokenData/category")
         .and_then(Value::as_str)
-        .is_some_and(|category| category.eq_ignore_ascii_case(MAINNET_CATEGORY_HEX));
+        .is_some_and(|category| category.eq_ignore_ascii_case(deployment.category_hex));
     let mutable = output
         .pointer("/tokenData/nft/capability")
         .and_then(Value::as_str)
@@ -673,8 +707,9 @@ fn native_transaction_output_is_photon_baton(output: &Value) -> bool {
 fn parse_native_transaction_output_baton(
     txid: &str,
     output: &Value,
+    deployment: &PhotonDeployment,
 ) -> Result<NativePhotonBaton, String> {
-    if !native_transaction_output_is_photon_baton(output) {
+    if !native_transaction_output_is_photon_baton(output, deployment) {
         return Err("native transaction output is not the authoritative PHOTON baton shape".into());
     }
     let vout = output
@@ -710,15 +745,15 @@ fn parse_native_transaction_output_baton(
 }
 
 /// Checks whether a scan entry represents a PHOTON baton.
-fn native_scan_entry_is_photon_baton(utxo: &Value) -> bool {
+fn native_scan_entry_is_photon_baton(utxo: &Value, deployment: &PhotonDeployment) -> bool {
     let script_matches = utxo
         .get("scriptPubKey")
         .and_then(Value::as_str)
-        .is_some_and(|script| script.eq_ignore_ascii_case(COVENANT_LOCKING_BYTECODE_HEX));
+        .is_some_and(|script| script.eq_ignore_ascii_case(deployment.covenant_lock_hex));
     let category_matches = utxo
         .pointer("/tokenData/category")
         .and_then(Value::as_str)
-        .is_some_and(|category| category.eq_ignore_ascii_case(MAINNET_CATEGORY_HEX));
+        .is_some_and(|category| category.eq_ignore_ascii_case(deployment.category_hex));
     let mutable = utxo
         .pointer("/tokenData/nft/capability")
         .and_then(Value::as_str)
@@ -727,8 +762,11 @@ fn native_scan_entry_is_photon_baton(utxo: &Value) -> bool {
 }
 
 /// Parses a baton from an unspent-output scan entry.
-fn parse_native_scan_baton(utxo: &Value) -> Result<NativePhotonBaton, String> {
-    if !native_scan_entry_is_photon_baton(utxo) {
+fn parse_native_scan_baton(
+    utxo: &Value,
+    deployment: &PhotonDeployment,
+) -> Result<NativePhotonBaton, String> {
+    if !native_scan_entry_is_photon_baton(utxo, deployment) {
         return Err("native UTXO is not the authoritative PHOTON baton shape".into());
     }
     let txid = utxo
@@ -780,6 +818,7 @@ fn parse_native_gettxout_baton(
     tip_height: u32,
     expected_bestblock: &str,
     txout: &Value,
+    deployment: &PhotonDeployment,
 ) -> Result<NativePhotonBaton, String> {
     let bestblock = txout
         .get("bestblock")
@@ -792,7 +831,7 @@ fn parse_native_gettxout_baton(
         .pointer("/scriptPubKey/hex")
         .and_then(Value::as_str)
         .ok_or("gettxout omitted scriptPubKey.hex")?;
-    if !script.eq_ignore_ascii_case(COVENANT_LOCKING_BYTECODE_HEX) {
+    if !script.eq_ignore_ascii_case(deployment.covenant_lock_hex) {
         return Err("native PHOTON baton locking bytecode does not match the covenant".into());
     }
 
@@ -800,7 +839,7 @@ fn parse_native_gettxout_baton(
         .pointer("/tokenData/category")
         .and_then(Value::as_str)
         .ok_or("gettxout omitted PHOTON token category")?;
-    if !category.eq_ignore_ascii_case(MAINNET_CATEGORY_HEX) {
+    if !category.eq_ignore_ascii_case(deployment.category_hex) {
         return Err("native PHOTON baton token category mismatch".into());
     }
     if txout
@@ -1373,6 +1412,7 @@ fn simple_b64(data: &[u8]) -> String {
 mod gbt_tests {
     use super::*;
     use crate::electrum::live_job_from_fulcrum_values;
+    use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX, MAINNET_PHOTON};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
@@ -1711,7 +1751,8 @@ mod gbt_tests {
             ("gettxout", txout),
         ]);
         let mut native_session =
-            NativePhotonSession::connect_failover(std::slice::from_ref(&endpoint)).unwrap();
+            NativePhotonSession::connect_failover(std::slice::from_ref(&endpoint), &MAINNET_PHOTON)
+                .unwrap();
         let native = native_session.snapshot().job.clone();
         let refreshed = native_session.refresh().unwrap();
         server.join().unwrap();
@@ -1837,7 +1878,8 @@ mod gbt_tests {
             ("getbestblockhash", json!(bestblock.clone())),
             ("gettxout", successor_txout),
         ]);
-        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint)).unwrap();
+        let native =
+            fetch_photon_live_job(std::slice::from_ref(&endpoint), &MAINNET_PHOTON).unwrap();
         server.join().unwrap();
 
         let fulcrum = live_job_from_fulcrum_values(
@@ -1979,7 +2021,8 @@ mod gbt_tests {
             ("getbestblockhash", json!(bestblock.clone())),
             ("gettxout", final_txout),
         ]);
-        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint)).unwrap();
+        let native =
+            fetch_photon_live_job(std::slice::from_ref(&endpoint), &MAINNET_PHOTON).unwrap();
         server.join().unwrap();
 
         let fulcrum = live_job_from_fulcrum_values(
@@ -2037,7 +2080,8 @@ mod gbt_tests {
             ("gettxout", Value::Null),
             ("getrawmempool", json!({})),
         ]);
-        let error = fetch_photon_live_job(std::slice::from_ref(&endpoint)).unwrap_err();
+        let error =
+            fetch_photon_live_job(std::slice::from_ref(&endpoint), &MAINNET_PHOTON).unwrap_err();
         server.join().unwrap();
 
         assert!(
@@ -2117,7 +2161,7 @@ mod gbt_tests {
             ("getbestblockhash", json!(bestblock.clone())),
             ("gettxout", settlement_txout),
         ]);
-        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint));
+        let native = fetch_photon_live_job(std::slice::from_ref(&endpoint), &MAINNET_PHOTON);
         server.join().expect("json-rpc fixture server");
         let native = native.expect("two-input settlement must be a canonical baton successor");
         assert_eq!(native.baton_txid, settlement_txid);
@@ -2234,7 +2278,8 @@ mod gbt_tests {
             ("gettxout", child_txout),
         ]);
         let mut session =
-            NativePhotonSession::connect_failover(std::slice::from_ref(&endpoint)).unwrap();
+            NativePhotonSession::connect_failover(std::slice::from_ref(&endpoint), &MAINNET_PHOTON)
+                .unwrap();
         assert_eq!(session.snapshot().job.baton_txid, unconfirmed_txid);
         let refreshed = session.refresh();
         server.join().expect("json-rpc fixture server");

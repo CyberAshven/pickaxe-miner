@@ -10,6 +10,10 @@ Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken bat
 
 Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
 
+Mainnet and Chipnet run the PHOTON v3.2 contract (mainnet category `53bd86e3f123918d2d7040449f88f7ed1bbddc309b66f2ac67cd429278f5ea58`). The retired PHOTON v0 is no longer mined, and the v0.0.2 release predates this change.
+
+PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes mine for your wallet. Each win pays directly. There is no additional reward split, minimum withdrawal, or deposit required. The donation is based on work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
+
 ## Supported platforms
 
 - Operating systems: Windows x86_64 and Linux x86_64
@@ -19,21 +23,21 @@ Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain 
 
 ## Install
 
-Download the archive for your operating system from the [v0.0.1 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.1). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
+Download the archive for your operating system from the [v0.0.2 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.2). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
 
 Linux:
 
 ```bash
-tar -xzf pickaxe-miner-v0.0.1-linux-x86_64.tar.gz
-cd pickaxe-miner-v0.0.1-linux-x86_64
+tar -xzf pickaxe-miner-v0.0.2-linux-x86_64.tar.gz
+cd pickaxe-miner-v0.0.2-linux-x86_64
 ./pickaxe mine
 ```
 
 Windows PowerShell:
 
 ```powershell
-Expand-Archive pickaxe-miner-v0.0.1-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.1-windows-x86_64
-cd pickaxe-miner-v0.0.1-windows-x86_64
+Expand-Archive pickaxe-miner-v0.0.2-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.2-windows-x86_64
+cd pickaxe-miner-v0.0.2-windows-x86_64
 .\pickaxe.exe mine
 ```
 
@@ -46,6 +50,36 @@ Headless, from the same directory:
 ```powershell
 .\pickaxe.exe mine --no-tui
 ```
+
+## Setup and profiles
+
+Without `--no-tui`, the miner opens a short setup:
+
+1. **Profiles**: your saved profiles. Enter on one opens its settings with Start selected, so a second Enter mines. `R` renames and `D` deletes (with a confirmation).
+2. **Hardware**: GPU or ASIC.
+3. **Network**: Mainnet or Chipnet.
+4. **Token**: the GPU tokens for that network, or for ASIC, "BCH + all merge-mined tokens" or an ASIC-exclusive token. ASIC mining is not supported yet.
+5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page.
+
+Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session.
+
+## Chipnet PHOTON test
+
+Use a build containing Chipnet support (the v0.0.2 download above predates it). After building this branch, run from the project root with the GPU files in place:
+
+```bash
+./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bitcoincash:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
+```
+
+Replace the quoted address with your valid token-aware P2PKH payout CashAddr. The miner converts a valid mainnet payout CashAddr to the equivalent `bchtest:` address with the same key hash. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoint; mainnet remains the default without `--chipnet`.
+
+New Chipnet wins pay the selected wallet directly, using the same donation policy. No local reward wallet or payout batching is created for new mining.
+
+The earlier Chipnet batch-payout preview is no longer supported. Rewards it held under `chipnet-funding.key` are Chipnet test coins and are not recovered; you can delete that file. If the preview left a pending `pending-reward-chipnet.json`, the miner says so and asks you to delete it.
+
+In the Chipnet TUI, `now` is the recent effective rate, `active GPU` is the last completed GPU batch rate, and `wall avg` averages candidates over all elapsed time, including reward handling pauses. A paused miner shows `now` as zero while retaining the last `active GPU` rate.
+
+After a verified direct win, the GPU mines the baton that win creates while the claim is broadcast, instead of waiting for Fulcrum to list the unconfirmed claim. A new claim is broadcast before any further state check, and also sent in the background to up to two other configured Fulcrum servers so it reaches more of the network at once. If the claim turns out stale, or another transaction already spent its baton, that work is discarded and mining continues on the baton Fulcrum reports. A direct claim pays its reward inside the claim transaction, so if a claim recorded as stale still confirms, the recipient is paid.
 
 ## Diagnostic logging
 
@@ -84,21 +118,32 @@ Log files are appended to without automatic rotation or a size limit. After an i
 
 ## Build
 
+Rust is the default CUDA mining backend. Build its GPU kernels with the pinned
+nightly compiler, then build the executable with stable Rust.
+
+Linux:
+
 ```bash
 rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
-pwsh -File tools/build-rust-kernels.ps1 -Architecture sm_120
+bash tools/build-rust-kernels.sh sm_120
 cargo build --release --locked
 ```
 
-The cargo binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.1`.
+Windows PowerShell 7:
 
-The default CUDA backend uses the pinned Rust arithmetic port of UltrafastSecp256k1. Building its kernels requires PowerShell 7 (`pwsh`), including on Linux. Keep `cuda/build`, including `photon_rust.ptx`, beside the executable when distributing it. HIP retains its existing backend.
+```powershell
+rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src,llvm-tools-preview,llvm-bitcode-linker
+./tools/build-rust-kernels.ps1 -Architecture sm_120
+cargo build --release --locked
+```
 
-The example targets SM 12.0, as do the release archives; use your GPU's SM architecture when building for other NVIDIA devices. The pinned engine and compiler make comparisons repeatable, but MH/s also depends on the GPU, driver, clocks, power limits and cooling. Physical validation currently covers SM 12.0; SM 7.5 has compilation coverage.
+The legacy CUDA C++ backend remains available with
+`cargo build --release --locked --no-default-features --features tail-grind`.
+Use a separate output directory when comparing the two builds.
 
-For the legacy native CUDA backend, build with `--no-default-features --features incremental-k`. Historical source is preserved in [legacy-engine-by-cyberashven](reference/legacy-engine-by-cyberashven/README.md).
+The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.2`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
 
-Contract identity is maintained in one [protocol profile](docs/protocol-profile.md); changing it requires rebuilding and end-to-end validation.
+The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing backend. Other NVIDIA architectures require compatible CUDA files and separate validation.
 
 Interactive TUI:
 

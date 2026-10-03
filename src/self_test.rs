@@ -8,6 +8,7 @@ use crate::hip_photon::HipPhotonEngine;
 #[cfg(feature = "portable-wgpu")]
 use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, reward, search, tx};
+use secp256k1::{PublicKey, SecretKey};
 use serde::Serialize;
 
 const TX_BYTES: usize = 615;
@@ -58,7 +59,9 @@ fn deterministic_secret(last_byte: u8) -> [u8; 32] {
 
 /// Derives the compressed public key for a test identity.
 fn public_key(secret: &[u8; 32]) -> Result<[u8; 33], String> {
-    crate::crypto::compressed_pubkey(secret).map_err(|error| format!("test key: {error}"))
+    let secret =
+        SecretKey::from_secret_bytes(*secret).map_err(|error| format!("test key: {error}"))?;
+    Ok(PublicKey::from_secret_key(&secret).serialize())
 }
 
 /// Builds the reference PHOTON transaction context.
@@ -95,7 +98,10 @@ fn build_reference_shaped_template(
         reward_amount: context.reward_raw,
         payout_locking,
     };
-    let bytes = tx::build_photon_template_bytes(&params)?;
+    let bytes = tx::build_photon_template_bytes_for_deployment(
+        &params,
+        &crate::protocol::MAINNET_V0_PHOTON,
+    )?;
     bytes.try_into().map_err(|bytes: Vec<u8>| {
         format!(
             "self-test PHOTON template is {} bytes; expected {TX_BYTES}",
@@ -120,12 +126,13 @@ fn validate_gpu_winner_and_reward(
         return Err("host BCH Schnorr verification rejected self-test signature".into());
     }
 
-    let completed = tx::apply_reference_signature(
+    let completed = tx::apply_reference_signature_for_deployment(
         &context,
         &reward_address,
         &hex::encode(reward_public_key),
         nonce,
         &hex::encode(signature),
+        &crate::protocol::MAINNET_V0_PHOTON,
     )?;
     if completed.len() != TX_BYTES {
         return Err(format!(
@@ -365,7 +372,7 @@ mod tests {
             validated.donation_token_amount,
             VECTOR_REWARD_RAW * u128::from(DONATION_BPS) / 10_000
         );
-        assert_eq!(validated.settlement_fee_sats, 794);
+        assert_eq!(validated.settlement_fee_sats, 867);
     }
     #[test]
     fn offline_host_validation_rejects_gpu_digest_mismatch() {

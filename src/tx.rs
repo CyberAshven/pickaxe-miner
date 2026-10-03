@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 use crate::config::DONATION_ADDRESS;
-use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX, REDEEM_SCRIPT_HEX};
+use crate::protocol::{PhotonDeployment, MAINNET_V0_PHOTON};
 use sha2::Digest;
 
 const CASHADDR_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -90,11 +90,38 @@ fn cashaddr_polymod(values: &[u8]) -> u64 {
 
 /// Encode a mainnet P2PKH hash as a canonical CashAddr.
 pub fn p2pkh_hash_to_cashaddr(hash: &[u8; 20]) -> Result<String, String> {
+    p2pkh_hash_to_cashaddr_for_network(hash, crate::config::MiningNetwork::Mainnet)
+}
+
+/// Encodes a P2PKH hash with the selected chain's canonical CashAddr prefix.
+pub fn p2pkh_hash_to_cashaddr_for_network(
+    hash: &[u8; 20],
+    network: crate::config::MiningNetwork,
+) -> Result<String, String> {
+    p2pkh_hash_to_cashaddr_with_type(hash, network, 0)
+}
+
+/// Encodes a token-aware P2PKH payout with the selected chain's prefix.
+pub fn token_p2pkh_hash_to_cashaddr_for_network(
+    hash: &[u8; 20],
+    network: crate::config::MiningNetwork,
+) -> Result<String, String> {
+    p2pkh_hash_to_cashaddr_with_type(hash, network, 2)
+}
+
+fn p2pkh_hash_to_cashaddr_with_type(
+    hash: &[u8; 20],
+    network: crate::config::MiningNetwork,
+    address_type: u8,
+) -> Result<String, String> {
     let mut decoded = Vec::with_capacity(21);
-    decoded.push(0); // P2PKH, 160-bit hash
+    decoded.push(address_type << 3); // 160-bit P2PKH or token-aware P2PKH
     decoded.extend_from_slice(hash);
     let payload = convert_bits(&decoded, 8, 5, true)?;
-    let prefix = "bitcoincash";
+    let prefix = match network {
+        crate::config::MiningNetwork::Mainnet => "bitcoincash",
+        crate::config::MiningNetwork::Chipnet => "bchtest",
+    };
     let mut checksum_input: Vec<u8> = prefix.bytes().map(|c| c & 31).collect();
     checksum_input.push(0);
     checksum_input.extend_from_slice(&payload);
@@ -222,11 +249,13 @@ fn compact_token_amount(amount: u128) -> Result<Vec<u8>, String> {
 
 /// Byte positions of a PHOTON mining transaction for one baton age.
 ///
-/// The input script pushes the age as a minimal script number, so the
+/// The input script pushes the age as a minimal script number, so the v0
 /// transaction is 615 bytes for age 0..=16 and one byte longer per extra
 /// number byte: 616 for 17..=127, 617 for 128..=32767, 618 for
-/// 32768..=65534. The covenant rejects age >= 65535. Every byte after the
-/// age push, including the nonce, target and signature, moves by `shift`.
+/// 32768..=65534. The covenant rejects age >= 65535. A longer redeem script
+/// adds its extra bytes too (the 273-byte v3.2 contract: 629..=632). Every
+/// byte after the age push, including the nonce, target and signature,
+/// moves by `shift`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhotonLayout {
     shift: usize,
@@ -235,8 +264,13 @@ pub struct PhotonLayout {
 impl PhotonLayout {
     /// Layout of the age 0..=16 reference vector.
     pub const BASE: Self = Self { shift: 0 };
-    /// Largest layout shift the covenant's age bound allows.
-    pub const MAX_SHIFT: usize = 3;
+    /// Layout shifts with GPU kernels: the v0 reference vector at every age
+    /// push width, and the 273-byte v3.2 contract (14 bytes past v0) up to
+    /// age 32767. Its age 32768..=65534 layout (shift 17) would need an
+    /// eleventh SHA-256 block. Each shift is a separate kernel build.
+    pub const GPU_SHIFTS: [usize; 7] = [0, 1, 2, 3, 14, 15, 16];
+    /// Widest layout the GPU kernels are built for.
+    pub const MAX_SHIFT: usize = 16;
     /// Covenant bound: `age < 65535`.
     pub const MAX_AGE: u32 = 65_534;
 
@@ -253,15 +287,50 @@ impl PhotonLayout {
         })
     }
 
+    /// Includes the selected redeem script's byte width in the GPU offsets.
+    /// Layouts without kernels fail before a job reaches the GPU.
+    pub fn for_age_with_deployment(
+        age: u32,
+        deployment: &PhotonDeployment,
+    ) -> Result<Self, String> {
+        let age_shift = Self::for_age(age)?.shift;
+        deployment.verify()?;
+        let redeem_len = deployment.redeem_script_hex.trim().len() / 2;
+        // The CUDA kernels' offsets are built for the original v0 contract.
+        let base_len = MAINNET_V0_PHOTON.redeem_script_hex.trim().len() / 2;
+        let redeem_shift = redeem_len
+            .checked_sub(base_len)
+            .ok_or("PHOTON deployment redeem script is shorter than CUDA's base layout")?;
+        let shift = age_shift + redeem_shift;
+        if !Self::GPU_SHIFTS.contains(&shift) {
+            return Err(format!(
+                "PHOTON deployment at baton age {age} needs GPU layout shift {shift}; kernels exist for shifts {:?}",
+                Self::GPU_SHIFTS
+            ));
+        }
+        Ok(Self { shift })
+    }
+
     /// Returns the layout of a serialized mining transaction of `len` bytes.
     pub fn for_tx_len(len: usize) -> Result<Self, String> {
         let shift = len
             .checked_sub(Self::BASE.tx_bytes())
-            .filter(|shift| *shift <= Self::MAX_SHIFT)
+            .filter(|shift| Self::GPU_SHIFTS.contains(shift))
             .ok_or_else(|| {
-                format!("PHOTON mining transaction is {len} bytes; expected 615..=618")
+                format!(
+                    "PHOTON mining transaction is {len} bytes; GPU layouts are {:?}",
+                    Self::GPU_SHIFTS.map(|shift| 615 + shift)
+                )
             })?;
         Ok(Self { shift })
+    }
+
+    /// This layout's position in [`Self::GPU_SHIFTS`], which indexes its kernels.
+    pub fn kernel_index(self) -> usize {
+        Self::GPU_SHIFTS
+            .iter()
+            .position(|shift| *shift == self.shift)
+            .expect("layouts are constructed only for GPU shifts")
     }
 
     /// Bytes the age push adds beyond the one-byte reference layout.
@@ -314,6 +383,50 @@ pub fn require_covenant_hash_preimage(
     Ok(())
 }
 
+/// Moves `j` tokens from the reward back to the baton while preserving the
+/// covenant's fixed nine-byte CompactSize amount serialization.
+pub fn t2_reward_amount(
+    contract_token_amount: u128,
+    reward_amount: u128,
+    j: u16,
+) -> Result<u128, String> {
+    let moved = reward_amount
+        .checked_sub(u128::from(j))
+        .ok_or("T2 adjustment exceeds the reward")?;
+    require_covenant_hash_preimage(contract_token_amount, moved)?;
+    Ok(moved)
+}
+
+/// Reads the reward in a PHOTON parent, checking T2's bounded, conserved
+/// amount change before the caller reconstructs the full signed transaction.
+pub fn t2_parent_reward_amount(
+    parent: &[u8],
+    contract_token_amount: u128,
+    base_reward: u128,
+) -> Result<u128, String> {
+    let shift = PhotonLayout::for_tx_len(parent.len())?.shift();
+    if parent[490 + shift] != 0xff || parent[577 + shift] != 0xff {
+        return Err("T2 parent token amount markers are not 8-byte CompactSize".into());
+    }
+    let baton = u128::from(u64::from_le_bytes(
+        parent[491 + shift..499 + shift].try_into().unwrap(),
+    ));
+    let reward = u128::from(u64::from_le_bytes(
+        parent[578 + shift..586 + shift].try_into().unwrap(),
+    ));
+    if baton.checked_add(reward) != Some(contract_token_amount) {
+        return Err("T2 parent does not conserve the job token supply".into());
+    }
+    let j = base_reward
+        .checked_sub(reward)
+        .ok_or("T2 parent reward exceeds the job reward")?;
+    let j = u16::try_from(j).map_err(|_| "T2 parent reward adjustment exceeds 65535")?;
+    if t2_reward_amount(contract_token_amount, base_reward, j)? != reward {
+        return Err("T2 parent reward adjustment is invalid".into());
+    }
+    Ok(reward)
+}
+
 /// Inputs for the reference single-payout PHOTON template (2 outputs).
 pub struct TemplateParams {
     pub prev_tx_hash_hex: String,
@@ -329,14 +442,45 @@ pub struct TemplateParams {
     pub payout_locking: Vec<u8>,
 }
 
-/// Reference layout from miner.js `buildPhotonTemplateBytes` (single reward output).
+/// Builds a template with GPU layout `shift` for kernel tests: the v0
+/// reference contract for shifts 0..=3 and the v3.2 contract for 14..=16.
+#[cfg(test)]
+pub fn template_for_shift(shift: usize, params: impl Fn(u32) -> TemplateParams) -> Vec<u8> {
+    let (deployment, age) = match shift {
+        0 => (&MAINNET_V0_PHOTON, 10),
+        1 => (&MAINNET_V0_PHOTON, 17),
+        2 => (&MAINNET_V0_PHOTON, 128),
+        3 => (&MAINNET_V0_PHOTON, 32_768),
+        14 => (&crate::protocol::MAINNET_PHOTON, 10),
+        15 => (&crate::protocol::MAINNET_PHOTON, 17),
+        16 => (&crate::protocol::MAINNET_PHOTON, 128),
+        _ => panic!("no GPU kernels for layout shift {shift}"),
+    };
+    let tx = build_photon_template_bytes_for_deployment(&params(age), deployment).unwrap();
+    assert_eq!(PhotonLayout::for_tx_len(tx.len()).unwrap().shift(), shift);
+    tx
+}
+
+/// Reference layout from miner.js `buildPhotonTemplateBytes` (single reward
+/// output) for the v0 reference vectors.
+#[cfg(test)]
 pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String> {
+    build_photon_template_bytes_for_deployment(p, &MAINNET_V0_PHOTON)
+}
+
+/// Builds a PHOTON parent for its selected contract deployment.
+pub fn build_photon_template_bytes_for_deployment(
+    p: &TemplateParams,
+    deployment: &PhotonDeployment,
+) -> Result<Vec<u8>, String> {
+    deployment.verify()?;
+    let layout = PhotonLayout::for_age_with_deployment(p.age, deployment)?;
     let public_key = parse_hex(&p.public_key_hex)?;
     let target = parse_hex(&p.target_hex)?;
     let signature = parse_hex(&p.signature_hex)?;
-    let redeem_script = parse_hex(REDEEM_SCRIPT_HEX.trim())?;
-    let category = parse_hex(MAINNET_CATEGORY_HEX)?;
-    let covenant_lock = parse_hex(COVENANT_LOCKING_BYTECODE_HEX)?;
+    let redeem_script = parse_hex(deployment.redeem_script_hex.trim())?;
+    let category = parse_hex(deployment.category_hex)?;
+    let covenant_lock = parse_hex(deployment.covenant_lock_hex)?;
 
     if public_key.len() != 33 {
         return Err("Compressed public key must be 33 bytes.".into());
@@ -347,22 +491,18 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
     if signature.len() != 64 {
         return Err("PHOTON commitment signature must be 64 bytes.".into());
     }
-    if redeem_script.len() != 259 {
-        return Err(format!(
-            "PHOTON redeem script must be 259 bytes (got {}).",
-            redeem_script.len()
-        ));
-    }
     if p.payout_locking.len() != 25 {
         return Err("Payout locking bytecode must be P2PKH (25 bytes).".into());
     }
 
     let age_push = encode_positive_script_number_push(p.age)?;
+    let redeem_len = u16::try_from(redeem_script.len())
+        .map_err(|_| "PHOTON redeem script exceeds PUSHDATA2 length")?;
     let input_script = concat(&[
         &[0x21],
         &public_key,
         &age_push,
-        &[0x4d, 0x03, 0x01],
+        &[0x4d, redeem_len as u8, (redeem_len >> 8) as u8],
         &redeem_script,
     ]);
 
@@ -398,7 +538,7 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
         return Err("prev tx hash must be 32 bytes".into());
     }
 
-    let max_baton_decrease_sats = crate::protocol::photon_single_input_max_baton_decrease_sats()?;
+    let max_baton_decrease_sats = deployment.single_input_max_baton_decrease_sats()?;
     let baton_sats = p
         .contract_value_sats
         .checked_sub(max_baton_decrease_sats)
@@ -420,7 +560,52 @@ pub fn build_photon_template_bytes(p: &TemplateParams) -> Result<Vec<u8>, String
     tx.extend_from_slice(&compact_uint(output1.len() as u64));
     tx.extend_from_slice(&output1);
     tx.extend_from_slice(&u32_le(0)); // locktime
+    if tx.len() != layout.tx_bytes() {
+        return Err(format!(
+            "PHOTON deployment serialized {} bytes; expected {} at age {}",
+            tx.len(),
+            layout.tx_bytes(),
+            p.age
+        ));
+    }
     Ok(tx)
+}
+
+/// Changes the unsigned BCH value of the miner's P2PKH output.
+/// The range respects the 675-satoshi token dust floor and the default
+/// 1 sat/byte relay fee for this fixed two-output PHOTON layout.
+pub fn set_payout_value_sats(tx: &mut [u8], sats: u16) -> Result<(), String> {
+    let layout = PhotonLayout::for_tx_len(tx.len())?;
+    let max_sats = 1_500usize
+        .checked_sub(tx.len())
+        .ok_or("PHOTON transaction exceeds its 1500-satoshi output budget")?;
+    if sats < 675 || usize::from(sats) > max_sats {
+        return Err(format!(
+            "payout BCH value {sats} is outside 675..={max_sats}"
+        ));
+    }
+    let offset = 534 + layout.shift();
+    if tx[offset..offset + 8] != 700u64.to_le_bytes() {
+        return Err("PHOTON payout BCH value is not the expected 700 satoshis".into());
+    }
+    tx[offset..offset + 8].copy_from_slice(&u64::from(sats).to_le_bytes());
+    Ok(())
+}
+
+/// Reads and bounds the unsigned BCH payout value in a PHOTON parent.
+pub fn payout_value_sats(tx: &[u8]) -> Result<u16, String> {
+    let layout = PhotonLayout::for_tx_len(tx.len())?;
+    let offset = 534 + layout.shift();
+    let sats = u64::from_le_bytes(tx[offset..offset + 8].try_into().unwrap());
+    let max_sats = 1_500usize
+        .checked_sub(tx.len())
+        .ok_or("PHOTON transaction exceeds its 1500-satoshi output budget")?;
+    if sats < 675 || sats > max_sats as u64 {
+        return Err(format!(
+            "PHOTON payout BCH value {sats} is outside relay bounds"
+        ));
+    }
+    u16::try_from(sats).map_err(|_| "PHOTON payout BCH value exceeds u16".into())
 }
 
 /// Historical 3-output 98/2 experiment, now fail-closed because the covenant
@@ -446,7 +631,6 @@ pub fn win_tx_preview_lines(
     let miner_lock = cashaddr_to_p2pkh_locking(miner_payout)?;
     let (miner_tokens, donation_tokens) =
         crate::config::RuntimeConfig::split_reward(job_reward_raw);
-    let donation_percent = crate::config::DONATION_BPS / 100;
     Ok(vec![
         "win-tx preview (unsigned two-output parent; no mining or broadcast):".into(),
         format!(
@@ -454,10 +638,7 @@ pub fn win_tx_preview_lines(
             miner_lock.len()
         ),
         "  this template has no donation output".into(),
-        format!(
-            "  mine settlement pays FT={miner_tokens} -> {miner_payout} and FT={donation_tokens} ({donation_percent}%) -> {}",
-            crate::config::DONATION_ADDRESS
-        ),
+        format!("  mine settlement pays FT={miner_tokens} -> {miner_payout}; total fee FT={donation_tokens}"),
     ])
 }
 
@@ -504,14 +685,74 @@ pub struct ReferenceJobContext {
     pub reward_raw: u128,
 }
 
-/// Build the proven two-output candidate and arm it only if both Schnorr and
-/// PHOTON proof-of-work checks pass.
+/// Rebuilds and validates a signed v0 reference-vector parent.
+#[cfg(test)]
 pub fn apply_reference_signature(
     job: &ReferenceJobContext,
     miner_payout: &str,
     public_key_hex: &str,
     nonce: u32,
     signature_hex: &str,
+) -> Result<Vec<u8>, String> {
+    apply_reference_signature_for_deployment(
+        job,
+        miner_payout,
+        public_key_hex,
+        nonce,
+        signature_hex,
+        &MAINNET_V0_PHOTON,
+    )
+}
+
+/// Rebuilds and validates a signed parent against its selected covenant.
+pub fn apply_reference_signature_for_deployment(
+    job: &ReferenceJobContext,
+    miner_payout: &str,
+    public_key_hex: &str,
+    nonce: u32,
+    signature_hex: &str,
+    deployment: &PhotonDeployment,
+) -> Result<Vec<u8>, String> {
+    apply_reference_signature_with_payout_sats_for_deployment(
+        job,
+        miner_payout,
+        public_key_hex,
+        nonce,
+        signature_hex,
+        None,
+        deployment,
+    )
+}
+
+/// Rebuilds a V-coordinate winner with its exact unsigned BCH payout value.
+#[cfg(test)]
+pub fn apply_reference_signature_with_payout_sats(
+    job: &ReferenceJobContext,
+    miner_payout: &str,
+    public_key_hex: &str,
+    nonce: u32,
+    signature_hex: &str,
+    payout_sats: Option<u16>,
+) -> Result<Vec<u8>, String> {
+    apply_reference_signature_with_payout_sats_for_deployment(
+        job,
+        miner_payout,
+        public_key_hex,
+        nonce,
+        signature_hex,
+        payout_sats,
+        &MAINNET_V0_PHOTON,
+    )
+}
+
+fn apply_reference_signature_with_payout_sats_for_deployment(
+    job: &ReferenceJobContext,
+    miner_payout: &str,
+    public_key_hex: &str,
+    nonce: u32,
+    signature_hex: &str,
+    payout_sats: Option<u16>,
+    deployment: &PhotonDeployment,
 ) -> Result<Vec<u8>, String> {
     let sig = parse_hex(signature_hex)?;
     if sig.len() != 64 {
@@ -540,10 +781,13 @@ pub fn apply_reference_signature(
         reward_amount: job.reward_raw,
         payout_locking: payout,
     };
-    let tx = build_photon_template_bytes(&p)?;
+    let mut tx = build_photon_template_bytes_for_deployment(&p, deployment)?;
+    if let Some(sats) = payout_sats {
+        set_payout_value_sats(&mut tx, sats)?;
+    }
     let target = crate::search::parse_hex32(&job.target_le_hex)?;
     let digest = crate::search::hash256(&tx);
-    if !crate::search::meets_target_le(&digest, &target) {
+    if !crate::search::meets_target_le_for_rule(&digest, &target, deployment.proof_rule) {
         return Err(format!(
             "candidate HASH256 {} does not meet PHOTON target {}",
             hex::encode(digest),
@@ -553,10 +797,11 @@ pub fn apply_reference_signature(
     Ok(tx)
 }
 
-/// Build the authoritative two-output layout with a zero-signature placeholder.
-pub fn build_unsigned_reference_preview(
+/// Builds an unsigned parent preview for the selected contract deployment.
+pub fn build_unsigned_reference_preview_for_deployment(
     job: &ReferenceJobContext,
     miner_payout: &str,
+    deployment: &PhotonDeployment,
 ) -> Result<Vec<u8>, String> {
     let payout = cashaddr_to_p2pkh_locking(miner_payout)?;
     // Placeholder compressed pubkey (secp order-2 style) + zero Schnorr — not a valid win.
@@ -573,12 +818,191 @@ pub fn build_unsigned_reference_preview(
         reward_amount: job.reward_raw,
         payout_locking: payout,
     };
-    build_photon_template_bytes(&p)
+    build_photon_template_bytes_for_deployment(&p, deployment)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chipnet_parent_matches_a_confirmed_on_chain_mining_transaction() {
+        // The author's v3.2 claim, confirmed on Chipnet as txid
+        // 00004cd0bbd7f5ce7fdcb82ab03cd100c05c98b2176a5947f0c23ecef246b4b5.
+        let confirmed = hex::decode(
+            include_str!("../reference/photon_v32_chipnet_confirmed_parent.hex").trim(),
+        )
+        .unwrap();
+        let commitment = "7c80000035d7926195893cea6470b56e14ef99b96cff15680c0cdcb725b3e62afbb90000b4ebbbcc64b1936cc0bdda156ff28db5093f7838ec4f11f4106bc6b1c949c5f51d2e823ecdc165707a567568d2601e51b1b0bf9c5df9e3edd13392214487845b";
+        let mut built = build_photon_template_bytes_for_deployment(
+            &TemplateParams {
+                prev_tx_hash_hex:
+                    "000025616fe32ac72a5ebd6fc6443bf2f606526b0296696fca6fbe2789ed0e35".into(),
+                prev_index: 0,
+                age: 8,
+                public_key_hex:
+                    "03f28c4f56345219a9ef58cfbd924b799c1fe77f7e55cc1a3ada50aa1038c08134".into(),
+                target_hex: commitment[8..72].into(),
+                signature_hex: commitment[72..].into(),
+                nonce: 0x807c,
+                contract_value_sats: 48_635_000,
+                contract_token_amount: 2_095_454_920_205_042,
+                reward_amount: 4_989_178_380,
+                payout_locking: hex::decode("76a914d337f66c1b16a6c0d84f35b920c8ad4df53e37f188ac")
+                    .unwrap(),
+            },
+            &crate::protocol::CHIPNET_PHOTON,
+        )
+        .unwrap();
+        // The author's miner pays 800 sats to the reward output; the
+        // covenant leaves that value to the network's dust rule.
+        set_payout_value_sats(&mut built, 800).unwrap();
+        assert_eq!(built, confirmed);
+        assert_eq!(
+            PhotonLayout::for_age_with_deployment(8, &crate::protocol::CHIPNET_PHOTON).unwrap(),
+            PhotonLayout::for_tx_len(built.len()).unwrap()
+        );
+        assert_eq!(
+            crate::reward::transaction_id(&built),
+            "00004cd0bbd7f5ce7fdcb82ab03cd100c05c98b2176a5947f0c23ecef246b4b5"
+        );
+    }
+
+    #[test]
+    fn v3_layout_tracks_the_longer_redeem_script_at_every_age() {
+        for deployment in [
+            crate::protocol::CHIPNET_PHOTON,
+            crate::protocol::MAINNET_PHOTON,
+        ] {
+            for (age, bytes, shift) in [
+                (0, 629, 14),
+                (16, 629, 14),
+                (17, 630, 15),
+                (127, 630, 15),
+                (128, 631, 16),
+                (32_767, 631, 16),
+            ] {
+                let layout = PhotonLayout::for_age_with_deployment(age, &deployment).unwrap();
+                assert_eq!(layout.tx_bytes(), bytes);
+                assert_eq!(layout.shift(), shift);
+            }
+            // Age 32768 and older would need an eleventh SHA-256 block.
+            let error = PhotonLayout::for_age_with_deployment(32_768, &deployment).unwrap_err();
+            assert!(error.contains("shift 17"), "{error}");
+            assert!(PhotonLayout::for_age_with_deployment(65_535, &deployment).is_err());
+        }
+        assert_eq!(
+            PhotonLayout::for_age_with_deployment(128, &crate::protocol::MAINNET_V0_PHOTON)
+                .unwrap()
+                .shift(),
+            2
+        );
+    }
+
+    #[test]
+    fn chipnet_signed_parent_reconstruction_uses_its_redeem_script_and_hash_rule() {
+        let sk = [0x11; 32];
+        let public_key = crate::crypto::compressed_pubkey(&sk).unwrap();
+        let payout = crate::config::CHIPNET_DONATION_ADDRESS;
+        let job = ReferenceJobContext {
+            prev_txid: "aa".repeat(32),
+            prev_vout: 0,
+            age: 38,
+            target_le_hex: format!("{}7f", "ff".repeat(31)),
+            contract_value_sats: 49_080_500,
+            contract_token_amount: 2_096_937_231_989_870,
+            reward_raw: 4_992_707_694,
+        };
+        let target = crate::search::parse_hex32(&job.target_le_hex).unwrap();
+        for nonce in 0..32 {
+            let message = photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+            let signature = crate::crypto::bch_schnorr_sign(&sk, &message).unwrap();
+            let raw = build_photon_template_bytes_for_deployment(
+                &TemplateParams {
+                    prev_tx_hash_hex: job.prev_txid.clone(),
+                    prev_index: job.prev_vout,
+                    age: job.age,
+                    public_key_hex: hex::encode(public_key),
+                    target_hex: job.target_le_hex.clone(),
+                    signature_hex: hex::encode(signature),
+                    nonce,
+                    contract_value_sats: job.contract_value_sats,
+                    contract_token_amount: job.contract_token_amount,
+                    reward_amount: job.reward_raw,
+                    payout_locking: cashaddr_to_p2pkh_locking(payout).unwrap(),
+                },
+                &crate::protocol::CHIPNET_PHOTON,
+            )
+            .unwrap();
+            if crate::search::meets_target_le_for_rule(
+                &crate::search::hash256(&raw),
+                &target,
+                crate::protocol::ProofRule::Positive,
+            ) {
+                assert_eq!(
+                    apply_reference_signature_for_deployment(
+                        &job,
+                        payout,
+                        &hex::encode(public_key),
+                        nonce,
+                        &hex::encode(signature),
+                        &crate::protocol::CHIPNET_PHOTON,
+                    )
+                    .unwrap(),
+                    raw
+                );
+                return;
+            }
+        }
+        panic!("no positive chipnet HASH256 found in 32 signed nonces");
+    }
+
+    #[test]
+    fn t2_reward_preserves_token_supply_and_fixed_width_encoding() {
+        let total = 2_099_905_002_035_715u128;
+        let reward = 4_999_773_813u128;
+        for j in [0, 1, 255, 65_535] {
+            let moved = t2_reward_amount(total, reward, j).unwrap();
+            assert_eq!(moved, reward - u128::from(j));
+            assert_eq!(moved + (total - moved), total);
+            assert_eq!(compact_token_amount(moved).unwrap().len(), 9);
+            assert_eq!(compact_token_amount(total - moved).unwrap().len(), 9);
+        }
+        assert!(t2_reward_amount(total, u128::from(u32::MAX) + 1, 1).is_err());
+        assert!(t2_reward_amount(u128::from(u32::MAX) + 1, 1, 0).is_err());
+    }
+
+    #[test]
+    fn t2_parent_reward_reads_only_bounded_supply_preserving_amounts() {
+        let total = 2_099_905_002_035_715u128;
+        let reward = 4_999_773_813u128;
+        let payout =
+            cashaddr_to_p2pkh_locking("zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3").unwrap();
+        for age in [10, 17, 128, 32_768] {
+            let mut raw = build_photon_template_bytes(&TemplateParams {
+                prev_tx_hash_hex: "aa".repeat(32),
+                prev_index: 0,
+                age,
+                public_key_hex:
+                    "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into(),
+                target_hex: "ff".repeat(32),
+                signature_hex: "00".repeat(64),
+                nonce: 0,
+                contract_value_sats: 15_971_500,
+                contract_token_amount: total,
+                reward_amount: reward - 65_535,
+                payout_locking: payout.clone(),
+            })
+            .unwrap();
+            assert_eq!(
+                t2_parent_reward_amount(&raw, total, reward).unwrap(),
+                reward - 65_535
+            );
+            let shift = PhotonLayout::for_age(age).unwrap().shift();
+            raw[578 + shift] ^= 1;
+            assert!(t2_parent_reward_amount(&raw, total, reward).is_err());
+        }
+    }
 
     #[test]
     fn decode_known_vector() {
@@ -592,6 +1016,48 @@ mod tests {
     }
 
     #[test]
+    fn chipnet_p2pkh_cashaddr_encoder_round_trips() {
+        let hash = [0x42u8; 20];
+        let address =
+            p2pkh_hash_to_cashaddr_for_network(&hash, crate::config::MiningNetwork::Chipnet)
+                .unwrap();
+        assert!(address.starts_with("bchtest:"));
+        assert_eq!(
+            cashaddr_to_p2pkh_locking(&address).unwrap(),
+            [&[0x76, 0xa9, 0x14][..], &hash, &[0x88, 0xac]].concat(),
+        );
+        assert_eq!(
+            p2pkh_hash_to_cashaddr(&hash).unwrap(),
+            p2pkh_hash_to_cashaddr_for_network(&hash, crate::config::MiningNetwork::Mainnet,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn token_aware_payout_keeps_its_type_when_converted_to_chipnet() {
+        let mainnet = "bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3";
+        let locking = cashaddr_to_p2pkh_locking(mainnet).unwrap();
+        let hash: [u8; 20] = locking[3..23].try_into().unwrap();
+        assert_eq!(
+            token_p2pkh_hash_to_cashaddr_for_network(&hash, crate::config::MiningNetwork::Mainnet,)
+                .unwrap(),
+            mainnet,
+        );
+        let chipnet =
+            token_p2pkh_hash_to_cashaddr_for_network(&hash, crate::config::MiningNetwork::Chipnet)
+                .unwrap();
+        assert!(chipnet.starts_with("bchtest:z"));
+        assert_eq!(cashaddr_to_p2pkh_locking(&chipnet).unwrap(), locking);
+        let mut invalid = chipnet.into_bytes();
+        *invalid.last_mut().unwrap() = if *invalid.last().unwrap() == b'q' {
+            b'p'
+        } else {
+            b'q'
+        };
+        assert!(cashaddr_to_p2pkh_locking(&String::from_utf8(invalid).unwrap()).is_err());
+    }
+
+    #[test]
     fn donation_address_decodes() {
         let lock = cashaddr_to_p2pkh_locking(DONATION_ADDRESS).expect("donation");
         assert_eq!(lock.len(), 25);
@@ -600,7 +1066,7 @@ mod tests {
 
     #[test]
     fn serializer_matches_reference_vector() {
-        let expected = crate::protocol::MINING_VECTOR_HEX.trim();
+        let expected = include_str!("../reference/photon_vector_tx.hex").trim();
         let payout = hex::decode("76a9146e0810ceea13412b73feb41566a3d2d0ce54e10188ac").unwrap();
         let p = TemplateParams {
             prev_tx_hash_hex: "000000124712ae4765fe9789372faebca19c99cc1d59f43df2508bf5c42ea042"
@@ -665,7 +1131,9 @@ mod tests {
         }
         assert!(PhotonLayout::for_age(65_535).is_err());
         assert!(PhotonLayout::for_tx_len(614).is_err());
-        assert!(PhotonLayout::for_tx_len(619).is_err());
+        for len in [619, 628, 632] {
+            assert!(PhotonLayout::for_tx_len(len).is_err(), "{len}");
+        }
     }
 
     #[test]
@@ -726,13 +1194,31 @@ mod tests {
         assert_ne!(miner_tokens, reward);
         assert!(text.contains(&format!("FT={reward}")));
         assert!(text.contains(&format!("FT={miner_tokens} -> {payout}")));
-        assert!(text.contains(&format!(
-            "FT={donation_tokens} ({}%) -> {}",
-            crate::config::DONATION_BPS / 100,
-            crate::config::DONATION_ADDRESS
-        )));
+        assert!(text.contains(&format!("total fee FT={donation_tokens}")));
         assert!(text.contains("this template has no donation output"));
         assert!(!text.contains("10000 bps"));
         print_win_tx_preview(reward, payout, None).expect("preview prints the same report");
+    }
+    #[test]
+    fn payout_value_coordinate_changes_only_output_satoshis() {
+        let original =
+            hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
+        let mut candidate = original.clone();
+        set_payout_value_sats(&mut candidate, 684).unwrap();
+        assert_eq!(payout_value_sats(&candidate).unwrap(), 684);
+        assert_eq!(&candidate[534..542], &684u64.to_le_bytes());
+        assert_eq!(&candidate[586..611], &original[586..611]);
+        assert_eq!(&candidate[491..499], &original[491..499]);
+        assert_eq!(&candidate[578..586], &original[578..586]);
+        assert_eq!(
+            candidate
+                .iter()
+                .zip(&original)
+                .filter(|(a, b)| a != b)
+                .count(),
+            1
+        );
+        assert!(set_payout_value_sats(&mut candidate, 674).is_err());
+        assert!(set_payout_value_sats(&mut candidate, 886).is_err());
     }
 }
