@@ -1569,29 +1569,29 @@ mod tests {
     }
 
     #[test]
-    fn release_workflow_prepares_pickaxe_miner_v0_0_2() {
+    fn release_workflow_prepares_pickaxe_miner_v0_0_3() {
         let workflow = include_str!("../.github/workflows/release.yml");
         let version = cargo_package_version(include_str!("../Cargo.toml"));
-        assert_eq!(version, "0.0.2");
+        assert_eq!(version, "0.0.3");
 
         let pattern = release_tag_pattern(workflow);
         assert!(
-            release_tag_matches(&pattern, "pickaxe-miner-v0.0.2"),
+            release_tag_matches(&pattern, "pickaxe-miner-v0.0.3"),
             "{pattern}"
         );
-        assert!(!release_tag_matches(&pattern, "v0.0.2"), "{pattern}");
-        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.2-rc.1"));
+        assert!(!release_tag_matches(&pattern, "v0.0.3"), "{pattern}");
+        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.3-rc.1"));
         assert!(workflow.contains("pickaxe-miner-v*.*.*"));
         assert!(!workflow.lines().any(|line| line.trim() == "- \"v*.*.*\""));
         assert!(workflow.contains("if [[ \"pickaxe-miner-v${version}\" != \"${TAG}\" ]]; then"));
         let tag = format!("pickaxe-miner-v{version}");
-        assert_eq!(tag, "pickaxe-miner-v0.0.2");
+        assert_eq!(tag, "pickaxe-miner-v0.0.3");
         assert_ne!(tag, format!("v{version}"));
 
         assert!(workflow.contains("release_title=\"Pickaxe Miner v${version}\""));
         assert!(workflow.contains("--title \"${release_title}\""));
         let title = format!("Pickaxe Miner v{version}");
-        assert_eq!(title, "Pickaxe Miner v0.0.2");
+        assert_eq!(title, "Pickaxe Miner v0.0.3");
 
         assert!(workflow.contains("pickaxe-miner-v${version}-linux-x86_64"));
         assert!(workflow.contains("pickaxe-miner-v$version-windows-x86_64"));
