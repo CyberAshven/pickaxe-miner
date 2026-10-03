@@ -20,3 +20,18 @@ test('WebSocket framing preserves notifications, matches IDs, and rejects server
   assert.equal(rpc.pending.size, 0);
   assert.deepEqual(sent.map(s => s.id), [1, 2, 3]);
 });
+
+test('raw RPC responses retain integers beyond JavaScript precision across frames', async () => {
+  const socket = { readyState: 1, send() {}, close() {} };
+  const rpc = new Electrum(socket);
+  const response = '{"id":1,"result":{"amount":9223372036854775807}}';
+  const request = rpc.rpcRaw('blockchain.scripthash.listunspent');
+  socket.onmessage({ data: response.slice(0, 25) });
+  socket.onmessage({ data: response.slice(25) + '\n' });
+  assert.equal(await request, response);
+  const unframed = rpc.rpcRaw('blockchain.scripthash.listunspent');
+  const second = response.replace('"id":1', '"id":2');
+  socket.onmessage({ data: second });
+  assert.equal(await unframed, second);
+  rpc.close();
+});

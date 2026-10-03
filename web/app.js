@@ -1,5 +1,6 @@
 import init, { BrowserMiner, browser_config } from './pkg/pickaxe_miner.js';
 import { Electrum } from './rpc.js';
+import { resolveSubmission } from './submission.js';
 
 const $ = id => document.getElementById(id);
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -45,45 +46,29 @@ async function run() {
     throw lastError || new Error('No server available');
   }
   async function snapshot() {
-    const before = await session.rpc('blockchain.headers.subscribe');
-    const unspent = await session.rpc('blockchain.scripthash.listunspent', [config.scriptHash, 'include_tokens']);
-    const after = await session.rpc('blockchain.headers.subscribe');
+    const before = await session.rpcRaw('blockchain.headers.subscribe');
+    const unspent = await session.rpcRaw('blockchain.scripthash.listunspent', [config.scriptHash, 'include_tokens']);
+    const after = await session.rpcRaw('blockchain.headers.subscribe');
     if (performance.now() - feeChecked >= 30000 || !feeChecked) {
       try {
-        const info = await session.rpc('mempool.get_info');
-        if (!Object.hasOwn(info, 'mempoolminfee')) throw new Error('Server omitted dynamic fee');
-        fee = info.mempoolminfee;
+        fee = await session.rpcRaw('mempool.get_info');
       } catch (error) {
         if (error.code !== -32601) throw error;
-        fee = await session.rpc('blockchain.relayfee');
+        fee = await session.rpcRaw('blockchain.relayfee');
       }
       feeChecked = performance.now();
     }
-    const context = miner.set_snapshot(JSON.stringify(before), JSON.stringify(unspent), JSON.stringify(after), JSON.stringify(fee));
+    const context = miner.set_snapshot(before, unspent, after, fee);
     lastSnapshot = performance.now();
-    return context;
+    return { context, baton: miner.baton() };
   }
   async function settle(pending) {
-    // Never replace an uncertain submission with another spend of its baton.
-    try {
-      const known = await session.rpc('blockchain.transaction.get', [pending.txid]);
-      if (typeof known === 'string' && known.toLowerCase() === pending.transaction) {
-        localStorage.removeItem(journal); wins++; log(`Reward accepted: ${pending.txid}`); return;
-      }
-    } catch (error) { if (error.code == null) throw error; }
-    if (await snapshot() !== pending.context) {
-      localStorage.removeItem(journal); log('Previous work is stale; using the current baton.'); return;
+    const result = await resolveSubmission({ session, snapshot, pending, stopped: () => stopping, wait, progress: status });
+    if (result !== 'pending') {
+      localStorage.removeItem(journal);
+      if (result === 'accepted') { wins++; log(`Reward accepted: ${pending.txid}`); }
+      else log('Previous work is stale; using the current baton.');
     }
-    const txid = await session.rpc('blockchain.transaction.broadcast', [pending.transaction]);
-    if (txid !== pending.txid) throw new Error('Broadcast returned a different transaction ID');
-    localStorage.removeItem(journal); wins++; log(`Reward accepted: ${txid}`);
-    // Wait for the server's authoritative successor before mining again.
-    for (let i = 0; i < 30; i++) {
-      if (await snapshot() !== pending.context) return;
-      if (stopping) return;
-      status('Waiting for the accepted baton update…'); await wait(1000);
-    }
-    throw new Error('Server has not indexed the accepted baton yet; try another server.');
   }
   try {
     status('Loading GPU table and compiling WebGPU…');
@@ -105,7 +90,7 @@ async function run() {
         const elapsed = performance.now() - batchStart;
         candidates += result.candidates;
         $('stats').textContent = `Active GPU ${(result.candidates / Math.max(elapsed, 1) / 1000).toFixed(2)} MH/s · wall average ${(candidates / (performance.now() - started) / 1000).toFixed(2)} MH/s\n${wins} accepted · ${Math.floor((performance.now() - started) / 1000)}s elapsed`;
-        if (result.transaction && await snapshot() === result.context) {
+        if (result.transaction && (await snapshot()).context === result.context) {
           localStorage.setItem(journal, JSON.stringify(result));
           await settle(result);
         }

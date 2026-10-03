@@ -69,7 +69,7 @@ Build the browser bundle (Rust, Python 3.11+, Clang and Node.js 24):
 rustup target add wasm32-unknown-unknown
 cargo install --locked wasm-bindgen-cli --version 0.2.128
 python tools/build-browser.py
-node --test web/rpc.test.mjs
+node --test web/rpc.test.mjs web/submission.test.mjs
 node web/smoke.mjs
 python -m http.server 8080 --bind 127.0.0.1 --directory dist/web
 ```

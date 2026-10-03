@@ -70,7 +70,7 @@ jobs:
       - name: Check browser engine and transport
         run: |
           cargo clippy --locked --lib --no-default-features --features portable-wgpu --target wasm32-unknown-unknown -- -D warnings
-          node --test web/rpc.test.mjs
+          node --test web/rpc.test.mjs web/submission.test.mjs
           python3 tools/build-browser.py
           node web/smoke.mjs
       - name: Package static browser application

@@ -26,7 +26,7 @@ def main():
     target = Path(json.loads(metadata)["target_directory"])
     run("wasm-bindgen", str(target / "wasm32-unknown-unknown/release/pickaxe_miner.wasm"),
         "--target", "web", "--out-dir", str(output / "pkg"))
-    for name in ("index.html", "style.css", "app.js", "rpc.js"):
+    for name in ("index.html", "style.css", "app.js", "rpc.js", "submission.js"):
         shutil.copyfile(ROOT / "web" / name, output / name)
     shutil.copyfile(ROOT / "LICENSE", output / "LICENSE")
     (output / "SOURCE_COMMIT.txt").write_text(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True))

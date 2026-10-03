@@ -83,7 +83,7 @@ impl BrowserMiner {
         })
     }
 
-    /// The JS adapter supplies raw JSON, preserving integral server amounts.
+    /// Parse complete RPC responses in Rust so JavaScript never rounds token amounts.
     pub fn set_snapshot(
         &mut self,
         before: &str,
@@ -91,7 +91,13 @@ impl BrowserMiner {
         after: &str,
         relay_fee: &str,
     ) -> Result<String, JsValue> {
-        let parse = |s| serde_json::from_str::<Value>(s).map_err(error);
+        let parse = |s| -> Result<Value, JsValue> {
+            serde_json::from_str::<Value>(s)
+                .map_err(error)?
+                .get("result")
+                .cloned()
+                .ok_or_else(|| error("RPC response omitted its result"))
+        };
         let before = parse(before)?;
         let after = parse(after)?;
         stable_fulcrum_tip_hash(&before, &after).map_err(error)?;
@@ -103,7 +109,14 @@ impl BrowserMiner {
             MiningToken::Photon.photon_deployment(self.network),
         )
         .map_err(error)?;
-        live.relay_fee_sats_per_kb = fee::bch_value_to_sats(&parse(relay_fee)?)
+        let fees = parse(relay_fee)?;
+        let fee = if fees.is_object() {
+            fees.get("mempoolminfee")
+                .ok_or_else(|| error("Server omitted dynamic fee"))?
+        } else {
+            &fees
+        };
+        live.relay_fee_sats_per_kb = fee::bch_value_to_sats(fee)
             .map_err(error)?
             .max(reward::MIN_RELAY_FEE_SATS_PER_KB);
         if self.live.as_ref() != Some(&live) || self.prepared.is_none() {
@@ -112,6 +125,14 @@ impl BrowserMiner {
             self.rotate()?;
         }
         self.context()
+    }
+
+    pub fn baton(&self) -> Result<String, JsValue> {
+        let live = self
+            .live
+            .as_ref()
+            .ok_or_else(|| error("waiting for network state"))?;
+        Ok(format!("{}:{}", live.baton_txid, live.baton_vout))
     }
 
     pub fn context(&self) -> Result<String, JsValue> {
@@ -151,7 +172,9 @@ impl BrowserMiner {
             .map_err(error)?;
         self.nonce += u64::from(result.candidates);
         self.schedule.record(result.candidates).map_err(error)?;
-        let mut response = json!({"candidates": result.candidates, "context": self.context()?});
+        let mut response = json!({
+            "candidates": result.candidates, "context": self.context()?, "baton": self.baton()?,
+        });
         if let Some(winner) = result.winners.first() {
             let verified = verify_gpu_winner(
                 self.prepared
