@@ -1899,6 +1899,8 @@ mod tests {
             let policy = crate::config::MiningToken::Photon.fee_policy(network);
             let mut job = integration_job(1);
             job.network = network;
+            job.payout_address =
+                crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], network).unwrap();
             job.age = 1;
             job.relay_fee_sats_per_kb = if network == MiningNetwork::Mainnet {
                 1_100

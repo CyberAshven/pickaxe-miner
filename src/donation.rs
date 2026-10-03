@@ -78,7 +78,7 @@ impl Policy {
         self.scheme.validate()?;
         let [a, b] = self.addresses;
         Ok([
-            config::reprefix_p2pkh_payout(miner, network)?,
+            config::validate_payout_address(network, miner)?,
             config::reprefix_p2pkh_payout(a, network)?,
             config::reprefix_p2pkh_payout(b, network)?,
         ])

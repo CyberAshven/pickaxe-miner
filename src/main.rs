@@ -1699,6 +1699,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_rejects_foreign_network_payouts() {
+        for (network, other) in [
+            (
+                config::MiningNetwork::Mainnet,
+                config::MiningNetwork::Chipnet,
+            ),
+            (
+                config::MiningNetwork::Chipnet,
+                config::MiningNetwork::Mainnet,
+            ),
+        ] {
+            let address = tx::p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], other).unwrap();
+            let args = cli::Cli::try_parse_from([
+                "pickaxe",
+                "mine",
+                "--network",
+                network.as_str(),
+                "--address",
+                &address,
+            ])
+            .unwrap();
+            assert!(runtime_config_from_cli(&args).is_err());
+        }
+    }
+
+    #[test]
     fn explicit_cli_values_override_saved_runtime_defaults() {
         let args = cli::Cli::try_parse_from([
             "pickaxe",

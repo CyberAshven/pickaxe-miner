@@ -6,6 +6,11 @@ protocol rules, signatures, independent winner checks, dynamic fee calculations
 and the token's donation policy. The browser uses the same WGSL backend that
 the native portable build runs through Metal on macOS or Vulkan elsewhere.
 
+All platforms share payout validation: Mainnet accepts `bitcoincash:` and Chipnet
+accepts `bchtest:`. Wrong-network addresses, invalid checksums and mixed case are
+rejected before mining. Chipnet and BCH testnets share the `bchtest:` format, so
+an address alone cannot distinguish those test networks.
+
 Backend performance depends on the GPU and driver; Metal and WebGPU do not
 promise CUDA T2 performance.
 

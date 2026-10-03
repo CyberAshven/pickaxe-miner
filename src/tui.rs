@@ -616,7 +616,10 @@ impl SetupFlow {
                     self.status_line = "Enter a payout address first.".into();
                     self.open_settings(SettingsRow::Address);
                 }
-                SettingsRow::Start => return SetupAction::Complete,
+                SettingsRow::Start => match self.config.ensure_mining_supported() {
+                    Ok(()) => return SetupAction::Complete,
+                    Err(error) => self.status_line = error,
+                },
                 SettingsRow::Gpu | SettingsRow::Intensity | SettingsRow::AsicTarget => {
                     self.status_line = "Use Left/Right to change this row.".into();
                 }
@@ -3624,6 +3627,24 @@ mod tests {
         assert_eq!(setup.config.intensity, 90);
         setup.handle_key(key(KeyCode::Esc));
         assert_eq!(setup.step, SetupStep::Profiles);
+    }
+
+    #[test]
+    fn setup_network_change_requires_a_matching_payout_before_start() {
+        let (mut setup, saved) = setup_with_saved_profile();
+        setup.handle_key(key(KeyCode::Enter));
+        setup.step = SetupStep::Network;
+        setup.handle_key(key(KeyCode::Down));
+        assert_eq!(setup.config.network, MiningNetwork::Chipnet);
+        assert_eq!(setup.config.payout_address, saved.payout_address);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert!(setup.status_line.contains("bchtest:"));
+        let chipnet =
+            crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], MiningNetwork::Chipnet)
+                .unwrap();
+        setup.config.set_payout(chipnet).unwrap();
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
     }
 
     #[test]

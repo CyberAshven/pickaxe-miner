@@ -1,5 +1,5 @@
 //! Browser bindings. Protocol, payouts, fees and verification stay in the native library.
-use crate::config::{MiningNetwork, MiningToken, RuntimeConfig};
+use crate::config::{MiningNetwork, MiningToken};
 use crate::donation::{Recipient, Schedule};
 use crate::live_job::{
     live_job_from_fulcrum_values_for_deployment, stable_fulcrum_tip_hash, LiveJob,
@@ -13,6 +13,13 @@ use wasm_bindgen::prelude::*;
 
 fn error(message: impl ToString) -> JsValue {
     JsValue::from_str(&message.to_string())
+}
+
+/// Use the native address checks before downloading GPU data or opening connections.
+#[wasm_bindgen]
+pub fn validate_payout_address(network: &str, address: &str) -> Result<String, JsValue> {
+    let network = MiningNetwork::parse(network).map_err(error)?;
+    crate::config::validate_payout_address(network, address).map_err(error)
 }
 
 #[wasm_bindgen]
@@ -50,16 +57,10 @@ pub struct BrowserMiner {
 impl BrowserMiner {
     pub async fn create(network: &str, address: &str, table: Vec<u8>) -> Result<Self, JsValue> {
         let network = MiningNetwork::parse(network).map_err(error)?;
-        let cfg = RuntimeConfig {
-            network,
-            payout_address: address.to_lowercase(),
-            ..Default::default()
-        };
-        cfg.validate_payout_network().map_err(error)?;
-        crate::tx::cashaddr_to_p2pkh_locking(address).map_err(error)?;
+        let address = crate::config::validate_payout_address(network, address).map_err(error)?;
         let policy = MiningToken::Photon.fee_policy(network);
         crate::donation::require_direct_reward_policy(policy.scheme).map_err(error)?;
-        let payouts = policy.payouts(network, address).map_err(error)?;
+        let payouts = policy.payouts(network, &address).map_err(error)?;
         let engine =
             WgpuPhotonEngine::new_async(0, 524_288, 8, (table, m29_table::M29TableSource::Cache))
                 .await

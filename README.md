@@ -84,10 +84,10 @@ Fulcrum servers and nodes you add are saved once per network in `config.sources.
 Use v0.0.3 or newer, which includes Chipnet support. After building this branch, run from the project root with the GPU files in place:
 
 ```bash
-./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bitcoincash:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
+./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bchtest:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
 ```
 
-Replace the quoted address with your valid token-aware P2PKH payout CashAddr. The miner converts a valid mainnet payout CashAddr to the equivalent `bchtest:` address with the same key hash. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoint; mainnet remains the default without `--chipnet`.
+Replace the quoted address with your valid Chipnet P2PKH or token-aware P2PKH payout CashAddr. Mainnet requires `bitcoincash:` addresses and Chipnet requires `bchtest:` addresses; mismatched networks are rejected, never converted. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoints; mainnet remains the default without `--chipnet`.
 
 New Chipnet wins pay the selected wallet directly, using the same donation policy. No local reward wallet or payout batching is created for new mining.
 

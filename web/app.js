@@ -1,4 +1,4 @@
-import init, { BrowserMiner, browser_config } from './pkg/pickaxe_miner.js';
+import init, { BrowserMiner, browser_config, validate_payout_address } from './pkg/pickaxe_miner.js';
 import { Electrum } from './rpc.js';
 import { resolveSubmission } from './submission.js';
 
@@ -20,7 +20,7 @@ $('stop').onclick = () => { stopping = true; status('Stopping after the current 
 
 async function run() {
   const network = $('network').value;
-  const address = $('address').value.trim();
+  let address = $('address').value.trim();
   const endpoints = [...new Set(($('endpoints').value.trim() ? $('endpoints').value.split(',').map(s => s.trim()) : config.endpoints))];
   const journal = `pickaxe.pending.${network}`;
   const settings = $('setup').querySelectorAll('input:not([type=range]),select');
@@ -71,6 +71,8 @@ async function run() {
     }
   }
   try {
+    address = validate_payout_address(network, address);
+    $('address').value = address;
     status('Loading GPU table and compiling WebGPU…');
     const response = await fetch('./photon-generator-table.bin');
     if (!response.ok) throw new Error('GPU table could not be downloaded');
