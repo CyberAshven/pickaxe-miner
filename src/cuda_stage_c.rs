@@ -480,6 +480,7 @@ mod tests {
                 signature_hex: "00".repeat(64),
                 nonce: 0,
                 contract_value_sats: 15_971_500,
+                relay_fee_sats_per_kb: 1_000,
                 contract_token_amount: 2_099_905_002_035_715,
                 reward_amount: 4_999_773_813,
                 payout_locking: tx::cashaddr_to_p2pkh_locking(

@@ -775,14 +775,11 @@ impl PendingSubmission {
             settlement_hex: hex::encode(&winner.transaction),
             resulting_baton_txid: parent_txid,
             resulting_baton_vout: 0,
-            resulting_baton_value_sats: live
-                .baton_value_sats
-                .checked_sub(
-                    cfg.token
-                        .photon_deployment(cfg.network)
-                        .single_input_max_baton_decrease_sats()?,
-                )
-                .ok_or("direct reward baton value underflow")?,
+            resulting_baton_value_sats: reward::successor_baton(
+                &winner.transaction,
+                cfg.token.photon_deployment(cfg.network),
+            )?
+            .value_sats,
             miner_token_amount: if recipient == crate::donation::Recipient::Miner {
                 amount
             } else {
@@ -1632,6 +1629,7 @@ fn successor_live_job(
         baton_vout: pending.resulting_baton_vout,
         baton_height: 0,
         baton_value_sats: baton.value_sats,
+        relay_fee_sats_per_kb: chain.relay_fee_sats_per_kb,
         commitment_hex: baton.commitment_hex,
         token_amount: baton.token_amount,
         age: derived.age,
@@ -2148,6 +2146,43 @@ fn production_relay_fee_sats_per_kb(cfg: &RuntimeConfig) -> Result<u64, String> 
     }
 }
 
+/// Refresh live policy at most twice a minute. A changed rate is job material:
+/// it must reach the GPU and winner reconstruction in the same generation.
+fn refresh_live_fee(
+    session: &mut ElectrumSession,
+    cfg: &RuntimeConfig,
+    live: &mut LiveJob,
+) -> Result<(), String> {
+    let fee = match session.fee_policy {
+        Some((checked, fee)) if checked.elapsed() < Duration::from_secs(30) => fee,
+        _ => {
+            let relay = match session.rpc("mempool.get_info", serde_json::json!([])) {
+                Ok(info) => info
+                    .get("mempoolminfee")
+                    .cloned()
+                    .ok_or("mempool.get_info omitted mempoolminfee")?,
+                // Older servers expose only the static relay minimum. Do not
+                // confuse a failed or malformed dynamic reply with absence.
+                Err(error)
+                    if error
+                        .strip_prefix("rpc error: ")
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .is_some_and(|value| value["code"].as_i64() == Some(-32601)) =>
+                {
+                    session.rpc("blockchain.relayfee", serde_json::json!([]))?
+                }
+                Err(error) => return Err(error),
+            };
+            let fee =
+                crate::node::bch_value_to_sats(&relay)?.max(production_relay_fee_sats_per_kb(cfg)?);
+            session.fee_policy = Some((Instant::now(), fee));
+            fee
+        }
+    };
+    live.relay_fee_sats_per_kb = fee;
+    Ok(())
+}
+
 /// Checks the submission journal for recovery hazards on startup.
 fn probe_submission_journal(journal_path: &Path) -> Result<(), String> {
     if journal_path.exists() {
@@ -2238,8 +2273,7 @@ fn production_preflight(
         );
     }
 
-    let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(cfg)?;
-    production_preflight_local(cfg, live, journal_path, relay_fee_sats_per_kb)?;
+    production_preflight_local(cfg, live, journal_path, live.relay_fee_sats_per_kb)?;
     Ok(())
 }
 
@@ -2295,6 +2329,7 @@ fn preflight_live_job(
         age: live.age,
         target_le_hex: live.target_le_hex.clone(),
         contract_value_sats: live.baton_value_sats,
+        relay_fee_sats_per_kb: live.relay_fee_sats_per_kb,
         contract_token_amount: live.token_amount,
         reward_raw: live.reward_raw,
     };
@@ -2303,9 +2338,6 @@ fn preflight_live_job(
     // Standard 1 sat/byte dust floor for the 188-byte PHOTON baton output
     // plus the policy's 148-byte spending input, multiplied by three.
     let baton_floor = 3 * (188 + 148);
-    if live.baton_value_sats < deployment.single_input_max_baton_decrease_sats()? + baton_floor {
-        return Err("baton BCH value is too small to preserve a spendable baton".into());
-    }
     let layout = tx::PhotonLayout::for_age_with_deployment(live.age, deployment)?;
     tx::require_covenant_hash_preimage(live.token_amount, live.reward_raw)?;
     let parent_preview = tx::build_unsigned_reference_preview_for_deployment(
@@ -2330,9 +2362,14 @@ fn preflight_live_job(
     if tx::payout_value_sats(&parent_preview)? != reward::TOKEN_OUTPUT_SATS as u16 {
         return Err("PHOTON parent must pay exactly 700 sats to the selected recipient".into());
     }
-    let spend_budget = deployment.single_input_max_baton_decrease_sats()?;
-    let parent_fee = spend_budget
-        .checked_sub(reward::TOKEN_OUTPUT_SATS)
+    let baton = reward::successor_baton(&parent_preview, deployment)?;
+    if baton.value_sats < baton_floor {
+        return Err("baton BCH value is too small to preserve a spendable baton".into());
+    }
+    let parent_fee = live
+        .baton_value_sats
+        .checked_sub(baton.value_sats)
+        .and_then(|value| value.checked_sub(reward::TOKEN_OUTPUT_SATS))
         .ok_or("PHOTON parent reward exceeds covenant spend budget")?;
     let minimum_fee = u64::try_from(parent_preview.len())
         .map_err(|_| "parent length overflow")?
@@ -2392,6 +2429,7 @@ fn validate_verified_parent_to(
         age: live.age,
         target_le_hex: live.target_le_hex.clone(),
         contract_value_sats: live.baton_value_sats,
+        relay_fee_sats_per_kb: live.relay_fee_sats_per_kb,
         contract_token_amount: live.token_amount,
         reward_raw: actual_reward,
     };
@@ -2583,7 +2621,8 @@ impl RuntimeSupervisor {
         )?;
         let journal_path = submission_journal_path(cfg.network);
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
-        let initial = session.fetch_live_job()?;
+        let mut initial = session.fetch_live_job()?;
+        refresh_live_fee(&mut session, &cfg, &mut initial)?;
         production_preflight(&mut session, &cfg, &initial, &journal_path)?;
         println!(
             "{}",
@@ -3984,8 +4023,15 @@ fn apply_refreshed_job(
     settlement: &mut SettlementState,
     search: &SearchHandle,
     journal_path: &Path,
-    next: LiveJob,
+    mut next: LiveJob,
 ) -> Result<bool, String> {
+    if let Err(error) = refresh_live_fee(session, cfg, &mut next) {
+        let _ = search.apply_control(SearchCommand::Pause);
+        return Err(error);
+    }
+    if next.relay_fee_sats_per_kb > live.relay_fee_sats_per_kb {
+        search.apply_control(SearchCommand::Pause)?;
+    }
     let staged =
         prepare_generation_transition(cfg, live, settlement, &next, |next_cfg, next_live| {
             production_preflight(session, next_cfg, next_live, journal_path)
@@ -4023,8 +4069,7 @@ fn begin_successor_generation(
     let next = successor_live_job(pending, live, cfg)?;
     let staged =
         prepare_generation_transition(cfg, live, settlement, &next, |next_cfg, next_live| {
-            let relay_fee_sats_per_kb = production_relay_fee_sats_per_kb(next_cfg)?;
-            preflight_live_job(next_cfg, next_live, None, relay_fee_sats_per_kb)
+            preflight_live_job(next_cfg, next_live, None, next_live.relay_fee_sats_per_kb)
         })?;
     let Some((next_cfg, next_settlement)) = staged else {
         return Ok(false);
@@ -4082,6 +4127,7 @@ fn live_job_changed(current: &LiveJob, next: &LiveJob) -> bool {
         || current.target_le_hex != next.target_le_hex
         || current.token_amount != next.token_amount
         || current.reward_raw != next.reward_raw
+        || current.relay_fee_sats_per_kb != next.relay_fee_sats_per_kb
 }
 
 /// Checks whether a GPU winner belongs to the current live baton. Any change
@@ -4530,6 +4576,7 @@ mod tests {
             baton_vout: 0,
             baton_height: 999,
             baton_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
             commitment_hex: "00".repeat(101),
             token_amount: 2_099_905_002_035_715,
             age: 1,
@@ -4629,6 +4676,7 @@ mod tests {
             age: job.age,
             target_le_hex: job.target_le_hex.clone(),
             contract_value_sats: job.baton_value_sats,
+            relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
             contract_token_amount: job.token_amount,
             reward_raw: job.reward_raw,
         };
@@ -4705,6 +4753,12 @@ mod tests {
                     cfg.payout_address =
                         crate::config::reprefix_p2pkh_payout(TEST_PAYOUT, network).unwrap();
                     job.age = age;
+                    job.relay_fee_sats_per_kb = match age {
+                        16 => 1_100,
+                        17 => 1_200,
+                        128 => 1_260,
+                        _ => 1_000,
+                    };
                     let old_target = (BigUint::from(1u32) << 253) * 144u32 / (age + 143);
                     let target = &old_target * (age + 143) / 144u32;
                     let le32 = |v: &BigUint| {
@@ -4732,6 +4786,7 @@ mod tests {
                             age: job.age,
                             target_le_hex: job.target_le_hex.clone(),
                             contract_value_sats: job.baton_value_sats,
+                            relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
                             contract_token_amount: job.token_amount,
                             reward_raw: job.reward_raw,
                         };
@@ -4778,6 +4833,16 @@ mod tests {
                         prepare_submission_for_network(&winner, &cfg, &job, &settlement, &journal)
                             .unwrap();
                     assert!(pending.is_direct());
+                    assert_eq!(
+                        job.baton_value_sats
+                            - pending.resulting_baton_value_sats
+                            - reward::TOKEN_OUTPUT_SATS,
+                        reward::required_relay_fee_sats(
+                            winner.transaction.len(),
+                            job.relay_fee_sats_per_kb
+                        )
+                        .unwrap(),
+                    );
                     assert_eq!(pending.parent_hex, pending.settlement_hex);
                     assert_eq!(
                         pending.miner_token_amount,
@@ -4892,7 +4957,7 @@ mod tests {
                             },
                         },
                     }]);
-                    let indexed = crate::electrum::live_job_from_fulcrum_values_for_deployment(
+                    let mut indexed = crate::electrum::live_job_from_fulcrum_values_for_deployment(
                         &job.url,
                         job.server_version.clone(),
                         &header,
@@ -4900,6 +4965,9 @@ mod tests {
                         deployment,
                     )
                     .unwrap();
+                    // Indexer values do not contain policy; the live session
+                    // attaches its cached fee before comparing generations.
+                    indexed.relay_fee_sats_per_kb = successor.relay_fee_sats_per_kb;
                     assert!(!live_job_changed(&successor, &indexed));
 
                     // A winner on the unconfirmed successor passes the job
@@ -4948,6 +5016,7 @@ mod tests {
                         "payout": payout, "age": successor.age, "old_target_le": &successor.commitment_hex[8..72],
                         "commitment": successor.commitment_hex,
                         "value": successor.baton_value_sats, "amount": successor.token_amount.to_string(),
+                        "relay_fee_sats_per_kb": successor.relay_fee_sats_per_kb,
                         "reward": successor.reward_raw.to_string(), "chained": true,
                     }));
 
@@ -4955,6 +5024,7 @@ mod tests {
                         "raw": pending.parent_hex, "network": network.as_str(), "recipient": format!("{recipient:?}"),
                         "payout": payout, "age": age, "old_target_le": le32(&old_target),
                         "value": job.baton_value_sats, "amount": job.token_amount.to_string(), "reward": job.reward_raw.to_string(),
+                        "relay_fee_sats_per_kb": job.relay_fee_sats_per_kb,
                     }));
                 }
             }
@@ -5567,6 +5637,7 @@ mod tests {
             age: job.age,
             target_le_hex: job.target_le_hex.clone(),
             contract_value_sats: job.baton_value_sats,
+            relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
             contract_token_amount: job.token_amount,
             reward_raw: job.reward_raw,
         };
@@ -5626,6 +5697,7 @@ mod tests {
             age: job.age,
             target_le_hex: job.target_le_hex.clone(),
             contract_value_sats: job.baton_value_sats,
+            relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
             contract_token_amount: job.token_amount,
             reward_raw: job.reward_raw,
         };
@@ -5715,6 +5787,7 @@ mod tests {
                 age: job.age,
                 target_le_hex: job.target_le_hex.clone(),
                 contract_value_sats: job.baton_value_sats,
+                relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
                 contract_token_amount: job.token_amount,
                 reward_raw: actual_reward,
             };
@@ -6529,8 +6602,10 @@ mod tests {
     /// Checks that production preflight refuses relay floor above covenant budget.
     fn production_preflight_refuses_relay_floor_above_covenant_budget() {
         let (cfg, job, _secret, _public, _mining_payout, journal) = preflight_fixture();
-        let error = production_preflight_local(&cfg, &job, &journal, 10_000).unwrap_err();
-        assert!(error.contains("below required"));
+        for fee in [1_001, 10_000] {
+            let error = production_preflight_local(&cfg, &job, &journal, fee).unwrap_err();
+            assert!(error.contains("below required"));
+        }
         assert!(!journal.exists());
     }
 
@@ -7179,5 +7254,142 @@ mod tests {
         assert!(submission_journal_path(MiningNetwork::Chipnet)
             .ends_with("pending-reward-chipnet.json"));
         assert!(submission_journal_path(MiningNetwork::Mainnet).ends_with("pending-reward.json"));
+    }
+
+    #[test]
+    fn live_fee_refresh_rounds_and_restamps_work_without_exceeding_the_covenant() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            for (method, result) in [
+                ("server.version", serde_json::json!(["fee-test", "1.4.1"])),
+                (
+                    "mempool.get_info",
+                    serde_json::json!({"mempoolminfee": "0.000011"}),
+                ),
+                (
+                    "mempool.get_info",
+                    serde_json::json!({"mempoolminfee": "0.000012"}),
+                ),
+                (
+                    "mempool.get_info",
+                    serde_json::json!({"mempoolminfee": "0.000013"}),
+                ),
+            ] {
+                let request: serde_json::Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], method);
+                ws.send(tungstenite::Message::Text(
+                    serde_json::json!({"id": request["id"], "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            }
+        });
+        let mut session = ElectrumSession::connect_failover(&[url]).unwrap();
+        let (cfg, job, _, _, _, journal) = preflight_fixture();
+        let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
+        let mut next = job.clone();
+        refresh_live_fee(&mut session, &cfg, &mut next).unwrap();
+        assert_eq!(next.relay_fee_sats_per_kb, 1_100);
+        refresh_live_fee(&mut session, &cfg, &mut next).unwrap(); // cached, no RPC
+        assert_eq!(next.relay_fee_sats_per_kb, 1_100);
+        let (changed, _) =
+            prepare_generation_transition(&cfg, &job, &settlement, &next, |cfg, live| {
+                preflight_live_job(cfg, live, Some(&journal), live.relay_fee_sats_per_kb)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(changed.generation_id > cfg.generation_id);
+        assert_eq!(job.relay_fee_sats_per_kb, 1_000);
+        assert_eq!(
+            reward::required_relay_fee_sats(629, next.relay_fee_sats_per_kb).unwrap(),
+            692
+        );
+        for rate in [1_200, 1_300] {
+            session.fee_policy.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(31);
+            refresh_live_fee(&mut session, &cfg, &mut next).unwrap();
+            assert_eq!(next.relay_fee_sats_per_kb, rate);
+            let result = preflight_live_job(&cfg, &next, Some(&journal), rate);
+            if rate == 1_200 {
+                result.unwrap();
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .contains("exceeds covenant spend budget"));
+            }
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn live_fee_falls_back_only_for_an_unsupported_mempool_method() {
+        for (field, value, fallback) in [
+            (
+                "error",
+                serde_json::json!({"code": -32601, "message": "Method not found"}),
+                true,
+            ),
+            (
+                "error",
+                serde_json::json!({"code": -32603, "message": "Internal error"}),
+                false,
+            ),
+            ("result", serde_json::json!({}), false),
+            (
+                "result",
+                serde_json::json!({"mempoolminfee": -0.000011}),
+                false,
+            ),
+            ("result", serde_json::json!({"mempoolminfee": "NaN"}), false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                for (method, response_field, response) in [
+                    (
+                        "server.version",
+                        "result",
+                        serde_json::json!(["fee-test", "1.4.1"]),
+                    ),
+                    ("mempool.get_info", field, value),
+                    ("blockchain.relayfee", "result", serde_json::json!(0.000011)),
+                ]
+                .into_iter()
+                .take(if fallback { 3 } else { 2 })
+                {
+                    let request: serde_json::Value =
+                        serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], method);
+                    let mut reply = serde_json::json!({"id": request["id"]});
+                    reply[response_field] = response;
+                    ws.send(tungstenite::Message::Text(reply.to_string().into()))
+                        .unwrap();
+                }
+            });
+            let mut session = ElectrumSession::connect_failover(&[url]).unwrap();
+            let (cfg, mut job, _, _, _, _) = preflight_fixture();
+            let result = refresh_live_fee(&mut session, &cfg, &mut job);
+            if fallback {
+                result.unwrap();
+                assert_eq!(job.relay_fee_sats_per_kb, 1_100);
+            } else {
+                assert!(result.is_err());
+                assert!(session.fee_policy.is_none());
+                assert_eq!(job.relay_fee_sats_per_kb, 1_000);
+            }
+            server.join().unwrap();
+        }
     }
 }

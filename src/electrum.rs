@@ -46,6 +46,7 @@ pub struct LiveJob {
     pub baton_vout: u32,
     pub baton_height: u32,
     pub baton_value_sats: u64,
+    pub relay_fee_sats_per_kb: u64,
     pub commitment_hex: String,
     pub token_amount: u128,
     pub age: u32,
@@ -79,6 +80,7 @@ impl LiveJob {
             baton_vout: self.baton_vout,
             baton_height: self.baton_height,
             baton_value_sats: self.baton_value_sats,
+            relay_fee_sats_per_kb: self.relay_fee_sats_per_kb,
             age: self.age,
             target_le_hex: self.target_le_hex.clone(),
             token_amount: self.token_amount,
@@ -121,6 +123,7 @@ pub struct ElectrumSession {
     next_id: u64,
     buf: String,
     deployment: &'static PhotonDeployment,
+    pub(crate) fee_policy: Option<(std::time::Instant, u64)>,
 }
 
 impl ElectrumSession {
@@ -181,6 +184,7 @@ impl ElectrumSession {
             next_id: 1,
             buf: String::new(),
             deployment,
+            fee_policy: None,
         };
 
         let ver = session.rpc("server.version", json!(["pickaxe-miner", "1.4.1"]))?;
@@ -195,7 +199,7 @@ impl ElectrumSession {
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let line = format!("{req}\n");
         self.ws
-            .send(Message::Text(line))
+            .send(Message::Text(line.into()))
             .map_err(|e| format!("transport: send: {e}"))?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -287,7 +291,7 @@ impl ElectrumSession {
 
         let tip_hash = stable_fulcrum_tip_hash(&header_before, &header_after)?;
 
-        let job = live_job_from_fulcrum_values_for_deployment(
+        let mut job = live_job_from_fulcrum_values_for_deployment(
             &self.url,
             self.server_version.clone(),
             &header_after,
@@ -297,6 +301,7 @@ impl ElectrumSession {
         if !job.tip_hash.eq_ignore_ascii_case(&tip_hash) {
             return Err("Fulcrum PHOTON snapshot tip identity is inconsistent".into());
         }
+        job.relay_fee_sats_per_kb = self.fee_policy.map_or(1_000, |(_, fee)| fee);
         Ok(LiveStateSnapshot { tip_hash, job })
     }
 }
@@ -499,6 +504,7 @@ pub(crate) fn live_job_from_fulcrum_values_for_deployment(
         baton_vout,
         baton_height,
         baton_value_sats,
+        relay_fee_sats_per_kb: 1_000,
         commitment_hex,
         token_amount,
         age: derived.age,

@@ -437,6 +437,7 @@ pub struct TemplateParams {
     pub signature_hex: String,
     pub nonce: u32,
     pub contract_value_sats: u64,
+    pub relay_fee_sats_per_kb: u64,
     pub contract_token_amount: u128,
     pub reward_amount: u128,
     pub payout_locking: Vec<u8>,
@@ -539,9 +540,26 @@ pub fn build_photon_template_bytes_for_deployment(
     }
 
     let max_baton_decrease_sats = deployment.single_input_max_baton_decrease_sats()?;
+    // Preserve the retired v0 reference bytes. Current claims use live policy;
+    // the unused covenant allowance stays in the baton for later claims.
+    let baton_decrease_sats = if deployment.redeem_script_hex == MAINNET_V0_PHOTON.redeem_script_hex
+    {
+        max_baton_decrease_sats
+    } else {
+        crate::reward::TOKEN_OUTPUT_SATS
+            .checked_add(crate::reward::required_relay_fee_sats(
+                layout.tx_bytes(),
+                p.relay_fee_sats_per_kb
+                    .max(crate::reward::MIN_RELAY_FEE_SATS_PER_KB),
+            )?)
+            .ok_or("PHOTON parent fee overflow")?
+    };
+    if baton_decrease_sats > max_baton_decrease_sats {
+        return Err("PHOTON parent relay fee exceeds covenant spend budget".into());
+    }
     let baton_sats = p
         .contract_value_sats
-        .checked_sub(max_baton_decrease_sats)
+        .checked_sub(baton_decrease_sats)
         .ok_or("contract value too small for PHOTON parent covenant budget")?;
 
     let mut tx = Vec::new();
@@ -556,7 +574,7 @@ pub fn build_photon_template_bytes_for_deployment(
     tx.extend_from_slice(&u64_le(baton_sats));
     tx.extend_from_slice(&compact_uint(output0.len() as u64));
     tx.extend_from_slice(&output0);
-    tx.extend_from_slice(&u64_le(700));
+    tx.extend_from_slice(&u64_le(crate::reward::TOKEN_OUTPUT_SATS));
     tx.extend_from_slice(&compact_uint(output1.len() as u64));
     tx.extend_from_slice(&output1);
     tx.extend_from_slice(&u32_le(0)); // locktime
@@ -681,6 +699,7 @@ pub struct ReferenceJobContext {
     pub age: u32,
     pub target_le_hex: String,
     pub contract_value_sats: u64,
+    pub relay_fee_sats_per_kb: u64,
     pub contract_token_amount: u128,
     pub reward_raw: u128,
 }
@@ -777,6 +796,7 @@ fn apply_reference_signature_with_payout_sats_for_deployment(
         signature_hex: signature_hex.to_string(),
         nonce,
         contract_value_sats: job.contract_value_sats,
+        relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
         contract_token_amount: job.contract_token_amount,
         reward_amount: job.reward_raw,
         payout_locking: payout,
@@ -814,6 +834,7 @@ pub fn build_unsigned_reference_preview_for_deployment(
         signature_hex: "00".repeat(64),
         nonce: 0,
         contract_value_sats: job.contract_value_sats,
+        relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
         contract_token_amount: job.contract_token_amount,
         reward_amount: job.reward_raw,
         payout_locking: payout,
@@ -826,7 +847,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chipnet_parent_matches_a_confirmed_on_chain_mining_transaction() {
+    fn chipnet_parent_matches_confirmed_layout_with_lower_fee() {
         // The author's v3.2 claim, confirmed on Chipnet as txid
         // 00004cd0bbd7f5ce7fdcb82ab03cd100c05c98b2176a5947f0c23ecef246b4b5.
         let confirmed = hex::decode(
@@ -846,6 +867,7 @@ mod tests {
                 signature_hex: commitment[72..].into(),
                 nonce: 0x807c,
                 contract_value_sats: 48_635_000,
+                relay_fee_sats_per_kb: 1_000,
                 contract_token_amount: 2_095_454_920_205_042,
                 reward_amount: 4_989_178_380,
                 payout_locking: hex::decode("76a914d337f66c1b16a6c0d84f35b920c8ad4df53e37f188ac")
@@ -854,8 +876,17 @@ mod tests {
             &crate::protocol::CHIPNET_PHOTON,
         )
         .unwrap();
-        // The author's miner pays 800 sats to the reward output; the
-        // covenant leaves that value to the network's dust rule.
+        let baton =
+            crate::reward::successor_baton(&built, &crate::protocol::CHIPNET_PHOTON).unwrap();
+        assert_eq!(48_635_000 - baton.value_sats - 700, built.len() as u64);
+        // Restore only the historical BCH output values for the exact-byte
+        // comparison. The lower-fee template requires new proof of work.
+        let offset = 346 + PhotonLayout::for_tx_len(built.len()).unwrap().shift();
+        assert_eq!(
+            u64::from_le_bytes(confirmed[offset..offset + 8].try_into().unwrap()),
+            48_635_000 - 1500
+        );
+        built[offset..offset + 8].copy_from_slice(&(48_635_000u64 - 1500).to_le_bytes());
         set_payout_value_sats(&mut built, 800).unwrap();
         assert_eq!(built, confirmed);
         assert_eq!(
@@ -910,6 +941,7 @@ mod tests {
             age: 38,
             target_le_hex: format!("{}7f", "ff".repeat(31)),
             contract_value_sats: 49_080_500,
+            relay_fee_sats_per_kb: 1_000,
             contract_token_amount: 2_096_937_231_989_870,
             reward_raw: 4_992_707_694,
         };
@@ -927,6 +959,7 @@ mod tests {
                     signature_hex: hex::encode(signature),
                     nonce,
                     contract_value_sats: job.contract_value_sats,
+                    relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
                     contract_token_amount: job.contract_token_amount,
                     reward_amount: job.reward_raw,
                     payout_locking: cashaddr_to_p2pkh_locking(payout).unwrap(),
@@ -989,6 +1022,7 @@ mod tests {
                 signature_hex: "00".repeat(64),
                 nonce: 0,
                 contract_value_sats: 15_971_500,
+                relay_fee_sats_per_kb: 1_000,
                 contract_token_amount: total,
                 reward_amount: reward - 65_535,
                 payout_locking: payout.clone(),
@@ -1080,6 +1114,7 @@ mod tests {
             signature_hex: "5b73543b21b74bd47b0dfc4565780e4ed2f0e5c4bb85f2c6dd3546727f84604fc6e8cc2b6b38de1c5630da8356e2e07a403ddeba8835caba0b80d75a5ac471e4".into(),
             nonce: 0x1234_5678,
             contract_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
             contract_token_amount: 2_099_905_002_035_715,
             reward_amount: 4_999_773_813,
             payout_locking: payout,
@@ -1115,6 +1150,7 @@ mod tests {
                 signature_hex: "ab".repeat(64),
                 nonce: 0x1234_5678,
                 contract_value_sats: 15_971_500,
+                relay_fee_sats_per_kb: 1_000,
                 contract_token_amount: 2_099_905_002_035_715,
                 reward_amount: 4_999_773_813,
                 payout_locking: payout.clone(),
@@ -1175,6 +1211,7 @@ mod tests {
             signature_hex: "00".repeat(64),
             nonce: 0,
             contract_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
             contract_token_amount: 2_099_905_002_035_715,
             reward_amount: 4_999_773_813,
             payout_locking: payout,

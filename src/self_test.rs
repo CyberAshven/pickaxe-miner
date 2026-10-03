@@ -72,6 +72,7 @@ fn reference_context(target: &[u8; 32]) -> tx::ReferenceJobContext {
         age: VECTOR_AGE,
         target_le_hex: hex::encode(target),
         contract_value_sats: VECTOR_CONTRACT_VALUE_SATS,
+        relay_fee_sats_per_kb: 1_000,
         contract_token_amount: VECTOR_TOKEN_AMOUNT,
         reward_raw: VECTOR_REWARD_RAW,
     }
@@ -94,6 +95,7 @@ fn build_reference_shaped_template(
         signature_hex: "00".repeat(64),
         nonce: 0,
         contract_value_sats: context.contract_value_sats,
+        relay_fee_sats_per_kb: context.relay_fee_sats_per_kb,
         contract_token_amount: context.contract_token_amount,
         reward_amount: context.reward_raw,
         payout_locking,

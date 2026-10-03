@@ -204,6 +204,7 @@ pub struct MiningJob {
     pub baton_vout: u32,
     pub baton_height: u32,
     pub baton_value_sats: u64,
+    pub relay_fee_sats_per_kb: u64,
     pub age: u32,
     pub target_le_hex: String,
     pub token_amount: u128,
@@ -409,6 +410,7 @@ fn prepare_job(
         signature_hex: hex::encode(signature),
         nonce: 0,
         contract_value_sats: job.baton_value_sats,
+        relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
         contract_token_amount: job.token_amount,
         reward_amount: job.reward_raw,
         payout_locking,
@@ -486,6 +488,7 @@ fn verify_gpu_winner(
         age: prepared.job.age,
         target_le_hex: prepared.job.target_le_hex.clone(),
         contract_value_sats: prepared.job.baton_value_sats,
+        relay_fee_sats_per_kb: prepared.job.relay_fee_sats_per_kb,
         contract_token_amount: prepared.job.token_amount,
         reward_raw: actual_reward,
     };
@@ -1821,6 +1824,7 @@ mod tests {
             baton_txid: "42a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae124712000000".into(),
             baton_vout: 0,
             baton_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
             age: 10,
             target_le_hex: "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
                 .into(),
@@ -1949,6 +1953,7 @@ mod tests {
             age: job.age,
             target_le_hex: job.target_le_hex.clone(),
             contract_value_sats: job.baton_value_sats,
+            relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
             contract_token_amount: job.token_amount,
             reward_raw: job.reward_raw - 31,
         };
@@ -2005,6 +2010,7 @@ mod tests {
             baton_vout: 0,
             baton_height: 990,
             baton_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
             age: 10,
             target_le_hex: "ae9b80bd66e57a8a081b68832ee48cf7f1be0d06ab3e33a34c1e61f014000000"
                 .into(),
@@ -2148,6 +2154,11 @@ mod tests {
             let mut job = integration_job(1);
             job.network = network;
             job.age = 1;
+            job.relay_fee_sats_per_kb = if network == MiningNetwork::Mainnet {
+                1_100
+            } else {
+                1_200
+            };
             let mut target = [0u8; 32];
             target[28] = 0x80;
             job.target_le_hex = hex::encode(target);
@@ -2187,6 +2198,7 @@ mod tests {
                         age: job.age,
                         target_le_hex: job.target_le_hex.clone(),
                         contract_value_sats: job.baton_value_sats,
+                        relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
                         contract_token_amount: job.token_amount,
                         reward_raw: amount,
                     };
@@ -2207,6 +2219,7 @@ mod tests {
                     if !seen[index] {
                         samples.push(serde_json::json!({
                             "raw": hex::encode(&winner.transaction), "network": network.as_str(),
+                            "relay_fee_sats_per_kb": job.relay_fee_sats_per_kb,
                             "recipient": format!("{:?}", crate::donation::Recipient::ALL[index]),
                             "payout": payouts[index], "age": 1, "old_target_le": job.target_le_hex,
                             "value": job.baton_value_sats, "amount": job.token_amount.to_string(), "reward": amount.to_string(),

@@ -368,6 +368,7 @@ fn benchmark_fixture() -> Result<BenchmarkFixture, String> {
         signature_hex: "00".repeat(64),
         nonce: 0,
         contract_value_sats: VECTOR_CONTRACT_VALUE_SATS,
+        relay_fee_sats_per_kb: 1_000,
         contract_token_amount: VECTOR_TOKEN_AMOUNT,
         reward_amount: VECTOR_REWARD_RAW,
         payout_locking,

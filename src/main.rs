@@ -236,6 +236,7 @@ fn reference_job_context(job: &LiveJob) -> tx::ReferenceJobContext {
         age: job.age,
         target_le_hex: job.target_le_hex.clone(),
         contract_value_sats: job.baton_value_sats,
+        relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
         contract_token_amount: job.token_amount,
         reward_raw: job.reward_raw,
     }
@@ -1531,6 +1532,7 @@ mod tests {
             baton_vout: 0,
             baton_height: 999,
             baton_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
             commitment_hex: "00".repeat(101),
             token_amount: 2_099_905_002_035_715,
             age: 1,
