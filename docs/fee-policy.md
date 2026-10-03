@@ -1,11 +1,13 @@
 # Maintainer fee policy
 
 PHOTON's BCH network fee is separate from the donation policy below. The miner
-refreshes the connected Fulcrum's relay minimum and any configured node's mempool
+refreshes the connected Fulcrum's mempool minimum and any configured node's
 minimum every 30 seconds, with a floor of 1 sat/byte. It rounds up by transaction
 size and starts a new work generation when the rate changes. The reward keeps
 700 sats; unused allowance stays in the baton. A rate exceeding the covenant's
 1,500-sat total allowance stops new work rather than requesting user funding.
+Older Fulcrum servers without `mempool.get_info` fall back to their advertised
+relay minimum; they cannot expose a changing mempool floor through that method.
 
 Edit `MiningToken::fee_policy` in `src/config.rs` to select a token's mode,
 fee shares and payout addresses. This is compiled policy, not a

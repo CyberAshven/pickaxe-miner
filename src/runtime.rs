@@ -2156,7 +2156,23 @@ fn refresh_live_fee(
     let fee = match session.fee_policy {
         Some((checked, fee)) if checked.elapsed() < Duration::from_secs(30) => fee,
         _ => {
-            let relay = session.rpc("blockchain.relayfee", serde_json::json!([]))?;
+            let relay = match session.rpc("mempool.get_info", serde_json::json!([])) {
+                Ok(info) => info
+                    .get("mempoolminfee")
+                    .cloned()
+                    .ok_or("mempool.get_info omitted mempoolminfee")?,
+                // Older servers expose only the static relay minimum. Do not
+                // confuse a failed or malformed dynamic reply with absence.
+                Err(error)
+                    if error
+                        .strip_prefix("rpc error: ")
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .is_some_and(|value| value["code"].as_i64() == Some(-32601)) =>
+                {
+                    session.rpc("blockchain.relayfee", serde_json::json!([]))?
+                }
+                Err(error) => return Err(error),
+            };
             let fee =
                 crate::node::bch_value_to_sats(&relay)?.max(production_relay_fee_sats_per_kb(cfg)?);
             session.fee_policy = Some((Instant::now(), fee));
@@ -7252,9 +7268,18 @@ mod tests {
             let mut ws = tungstenite::accept(stream).unwrap();
             for (method, result) in [
                 ("server.version", serde_json::json!(["fee-test", "1.4.1"])),
-                ("blockchain.relayfee", serde_json::json!("0.000011")),
-                ("blockchain.relayfee", serde_json::json!("0.000012")),
-                ("blockchain.relayfee", serde_json::json!("0.000013")),
+                (
+                    "mempool.get_info",
+                    serde_json::json!({"mempoolminfee": "0.000011"}),
+                ),
+                (
+                    "mempool.get_info",
+                    serde_json::json!({"mempoolminfee": "0.000012"}),
+                ),
+                (
+                    "mempool.get_info",
+                    serde_json::json!({"mempoolminfee": "0.000013"}),
+                ),
             ] {
                 let request: serde_json::Value =
                     serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
@@ -7299,5 +7324,70 @@ mod tests {
             }
         }
         server.join().unwrap();
+    }
+
+    #[test]
+    fn live_fee_falls_back_only_for_an_unsupported_mempool_method() {
+        for (field, value, fallback) in [
+            (
+                "error",
+                serde_json::json!({"code": -32601, "message": "Method not found"}),
+                true,
+            ),
+            (
+                "error",
+                serde_json::json!({"code": -32603, "message": "Internal error"}),
+                false,
+            ),
+            ("result", serde_json::json!({}), false),
+            (
+                "result",
+                serde_json::json!({"mempoolminfee": -0.000011}),
+                false,
+            ),
+            ("result", serde_json::json!({"mempoolminfee": "NaN"}), false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                for (method, response_field, response) in [
+                    (
+                        "server.version",
+                        "result",
+                        serde_json::json!(["fee-test", "1.4.1"]),
+                    ),
+                    ("mempool.get_info", field, value),
+                    ("blockchain.relayfee", "result", serde_json::json!(0.000011)),
+                ]
+                .into_iter()
+                .take(if fallback { 3 } else { 2 })
+                {
+                    let request: serde_json::Value =
+                        serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], method);
+                    let mut reply = serde_json::json!({"id": request["id"]});
+                    reply[response_field] = response;
+                    ws.send(tungstenite::Message::Text(reply.to_string()))
+                        .unwrap();
+                }
+            });
+            let mut session = ElectrumSession::connect_failover(&[url]).unwrap();
+            let (cfg, mut job, _, _, _, _) = preflight_fixture();
+            let result = refresh_live_fee(&mut session, &cfg, &mut job);
+            if fallback {
+                result.unwrap();
+                assert_eq!(job.relay_fee_sats_per_kb, 1_100);
+            } else {
+                assert!(result.is_err());
+                assert!(session.fee_policy.is_none());
+                assert_eq!(job.relay_fee_sats_per_kb, 1_000);
+            }
+            server.join().unwrap();
+        }
     }
 }
