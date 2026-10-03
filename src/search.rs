@@ -14,7 +14,7 @@ use rand::Rng;
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -684,10 +684,16 @@ fn deliver_verified_batch(
 
     paused.store(true, Ordering::SeqCst);
     for verified in verified_batch {
-        if winner_tx.send(verified).is_err() {
-            return false;
+        match winner_tx.try_send(verified) {
+            Ok(()) => {
+                winners.fetch_add(1, Ordering::Release);
+            }
+            // Queued winners the supervisor has not drained yet already cover
+            // this job; blocking here would hold `batch_in_flight` and stall
+            // the supervisor, which waits for it before draining.
+            Err(TrySendError::Full(_)) => break,
+            Err(TrySendError::Disconnected(_)) => return false,
         }
-        winners.fetch_add(1, Ordering::Release);
     }
     true
 }
@@ -1697,7 +1703,7 @@ mod tests {
         let paused = AtomicBool::new(false);
         let winners = AtomicU64::new(0);
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
-        let batch = (0..WINNER_BUFFER_CAP)
+        let batch: Vec<_> = (0..WINNER_BUFFER_CAP)
             .map(|nonce| VerifiedWinner {
                 generation_id: 1,
                 height: 1_000,
@@ -1712,7 +1718,20 @@ mod tests {
             })
             .collect();
 
+        let second = batch.clone();
         assert!(deliver_verified_batch(batch, &paused, &winners, &winner_tx));
+        assert!(paused.load(Ordering::SeqCst));
+        assert_eq!(
+            winners.load(Ordering::Acquire),
+            u64::from(WINNER_BUFFER_CAP)
+        );
+
+        // A second winning batch before the supervisor drains the queue (the
+        // GPU resumed while a claim resolved) must not block the worker.
+        paused.store(false, Ordering::SeqCst);
+        assert!(deliver_verified_batch(
+            second, &paused, &winners, &winner_tx
+        ));
         assert!(paused.load(Ordering::SeqCst));
         assert_eq!(
             winners.load(Ordering::Acquire),
