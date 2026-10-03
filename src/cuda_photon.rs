@@ -230,13 +230,7 @@ pub(crate) fn cuda_unavailable_for_tests(error: &str) -> bool {
 /// SHA-256 state after the job-fixed transaction bytes 0..384.
 fn transaction_midstate(template: &[u8]) -> [u32; 8] {
     let mut state = SHA256_INITIAL_STATE;
-    let blocks = template[..MIDSTATE_BYTES]
-        .as_chunks::<64>()
-        .0
-        .iter()
-        .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
-        .collect::<Vec<_>>();
-    sha2::compress256(&mut state, &blocks);
+    sha2::block_api::compress256(&mut state, template[..MIDSTATE_BYTES].as_chunks::<64>().0);
     state
 }
 
@@ -765,13 +759,7 @@ mod tests {
             tail.push(0);
         }
         tail.extend_from_slice(&((TX_BYTES as u64) * 8).to_be_bytes());
-        let blocks = tail
-            .as_chunks::<64>()
-            .0
-            .iter()
-            .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
-            .collect::<Vec<_>>();
-        sha2::compress256(&mut state, &blocks);
+        sha2::block_api::compress256(&mut state, tail.as_chunks::<64>().0);
         let resumed = state
             .iter()
             .flat_map(|word| word.to_be_bytes())

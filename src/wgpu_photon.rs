@@ -8,8 +8,7 @@
 use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
 use secp256k1::SecretKey;
-use sha2::compress256;
-use sha2::digest::generic_array::GenericArray;
+use sha2::block_api::compress256;
 use std::borrow::Cow;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -181,8 +180,7 @@ fn u32_words_to_le_bytes(words: &[u32]) -> Vec<u8> {
 
 /// Computes SHA-256 compression for one message block.
 fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
-    let block = GenericArray::clone_from_slice(block);
-    compress256(state, std::slice::from_ref(&block));
+    compress256(state, std::slice::from_ref(block));
 }
 
 /// Precomputes the PHOTON M27 message words.

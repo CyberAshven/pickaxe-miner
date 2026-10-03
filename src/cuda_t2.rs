@@ -176,13 +176,7 @@ impl T2Engine {
             );
         }
         let mut state = SHA256_INITIAL_STATE;
-        let blocks = template[..T2_PREFIX_BYTES]
-            .as_chunks::<64>()
-            .0
-            .iter()
-            .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
-            .collect::<Vec<_>>();
-        sha2::compress256(&mut state, &blocks);
+        sha2::block_api::compress256(&mut state, template[..T2_PREFIX_BYTES].as_chunks::<64>().0);
         // Bytes 512..575 are unchanged by the nonce and signature, and
         // supports_job keeps the T2 amounts out of them.
         let mut middle_schedule = [0u32; 64];

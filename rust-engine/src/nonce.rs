@@ -1,5 +1,5 @@
 use crate::scalar::Scalar;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 fn hmac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {

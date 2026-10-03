@@ -13,8 +13,8 @@ upstream-rust = ["dep:ufsecp-core"]
 
 [dependencies]
 ufsecp-core = { git = "https://github.com/CyberAshven/UltrafastSecp256k1.git", rev = "e346efe3239175ef5d8dc97ca6e46920658bdf97", optional = true }
-sha2 = { version = "0.10", default-features = false, features = ["compress"] }
-hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+hmac = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 num-bigint = "0.4"
