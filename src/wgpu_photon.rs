@@ -5,20 +5,25 @@
 //! intermediates stay on the GPU; the host reads only counters plus a fixed
 //! number of winner nonce/HASH256 records.
 
-use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
+use crate::gpu_types::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
+use crate::{protocol::ProofRule, tx::PhotonLayout};
 use secp256k1::SecretKey;
 use sha2::compress256;
 use sha2::digest::generic_array::GenericArray;
 use std::borrow::Cow;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
+#[cfg(test)]
 const TX_BYTES: usize = 615;
-const TARGET_OFFSET: usize = 394;
-const INPUT_WORDS: usize = 155;
+const TEMPLATE_WORDS: usize = (615 + PhotonLayout::MAX_SHIFT).div_ceil(4);
+const INPUT_WORDS: usize = TEMPLATE_WORDS + 4;
 const INPUT_BYTES: usize = INPUT_WORDS * 4;
-const BASE_NONCE_OFFSET: u64 = 154 * 4;
+const BASE_NONCE_OFFSET: u64 = (TEMPLATE_WORDS * 4) as u64;
 const M38_RECORD_BYTES: usize = 160;
 const SIGNATURE_BYTES: usize = 64;
 const HASH_BYTES: usize = 32;
@@ -97,11 +102,64 @@ fn reference_shader_source_for_wgpu() -> Result<String, String> {
         .ok_or_else(|| "could not locate field_inv_binary closing brace".to_string())?;
     source.insert_str(function_close, "\n    return x1;");
     source.push('\n');
+    // Keep the upstream reference intact; update only the functions reachable
+    // from our production entry points. Native Metal/Vulkan and browser WebGPU
+    // compile this same source and consume the same PhotonLayout fields.
+    source = source.replace(
+        "words: array<u32, 154>,",
+        &format!("words: array<u32, {TEMPLATE_WORDS}>,"),
+    );
+    source = source.replacen(
+        "byteLength: u32,",
+        "byteLength: u32,\n    layoutShift: u32,\n    txLength: u32,\n    positiveProof: u32,",
+        1,
+    );
+    for (name, offsets) in [
+        ("m9_message_hash", &[394usize][..]),
+        ("m9_completed_tx_byte", &[390, 394, 426, 458, 490][..]),
+    ] {
+        let start = source
+            .find(&format!("fn {name}("))
+            .ok_or("missing WGSL layout function")?;
+        let end = start
+            + source[start..]
+                .find("\n}")
+                .ok_or("missing WGSL function end")?
+            + 2;
+        let mut body = source[start..end].to_string();
+        for offset in offsets {
+            body = body.replace(
+                &format!("{offset}u"),
+                &format!("({offset}u + input.layoutShift)"),
+            );
+        }
+        source.replace_range(start..end, &body);
+    }
+    let start = source
+        .find("fn m30_transaction_hashes_prefixed(")
+        .ok_or("missing prefixed HASH256")?;
+    let end = start
+        + source[start..]
+            .find("\n}")
+            .ok_or("missing HASH256 function end")?
+        + 2;
+    let body = source[start..end].replace("615u", "input.txLength");
+    source.replace_range(start..end, &body);
+    let start = source
+        .find("fn m10_hash_is_below_target(")
+        .ok_or("missing target predicate")?;
+    let end = start
+        + source[start..]
+            .find("\n}")
+            .ok_or("missing target predicate end")?
+        + 2;
+    source.replace_range(start..end, include_str!("wgpu_target.wgsl"));
     source.push_str(BOUNDED_C3_WGSL);
     Ok(source)
 }
 
 /// Rejects non-hardware WGPU adapters for mining.
+#[cfg(not(target_arch = "wasm32"))]
 fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
     matches!(
         info.device_type,
@@ -212,7 +270,7 @@ fn m27_precomputed_words(private_key: &[u8; 32]) -> [u32; 16] {
 }
 
 /// Builds the reusable PHOTON M30 message prefix.
-fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
+fn m30_prefix_words(template: &[u8]) -> [u32; 8] {
     let mut state = SHA256_IV;
     for block in template[..384].as_chunks::<64>().0 {
         compress_block(&mut state, block);
@@ -222,12 +280,14 @@ fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
 
 /// Checks GPU job material against authoritative PHOTON fields.
 fn validate_job_material(
-    template: &[u8; TX_BYTES],
+    template: &[u8],
     target: &[u8; 32],
     private_key: &[u8; 32],
 ) -> Result<(), String> {
-    if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
-        return Err("PHOTON WGPU target must match transaction template bytes 394..425".into());
+    let layout = PhotonLayout::for_tx_len(template.len())?;
+    let offset = layout.target_offset();
+    if template[offset..offset + 32] != target[..] {
+        return Err("PHOTON WGPU target must match transaction template".into());
     }
     SecretKey::from_secret_bytes(*private_key)
         .map_err(|error| format!("invalid PHOTON WGPU signing key: {error}"))?;
@@ -289,6 +349,7 @@ fn create_bind_group(
 }
 
 pub struct WgpuPhotonEngine {
+    #[cfg(not(target_arch = "wasm32"))]
     instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -322,15 +383,36 @@ pub struct WgpuPhotonEngine {
     recommended_candidates: u32,
     _adapter_name: String,
     job_ready: bool,
+    positive_target_rule: bool,
 }
 
 impl WgpuPhotonEngine {
     /// Creates a WgpuPhotonEngine for the portable GPU pipeline.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(
         device_ordinal: usize,
         max_candidates: u32,
         winner_cap: u32,
     ) -> Result<Self, String> {
+        let table = m29_table::load_or_generate_m29_g16()?;
+        pollster::block_on(Self::new_async(
+            device_ordinal,
+            max_candidates,
+            winner_cap,
+            table,
+        ))
+    }
+
+    /// Uses the same asynchronous pipeline on native and browser devices.
+    pub async fn new_async(
+        device_ordinal: usize,
+        max_candidates: u32,
+        winner_cap: u32,
+        table: (Vec<u8>, M29TableSource),
+    ) -> Result<Self, String> {
+        if !m29_table::valid_table(&table.0) {
+            return Err("invalid PHOTON generator table".into());
+        }
         if max_candidates == 0 {
             return Err("PHOTON WGPU max_candidates must be greater than zero".into());
         }
@@ -338,11 +420,13 @@ impl WgpuPhotonEngine {
             return Err("PHOTON WGPU winner_cap must be greater than zero".into());
         }
 
-        let backends = crate::backend::production_wgpu_backends();
+        let backends = production_wgpu_backends();
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_descriptor.backends = backends;
         let instance = wgpu::Instance::new(instance_descriptor);
-        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+        #[cfg(not(target_arch = "wasm32"))]
+        let adapters = instance.enumerate_adapters(backends).await;
+        #[cfg(not(target_arch = "wasm32"))]
         let adapter = adapters
             .into_iter()
             .filter(|adapter| is_hardware_adapter(&adapter.get_info()))
@@ -350,6 +434,21 @@ impl WgpuPhotonEngine {
             .ok_or_else(|| {
                 format!("no hardware WGPU adapter at backend-local ordinal {device_ordinal}")
             })?;
+        #[cfg(target_arch = "wasm32")]
+        let adapter = {
+            if device_ordinal != 0 {
+                return Err("the browser selects the GPU adapter".into());
+            }
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| format!("WebGPU adapter: {error}"))?
+        };
         let adapter_info = adapter.get_info();
         let limits = adapter.limits();
         if (limits.max_storage_buffer_binding_size as usize) < m29_table::M29_G16_BYTES {
@@ -385,7 +484,9 @@ impl WgpuPhotonEngine {
             required_limits: limits,
             ..Default::default()
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
+        let (device, queue) = adapter
+            .request_device(&descriptor)
+            .await
             .map_err(|error| format!("request WGPU device {}: {error}", adapter_info.name))?;
 
         let shader_source = reference_shader_source_for_wgpu()?;
@@ -404,7 +505,7 @@ impl WgpuPhotonEngine {
         let stage_c2 = create_pipeline(&device, &shader, "photon_m6725_c2_hash_only_wg64");
         let stage_c3 = create_pipeline(&device, &shader, "pickaxe_photon_c3_bounded_wg64");
 
-        let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
+        let (table_bytes, table_source) = table;
         let table_gpu = create_buffer(
             &device,
             "PHOTON M29 16-bit generator table",
@@ -592,6 +693,7 @@ impl WgpuPhotonEngine {
         );
 
         Ok(Self {
+            #[cfg(not(target_arch = "wasm32"))]
             instance,
             device,
             queue,
@@ -625,6 +727,7 @@ impl WgpuPhotonEngine {
             recommended_candidates: initial_wgpu_batch_size(max_candidates),
             _adapter_name: adapter_info.name,
             job_ready: false,
+            positive_target_rule: false,
         })
     }
 
@@ -654,17 +757,31 @@ impl WgpuPhotonEngine {
         self.recommended_candidates
     }
 
+    pub fn set_proof_rule(&mut self, rule: ProofRule) {
+        self.positive_target_rule = rule == ProofRule::Positive;
+        self.job_ready = false;
+    }
+
     /// Writes validated PHOTON job data to WGPU buffers.
     pub fn set_job(
         &mut self,
-        template: &[u8; TX_BYTES],
+        template: &[u8],
         target: &[u8; 32],
         private_key: &[u8; 32],
     ) -> Result<(), String> {
+        self.job_ready = false;
         validate_job_material(template, target, private_key)?;
-
-        let mut input = pack_big_endian_words(template, 154);
-        input.extend_from_slice(&0u32.to_le_bytes());
+        let layout = PhotonLayout::for_tx_len(template.len())?;
+        if self.positive_target_rule && (target[31] & 0x80 != 0 || target.iter().all(|b| *b == 0)) {
+            return Err("PHOTON target must be a positive ScriptNum".into());
+        }
+        let mut input = pack_big_endian_words(template, TEMPLATE_WORDS);
+        input.extend_from_slice(&u32_words_to_le_bytes(&[
+            0,
+            layout.shift() as u32,
+            template.len() as u32,
+            u32::from(self.positive_target_rule),
+        ]));
         debug_assert_eq!(input.len(), INPUT_BYTES);
         let private_words = pack_big_endian_words(private_key, 8);
         let m27 = u32_words_to_le_bytes(&m27_precomputed_words(private_key));
@@ -680,7 +797,16 @@ impl WgpuPhotonEngine {
     }
 
     /// Dispatches a bounded portable GPU candidate search.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn search_batch(
+        &mut self,
+        nonce_base: u32,
+        candidate_count: u32,
+    ) -> Result<PhotonCudaBatchResult, String> {
+        pollster::block_on(self.search_batch_async(nonce_base, candidate_count))
+    }
+
+    pub async fn search_batch_async(
         &mut self,
         nonce_base: u32,
         candidate_count: u32,
@@ -702,7 +828,10 @@ impl WgpuPhotonEngine {
             ));
         }
         let adapt_batch = candidate_count == self.recommended_candidates;
+        #[cfg(not(target_arch = "wasm32"))]
         let batch_started = Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        let batch_started = js_sys::Date::now();
 
         let active_candidates = candidate_count.div_ceil(128) * 128;
         let groups_a = active_candidates / 128;
@@ -795,15 +924,28 @@ impl WgpuPhotonEngine {
         self.queue.submit([encoder.finish()]);
 
         let slice = self.readback_gpu.slice(..self.readback_bytes as u64);
-        let (map_tx, map_rx) = mpsc::sync_channel(1);
+        let ready = Arc::new(Mutex::new((None, None::<std::task::Waker>)));
+        let callback = Arc::clone(&ready);
         slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = map_tx.send(result);
+            let mut state = callback.lock().unwrap();
+            state.0 = Some(result);
+            if let Some(waker) = state.1.take() {
+                waker.wake();
+            }
         });
+        #[cfg(not(target_arch = "wasm32"))]
         self.instance.poll_all(true);
-        map_rx
-            .recv()
-            .map_err(|_| "WGPU result map callback disconnected".to_string())?
-            .map_err(|error| format!("map WGPU bounded result: {error}"))?;
+        std::future::poll_fn(|cx| {
+            let mut state = ready.lock().unwrap();
+            if let Some(result) = state.0.take() {
+                Poll::Ready(result)
+            } else {
+                state.1 = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+        .map_err(|error| format!("map WGPU bounded result: {error}"))?;
 
         let view = slice
             .get_mapped_range()
@@ -840,12 +982,14 @@ impl WgpuPhotonEngine {
         }
         drop(view);
         self.readback_gpu.unmap();
+        #[cfg(not(target_arch = "wasm32"))]
+        let elapsed = batch_started.elapsed();
+        #[cfg(target_arch = "wasm32")]
+        let elapsed =
+            Duration::from_secs_f64(((js_sys::Date::now() - batch_started) / 1000.0).max(0.0));
         if adapt_batch {
-            self.recommended_candidates = next_wgpu_batch_size(
-                candidate_count,
-                batch_started.elapsed(),
-                self.max_candidates,
-            );
+            self.recommended_candidates =
+                next_wgpu_batch_size(candidate_count, elapsed, self.max_candidates);
         }
 
         Ok(PhotonCudaBatchResult {
@@ -853,6 +997,17 @@ impl WgpuPhotonEngine {
             total_winners,
             winners,
         })
+    }
+}
+
+/// Platform APIs used by both discovery and execution.
+pub fn production_wgpu_backends() -> wgpu::Backends {
+    if cfg!(target_arch = "wasm32") {
+        wgpu::Backends::BROWSER_WEBGPU
+    } else if cfg!(target_os = "macos") {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN
     }
 }
 
@@ -872,7 +1027,7 @@ mod tests {
     }
 
     fn assert_reconstructs(
-        template: &[u8; TX_BYTES],
+        template: &[u8],
         target: &[u8; 32],
         private_key: &[u8; 32],
         winner: &PhotonCudaWinner,
@@ -884,12 +1039,45 @@ mod tests {
                 .serialize();
         assert!(crypto::bch_schnorr_verify(&public_key, &message, &signature).unwrap());
 
-        let mut completed = *template;
+        let mut completed = template.to_vec();
         completed[390..394].copy_from_slice(&winner.nonce.to_le_bytes());
         completed[426..490].copy_from_slice(&signature);
         let expected = search::hash256(&completed);
         assert_eq!(winner.digest, expected);
         assert!(search::meets_target_le(&expected, target));
+    }
+
+    #[test]
+    fn portable_shader_validates_current_layout_and_proof_fields_without_a_gpu() {
+        let source = reference_shader_source_for_wgpu().unwrap();
+        let module = naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+        assert!(source.contains("words: array<u32, 158>"));
+        for shift in PhotonLayout::GPU_SHIFTS {
+            let layout = PhotonLayout::for_tx_len(615 + shift).unwrap();
+            let target = [0x42; 32];
+            let mut template = vec![0; layout.tx_bytes()];
+            template[layout.target_offset()..layout.target_offset() + 32].copy_from_slice(&target);
+            let mut key = [0; 32];
+            key[31] = 1;
+            validate_job_material(&template, &target, &key).unwrap();
+            let packed = pack_big_endian_words(&template, TEMPLATE_WORDS);
+            let byte_at = |i: usize| {
+                let start = i / 4 * 4;
+                let word = u32::from_le_bytes(packed[start..start + 4].try_into().unwrap());
+                ((word >> ((3 - i % 4) * 8)) & 255) as u8
+            };
+            for (i, expected) in target.iter().enumerate() {
+                assert_eq!(byte_at(394 + shift + i), *expected);
+            }
+            assert!(layout.tx_bytes() <= 631);
+        }
     }
 
     #[test]
@@ -1043,5 +1231,66 @@ mod tests {
             + winner_cap as usize * WINNER_RECORD_BYTES
             + (RESULT_BYTES + winner_cap as usize * WINNER_RECORD_BYTES);
         assert_eq!(engine.persistent_device_bytes(), expected_bytes);
+
+        // Exercise actual serializer layouts, including both current deployments.
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        let public_key =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(private_key).unwrap())
+                .serialize();
+        for deployment in [
+            crate::protocol::MAINNET_V0_PHOTON,
+            crate::protocol::MAINNET_PHOTON,
+            crate::protocol::CHIPNET_PHOTON,
+        ] {
+            for age in [8, 17, 128, 32_768] {
+                let Ok(layout) = PhotonLayout::for_age_with_deployment(age, &deployment) else {
+                    continue;
+                };
+                let template = tx::build_photon_template_bytes_for_deployment(
+                    &tx::TemplateParams {
+                        prev_tx_hash_hex: "11".repeat(32),
+                        prev_index: 0,
+                        age,
+                        public_key_hex: hex::encode(public_key),
+                        target_hex: hex::encode(target),
+                        signature_hex: "00".repeat(64),
+                        nonce: 0,
+                        contract_value_sats: 48_635_000,
+                        relay_fee_sats_per_kb: 1_100,
+                        contract_token_amount: 2_095_454_920_205_042,
+                        reward_amount: 4_989_178_380,
+                        payout_locking: tx::cashaddr_to_p2pkh_locking(
+                            crate::config::DONATION_ADDRESS,
+                        )
+                        .unwrap(),
+                    },
+                    &deployment,
+                )
+                .unwrap();
+                engine.set_proof_rule(deployment.proof_rule);
+                engine.set_job(&template, &target, &private_key).unwrap();
+                let actual = engine.search_batch(nonce_base, candidate_count).unwrap();
+                let mut expected = std::collections::BTreeMap::new();
+                for nonce in nonce_base..nonce_base + candidate_count {
+                    let message = tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
+                    let signature = crypto::bch_schnorr_sign(&private_key, &message).unwrap();
+                    assert!(crypto::bch_schnorr_verify(&public_key, &message, &signature).unwrap());
+                    let mut completed = template.clone();
+                    let offset = layout.nonce_offset();
+                    completed[offset..offset + 4].copy_from_slice(&nonce.to_le_bytes());
+                    let offset = layout.signature_offset();
+                    completed[offset..offset + 64].copy_from_slice(&signature);
+                    let digest = search::hash256(&completed);
+                    if search::meets_target_le_for_rule(&digest, &target, deployment.proof_rule) {
+                        expected.insert(nonce, digest);
+                    }
+                }
+                assert_eq!(actual.total_winners as usize, expected.len());
+                for winner in actual.winners {
+                    assert_eq!(expected.get(&winner.nonce), Some(&winner.digest));
+                }
+            }
+        }
     }
 }

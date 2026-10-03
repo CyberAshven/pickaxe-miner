@@ -57,7 +57,7 @@ const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
 type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 #[derive(Debug, Clone)]
-pub(crate) struct SetupResult {
+pub struct SetupResult {
     pub config: RuntimeConfig,
     pub backend: BackendKind,
     pub device: u32,
@@ -65,7 +65,7 @@ pub(crate) struct SetupResult {
 }
 
 #[derive(Default)]
-pub(crate) struct SetupOverrides {
+pub struct SetupOverrides {
     pub network: Option<MiningNetwork>,
     pub token: Option<String>,
     pub intensity: Option<u8>,
@@ -1169,7 +1169,7 @@ impl TuiState {
 
 /// Runs the interactive setup flow before starting mining.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_setup(
+pub fn run_setup(
     config: RuntimeConfig,
     devices: Vec<GpuDevice>,
     default_device: &GpuDevice,

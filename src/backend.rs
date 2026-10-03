@@ -6,36 +6,7 @@ use libloading::Library;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind {
-    Auto,
-    Cuda,
-    Hip,
-    Wgpu,
-}
-
-impl BackendKind {
-    /// Parses a requested GPU backend by name.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "cuda" => Ok(Self::Cuda),
-            "hip" | "rocm" => Ok(Self::Hip),
-            "wgpu" => Ok(Self::Wgpu),
-            other => Err(format!("unknown backend `{other}` (auto|cuda|hip|wgpu)")),
-        }
-    }
-
-    /// Returns the canonical CLI name of the GPU backend.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Cuda => "cuda",
-            Self::Hip => "hip",
-            Self::Wgpu => "wgpu",
-        }
-    }
-}
+pub use crate::backend_kind::BackendKind;
 
 #[derive(Debug, Clone)]
 pub struct GpuDevice {
@@ -178,7 +149,7 @@ fn wgpu_vendor_name(vendor: u32) -> String {
 #[cfg(feature = "portable-wgpu")]
 /// Limits WGPU discovery to production-capable APIs.
 pub(crate) fn production_wgpu_backends() -> wgpu::Backends {
-    wgpu::Backends::VULKAN
+    crate::wgpu_photon::production_wgpu_backends()
 }
 
 #[cfg(feature = "portable-wgpu")]
@@ -218,7 +189,7 @@ fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
     }
 
     if out.is_empty() {
-        Err("WGPU found no hardware Vulkan GPU adapters".into())
+        Err("WGPU found no hardware GPU adapters".into())
     } else {
         Ok(out)
     }
@@ -232,6 +203,9 @@ fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
 
 /// Enumerates CUDA devices usable for mining.
 fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
+    if cfg!(target_os = "macos") {
+        return Err("CUDA is unavailable on macOS; use the wgpu Metal backend".into());
+    }
     // Driver must be initialized before get_count (same path CudaContext::new uses).
     cudarc::driver::result::init()
         .map_err(|e| format!("CUDA unavailable: {e}. Install or fix the CUDA runtime."))?;
@@ -511,8 +485,15 @@ mod tests {
 
     #[cfg(feature = "portable-wgpu")]
     #[test]
-    fn production_wgpu_surface_is_vulkan_only() {
-        assert_eq!(production_wgpu_backends(), wgpu::Backends::VULKAN);
+    fn production_wgpu_surface_matches_platform() {
+        assert_eq!(
+            production_wgpu_backends(),
+            if cfg!(target_os = "macos") {
+                wgpu::Backends::METAL
+            } else {
+                wgpu::Backends::VULKAN
+            }
+        );
     }
 
     #[test]

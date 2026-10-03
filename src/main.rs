@@ -4,48 +4,10 @@
 //! Each supported token declares its fee policy.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
-mod backend;
-mod benchmark;
-mod cli;
-mod config;
-mod crypto;
-#[cfg(test)]
-#[allow(dead_code, clippy::needless_range_loop)]
-mod cuda_miner;
-#[allow(dead_code)]
-mod cuda_photon;
-#[cfg(test)]
-mod cuda_stage_a;
-#[cfg(test)]
-mod cuda_stage_a_ref;
-#[cfg(test)]
-mod cuda_stage_b;
-#[allow(dead_code)]
-mod cuda_stage_c;
-mod donation;
-#[allow(dead_code)]
-mod electrum;
-mod hip_photon;
-#[allow(dead_code)]
-mod m29_table;
-mod mining_lock;
-#[allow(dead_code)]
-mod node;
-#[allow(dead_code)]
-mod protocol;
-mod reward;
-mod runtime;
-#[allow(dead_code)]
-mod search;
-mod self_test;
-#[cfg(test)]
-mod stage_b;
-mod telemetry;
-#[allow(dead_code)]
-mod tui;
-mod tx;
-#[cfg(feature = "portable-wgpu")]
-mod wgpu_photon;
+use pickaxe_miner::{
+    backend, benchmark, cli, config, electrum, mining_lock, node, runtime, search, self_test,
+    telemetry, tui, tx,
+};
 
 use config::RuntimeConfig;
 use electrum::{ElectrumSession, LiveJob};

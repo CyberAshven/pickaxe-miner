@@ -150,6 +150,17 @@ impl Schedule {
     }
 }
 
+pub(crate) fn require_direct_reward_policy(scheme: crate::donation::Scheme) -> Result<(), String> {
+    scheme.validate()?;
+    if scheme.reward() != [0, 0] {
+        return Err(
+            "this PHOTON deployment supports work fees only; a reward-split adapter is required"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

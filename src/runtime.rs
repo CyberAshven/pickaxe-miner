@@ -5,6 +5,8 @@
 //! supervisor keeps network polling independent of the GPU hot path and applies
 //! an immutable generation change at the worker's next batch boundary.
 
+use crate::donation::require_direct_reward_policy;
+
 use crate::backend::BackendKind;
 use crate::config::{JobSource, MiningNetwork, RuntimeConfig};
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
@@ -2075,19 +2077,6 @@ fn prepare_submission_for_network(
     let pending = PendingSubmission::from_direct(winner, live, cfg, recipient)?;
     pending.persist_new(journal_path)?;
     Ok(pending)
-}
-
-/// The current PHOTON direct claim cannot fund extra reward outputs. Other
-/// protocols provide their own split builder; changing a policy must fail closed.
-fn require_direct_reward_policy(scheme: crate::donation::Scheme) -> Result<(), String> {
-    scheme.validate()?;
-    if scheme.reward() != [0, 0] {
-        return Err(
-            "this PHOTON deployment supports work fees only; a reward-split adapter is required"
-                .into(),
-        );
-    }
-    Ok(())
 }
 
 /// Resolves any outstanding submission before allowing new GPU work.

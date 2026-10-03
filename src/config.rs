@@ -533,7 +533,7 @@ impl SavedConfig {
     /// Rejects inconsistent or unsupported saved configuration values.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(value) = &self.backend {
-            crate::backend::BackendKind::parse(value)?;
+            crate::backend_kind::BackendKind::parse(value)?;
         }
         let mut runtime = RuntimeConfig::default();
         self.apply_to_runtime(&mut runtime)?;
@@ -980,6 +980,7 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
     if !replacing {
         if let Err(error) = restrict_private_config(path) {
+            #[cfg(not(target_arch = "wasm32"))]
             drop(file);
             let _ = fs::remove_file(path);
             return Err(error);
@@ -993,6 +994,8 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn restrict_private_config(path: &Path) -> Result<(), String> {
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

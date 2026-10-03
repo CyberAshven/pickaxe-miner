@@ -805,9 +805,9 @@ fn apply_reference_signature_with_payout_sats_for_deployment(
     if let Some(sats) = payout_sats {
         set_payout_value_sats(&mut tx, sats)?;
     }
-    let target = crate::search::parse_hex32(&job.target_le_hex)?;
-    let digest = crate::search::hash256(&tx);
-    if !crate::search::meets_target_le_for_rule(&digest, &target, deployment.proof_rule) {
+    let target = crate::proof::parse_hex32(&job.target_le_hex)?;
+    let digest = crate::proof::hash256(&tx);
+    if !crate::proof::meets_target_le_for_rule(&digest, &target, deployment.proof_rule) {
         return Err(format!(
             "candidate HASH256 {} does not meet PHOTON target {}",
             hex::encode(digest),
@@ -945,7 +945,7 @@ mod tests {
             contract_token_amount: 2_096_937_231_989_870,
             reward_raw: 4_992_707_694,
         };
-        let target = crate::search::parse_hex32(&job.target_le_hex).unwrap();
+        let target = crate::proof::parse_hex32(&job.target_le_hex).unwrap();
         for nonce in 0..32 {
             let message = photon_message_sha256(nonce, &job.target_le_hex).unwrap();
             let signature = crate::crypto::bch_schnorr_sign(&sk, &message).unwrap();
@@ -967,8 +967,8 @@ mod tests {
                 &crate::protocol::CHIPNET_PHOTON,
             )
             .unwrap();
-            if crate::search::meets_target_le_for_rule(
-                &crate::search::hash256(&raw),
+            if crate::proof::meets_target_le_for_rule(
+                &crate::proof::hash256(&raw),
                 &target,
                 crate::protocol::ProofRule::Positive,
             ) {
