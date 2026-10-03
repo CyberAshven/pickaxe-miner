@@ -10,7 +10,7 @@ Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken bat
 
 Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
 
-Mainnet and Chipnet run the PHOTON v3.2 contract (mainnet category `53bd86e3f123918d2d7040449f88f7ed1bbddc309b66f2ac67cd429278f5ea58`). The retired PHOTON v0 is no longer mined, and the v0.0.2 release predates this change.
+Mainnet and Chipnet run the PHOTON v3.2 contract (mainnet category `53bd86e3f123918d2d7040449f88f7ed1bbddc309b66f2ac67cd429278f5ea58`). The retired PHOTON v0 is no longer mined; releases before v0.0.3 mine only v0.
 
 PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes mine for your wallet. Each win pays directly. There is no additional reward split, minimum withdrawal, or deposit required. The donation is based on work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
 
@@ -23,21 +23,21 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 
 ## Install
 
-Download the archive for your operating system from the [v0.0.2 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.2). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
+Download the archive for your operating system from the [v0.0.3 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.3). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
 
 Linux:
 
 ```bash
-tar -xzf pickaxe-miner-v0.0.2-linux-x86_64.tar.gz
-cd pickaxe-miner-v0.0.2-linux-x86_64
+tar -xzf pickaxe-miner-v0.0.3-linux-x86_64.tar.gz
+cd pickaxe-miner-v0.0.3-linux-x86_64
 ./pickaxe mine
 ```
 
 Windows PowerShell:
 
 ```powershell
-Expand-Archive pickaxe-miner-v0.0.2-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.2-windows-x86_64
-cd pickaxe-miner-v0.0.2-windows-x86_64
+Expand-Archive pickaxe-miner-v0.0.3-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.3-windows-x86_64
+cd pickaxe-miner-v0.0.3-windows-x86_64
 .\pickaxe.exe mine
 ```
 
@@ -65,7 +65,7 @@ Fulcrum servers and nodes you add are saved once per network in `config.sources.
 
 ## Chipnet PHOTON test
 
-Use a build containing Chipnet support (the v0.0.2 download above predates it). After building this branch, run from the project root with the GPU files in place:
+Use v0.0.3 or newer, which includes Chipnet support. After building this branch, run from the project root with the GPU files in place:
 
 ```bash
 ./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bitcoincash:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
@@ -141,7 +141,7 @@ The legacy CUDA C++ backend remains available with
 `cargo build --release --locked --no-default-features --features tail-grind`.
 Use a separate output directory when comparing the two builds.
 
-The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.2`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
+The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.3`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
 
 The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing backend. Other NVIDIA architectures require compatible CUDA files and separate validation.
 
