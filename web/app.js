@@ -84,7 +84,7 @@ async function run() {
         const pending = localStorage.getItem(journal);
         if (pending) { status('Resolving pending reward…'); await settle(JSON.parse(pending)); continue; }
         if (performance.now() - lastSnapshot > 1000) await snapshot();
-        status('Mining');
+        status(candidates ? 'Mining' : 'Preparing the first GPU batch; shader compilation can take several minutes…');
         const batchStart = performance.now();
         const result = JSON.parse(await miner.search());
         const elapsed = performance.now() - batchStart;
