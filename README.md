@@ -21,6 +21,22 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 - AMD: HIP `gfx1036`
 - Apple Silicon (Metal) and browser (WebGPU/WASM) builds: [portable build instructions](docs/portable.md).
 
+## Quick start: mainnet TUI
+
+From the extracted download folder, run the command for your platform:
+
+| Platform | Command |
+| --- | --- |
+| Windows PowerShell | `.\pickaxe.exe mine --network mainnet` |
+| Linux | `./pickaxe mine --network mainnet` |
+| Apple Silicon Mac | `./pickaxe mine --network mainnet --backend wgpu` |
+
+The interactive setup opens with Mainnet selected. Enter your payout address
+and choose **Start mining**. Saved profiles keep your settings for next time.
+To skip setup and start directly in the mining TUI, append
+`--address "YOUR_MAINNET_PAYOUT_ADDRESS"`, replacing the placeholder with your
+valid payout CashAddr. Servers are selected automatically.
+
 ## Install
 
 Download the archive for your operating system from the [v0.0.3 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.3). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:

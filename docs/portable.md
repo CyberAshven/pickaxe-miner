@@ -16,8 +16,19 @@ archive on each pull request and master/dev update. Extract it, verify its
 checksum and source commit, then run:
 
 ```sh
-./pickaxe mine --backend wgpu
+./pickaxe mine --network mainnet --backend wgpu
 ```
+
+This opens the mainnet TUI setup. Enter your payout address and choose
+**Start mining**; connection settings are automatic. To open the mining TUI
+and start immediately with a known address, run:
+
+```sh
+./pickaxe mine --network mainnet --backend wgpu --address "YOUR_MAINNET_PAYOUT_ADDRESS"
+```
+
+Replace the placeholder with your valid payout CashAddr. Use `--network chipnet`
+instead of `--network mainnet` for test mining.
 
 This is a command-line archive, without Developer ID signing or notarization.
 No Apple Developer account is needed to build it. macOS may require explicit
