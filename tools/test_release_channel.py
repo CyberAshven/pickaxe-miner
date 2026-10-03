@@ -10,6 +10,43 @@ import unittest
 
 
 class ReleaseChannelTest(unittest.TestCase):
+    def test_download_replacement_never_creates_a_release(self):
+        workflow = (Path(__file__).resolve().parents[1] /
+                    '.github/workflows/release.yml').read_text(encoding='utf-8')
+        block = re.search(
+            r'      - name: Publish release assets\n.*?        run: \|\n'
+            r'((?:          [^\n]*\n|\n)+)', workflow, re.S)
+        self.assertIsNotNone(block)
+        script = textwrap.dedent(block[1])
+        mock_gh = '''gh() {
+          printf '%s\\n' "$*" >> gh.calls
+          if [[ "$1 $2" == "release view" ]]; then
+            return "$RELEASE_MISSING"
+          fi
+        }
+        '''
+        with tempfile.TemporaryDirectory() as directory:
+            calls = Path(directory) / 'gh.calls'
+            for rebuild, missing, allowed in [(True, False, True),
+                                               (True, True, False),
+                                               (False, True, True)]:
+                with self.subTest(rebuild=rebuild, missing=missing):
+                    calls.unlink(missing_ok=True)
+                    env = dict(os.environ, MODE='publish',
+                               TAG='pickaxe-miner-v0.0.3', SHA='a' * 40,
+                               GH_REPO='example/miner',
+                               REBUILD_SHA='a' * 40 if rebuild else '',
+                               RELEASE_MISSING=str(int(missing)))
+                    result = subprocess.run(
+                        [shutil.which('bash'), '--noprofile', '--norc', '-c', mock_gh + script],
+                        cwd=directory, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, allowed,
+                                     result.stdout + result.stderr)
+                    commands = calls.read_text(encoding='utf-8')
+                    self.assertEqual('release create ' in commands, not rebuild)
+                    self.assertEqual('release upload ' in commands, not missing)
+                    self.assertEqual('release edit ' in commands, not missing)
+
     def test_publication_and_promotion_channels(self):
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
