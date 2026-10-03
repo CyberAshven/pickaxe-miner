@@ -1,6 +1,7 @@
 import init, { BrowserMiner, browser_config, validate_payout_address } from './pkg/pickaxe_miner.js';
 import { Electrum } from './rpc.js';
 import { resolveSubmission } from './submission.js';
+import { MiningError, searchBatch, unsupportedReason } from './platform.js';
 
 const $ = id => document.getElementById(id);
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -88,7 +89,7 @@ async function run() {
         if (performance.now() - lastSnapshot > 1000) await snapshot();
         status(candidates ? 'Mining' : 'Preparing the first GPU batch; shader compilation can take several minutes…');
         const batchStart = performance.now();
-        const result = JSON.parse(await miner.search());
+        const result = await searchBatch(miner);
         const elapsed = performance.now() - batchStart;
         candidates += result.candidates;
         $('stats').textContent = `Active GPU ${(result.candidates / Math.max(elapsed, 1) / 1000).toFixed(2)} MH/s · wall average ${(candidates / (performance.now() - started) / 1000).toFixed(2)} MH/s\n${wins} accepted · ${Math.floor((performance.now() - started) / 1000)}s elapsed`;
@@ -99,6 +100,7 @@ async function run() {
         failures = 0;
         await wait(Math.max(0, elapsed * (100 / Number($('intensity').value) - 1)));
       } catch (error) {
+        if (error instanceof MiningError) throw error;
         // Bounded retries preserve the journal and surface persistent failures.
         if (++failures > 3) throw error;
         log(String(error)); status('Refreshing connection…');
@@ -117,12 +119,17 @@ $('setup').onsubmit = async event => {
   event.preventDefault();
   if (!ready) return;
   try {
-    if (!navigator.gpu || !navigator.locks) throw new Error('This browser needs WebGPU and Web Locks on HTTPS or localhost');
+    const unsupported = unsupportedReason();
+    if (unsupported) throw new Error(unsupported);
     await navigator.locks.request('pickaxe-gpu', { ifAvailable: true }, async lock => {
       if (!lock) throw new Error('Another Pickaxe tab on this site is already mining');
       await run();
     });
   } catch (error) { status(String(error)); }
 };
-try { await init(); networkChanged(); ready = true; status('Ready'); }
-catch (error) { status(`Could not load shared Rust engine: ${error}`); }
+const unsupported = unsupportedReason();
+if (unsupported) { $('start').disabled = true; status(unsupported); }
+else {
+  try { await init(); networkChanged(); ready = true; status('Ready'); }
+  catch (error) { $('start').disabled = true; status(`Could not load shared Rust engine: ${error}`); }
+}

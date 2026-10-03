@@ -67,6 +67,12 @@ mining starts only when you press **Start mining**. No wallet private key is
 requested. Use a WebGPU-capable browser on HTTPS or localhost. Keep the tab
 open: browsers may throttle background tabs or suspend work on sleep.
 
+The application checks WebGPU, WebAssembly and Web Locks capabilities rather
+than browser names. Chromium, Firefox and Safari provide these standards on
+supported systems; actual availability depends on browser version, OS, GPU and
+driver. Unsupported environments show the reason before mining starts. A GPU
+or winner-verification failure stops mining rather than retrying servers.
+
 Close desktop miners before starting. Web Locks prevent two mining tabs on
 the **same website**; browser isolation cannot enforce the desktop process
 lock or coordinate unrelated websites.
@@ -83,7 +89,7 @@ Build the browser bundle (Rust, Python 3.11+, Clang and Node.js 24):
 rustup target add wasm32-unknown-unknown
 cargo install --locked wasm-bindgen-cli --version 0.2.128
 python tools/build-browser.py
-node --test web/rpc.test.mjs web/submission.test.mjs
+node --test web/rpc.test.mjs web/submission.test.mjs web/platform.test.mjs
 node web/smoke.mjs
 python -m http.server 8080 --bind 127.0.0.1 --directory dist/web
 ```
