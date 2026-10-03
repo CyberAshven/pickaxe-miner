@@ -1,5 +1,12 @@
 # Maintainer fee policy
 
+PHOTON's BCH network fee is separate from the donation policy below. The miner
+refreshes the connected Fulcrum's relay minimum and any configured node's mempool
+minimum every 30 seconds, with a floor of 1 sat/byte. It rounds up by transaction
+size and starts a new work generation when the rate changes. The reward keeps
+700 sats; unused allowance stays in the baton. A rate exceeding the covenant's
+1,500-sat total allowance stops new work rather than requesting user funding.
+
 Edit `MiningToken::fee_policy` in `src/config.rs` to select a token's mode,
 fee shares and payout addresses. This is compiled policy, not a
 user preference. Saved profiles and command-line arguments cannot change it.

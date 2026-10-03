@@ -96,7 +96,7 @@ pub fn fetch_relay_policy(endpoints: &[String]) -> Result<(String, RelayPolicy),
 }
 
 /// Converts a JSON BCH amount into integral satoshis.
-fn bch_value_to_sats(value: &Value) -> Result<u64, String> {
+pub(crate) fn bch_value_to_sats(value: &Value) -> Result<u64, String> {
     let text = match value {
         Value::Number(number) => number.to_string(),
         Value::String(text) => text.clone(),
@@ -445,6 +445,7 @@ fn finalize_native_photon_snapshot(
         baton_vout: second_baton.vout,
         baton_height: second_baton.height,
         baton_value_sats: second_baton.value_sats,
+        relay_fee_sats_per_kb: 1_000,
         commitment_hex: second_baton.commitment_hex,
         token_amount: second_baton.token_amount,
         age: derived.age,

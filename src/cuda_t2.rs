@@ -633,6 +633,7 @@ mod tests {
             signature_hex: hex::encode(signature),
             nonce,
             contract_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
             contract_token_amount: TOTAL,
             reward_amount: reward,
             payout_locking: tx::cashaddr_to_p2pkh_locking(
@@ -654,6 +655,7 @@ mod tests {
                 signature_hex: "00".repeat(64),
                 nonce: 0,
                 contract_value_sats: 15_971_500,
+                relay_fee_sats_per_kb: 1_000,
                 contract_token_amount: u128::from(baton) + REWARD,
                 reward_amount: REWARD,
                 payout_locking: tx::cashaddr_to_p2pkh_locking(

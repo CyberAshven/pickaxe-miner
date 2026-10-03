@@ -40,6 +40,10 @@ on:
         description: "Existing semantic tag to build and publish, e.g. pickaxe-miner-v0.0.1"
         required: true
         type: string
+      source_commit:
+        description: "Optional full merged commit SHA to replace this release's downloads without moving its tag"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -65,7 +69,7 @@ jobs:
       - name: Checkout release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || (github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha) }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.source_commit || inputs.tag) || (github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha) }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -154,6 +158,8 @@ jobs:
           MODE: ${{ steps.release.outputs.mode }}
           SHA: ${{ steps.release.outputs.sha }}
           BRANCH: ${{ github.base_ref || github.ref_name }}
+          REBUILD_SHA: ${{ inputs.source_commit }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           version="${TAG#pickaxe-miner-v}"
@@ -172,6 +178,13 @@ jobs:
           if ! git merge-base --is-ancestor "${SHA}" FETCH_HEAD; then
             echo "${TAG} must point to a reviewed commit on ${channel}." >&2
             exit 1
+          fi
+          if [[ -n "${REBUILD_SHA:-}" ]]; then
+            if [[ "${MODE}" != "publish" || ! "${REBUILD_SHA}" =~ ^[0-9a-f]{40}$ || "${REBUILD_SHA}" != "${SHA}" || "${SHA}" != "${WORKFLOW_SHA}" ]]; then
+              echo "A download replacement must build the exact merged workflow commit." >&2
+              exit 1
+            fi
+            git merge-base --is-ancestor "refs/tags/${TAG}" "${SHA}"
           fi
 
   hip-gfx1036:
@@ -521,6 +534,8 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
           MODE: ${{ needs.validate.outputs.mode }}
           SHA: ${{ needs.validate.outputs.sha }}
+          REBUILD_SHA: ${{ inputs.source_commit }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -euo pipefail
           version="${TAG#pickaxe-miner-v}"
@@ -542,6 +557,11 @@ jobs:
             echo "The default interface is the interactive TUI. Headless mode is --no-tui."
             echo "There is no CPU mining fallback."
             echo "Source commit: ${SHA}"
+            if [[ -n "${REBUILD_SHA}" ]]; then
+              echo
+              echo "Downloads rebuilt $(date -u +%F) with the PHOTON transaction-fee fix. Existing installations are unchanged."
+              echo "The original tag is unchanged. Updated source: [${SHA}](${SOURCE_URL}/tree/${SHA}) ([archive](${SOURCE_URL}/archive/${SHA}.tar.gz))."
+            fi
             echo
             echo "SHA-256"
             cat SHA256SUMS.txt
@@ -608,7 +628,8 @@ jobs:
           fi
 
           # A new tag is created by the release itself, on the exact commit
-          # that was built. An existing tag must already name that commit.
+          # that was built. Explicit download rebuilds preserve the original
+          # tag and identify their merged source commit in the release notes.
           tag_args=(--verify-tag)
           if [[ "${MODE}" == "create" ]]; then
             if tagged="$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq .sha 2>/dev/null)"; then
