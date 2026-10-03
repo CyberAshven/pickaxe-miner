@@ -121,7 +121,11 @@ impl PhotonEngine {
                 engine.set_job(template, target, private_key)
             }
             Self::Hip(engine) => {
-                engine.set_job(base_layout_template(template, "HIP")?, target, private_key)
+                engine.set_positive_target_rule(
+                    MiningToken::Photon.photon_deployment(network).proof_rule
+                        == ProofRule::Positive,
+                );
+                engine.set_job(template, target, private_key)
             }
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => {
@@ -296,7 +300,7 @@ pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Returns the 615-byte template the HIP and wgpu kernels are built for.
+/// Returns the 615-byte template the wgpu kernels are built for.
 fn base_layout_template<'a>(template: &'a [u8], backend: &str) -> Result<&'a [u8; 615], String> {
     template.try_into().map_err(|_| {
         format!(

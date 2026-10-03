@@ -18,7 +18,7 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 
 - Operating systems: Windows x86_64 and Linux x86_64
 - NVIDIA: CUDA PTX `sm_120`
-- AMD: HIP `gfx1036` (retired v0 PHOTON layout only; the current mainnet and Chipnet contract needs CUDA)
+- AMD: HIP `gfx1036`
 - No ARM, ARM64, or macOS build
 
 ## Install
@@ -143,7 +143,7 @@ Use a separate output directory when comparing the two builds.
 
 The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.2`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
 
-The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing backend, which supports only the retired v0 PHOTON layout. Other NVIDIA architectures require compatible CUDA files and separate validation.
+The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing backend. Other NVIDIA architectures require compatible CUDA files and separate validation.
 
 Interactive TUI:
 
