@@ -51,7 +51,7 @@ fn compress_from_limited<const START: usize>(
     state: &mut [u32; 8],
     mut w: [u32; 16],
     head: [u32; 8],
-    high_byte: Option<u8>,
+    high_byte: Option<(u8, bool)>,
 ) -> bool {
     // Unrolled rounds rotate variable roles rather than copying eight words.
     // Map a resumed logical state back to those roles at START.
@@ -84,8 +84,10 @@ fn compress_from_limited<const START: usize>(
                 if $i == 60 {
                     // Logical e after round 60 becomes final h after round 63.
                     // Its low byte is digest[31], PHOTON's first comparison byte.
-                    if let Some(limit) = high_byte {
-                        if (state[7].wrapping_add($d) as u8 & 0x7f) > limit {
+                    if let Some((limit, strict_positive)) = high_byte {
+                        let high = state[7].wrapping_add($d) as u8;
+                        let comparable = if strict_positive { high } else { high & 0x7f };
+                        if comparable > limit {
                             return false;
                         }
                     }
@@ -232,12 +234,27 @@ pub fn hash_state(first_hash: [u32; 8]) -> [u8; 32] {
 /// Surviving hashes still require the complete strict target comparison.
 #[inline(always)]
 pub fn hash_state_filtered(first_hash: [u32; 8], high_byte: u8) -> Option<[u8; 32]> {
+    hash_state_filtered_with_rule(first_hash, high_byte, false)
+}
+
+#[inline(always)]
+pub fn hash_state_filtered_with_rule(
+    first_hash: [u32; 8],
+    high_byte: u8,
+    strict_positive: bool,
+) -> Option<[u8; 32]> {
     let mut block = [0; 16];
     block[..8].copy_from_slice(&first_hash);
     block[8] = 0x80000000;
     block[15] = 256;
     let mut state = INITIAL;
-    compress_from_limited::<0>(&mut state, block, INITIAL, Some(high_byte)).then(|| bytes(state))
+    compress_from_limited::<0>(
+        &mut state,
+        block,
+        INITIAL,
+        Some((high_byte, strict_positive)),
+    )
+    .then(|| bytes(state))
 }
 
 #[inline(always)]

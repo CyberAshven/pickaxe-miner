@@ -8,7 +8,8 @@
 
 namespace {
 
-constexpr uint32_t T2_WINDOW_BYTES = TX_BYTES + 3u;
+// Widest transaction (TX_BYTES + PhotonLayout::MAX_SHIFT); must match cuda_t2.rs.
+constexpr uint32_t T2_WINDOW_BYTES = TX_BYTES + 16u;
 constexpr uint32_t T2_POINT_WORDS = 24u;
 
 __device__ __forceinline__ void t2_middle_compress(
@@ -199,7 +200,14 @@ __device__ void t2_hash(
 
 
 __device__ __forceinline__ bool t2_meets_target(const uint8_t digest[32], const uint8_t* target) {
-    const uint8_t top = digest[31] & 0x7fu;
+    const bool strict_positive = target[32] != 0u;
+    if (strict_positive && (digest[31] & 0x80u)) return false;
+    if (strict_positive && digest[31] == 0u) {
+        uint8_t nonzero = 0u;
+        for (int i = 0; i < 31; ++i) nonzero |= digest[i];
+        if (nonzero == 0u) return false;
+    }
+    const uint8_t top = strict_positive ? digest[31] : (digest[31] & 0x7fu);
     if (top != target[31]) return top < target[31];
     for (int i = 30; i >= 0; --i) {
         if (digest[i] != target[i]) return digest[i] < target[i];
@@ -291,6 +299,9 @@ T2_EXPORT(0)
 T2_EXPORT(1)
 T2_EXPORT(2)
 T2_EXPORT(3)
+T2_EXPORT(14)
+T2_EXPORT(15)
+T2_EXPORT(16)
 
 #define T2_GROUP_EXPORT(SHIFT)                                                 \
 extern "C" __global__ void pickaxe_t2_prepare_shift##SHIFT(                    \
@@ -316,3 +327,6 @@ T2_GROUP_EXPORT(0)
 T2_GROUP_EXPORT(1)
 T2_GROUP_EXPORT(2)
 T2_GROUP_EXPORT(3)
+T2_GROUP_EXPORT(14)
+T2_GROUP_EXPORT(15)
+T2_GROUP_EXPORT(16)

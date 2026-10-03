@@ -5,7 +5,8 @@ use super::{index, meets, point_at, read, write};
 use crate::sha256;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-const WINDOW_BYTES: usize = 618;
+// Widest transaction (615 + PhotonLayout::MAX_SHIFT); must match cuda_t2.rs.
+const WINDOW_BYTES: usize = 631;
 // Must match cuda_t2.rs: 256 full windows plus one partial boundary window.
 const HEAD_OFFSET: usize = 257 * 8;
 
@@ -140,7 +141,7 @@ unsafe fn filter<const SHIFT: usize>(
     }
     let j = base + index;
     let digest = hash::<SHIFT>(tx, prefix, baton, reward, j);
-    if !meets(&digest, &read(target)) {
+    if !meets(&digest, &read(target), *target.add(32) != 0) {
         return;
     }
     let slot = AtomicU32::from_ptr(winner_count).fetch_add(1, Ordering::Relaxed);
@@ -196,10 +197,13 @@ unsafe fn group<const SHIFT: usize>(
     // Broadcast the fixed schedule from block-local shared memory.
     sha256::compress_scheduled(&mut state, &*shared.cast::<[u32; 64]>());
     sha256::compress(&mut state, block::<SHIFT, 9>(tx, baton, reward, j));
-    let Some(digest) = sha256::hash_state_filtered(state, *target.add(31)) else {
+    let strict_positive = *target.add(32) != 0;
+    let Some(digest) =
+        sha256::hash_state_filtered_with_rule(state, *target.add(31), strict_positive)
+    else {
         return;
     };
-    if !meets(&digest, &read(target)) {
+    if !meets(&digest, &read(target), strict_positive) {
         return;
     }
     let slot = AtomicU32::from_ptr(winner_count).fetch_add(1, Ordering::Relaxed);
@@ -336,4 +340,25 @@ kernels!(
     pickaxe_t2_filter_shift3,
     pickaxe_t2_probe_shift3,
     3
+);
+kernels!(
+    pickaxe_t2_prepare_shift14,
+    pickaxe_t2_filter_group_shift14,
+    pickaxe_t2_filter_shift14,
+    pickaxe_t2_probe_shift14,
+    14
+);
+kernels!(
+    pickaxe_t2_prepare_shift15,
+    pickaxe_t2_filter_group_shift15,
+    pickaxe_t2_filter_shift15,
+    pickaxe_t2_probe_shift15,
+    15
+);
+kernels!(
+    pickaxe_t2_prepare_shift16,
+    pickaxe_t2_filter_group_shift16,
+    pickaxe_t2_filter_shift16,
+    pickaxe_t2_probe_shift16,
+    16
 );

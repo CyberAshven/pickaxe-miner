@@ -1,0 +1,32 @@
+name: Rust security monitoring
+
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-security-monitoring
+  cancel-in-progress: false
+
+jobs:
+  dependencies:
+    name: Rust dependencies (${{ matrix.branch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [master, dev]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Check both Rust dependency graphs
+        run: bash tools/check-rust-deps.sh

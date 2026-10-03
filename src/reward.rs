@@ -6,7 +6,9 @@
 
 use crate::config::{RuntimeConfig, DONATION_ADDRESS, DONATION_BPS, SHREC_DONATION_ADDRESS};
 use crate::crypto;
-use crate::protocol::{COVENANT_LOCKING_BYTECODE_HEX, MAINNET_CATEGORY_HEX};
+use crate::protocol::{
+    PhotonDeployment, MAINNET_V0_CATEGORY_HEX, MAINNET_V0_COVENANT_LOCKING_BYTECODE_HEX,
+};
 use crate::tx;
 use ripemd::Ripemd160;
 use secp256k1::{PublicKey, SecretKey};
@@ -125,9 +127,9 @@ fn push_data(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Serializes a CashToken prefix for a transaction output.
+/// Serializes a v0 PHOTON CashToken prefix for a self-funded settlement output.
 fn token_prefix(amount: u128) -> Result<Vec<u8>, String> {
-    let category = hex::decode(MAINNET_CATEGORY_HEX).map_err(|error| error.to_string())?;
+    let category = hex::decode(MAINNET_V0_CATEGORY_HEX).map_err(|error| error.to_string())?;
     if category.len() != 32 {
         return Err("PHOTON category must be 32 bytes".into());
     }
@@ -197,19 +199,20 @@ fn read_canonical_compact_uint(bytes: &[u8], cursor: &mut usize) -> Result<u64, 
     Ok(value)
 }
 
-/// Checks a parent token against the authoritative PHOTON baton.
+/// Checks a parent token against the v0 PHOTON baton the self-funded
+/// settlement was proven against.
 fn validate_authoritative_baton_token(token_and_locking_bytecode: &[u8]) -> Result<(), String> {
     const TOKEN_PREFIX_MARKER: u8 = 0xef;
     const MUTABLE_NFT_WITH_COMMITMENT_AND_AMOUNT: u8 = 0x71;
     const MIN_REFERENCE_COMMITMENT_BYTES: usize = 36;
 
-    let category = hex::decode(MAINNET_CATEGORY_HEX).map_err(|error| error.to_string())?;
+    let category = hex::decode(MAINNET_V0_CATEGORY_HEX).map_err(|error| error.to_string())?;
     if category.len() != 32 {
         return Err("PHOTON category must be 32 bytes".into());
     }
     let category_le = reverse(&category);
     let covenant_lock =
-        hex::decode(COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
+        hex::decode(MAINNET_V0_COVENANT_LOCKING_BYTECODE_HEX).map_err(|error| error.to_string())?;
 
     let marker = token_and_locking_bytecode
         .first()
@@ -347,6 +350,118 @@ fn encode_input(txid: &str, vout: u32, unlocking: &[u8]) -> Result<Vec<u8>, Stri
     Ok(out)
 }
 
+fn deployment_token_prefix(deployment: &PhotonDeployment, amount: u128) -> Result<Vec<u8>, String> {
+    let category = hex::decode(deployment.category_hex).map_err(|error| error.to_string())?;
+    if category.len() != 32 {
+        return Err("PHOTON category must be 32 bytes".into());
+    }
+    let mut out = Vec::with_capacity(43);
+    out.push(0xef);
+    out.extend(category.into_iter().rev());
+    out.push(0x10);
+    out.extend_from_slice(&compact_token_amount(amount)?);
+    Ok(out)
+}
+
+fn validate_deployment_baton_token(
+    deployment: &PhotonDeployment,
+    token_and_locking_bytecode: &[u8],
+) -> Result<(), String> {
+    let category = hex::decode(deployment.category_hex).map_err(|error| error.to_string())?;
+    let covenant_lock =
+        hex::decode(deployment.covenant_lock_hex).map_err(|error| error.to_string())?;
+    if token_and_locking_bytecode.first() != Some(&0xef)
+        || token_and_locking_bytecode.get(1..33) != Some(reverse(&category).as_slice())
+    {
+        return Err("parent baton has the wrong PHOTON token category".into());
+    }
+    if token_and_locking_bytecode.get(33) != Some(&0x71) {
+        return Err("parent baton is not a mutable PHOTON NFT with amount".into());
+    }
+    let mut cursor = 34usize;
+    let commitment_len = usize::try_from(read_canonical_compact_uint(
+        token_and_locking_bytecode,
+        &mut cursor,
+    )?)
+    .map_err(|_| "PHOTON baton commitment exceeds usize")?;
+    if commitment_len < 36 {
+        return Err("parent baton commitment is too short".into());
+    }
+    cursor = cursor
+        .checked_add(commitment_len)
+        .ok_or("PHOTON baton commitment cursor overflow")?;
+    token_and_locking_bytecode
+        .get(..cursor)
+        .ok_or("parent baton commitment is truncated")?;
+    read_canonical_compact_uint(token_and_locking_bytecode, &mut cursor)?;
+    if token_and_locking_bytecode.get(cursor..) != Some(covenant_lock.as_slice()) {
+        return Err("parent baton does not end in the selected PHOTON covenant".into());
+    }
+    Ok(())
+}
+
+/// Bind direct-reward recovery metadata to the immutable transaction bytes.
+pub fn validate_direct_reward_record(
+    raw: &[u8],
+    deployment: &PhotonDeployment,
+    baton_value: u64,
+    reward_amount: u128,
+) -> Result<(), String> {
+    let [baton, reward] = parse_parent_outputs(raw)?;
+    validate_deployment_baton_token(deployment, &baton.token_and_locking_bytecode)?;
+    let prefix = deployment_token_prefix(deployment, reward_amount)?;
+    let locking = reward
+        .token_and_locking_bytecode
+        .strip_prefix(prefix.as_slice())
+        .ok_or("direct reward journal token amount or category disagrees with transaction")?;
+    if baton.value_sats != baton_value
+        || reward.value_sats != TOKEN_OUTPUT_SATS
+        || locking.len() != 25
+        || locking[..3] != [0x76, 0xa9, 0x14]
+        || locking[23..] != [0x88, 0xac]
+    {
+        return Err(
+            "direct reward journal value or payout shape disagrees with transaction".into(),
+        );
+    }
+    Ok(())
+}
+
+/// The PHOTON baton a winning parent creates at output 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessorBaton {
+    pub value_sats: u64,
+    pub commitment_hex: String,
+    pub token_amount: u128,
+}
+
+/// Reads the successor baton from a signed winning parent so mining can
+/// continue on it before an indexer lists the unconfirmed parent.
+pub fn successor_baton(
+    raw: &[u8],
+    deployment: &PhotonDeployment,
+) -> Result<SuccessorBaton, String> {
+    let [baton, _reward] = parse_parent_outputs(raw)?;
+    let bytes = &baton.token_and_locking_bytecode;
+    validate_deployment_baton_token(deployment, bytes)?;
+    let mut cursor = 34usize;
+    let commitment_len = usize::try_from(read_canonical_compact_uint(bytes, &mut cursor)?)
+        .map_err(|_| "PHOTON baton commitment exceeds usize")?;
+    let commitment_end = cursor
+        .checked_add(commitment_len)
+        .ok_or("PHOTON baton commitment cursor overflow")?;
+    let commitment = bytes
+        .get(cursor..commitment_end)
+        .ok_or("parent baton commitment is truncated")?;
+    cursor = commitment_end;
+    let token_amount = read_canonical_compact_uint(bytes, &mut cursor)?;
+    Ok(SuccessorBaton {
+        value_sats: baton.value_sats,
+        commitment_hex: hex::encode(commitment),
+        token_amount: u128::from(token_amount),
+    })
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 /// Builds the BCH signature hash for a self-funded input.
 fn self_funded_p2pkh_sighash(
@@ -399,16 +514,6 @@ pub fn p2pkh_cashaddr_from_public_key(public_key: &[u8; 33]) -> Result<String, S
 }
 
 /// Creates an ephemeral identity for the self-funded settlement.
-pub fn new_intermediate_identity() -> Result<([u8; 32], [u8; 33], String), String> {
-    let secret = SecretKey::new(&mut rand::rng());
-    let secret_bytes = secret.to_secret_bytes();
-    let public_key = PublicKey::from_secret_key(&secret).serialize();
-    let address = p2pkh_cashaddr_from_public_key(&public_key)?;
-    Ok((secret_bytes, public_key, address))
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-/// Calculates the relay fee required for the serialized transaction.
 fn required_relay_fee_sats(
     serialized_bytes: usize,
     relay_fee_sats_per_kb: u64,
@@ -726,6 +831,24 @@ pub fn build_self_funded_settlement_with_relay_fee(
     })
 }
 
+/// Preserve the established 2% donation and odd-token rounding policy.
+#[cfg(test)]
+fn funded_split_amounts(reward_token_amount: u128) -> Result<(u128, u128, u128), String> {
+    let (miner, donation) = RuntimeConfig::split_reward(reward_token_amount);
+    let (original, shrec) = RuntimeConfig::split_donation(donation);
+    if original == 0 || shrec == 0 {
+        return Err("reward donation is too small for two nonzero token outputs".into());
+    }
+    if miner
+        .checked_add(original)
+        .and_then(|amount| amount.checked_add(shrec))
+        != Some(reward_token_amount)
+    {
+        return Err("funded reward split failed token conservation".into());
+    }
+    Ok((miner, original, shrec))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +904,25 @@ mod tests {
         assert_eq!(RuntimeConfig::split_reward(49), (49, 0));
         assert_eq!(RuntimeConfig::split_reward(50), (49, 1));
         assert_eq!(RuntimeConfig::split_reward(100), (98, 2));
+    }
+
+    #[test]
+    fn funded_split_preserves_existing_odd_donation_rounding() {
+        for amount in [100u128, 199, 4_999_773_850] {
+            let (miner, original, shrec) = funded_split_amounts(amount).unwrap();
+            let (expected_miner, donation) = RuntimeConfig::split_reward(amount);
+            let (expected_original, expected_shrec) = RuntimeConfig::split_donation(donation);
+            assert_eq!(
+                (miner, original, shrec),
+                (expected_miner, expected_original, expected_shrec)
+            );
+            assert_eq!(miner + original + shrec, amount);
+        }
+        assert_eq!(funded_split_amounts(199).unwrap(), (196, 2, 1));
+        assert_eq!(
+            funded_split_amounts(99).unwrap_err(),
+            "reward donation is too small for two nonzero token outputs"
+        );
     }
 
     #[test]
@@ -975,7 +1117,7 @@ mod tests {
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
                 .serialize();
         let mut parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
-        let category_le = reverse(&hex::decode(MAINNET_CATEGORY_HEX).unwrap());
+        let category_le = reverse(&hex::decode(MAINNET_V0_CATEGORY_HEX).unwrap());
         let prefix = [vec![0xef], category_le.clone(), vec![0x71]].concat();
         let offset = parent
             .windows(prefix.len())
@@ -1005,7 +1147,7 @@ mod tests {
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(reward_secret).unwrap())
                 .serialize();
         let mut parent = vector_parent(p2pkh_locking_from_public_key(&reward_public));
-        let category_le = reverse(&hex::decode(MAINNET_CATEGORY_HEX).unwrap());
+        let category_le = reverse(&hex::decode(MAINNET_V0_CATEGORY_HEX).unwrap());
         let prefix = [vec![0xef], category_le, vec![0x71]].concat();
         let offset = parent
             .windows(prefix.len())

@@ -28,11 +28,11 @@ struct T2Batch {
 struct T2Engine {
     _ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
-    filter: [CudaFunction; 4],
-    probes: [CudaFunction; 4],
-    prepare_group: [CudaFunction; 4],
-    filter_group: [CudaFunction; 4],
-    value_filter_group: Option<[CudaFunction; 4]>,
+    filter: ShiftKernels,
+    probes: ShiftKernels,
+    prepare_group: ShiftKernels,
+    filter_group: ShiftKernels,
+    value_filter_group: Option<ShiftKernels>,
     template_gpu: CudaSlice<u8>,
     prefix_gpu: CudaSlice<u32>,
     middle_schedule_gpu: CudaSlice<u32>,
@@ -68,74 +68,21 @@ impl T2Engine {
         winner_cap: u32,
         value_mode: bool,
     ) -> Result<Self, String> {
-        let filter = [0, 1, 2, 3].map(|shift| {
-            load_function(
-                &ctx,
-                "photon_t2_tail.ptx",
-                &format!("pickaxe_t2_filter_shift{shift}"),
-            )
-        });
-        let filter = filter
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .ok()
-            .unwrap();
-        let probes = [0, 1, 2, 3].map(|shift| {
-            load_function(
-                &ctx,
-                "photon_t2_tail.ptx",
-                &format!("pickaxe_t2_probe_shift{shift}"),
-            )
-        });
-        let probes = probes
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .ok()
-            .unwrap();
-        let prepare_group = [0, 1, 2, 3].map(|shift| {
-            load_function(
-                &ctx,
-                "photon_t2_tail.ptx",
-                &format!("pickaxe_t2_prepare_shift{shift}"),
-            )
-        });
-        let prepare_group = prepare_group
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .ok()
-            .unwrap();
-        let filter_group = [0, 1, 2, 3].map(|shift| {
-            load_function(
-                &ctx,
-                "photon_t2_tail.ptx",
-                &format!("pickaxe_t2_filter_group_shift{shift}"),
-            )
-        });
-        let filter_group = filter_group
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .ok()
-            .unwrap();
+        let tail = |kernel: &str| {
+            load_shift_functions(&ctx, "photon_t2_tail.ptx", |shift| {
+                format!("pickaxe_t2_{kernel}_shift{shift}")
+            })
+        };
+        let filter = tail("filter")?;
+        let probes = tail("probe")?;
+        let prepare_group = tail("prepare")?;
+        let filter_group = tail("filter_group")?;
         let value_filter_group = if value_mode {
-            let kernels = [0, 1, 2, 3].map(|shift| {
-                load_function(
-                    &ctx,
-                    "photon_t2_value.ptx",
-                    &format!("pickaxe_t2_value_filter_shift{shift}"),
-                )
-            });
-            Some(
-                kernels
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?
-                    .try_into()
-                    .ok()
-                    .unwrap(),
-            )
+            Some(load_shift_functions(
+                &ctx,
+                "photon_t2_value.ptx",
+                |shift| format!("pickaxe_t2_value_filter_shift{shift}"),
+            )?)
         } else {
             None
         };
@@ -157,7 +104,7 @@ impl T2Engine {
             .alloc_zeros::<u32>(T2_MAX_WINDOWS * if cfg!(feature = "rust-t2") { 16 } else { 8 })
             .map_err(|error| error.to_string())?;
         let target_gpu = stream
-            .alloc_zeros::<u8>(32)
+            .alloc_zeros::<u8>(33)
             .map_err(|error| error.to_string())?;
         let count_gpu = stream
             .alloc_zeros::<u32>(1)
@@ -211,6 +158,7 @@ impl T2Engine {
         target: &[u8; 32],
         total: u128,
         reward: u128,
+        positive_target: bool,
     ) -> Result<(), String> {
         let layout = PhotonLayout::for_tx_len(template.len())?;
         tx::t2_reward_amount(total, reward, u16::MAX)?;
@@ -235,7 +183,8 @@ impl T2Engine {
             .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
             .collect::<Vec<_>>();
         sha2::compress256(&mut state, &blocks);
-        // Bytes 512..575 are unchanged by the nonce, signature, and T2 amounts.
+        // Bytes 512..575 are unchanged by the nonce and signature, and
+        // supports_job keeps the T2 amounts out of them.
         let mut middle_schedule = [0u32; 64];
         for (word, bytes) in template[512..576].as_chunks::<4>().0.iter().enumerate() {
             middle_schedule[word] = u32::from_be_bytes(*bytes);
@@ -261,8 +210,11 @@ impl T2Engine {
         self.stream
             .memcpy_htod(&middle_schedule, &mut self.middle_schedule_gpu)
             .map_err(|error| error.to_string())?;
+        let mut gpu_target = [0u8; 33];
+        gpu_target[..32].copy_from_slice(target);
+        gpu_target[32] = u8::from(positive_target);
         self.stream
-            .memcpy_htod(target, &mut self.target_gpu)
+            .memcpy_htod(&gpu_target, &mut self.target_gpu)
             .map_err(|error| error.to_string())?;
         self.layout = layout;
         self.baton = baton;
@@ -277,7 +229,7 @@ impl T2Engine {
         }
         unsafe {
             self.stream
-                .launch_builder(&self.probes[self.layout.shift()])
+                .launch_builder(&self.probes[self.layout.kernel_index()])
                 .arg(&self.template_gpu)
                 .arg(&self.prefix_gpu)
                 .arg(&self.baton)
@@ -318,7 +270,7 @@ impl T2Engine {
             .map_err(|error| error.to_string())?;
         unsafe {
             self.stream
-                .launch_builder(&self.filter[self.layout.shift()])
+                .launch_builder(&self.filter[self.layout.kernel_index()])
                 .arg(&self.template_gpu)
                 .arg(&self.prefix_gpu)
                 .arg(&self.baton)
@@ -382,7 +334,7 @@ impl T2Engine {
         }
         unsafe {
             self.stream
-                .launch_builder(&self.prepare_group[self.layout.shift()])
+                .launch_builder(&self.prepare_group[self.layout.kernel_index()])
                 .arg(&self.template_gpu)
                 .arg(&parent.midstate_gpu)
                 .arg(&parent.signatures_gpu)
@@ -407,7 +359,7 @@ impl T2Engine {
         let threads = if cfg!(feature = "rust-t2") { 256 } else { 128 };
         unsafe {
             self.stream
-                .launch_builder(&self.filter_group[self.layout.shift()])
+                .launch_builder(&self.filter_group[self.layout.kernel_index()])
                 .arg(&self.window_txs_gpu)
                 .arg(&self.window_prefixes_gpu)
                 .arg(&self.middle_schedule_gpu)
@@ -554,6 +506,17 @@ impl T2Live {
         let baton = u64::from_le_bytes(template[491 + shift..499 + shift].try_into().unwrap());
         let reward = u64::from_le_bytes(template[578 + shift..586 + shift].try_into().unwrap());
         let total = u128::from(baton) + u128::from(reward);
+        // The group kernel reuses one SHA-256 schedule for bytes 512..575.
+        // Wide layouts put the baton's top bytes there, so every T2 amount
+        // must leave those bytes unchanged.
+        let block7_bytes = 512 - (491 + shift).min(512);
+        if block7_bytes < 8
+            && baton
+                .checked_add(u64::from(u16::MAX))
+                .is_none_or(|last| last >> (8 * block7_bytes) != baton >> (8 * block7_bytes))
+        {
+            return Ok(false);
+        }
         Ok(tx::t2_reward_amount(total, u128::from(reward), u16::MAX).is_ok())
     }
 
@@ -580,6 +543,7 @@ impl T2Live {
         template: &[u8],
         target: &[u8; 32],
         key: &[u8; 32],
+        positive_target: bool,
     ) -> Result<(), String> {
         if !Self::supports_job(template)? {
             return Err("T2 job cannot cover the complete 65,536-amount window".into());
@@ -589,7 +553,7 @@ impl T2Live {
         let reward = u64::from_le_bytes(template[578 + shift..586 + shift].try_into().unwrap());
         let total = u128::from(baton) + u128::from(reward);
         self.engine
-            .set_template(template, target, total, u128::from(reward))?;
+            .set_template(template, target, total, u128::from(reward), positive_target)?;
         self.key.fill(0);
         self.key = *key;
         self.template = template.to_vec();
@@ -643,16 +607,24 @@ mod tests {
     const REWARD: u128 = 4_999_773_813;
     const NONCE: u32 = 0x1234_5678;
 
-    fn signed_template(age: u32, target: [u8; 32], reward: u128) -> Vec<u8> {
-        signed_template_with_nonce(age, target, reward, NONCE)
+    /// Every layout shift the kernels are built for.
+    const SHIFTS: [usize; PhotonLayout::GPU_SHIFTS.len()] = PhotonLayout::GPU_SHIFTS;
+
+    fn signed_template(shift: usize, target: [u8; 32], reward: u128) -> Vec<u8> {
+        signed_template_with_nonce(shift, target, reward, NONCE)
     }
 
-    fn signed_template_with_nonce(age: u32, target: [u8; 32], reward: u128, nonce: u32) -> Vec<u8> {
+    fn signed_template_with_nonce(
+        shift: usize,
+        target: [u8; 32],
+        reward: u128,
+        nonce: u32,
+    ) -> Vec<u8> {
         let key = [0x11; 32];
         let public = crypto::compressed_pubkey(&key).unwrap();
         let message = tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
         let signature = crypto::bch_schnorr_sign(&key, &message).unwrap();
-        tx::build_photon_template_bytes(&tx::TemplateParams {
+        tx::template_for_shift(shift, |age| tx::TemplateParams {
             prev_tx_hash_hex: "aa".repeat(32),
             prev_index: 0,
             age,
@@ -668,7 +640,35 @@ mod tests {
             )
             .unwrap(),
         })
-        .unwrap()
+    }
+
+    #[test]
+    fn t2_keeps_wide_layout_baton_bytes_out_of_the_shared_middle_block() {
+        let template = |shift, baton: u64| {
+            tx::template_for_shift(shift, |age| tx::TemplateParams {
+                prev_tx_hash_hex: "aa".repeat(32),
+                prev_index: 0,
+                age,
+                public_key_hex: hex::encode(crypto::compressed_pubkey(&[0x11; 32]).unwrap()),
+                target_hex: "ff".repeat(32),
+                signature_hex: "00".repeat(64),
+                nonce: 0,
+                contract_value_sats: 15_971_500,
+                contract_token_amount: u128::from(baton) + REWARD,
+                reward_amount: REWARD,
+                payout_locking: tx::cashaddr_to_p2pkh_locking(
+                    "zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3",
+                )
+                .unwrap(),
+            })
+        };
+        // At shift 16 baton bytes 5..=7 sit in bytes 512..575.
+        let steady = u64::try_from(TOTAL - REWARD).unwrap();
+        let carries = 0x0007_00ff_ffff_8000;
+        assert!(T2Live::supports_job(&template(16, steady)).unwrap());
+        assert!(!T2Live::supports_job(&template(16, carries)).unwrap());
+        // The narrow v0 layout keeps every baton byte in block 7.
+        assert!(T2Live::supports_job(&template(0, carries)).unwrap());
     }
 
     #[test]
@@ -676,18 +676,50 @@ mod tests {
         let mut engine = T2Engine::new(0, 65_536, 8).unwrap();
         let mut target = [0xff; 32];
         target[31] = 0x7f;
-        for age in [10, 17, 128, 32_768] {
-            let template = signed_template(age, target, REWARD);
+        for shift in SHIFTS {
+            let template = signed_template(shift, target, REWARD);
             engine
-                .set_template(&template, &target, TOTAL, REWARD)
+                .set_template(&template, &target, TOTAL, REWARD, false)
                 .unwrap();
             for j in [0, 1, 255, 256, 65_535] {
                 let actual = engine.probe(j).unwrap();
                 let expected =
-                    search::hash256(&signed_template(age, target, REWARD - u128::from(j)));
-                assert_eq!(actual, expected, "age={age} j={j}");
+                    search::hash256(&signed_template(shift, target, REWARD - u128::from(j)));
+                assert_eq!(actual, expected, "shift={shift} j={j}");
             }
         }
+    }
+
+    #[test]
+    fn t2_gpu_hash_matches_confirmed_chipnet_parent_if_cuda_present() {
+        let template = hex::decode(
+            include_str!("../reference/photon_v32_chipnet_confirmed_parent.hex").trim(),
+        )
+        .unwrap();
+        let layout =
+            PhotonLayout::for_age_with_deployment(8, &crate::protocol::CHIPNET_PHOTON).unwrap();
+        assert_eq!(layout.shift(), 14);
+        let target: [u8; 32] = template[layout.target_offset()..layout.target_offset() + 32]
+            .try_into()
+            .unwrap();
+        let mut engine = match T2Engine::new(0, 65_536, 8) {
+            Ok(engine) => engine,
+            Err(error) if cuda_unavailable_for_tests(&error) => {
+                eprintln!("skip chipnet T2 GPU vector: {error}");
+                return;
+            }
+            Err(error) => panic!("chipnet T2 GPU setup failed: {error}"),
+        };
+        engine
+            .set_template(
+                &template,
+                &target,
+                2_095_454_920_205_042,
+                4_989_178_380,
+                true,
+            )
+            .unwrap();
+        assert_eq!(engine.probe(0).unwrap(), search::hash256(&template));
     }
 
     #[test]
@@ -695,7 +727,13 @@ mod tests {
         let mut engine = T2Engine::new(0, 65_536, 8).unwrap();
         let target = [0xff; 32];
         engine
-            .set_template(&signed_template(10, target, REWARD), &target, TOTAL, REWARD)
+            .set_template(
+                &signed_template(0, target, REWARD),
+                &target,
+                TOTAL,
+                REWARD,
+                false,
+            )
             .unwrap();
         let result = engine.batch(0, 128).unwrap();
         assert_eq!(result.candidates, 128);
@@ -704,9 +742,48 @@ mod tests {
         for winner in result.winners {
             assert_eq!(
                 winner.digest,
-                search::hash256(&signed_template(10, target, REWARD - u128::from(winner.j)))
+                search::hash256(&signed_template(0, target, REWARD - u128::from(winner.j)))
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "tail-grind")]
+    fn chipnet_t2_filter_does_not_let_negative_hashes_fill_winner_buffer_if_cuda_present() {
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        let key = [0x11; 32];
+        let template = signed_template_with_nonce(0, target, REWARD, 0);
+        let baton = u64::try_from(TOTAL - REWARD).unwrap();
+        let reward = u64::try_from(REWARD).unwrap();
+        let digest_at = |j: u32| {
+            let mut tx = template.clone();
+            tx[491..499].copy_from_slice(&(baton + u64::from(j)).to_le_bytes());
+            tx[578..586].copy_from_slice(&(reward - u64::from(j)).to_le_bytes());
+            search::hash256(&tx)
+        };
+        let base = (0..65_528)
+            .find(|base| {
+                (0..8).all(|offset| digest_at(base + offset)[31] & 0x80 != 0)
+                    && digest_at(base + 8)[31] & 0x80 == 0
+            })
+            .expect("fixture has eight negative hashes followed by a positive hash");
+        let mut engine = match CudaPhotonEngine::new(0, 65_536, 1) {
+            Ok(engine) => engine,
+            Err(error) if cuda_unavailable_for_tests(&error) => {
+                eprintln!("skip chipnet signed T2 GPU filter: {error}");
+                return;
+            }
+            Err(error) => panic!("chipnet T2 GPU setup failed: {error}"),
+        };
+        engine.enable_t2_search().unwrap();
+        engine.set_positive_target_rule(true);
+        engine.set_job(&template, &target, &key).unwrap();
+        let result = engine.search_batch(base, 9).unwrap();
+        assert_eq!(result.total_winners, 1);
+        assert_eq!(result.winners.len(), 1);
+        assert_eq!(result.winners[0].tail_j, Some((base + 8) as u16));
+        assert_eq!(result.winners[0].digest, digest_at(base + 8));
     }
 
     #[test]
@@ -718,7 +795,7 @@ mod tests {
         engine.enable_t2_search().unwrap();
         engine
             .set_job(
-                &signed_template_with_nonce(10, target, REWARD, 0),
+                &signed_template_with_nonce(0, target, REWARD, 0),
                 &target,
                 &key,
             )
@@ -731,7 +808,7 @@ mod tests {
                 let j = winner.tail_j.unwrap();
                 assert_eq!(winner.nonce, base >> 16);
                 let raw =
-                    signed_template_with_nonce(10, target, REWARD - u128::from(j), winner.nonce);
+                    signed_template_with_nonce(0, target, REWARD - u128::from(j), winner.nonce);
                 assert_eq!(winner.digest, search::hash256(&raw));
             }
         }
@@ -747,7 +824,7 @@ mod tests {
         let boundary_reward = u128::from(u32::MAX) + 100;
         engine
             .set_job(
-                &signed_template_with_nonce(10, target, boundary_reward, 0),
+                &signed_template_with_nonce(0, target, boundary_reward, 0),
                 &target,
                 &key,
             )
@@ -759,7 +836,7 @@ mod tests {
 
         engine
             .set_job(
-                &signed_template_with_nonce(10, target, REWARD, 0),
+                &signed_template_with_nonce(0, target, REWARD, 0),
                 &target,
                 &key,
             )
@@ -776,7 +853,7 @@ mod tests {
         engine.enable_t2_search().unwrap();
         engine
             .set_job(
-                &signed_template_with_nonce(10, target, REWARD, 0),
+                &signed_template_with_nonce(0, target, REWARD, 0),
                 &target,
                 &key,
             )
@@ -788,7 +865,7 @@ mod tests {
         for winner in result.winners {
             let j = winner.tail_j.unwrap();
             let expected =
-                signed_template_with_nonce(10, target, REWARD - u128::from(j), winner.nonce);
+                signed_template_with_nonce(0, target, REWARD - u128::from(j), winner.nonce);
             assert_eq!(winner.digest, search::hash256(&expected));
         }
     }
@@ -800,10 +877,10 @@ mod tests {
         let key = [0x11; 32];
         let mut engine = CudaPhotonEngine::new(0, 65_536, 8).unwrap();
         engine.enable_t2_search().unwrap();
-        for age in [10, 17, 128, 32_768] {
+        for shift in SHIFTS {
             engine
                 .set_job(
-                    &signed_template_with_nonce(age, target, REWARD, 0),
+                    &signed_template_with_nonce(shift, target, REWARD, 0),
                     &target,
                     &key,
                 )
@@ -814,12 +891,16 @@ mod tests {
                 for winner in result.winners {
                     let j = winner.tail_j.unwrap();
                     let tx = signed_template_with_nonce(
-                        age,
+                        shift,
                         target,
                         REWARD - u128::from(j),
                         winner.nonce,
                     );
-                    assert_eq!(winner.digest, search::hash256(&tx), "age={age} base={base}");
+                    assert_eq!(
+                        winner.digest,
+                        search::hash256(&tx),
+                        "shift={shift} base={base}"
+                    );
                 }
             }
         }
@@ -830,13 +911,13 @@ mod tests {
     fn t2_gpu_filter_has_no_missing_winners_across_targets_and_partial_blocks_if_cuda_present() {
         let mut engine = CudaPhotonEngine::new(0, 65_536, 1024).unwrap();
         engine.enable_t2_search().unwrap();
-        for age in [10, 17, 128, 32_768] {
+        for shift in SHIFTS {
             for high_byte in [0, 0x3f, 0x7f, 0xff] {
                 let mut target = [0xff; 32];
                 target[31] = high_byte;
                 engine
                     .set_job(
-                        &signed_template_with_nonce(age, target, REWARD, 0),
+                        &signed_template_with_nonce(shift, target, REWARD, 0),
                         &target,
                         &[0x11; 32],
                     )
@@ -847,8 +928,12 @@ mod tests {
                     for position in base..base + 513 {
                         let nonce = position >> 16;
                         let j = (position & 0xffff) as u16;
-                        let tx =
-                            signed_template_with_nonce(age, target, REWARD - u128::from(j), nonce);
+                        let tx = signed_template_with_nonce(
+                            shift,
+                            target,
+                            REWARD - u128::from(j),
+                            nonce,
+                        );
                         let digest = search::hash256(&tx);
                         if search::meets_target_le(&digest, &target) {
                             expected.push((nonce, j, digest));
@@ -861,7 +946,10 @@ mod tests {
                         .collect();
                     actual.sort_unstable();
                     assert_eq!(result.total_winners as usize, expected.len());
-                    assert_eq!(actual, expected, "age={age} high={high_byte} base={base}");
+                    assert_eq!(
+                        actual, expected,
+                        "shift={shift} high={high_byte} base={base}"
+                    );
                 }
             }
         }
@@ -878,7 +966,7 @@ mod tests {
         engine.enable_t2_search().unwrap();
         engine
             .set_job(
-                &signed_template_with_nonce(17, target, REWARD, 0),
+                &signed_template_with_nonce(1, target, REWARD, 0),
                 &target,
                 &key,
             )
@@ -889,7 +977,7 @@ mod tests {
         assert_eq!(result.winners.len(), 8);
         for winner in result.winners {
             let j = winner.tail_j.unwrap();
-            let tx = signed_template_with_nonce(17, target, REWARD - u128::from(j), winner.nonce);
+            let tx = signed_template_with_nonce(1, target, REWARD - u128::from(j), winner.nonce);
             assert_eq!(winner.digest, search::hash256(&tx));
         }
     }
@@ -902,16 +990,15 @@ mod tests {
         let key = [0x11; 32];
         let mut engine = CudaPhotonEngine::new(0, 65_536, 8).unwrap();
         engine.enable_t2_value_search().unwrap();
-        for age in [10, 17, 128, 32_768] {
+        for shift in SHIFTS {
             engine
                 .set_job(
-                    &signed_template_with_nonce(age, target, REWARD, 0),
+                    &signed_template_with_nonce(shift, target, REWARD, 0),
                     &target,
                     &key,
                 )
                 .unwrap();
-            let shift = PhotonLayout::for_age(age).unwrap().shift() as u32;
-            let per_nonce = 65_536 * (211 - shift);
+            let per_nonce = 65_536 * (211 - shift as u32);
             assert_eq!(engine.t2_group_batch_candidates(), Some(4 * per_nonce));
             for (base, count) in [(0, 64), (17, 31), (per_nonce - 2, 4)] {
                 let result = engine.search_batch(base, count).unwrap();
@@ -920,7 +1007,7 @@ mod tests {
                     let j = winner.tail_j.unwrap();
                     let sats = winner.tail_value_sats.unwrap();
                     let mut raw = signed_template_with_nonce(
-                        age,
+                        shift,
                         target,
                         REWARD - u128::from(j),
                         winner.nonce,
@@ -933,6 +1020,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tail-grind")]
     #[ignore = "serial offline SHA throughput benchmark; requires CUDA and matching local PTX"]
     fn t2_sha_filter_group_benchmark() {
         let target = [0u8; 32];
@@ -941,7 +1029,7 @@ mod tests {
         engine.enable_t2_search().unwrap();
         engine
             .set_job(
-                &signed_template_with_nonce(17, target, REWARD, 0),
+                &signed_template_with_nonce(1, target, REWARD, 0),
                 &target,
                 &key,
             )
@@ -984,12 +1072,18 @@ mod tests {
         let mut old = CudaPhotonEngine::new(0, 565_248, 8).unwrap();
         let mut incremental = super::super::incremental::Incremental::new(&old, 32).unwrap();
         incremental.c1_per_thread = 16;
-        old.set_job(&signed_template(10, target, REWARD), &target, &key)
+        old.set_job(&signed_template(0, target, REWARD), &target, &key)
             .unwrap();
         incremental.set_message(&old, &target, NONCE).unwrap();
         let mut t2 = T2Engine::new(0, 65_536, 8).unwrap();
-        t2.set_template(&signed_template(10, target, REWARD), &target, TOTAL, REWARD)
-            .unwrap();
+        t2.set_template(
+            &signed_template(0, target, REWARD),
+            &target,
+            TOTAL,
+            REWARD,
+            false,
+        )
+        .unwrap();
         let mut old_base = 0u32;
         let mut t2_nonce = NONCE;
         let mut records = Vec::new();
@@ -1009,8 +1103,9 @@ mod tests {
                     65_536
                 }
                 _ => {
-                    let template = signed_template_with_nonce(10, target, REWARD, t2_nonce);
-                    t2.set_template(&template, &target, TOTAL, REWARD).unwrap();
+                    let template = signed_template_with_nonce(0, target, REWARD, t2_nonce);
+                    t2.set_template(&template, &target, TOTAL, REWARD, false)
+                        .unwrap();
                     assert_eq!(t2.batch(0, 65_536).unwrap().candidates, 65_536);
                     t2_nonce = t2_nonce.wrapping_add(1);
                     65_536
@@ -1051,13 +1146,13 @@ mod tests {
         let mut old = CudaPhotonEngine::new(0, 565_248, 8).unwrap();
         let mut incremental = super::super::incremental::Incremental::new(&old, 32).unwrap();
         incremental.c1_per_thread = 16;
-        old.set_job(&signed_template(10, target, REWARD), &target, &key)
+        old.set_job(&signed_template(0, target, REWARD), &target, &key)
             .unwrap();
         incremental.set_message(&old, &target, NONCE).unwrap();
         let mut live = CudaPhotonEngine::new(0, 65_536, 8).unwrap();
         live.enable_t2_search().unwrap();
         live.set_job(
-            &signed_template_with_nonce(10, target, REWARD, 0),
+            &signed_template_with_nonce(0, target, REWARD, 0),
             &target,
             &key,
         )

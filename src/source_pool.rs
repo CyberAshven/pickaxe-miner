@@ -306,10 +306,32 @@ impl SourceCatalog {
         catalog
     }
 
+    /// Builds a Chipnet-only source catalog.
+    pub(crate) fn chipnet() -> Self {
+        let mut catalog = Self::default();
+        for endpoint in crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP {
+            let host = endpoint_host(endpoint).unwrap_or(endpoint);
+            catalog.entries.push(SourceEntry::published(
+                SourceKind::Fulcrum,
+                endpoint,
+                format!("{host} Chipnet WSS"),
+                SourceTransport::Wss,
+                SourceOrigin::Pickaxe,
+            ));
+        }
+        catalog
+    }
+
     /// Adds configured endpoints to the built-in source catalog.
     pub(crate) fn configured(cfg: &crate::config::RuntimeConfig) -> Result<Self, String> {
-        let mut catalog = Self::mainnet();
+        let mut catalog = match cfg.network {
+            crate::config::MiningNetwork::Mainnet => Self::mainnet(),
+            crate::config::MiningNetwork::Chipnet => Self::chipnet(),
+        };
         for endpoint in cfg.custom_fulcrum_endpoints() {
+            if !cfg.network.accepts_known_electrum_endpoint(endpoint) {
+                continue;
+            }
             let built_in = catalog
                 .find_index(SourceKind::Fulcrum, endpoint)
                 .is_some_and(|index| {
@@ -812,6 +834,54 @@ mod tests {
                 .filter(|entry| entry.kind == SourceKind::NativeNode)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn chipnet_catalog_contains_only_chipnet_bootstrap_and_custom_sources() {
+        let mut cfg = crate::config::RuntimeConfig::default();
+        cfg.set_network(crate::config::MiningNetwork::Chipnet);
+        let catalog = SourceCatalog::configured(&cfg).unwrap();
+        let endpoints: Vec<_> = catalog
+            .entries()
+            .iter()
+            .map(|entry| entry.endpoint.as_str())
+            .collect();
+        assert_eq!(endpoints, crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP);
+        assert!(endpoints
+            .iter()
+            .all(|endpoint| { !crate::protocol::FULCRUM_WSS_BOOTSTRAP.contains(endpoint) }));
+
+        cfg.set_fulcrum_url("wss://custom-chipnet.invalid:50004")
+            .unwrap();
+        let catalog = SourceCatalog::configured(&cfg).unwrap();
+        assert_eq!(
+            catalog.entries().len(),
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len() + 1
+        );
+        assert!(catalog
+            .entries()
+            .iter()
+            .take(crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len())
+            .all(|entry| entry.provenance == SourceProvenance::BuiltIn));
+        assert_eq!(
+            catalog.entries().last().unwrap().provenance,
+            SourceProvenance::User
+        );
+
+        let mut switched = crate::config::RuntimeConfig::default();
+        switched
+            .set_fulcrum_url(crate::protocol::FULCRUM_WSS_BOOTSTRAP[0])
+            .unwrap();
+        switched.set_network(crate::config::MiningNetwork::Chipnet);
+        let catalog = SourceCatalog::configured(&switched).unwrap();
+        assert_eq!(
+            catalog.entries().len(),
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP.len()
+        );
+        assert_eq!(
+            catalog.entries()[0].endpoint,
+            crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP[0]
         );
     }
 

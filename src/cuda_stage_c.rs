@@ -2,11 +2,13 @@
 //!
 //! This module implements the authoritative Stage C boundary from the M67.38
 //! reference. It accepts device-bound Schnorr signatures, injects nonce/signature
-//! into the immutable 615-byte transaction template, hashes the completed
-//! transaction, compares HASH256 strictly as a little-endian integer, and returns
-//! only a bounded winner set. The complete production A->B->C path is still gated
-//! until Stage A/B/C1 share one persistent engine without host crypto handoff.
+//! into the immutable transaction template of any GPU layout, hashes the
+//! completed transaction, applies the contract's proof rule, and returns only a
+//! bounded winner set. The HIP backend compiles the same kernel source, so these
+//! CUDA tests also check AMD's Stage C logic.
 
+use crate::protocol::ProofRule;
+use crate::tx::PhotonLayout;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -14,8 +16,7 @@ use cudarc::nvrtc::Ptx;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const TX_BYTES: usize = 615;
-const TARGET_OFFSET: usize = 394;
+const MAX_TX_BYTES: usize = 615 + PhotonLayout::MAX_SHIFT;
 const SIGNATURE_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,8 @@ pub struct CudaStageC {
     signature_staging: Vec<u8>,
     max_candidates: u32,
     winner_cap: u32,
+    shift: u32,
+    positive_rule: u32,
 }
 
 impl CudaStageC {
@@ -94,7 +97,7 @@ impl CudaStageC {
             .map_err(|e| format!("load Stage C compare probe: {e}"))?;
 
         let template_gpu = stream
-            .alloc_zeros::<u8>(TX_BYTES)
+            .alloc_zeros::<u8>(MAX_TX_BYTES)
             .map_err(|e| format!("alloc Stage C template: {e}"))?;
         let target_gpu = stream
             .alloc_zeros::<u8>(32)
@@ -127,20 +130,36 @@ impl CudaStageC {
             signature_staging: Vec::with_capacity((max_candidates as usize) * SIGNATURE_BYTES),
             max_candidates,
             winner_cap,
+            shift: 0,
+            positive_rule: 0,
         })
     }
 
     /// Uploads PHOTON job material to the stage C kernels.
-    pub fn set_job(&mut self, template: &[u8; TX_BYTES], target: &[u8; 32]) -> Result<(), String> {
-        if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
-            return Err("Stage C target must match transaction template bytes 394..425".into());
+    pub fn set_job(
+        &mut self,
+        template: &[u8],
+        target: &[u8; 32],
+        rule: ProofRule,
+    ) -> Result<(), String> {
+        let layout = PhotonLayout::for_tx_len(template.len())?;
+        let target_offset = layout.target_offset();
+        if template[target_offset..target_offset + 32] != target[..] {
+            return Err(format!(
+                "Stage C target must match transaction template bytes {target_offset}..{}",
+                target_offset + 31
+            ));
         }
+        let mut padded = [0u8; MAX_TX_BYTES];
+        padded[..template.len()].copy_from_slice(template);
         self.stream
-            .memcpy_htod(template, &mut self.template_gpu)
+            .memcpy_htod(&padded, &mut self.template_gpu)
             .map_err(|e| format!("upload Stage C template: {e}"))?;
         self.stream
             .memcpy_htod(target, &mut self.target_gpu)
             .map_err(|e| format!("upload Stage C target: {e}"))?;
+        self.shift = u32::try_from(layout.shift()).map_err(|_| "layout shift exceeds u32")?;
+        self.positive_rule = u32::from(rule == ProofRule::Positive);
         Ok(())
     }
 
@@ -193,7 +212,9 @@ impl CudaStageC {
                 .arg(&self.winner_cap)
                 .arg(&mut self.winner_count_gpu)
                 .arg(&mut self.winner_nonces_gpu)
-                .arg(&mut self.winner_hashes_gpu);
+                .arg(&mut self.winner_hashes_gpu)
+                .arg(&self.shift)
+                .arg(&self.positive_rule);
             builder
                 .launch(cfg)
                 .map_err(|e| format!("launch Stage C: {e}"))?;
@@ -320,7 +341,9 @@ impl CudaStageC {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search;
+    use crate::{search, tx};
+
+    const TX_BYTES: usize = 615;
 
     fn should_skip_cuda_error(error: &str) -> bool {
         crate::cuda_photon::cuda_unavailable_for_tests(error)
@@ -348,7 +371,9 @@ mod tests {
             }
             Err(error) => panic!("Stage C init failed: {error}"),
         };
-        stage.set_job(&template, &target).unwrap();
+        stage
+            .set_job(&template, &target, ProofRule::Absolute)
+            .unwrap();
         let (first, final_hash) = stage.probe_hash(nonce, &signature).unwrap();
         assert_eq!(
             hex::encode(first),
@@ -371,7 +396,9 @@ mod tests {
             }
             Err(error) => panic!("Stage C init failed: {error}"),
         };
-        stage.set_job(&template, &target).unwrap();
+        stage
+            .set_job(&template, &target, ProofRule::Absolute)
+            .unwrap();
 
         let hash = [0x55u8; 32];
         assert!(!stage.compare_probe(&hash, &hash).unwrap());
@@ -399,7 +426,9 @@ mod tests {
             }
             Err(error) => panic!("Stage C init failed: {error}"),
         };
-        stage.set_job(&template, &target).unwrap();
+        stage
+            .set_job(&template, &target, ProofRule::Absolute)
+            .unwrap();
         let result = stage.hash_and_filter(1000, &signatures).unwrap();
         assert_eq!(result.candidates, 32);
         assert_eq!(result.total_winners, 32);
@@ -413,6 +442,86 @@ mod tests {
             completed[426..490].copy_from_slice(&signatures[index]);
             assert_eq!(winner.digest, search::hash256(&completed));
             assert!(search::meets_target_le(&winner.digest, &target));
+        }
+    }
+
+    #[test]
+    fn gpu_stage_c_filters_every_layout_with_its_proof_rule_if_cuda_present() {
+        // Absolute admits digest top bytes 0x00..=0x1f and 0x80..=0x9f;
+        // Positive only the first range.
+        let mut target = [0xffu8; 32];
+        target[31] = 0x20;
+        let count = 256u32;
+        let signatures = (0..count)
+            .map(|index| {
+                let half = search::hash256(&index.to_le_bytes());
+                let mut signature = [0u8; SIGNATURE_BYTES];
+                signature[..32].copy_from_slice(&half);
+                signature[32..].copy_from_slice(&half);
+                signature
+            })
+            .collect::<Vec<_>>();
+        let mut stage = match CudaStageC::new(0, count, count) {
+            Ok(stage) => stage,
+            Err(error) if should_skip_cuda_error(&error) => {
+                eprintln!("skip Stage C layout test: {error}");
+                return;
+            }
+            Err(error) => panic!("Stage C init failed: {error}"),
+        };
+        let public_key = hex::encode(crate::crypto::compressed_pubkey(&[0x11; 32]).unwrap());
+        for shift in PhotonLayout::GPU_SHIFTS {
+            let template = tx::template_for_shift(shift, |age| tx::TemplateParams {
+                prev_tx_hash_hex: "aa".repeat(32),
+                prev_index: 0,
+                age,
+                public_key_hex: public_key.clone(),
+                target_hex: hex::encode(target),
+                signature_hex: "00".repeat(64),
+                nonce: 0,
+                contract_value_sats: 15_971_500,
+                contract_token_amount: 2_099_905_002_035_715,
+                reward_amount: 4_999_773_813,
+                payout_locking: tx::cashaddr_to_p2pkh_locking(
+                    "zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3",
+                )
+                .unwrap(),
+            });
+            let layout = PhotonLayout::for_tx_len(template.len()).unwrap();
+            for rule in [ProofRule::Absolute, ProofRule::Positive] {
+                stage.set_job(&template, &target, rule).unwrap();
+                let base = 0x5000_0000 + shift as u32;
+                let result = stage.hash_and_filter(base, &signatures).unwrap();
+                let mut expected = Vec::new();
+                for (index, signature) in signatures.iter().enumerate() {
+                    let nonce = base + index as u32;
+                    let mut completed = template.clone();
+                    let n = layout.nonce_offset();
+                    completed[n..n + 4].copy_from_slice(&nonce.to_le_bytes());
+                    let s = layout.signature_offset();
+                    completed[s..s + SIGNATURE_BYTES].copy_from_slice(signature);
+                    let digest = search::hash256(&completed);
+                    if search::meets_target_le_for_rule(&digest, &target, rule) {
+                        expected.push((nonce, digest));
+                    }
+                }
+                let mut found = result
+                    .winners
+                    .iter()
+                    .map(|winner| (winner.nonce, winner.digest))
+                    .collect::<Vec<_>>();
+                found.sort_unstable();
+                assert!(
+                    !expected.is_empty(),
+                    "shift {shift} {rule:?}: no host winners"
+                );
+                assert_eq!(
+                    result.total_winners as usize,
+                    expected.len(),
+                    "shift {shift} {rule:?}"
+                );
+                assert_eq!(found, expected, "shift {shift} {rule:?}");
+            }
         }
     }
 }

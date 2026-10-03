@@ -356,11 +356,18 @@ unsafe fn finish_hash<const SHIFT: usize, const INCREMENTAL: bool>(
     sha256::hash_state(state)
 }
 
-fn meets(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+fn meets(hash: &[u8; 32], target: &[u8; 32], strict_positive: bool) -> bool {
+    if strict_positive && hash[31] & 0x80 != 0 {
+        return false;
+    }
     for i in (0..32).rev() {
-        let byte = if i == 31 { hash[i] & 0x7f } else { hash[i] };
+        let byte = if i == 31 && !strict_positive {
+            hash[i] & 0x7f
+        } else {
+            hash[i]
+        };
         if byte != target[i] {
-            return byte < target[i];
+            return byte < target[i] && (!strict_positive || hash.iter().any(|byte| *byte != 0));
         }
     }
     false
@@ -388,6 +395,7 @@ unsafe fn filter<const SHIFT: usize, const INCREMENTAL: bool>(
     let r = read(signatures.add(candidate * 64));
     let plus = read(signatures.add(candidate * 64 + 32));
     let minus = read(negated_s.add(candidate * 32));
+    let strict_positive = *target.add(32) != 0;
     let target = read(target);
     let mut state = read(midstate);
     sha256::compress(
@@ -408,8 +416,8 @@ unsafe fn filter<const SHIFT: usize, const INCREMENTAL: bool>(
         &minus,
         base.wrapping_add(candidate as u32),
     );
-    let pass_plus = meets(&hash_plus, &target);
-    let pass_minus = meets(&hash_minus, &target);
+    let pass_plus = meets(&hash_plus, &target, strict_positive);
+    let pass_minus = meets(&hash_minus, &target, strict_positive);
     if !pass_plus && !pass_minus {
         return;
     }
@@ -474,3 +482,9 @@ filter_kernel!(pickaxe_stage_c_dual_filter_shift2, 2, true);
 filter_kernel!(pickaxe_stage_c_dual_filter_rfc_shift2, 2, false);
 filter_kernel!(pickaxe_stage_c_dual_filter_shift3, 3, true);
 filter_kernel!(pickaxe_stage_c_dual_filter_rfc_shift3, 3, false);
+filter_kernel!(pickaxe_stage_c_dual_filter_shift14, 14, true);
+filter_kernel!(pickaxe_stage_c_dual_filter_rfc_shift14, 14, false);
+filter_kernel!(pickaxe_stage_c_dual_filter_shift15, 15, true);
+filter_kernel!(pickaxe_stage_c_dual_filter_rfc_shift15, 15, false);
+filter_kernel!(pickaxe_stage_c_dual_filter_shift16, 16, true);
+filter_kernel!(pickaxe_stage_c_dual_filter_rfc_shift16, 16, false);

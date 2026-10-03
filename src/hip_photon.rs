@@ -2,6 +2,7 @@
 
 use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
+use crate::tx::PhotonLayout;
 use libloading::Library;
 use num_bigint::BigUint;
 use secp256k1::{PublicKey, SecretKey};
@@ -12,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 
-const TX_BYTES: usize = 615;
-const TARGET_OFFSET: usize = 394;
+/// Template buffer size: the widest layout with GPU kernels.
+const MAX_TX_BYTES: usize = 615 + PhotonLayout::MAX_SHIFT;
 const SIGNATURE_BYTES: usize = 64;
 const POINT_WORDS: usize = 24;
 const FIXED_D_WORDS: usize = 32 * 256 * 8;
@@ -65,7 +66,7 @@ const HIP_STAGE_C1_ABI: [HipArgKind; 7] = [
     HipArgKind::Ptr,
     HipArgKind::U32,
 ];
-const HIP_STAGE_C3_ABI: [HipArgKind; 9] = [
+const HIP_STAGE_C3_ABI: [HipArgKind; 11] = [
     HipArgKind::Ptr,
     HipArgKind::Ptr,
     HipArgKind::U32,
@@ -75,6 +76,8 @@ const HIP_STAGE_C3_ABI: [HipArgKind; 9] = [
     HipArgKind::Ptr,
     HipArgKind::Ptr,
     HipArgKind::Ptr,
+    HipArgKind::U32,
+    HipArgKind::U32,
 ];
 const MAX_HIP_KERNEL_ARGS: usize = HIP_STAGE_C3_ABI.len();
 
@@ -411,6 +414,8 @@ pub struct HipPhotonEngine {
     table_source: M29TableSource,
     #[allow(dead_code)]
     architecture: String,
+    layout: PhotonLayout,
+    positive_target: bool,
     job_ready: bool,
 }
 
@@ -716,7 +721,7 @@ impl HipPhotonEngine {
                 max_candidates as usize * SIGNATURE_BYTES,
                 "signatures",
             )?,
-            template_gpu: HipBuffer::allocate(&api, TX_BYTES, "transaction template")?,
+            template_gpu: HipBuffer::allocate(&api, MAX_TX_BYTES, "transaction template")?,
             winner_count_gpu: HipBuffer::allocate(&api, 4, "winner count")?,
             winner_nonces_gpu: HipBuffer::allocate(&api, winner_cap as usize * 4, "winner nonces")?,
             winner_hashes_gpu: HipBuffer::allocate(
@@ -739,6 +744,8 @@ impl HipPhotonEngine {
             winner_cap,
             table_source,
             architecture,
+            layout: PhotonLayout::BASE,
+            positive_target: false,
             job_ready: false,
         })
     }
@@ -772,14 +779,23 @@ impl HipPhotonEngine {
             + self.winner_hashes_gpu.bytes
     }
 
+    /// Selects the positive ScriptNum proof rule for the next job.
+    pub fn set_positive_target_rule(&mut self, enabled: bool) {
+        self.positive_target = enabled;
+        self.job_ready = false;
+    }
+
     /// Uploads validated PHOTON job material to HIP device buffers.
     pub fn set_job(
         &mut self,
-        template: &[u8; TX_BYTES],
+        template: &[u8],
         target: &[u8; 32],
         private_key: &[u8; 32],
     ) -> Result<(), String> {
-        if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
+        self.job_ready = false;
+        let layout = PhotonLayout::for_tx_len(template.len())?;
+        let target_offset = layout.target_offset();
+        if template[target_offset..target_offset + 32] != target[..] {
             return Err("PHOTON HIP target does not match transaction template".into());
         }
         let secret = SecretKey::from_secret_bytes(*private_key)
@@ -795,6 +811,7 @@ impl HipPhotonEngine {
             .copy_from(&fixed_d, "upload fixed-d table")?;
         self.template_gpu
             .copy_from(template, "upload transaction template")?;
+        self.layout = layout;
         self.job_ready = true;
         Ok(())
     }
@@ -941,6 +958,8 @@ impl HipPhotonEngine {
         let mut winner_count = self.winner_count_gpu.ptr;
         let mut winner_nonces = self.winner_nonces_gpu.ptr;
         let mut winner_hashes = self.winner_hashes_gpu.ptr;
+        let mut shift = u32::try_from(self.layout.shift()).expect("layout shift fits u32");
+        let mut positive_rule = u32::from(self.positive_target);
         let mut params = [
             ptr_arg(&mut template),
             ptr_arg(&mut signatures),
@@ -951,6 +970,8 @@ impl HipPhotonEngine {
             ptr_arg(&mut winner_count),
             ptr_arg(&mut winner_nonces),
             ptr_arg(&mut winner_hashes),
+            u32_arg(&mut shift),
+            u32_arg(&mut positive_rule),
         ];
         launch(
             &self.api,

@@ -3,8 +3,10 @@
 //! CPU cryptography is limited to job setup and rare returned-winner verification.
 
 use crate::backend::BackendKind;
+use crate::config::{MiningNetwork, MiningToken};
 use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::hip_photon::HipPhotonEngine;
+use crate::protocol::ProofRule;
 #[cfg(feature = "portable-wgpu")]
 use crate::wgpu_photon::WgpuPhotonEngine;
 use crate::{crypto, tx};
@@ -12,7 +14,7 @@ use rand::Rng;
 use secp256k1::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -100,10 +102,30 @@ impl PhotonEngine {
         target: &[u8; 32],
         private_key: &[u8; 32],
     ) -> Result<(), String> {
+        self.set_job_for_network(template, target, private_key, MiningNetwork::Mainnet)
+    }
+
+    pub(crate) fn set_job_for_network(
+        &mut self,
+        template: &[u8],
+        target: &[u8; 32],
+        private_key: &[u8; 32],
+        network: MiningNetwork,
+    ) -> Result<(), String> {
         match self {
-            Self::Cuda(engine) => engine.set_job(template, target, private_key),
+            Self::Cuda(engine) => {
+                engine.set_positive_target_rule(
+                    MiningToken::Photon.photon_deployment(network).proof_rule
+                        == ProofRule::Positive,
+                );
+                engine.set_job(template, target, private_key)
+            }
             Self::Hip(engine) => {
-                engine.set_job(base_layout_template(template, "HIP")?, target, private_key)
+                engine.set_positive_target_rule(
+                    MiningToken::Photon.photon_deployment(network).proof_rule
+                        == ProofRule::Positive,
+                );
+                engine.set_job(template, target, private_key)
             }
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => {
@@ -176,6 +198,7 @@ pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32
 
 #[derive(Debug, Clone, Default)]
 pub struct MiningJob {
+    pub network: MiningNetwork,
     pub height: u32,
     pub baton_txid: String,
     pub baton_vout: u32,
@@ -208,6 +231,8 @@ pub struct VerifiedWinner {
 #[derive(Debug, Clone, Default)]
 pub struct SearchStats {
     pub candidates: u64,
+    /// Completed live candidate hashes for miner, project and collaborator.
+    pub work_candidates: [u64; 3],
     pub batches: u64,
     pub intensity: u8,
     pub state: MiningState,
@@ -215,6 +240,9 @@ pub struct SearchStats {
     pub rate: f64,
     pub current_rate: f64,
     pub peak_rate: f64,
+    /// Throughput of the last completed GPU batch, excluding host verification.
+    /// Retained while settlement pauses GPU work.
+    pub active_rate: f64,
     pub winners: u64,
     pub rejected_winners: u64,
     /// Every nonce of the current job has been tried and a fresh signing
@@ -272,7 +300,7 @@ pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Returns the 615-byte template the HIP and wgpu kernels are built for.
+/// Returns the 615-byte template the wgpu kernels are built for.
 fn base_layout_template<'a>(template: &'a [u8], backend: &str) -> Result<&'a [u8; 615], String> {
     template.try_into().map_err(|_| {
         format!(
@@ -303,6 +331,19 @@ pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
     false
 }
 
+/// Applies the selected covenant's proof rule.
+pub fn meets_target_le_for_rule(digest: &[u8; 32], target_le: &[u8; 32], rule: ProofRule) -> bool {
+    if rule == ProofRule::Positive
+        && (digest[31] & 0x80 != 0
+            || digest.iter().all(|byte| *byte == 0)
+            || target_le[31] & 0x80 != 0
+            || target_le.iter().all(|byte| *byte == 0))
+    {
+        return false;
+    }
+    meets_target_le(digest, target_le)
+}
+
 struct PreparedJob {
     job: MiningJob,
     template: Vec<u8>,
@@ -321,12 +362,24 @@ fn validate_job(job: &MiningJob) -> Result<[u8; 32], String> {
     if job.generation_id == 0 {
         return Err("mining job generation_id must be nonzero".into());
     }
-    tx::PhotonLayout::for_age(job.age)?;
+    tx::PhotonLayout::for_age_with_deployment(
+        job.age,
+        MiningToken::Photon.photon_deployment(job.network),
+    )?;
     tx::require_covenant_hash_preimage(job.token_amount, job.reward_raw)?;
     if job.payout_address.trim().is_empty() {
         return Err("mining payout address is required".into());
     }
-    parse_hex32(&job.target_le_hex)
+    let target = parse_hex32(&job.target_le_hex)?;
+    if MiningToken::Photon
+        .photon_deployment(job.network)
+        .proof_rule
+        == ProofRule::Positive
+        && (target[31] & 0x80 != 0 || target.iter().all(|byte| *byte == 0))
+    {
+        return Err("PHOTON target must be a positive ScriptNum".into());
+    }
+    Ok(target)
 }
 
 /// Prepares validated job bytes and target for GPU search.
@@ -360,8 +413,9 @@ fn prepare_job(
         reward_amount: job.reward_raw,
         payout_locking,
     };
-    let template = tx::build_photon_template_bytes(&params)?;
-    let layout = tx::PhotonLayout::for_age(job.age)?;
+    let deployment = MiningToken::Photon.photon_deployment(job.network);
+    let template = tx::build_photon_template_bytes_for_deployment(&params, deployment)?;
+    let layout = tx::PhotonLayout::for_age_with_deployment(job.age, deployment)?;
     if template.len() != layout.tx_bytes() {
         return Err(format!(
             "PHOTON live template is {} bytes; age {} needs {}",
@@ -390,7 +444,12 @@ fn rotate_search_identity(
     let sk = secret.to_secret_bytes();
     let public_key = PublicKey::from_secret_key(&secret).serialize();
     let prepared = prepare_job(job.clone(), &sk, &public_key)?;
-    engine.set_job(&prepared.template, &prepared.target, &sk)?;
+    engine.set_job_for_network(
+        &prepared.template,
+        &prepared.target,
+        &sk,
+        prepared.job.network,
+    )?;
     Ok((prepared, sk, public_key))
 }
 
@@ -430,12 +489,13 @@ fn verify_gpu_winner(
         contract_token_amount: prepared.job.token_amount,
         reward_raw: actual_reward,
     };
-    let transaction = tx::apply_reference_signature(
+    let transaction = tx::apply_reference_signature_for_deployment(
         &context,
         &prepared.job.payout_address,
         &hex::encode(public_key),
         winner.nonce,
         &hex::encode(signature),
+        MiningToken::Photon.photon_deployment(prepared.job.network),
     )?;
     let digest = hash256(&transaction);
     if digest != winner.digest {
@@ -445,7 +505,13 @@ fn verify_gpu_winner(
             hex::encode(digest)
         ));
     }
-    if !meets_target_le(&digest, &prepared.target) {
+    if !meets_target_le_for_rule(
+        &digest,
+        &prepared.target,
+        MiningToken::Photon
+            .photon_deployment(prepared.job.network)
+            .proof_rule,
+    ) {
         return Err("returned GPU winner failed strict host hash < target verification".into());
     }
     Ok(VerifiedWinner {
@@ -605,6 +671,21 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     Duration::from_nanos(u64::try_from(rest_ns).unwrap_or(u64::MAX))
 }
 
+// #### PR #11: winner delivery never blocks ####
+// What: the GPU worker hands host-verified winners to the supervisor through
+// a bounded queue (WINNER_CHANNEL_CAP). When the queue is full it stops and
+// drops the rest of this batch's winners instead of waiting.
+// Why: a blocking send kept `batch_in_flight` set while the supervisor waited
+// for `!batch_in_flight` before draining the queue. With a winner in nearly
+// every batch the miner froze for good ("WINNER PENDING (GPU PAUSED)"), as in
+// the first live Chipnet v3.2 run on 2026-10-03.
+// Safe because: winners still queued already cover the job, and only one of
+// them becomes a claim. If they belong to an older generation (stale), the
+// next batch finds fresh winners again.
+// If something looks wrong here: GPU winners found but never claimed, or
+// `stale_winners` jumping by up to 8 at once. Review this function together
+// with `drain_winners` (search.rs) and `winner_refresh_ready` (runtime.rs).
+
 /// Publishes only GPU batches that pass host verification.
 fn deliver_verified_batch(
     verified_batch: Vec<VerifiedWinner>,
@@ -618,19 +699,26 @@ fn deliver_verified_batch(
 
     paused.store(true, Ordering::SeqCst);
     for verified in verified_batch {
-        if winner_tx.send(verified).is_err() {
-            return false;
+        match winner_tx.try_send(verified) {
+            Ok(()) => {
+                winners.fetch_add(1, Ordering::Release);
+            }
+            // Full: the queued winners already cover this job (see above).
+            Err(TrySendError::Full(_)) => break,
+            Err(TrySendError::Disconnected(_)) => return false,
         }
-        winners.fetch_add(1, Ordering::Release);
     }
     true
 }
+// #### end PR #11 ####
 
 struct WorkerDiagnostics {
     last_error: Mutex<Option<String>>,
     rejected_winners: AtomicU64,
     job_exhausted: AtomicBool,
     key_rotations: AtomicU64,
+    active_rate_bits: AtomicU64,
+    work_candidates: [AtomicU64; 3],
 }
 
 impl WorkerDiagnostics {
@@ -640,6 +728,16 @@ impl WorkerDiagnostics {
             rejected_winners: AtomicU64::new(0),
             job_exhausted: AtomicBool::new(false),
             key_rotations: AtomicU64::new(0),
+            active_rate_bits: AtomicU64::new(0),
+            work_candidates: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn record_active_batch(&self, candidates: u32, elapsed: Duration) {
+        if candidates != 0 {
+            let rate = f64::from(candidates) / elapsed.as_secs_f64().max(1e-9);
+            self.active_rate_bits
+                .store(rate.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -660,6 +758,7 @@ impl WorkerDiagnostics {
     }
 
     fn publish(&self, stats: &mut SearchStats) {
+        stats.active_rate = f64::from_bits(self.active_rate_bits.load(Ordering::Relaxed));
         stats.rejected_winners = self.rejected_winners.load(Ordering::Relaxed);
         stats.waiting_for_job = self.job_exhausted.load(Ordering::Relaxed);
         stats.key_rotations = self.key_rotations.load(Ordering::Relaxed);
@@ -724,9 +823,26 @@ fn run_worker(
     diagnostics: Arc<WorkerDiagnostics>,
     job_rx: Receiver<WorkerCommand>,
     winner_tx: SyncSender<VerifiedWinner>,
+    work_fee: Option<crate::donation::Policy>,
 ) {
     let t2_coordinate = cfg!(feature = "tail-grind") && matches!(&engine, PhotonEngine::Cuda(_));
     let mut rng = rand::rng();
+    let quantum = u64::from(engine.scheduled_batch_candidates(100)) * 64;
+    let allocation = work_fee
+        .map(|policy| {
+            let schedule = crate::donation::Schedule::new(policy.scheme, quantum, rng.random())?;
+            let payouts = policy.payouts(prepared.job.network, &prepared.job.payout_address)?;
+            Ok::<_, String>((schedule, payouts, policy))
+        })
+        .transpose();
+    let mut allocation = match allocation {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            diagnostics.record_batch_error(error);
+            stop.store(true, Ordering::Relaxed);
+            return;
+        }
+    };
     let mut nonce_base = if t2_coordinate {
         0
     } else {
@@ -737,11 +853,34 @@ fn run_worker(
     while !stop.load(Ordering::Relaxed) {
         loop {
             match job_rx.try_recv() {
-                Ok(WorkerCommand::ReplaceJob { job, reply }) => {
+                Ok(WorkerCommand::ReplaceJob { mut job, reply }) => {
+                    let next_payouts = if let Some((schedule, _, policy)) = &allocation {
+                        match policy.payouts(job.network, &job.payout_address) {
+                            Ok(payouts) => {
+                                job.payout_address = payouts[schedule.recipient() as usize].clone();
+                                Some(payouts)
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let result = prepare_job(job, &sk, &public_key).and_then(|next| {
-                        engine.set_job(&next.template, &next.target, &sk)?;
+                        engine.set_job_for_network(
+                            &next.template,
+                            &next.target,
+                            &sk,
+                            next.job.network,
+                        )?;
                         generation_id.store(next.job.generation_id, Ordering::Release);
                         prepared = next;
+                        if let (Some((_, payouts, _)), Some(next)) = (&mut allocation, next_payouts)
+                        {
+                            *payouts = next;
+                        }
                         nonce_base = if t2_coordinate {
                             0
                         } else {
@@ -773,6 +912,43 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
+        if let Some((schedule, payouts, _)) = &allocation {
+            let address = &payouts[schedule.recipient() as usize];
+            let next = (|| {
+                if address == &prepared.job.payout_address {
+                    return Ok(None);
+                }
+                let mut job = prepared.job.clone();
+                job.payout_address = address.clone();
+                // A fresh identity prevents duplicate work when returning to
+                // a recipient before the chain job changes.
+                rotate_search_identity(&mut engine, &job).map(Some)
+            })();
+            match next {
+                Ok(Some((next, next_sk, next_public_key))) => {
+                    prepared = next;
+                    sk.fill(0);
+                    sk = next_sk;
+                    public_key = next_public_key;
+                    nonce_base = if t2_coordinate {
+                        0
+                    } else {
+                        rng.random::<u32>()
+                    };
+                    sweep = NonceSweep::default();
+                    diagnostics.key_rotations.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    diagnostics.record_batch_error(format!(
+                        "mining-work recipient change failed: {error}"
+                    ));
+                    batch_in_flight.store(false, Ordering::SeqCst);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
         let Some(batch_size) =
             sweep.next_batch(engine.scheduled_batch_candidates(active_intensity))
         else {
@@ -808,8 +984,15 @@ fn run_worker(
         // Incremental scalar indexes must not cross u32::MAX inside a batch.
         // The next batch wraps to zero; NonceSweep still counts each index once.
         let batch_size = batch_before_wrap(nonce_base, batch_size);
+        let batch_size = allocation.as_ref().map_or(batch_size, |(schedule, _, _)| {
+            schedule.limit_batch(batch_size)
+        });
         let batch_started = Instant::now();
         let batch = engine.search_batch(nonce_base, batch_size);
+        let gpu_elapsed = batch_started.elapsed();
+        if let Ok(ref result) = batch {
+            diagnostics.record_active_batch(result.candidates, gpu_elapsed);
+        }
         let control = absorb_search_batch(&diagnostics, batch, |gpu_winner| {
             verify_gpu_winner(&prepared, &sk, &public_key, gpu_winner)
         });
@@ -822,6 +1005,17 @@ fn run_worker(
             BatchControl::Continue(accepted) => accepted,
         };
         let compute_time = batch_started.elapsed();
+        if let Some((schedule, _, _)) = &mut allocation {
+            let recipient = schedule.recipient();
+            if let Err(error) = schedule.record(accepted.candidates) {
+                diagnostics.record_batch_error(error);
+                batch_in_flight.store(false, Ordering::SeqCst);
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            diagnostics.work_candidates[recipient as usize]
+                .fetch_add(u64::from(accepted.candidates), Ordering::Relaxed);
+        }
         candidates.fetch_add(u64::from(accepted.candidates), Ordering::Relaxed);
         batches.fetch_add(1, Ordering::Release);
 
@@ -895,7 +1089,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, false)
+        Self::start_inner(backend, device_ordinal, intensity, job, false, None)
     }
 
     /// Start exact GPU search under the live runtime supervisor. The GPU keeps
@@ -922,7 +1116,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, false)
+        Self::start_inner(backend, device_ordinal, intensity, job, false, None)
     }
 
     /// Start supervised search in a paused state. This is used while a
@@ -953,7 +1147,19 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, true)
+        Self::start_inner(backend, device_ordinal, intensity, job, true, None)
+    }
+
+    /// Starts production PHOTON mining with direct 96/2/2 work allocation.
+    pub fn start_with_work_fee(
+        backend: BackendKind,
+        device_ordinal: usize,
+        intensity: u8,
+        job: MiningJob,
+        policy: crate::donation::Policy,
+    ) -> Result<Self, String> {
+        policy.payouts(job.network, &job.payout_address)?;
+        Self::start_inner(backend, device_ordinal, intensity, job, false, Some(policy))
     }
 
     /// Creates the shared GPU worker and its control channels.
@@ -963,6 +1169,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
         initially_paused: bool,
+        work_fee: Option<crate::donation::Policy>,
     ) -> Result<Self, String> {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
@@ -989,7 +1196,12 @@ impl SearchHandle {
         if let PhotonEngine::Cuda(cuda) = &mut engine {
             cuda.enable_incremental_search()?;
         }
-        engine.set_job(&prepared.template, &prepared.target, &sk)?;
+        engine.set_job_for_network(
+            &prepared.template,
+            &prepared.target,
+            &sk,
+            prepared.job.network,
+        )?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(initially_paused));
@@ -1035,6 +1247,7 @@ impl SearchHandle {
                         worker_diagnostics,
                         job_rx,
                         winner_tx,
+                        work_fee,
                     )
                 }
             })
@@ -1150,6 +1363,9 @@ impl SearchHandle {
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
         let mut stats = SearchStats {
             candidates,
+            work_candidates: std::array::from_fn(|i| {
+                self.diagnostics.work_candidates[i].load(Ordering::Relaxed)
+            }),
             batches: self.batches.load(Ordering::Acquire),
             intensity: self.intensity.load(Ordering::Relaxed),
             state: self.state(),
@@ -1157,6 +1373,7 @@ impl SearchHandle {
             rate: candidates as f64 / elapsed,
             current_rate: 0.0,
             peak_rate: 0.0,
+            active_rate: 0.0,
             winners: self.winners.load(Ordering::Relaxed),
             rejected_winners: 0,
             waiting_for_job: false,
@@ -1252,6 +1469,20 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("HASH256 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn active_gpu_rate_is_measured_before_verification_and_retained_while_paused() {
+        let diagnostics = WorkerDiagnostics::new();
+        diagnostics.record_active_batch(10_000, Duration::from_millis(10));
+        let mut paused = SearchStats {
+            state: MiningState::Paused,
+            current_rate: 0.0,
+            ..SearchStats::default()
+        };
+        diagnostics.publish(&mut paused);
+        assert_eq!(paused.current_rate, 0.0);
+        assert_eq!(paused.active_rate, 1_000_000.0);
     }
 
     #[test]
@@ -1486,7 +1717,7 @@ mod tests {
         let paused = AtomicBool::new(false);
         let winners = AtomicU64::new(0);
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
-        let batch = (0..WINNER_BUFFER_CAP)
+        let batch: Vec<_> = (0..WINNER_BUFFER_CAP)
             .map(|nonce| VerifiedWinner {
                 generation_id: 1,
                 height: 1_000,
@@ -1501,13 +1732,28 @@ mod tests {
             })
             .collect();
 
+        let second = batch.clone();
         assert!(deliver_verified_batch(batch, &paused, &winners, &winner_tx));
         assert!(paused.load(Ordering::SeqCst));
         assert_eq!(
             winners.load(Ordering::Acquire),
             u64::from(WINNER_BUFFER_CAP)
         );
+
+        // #### PR #11 test: a second winning batch into a full queue ####
+        // The GPU resumed while a claim resolved, before the supervisor
+        // drained the queue. The old blocking send hung here forever.
+        paused.store(false, Ordering::SeqCst);
+        assert!(deliver_verified_batch(
+            second, &paused, &winners, &winner_tx
+        ));
+        assert!(paused.load(Ordering::SeqCst));
+        assert_eq!(
+            winners.load(Ordering::Acquire),
+            u64::from(WINNER_BUFFER_CAP)
+        );
         assert_eq!(winner_rx.try_iter().count(), WINNER_BUFFER_CAP as usize);
+        // #### end PR #11 test ####
     }
 
     #[test]
@@ -1584,21 +1830,106 @@ mod tests {
             generation_id: 1,
             ..MiningJob::default()
         };
-        let prepared = prepare_job(job.clone(), &sk, &public_key).unwrap();
-        assert_eq!(prepared.template.len(), 615);
-        assert_eq!(&prepared.template[390..394], &[0u8; 4]);
-        assert_eq!(&prepared.template[394..426], &prepared.target);
-        assert_eq!(&prepared.template[45..78], &public_key);
-
-        for (age, bytes) in [(17u32, 616usize), (128, 617), (40_000, 618)] {
+        // Mainnet runs the 273-byte v3.2 contract: fourteen bytes past v0.
+        for (age, bytes) in [(10u32, 629usize), (17, 630), (128, 631), (32_767, 631)] {
             let prepared = prepare_job(MiningJob { age, ..job.clone() }, &sk, &public_key).unwrap();
-            let layout = tx::PhotonLayout::for_age(age).unwrap();
+            let layout =
+                tx::PhotonLayout::for_age_with_deployment(age, &crate::protocol::MAINNET_PHOTON)
+                    .unwrap();
             assert_eq!(prepared.template.len(), bytes);
+            let n = layout.nonce_offset();
+            assert_eq!(&prepared.template[n..n + 4], &[0u8; 4]);
             let t = layout.target_offset();
             assert_eq!(&prepared.template[t..t + 32], &prepared.target);
             assert_eq!(&prepared.template[45..78], &public_key);
         }
+        assert!(prepare_job(
+            MiningJob {
+                age: 32_768,
+                ..job.clone()
+            },
+            &sk,
+            &public_key
+        )
+        .is_err());
         assert!(prepare_job(MiningJob { age: 65_535, ..job }, &sk, &public_key).is_err());
+    }
+
+    #[test]
+    fn positive_proof_rule_requires_positive_nonzero_digest() {
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        let mut positive = [1; 32];
+        positive[31] = 0;
+        assert!(meets_target_le_for_rule(
+            &positive,
+            &target,
+            crate::protocol::ProofRule::Positive,
+        ));
+        let mut negative = positive;
+        negative[31] = 0x80;
+        assert!(!meets_target_le_for_rule(
+            &negative,
+            &target,
+            crate::protocol::ProofRule::Positive,
+        ));
+        assert!(!meets_target_le_for_rule(
+            &[0; 32],
+            &target,
+            crate::protocol::ProofRule::Positive,
+        ));
+        assert!(meets_target_le_for_rule(
+            &negative,
+            &target,
+            crate::protocol::ProofRule::Absolute,
+        ));
+        let mut invalid_target = target;
+        invalid_target[31] = 0xff;
+        assert!(!meets_target_le_for_rule(
+            &positive,
+            &invalid_target,
+            crate::protocol::ProofRule::Positive,
+        ));
+    }
+
+    #[test]
+    fn prepared_chipnet_job_uses_confirmed_deployment_layout() {
+        let sk = [1u8; 32];
+        let public_key =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
+        let mut job = integration_job(8);
+        job.network = MiningNetwork::Chipnet;
+        job.age = 38;
+        job.baton_value_sats = 49_080_500;
+        job.payout_address = crate::config::CHIPNET_DONATION_ADDRESS.into();
+        let prepared = prepare_job(job.clone(), &sk, &public_key).unwrap();
+        let layout = tx::PhotonLayout::for_age_with_deployment(
+            job.age,
+            MiningToken::Photon.photon_deployment(job.network),
+        )
+        .unwrap();
+        assert_eq!(prepared.template.len(), 630);
+        assert_eq!(layout.shift(), 15);
+        assert_eq!(
+            &prepared.template[layout.target_offset()..layout.target_offset() + 32],
+            &prepared.target,
+        );
+        let prepared = prepare_job(
+            MiningJob {
+                age: 128,
+                ..job.clone()
+            },
+            &sk,
+            &public_key,
+        )
+        .unwrap();
+        assert_eq!(prepared.template.len(), 631);
+        let mut unsupported = job;
+        unsupported.age = 32_768;
+        assert!(prepare_job(unsupported, &sk, &public_key)
+            .err()
+            .unwrap()
+            .contains("GPU layout shift 17"));
     }
 
     #[test]
@@ -1607,14 +1938,11 @@ mod tests {
         let public =
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(sk).unwrap()).serialize();
         let job = MiningJob {
-            target_le_hex: "ff".repeat(32),
+            target_le_hex: format!("{}7f", "ff".repeat(31)),
             payout_address: "zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3".into(),
             ..integration_job(12)
         };
         let prepared = prepare_job(job.clone(), &sk, &public).unwrap();
-        let nonce = 7;
-        let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
-        let signature = crypto::bch_schnorr_sign(&sk, &message).unwrap();
         let context = tx::ReferenceJobContext {
             prev_txid: job.baton_txid.clone(),
             prev_vout: job.baton_vout,
@@ -1624,14 +1952,23 @@ mod tests {
             contract_token_amount: job.token_amount,
             reward_raw: job.reward_raw - 31,
         };
-        let tx = tx::apply_reference_signature(
-            &context,
-            &job.payout_address,
-            &hex::encode(public),
-            nonce,
-            &hex::encode(signature),
-        )
-        .unwrap();
+        // The positive proof rule rejects about half the digests.
+        let (nonce, signature, tx) = (0..64)
+            .find_map(|nonce| {
+                let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+                let signature = crypto::bch_schnorr_sign(&sk, &message).unwrap();
+                tx::apply_reference_signature_for_deployment(
+                    &context,
+                    &job.payout_address,
+                    &hex::encode(public),
+                    nonce,
+                    &hex::encode(signature),
+                    &crate::protocol::MAINNET_PHOTON,
+                )
+                .ok()
+                .map(|tx| (nonce, signature, tx))
+            })
+            .unwrap();
         let gpu = PhotonCudaWinner {
             nonce,
             digest: hash256(&tx),
@@ -1662,6 +1999,7 @@ mod tests {
 
     fn integration_job(generation_id: u64) -> MiningJob {
         MiningJob {
+            network: MiningNetwork::Mainnet,
             height: 1_000,
             baton_txid: "42a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae124712000000".into(),
             baton_vout: 0,
@@ -1714,7 +2052,7 @@ mod tests {
         };
         cuda.enable_incremental_search().unwrap();
         let mut engine = PhotonEngine::Cuda(Box::new(cuda));
-        for age in [0, 17, 128, 65534] {
+        for age in [0, 17, 128, 32_767] {
             job.age = age;
             job.generation_id += 1;
             let prepared = prepare_job(job.clone(), &sk, &public).unwrap();
@@ -1722,7 +2060,8 @@ mod tests {
                 .set_job(&prepared.template, &prepared.target, &sk)
                 .unwrap();
             let result = engine.search_batch(u32::MAX - 64, 65).unwrap();
-            assert_eq!(result.total_winners, 65);
+            // Mainnet's positive proof rule admits about half the digests.
+            assert!(result.total_winners > 0 && result.total_winners <= 65);
             for winner in &result.winners {
                 assert_eq!(winner.nonce, 0);
                 assert!(winner.schnorr_k.unwrap() >= (1u64 << 32) - 64);
@@ -1794,8 +2133,119 @@ mod tests {
     // separate GPU winner tests retain their real targets and verification.
     fn control_job(generation_id: u64) -> MiningJob {
         MiningJob {
-            target_le_hex: "00".repeat(32),
+            // The smallest positive target: only a zero digest could meet it.
+            target_le_hex: format!("01{}", "00".repeat(31)),
             ..integration_job(generation_id)
+        }
+    }
+
+    #[test]
+    fn direct_work_fee_pays_each_recipient_across_controls_if_cuda_present() {
+        let _lock = crate::mining_lock::acquire_gpu_lock().unwrap();
+        let mut samples = Vec::new();
+        for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            let policy = crate::config::MiningToken::Photon.fee_policy(network);
+            let mut job = integration_job(1);
+            job.network = network;
+            job.age = 1;
+            let mut target = [0u8; 32];
+            target[28] = 0x80;
+            job.target_le_hex = hex::encode(target);
+            let payouts = policy.payouts(network, &job.payout_address).unwrap();
+            let handle = match SearchHandle::start_with_work_fee(
+                BackendKind::Cuda,
+                0,
+                100,
+                job.clone(),
+                policy,
+            ) {
+                Ok(handle) => handle,
+                Err(error) if crate::cuda_photon::cuda_unavailable_for_tests(&error) => {
+                    eprintln!("skip direct fee CUDA test: {error}");
+                    return;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            let mut seen = [
+                false,
+                policy.scheme.work()[0] == 0,
+                policy.scheme.work()[1] == 0,
+            ];
+            let mut changed = false;
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while Instant::now() < deadline && !seen.iter().all(|seen| *seen) {
+                for winner in handle.drain_winners() {
+                    let amount = tx::t2_parent_reward_amount(
+                        &winner.transaction,
+                        job.token_amount,
+                        job.reward_raw,
+                    )
+                    .unwrap();
+                    let context = tx::ReferenceJobContext {
+                        prev_txid: job.baton_txid.clone(),
+                        prev_vout: job.baton_vout,
+                        age: job.age,
+                        target_le_hex: job.target_le_hex.clone(),
+                        contract_value_sats: job.baton_value_sats,
+                        contract_token_amount: job.token_amount,
+                        reward_raw: amount,
+                    };
+                    let index = payouts
+                        .iter()
+                        .position(|payout| {
+                            tx::apply_reference_signature_for_deployment(
+                                &context,
+                                payout,
+                                &hex::encode(winner.public_key),
+                                winner.nonce,
+                                &hex::encode(winner.signature),
+                                crate::config::MiningToken::Photon.photon_deployment(network),
+                            )
+                            .is_ok_and(|raw| raw == winner.transaction)
+                        })
+                        .expect("GPU winner paid an unauthorized recipient");
+                    if !seen[index] {
+                        samples.push(serde_json::json!({
+                            "raw": hex::encode(&winner.transaction), "network": network.as_str(),
+                            "recipient": format!("{:?}", crate::donation::Recipient::ALL[index]),
+                            "payout": payouts[index], "age": 1, "old_target_le": job.target_le_hex,
+                            "value": job.baton_value_sats, "amount": job.token_amount.to_string(), "reward": amount.to_string(),
+                        }));
+                    }
+                    seen[index] = true;
+                }
+                if !changed && handle.snapshot().batches >= 5 {
+                    handle.apply_control(RuntimeCommand::Pause).unwrap();
+                    let pause_deadline = Instant::now() + Duration::from_secs(20);
+                    while handle.batch_in_flight() && Instant::now() < pause_deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(!handle.batch_in_flight());
+                    let before = handle.snapshot().work_candidates;
+                    job.generation_id += 1;
+                    handle.replace_job(job.clone()).unwrap();
+                    handle.set_intensity(95).unwrap();
+                    assert_eq!(handle.snapshot().work_candidates, before);
+                    changed = true;
+                }
+                handle.apply_control(RuntimeCommand::Resume).unwrap();
+                thread::sleep(Duration::from_millis(5));
+            }
+            let stats = handle.stop();
+            assert!(
+                seen.iter().all(|seen| *seen),
+                "{network:?}: recipients={seen:?} {stats:?}"
+            );
+            assert_eq!(stats.candidates, stats.work_candidates.iter().sum::<u64>());
+            assert_eq!(stats.rejected_winners, 0);
+            assert!(stats.last_error.is_none());
+            eprintln!(
+                "direct fee {network:?}: candidates={} recipient_counts={:?}, rotations={}",
+                stats.candidates, stats.work_candidates, stats.key_rotations
+            );
+        }
+        if let Ok(path) = std::env::var("PICKAXE_DIRECT_GPU_PROOF") {
+            std::fs::write(path, serde_json::to_vec(&samples).unwrap()).unwrap();
         }
     }
 

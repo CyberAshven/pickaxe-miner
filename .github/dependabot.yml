@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # Routine changes enter the alpha/testing branch for review.
+  - package-ecosystem: cargo
+    directories: ["/", "/rust-engine"]
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      compatible-rust-updates:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  # Security update PRs use GitHub's default branch; no routine duplicates.
+  - package-ecosystem: cargo
+    directories: ["/", "/rust-engine"]
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
