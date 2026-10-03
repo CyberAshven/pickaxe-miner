@@ -19,7 +19,7 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 - Operating systems: Windows x86_64 and Linux x86_64
 - NVIDIA: CUDA PTX `sm_120`
 - AMD: HIP `gfx1036`
-- Experimental Apple Silicon (Metal) and browser (WebGPU/WASM) builds: [portable build instructions](docs/portable.md). GPU/live validation on Apple hardware is pending.
+- Apple Silicon (Metal) and browser (WebGPU/WASM) builds: [portable build instructions](docs/portable.md).
 
 ## Install
 

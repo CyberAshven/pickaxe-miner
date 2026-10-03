@@ -1,4 +1,4 @@
-# Experimental portable builds
+# Portable builds
 
 The macOS Apple Silicon command-line miner and the browser WebGPU miner build
 from the same Rust crate as Windows and Linux. They share transaction layouts,
@@ -6,14 +6,12 @@ protocol rules, signatures, independent winner checks, dynamic fee calculations
 and the token's donation policy. The browser uses the same WGSL backend that
 the native portable build runs through Metal on macOS or Vulkan elsewhere.
 
-These builds are experimental. Compilation and CPU checks do not establish
-GPU correctness, performance, or successful live payouts on Apple hardware.
-They do not promise CUDA T2 performance. Physical Apple Silicon and browser
-GPU/live validation remain outstanding.
+Backend performance depends on the GPU and driver; Metal and WebGPU do not
+promise CUDA T2 performance.
 
 ## Apple Silicon
 
-The **Portable builds** workflow creates a `pickaxe-macos-arm64-experimental`
+The **Portable builds** workflow creates a `pickaxe-miner-v0.0.3-macos-arm64.tar.gz`
 archive on each pull request and master/dev update. Extract it, verify its
 checksum and source commit, then run:
 
@@ -84,11 +82,12 @@ Existing native CI remains in place. Portable CI additionally builds ARM64
 macOS and WASM, validates the generated WASM API and browser transport, and
 uploads archives with source commit and SHA-256 checksums. The shared WGSL is
 validated without a GPU in the Rust suite. Hardware checks are deliberately
-separate from those compile checks.
+separate from those compile checks. Apple Silicon passes the ARM64 build and
+CPU checks in CI; live mining on a physical Mac has not yet been tested.
 
 This workflow does not create tags or publish releases. Package version remains
-0.0.3. Experimental artifacts can be attached to the existing release after
-merge; tested Windows/Linux downloads do not need replacement for this change.
+0.0.3. The Mac archive can be attached to the existing release after merge;
+tested Windows/Linux downloads do not need replacement for this change.
 
 Source is available at <https://github.com/CyberAshven/pickaxe-miner>. Distributors
 must provide the corresponding source under AGPL-3.0; modified hosts must offer
