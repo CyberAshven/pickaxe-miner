@@ -17,5 +17,5 @@ sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
 
 [dev-dependencies]
-num-bigint = "0.4"
+num-bigint = "0.5"
 secp256k1 = "0.33.1"
