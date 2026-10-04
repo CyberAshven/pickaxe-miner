@@ -1,4 +1,6 @@
 //! Shared transaction-block layout for T2 amount grinding.
+#[cfg(target_arch = "spirv")]
+use spirv_std::arch::IndexUnchecked;
 // #### PR #22
 // Keep one layout/padding definition. Only byte access and 64-bit primitives
 // differ at the SPIR-V boundary. Native PTX identity is a required gate.
@@ -40,7 +42,7 @@ type Byte = u32;
 // One layout definition; native keeps its original captured closure so LLVM
 // retains the verified register schedule, while SPIR-V uses a direct function.
 macro_rules! byte_body {
-    ($tx:ident, $tx_start:ident, $baton:ident, $reward:ident, $j:ident, $pos:ident, $SHIFT:ident) => {{
+    ($tx:ident, $tx_start:ident, $tx_origin:ident, $big_endian:ident, $baton:ident, $reward:ident, $j:ident, $pos:ident, $SHIFT:ident) => {{
         if $pos >= 491 + $SHIFT && $pos < 499 + $SHIFT {
             #[cfg(not(target_arch = "spirv"))]
             {
@@ -66,7 +68,15 @@ macro_rules! byte_body {
             }
             #[cfg(target_arch = "spirv")]
             {
-                ($tx[$tx_start + $pos / 4] >> (($pos & 3) * 8)) & 255
+                let byte_index = if $big_endian {
+                    3 - ($pos & 3)
+                } else {
+                    $pos & 3
+                };
+                // The entry adapter validates the record span once. Avoid a
+                // Rust panic branch for each byte of every fixed-width word.
+                (*$tx.index_unchecked($tx_start + $pos / 4 - $tx_origin / 4) >> (byte_index * 8))
+                    & 255
             }
         } else if $pos == 615 + $SHIFT {
             0x80
@@ -93,29 +103,36 @@ macro_rules! byte_body {
 unsafe fn byte<const SHIFT: usize>(
     tx: &[u32],
     tx_start: usize,
+    tx_origin: usize,
+    big_endian: bool,
     baton: Amount,
     reward: Amount,
     j: u32,
     pos: usize,
 ) -> Byte {
-    byte_body!(tx, tx_start, baton, reward, j, pos, SHIFT)
+    byte_body!(tx, tx_start, tx_origin, big_endian, baton, reward, j, pos, SHIFT)
 }
 
 /// Assemble one padded transaction block with the conserved amount coordinate.
 /// # Safety
 /// Native `tx` must point to at least `615 + SHIFT` readable bytes. The host
 /// validates amount arithmetic and layout eligibility before dispatch.
+/// Portable records must cover every source byte in the requested block,
+/// starting at `tx_origin` (word aligned); `tx_start` is their first word.
 #[inline(always)]
 pub unsafe fn block<const SHIFT: usize, const BLOCK: usize>(
     #[cfg(not(target_arch = "spirv"))] tx: *const u8,
     #[cfg(target_arch = "spirv")] tx: &[u32],
     #[cfg(target_arch = "spirv")] tx_start: usize,
+    #[cfg(target_arch = "spirv")] tx_origin: usize,
+    #[cfg(target_arch = "spirv")] big_endian: bool,
     baton: Amount,
     reward: Amount,
     j: u32,
 ) -> [u32; 16] {
     #[cfg(not(target_arch = "spirv"))]
-    let byte = |pos: usize| byte_body!(tx, tx_start, baton, reward, j, pos, SHIFT);
+    let byte =
+        |pos: usize| byte_body!(tx, tx_start, tx_origin, big_endian, baton, reward, j, pos, SHIFT);
     macro_rules! byte {
         ($pos:expr) => {{
             #[cfg(not(target_arch = "spirv"))]
@@ -124,7 +141,7 @@ pub unsafe fn block<const SHIFT: usize, const BLOCK: usize>(
             }
             #[cfg(target_arch = "spirv")]
             {
-                byte::<SHIFT>(tx, tx_start, baton, reward, j, $pos)
+                byte::<SHIFT>(tx, tx_start, tx_origin, big_endian, baton, reward, j, $pos)
             }
         }};
     }

@@ -5,6 +5,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let output = root.join("artifacts/shared-gpu-proof");
     fs::create_dir_all(&output)?;
+    if std::env::var_os("PICKAXE_BUILD_SHARED_FILTER").is_some() {
+        let result = spirv_builder::SpirvBuilder::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../filter"),
+            "spirv-unknown-vulkan1.1",
+        )
+        .multimodule(true)
+        .build()?;
+        let spirv_builder::ModuleResult::MultiModule(modules) = result.module else {
+            return Err("Expected one portable module per layout".into());
+        };
+        let directory = output.join("filter");
+        if modules.len() != 17 {
+            return Err("Expected exactly 17 layout kernels".into());
+        }
+        fs::create_dir_all(&directory)?;
+        for (name, path) in modules {
+            let name = name.rsplit("::").next().ok_or("Missing kernel name")?;
+            let module = naga::front::spv::parse_u8_slice(&fs::read(&path)?, &Default::default())?;
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)?;
+            fs::write(
+                directory.join(format!("{name}.wgsl")),
+                naga::back::wgsl::write_string(
+                    &module,
+                    &info,
+                    naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+                )?,
+            )?;
+            let (metal, _) = naga::back::msl::write_string(
+                &module,
+                &info,
+                &Default::default(),
+                &Default::default(),
+            )?;
+            fs::write(directory.join(format!("{name}.metal")), metal)?;
+            fs::copy(path, directory.join(format!("{name}.spv")))?;
+        }
+        println!("Shared T2 filters generated in {}", directory.display());
+        return Ok(());
+    }
     let result = spirv_builder::SpirvBuilder::new(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kernel"),
         "spirv-unknown-vulkan1.1",

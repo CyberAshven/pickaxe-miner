@@ -36,7 +36,17 @@ fn assembled<const SHIFT: usize, const BLOCK: usize>(inputs: &[u32], base: usize
             lo: inputs[base + 162],
             hi: inputs[base + 163],
         };
-        unsafe { t2_block::block::<SHIFT, BLOCK>(inputs, base, baton, reward, inputs[base + 164]) }
+        unsafe {
+            t2_block::block::<SHIFT, BLOCK>(
+                inputs,
+                base,
+                0,
+                false,
+                baton,
+                reward,
+                inputs[base + 164],
+            )
+        }
     }
 }
 

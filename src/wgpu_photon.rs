@@ -457,9 +457,61 @@ fn create_bind_group(
     })
 }
 
+// #### PR #22: isolated shared-source filter candidate. Generated from the
+// pinned Rust-GPU compiler; no alternative signature or payout policy.
+#[cfg(feature = "shared-rust-t2")]
+fn create_shared_t2_filter(
+    device: &wgpu::Device,
+    shift: usize,
+    windows: &wgpu::Buffer,
+    control: &wgpu::Buffer,
+    result: &wgpu::Buffer,
+    winners: &wgpu::Buffer,
+) -> (wgpu::ComputePipeline, wgpu::BindGroup) {
+    let source = match shift {
+        0 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_0.wgsl"),
+        1 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_1.wgsl"),
+        2 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_2.wgsl"),
+        3 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_3.wgsl"),
+        4 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_4.wgsl"),
+        5 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_5.wgsl"),
+        6 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_6.wgsl"),
+        7 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_7.wgsl"),
+        8 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_8.wgsl"),
+        9 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_9.wgsl"),
+        10 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_10.wgsl"),
+        11 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_11.wgsl"),
+        12 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_12.wgsl"),
+        13 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_13.wgsl"),
+        14 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_14.wgsl"),
+        15 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_15.wgsl"),
+        16 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_16.wgsl"),
+        _ => unreachable!("Validated T2 layout"),
+    };
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Shared Rust T2 filter"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Shared Rust T2 filter"),
+        layout: None,
+        module: &module,
+        entry_point: None,
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let binding = create_bind_group(
+        device,
+        &pipeline,
+        "Shared Rust T2 filter",
+        &[(0, windows), (1, control), (2, result), (3, winners)],
+    );
+    (pipeline, binding)
+}
+
 pub struct WgpuPhotonEngine {
     _instance: wgpu::Instance,
-    shader: wgpu::ShaderModule,
+    _shader: wgpu::ShaderModule,
     device: wgpu::Device,
     queue: wgpu::Queue,
     stage_a: wgpu::ComputePipeline,
@@ -473,6 +525,8 @@ pub struct WgpuPhotonEngine {
     bind_t2_filter: wgpu::BindGroup,
     _t2_windows_gpu: wgpu::Buffer,
     t2_control_gpu: wgpu::Buffer,
+    #[cfg(feature = "shared-rust-t2")]
+    shared_t2_control: [u32; 17],
     t2_active: bool,
     t2_group_size: u32,
     t2_filter_shift: usize,
@@ -641,6 +695,7 @@ impl WgpuPhotonEngine {
         let stage_c2 = create_pipeline(&device, &shader, "photon_m6725_c2_hash_only_wg64");
         let stage_c3 = create_pipeline(&device, &shader, "pickaxe_photon_c3_bounded_wg64");
         let t2_prepare = create_pipeline(&device, &shader, "pickaxe_t2_prepare");
+        #[cfg(not(feature = "shared-rust-t2"))]
         let t2_filter = create_pipeline(&device, &shader, "pickaxe_t2_filter");
 
         let (table_bytes, table_source) = table;
@@ -859,8 +914,18 @@ impl WgpuPhotonEngine {
         let t2_control_gpu = create_buffer(
             &device,
             "PHOTON T2 dispatch",
-            16,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            if cfg!(feature = "shared-rust-t2") {
+                80
+            } else {
+                16
+            },
+            wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | if cfg!(feature = "shared-rust-t2") {
+                    wgpu::BufferUsages::STORAGE
+                } else {
+                    wgpu::BufferUsages::empty()
+                },
             false,
         );
         let bind_t2_prepare = create_bind_group(
@@ -875,6 +940,7 @@ impl WgpuPhotonEngine {
                 (18, &t2_control_gpu),
             ],
         );
+        #[cfg(not(feature = "shared-rust-t2"))]
         let bind_t2_filter = create_bind_group(
             &device,
             &t2_filter,
@@ -887,9 +953,18 @@ impl WgpuPhotonEngine {
                 (18, &t2_control_gpu),
             ],
         );
+        #[cfg(feature = "shared-rust-t2")]
+        let (t2_filter, bind_t2_filter) = create_shared_t2_filter(
+            &device,
+            0,
+            &t2_windows_gpu,
+            &t2_control_gpu,
+            &result_gpu,
+            &winner_records_gpu,
+        );
         Ok(Self {
             _instance: instance,
-            shader,
+            _shader: shader,
             device,
             queue,
             stage_a,
@@ -903,6 +978,8 @@ impl WgpuPhotonEngine {
             bind_t2_filter,
             _t2_windows_gpu: t2_windows_gpu,
             t2_control_gpu,
+            #[cfg(feature = "shared-rust-t2")]
+            shared_t2_control: [0; 17],
             t2_active: false,
             t2_group_size: 64,
             t2_filter_shift: 0,
@@ -1025,35 +1102,64 @@ impl WgpuPhotonEngine {
         self.queue.write_buffer(&self.m27_gpu, 0, &m27);
         self.queue.write_buffer(&self.m30_gpu, 0, &m30);
         self.t2_active = crate::tx::supports_t2_window(template)?;
+        #[cfg(feature = "shared-rust-t2")]
+        if self.t2_active {
+            let shift = layout.shift();
+            for (i, offset) in [491 + shift, 495 + shift, 578 + shift, 582 + shift]
+                .into_iter()
+                .enumerate()
+            {
+                self.shared_t2_control[4 + i] =
+                    u32::from_le_bytes(template[offset..offset + 4].try_into().unwrap());
+            }
+            for (i, word) in target.as_chunks::<4>().0.iter().enumerate() {
+                self.shared_t2_control[8 + i] = u32::from_le_bytes(*word);
+            }
+            self.shared_t2_control[16] = u32::from(self.positive_target_rule);
+        }
         if self.t2_active && self.t2_filter_shift != layout.shift() {
             let shift = layout.shift();
             let (pipeline, binding) = self.t2_filter_cache.remove(&shift).unwrap_or_else(|| {
-                let pipeline =
-                    self.device
-                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                            label: Some("PHOTON T2 specialized filter"),
-                            layout: None,
-                            module: &self.shader,
-                            entry_point: Some("pickaxe_t2_filter"),
-                            compilation_options: wgpu::PipelineCompilationOptions {
-                                constants: &[("T2_SHIFT", shift as f64)],
-                                ..Default::default()
-                            },
-                            cache: None,
-                        });
-                let binding = create_bind_group(
-                    &self.device,
-                    &pipeline,
-                    "PHOTON T2 filter",
-                    &[
-                        (0, &self.input_gpu),
-                        (2, &self.result_gpu),
-                        (16, &self.winner_records_gpu),
-                        (17, &self._t2_windows_gpu),
-                        (18, &self.t2_control_gpu),
-                    ],
-                );
-                (pipeline, binding)
+                #[cfg(feature = "shared-rust-t2")]
+                {
+                    create_shared_t2_filter(
+                        &self.device,
+                        shift,
+                        &self._t2_windows_gpu,
+                        &self.t2_control_gpu,
+                        &self.result_gpu,
+                        &self.winner_records_gpu,
+                    )
+                }
+                #[cfg(not(feature = "shared-rust-t2"))]
+                {
+                    let pipeline =
+                        self.device
+                            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                                label: Some("PHOTON T2 specialized filter"),
+                                layout: None,
+                                module: &self._shader,
+                                entry_point: Some("pickaxe_t2_filter"),
+                                compilation_options: wgpu::PipelineCompilationOptions {
+                                    constants: &[("T2_SHIFT", shift as f64)],
+                                    ..Default::default()
+                                },
+                                cache: None,
+                            });
+                    let binding = create_bind_group(
+                        &self.device,
+                        &pipeline,
+                        "PHOTON T2 filter",
+                        &[
+                            (0, &self.input_gpu),
+                            (2, &self.result_gpu),
+                            (16, &self.winner_records_gpu),
+                            (17, &self._t2_windows_gpu),
+                            (18, &self.t2_control_gpu),
+                        ],
+                    );
+                    (pipeline, binding)
+                }
             });
             self.t2_filter_cache.insert(
                 self.t2_filter_shift,
@@ -1112,11 +1218,29 @@ impl WgpuPhotonEngine {
         let (signature_base, signatures) = if self.t2_active {
             let offset = nonce_base & 65535;
             let windows = (offset + candidate_count).div_ceil(65536);
+            #[cfg(not(feature = "shared-rust-t2"))]
             self.queue.write_buffer(
                 &self.t2_control_gpu,
                 0,
                 &u32_words_to_le_bytes(&[offset, candidate_count, windows, 0]),
             );
+            #[cfg(feature = "shared-rust-t2")]
+            {
+                // Preparation reads the first four words as a uniform. The
+                // shared filter reads the same buffer as storage, so one
+                // upload supplies both stages without another queue transfer.
+                self.shared_t2_control[..4].copy_from_slice(&[
+                    offset,
+                    candidate_count,
+                    windows,
+                    nonce_base / 65536,
+                ]);
+                self.queue.write_buffer(
+                    &self.t2_control_gpu,
+                    0,
+                    &u32_words_to_le_bytes(&self.shared_t2_control),
+                );
+            }
             (nonce_base / 65536, windows)
         } else {
             (nonce_base, candidate_count)
@@ -1596,16 +1720,26 @@ mod tests {
             .set_job(&template_for_key(key), &target, &key)
             .unwrap();
         assert!(engine.t2_active);
+        // #### PR #22: compare the actual shared Rust filter against the current
+        // 64-lane WGSL filter; keep the historical geometry probe without it.
+        let alternate_group_size = if cfg!(feature = "shared-rust-t2") {
+            64
+        } else {
+            256
+        };
         let mut alternate =
             engine
                 .device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("T2 comparison with 64-thread groups"),
+                    label: Some("T2 baseline comparison"),
                     layout: None,
-                    module: &engine.shader,
+                    module: &engine._shader,
                     entry_point: Some("pickaxe_t2_filter"),
                     compilation_options: wgpu::PipelineCompilationOptions {
-                        constants: &[("T2_SHIFT", 16.0), ("T2_GROUP_SIZE", 256.0)],
+                        constants: &[
+                            ("T2_SHIFT", 16.0),
+                            ("T2_GROUP_SIZE", alternate_group_size as f64),
+                        ],
                         ..Default::default()
                     },
                     cache: None,
@@ -1632,13 +1766,26 @@ mod tests {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(6)
             .clamp(2, 8);
+        let warmup = std::env::var("PICKAXE_WARMUP_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10)
+            .min(60);
         for round in 0..rounds {
             std::mem::swap(&mut engine.t2_filter, &mut alternate);
             std::mem::swap(&mut engine.bind_t2_filter, &mut alternate_bind);
-            let group_size = if round % 2 == 1 { 64 } else { 256 };
+            let group_size = if round % 2 == 1 {
+                64
+            } else {
+                alternate_group_size
+            };
             engine.t2_group_size = group_size;
             let count = WGPU_T2_MAX_BATCH;
             engine.search_batch(0, count).unwrap();
+            let warming = Instant::now();
+            while warming.elapsed() < Duration::from_secs(warmup) {
+                engine.search_batch(0, count).unwrap();
+            }
             let start = Instant::now();
             let mut candidates = 0u64;
             let mut position = u64::from(count);
@@ -1657,7 +1804,12 @@ mod tests {
                 candidates += u64::from(result.candidates);
                 position += u64::from(result.candidates);
             }
-            eprintln!("T2_TRIAL round={round} group_size={group_size} candidates={candidates} elapsed_s={:.6} mh_s={:.4} rotations={rotations} adapter={}", start.elapsed().as_secs_f64(), candidates as f64 / start.elapsed().as_secs_f64() / 1e6, engine._adapter_name);
+            let variant = if round % 2 == 0 {
+                "baseline"
+            } else {
+                "candidate"
+            };
+            eprintln!("T2_TRIAL round={round} variant={variant} group_size={group_size} candidates={candidates} elapsed_s={:.6} mh_s={:.4} rotations={rotations} adapter={}", start.elapsed().as_secs_f64(), candidates as f64 / start.elapsed().as_secs_f64() / 1e6, engine._adapter_name);
         }
     }
 
