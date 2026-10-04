@@ -1574,9 +1574,13 @@ mod tests {
             windows.trim_end_matches("-windows-x86_64")
         );
 
-        assert!(!workflow.to_ascii_lowercase().contains("aarch64"));
-        assert!(!workflow.contains("apple-darwin"));
-        assert!(!workflow.contains("-arm64"));
+        // #### PR #22: ARM64 is supported by the shared macOS package. Keep
+        // excluding unsupported Windows/Linux ARM packages from this release.
+        assert!(workflow.contains("\"${TAG}-macos-arm64.tar.gz\""));
+        assert!(workflow.contains("\"${TAG}-web.tar.gz\""));
+        assert!(workflow.contains("name: Verify portable package provenance"));
+        assert!(!workflow.contains("-linux-arm64"));
+        assert!(!workflow.contains("-windows-arm64"));
         assert!(workflow.contains("GH_REPO: ${{ github.repository }}"));
         assert!(workflow.contains("--repo \"${GH_REPO}\""));
     }
