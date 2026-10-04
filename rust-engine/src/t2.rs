@@ -1,7 +1,11 @@
 //! PHOTON T2 amount grinding, ported from shrec's v0.0.2 CUDA implementation.
 //! Same signatures, amount coordinate, transaction layouts and winner ABI.
 //! Host validation bounds every buffer and amount before launching these kernels.
-use super::{index, meets, point_at, read, write};
+#[cfg(target_os = "cuda")]
+use super::index;
+#[cfg(target_os = "amdhsa")]
+use super::index_in;
+use super::{meets, point_at, read, write};
 use crate::sha256;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -38,7 +42,7 @@ unsafe fn prepare<const SHIFT: usize>(
     window_txs: *mut u8,
     prefixes: *mut u32,
 ) {
-    let window = index() as usize;
+    let window = gpu_index!(128) as usize;
     if window >= count as usize {
         return;
     }
@@ -85,7 +89,7 @@ unsafe fn filter<const SHIFT: usize>(
     winner_j: *mut u32,
     hashes: *mut u8,
 ) {
-    let index = index();
+    let index = gpu_index!(128);
     if index >= count {
         return;
     }
@@ -121,19 +125,28 @@ unsafe fn group<const SHIFT: usize>(
 ) {
     // SAFETY: one 64-word array per block. Each word has one writer;
     // all threads reach the barrier before any thread reads or returns.
+    #[cfg(target_os = "cuda")]
     let shared: *mut u32;
+    #[cfg(target_os = "cuda")]
     core::arch::asm!(
         "{{ .shared .align 4 .b32 schedule[64];",
         "cvta.shared.u64 {ptr}, schedule; }}",
         ptr = out(reg64) shared,
         options(nostack),
     );
+    #[cfg(target_os = "cuda")]
     let lane = core::arch::nvptx::_thread_idx_x() as usize;
+    #[cfg(target_os = "cuda")]
     if lane < 64 {
         *shared.add(lane) = *middle.add(lane);
     }
+    #[cfg(target_os = "cuda")]
     core::arch::nvptx::_syncthreads();
-    let index = index();
+    // AMD reads the job-wide schedule straight from global memory: every lane
+    // loads the same address, which the scalar cache serves.
+    #[cfg(target_os = "amdhsa")]
+    let shared = middle;
+    let index = gpu_index!(256);
     if index >= count {
         return;
     }
@@ -168,7 +181,7 @@ unsafe fn group<const SHIFT: usize>(
 macro_rules! kernels {
     ($prepare:ident, $group:ident, $filter:ident, $probe:ident, $shift:literal) => {
         #[no_mangle]
-        pub unsafe extern "ptx-kernel" fn $prepare(
+        pub unsafe extern "gpu-kernel" fn $prepare(
             tx: *const u8,
             midstate: *const u32,
             signatures: *const u8,
@@ -184,7 +197,7 @@ macro_rules! kernels {
             );
         }
         #[no_mangle]
-        pub unsafe extern "ptx-kernel" fn $group(
+        pub unsafe extern "gpu-kernel" fn $group(
             txs: *const u8,
             prefixes: *const u32,
             middle: *const u32,
@@ -218,7 +231,7 @@ macro_rules! kernels {
             );
         }
         #[no_mangle]
-        pub unsafe extern "ptx-kernel" fn $filter(
+        pub unsafe extern "gpu-kernel" fn $filter(
             tx: *const u8,
             prefix: *const u32,
             baton: u64,
@@ -246,7 +259,7 @@ macro_rules! kernels {
             );
         }
         #[no_mangle]
-        pub unsafe extern "ptx-kernel" fn $probe(
+        pub unsafe extern "gpu-kernel" fn $probe(
             tx: *const u8,
             prefix: *const u32,
             baton: u64,
@@ -254,7 +267,7 @@ macro_rules! kernels {
             j: u16,
             output: *mut u8,
         ) {
-            if index() == 0 {
+            if gpu_index!(1) == 0 {
                 write(
                     output,
                     &hash::<$shift>(tx, prefix, baton, reward, u32::from(j)),

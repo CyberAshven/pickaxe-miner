@@ -240,6 +240,12 @@ jobs:
             hip-dev=7.0.51831.70002-56~24.04 \
             hipcc=1.1.1.70002-56~24.04
 
+      - name: Install pinned Rust GPU compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src
+
       - name: Build and verify gfx1036 HSACO set
         shell: bash
         run: |
@@ -248,6 +254,7 @@ jobs:
           hipcc --version
           python3 tools/build_hip.py --arch gfx1036 --check-reproducible
           python3 -m unittest tools.test_verify_hip_artifacts -v
+          python3 tools/build_rust_amd.py --arch gfx1036
           (cd hip/build/gfx1036 && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
           cat hip/build/gfx1036/SHA256SUMS.txt
 
@@ -300,12 +307,19 @@ jobs:
             hip-dev=7.0.51831.70002-56~24.04 \
             hipcc=1.1.1.70002-56~24.04
 
+      - name: Install pinned Rust GPU compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src
+
       - name: Build and verify ${{ matrix.arch }} HSACO set
         shell: bash
         run: |
           set -euo pipefail
           export PATH="/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/opt/rocm/llvm/bin:${PATH}"
           python3 tools/build_hip.py --arch "${{ matrix.arch }}" --check-reproducible
+          python3 tools/build_rust_amd.py --arch "${{ matrix.arch }}"
           (cd "hip/build/${{ matrix.arch }}" && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
           cat "hip/build/${{ matrix.arch }}/SHA256SUMS.txt"
 
@@ -461,7 +475,8 @@ jobs:
               photon_stage_b16.hsaco \
               photon_c1_schnorr.hsaco \
               stage_c_hash.hsaco \
-              photon_t2_tail.hsaco; do
+              photon_t2_tail.hsaco \
+              photon_rust.hsaco; do
               test -s "hip/build/${arch}/${artifact}"
             done
           done
@@ -475,6 +490,7 @@ jobs:
             echo "NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required."
             echo "NVIDIA CUDA T2 mining uses the Rust backend."
             echo "AMD HIP T2 code objects in hip/build/<arch> cover gfx1030, gfx1031, gfx1032, gfx1034, gfx1036, gfx1100, gfx1101, gfx1102, gfx1200, gfx1201 and were built by this workflow."
+            echo "Each folder also holds photon_rust.hsaco from the shared Rust engine; PICKAXE_HIP_KERNELS=rust selects it, C++ stays the default."
             echo "Other AMD and Intel GPUs, and integrated GPUs, mine through the included Vulkan (wgpu) T2 engine."
             echo "No CPU mining fallback."
           } > "dist/${package}/BACKENDS.txt"
@@ -563,7 +579,8 @@ jobs:
             'photon_stage_b16.hsaco',
             'photon_c1_schnorr.hsaco',
             'stage_c_hash.hsaco',
-            'photon_t2_tail.hsaco'
+            'photon_t2_tail.hsaco',
+            'photon_rust.hsaco'
           )
           foreach ($arch in @('gfx1030', 'gfx1031', 'gfx1032', 'gfx1034', 'gfx1036', 'gfx1100', 'gfx1101', 'gfx1102', 'gfx1200', 'gfx1201')) {
             foreach ($artifact in $requiredHipArtifacts) {
@@ -584,6 +601,7 @@ jobs:
             'NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required.'
             'NVIDIA CUDA T2 mining uses the Rust backend.'
             'AMD HIP T2 code objects in hip/build/<arch> cover gfx1030, gfx1031, gfx1032, gfx1034, gfx1036, gfx1100, gfx1101, gfx1102, gfx1200, gfx1201 and were built by this workflow.'
+            'Each folder also holds photon_rust.hsaco from the shared Rust engine; PICKAXE_HIP_KERNELS=rust selects it, C++ stays the default.'
             'Other AMD and Intel GPUs, and integrated GPUs, mine through the included Vulkan (wgpu) T2 engine.'
             'No CPU mining fallback.'
           ) | Set-Content -LiteralPath (Join-Path $packageDir 'BACKENDS.txt') -Encoding utf8

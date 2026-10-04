@@ -5,9 +5,23 @@ use crate::sha256;
 use crate::upstream::{Field, Point, Scalar};
 #[cfg(not(feature = "upstream-rust"))]
 use crate::{field::Field, point::Point, scalar::Scalar};
+#[cfg(target_os = "cuda")]
 use core::arch::nvptx;
 use core::sync::atomic::{AtomicU32, Ordering};
 use sha2::{Digest, Sha256};
+
+#[cfg(target_os = "cuda")]
+macro_rules! gpu_index {
+    ($group:literal) => {
+        index()
+    };
+}
+#[cfg(target_os = "amdhsa")]
+macro_rules! gpu_index {
+    ($group:literal) => {
+        index_in::<$group>()
+    };
+}
 
 #[path = "t2.rs"]
 mod t2;
@@ -28,15 +42,33 @@ fn words(field: Field) -> [u32; 8] {
     field.0
 }
 
+#[cfg(target_os = "cuda")]
 fn index() -> u32 {
     unsafe { nvptx::_block_idx_x() * nvptx::_block_dim_x() + nvptx::_thread_idx_x() }
 }
+#[cfg(target_os = "cuda")]
 fn stride() -> u32 {
     unsafe { nvptx::_grid_dim_x() * nvptx::_block_dim_x() }
 }
 
+// #### PR #22: one Rust kernel source for NVIDIA and AMD
+// What: AMD builds compute the thread index from each kernel's launch group
+// size, which the HIP host passes unchanged; NVIDIA reads it from the GPU.
+// Why: this core::arch::amdgpu exposes workgroup and work-item ids but no
+// workgroup size. AMD launches keep per_thread at one, so stride is unused.
+// Check: HIP launch geometry must match every gpu_index! group size.
+#[cfg(target_os = "amdhsa")]
+fn index_in<const GROUP: u32>() -> u32 {
+    core::arch::amdgpu::workgroup_id_x() * GROUP + core::arch::amdgpu::workitem_id_x()
+}
+#[cfg(target_os = "amdhsa")]
+fn stride() -> u32 {
+    0
+}
+
+
 #[no_mangle]
-pub unsafe extern "ptx-kernel" fn pickaxe_stage_a_rfc6979(
+pub unsafe extern "gpu-kernel" fn pickaxe_stage_a_rfc6979(
     base: u32,
     target: *const u8,
     secret: *const u8,
@@ -44,7 +76,7 @@ pub unsafe extern "ptx-kernel" fn pickaxe_stage_a_rfc6979(
     scalars: *mut u8,
     count: u32,
 ) {
-    let candidate = index() as usize;
+    let candidate = gpu_index!(128) as usize;
     if candidate >= count as usize {
         return;
     }
@@ -64,7 +96,7 @@ unsafe fn fixed_base_part<const FIRST: usize>(
     points: *mut u32,
     count: u32,
 ) {
-    let candidate = index() as usize;
+    let candidate = gpu_index!(64) as usize;
     if candidate >= count as usize {
         return;
     }
@@ -93,7 +125,7 @@ unsafe fn fixed_base_part<const FIRST: usize>(
 macro_rules! fixed_base_kernel {
     ($name:ident, $first:literal) => {
         #[no_mangle]
-        pub unsafe extern "ptx-kernel" fn $name(
+        pub unsafe extern "gpu-kernel" fn $name(
             scalars: *const u8,
             table: *const u32,
             points: *mut u32,
@@ -129,8 +161,9 @@ unsafe fn point_at(ptr: *const u32, candidate: usize) -> Point {
 }
 
 /// Input and output contain count * 8 words and do not overlap.
+#[cfg(target_os = "cuda")]
 #[no_mangle]
-pub unsafe extern "ptx-kernel" fn pickaxe_rust_inverse(
+pub unsafe extern "gpu-kernel" fn pickaxe_rust_inverse(
     inputs: *const u32,
     outputs: *mut u32,
     count: u32,
@@ -151,8 +184,9 @@ pub unsafe extern "ptx-kernel" fn pickaxe_rust_inverse(
 }
 
 /// Only public scalars for unfunded mining identities. Never use a funded key.
+#[cfg(target_os = "cuda")]
 #[no_mangle]
-pub unsafe extern "ptx-kernel" fn pickaxe_photon_incremental_k(
+pub unsafe extern "gpu-kernel" fn pickaxe_photon_incremental_k(
     base: u32,
     count: u32,
     table: *const u32,
@@ -203,7 +237,7 @@ pub unsafe extern "ptx-kernel" fn pickaxe_photon_incremental_k(
 }
 
 #[no_mangle]
-pub unsafe extern "ptx-kernel" fn pickaxe_photon_c1_schnorr_dual_batched(
+pub unsafe extern "gpu-kernel" fn pickaxe_photon_c1_schnorr_dual_batched(
     messages: *const u8,
     scalars: *const u8,
     points: *const u32,
@@ -214,7 +248,7 @@ pub unsafe extern "ptx-kernel" fn pickaxe_photon_c1_schnorr_dual_batched(
     candidate_count: u32,
     per_thread: u32,
 ) {
-    let lane = index() as usize;
+    let lane = gpu_index!(64) as usize;
     let stride = stride() as usize;
     let mut prefix = [Field::ONE; 16];
     let mut product = Field::ONE;
@@ -388,7 +422,7 @@ unsafe fn filter<const SHIFT: usize, const INCREMENTAL: bool>(
     winners: *mut u32,
     hashes: *mut u8,
 ) {
-    let candidate = index() as usize;
+    let candidate = gpu_index!(128) as usize;
     if candidate >= count as usize {
         return;
     }
@@ -442,7 +476,7 @@ unsafe fn filter<const SHIFT: usize, const INCREMENTAL: bool>(
 macro_rules! filter_kernel {
     ($name:ident, $shift:literal, $incremental:literal) => {
         #[no_mangle]
-        pub unsafe extern "ptx-kernel" fn $name(
+        pub unsafe extern "gpu-kernel" fn $name(
             template: *const u8,
             midstate: *const u32,
             signatures: *const u8,

@@ -616,9 +616,15 @@ def main() -> int:
         type=Path,
         help="directory containing HSACO files; defaults to hip/build/<arch>",
     )
+    parser.add_argument(
+        "--contract",
+        type=Path,
+        default=CONTRACT_PATH,
+        help="kernel contract to verify; hip/rust_kernel_contract.json covers photon_rust.hsaco",
+    )
     args = parser.parse_args()
 
-    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract = json.loads(args.contract.read_text(encoding="utf-8"))
     architectures = contract.get("architectures", [contract["architecture"]])
     if args.arch not in architectures:
         print(

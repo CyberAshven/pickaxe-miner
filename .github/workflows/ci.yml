@@ -114,6 +114,12 @@ jobs:
             hip-dev=7.0.51831.70002-56~24.04 \
             hipcc=1.1.1.70002-56~24.04
 
+      - name: Install pinned Rust GPU compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src
+
       - name: Build and verify gfx1036 HSACO set
         shell: bash
         run: |
@@ -122,6 +128,7 @@ jobs:
           hipcc --version
           python3 tools/build_hip.py --arch gfx1036 --check-reproducible
           python3 -m unittest tools.test_verify_hip_artifacts -v
+          python3 tools/build_rust_amd.py --arch gfx1036
           (cd hip/build/gfx1036 && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
           cat hip/build/gfx1036/SHA256SUMS.txt
 
@@ -169,12 +176,19 @@ jobs:
             hip-dev=7.0.51831.70002-56~24.04 \
             hipcc=1.1.1.70002-56~24.04
 
+      - name: Install pinned Rust GPU compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src
+
       - name: Build and verify ${{ matrix.arch }} HSACO set
         shell: bash
         run: |
           set -euo pipefail
           export PATH="/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/opt/rocm/llvm/bin:${PATH}"
           python3 tools/build_hip.py --arch "${{ matrix.arch }}" --check-reproducible
+          python3 tools/build_rust_amd.py --arch "${{ matrix.arch }}"
           (cd "hip/build/${{ matrix.arch }}" && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
           cat "hip/build/${{ matrix.arch }}/SHA256SUMS.txt"
 

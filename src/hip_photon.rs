@@ -28,6 +28,75 @@ const HIP_CODE_OBJECT_NAMES: [&str; 5] = [
     "stage_c_hash.hsaco",
     "photon_t2_tail.hsaco",
 ];
+/// The shared Rust GPU engine built for AMD: the same source as photon_rust.ptx.
+const HIP_RUST_CODE_OBJECT: &str = "photon_rust.hsaco";
+
+// #### PR #22: swappable HIP kernel builds
+// What: PICKAXE_HIP_KERNELS=rust loads photon_rust.hsaco, built from the shared
+// Rust engine; the default loads the CUDA C++ kernels compiled for HIP.
+// Why: one Rust source for NVIDIA and AMD, while the proven C++ build stays
+// the default until the Rust build has mined on AMD hardware.
+// Check: both builds ship for every architecture; the Rust launch geometry
+// must match the group sizes the AMD build was compiled with.
+/// Which kernel build the native HIP engine loads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HipKernelSource {
+    Cpp,
+    Rust,
+}
+
+impl HipKernelSource {
+    /// Parses PICKAXE_HIP_KERNELS; unset or empty keeps the C++ default.
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") | Some("cpp") => Ok(Self::Cpp),
+            Some("rust") => Ok(Self::Rust),
+            Some(other) => Err(format!(
+                "PICKAXE_HIP_KERNELS must be cpp or rust, not {other:?}"
+            )),
+        }
+    }
+
+    pub(crate) fn from_env() -> Result<Self, String> {
+        Self::parse(std::env::var("PICKAXE_HIP_KERNELS").ok().as_deref())
+    }
+
+    fn code_objects(self) -> &'static [&'static str] {
+        match self {
+            Self::Cpp => &HIP_CODE_OBJECT_NAMES,
+            Self::Rust => &[HIP_RUST_CODE_OBJECT],
+        }
+    }
+
+    /// T2 filter group size: the AMD Rust build computes its index from 256.
+    fn t2_filter_threads(self) -> u32 {
+        match self {
+            Self::Cpp => 128,
+            Self::Rust => 256,
+        }
+    }
+
+    fn build_hint(self, architecture: &str) -> String {
+        match self {
+            Self::Cpp => format!(
+                "run `python tools/build_hip.py --arch {architecture}` with a matching ROCm/HIP compiler"
+            ),
+            Self::Rust => format!("run `python tools/build_rust_amd.py --arch {architecture}`"),
+        }
+    }
+}
+
+/// Non-T2 filter kernels: the C++ C1 and C2/C3 stages, or the Rust dual filter.
+#[derive(Clone, Copy)]
+enum PlainFilter {
+    Cpp {
+        stage_c1: usize,
+        stage_c3: usize,
+    },
+    Rust {
+        dual_filter: [usize; PhotonLayout::GPU_SHIFTS.len()],
+    },
+}
 const HIP_STAGE_A_SYMBOL: &str = "pickaxe_stage_a_rfc6979";
 const HIP_STAGE_B_SYMBOLS: [&str; 4] = [
     "pickaxe_photon_b16_part0",
@@ -137,6 +206,20 @@ const HIP_T2_FILTER_GROUP_ABI: [HipArgKind; 14] = [
     HipArgKind::U32,
     HipArgKind::U32,
     HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+];
+const HIP_RUST_DUAL_FILTER_ABI: [HipArgKind; 12] = [
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+    HipArgKind::U32,
     HipArgKind::Ptr,
     HipArgKind::Ptr,
     HipArgKind::Ptr,
@@ -449,15 +532,11 @@ impl Drop for HipModule {
 pub struct HipPhotonEngine {
     api: Arc<HipApi>,
     stream: HipStream,
-    _stage_a_module: HipModule,
-    _stage_b_module: HipModule,
-    _stage_c1_module: HipModule,
-    _stage_c3_module: HipModule,
+    _modules: Vec<HipModule>,
+    kernel_source: HipKernelSource,
     stage_a: usize,
     stage_b: [usize; 4],
-    stage_c1: usize,
-    stage_c3: usize,
-    _t2_module: HipModule,
+    plain_filter: PlainFilter,
     stage_c1_dual: usize,
     t2_prepare: [usize; PhotonLayout::GPU_SHIFTS.len()],
     t2_filter_group: [usize; PhotonLayout::GPU_SHIFTS.len()],
@@ -571,19 +650,20 @@ fn code_object_candidate_dirs_for_runtime(architecture: &str) -> Vec<PathBuf> {
     )
 }
 
-/// Checks that all required kernel code objects are present.
-fn directory_has_complete_code_objects(directory: &Path) -> bool {
-    HIP_CODE_OBJECT_NAMES
+/// Checks that all code objects of one kernel build are present.
+fn directory_has_complete_code_objects(directory: &Path, source: HipKernelSource) -> bool {
+    source
+        .code_objects()
         .iter()
         .all(|name| directory.join(name).is_file())
 }
 
 /// Finds a complete HIP code object directory for the device.
-fn resolve_code_object_dir(architecture: &str) -> Result<PathBuf, String> {
+fn resolve_code_object_dir(architecture: &str, source: HipKernelSource) -> Result<PathBuf, String> {
     let candidates = code_object_candidate_dirs_for_runtime(architecture);
     if let Some(directory) = candidates
         .iter()
-        .find(|directory| directory_has_complete_code_objects(directory))
+        .find(|directory| directory_has_complete_code_objects(directory, source))
     {
         return Ok(directory.clone());
     }
@@ -594,7 +674,8 @@ fn resolve_code_object_dir(architecture: &str) -> Result<PathBuf, String> {
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "missing complete PHOTON HIP code-object set for {architecture}; searched: {searched}; run `python tools/build_hip.py --arch {architecture}` with a matching ROCm/HIP compiler"
+        "missing complete PHOTON HIP code-object set for {architecture}; searched: {searched}; {}",
+        source.build_hint(architecture)
     ))
 }
 
@@ -806,11 +887,34 @@ pub(crate) fn is_apu_architecture(architecture: &str) -> bool {
     )
 }
 
-/// Whether a complete PHOTON code-object set is installed for an architecture.
+/// Whether the selected kernel build is installed for an architecture.
 pub(crate) fn code_objects_installed(architecture: &str) -> bool {
-    code_object_candidate_dirs_for_runtime(architecture)
-        .iter()
-        .any(|directory| directory_has_complete_code_objects(directory))
+    HipKernelSource::from_env().is_ok_and(|source| {
+        code_object_candidate_dirs_for_runtime(architecture)
+            .iter()
+            .any(|directory| directory_has_complete_code_objects(directory, source))
+    })
+}
+
+/// Loads one kernel per GPU transaction layout from a module.
+fn shift_functions(
+    module: &HipModule,
+    name: impl Fn(usize) -> String,
+) -> Result<[usize; PhotonLayout::GPU_SHIFTS.len()], String> {
+    let mut functions = [0usize; PhotonLayout::GPU_SHIFTS.len()];
+    for (slot, shift) in PhotonLayout::GPU_SHIFTS.iter().enumerate() {
+        functions[slot] = module.function(&name(*shift))?;
+    }
+    Ok(functions)
+}
+
+/// Kernel symbol of the Rust non-T2 dual filter for one layout.
+fn rust_dual_filter_symbol(shift: usize) -> String {
+    if shift == 0 {
+        "pickaxe_stage_c_dual_filter_rfc".into()
+    } else {
+        format!("pickaxe_stage_c_dual_filter_rfc_shift{shift}")
+    }
 }
 
 impl HipPhotonEngine {
@@ -819,6 +923,21 @@ impl HipPhotonEngine {
         device_ordinal: usize,
         max_candidates: u32,
         winner_cap: u32,
+    ) -> Result<Self, String> {
+        Self::new_with_source(
+            device_ordinal,
+            max_candidates,
+            winner_cap,
+            HipKernelSource::from_env()?,
+        )
+    }
+
+    /// Creates the engine with an explicit kernel build.
+    pub(crate) fn new_with_source(
+        device_ordinal: usize,
+        max_candidates: u32,
+        winner_cap: u32,
+        kernel_source: HipKernelSource,
     ) -> Result<Self, String> {
         if max_candidates == 0 || winner_cap == 0 {
             return Err("HIP candidate and winner capacities must be non-zero".into());
@@ -829,7 +948,7 @@ impl HipPhotonEngine {
             "select HIP device",
         )?;
         let architecture = device_architecture(&api, device_ordinal)?;
-        let directory = resolve_code_object_dir(&architecture)?;
+        let directory = resolve_code_object_dir(&architecture, kernel_source)?;
         // #### PR #22: native HIP stays off integrated GPUs under Windows
         // What: refuse integrated (APU) targets on Windows after the
         // code-object check, before any module load or launch.
@@ -845,37 +964,50 @@ impl HipPhotonEngine {
                  under Windows; use the default Vulkan engine (--backend wgpu)"
             ));
         }
-        for name in HIP_CODE_OBJECT_NAMES {
+        for name in kernel_source.code_objects() {
             let path = directory.join(name);
             verify_code_object_architecture(&path, &architecture)?;
         }
 
         let stream = HipStream::create(&api)?;
-        let stage_a_module = HipModule::load(&api, &directory.join("stage_a_rfc6979.hsaco"))?;
-        let stage_b_module = HipModule::load(&api, &directory.join("photon_stage_b16.hsaco"))?;
-        let stage_c1_module = HipModule::load(&api, &directory.join("photon_c1_schnorr.hsaco"))?;
-        let stage_c3_module = HipModule::load(&api, &directory.join("stage_c_hash.hsaco"))?;
-        let stage_a = stage_a_module.function(HIP_STAGE_A_SYMBOL)?;
+        let load = |name: &str| HipModule::load(&api, &directory.join(name));
+        let (modules, stage_a_module, stage_b_module, stage_c1_module, t2_module) =
+            match kernel_source {
+                HipKernelSource::Cpp => {
+                    let modules = vec![
+                        load("stage_a_rfc6979.hsaco")?,
+                        load("photon_stage_b16.hsaco")?,
+                        load("photon_c1_schnorr.hsaco")?,
+                        load("stage_c_hash.hsaco")?,
+                        load("photon_t2_tail.hsaco")?,
+                    ];
+                    (modules, 0, 1, 2, 4)
+                }
+                HipKernelSource::Rust => (vec![load(HIP_RUST_CODE_OBJECT)?], 0, 0, 0, 0),
+            };
+        let stage_a = modules[stage_a_module].function(HIP_STAGE_A_SYMBOL)?;
         let stage_b = [
-            stage_b_module.function(HIP_STAGE_B_SYMBOLS[0])?,
-            stage_b_module.function(HIP_STAGE_B_SYMBOLS[1])?,
-            stage_b_module.function(HIP_STAGE_B_SYMBOLS[2])?,
-            stage_b_module.function(HIP_STAGE_B_SYMBOLS[3])?,
+            modules[stage_b_module].function(HIP_STAGE_B_SYMBOLS[0])?,
+            modules[stage_b_module].function(HIP_STAGE_B_SYMBOLS[1])?,
+            modules[stage_b_module].function(HIP_STAGE_B_SYMBOLS[2])?,
+            modules[stage_b_module].function(HIP_STAGE_B_SYMBOLS[3])?,
         ];
-        let stage_c1 = stage_c1_module.function(HIP_STAGE_C1_SYMBOL)?;
-        let stage_c3 = stage_c3_module.function(HIP_STAGE_C3_SYMBOL)?;
-        let stage_c1_dual = stage_c1_module.function(HIP_STAGE_C1_DUAL_SYMBOL)?;
-        let t2_module = HipModule::load(&api, &directory.join("photon_t2_tail.hsaco"))?;
-        let shift_functions = |kernel: &str| {
-            let mut functions = [0usize; PhotonLayout::GPU_SHIFTS.len()];
-            for (slot, shift) in PhotonLayout::GPU_SHIFTS.iter().enumerate() {
-                functions[slot] =
-                    t2_module.function(&format!("pickaxe_t2_{kernel}_shift{shift}"))?;
-            }
-            Ok::<_, String>(functions)
+        let stage_c1_dual = modules[stage_c1_module].function(HIP_STAGE_C1_DUAL_SYMBOL)?;
+        let t2_prepare = shift_functions(&modules[t2_module], |shift| {
+            format!("pickaxe_t2_prepare_shift{shift}")
+        })?;
+        let t2_filter_group = shift_functions(&modules[t2_module], |shift| {
+            format!("pickaxe_t2_filter_group_shift{shift}")
+        })?;
+        let plain_filter = match kernel_source {
+            HipKernelSource::Cpp => PlainFilter::Cpp {
+                stage_c1: modules[2].function(HIP_STAGE_C1_SYMBOL)?,
+                stage_c3: modules[3].function(HIP_STAGE_C3_SYMBOL)?,
+            },
+            HipKernelSource::Rust => PlainFilter::Rust {
+                dual_filter: shift_functions(&modules[0], rust_dual_filter_symbol)?,
+            },
         };
-        let t2_prepare = shift_functions("prepare")?;
-        let t2_filter_group = shift_functions("filter_group")?;
 
         let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
         let table_gpu = HipBuffer::allocate(&api, table_bytes.len(), "64 MiB M29 table")?;
@@ -915,7 +1047,11 @@ impl HipPhotonEngine {
                 winner_cap as usize * 32,
                 "winner hashes",
             )?,
-            negated_s_gpu: HipBuffer::allocate(&api, T2_MAX_WINDOWS * 32, "negated nonce scalars")?,
+            negated_s_gpu: HipBuffer::allocate(
+                &api,
+                (max_candidates as usize).max(T2_MAX_WINDOWS) * 32,
+                "negated nonce scalars",
+            )?,
             midstate_gpu: HipBuffer::allocate(&api, 8 * 4, "T2 transaction midstate")?,
             middle_schedule_gpu: HipBuffer::allocate(&api, 64 * 4, "T2 middle schedule")?,
             window_txs_gpu: HipBuffer::allocate(
@@ -923,24 +1059,21 @@ impl HipPhotonEngine {
                 T2_MAX_WINDOWS * MAX_TX_BYTES,
                 "T2 window transactions",
             )?,
+            // The Rust build also stores each window's round-10 head after the prefixes.
             window_prefixes_gpu: HipBuffer::allocate(
                 &api,
-                T2_MAX_WINDOWS * 8 * 4,
+                T2_MAX_WINDOWS * 16 * 4,
                 "T2 window prefixes",
             )?,
             t2_target_gpu: HipBuffer::allocate(&api, 33, "T2 target and proof rule")?,
             winner_j_gpu: HipBuffer::allocate(&api, winner_cap as usize * 4, "winner amounts")?,
             api,
             stream,
-            _stage_a_module: stage_a_module,
-            _stage_b_module: stage_b_module,
-            _stage_c1_module: stage_c1_module,
-            _stage_c3_module: stage_c3_module,
+            _modules: modules,
+            kernel_source,
             stage_a,
             stage_b,
-            stage_c1,
-            stage_c3,
-            _t2_module: t2_module,
+            plain_filter,
             stage_c1_dual,
             t2_prepare,
             t2_filter_group,
@@ -1044,20 +1177,28 @@ impl HipPhotonEngine {
             .copy_from(&fixed_d, "upload fixed-d table")?;
         self.template_gpu
             .copy_from(template, "upload transaction template")?;
+        // The T2 kernels and the Rust dual filter resume from the midstate and
+        // read the proof rule from byte 32 of the target.
+        self.midstate_gpu
+            .copy_from(&t2_midstate(template), "upload transaction midstate")?;
+        let mut rule_target = [0u8; 33];
+        rule_target[..32].copy_from_slice(target);
+        rule_target[32] = u8::from(self.positive_target);
+        self.t2_target_gpu
+            .copy_from(&rule_target, "upload target and proof rule")?;
         self.t2 = None;
         if self.t2_requested && tx::supports_t2_window(template)? {
-            self.t2 = Some(self.set_t2_template(template, target, layout)?);
+            self.t2 = Some(self.set_t2_template(template, layout)?);
         }
         self.layout = layout;
         self.job_ready = true;
         Ok(())
     }
 
-    /// Uploads the per-job T2 material: fixed midstate, middle schedule and target rule.
+    /// Uploads the per-job T2 middle schedule and returns the token amounts.
     fn set_t2_template(
         &mut self,
         template: &[u8],
-        target: &[u8; 32],
         layout: PhotonLayout,
     ) -> Result<HipT2Amounts, String> {
         let shift = layout.shift();
@@ -1068,15 +1209,8 @@ impl HipPhotonEngine {
             u128::from(reward),
             u16::MAX,
         )?;
-        self.midstate_gpu
-            .copy_from(&t2_midstate(template), "upload T2 midstate")?;
         self.middle_schedule_gpu
             .copy_from(&t2_middle_schedule(template), "upload T2 middle schedule")?;
-        let mut rule_target = [0u8; 33];
-        rule_target[..32].copy_from_slice(target);
-        rule_target[32] = u8::from(self.positive_target);
-        self.t2_target_gpu
-            .copy_from(&rule_target, "upload T2 target")?;
         Ok(HipT2Amounts { baton, reward })
     }
 
@@ -1203,6 +1337,7 @@ impl HipPhotonEngine {
         )?;
 
         self.reset_winner_count()?;
+        let filter_threads = self.kernel_source.t2_filter_threads();
         let mut middle_schedule = self.middle_schedule_gpu.ptr;
         let mut baton = amounts.baton;
         let mut reward = amounts.reward;
@@ -1234,7 +1369,7 @@ impl HipPhotonEngine {
             &self.api,
             &self.stream,
             self.t2_filter_group[kernel],
-            (count.div_ceil(T2_THREADS), T2_THREADS),
+            (count.div_ceil(filter_threads), filter_threads),
             &mut filter_params,
             &HIP_T2_FILTER_GROUP_ABI,
             "launch PHOTON HIP T2 amount filter",
@@ -1312,8 +1447,20 @@ impl HipPhotonEngine {
         candidate_count: u32,
     ) -> Result<PhotonCudaBatchResult, String> {
         self.search_stage_b(candidate_count)?;
-        self.search_stage_c1(candidate_count)?;
-        self.search_stage_c23(nonce_base, candidate_count)
+        match self.plain_filter {
+            PlainFilter::Cpp { stage_c1, stage_c3 } => {
+                self.search_stage_c1(stage_c1, candidate_count)?;
+                self.search_stage_c23(stage_c3, nonce_base, candidate_count)
+            }
+            PlainFilter::Rust { dual_filter } => {
+                self.launch_stage_c1_dual(candidate_count)?;
+                self.search_rust_dual_filter(
+                    dual_filter[self.layout.kernel_index()],
+                    nonce_base,
+                    candidate_count,
+                )
+            }
+        }
     }
 
     /// Runs the HIP stage B candidate-point kernel.
@@ -1343,7 +1490,7 @@ impl HipPhotonEngine {
     }
 
     /// Runs the HIP stage C1 Schnorr candidate filter.
-    fn search_stage_c1(&mut self, candidate_count: u32) -> Result<(), String> {
+    fn search_stage_c1(&mut self, function: usize, candidate_count: u32) -> Result<(), String> {
         let mut message_hashes = self.message_hashes_gpu.ptr;
         let mut rfc6979 = self.rfc6979_gpu.ptr;
         let mut points = self.points_gpu.ptr;
@@ -1363,7 +1510,7 @@ impl HipPhotonEngine {
         launch(
             &self.api,
             &self.stream,
-            self.stage_c1,
+            function,
             (candidate_count.div_ceil(64), 64),
             &mut params,
             &HIP_STAGE_C1_ABI,
@@ -1374,6 +1521,7 @@ impl HipPhotonEngine {
     /// Runs the remaining HIP stage C hash and target filters.
     fn search_stage_c23(
         &mut self,
+        function: usize,
         nonce_base: u32,
         candidate_count: u32,
     ) -> Result<PhotonCudaBatchResult, String> {
@@ -1404,12 +1552,66 @@ impl HipPhotonEngine {
         launch(
             &self.api,
             &self.stream,
-            self.stage_c3,
+            function,
             (candidate_count.div_ceil(128), 128),
             &mut params,
             &HIP_STAGE_C3_ABI,
             "launch PHOTON HIP Stage C2/C3",
         )?;
+        self.read_plain_winners(candidate_count)
+    }
+
+    /// Runs the Rust non-T2 dual filter: C1 wrote both s values for each nonce.
+    fn search_rust_dual_filter(
+        &mut self,
+        function: usize,
+        nonce_base: u32,
+        candidate_count: u32,
+    ) -> Result<PhotonCudaBatchResult, String> {
+        self.reset_winner_count()?;
+        let mut template = self.template_gpu.ptr;
+        let mut midstate = self.midstate_gpu.ptr;
+        let mut signatures = self.signatures_gpu.ptr;
+        let mut negated_s = self.negated_s_gpu.ptr;
+        let mut points = self.points_gpu.ptr;
+        let mut nonce_arg = nonce_base;
+        let mut target = self.t2_target_gpu.ptr;
+        let mut count = candidate_count;
+        let mut winner_cap = self.winner_cap;
+        let mut winner_count = self.winner_count_gpu.ptr;
+        let mut winner_nonces = self.winner_nonces_gpu.ptr;
+        let mut winner_hashes = self.winner_hashes_gpu.ptr;
+        let mut params = [
+            ptr_arg(&mut template),
+            ptr_arg(&mut midstate),
+            ptr_arg(&mut signatures),
+            ptr_arg(&mut negated_s),
+            ptr_arg(&mut points),
+            u32_arg(&mut nonce_arg),
+            ptr_arg(&mut target),
+            u32_arg(&mut count),
+            u32_arg(&mut winner_cap),
+            ptr_arg(&mut winner_count),
+            ptr_arg(&mut winner_nonces),
+            ptr_arg(&mut winner_hashes),
+        ];
+        launch(
+            &self.api,
+            &self.stream,
+            function,
+            (candidate_count.div_ceil(128), 128),
+            &mut params,
+            &HIP_RUST_DUAL_FILTER_ABI,
+            "launch PHOTON HIP Rust dual filter",
+        )?;
+        self.read_plain_winners(candidate_count)
+    }
+
+    /// Waits for a non-T2 filter and reads its winning nonces and hashes.
+    fn read_plain_winners(
+        &mut self,
+        candidate_count: u32,
+    ) -> Result<PhotonCudaBatchResult, String> {
         self.stream.synchronize()?;
 
         let mut total_winners = [0u32; 1];
@@ -1549,6 +1751,77 @@ mod tests {
     }
 
     #[test]
+    fn rust_launch_contract_matches_rust_hip_artifact_contract() {
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../hip/rust_kernel_contract.json"))
+                .expect("parse Rust HIP kernel contract");
+        let objects = contract["code_objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["file"], HIP_RUST_CODE_OBJECT);
+        let mut expected = vec![(HIP_STAGE_A_SYMBOL.to_string(), abi_kinds(&HIP_STAGE_A_ABI))];
+        for symbol in HIP_STAGE_B_SYMBOLS {
+            expected.push((symbol.to_string(), abi_kinds(&HIP_STAGE_B_ABI)));
+        }
+        expected.push((
+            HIP_STAGE_C1_DUAL_SYMBOL.to_string(),
+            abi_kinds(&HIP_STAGE_C1_DUAL_ABI),
+        ));
+        for shift in PhotonLayout::GPU_SHIFTS {
+            expected.push((
+                format!("pickaxe_t2_prepare_shift{shift}"),
+                abi_kinds(&HIP_T2_PREPARE_ABI),
+            ));
+        }
+        for shift in PhotonLayout::GPU_SHIFTS {
+            expected.push((
+                format!("pickaxe_t2_filter_group_shift{shift}"),
+                abi_kinds(&HIP_T2_FILTER_GROUP_ABI),
+            ));
+        }
+        for shift in PhotonLayout::GPU_SHIFTS {
+            expected.push((
+                rust_dual_filter_symbol(shift),
+                abi_kinds(&HIP_RUST_DUAL_FILTER_ABI),
+            ));
+        }
+        let actual = objects[0]["kernels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|kernel| {
+                let kinds = kernel["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|arg| arg["kind"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                (kernel["symbol"].as_str().unwrap().to_string(), kinds)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hip_kernel_source_defaults_to_cpp_until_rust_is_requested() {
+        assert_eq!(HipKernelSource::parse(None).unwrap(), HipKernelSource::Cpp);
+        assert_eq!(
+            HipKernelSource::parse(Some("")).unwrap(),
+            HipKernelSource::Cpp
+        );
+        assert_eq!(
+            HipKernelSource::parse(Some("cpp")).unwrap(),
+            HipKernelSource::Cpp
+        );
+        assert_eq!(
+            HipKernelSource::parse(Some(" rust ")).unwrap(),
+            HipKernelSource::Rust
+        );
+        assert!(HipKernelSource::parse(Some("cuda")).is_err());
+        assert_eq!(HipKernelSource::Rust.code_objects(), [HIP_RUST_CODE_OBJECT]);
+        assert_eq!(HipKernelSource::Cpp.code_objects(), HIP_CODE_OBJECT_NAMES);
+    }
+
+    #[test]
     fn t2_group_windows_split_flattened_candidates() {
         assert_eq!(t2_group_windows(0, 16).unwrap(), (0, 0, 1));
         // A batch starting 16 amounts before a window edge needs two signatures.
@@ -1662,13 +1935,19 @@ mod tests {
 
     #[test]
     fn t2_group_winners_match_cpu_signed_windows_if_hip_present() {
+        for source in [HipKernelSource::Cpp, HipKernelSource::Rust] {
+            t2_group_winners_match_cpu_signed_windows(source);
+        }
+    }
+
+    fn t2_group_winners_match_cpu_signed_windows(source: HipKernelSource) {
         const REWARD: u128 = 4_999_773_813;
         let target = [0xff; 32];
         let key = [0x11; 32];
-        let mut engine = match HipPhotonEngine::new(0, 65_536, 8) {
+        let mut engine = match HipPhotonEngine::new_with_source(0, 65_536, 8, source) {
             Ok(engine) => engine,
             Err(error) => {
-                eprintln!("skip HIP T2 vector: {error}");
+                eprintln!("skip HIP T2 vector ({source:?}): {error}");
                 return;
             }
         };
@@ -1745,11 +2024,17 @@ mod tests {
         for name in HIP_CODE_OBJECT_NAMES {
             fs::write(directory.join(name), b"probe").expect("write HIP code-object probe");
         }
-        assert!(directory_has_complete_code_objects(&directory));
+        assert!(directory_has_complete_code_objects(
+            &directory,
+            HipKernelSource::Cpp
+        ));
 
         fs::remove_file(directory.join(HIP_CODE_OBJECT_NAMES[2]))
             .expect("remove one HIP code-object probe");
-        assert!(!directory_has_complete_code_objects(&directory));
+        assert!(!directory_has_complete_code_objects(
+            &directory,
+            HipKernelSource::Cpp
+        ));
 
         let _ = fs::remove_dir_all(&directory);
     }
@@ -1810,7 +2095,7 @@ mod tests {
         let candidates = code_object_candidate_dirs_for_runtime(&architecture);
         if candidates
             .iter()
-            .any(|directory| directory_has_complete_code_objects(directory))
+            .any(|directory| directory_has_complete_code_objects(directory, HipKernelSource::Cpp))
         {
             eprintln!(
                 "skip missing-artifact assertion: PHOTON HIP code objects already exist for {architecture}"
