@@ -147,7 +147,7 @@ impl ElectrumSession {
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let line = format!("{req}\n");
         self.ws
-            .send(Message::Text(line))
+            .send(Message::Text(line.into()))
             .map_err(|e| format!("transport: send: {e}"))?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);

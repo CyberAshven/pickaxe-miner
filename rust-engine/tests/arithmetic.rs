@@ -23,7 +23,7 @@ fn gpu_sha256_matches_rustcrypto() {
         block[..32].copy_from_slice(&r);
         block[32..].copy_from_slice(&message);
         let mut expected = state;
-        sha2::compress256(&mut expected, &[block.into()]);
+        sha2::block_api::compress256(&mut expected, &[block]);
         let words: [u32; 16] = core::array::from_fn(|i| {
             u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap())
         });

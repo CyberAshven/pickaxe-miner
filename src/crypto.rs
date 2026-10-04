@@ -8,7 +8,7 @@
 //! The signer is shared by deterministic vector tests, live job setup, and rare
 //! returned-winner reconstruction. Mining identities remain runtime-only.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use secp256k1::{PublicKey, Scalar, SecretKey};

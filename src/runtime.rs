@@ -7274,7 +7274,9 @@ mod tests {
                     serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(request["method"], method);
                 ws.send(tungstenite::Message::Text(
-                    serde_json::json!({"id": request["id"], "result": result}).to_string(),
+                    serde_json::json!({"id": request["id"], "result": result})
+                        .to_string()
+                        .into(),
                 ))
                 .unwrap();
             }
@@ -7361,7 +7363,7 @@ mod tests {
                     assert_eq!(request["method"], method);
                     let mut reply = serde_json::json!({"id": request["id"]});
                     reply[response_field] = response;
-                    ws.send(tungstenite::Message::Text(reply.to_string()))
+                    ws.send(tungstenite::Message::Text(reply.to_string().into()))
                         .unwrap();
                 }
             });
