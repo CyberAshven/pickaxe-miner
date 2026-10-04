@@ -66,7 +66,6 @@ fn stride() -> u32 {
     0
 }
 
-
 #[no_mangle]
 pub unsafe extern "gpu-kernel" fn pickaxe_stage_a_rfc6979(
     base: u32,
