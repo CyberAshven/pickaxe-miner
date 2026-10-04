@@ -20,6 +20,7 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 - NVIDIA: CUDA PTX `sm_120`
 - AMD: discrete Radeon RX 6000, 7000 and 9000 GPUs (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) mine with native HIP T2 (C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine); other AMD and Intel GPUs mine through the portable T2 engine on Vulkan. The engine is selected automatically. A discrete GPU always comes first; an integrated GPU is used automatically only when no discrete GPU is present, or when chosen with `--device`.
 - Apple Silicon (Metal) and browser (WebGPU/WASM) builds: [portable build instructions](docs/portable.md).
+- Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
 
 ## Quick start: mainnet TUI
 
@@ -31,7 +32,7 @@ From the extracted download folder, run the command for your platform:
 | Linux | `./pickaxe mine --network mainnet` |
 | Apple Silicon Mac | `./pickaxe mine --network mainnet --backend wgpu` |
 
-The interactive setup opens with Mainnet selected. Enter your payout address
+Double-clicking the executable opens the same setup. The interactive setup opens with Mainnet selected. Enter your payout address
 and choose **Start mining**. Saved profiles keep your settings for next time.
 To skip setup and start directly in the mining TUI, append
 `--address "YOUR_MAINNET_PAYOUT_ADDRESS"`, replacing the placeholder with your

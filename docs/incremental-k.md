@@ -2,7 +2,7 @@
 
 Historical evaluation: defaults and deployment descriptions below refer to the
 recorded revisions. Current CUDA builds default to the
-[upstream-derived Rust backend](upstream-rust-port-evaluation.md); reproduction
+[upstream-derived Rust backend](experiments/upstream-rust-port-evaluation.md); reproduction
 commands below explicitly select the historical backend.
 
 Branch `perf/incremental-k`, based on remote master/release commit `bb92508908b7a6e8235440168c6fe08140964890`.

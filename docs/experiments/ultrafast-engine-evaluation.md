@@ -40,7 +40,7 @@ PR #442 contains only the Rust-binding declaration fix, not the Pickaxe mining i
 - The public Rust/C ABI signer implements BIP-340. PHOTON requires BCH Schnorr. Upstream has a separate BCHN compatibility shim; the generic signer is not a drop-in replacement.
 - The GPU generator API takes host scalar buffers and returns compressed public keys to host memory. Pickaxe's current PHOTON pipeline keeps intermediate points/signatures on the GPU and returns bounded winners. This interface difference must be measured and addressed before claiming a performance-neutral swap.
 - Stock v4.6.0 Rust bindings fail `cargo check`: unexpected closing delimiter in `bindings/rust/ufsecp-sys/src/lib.rs:376`. A duplicated trailing block redeclares 58 functions already present in the first block. Removing only that duplicated block makes the Rust wrapper build and its tests pass.
-- The Windows MSVC CUDA+OpenCL build succeeds after three local compatibility fixes: removing the duplicated Rust declarations, splitting oversized embedded OpenCL string literals without changing their concatenated contents, and using the MSVC byte-swap intrinsic on MSVC while retaining the existing builtin elsewhere. The final patch also backports internal linkage for 46 embedded OpenCL helpers from upstream development commit `73372cec7dc23fee1bac40fae991e3d1ac28bd9d`. These changes are preserved in `tools/ultrafast-v4.6.0-compat.patch`.
+- The Windows MSVC CUDA+OpenCL build succeeds after three local compatibility fixes: removing the duplicated Rust declarations, splitting oversized embedded OpenCL string literals without changing their concatenated contents, and using the MSVC byte-swap intrinsic on MSVC while retaining the existing builtin elsewhere. The final patch also backports internal linkage for 46 embedded OpenCL helpers from upstream development commit `73372cec7dc23fee1bac40fae991e3d1ac28bd9d`. These changes are preserved in `tools/legacy/ultrafast-v4.6.0-compat.patch`.
 - The independently useful Rust declaration fix is submitted as [upstream PR #442](https://github.com/shrec/UltrafastSecp256k1/pull/442), commit `21a7899`. The OpenCL linkage fix was already present in upstream development and is credited as a backport. The remaining Windows fixes are local evaluation patches. No Pickaxe AGPL engine code is included in the upstream contribution.
 
 ## Measured results (2026-09-27)
@@ -75,8 +75,8 @@ $src = 'artifacts/ultrafast-evaluation/upstream'
 $build = 'artifacts/ultrafast-evaluation/build'
 git clone --depth 1 --branch v4.6.0 https://github.com/shrec/UltrafastSecp256k1.git $src
 git -C $src rev-parse HEAD # must equal 540ac5b9c910f089c449177ebf000e4c130cab19
-git -C $src apply --check (Resolve-Path tools/ultrafast-v4.6.0-compat.patch)
-git -C $src apply (Resolve-Path tools/ultrafast-v4.6.0-compat.patch)
+git -C $src apply --check (Resolve-Path tools/legacy/ultrafast-v4.6.0-compat.patch)
+git -C $src apply (Resolve-Path tools/legacy/ultrafast-v4.6.0-compat.patch)
 cmake -S $src -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release `
   -DSECP256K1_BUILD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 `
   -DSECP256K1_BUILD_OPENCL=ON -DSECP256K1_BUILD_CABI=ON -DUFSECP_BUILD_STATIC=OFF `
@@ -93,7 +93,7 @@ cargo test --locked --release --no-default-features --features incremental-k ult
 
 # Export the existing static BCH shim for the Rust test; no replacement signer code.
 link /NOLOGO /DLL /MACHINE:X64 /OUT:artifacts/ultrafast-evaluation/pickaxe_bchn_probe.dll `
-  /DEF:tools/ultrafast-bchn-probe.def `
+  /DEF:tools/legacy/ultrafast-bchn-probe.def `
   "$build/compat/libsecp256k1_bchn_shim/secp256k1_bchn_shim.lib" `
   "$build/src/cpu/fastsecp256k1.lib" bcrypt.lib
 $env:PICKAXE_BCHN_LIBRARY = (Resolve-Path artifacts/ultrafast-evaluation/pickaxe_bchn_probe.dll).Path
@@ -131,7 +131,7 @@ A short screen covers both candidates with walk lanes 16/32/64 and inversion gro
 The original TUI was restored after each exclusive GPU session and confirmed mining at intensity 100 without a reported error. There was one live miner. This experiment does not validate prolonged candidate mining, restart stability, an integrated AMD/OpenCL/Metal backend, or future CashToken algorithms. A future upstream version or backend can be retested with this harness; adoption still requires the applicable correctness, performance, and live stability gates.
 
 ```powershell
-tools/build-ultrafast-candidate.cmd
+tools/legacy/build-ultrafast-candidate.cmd
 # With the live miner stopped normally, run serially:
 cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_correctness -- --ignored --exact --nocapture
 cargo test --locked --release --no-default-features --features incremental-k cuda_photon::incremental_k::incremental_k_ultrafast_scalar_oracle -- --ignored --exact --nocapture
