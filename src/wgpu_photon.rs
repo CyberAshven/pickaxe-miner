@@ -1279,11 +1279,15 @@ impl WgpuPhotonEngine {
         #[cfg(test)]
         if self.profile.is_some() {
             let stamps: Vec<u64> = bytes[self.readback_bytes - 128..]
-                .chunks_exact(8)
-                .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| u64::from_le_bytes(*v))
                 .collect();
             let times: Vec<f64> = stamps
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|v| {
                     v[1].saturating_sub(v[0]) as f64 * f64::from(self.queue.get_timestamp_period())
                         / 1e6
