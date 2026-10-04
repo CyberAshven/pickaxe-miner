@@ -1,6 +1,7 @@
 import init, { BrowserMiner, BrowserControls, browser_config, validate_payout_address } from './pkg/pickaxe_miner.js';
 import { Electrum, rpcErrorCode } from './rpc.js';
 import { resolveSubmission } from './submission.js';
+import { SnapshotRefresh } from './refresh.js';
 import { MiningError, searchBatch, unsupportedReason, isPendingReward, parsePendingReward, type PendingReward } from './platform.js';
 
 function element<T extends HTMLElement>(id: string, type: { new(): T }): T {
@@ -17,6 +18,7 @@ const elements = {
 };
 const $ = <K extends keyof typeof elements>(id: K): typeof elements[K] => elements[id];
 interface BrowserConfig { tokens: string[]; endpoints: string[]; scriptHash: string }
+interface RawSnapshot { before: string; unspent: string; after: string; fee: string }
 function parseConfig(raw: string): BrowserConfig {
   const value: unknown = JSON.parse(raw);
   if (typeof value !== 'object' || value === null || !('tokens' in value) || !Array.isArray(value.tokens)
@@ -57,10 +59,11 @@ async function run() {
   stopping = false;
   let miner: BrowserMiner | undefined;
   let session: Electrum | undefined;
+  let refresh: SnapshotRefresh<RawSnapshot> | undefined;
   let candidates = 0, wins = 0;
   const started = performance.now();
   const controls = new BrowserControls(started);
-  let lastSnapshot = 0, feeChecked = 0, endpointIndex = 0;
+  let feeChecked = 0, endpointIndex = 0;
   let fee = '';
   function connected(): Electrum { if (!session) throw new Error('Not connected'); return session; }
   function engine(): BrowserMiner { if (!miner) throw new Error('Mining engine is not ready'); return miner; }
@@ -72,28 +75,36 @@ async function run() {
       try {
         session = await Electrum.connect(endpoint);
         feeChecked = 0;
+        const source = session;
+        refresh = new SnapshotRefresh(() => fetchSnapshot(source), () => performance.now());
         log(`Connected: ${new URL(endpoint).hostname}`);
         return;
       } catch (error) { lastError = error; await wait(1000); }
     }
     throw lastError || new Error('No server available');
   }
-  async function snapshot() {
-    const before = await connected().rpcRaw('blockchain.headers.subscribe');
-    const unspent = await connected().rpcRaw('blockchain.scripthash.listunspent', [config.scriptHash, 'include_tokens']);
-    const after = await connected().rpcRaw('blockchain.headers.subscribe');
+  async function fetchSnapshot(source: Electrum): Promise<RawSnapshot> {
+    const before = await source.rpcRaw('blockchain.headers.subscribe');
+    const unspent = await source.rpcRaw('blockchain.scripthash.listunspent', [config.scriptHash, 'include_tokens']);
+    const after = await source.rpcRaw('blockchain.headers.subscribe');
     if (performance.now() - feeChecked >= 30000 || !feeChecked) {
       try {
-        fee = await connected().rpcRaw('mempool.get_info');
+        fee = await source.rpcRaw('mempool.get_info');
       } catch (error) {
         if (rpcErrorCode(error) !== -32601) throw error;
-        fee = await connected().rpcRaw('blockchain.relayfee');
+        fee = await source.rpcRaw('blockchain.relayfee');
       }
       feeChecked = performance.now();
     }
+    return { before, unspent, after, fee };
+  }
+  function applySnapshot({ before, unspent, after, fee }: RawSnapshot) {
     const context = engine().set_snapshot(before, unspent, after, fee);
-    lastSnapshot = performance.now();
     return { context, baton: engine().baton() };
+  }
+  async function snapshot() {
+    if (!refresh) throw new Error('Snapshot reader is not ready');
+    return applySnapshot(await refresh.fresh());
   }
   async function settle(pending: PendingReward) {
     const result = await resolveSubmission({ session: connected(), snapshot, pending, stopped: () => stopping, wait, progress: status });
@@ -128,7 +139,9 @@ async function run() {
       try {
         const pending = localStorage.getItem(journal);
         if (pending) { status('Resolving pending reward…'); await settle(parsePendingReward(pending)); controls.reset(performance.now()); continue; }
-        if (performance.now() - lastSnapshot > 1000) await snapshot();
+        const update = await refresh?.beforeBatch();
+        if (update) applySnapshot(update);
+        if (stopping) break;
         status(candidates ? 'Mining' : 'Preparing the first GPU batch; shader compilation can take several minutes…');
         const batchStart = performance.now();
         const result = await searchBatch(miner);
@@ -151,14 +164,16 @@ async function run() {
         // Bounded retries preserve the journal and surface persistent failures.
         if (++failures > 3) throw error;
         log(String(error)); status('Refreshing connection…');
-        session?.close(); await wait(2000); await connect(); await snapshot(); controls.reset(performance.now());
+        refresh?.close(); session?.close(); await refresh?.drain();
+        await wait(2000); await connect(); await snapshot(); controls.reset(performance.now());
       }
     }
     status('Stopped');
   } finally {
     clearInterval(renderTimer);
     render(true);
-    session?.close(); miner?.free(); controls.free();
+    refresh?.close(); session?.close(); await refresh?.drain();
+    miner?.free(); controls.free();
     settings.forEach(input => { input.disabled = false; });
     $('start').disabled = false; $('stop').disabled = true;
   }

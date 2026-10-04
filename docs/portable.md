@@ -100,7 +100,7 @@ cargo install --locked wasm-bindgen-cli --version 0.2.128
 npm --prefix web ci --ignore-scripts
 python tools/build-browser.py
 npm --prefix web run check
-node --test web/rpc.test.mjs web/submission.test.mjs web/platform.test.mjs
+npm --prefix web test
 node web/smoke.mjs
 python -m http.server 8080 --bind 127.0.0.1 --directory dist/web
 ```
@@ -119,6 +119,13 @@ pauses and network waits; it updates once per second and reaches zero when idle.
 Its session average also includes startup. Active-only GPU timing remains available
 to diagnostics, but is not the primary display because it hides intensity changes.
 Pause desktop mining while using the browser: both otherwise compete for the GPU.
+
+Server refreshes can run while the GPU searches. Responses are applied only
+between batches, preserving exclusive access to the Rust engine. A batch still
+waits if the last delivered response is one second old; completed replies from
+before a browser suspension are discarded. Every winner starts a new coherent
+server read before submission, and stopping drains the reader before freeing
+the engine. The native TUI already refreshes independently of its GPU worker.
 
 ## Validation and distribution
 

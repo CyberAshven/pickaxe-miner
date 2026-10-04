@@ -1,0 +1,92 @@
+{
+  "date": "2026-10-04T05:15:47.828Z",
+  "gpu": "NVIDIA RTX 5070 Ti Laptop GPU",
+  "browser": "Brave headless",
+  "network": "mainnet",
+  "endpoint": "cashnode.bch.ninja",
+  "intensity": 100,
+  "warmupSeconds": 15,
+  "measurementSeconds": 60,
+  "baselineCommit": "82f9ddda3154198d9a7664be8262c9b732fa0a82",
+  "wasmSha256": "b7f9bb3f8b91af2cffd942944a7cb6bc45b9d4c1ed1fd28de286f55e555d8e67",
+  "candidateAppSha256": "f3d7a0f3f4b1364d0d949e343297c6e2b3301621dec2ab9e44fbe5a69a9e4fab",
+  "candidateRefreshSha256": "d71d3d8c9cfc82c2f5d91d976ee182bfe21804126406f627f047c14ac5018c24",
+  "pageErrors": 0,
+  "trials": [
+    {
+      "variant": "overlap",
+      "seconds": 60.00179999995232,
+      "candidates": 60163096576,
+      "batches": 1793,
+      "searchMs": 59191.90000021458,
+      "snapshots": 59,
+      "exploratory": true
+    },
+    {
+      "variant": "baseline",
+      "seconds": 60.00910000002384,
+      "candidates": 42949672960,
+      "batches": 1280,
+      "searchMs": 40370.3000023365,
+      "snapshots": 40
+    },
+    {
+      "variant": "overlap",
+      "seconds": 60.007700000047684,
+      "candidates": 61001957376,
+      "batches": 1818,
+      "searchMs": 59120.2000002861,
+      "snapshots": 59
+    },
+    {
+      "variant": "baseline",
+      "seconds": 60.01409999990463,
+      "candidates": 41003515904,
+      "batches": 1222,
+      "searchMs": 38710.800001859665,
+      "snapshots": 41,
+      "winners": 1,
+      "observedAt": 1791090519796
+    },
+    {
+      "variant": "overlap",
+      "seconds": 60.00570000004768,
+      "candidates": 60867739648,
+      "batches": 1814,
+      "searchMs": 59098.30000126362,
+      "snapshots": 59,
+      "winners": 0,
+      "observedAt": 1791090630369
+    },
+    {
+      "variant": "baseline",
+      "seconds": 60.00410000002384,
+      "candidates": 42849009664,
+      "batches": 1277,
+      "searchMs": 40468.800000309944,
+      "snapshots": 40,
+      "winners": 0,
+      "observedAt": 1791090726301
+    },
+    {
+      "variant": "overlap",
+      "seconds": 60.00179999995232,
+      "candidates": 59894661120,
+      "batches": 1785,
+      "searchMs": 59092.19999778271,
+      "snapshots": 59,
+      "winners": 0,
+      "observedAt": 1791090831095
+    },
+    {
+      "variant": "baseline",
+      "seconds": 60.01660000002384,
+      "candidates": 42714791936,
+      "batches": 1273,
+      "searchMs": 40355.30000138283,
+      "snapshots": 40,
+      "winners": 0,
+      "observedAt": 1791090947827
+    }
+  ]
+}
