@@ -20,13 +20,17 @@ def main():
         raise SystemExit(f"Install the matching CLI: cargo install --locked wasm-bindgen-cli --version {version}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=Path, default=ROOT / "dist" / "web")
-    output = parser.parse_args().out_dir.resolve()
+    # #### PR #22: development build exporting verify_portable_engine.
+    parser.add_argument("--check", action="store_true", help="include the portable engine check")
+    arguments = parser.parse_args()
+    output = arguments.out_dir.resolve()
+    features = "browser-check" if arguments.check else "portable-wgpu"
     compiler = ROOT / "web/node_modules/typescript/bin/tsc"
     if not compiler.is_file():
         raise SystemExit("Install browser build tools: npm --prefix web ci --ignore-scripts")
     output.mkdir(parents=True, exist_ok=True)
     run("cargo", "build", "--locked", "--release", "--lib", "--no-default-features",
-        "--features", "portable-wgpu", "--target", "wasm32-unknown-unknown")
+        "--features", features, "--target", "wasm32-unknown-unknown")
     metadata = subprocess.check_output(["cargo", "metadata", "--format-version=1", "--no-deps"], cwd=ROOT)
     import json
     target = Path(json.loads(metadata)["target_directory"])

@@ -38,6 +38,30 @@ pub fn browser_config(network: &str) -> Result<String, JsValue> {
     .to_string())
 }
 
+/// #### PR #22: development check of the portable engine in this browser.
+/// Signs and searches T2 windows with the chosen signer ("wgsl" or "rust")
+/// and reconstructs every candidate on the CPU. Mines and sends nothing.
+#[cfg(feature = "browser-check")]
+#[wasm_bindgen]
+pub async fn verify_portable_engine(table: Vec<u8>, signer: &str) -> Result<String, JsValue> {
+    let signer = crate::wgpu_photon::PortableSigner::parse(Some(signer)).map_err(error)?;
+    let mut engine = WgpuPhotonEngine::new_async(
+        0,
+        4096,
+        4096,
+        (table, m29_table::M29TableSource::Cache),
+        signer,
+    )
+    .await
+    .map_err(error)?;
+    let checked = crate::wgpu_photon::verify_t2_against_cpu(&mut engine)
+        .await
+        .map_err(error)?;
+    Ok(format!(
+        "{checked} candidates match the CPU ({signer:?} signer)"
+    ))
+}
+
 #[wasm_bindgen]
 pub struct BrowserMiner {
     engine: WgpuPhotonEngine,
@@ -66,6 +90,7 @@ impl BrowserMiner {
             crate::wgpu_photon::WGPU_T2_MAX_BATCH,
             8,
             (table, m29_table::M29TableSource::Cache),
+            crate::wgpu_photon::PortableSigner::default(),
         )
         .await
         .map_err(error)?;

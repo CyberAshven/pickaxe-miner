@@ -19,12 +19,17 @@ pub mod nonce;
 pub mod point;
 pub mod scalar;
 pub mod sha256;
+// #### PR #22: portable-only signing helpers stay out of native GPU builds,
+// whose verified PTX and code objects must not change.
+#[cfg(not(any(target_os = "cuda", target_os = "amdhsa")))]
+pub mod sign;
 pub mod t2_block;
 #[cfg(all(
     any(target_os = "cuda", target_os = "amdhsa"),
     feature = "upstream-rust"
 ))]
 mod upstream;
+pub mod wide;
 
 #[cfg(target_os = "cuda")]
 #[panic_handler]

@@ -18,6 +18,70 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
+// #### PR #22: shared Rust signing stages for portable GPUs
+// What: stages A, B and C1 come from the shared Rust engine
+// (reference/shared-signer) by default; PICKAXE_WGPU_SIGNER=wgsl selects the
+// original PHOTON WGSL stages. Buffers and the later stages are shared.
+// Why: one signing source for every GPU. Measured per batch, signing takes
+// 0.9 ms instead of 3.4 ms on an RTX 5070 Ti Laptop GPU and 2.6 ms instead of
+// 90 ms on the integrated Radeon gfx1036, and the stages compile in seconds.
+// Check: both signers pass the same GPU tests and CPU reconstruction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortableSigner {
+    Wgsl,
+    #[default]
+    Rust,
+}
+
+impl PortableSigner {
+    /// Parses PICKAXE_WGPU_SIGNER; unset or empty selects the shared Rust stages.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") | Some("rust") => Ok(Self::Rust),
+            Some("wgsl") => Ok(Self::Wgsl),
+            Some(other) => Err(format!(
+                "PICKAXE_WGPU_SIGNER must be wgsl or rust, not {other:?}"
+            )),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_env() -> Result<Self, String> {
+        Self::parse(std::env::var("PICKAXE_WGPU_SIGNER").ok().as_deref())
+    }
+
+    /// Entry points of stage A, the stage B dispatches and stage C1.
+    fn entry_points(self) -> (&'static str, &'static [&'static str], &'static str) {
+        match self {
+            Self::Wgsl => (
+                "photon_m38_stage_a_wg128",
+                &[
+                    "photon_m45_b4a_wg32",
+                    "photon_m45_b4b_wg32",
+                    "photon_m45_b4c_wg32",
+                    "photon_m45_b4d_wg32",
+                ],
+                "photon_m6729_c1_znorm_wg64",
+            ),
+            Self::Rust => (
+                "pickaxe_shared_stage_a",
+                &["pickaxe_shared_stage_b"],
+                "pickaxe_shared_c1_signature",
+            ),
+        }
+    }
+}
+
+// Tests read signing intermediates back; production buffers stay GPU-only.
+#[cfg(test)]
+const DEBUG_READABLE_STORAGE: wgpu::BufferUsages =
+    wgpu::BufferUsages::STORAGE.union(wgpu::BufferUsages::COPY_SRC);
+#[cfg(not(test))]
+const DEBUG_READABLE_STORAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE;
+
+const SHARED_SIGNER_WGSL: &str =
+    include_str!("../reference/shared-signer/pickaxe_shared_signer.wgsl");
+
 #[cfg(test)]
 const TX_BYTES: usize = 615;
 const TEMPLATE_WORDS: usize = (615 + PhotonLayout::MAX_SHIFT).div_ceil(4);
@@ -518,7 +582,7 @@ pub struct WgpuPhotonEngine {
     device: wgpu::Device,
     queue: wgpu::Queue,
     stage_a: wgpu::ComputePipeline,
-    stage_b: [wgpu::ComputePipeline; 4],
+    stage_b: Vec<wgpu::ComputePipeline>,
     stage_c1: wgpu::ComputePipeline,
     stage_c2: wgpu::ComputePipeline,
     stage_c3: wgpu::ComputePipeline,
@@ -535,7 +599,7 @@ pub struct WgpuPhotonEngine {
     t2_filter_shift: usize,
     t2_filter_cache: std::collections::HashMap<usize, (wgpu::ComputePipeline, wgpu::BindGroup)>,
     bind_a: wgpu::BindGroup,
-    bind_b: [wgpu::BindGroup; 4],
+    bind_b: Vec<wgpu::BindGroup>,
     bind_c1: wgpu::BindGroup,
     bind_c2: wgpu::BindGroup,
     bind_c3: wgpu::BindGroup,
@@ -558,11 +622,14 @@ pub struct WgpuPhotonEngine {
     readback_bytes: usize,
     #[cfg(test)]
     profile: Option<(wgpu::QuerySet, wgpu::Buffer)>,
+    #[cfg(test)]
+    last_stage_ms: Vec<f64>,
     table_source: M29TableSource,
     recommended_candidates: u32,
     _adapter_name: String,
     job_ready: bool,
     positive_target_rule: bool,
+    signer: PortableSigner,
 }
 
 impl WgpuPhotonEngine {
@@ -579,6 +646,7 @@ impl WgpuPhotonEngine {
             max_candidates,
             winner_cap,
             table,
+            PortableSigner::from_env()?,
         ))
     }
 
@@ -588,6 +656,7 @@ impl WgpuPhotonEngine {
         max_candidates: u32,
         winner_cap: u32,
         table: (Vec<u8>, M29TableSource),
+        signer: PortableSigner,
     ) -> Result<Self, String> {
         if !m29_table::valid_table(&table.0) {
             return Err("invalid PHOTON generator table".into());
@@ -606,17 +675,28 @@ impl WgpuPhotonEngine {
         #[cfg(not(target_arch = "wasm32"))]
         let adapters = instance.enumerate_adapters(backends).await;
         #[cfg(not(target_arch = "wasm32"))]
-        let adapter = adapters
-            .into_iter()
-            .filter(|adapter| is_hardware_adapter(&adapter.get_info()))
-            .nth(device_ordinal)
+        let adapter = {
+            let mut hardware = adapters
+                .into_iter()
+                .filter(|adapter| is_hardware_adapter(&adapter.get_info()));
+            // #### PR #22: GPU tests may name their adapter, because the Vulkan
+            // order can differ between processes; a named test never runs elsewhere.
+            #[cfg(test)]
+            let named = std::env::var("PICKAXE_TEST_WGPU_ADAPTER").ok();
+            #[cfg(not(test))]
+            let named: Option<String> = None;
+            match named {
+                Some(name) => hardware.find(|adapter| adapter.get_info().name.contains(&name)),
+                None => hardware.nth(device_ordinal),
+            }
             .ok_or_else(|| {
                 #[cfg(test)]
                 if std::env::var("PICKAXE_TEST_SOFTWARE_WGPU").as_deref() == Ok("1") {
                     return "required software WGPU test adapter is unavailable".into();
                 }
                 format!("no hardware WGPU adapter at backend-local ordinal {device_ordinal}")
-            })?;
+            })?
+        };
         #[cfg(target_arch = "wasm32")]
         let adapter = {
             if device_ordinal != 0 {
@@ -687,14 +767,20 @@ impl WgpuPhotonEngine {
             label: Some("Pickaxe M67.38 PHOTON reference shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
         });
-        let stage_a = create_pipeline(&device, &shader, "photon_m38_stage_a_wg128");
-        let stage_b = [
-            create_pipeline(&device, &shader, "photon_m45_b4a_wg32"),
-            create_pipeline(&device, &shader, "photon_m45_b4b_wg32"),
-            create_pipeline(&device, &shader, "photon_m45_b4c_wg32"),
-            create_pipeline(&device, &shader, "photon_m45_b4d_wg32"),
-        ];
-        let stage_c1 = create_pipeline(&device, &shader, "photon_m6729_c1_znorm_wg64");
+        let signer_shader = (signer == PortableSigner::Rust).then(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Shared Rust signer"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHARED_SIGNER_WGSL)),
+            })
+        });
+        let signing = signer_shader.as_ref().unwrap_or(&shader);
+        let (a, b, c1) = signer.entry_points();
+        let stage_a = create_pipeline(&device, signing, a);
+        let stage_b: Vec<_> = b
+            .iter()
+            .map(|entry| create_pipeline(&device, signing, entry))
+            .collect();
+        let stage_c1 = create_pipeline(&device, signing, c1);
         let stage_c2 = create_pipeline(&device, &shader, "photon_m6725_c2_hash_only_wg64");
         let stage_c3 = create_pipeline(&device, &shader, "pickaxe_photon_c3_bounded_wg64");
         let t2_prepare = create_pipeline(&device, &shader, "pickaxe_t2_prepare");
@@ -752,7 +838,7 @@ impl WgpuPhotonEngine {
             &device,
             "PHOTON M38 intermediate records",
             storage_candidates as usize * M38_RECORD_BYTES,
-            wgpu::BufferUsages::STORAGE,
+            DEBUG_READABLE_STORAGE,
             false,
         );
         let dispatch_params_gpu = create_buffer(
@@ -766,7 +852,7 @@ impl WgpuPhotonEngine {
             &device,
             "PHOTON BCH Schnorr signatures",
             storage_candidates as usize * SIGNATURE_BYTES,
-            wgpu::BufferUsages::STORAGE,
+            DEBUG_READABLE_STORAGE,
             false,
         );
         let hashes_gpu = create_buffer(
@@ -831,48 +917,21 @@ impl WgpuPhotonEngine {
                 (10, &intermediate_gpu),
             ],
         );
-        let bind_b = [
-            create_bind_group(
-                &device,
-                &stage_b[0],
-                "PHOTON B4a bind group",
-                &[
-                    (3, &table_gpu),
-                    (10, &intermediate_gpu),
-                    (12, &dispatch_params_gpu),
-                ],
-            ),
-            create_bind_group(
-                &device,
-                &stage_b[1],
-                "PHOTON B4b bind group",
-                &[
-                    (3, &table_gpu),
-                    (10, &intermediate_gpu),
-                    (12, &dispatch_params_gpu),
-                ],
-            ),
-            create_bind_group(
-                &device,
-                &stage_b[2],
-                "PHOTON B4c bind group",
-                &[
-                    (3, &table_gpu),
-                    (10, &intermediate_gpu),
-                    (12, &dispatch_params_gpu),
-                ],
-            ),
-            create_bind_group(
-                &device,
-                &stage_b[3],
-                "PHOTON B4d bind group",
-                &[
-                    (3, &table_gpu),
-                    (10, &intermediate_gpu),
-                    (12, &dispatch_params_gpu),
-                ],
-            ),
-        ];
+        let bind_b = stage_b
+            .iter()
+            .map(|pipeline| {
+                create_bind_group(
+                    &device,
+                    pipeline,
+                    "PHOTON B bind group",
+                    &[
+                        (3, &table_gpu),
+                        (10, &intermediate_gpu),
+                        (12, &dispatch_params_gpu),
+                    ],
+                )
+            })
+            .collect();
         let bind_c1 = create_bind_group(
             &device,
             &stage_c1,
@@ -1011,11 +1070,14 @@ impl WgpuPhotonEngine {
             readback_bytes,
             #[cfg(test)]
             profile,
+            #[cfg(test)]
+            last_stage_ms: Vec::new(),
             table_source,
             recommended_candidates: initial_wgpu_batch_size(max_candidates),
             _adapter_name: adapter_info.name,
             job_ready: false,
             positive_target_rule: false,
+            signer,
         })
     }
 
@@ -1033,6 +1095,10 @@ impl WgpuPhotonEngine {
     }
 
     /// Returns the source of the portable GPU lookup table.
+    pub fn signer(&self) -> PortableSigner {
+        self.signer
+    }
+
     pub fn table_source(&self) -> M29TableSource {
         self.table_source
     }
@@ -1281,7 +1347,7 @@ impl WgpuPhotonEngine {
             self.stage_b.iter().zip(self.bind_b.iter()).enumerate()
         {
             let label = match index {
-                0 => "PHOTON Stage B4a",
+                0 => "PHOTON Stage B (part a)",
                 1 => "PHOTON Stage B4b",
                 2 => "PHOTON Stage B4c",
                 _ => "PHOTON Stage B4d",
@@ -1420,10 +1486,13 @@ impl WgpuPhotonEngine {
                         / 1e6
                 })
                 .collect();
-            eprintln!(
-                "T2_PROFILE candidates={candidate_count} group={} ms={times:?}",
-                self.t2_group_size
-            );
+            if std::env::var_os("PICKAXE_WGPU_PROFILE_QUIET").is_none() {
+                eprintln!(
+                    "T2_PROFILE candidates={candidate_count} group={} ms={times:?}",
+                    self.t2_group_size
+                );
+            }
+            self.last_stage_ms = times;
         }
         let completed = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let total_winners = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -1485,6 +1554,115 @@ pub fn production_wgpu_backends() -> wgpu::Backends {
     }
 }
 
+/// #### PR #22: an independent CPU check of the portable T2 search
+/// What: serializer -> GPU signatures and search -> CPU signature, complete
+/// transaction and digest for every deployment, layout, carry and window edge.
+/// Why: native GPU tests and the browser check run this one implementation.
+/// Check: the engine needs capacity for 4096 candidates and winners.
+#[cfg(any(test, all(feature = "browser-check", target_arch = "wasm32")))]
+pub(crate) async fn verify_t2_against_cpu(engine: &mut WgpuPhotonEngine) -> Result<usize, String> {
+    use crate::{crypto, proof, tx};
+    use secp256k1::PublicKey;
+    let mut checked = 0usize;
+    for (key_index, deployment) in [
+        crate::protocol::MAINNET_V0_PHOTON,
+        crate::protocol::MAINNET_PHOTON,
+        crate::protocol::CHIPNET_PHOTON,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = [0x11 + key_index as u8; 32];
+        let public_key = PublicKey::from_secret_key(
+            &SecretKey::from_secret_bytes(key).map_err(|error| error.to_string())?,
+        )
+        .serialize();
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        for age in [0, 1, 8, 17, 128, 32768] {
+            let Ok(layout) = PhotonLayout::for_age_with_deployment(age, &deployment) else {
+                continue;
+            };
+            // Both limbs exercise a carry/borrow within the amount window.
+            let reward = (1u128 << 33) + 7;
+            let baton = (1u128 << 49) + u128::from(u32::MAX) - 7;
+            let template = tx::build_photon_template_bytes_for_deployment(
+                &tx::TemplateParams {
+                    prev_tx_hash_hex: "11".repeat(32),
+                    prev_index: key_index as u32,
+                    age,
+                    public_key_hex: hex::encode(public_key),
+                    target_hex: hex::encode(target),
+                    signature_hex: "00".repeat(64),
+                    nonce: 0,
+                    contract_value_sats: 48_635_000,
+                    relay_fee_sats_per_kb: 1100,
+                    contract_token_amount: baton + reward,
+                    reward_amount: reward,
+                    payout_locking: tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS)?,
+                },
+                &deployment,
+            )?;
+            engine.set_proof_rule(deployment.proof_rule);
+            engine.set_job(&template, &target, &key)?;
+            if !engine.t2_active {
+                return Err(format!("age {age}: T2 was not enabled"));
+            }
+            for (base, count) in [
+                (0, 67),
+                (65500, 128),
+                (0x1234ffff, 129),
+                (u32::MAX - 66, 67),
+            ] {
+                let actual = engine.search_batch_async(base, count).await?;
+                let mut expected = std::collections::BTreeMap::new();
+                for candidate in u64::from(base)..u64::from(base) + u64::from(count) {
+                    let nonce = (candidate / 65536) as u32;
+                    let j = (candidate & 65535) as u16;
+                    let message = tx::photon_message_sha256(nonce, &hex::encode(target))?;
+                    let signature = crypto::bch_schnorr_sign(&key, &message)?;
+                    if !crypto::bch_schnorr_verify(&public_key, &message, &signature)? {
+                        return Err(format!("CPU signature failed for nonce {nonce}"));
+                    }
+                    let mut completed = template.clone();
+                    let n = layout.nonce_offset();
+                    completed[n..n + 4].copy_from_slice(&nonce.to_le_bytes());
+                    let s = layout.signature_offset();
+                    completed[s..s + 64].copy_from_slice(&signature);
+                    let shift = layout.shift();
+                    completed[491 + shift..499 + shift]
+                        .copy_from_slice(&((baton + u128::from(j)) as u64).to_le_bytes());
+                    completed[578 + shift..586 + shift]
+                        .copy_from_slice(&((reward - u128::from(j)) as u64).to_le_bytes());
+                    let digest = proof::hash256(&completed);
+                    if proof::meets_target_le_for_rule(&digest, &target, deployment.proof_rule) {
+                        expected.insert((nonce, j), digest);
+                    }
+                    checked += 1;
+                }
+                let returned: std::collections::BTreeMap<_, _> = actual
+                    .winners
+                    .iter()
+                    .map(|w| ((w.nonce, w.tail_j.unwrap_or_default()), w.digest))
+                    .collect();
+                if actual.candidates != count
+                    || actual.total_winners as usize != expected.len()
+                    || actual.truncated()
+                    || returned != expected
+                {
+                    return Err(format!(
+                        "age {age} base {base}: GPU result differs from the CPU"
+                    ));
+                }
+            }
+            if engine.search_batch_async(u32::MAX, 2).await.is_ok() {
+                return Err("a batch crossing the key-rotation boundary was accepted".into());
+            }
+        }
+    }
+    Ok(checked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,98 +1679,7 @@ mod tests {
             .parse()
             .unwrap_or(0);
         let mut engine = WgpuPhotonEngine::new(ordinal, 4096, 4096).unwrap();
-        let mut checked = 0usize;
-        for (key_index, deployment) in [
-            crate::protocol::MAINNET_V0_PHOTON,
-            crate::protocol::MAINNET_PHOTON,
-            crate::protocol::CHIPNET_PHOTON,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let key = [0x11 + key_index as u8; 32];
-            let public_key =
-                PublicKey::from_secret_key(&SecretKey::from_secret_bytes(key).unwrap()).serialize();
-            let mut target = [0xff; 32];
-            target[31] = 0x7f;
-            for age in [0, 1, 8, 17, 128, 32768] {
-                let Ok(layout) = PhotonLayout::for_age_with_deployment(age, &deployment) else {
-                    continue;
-                };
-                // Both limbs exercise a carry/borrow within the amount window.
-                let reward = (1u128 << 33) + 7;
-                let baton = (1u128 << 49) + u128::from(u32::MAX) - 7;
-                let template = tx::build_photon_template_bytes_for_deployment(
-                    &tx::TemplateParams {
-                        prev_tx_hash_hex: "11".repeat(32),
-                        prev_index: key_index as u32,
-                        age,
-                        public_key_hex: hex::encode(public_key),
-                        target_hex: hex::encode(target),
-                        signature_hex: "00".repeat(64),
-                        nonce: 0,
-                        contract_value_sats: 48_635_000,
-                        relay_fee_sats_per_kb: 1100,
-                        contract_token_amount: baton + reward,
-                        reward_amount: reward,
-                        payout_locking: tx::cashaddr_to_p2pkh_locking(
-                            crate::config::DONATION_ADDRESS,
-                        )
-                        .unwrap(),
-                    },
-                    &deployment,
-                )
-                .unwrap();
-                engine.set_proof_rule(deployment.proof_rule);
-                engine.set_job(&template, &target, &key).unwrap();
-                assert!(engine.t2_active);
-                for (base, count) in [
-                    (0, 67),
-                    (65500, 128),
-                    (0x1234ffff, 129),
-                    (u32::MAX - 66, 67),
-                ] {
-                    let actual = engine.search_batch(base, count).unwrap();
-                    let mut expected = std::collections::BTreeMap::new();
-                    for candidate in u64::from(base)..u64::from(base) + u64::from(count) {
-                        let nonce = (candidate / 65536) as u32;
-                        let j = (candidate & 65535) as u16;
-                        let message =
-                            tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
-                        let signature = crypto::bch_schnorr_sign(&key, &message).unwrap();
-                        assert!(
-                            crypto::bch_schnorr_verify(&public_key, &message, &signature).unwrap()
-                        );
-                        let mut completed = template.clone();
-                        let n = layout.nonce_offset();
-                        completed[n..n + 4].copy_from_slice(&nonce.to_le_bytes());
-                        let s = layout.signature_offset();
-                        completed[s..s + 64].copy_from_slice(&signature);
-                        let shift = layout.shift();
-                        completed[491 + shift..499 + shift]
-                            .copy_from_slice(&((baton + u128::from(j)) as u64).to_le_bytes());
-                        completed[578 + shift..586 + shift]
-                            .copy_from_slice(&((reward - u128::from(j)) as u64).to_le_bytes());
-                        let digest = search::hash256(&completed);
-                        if search::meets_target_le_for_rule(&digest, &target, deployment.proof_rule)
-                        {
-                            expected.insert((nonce, j), digest);
-                        }
-                        checked += 1;
-                    }
-                    assert_eq!(actual.candidates, count);
-                    assert_eq!(actual.total_winners as usize, expected.len());
-                    assert!(!actual.truncated());
-                    let returned: std::collections::BTreeMap<_, _> = actual
-                        .winners
-                        .iter()
-                        .map(|w| ((w.nonce, w.tail_j.unwrap()), w.digest))
-                        .collect();
-                    assert_eq!(returned, expected, "age {age} base {base}");
-                }
-                assert!(engine.search_batch(u32::MAX, 2).is_err());
-            }
-        }
+        let checked = pollster::block_on(verify_t2_against_cpu(&mut engine)).unwrap();
         eprintln!(
             "T2 independent candidate checks={checked}; adapter={}",
             engine._adapter_name
@@ -1818,6 +1905,440 @@ mod tests {
         }
     }
 
+    // #### PR #22: pipeline compilation time; clear the driver cache to see
+    // the cost of a first launch.
+    #[test]
+    #[ignore = "requires exclusive access to a physical GPU"]
+    fn engine_creation_time() {
+        let started = Instant::now();
+        let engine = WgpuPhotonEngine::new(0, 4096, 8).unwrap();
+        eprintln!(
+            "ENGINE_CREATED signer={:?} adapter={} seconds={:.1}",
+            engine.signer,
+            engine._adapter_name,
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    // Compile time of each shared signer pipeline (clear the driver cache first).
+    #[test]
+    #[ignore = "requires exclusive access to a physical GPU"]
+    fn shared_signer_pipeline_compile_times() {
+        let engine = WgpuPhotonEngine::new(0, 4096, 8).unwrap();
+        let module = engine
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Shared Rust signer"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHARED_SIGNER_WGSL)),
+            });
+        let (a, b, c1) = PortableSigner::Rust.entry_points();
+        for entry in [a, b[0], c1] {
+            let started = Instant::now();
+            let _pipeline = create_pipeline(&engine.device, &module, entry);
+            eprintln!(
+                "PIPELINE_COMPILED entry={entry} seconds={:.1}",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    // #### PR #22: per-stage GPU time of both signers on the same GPU and job.
+    // Run with PICKAXE_WGPU_TIMESTAMPS=1; prints mean milliseconds per stage.
+    #[test]
+    #[ignore = "requires exclusive access to a physical GPU"]
+    fn signer_stage_timing_comparison() {
+        let table = m29_table::load_or_generate_m29_g16().unwrap();
+        let candidates = std::env::var("PICKAXE_BENCH_CANDIDATES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(WGPU_T2_MAX_BATCH);
+        let rounds: usize = std::env::var("PICKAXE_TRIAL_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        // Creation order decides which engine gets device memory first;
+        // PICKAXE_BENCH_RUST_FIRST=1 reverses it to separate that from signing.
+        let order = if std::env::var_os("PICKAXE_BENCH_RUST_FIRST").is_some() {
+            [PortableSigner::Rust, PortableSigner::Wgsl]
+        } else {
+            [PortableSigner::Wgsl, PortableSigner::Rust]
+        };
+        let mut engines = order.map(|signer| {
+            pollster::block_on(WgpuPhotonEngine::new_async(
+                0,
+                WGPU_T2_MAX_BATCH,
+                8,
+                table.clone(),
+                signer,
+            ))
+            .unwrap()
+        });
+        assert!(
+            engines[0].profile.is_some(),
+            "set PICKAXE_WGPU_TIMESTAMPS=1"
+        );
+        let key = [0x11; 32];
+        let mut target = [0; 32];
+        target[0] = 1;
+        let public_key =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(key).unwrap()).serialize();
+        let template = tx::build_photon_template_bytes_for_deployment(
+            &tx::TemplateParams {
+                prev_tx_hash_hex: "11".repeat(32),
+                prev_index: 0,
+                age: 128,
+                public_key_hex: hex::encode(public_key),
+                target_hex: hex::encode(target),
+                signature_hex: "00".repeat(64),
+                nonce: 0,
+                contract_value_sats: 48_635_000,
+                relay_fee_sats_per_kb: 1100,
+                contract_token_amount: 2_100_000_000_000_000_000,
+                reward_amount: 4_999_999_999_999,
+                payout_locking: tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS)
+                    .unwrap(),
+            },
+            &crate::protocol::MAINNET_PHOTON,
+        )
+        .unwrap();
+        for engine in &mut engines {
+            engine.set_proof_rule(crate::protocol::ProofRule::Positive);
+            engine.set_job(&template, &target, &key).unwrap();
+            assert!(engine.t2_active);
+            for _ in 0..2 {
+                engine.search_batch(0, candidates).unwrap();
+            }
+        }
+        // Stage slots: A, B parts (four for WGSL, one for Rust), C1, prepare, filter.
+        let mut sums = [[0f64; 5]; 2];
+        for round in 0..rounds {
+            // Alternate which engine runs first, so neither always follows the other.
+            for step in 0..2 {
+                let index = (step + round) % 2;
+                let engine = &mut engines[index];
+                let base = (round as u32 + 1) * candidates;
+                engine.search_batch(base, candidates).unwrap();
+                let ms = &engine.last_stage_ms;
+                let stages = [ms[0], ms[1] + ms[2] + ms[3] + ms[4], ms[5], ms[6], ms[7]];
+                for (sum, value) in sums[index].iter_mut().zip(stages) {
+                    *sum += value;
+                }
+            }
+        }
+        for (index, sum) in sums.iter().enumerate() {
+            let mean = sum.map(|value| value / rounds as f64);
+            eprintln!(
+                "SIGNER_TIMING signer={:?} adapter={} candidates={candidates} a={:.4} b={:.4} c1={:.4} signing={:.4} prepare={:.4} filter={:.4} ms",
+                engines[index].signer,
+                engines[index]._adapter_name,
+                mean[0],
+                mean[1],
+                mean[2],
+                mean[0] + mean[1] + mean[2],
+                mean[3],
+                mean[4],
+            );
+        }
+    }
+
+    /// Copies a GPU-only buffer prefix to the host (test builds add COPY_SRC).
+    fn read_words(engine: &WgpuPhotonEngine, buffer: &wgpu::Buffer, words: usize) -> Vec<u32> {
+        let staging = create_buffer(
+            &engine.device,
+            "test readback",
+            words * 4,
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            false,
+        );
+        let mut encoder = engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, (words * 4) as u64);
+        engine.queue.submit([encoder.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.unwrap());
+        engine._instance.poll_all(true);
+        let words = slice
+            .get_mapped_range()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        staging.unmap();
+        words
+    }
+
+    /// Runs only the signing stages A, B and C1 for a batch.
+    fn run_signing_stages(engine: &WgpuPhotonEngine, nonce_base: u32, count: u32) {
+        let active = count.div_ceil(128) * 128;
+        engine.queue.write_buffer(
+            &engine.input_gpu,
+            BASE_NONCE_OFFSET,
+            &nonce_base.to_le_bytes(),
+        );
+        engine.queue.write_buffer(
+            &engine.dispatch_params_gpu,
+            0,
+            &u32_words_to_le_bytes(&[active / 32, active, 0, 0]),
+        );
+        let mut encoder = engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut stage = |pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, groups: u32| {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+        };
+        stage(&engine.stage_a, &engine.bind_a, active / 128);
+        for (pipeline, bind) in engine.stage_b.iter().zip(&engine.bind_b) {
+            stage(pipeline, bind, active / 32);
+        }
+        stage(&engine.stage_c1, &engine.bind_c1, active / 64);
+        engine.queue.submit([encoder.finish()]);
+    }
+
+    /// The T2 job shared by the signing tests.
+    fn signing_test_job() -> ([u8; 32], [u8; 32], Vec<u8>) {
+        let key = [0x11; 32];
+        let public_key =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(key).unwrap()).serialize();
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        let template = tx::build_photon_template_bytes_for_deployment(
+            &tx::TemplateParams {
+                prev_tx_hash_hex: "11".repeat(32),
+                prev_index: 0,
+                age: 128,
+                public_key_hex: hex::encode(public_key),
+                target_hex: hex::encode(target),
+                signature_hex: "00".repeat(64),
+                nonce: 0,
+                contract_value_sats: 48_635_000,
+                relay_fee_sats_per_kb: 1100,
+                contract_token_amount: (1 << 50) + 7,
+                reward_amount: (1 << 33) + 7,
+                payout_locking: tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS)
+                    .unwrap(),
+            },
+            &crate::protocol::MAINNET_PHOTON,
+        )
+        .unwrap();
+        (key, target, template)
+    }
+
+    // #### PR #22: checks each signing stage separately, for either signer.
+    #[test]
+    #[ignore = "requires exclusive access to a physical GPU"]
+    fn signing_stages_match_cpu_per_window() {
+        let mut engine = WgpuPhotonEngine::new(0, 4096, 8).unwrap();
+        let (key, target, template) = signing_test_job();
+        engine.set_proof_rule(crate::protocol::MAINNET_PHOTON.proof_rule);
+        engine.set_job(&template, &target, &key).unwrap();
+        engine.t2_active = false;
+        let windows = 128;
+        run_signing_stages(&engine, 0x0102_0304, windows);
+        let records = read_words(&engine, &engine._intermediate_gpu, windows as usize * 40);
+        let signatures = read_words(&engine, &engine._signatures_gpu, windows as usize * 16);
+        let words_be = |bytes: &[u8]| -> Vec<u32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| u32::from_be_bytes(*w))
+                .collect()
+        };
+        let limbs_be = |limbs: &[u32]| -> Vec<u8> {
+            limbs.iter().rev().flat_map(|w| w.to_be_bytes()).collect()
+        };
+        let mut failures = Vec::new();
+        for index in 0..windows as usize {
+            let nonce = 0x0102_0304 + index as u32;
+            let message = tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
+            let record = &records[index * 40..index * 40 + 40];
+            if record[..8] != words_be(&message)[..] {
+                failures.push(format!("{index}: message"));
+                continue;
+            }
+            let signature = crypto::bch_schnorr_sign(&key, &message).unwrap();
+            let k = limbs_be(&record[8..16]);
+            if k != crypto::bch_rfc6979_nonce(&key, &message).unwrap() {
+                failures.push(format!("{index}: k"));
+                continue;
+            }
+            let r_point = PublicKey::from_secret_key(
+                &SecretKey::from_secret_bytes(k.try_into().unwrap()).unwrap(),
+            )
+            .serialize_uncompressed();
+            // Affine x of the Jacobian point the B stages produced.
+            let field = |limbs: &[u32]| num_bigint::BigUint::from_bytes_be(&limbs_be(limbs));
+            let p = num_bigint::BigUint::parse_bytes(
+                b"fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+                16,
+            )
+            .unwrap();
+            let z = field(&record[32..40]);
+            let z2 = z.modpow(&(&p - 2u32), &p).pow(2) % &p;
+            let x = field(&record[16..24]) * z2 % &p;
+            if x != num_bigint::BigUint::from_bytes_be(&r_point[1..33]) {
+                failures.push(format!("{index}: point"));
+                continue;
+            }
+            if signatures[index * 16..index * 16 + 8] != words_be(&signature[..32])[..] {
+                failures.push(format!("{index}: r"));
+                continue;
+            }
+            if signatures[index * 16 + 8..index * 16 + 16] != words_be(&signature[32..])[..] {
+                failures.push(format!("{index}: s"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {windows} windows failed ({:?}): {:?}",
+            failures.len(),
+            engine.signer,
+            &failures[..failures.len().min(8)]
+        );
+    }
+
+    // #### PR #22: development check of the shared signer's arithmetic on GPU.
+    // Needs `PICKAXE_BUILD_SHARED_SIGNER=debug` output; skipped without it.
+    #[test]
+    #[ignore = "requires exclusive access to a physical GPU"]
+    fn shared_signer_arithmetic_matches_integers() {
+        use num_bigint::BigUint;
+        let path = "artifacts/shared-gpu-proof/signer-debug/pickaxe_shared_signer.wgsl";
+        let Ok(source) = std::fs::read_to_string(path) else {
+            eprintln!("skip: build {path} first");
+            return;
+        };
+        let engine = WgpuPhotonEngine::new(0, 128, 1).unwrap();
+        let module = engine
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("debug signer"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
+            });
+        let pipeline = create_pipeline(&engine.device, &module, "pickaxe_debug_arithmetic");
+        let p = BigUint::parse_bytes(
+            b"fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            16,
+        )
+        .unwrap();
+        let limbs = |v: &BigUint| -> Vec<u32> {
+            let mut d = v.to_u32_digits();
+            d.resize(8, 0);
+            d
+        };
+        let number = |w: &[u32]| BigUint::new(w.to_vec());
+        let digest = |tag: &str, i: u32| {
+            BigUint::from_bytes_be(&<sha2::Sha256 as sha2::Digest>::digest(format!("{tag}{i}")))
+                % &p
+        };
+        let point = |k: &BigUint| {
+            let mut bytes = [0u8; 32];
+            let be = k.to_bytes_be();
+            bytes[32 - be.len()..].copy_from_slice(&be);
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(bytes).unwrap())
+        };
+        let cases = 64u32;
+        let mut input = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..cases {
+            let (a, b) = (digest("a", i), digest("b", i));
+            let (k, m) = (
+                digest("k", i) % (&p >> 2) + 1u32,
+                digest("m", i) % (&p >> 2) + 1u32,
+            );
+            let (pk, qm) = (point(&k), point(&m));
+            let affine = |key: &PublicKey| {
+                let raw = key.serialize_uncompressed();
+                (
+                    BigUint::from_bytes_be(&raw[1..33]),
+                    BigUint::from_bytes_be(&raw[33..65]),
+                )
+            };
+            let (px, py) = affine(&pk);
+            let (qx, qy) = affine(&qm);
+            let lambda = digest("z", i) + 1u32;
+            let l2 = &lambda * &lambda % &p;
+            input.extend(limbs(&a));
+            input.extend(limbs(&b));
+            input.extend(limbs(&(&px * &l2 % &p)));
+            input.extend(limbs(&(&py * &l2 % &p * &lambda % &p)));
+            input.extend(limbs(&lambda));
+            input.extend(limbs(&qx));
+            input.extend(limbs(&qy));
+            let sum = affine(&pk.combine(&qm).unwrap());
+            expected.push((
+                &a * &b % &p,
+                &a * &a % &p,
+                (&a + &b) % &p,
+                (&a + &p - &b) % &p,
+                a.modpow(&(&p - 2u32), &p),
+                sum,
+            ));
+        }
+        let to_bytes = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let cases_gpu = create_buffer(
+            &engine.device,
+            "debug cases",
+            input.len() * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            false,
+        );
+        engine.queue.write_buffer(&cases_gpu, 0, &to_bytes(&input));
+        let results_gpu = create_buffer(
+            &engine.device,
+            "debug results",
+            cases as usize * 64 * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            false,
+        );
+        let bind = create_bind_group(
+            &engine.device,
+            &pipeline,
+            "debug",
+            &[(0, &cases_gpu), (1, &results_gpu)],
+        );
+        let mut encoder = engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        engine.queue.submit([encoder.finish()]);
+        let results = read_words(&engine, &results_gpu, cases as usize * 64);
+        let mut failures = std::collections::BTreeMap::<&str, u32>::new();
+        for (i, (mul, square, add, sub, inverse, (sx, sy))) in expected.iter().enumerate() {
+            let r = &results[i * 64..i * 64 + 64];
+            for (name, got, want) in [
+                ("mul", number(&r[0..8]), mul),
+                ("square", number(&r[8..16]), square),
+                ("add", number(&r[16..24]), add),
+                ("sub", number(&r[24..32]), sub),
+                ("inverse", number(&r[32..40]), inverse),
+            ] {
+                if &got != want {
+                    *failures.entry(name).or_default() += 1;
+                }
+            }
+            let z = number(&r[56..64]);
+            let zi = z.modpow(&(&p - 2u32), &p);
+            let x = number(&r[40..48]) * &zi % &p * &zi % &p;
+            let y = number(&r[48..56]) * &zi % &p * &zi % &p * &zi % &p;
+            if (&x, &y) != (sx, sy) {
+                *failures.entry("point add").or_default() += 1;
+            }
+        }
+        assert!(failures.is_empty(), "failures out of {cases}: {failures:?}");
+    }
+
     fn reference_template_with_target(target: [u8; 32]) -> [u8; TX_BYTES] {
         let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
         let mut template: [u8; TX_BYTES] = raw.try_into().unwrap();
@@ -1878,6 +2399,37 @@ mod tests {
                 assert_eq!(byte_at(394 + shift + i), *expected);
             }
             assert!(layout.tx_bytes() <= 631);
+        }
+    }
+
+    #[test]
+    fn portable_signer_defaults_to_shared_rust_and_keeps_wgsl_selectable() {
+        assert_eq!(PortableSigner::parse(None), Ok(PortableSigner::Rust));
+        assert_eq!(PortableSigner::parse(Some(" ")), Ok(PortableSigner::Rust));
+        assert_eq!(
+            PortableSigner::parse(Some("rust")),
+            Ok(PortableSigner::Rust)
+        );
+        assert_eq!(
+            PortableSigner::parse(Some("wgsl")),
+            Ok(PortableSigner::Wgsl)
+        );
+        assert!(PortableSigner::parse(Some("cuda")).is_err());
+        assert_eq!(PortableSigner::default(), PortableSigner::Rust);
+        // Every entry point either signer names exists in its shader.
+        let reference = reference_shader_source_for_wgpu().unwrap();
+        for signer in [PortableSigner::Wgsl, PortableSigner::Rust] {
+            let source = match signer {
+                PortableSigner::Wgsl => reference.as_str(),
+                PortableSigner::Rust => SHARED_SIGNER_WGSL,
+            };
+            let (a, b, c1) = signer.entry_points();
+            for entry in b.iter().copied().chain([a, c1]) {
+                assert!(
+                    source.contains(&format!("fn {entry}(")),
+                    "{signer:?} lacks {entry}"
+                );
+            }
         }
     }
 

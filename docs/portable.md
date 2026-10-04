@@ -4,8 +4,11 @@ The macOS Apple Silicon command-line miner and the browser WebGPU miner build
 from the same Rust crate as Windows and Linux. They share transaction layouts,
 protocol rules, signatures, intensity pacing, measured active rates, independent
 winner checks, dynamic fee calculations
-and the token's donation policy. The browser uses the same WGSL backend that
-the native portable build runs through Metal on macOS or Vulkan elsewhere.
+and the token's donation policy. The browser miner and the native portable
+build run the same WGSL shaders through the wgpu library: on Metal on macOS, on
+Vulkan on Windows and Linux, and on the browser's WebGPU. The signing stages
+come from the shared Rust engine; on native builds `PICKAXE_WGPU_SIGNER=wgsl`
+selects the original PHOTON WGSL stages instead. See [GPU code map](gpu-sources.md).
 
 All platforms share payout validation: Mainnet accepts `bitcoincash:` and Chipnet
 accepts `bchtest:`. Wrong-network addresses, invalid checksums and mixed case are
@@ -76,6 +79,9 @@ mining starts only when you press **Start mining**. No wallet private key is
 requested. Use a WebGPU-capable browser on HTTPS or localhost. Keep the tab
 open: browsers may throttle background tabs or suspend work on sleep.
 
+On Windows, Chromium browsers ignore a page's GPU preference: choose the GPU
+for the browser in Windows Settings, System, Display, Graphics.
+
 The application checks WebGPU, WebAssembly and Web Locks capabilities rather
 than browser names. Chromium, Firefox and Safari provide these standards on
 supported systems; actual availability depends on browser version, OS, GPU and
@@ -104,6 +110,11 @@ npm --prefix web test
 node web/smoke.mjs
 python -m http.server 8080 --bind 127.0.0.1 --directory dist/web
 ```
+
+`python tools/build-browser.py --check` builds a development bundle that also
+exports `verify_portable_engine(table, signer)`: it signs and searches T2 windows
+in the browser with the chosen signer (`"rust"` or `"wgsl"`) and reconstructs
+every candidate on the CPU. Release bundles do not include it.
 
 Use the wasm-bindgen CLI version in `Cargo.lock`; the build script checks it.
 Windows also needs Clang on PATH. The browser interface uses strict TypeScript,

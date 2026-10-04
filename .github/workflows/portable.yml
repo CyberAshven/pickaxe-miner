@@ -42,6 +42,8 @@ jobs:
             artifacts/shared-gpu-proof/shared-t2-hash.*
             artifacts/shared-gpu-proof/filter/*.metal
             artifacts/shared-gpu-proof/filter/*.spv
+            artifacts/shared-gpu-proof/signer/*.metal
+            artifacts/shared-gpu-proof/signer/*.spv
           if-no-files-found: error
 
   software-vulkan:
@@ -69,6 +71,8 @@ jobs:
           mkdir -p "$XDG_RUNTIME_DIR"
           chmod 700 "$XDG_RUNTIME_DIR"
           cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
+          # #### PR #22: the same oracle with the original PHOTON WGSL signing stages.
+          PICKAXE_WGPU_SIGNER=wgsl cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
 
   apple-silicon:
     name: macOS ARM64
@@ -89,7 +93,7 @@ jobs:
       - name: Compile generated shared Rust shader with Apple Metal
         run: |
           xcrun -sdk macosx metal -c artifacts/shared-gpu-proof/shared-t2-hash.metal -o artifacts/shared-gpu-proof/shared-t2-hash.air
-          for shader in artifacts/shared-gpu-proof/filter/*.metal; do
+          for shader in artifacts/shared-gpu-proof/filter/*.metal artifacts/shared-gpu-proof/signer/*.metal; do
             xcrun -sdk macosx metal -c "$shader" -o "${shader%.metal}.air"
           done
       - name: Check shared application and Metal backend

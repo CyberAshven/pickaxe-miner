@@ -8,10 +8,16 @@ fn main() {
     if env::var_os("CARGO_FEATURE_SHARED_RUST_T2").is_none() {
         return;
     }
+    // (generated directory, shaders, shared sources) per portable artifact set.
+    verify("reference/shared-t2", 17, 10);
+    verify("reference/shared-signer", 1, 14);
+}
+
+fn verify(directory: &str, expected_shaders: usize, expected_sources: usize) {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let manifest = "reference/shared-t2/SHA256SUMS";
+    let manifest = format!("{directory}/SHA256SUMS");
     println!("cargo:rerun-if-changed={manifest}");
-    let contents = fs::read_to_string(root.join(manifest))
+    let contents = fs::read_to_string(root.join(&manifest))
         .expect("Generate portable shaders: python tools/shared-gpu-proof/sync_filter.py --write");
     let mut shaders = 0;
     let mut sources = 0;
@@ -26,12 +32,18 @@ fn main() {
             .collect();
         assert_eq!(actual, expected,
             "Stale shared GPU source/artifact: {path}. Run python tools/shared-gpu-proof/sync_filter.py --write");
-        if path.starts_with("reference/shared-t2/") {
+        if path.starts_with(&format!("{directory}/")) {
             shaders += 1;
         } else {
             sources += 1;
         }
     }
-    assert_eq!(shaders, 17, "Incomplete portable shader manifest");
-    assert_eq!(sources, 10, "Incomplete shared Rust source manifest");
+    assert_eq!(
+        shaders, expected_shaders,
+        "Incomplete portable shader manifest"
+    );
+    assert_eq!(
+        sources, expected_sources,
+        "Incomplete shared Rust source manifest"
+    );
 }

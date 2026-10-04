@@ -5,6 +5,40 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let output = root.join("artifacts/shared-gpu-proof");
     fs::create_dir_all(&output)?;
+    // #### PR #22: the portable signing stages, one module with six entry points.
+    // PICKAXE_BUILD_SHARED_SIGNER=debug adds a development-only arithmetic entry.
+    if let Some(mode) = std::env::var_os("PICKAXE_BUILD_SHARED_SIGNER") {
+        let debug = mode == "debug";
+        let result = spirv_builder::SpirvBuilder::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../signer"),
+            "spirv-unknown-vulkan1.1",
+        )
+        .shader_crate_features(debug.then(|| "debug".to_string()))
+        .build()?;
+        let path = result.module.unwrap_single();
+        let module = naga::front::spv::parse_u8_slice(&fs::read(path)?, &Default::default())?;
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)?;
+        let directory = output.join(if debug { "signer-debug" } else { "signer" });
+        fs::create_dir_all(&directory)?;
+        fs::write(
+            directory.join("pickaxe_shared_signer.wgsl"),
+            naga::back::wgsl::write_string(
+                &module,
+                &info,
+                naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+            )?,
+        )?;
+        let (metal, _) =
+            naga::back::msl::write_string(&module, &info, &Default::default(), &Default::default())?;
+        fs::write(directory.join("pickaxe_shared_signer.metal"), metal)?;
+        fs::copy(path, directory.join("pickaxe_shared_signer.spv"))?;
+        println!("Shared signer generated in {}", directory.display());
+        return Ok(());
+    }
     if std::env::var_os("PICKAXE_BUILD_SHARED_FILTER").is_some() {
         let result = spirv_builder::SpirvBuilder::new(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../filter"),
