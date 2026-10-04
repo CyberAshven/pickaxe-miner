@@ -264,6 +264,13 @@ fn reference_shader_source_for_wgpu() -> Result<String, String> {
 /// Rejects non-hardware WGPU adapters for mining.
 #[cfg(not(target_arch = "wasm32"))]
 fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
+    // #### PR #22
+    // CI executes the real kernels on lavapipe. This opt-in exists only in a
+    // test binary, requires a software device, and is never a mining fallback.
+    #[cfg(test)]
+    if std::env::var("PICKAXE_TEST_SOFTWARE_WGPU").as_deref() == Ok("1") {
+        return info.device_type == wgpu::DeviceType::Cpu;
+    }
     matches!(
         info.device_type,
         wgpu::DeviceType::DiscreteGpu
@@ -547,6 +554,10 @@ impl WgpuPhotonEngine {
             .filter(|adapter| is_hardware_adapter(&adapter.get_info()))
             .nth(device_ordinal)
             .ok_or_else(|| {
+                #[cfg(test)]
+                if std::env::var("PICKAXE_TEST_SOFTWARE_WGPU").as_deref() == Ok("1") {
+                    return "required software WGPU test adapter is unavailable".into();
+                }
                 format!("no hardware WGPU adapter at backend-local ordinal {device_ordinal}")
             })?;
         #[cfg(target_arch = "wasm32")]

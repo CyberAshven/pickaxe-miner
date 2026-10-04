@@ -12,8 +12,63 @@ permissions:
   contents: read
 
 jobs:
+  shared-rust-gpu:
+    name: Shared Rust GPU compilation
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - name: Install pinned SPIR-V compiler
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly-2026-04-11 --profile minimal --component rust-src,rustc-dev,llvm-tools-preview
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang cmake ninja-build
+      - name: Check shared Rust hashes and compile portable shaders
+        env:
+          PICKAXE_PROOF_FIXTURES: artifacts/shared-gpu-proof/fixtures
+        run: |
+          cargo +stable test --locked --manifest-path tools/shared-gpu-proof/Cargo.toml --release -p pickaxe-shared-hash-proof --test oracle -- --nocapture
+          cargo +nightly-2026-04-11 run --locked --manifest-path tools/shared-gpu-proof/Cargo.toml --release -p pickaxe-shared-hash-builder
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pickaxe-shared-gpu-${{ inputs.source-ref }}
+          path: |
+            artifacts/shared-gpu-proof/shared-t2-hash.*
+          if-no-files-found: error
+
+  software-vulkan:
+    name: Portable GPU correctness (lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - name: Install Rust and software Vulkan
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+      - name: Run shared signature, transaction and digest oracles
+        env:
+          PICKAXE_TEST_SOFTWARE_WGPU: '1'
+        run: |
+          export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)"
+          test -n "$VK_DRIVER_FILES"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/vulkan-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
+
   apple-silicon:
     name: macOS ARM64
+    needs: shared-rust-gpu
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -23,6 +78,12 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pickaxe-shared-gpu-${{ inputs.source-ref }}
+          path: artifacts/shared-gpu-proof
+      - name: Compile generated shared Rust shader with Apple Metal
+        run: xcrun -sdk macosx metal -c artifacts/shared-gpu-proof/shared-t2-hash.metal -o artifacts/shared-gpu-proof/shared-t2-hash.air
       - name: Check shared application and Metal backend
         run: |
           rustup default stable
