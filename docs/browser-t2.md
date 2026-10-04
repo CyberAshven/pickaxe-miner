@@ -35,8 +35,27 @@ not a native CUDA speed claim. WASM SHA-256:
   Strict TypeScript and ten browser transport/submission checks passed.
 
 Physical AMD and Apple performance comparisons remain separate requirements.
-Mac compilation is not proof of Apple GPU mining. The live mainnet browser
-acceptance check is still running; no accepted reward is claimed by this report.
+Mac compilation is not proof of Apple GPU mining.
+
+## Mainnet acceptance and current dev validation
+
+Source `ddb6159fed37fb16f86d445cfffc579257f5a469` mined one accepted
+mainnet reward on 2026-10-04. Two independent Electrum servers returned the
+exact submitted transaction. Independent Libauth BCH 2026 standard and
+consensus VM checks passed, with the entered miner recipient and conserved
+token reward verified; an edited reward failed. The transaction used one
+input, two outputs and 629 sats for 629 bytes at the observed relay floor.
+There was no extra funding input or split payment. The browser ended with
+one accepted reward, no pending reward and no page errors.
+
+The tested WASM SHA-256 was
+`434a9966e8c096e42c7f6992c136bbb75a1bf45e8f69c27144cd9d3b24d0ca78`.
+Three 30-second offline complete-pipeline trials on that build measured
+910.305, 894.552 and 880.051 million candidates/second. These trials were
+not interleaved with the older build, so they do not establish a speedup.
+The actual full recipient work cycle and five independent covenant VM samples
+also passed on this build. Shared GPU source migration remains unfinished;
+see `tools/shared-gpu-proof/README.md` for the separate compiler proof.
 
 Temporary local telemetry verified continued work while the page was hidden.
 The telemetry hook is not included in distributed files. Browser discard and
