@@ -1103,20 +1103,107 @@ fn persist_session_profile(
 }
 
 /// Dispatches the requested CLI command and mining mode.
+// #### PR #22: starting the miner by double-click
+// What: with no command the miner opens the mining setup (as `mine` does)
+// instead of the hidden command prompt, now `pickaxe repl`. A console opened
+// just for the miner stays open after an error until Enter, and on Linux a
+// launch without a terminal reopens the miner inside the desktop's terminal.
+// Why: users double-click the executable; the prompt looked like nothing
+// happened, Windows closed the window on errors, and Linux file managers run
+// terminal programs invisibly.
+// Check: double-click on Windows, Linux (GNOME/KDE) and macOS; `pickaxe` from
+// a shell must not pause on errors.
+#[cfg(not(windows))]
+const TERMINAL_RELAUNCH_ENV: &str = "PICKAXE_TERMINAL_LAUNCHED";
+
+/// Exits after an error, keeping a console opened just for the miner open.
+fn exit_after_error(code: i32) -> ! {
+    if console_closes_on_exit() {
+        eprintln!();
+        eprintln!("Press Enter to close.");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+    std::process::exit(code)
+}
+
+/// A Windows console whose only process is the miner was opened by Explorer.
+#[cfg(windows)]
+fn console_closes_on_exit() -> bool {
+    let mut processes = [0u32; 2];
+    let attached = unsafe {
+        windows_sys::Win32::System::Console::GetConsoleProcessList(
+            processes.as_mut_ptr(),
+            processes.len() as u32,
+        )
+    };
+    attached == 1
+}
+
+/// The Linux launcher marks the terminal it opened for the miner.
+#[cfg(not(windows))]
+fn console_closes_on_exit() -> bool {
+    std::env::var_os(TERMINAL_RELAUNCH_ENV).is_some()
+}
+
+/// Started from a Linux file manager without a terminal: reopen in one.
+#[cfg(target_os = "linux")]
+fn relaunch_in_terminal() {
+    use std::io::IsTerminal;
+    let desktop =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::env::var_os(TERMINAL_RELAUNCH_ENV).is_some()
+        || !desktop
+    {
+        return;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // Each terminal with the arguments that precede the command it runs.
+    const TERMINALS: [(&str, &[&str]); 9] = [
+        ("x-terminal-emulator", &["-e"]),
+        ("gnome-terminal", &["--"]),
+        ("konsole", &["-e"]),
+        ("xfce4-terminal", &["-x"]),
+        ("mate-terminal", &["-x"]),
+        ("kitty", &[]),
+        ("alacritty", &["-e"]),
+        ("foot", &[]),
+        ("xterm", &["-e"]),
+    ];
+    for (terminal, prefix) in TERMINALS {
+        let launched = std::process::Command::new(terminal)
+            .args(prefix)
+            .arg(&executable)
+            .args(&args)
+            .env(TERMINAL_RELAUNCH_ENV, "1")
+            .spawn();
+        if launched.is_ok() {
+            std::process::exit(0);
+        }
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    relaunch_in_terminal();
     let args = cli::parse();
     let config_path = match config::config_path(args.config.as_deref()) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     };
     let saved_config = match config::SavedConfig::load_optional(&config_path) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     };
     let mut effective_backend = "auto".to_string();
@@ -1137,29 +1224,29 @@ fn main() {
         Ok(kind) => kind,
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     };
     let mut base_cfg = RuntimeConfig::default();
     if let Some(config) = &saved_config {
         if let Err(error) = config.apply_to_runtime(&mut base_cfg) {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     }
     let cfg = match runtime_config_from_cli_with_base(&args, base_cfg) {
         Ok(cfg) => cfg,
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     };
 
-    match args.command.unwrap_or(cli::Commands::Repl) {
+    match args.command.unwrap_or(cli::Commands::Mine) {
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {
                 eprintln!("error: {error}");
-                std::process::exit(1);
+                exit_after_error(1);
             }
         }
         cli::Commands::SelfTest => {
@@ -1167,14 +1254,14 @@ fn main() {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             };
             match self_test::run_self_test(selected.backend, selected.index) {
                 Ok(report) => self_test::print_report(&report, args.json),
                 Err(error) => {
                     eprintln!("error: self-test failed: {error}");
-                    std::process::exit(1);
+                    exit_after_error(1);
                 }
             }
         }
@@ -1186,7 +1273,7 @@ fn main() {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             };
             match benchmark::run_gpu_benchmark(&selected, seconds, args.intensity, ui_compare) {
@@ -1194,12 +1281,12 @@ fn main() {
                     let passed = report.passed();
                     benchmark::print_report(&report, args.json);
                     if !passed {
-                        std::process::exit(1);
+                        exit_after_error(1);
                     }
                 }
                 Err(error) => {
                     eprintln!("error: benchmark failed: {error}");
-                    std::process::exit(1);
+                    exit_after_error(1);
                 }
             }
         }
@@ -1245,7 +1332,7 @@ fn main() {
                     config::SavedConfig::from_effective(&effective_backend, effective_device, &cfg);
                 if let Err(error) = saved.save(&config_path) {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
                 if args.json {
                     println!(
@@ -1267,7 +1354,7 @@ fn main() {
                 Ok(sources) => sources,
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             };
             if saved_config
@@ -1276,7 +1363,7 @@ fn main() {
             {
                 if let Err(error) = sources.save(&sources_path) {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             }
             let startup = mine_startup(&args);
@@ -1300,7 +1387,7 @@ fn main() {
                 });
                 if let Err(error) = applied {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             }
             if matches!(startup, MineStartup::Direct)
@@ -1308,19 +1395,19 @@ fn main() {
                 && cfg.payout_address.trim().is_empty()
             {
                 eprintln!("error: --address is required with --no-tui or --json");
-                std::process::exit(2);
+                exit_after_error(2);
             }
             if matches!(startup, MineStartup::Direct) {
                 if let Err(error) = cfg.ensure_mining_supported() {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             }
             let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             };
             let (cfg, selected_backend, selected_device, profile_name) = match startup {
@@ -1329,14 +1416,14 @@ fn main() {
                         Ok(devices) => devices,
                         Err(error) => {
                             eprintln!("error: {error}");
-                            std::process::exit(2);
+                            exit_after_error(2);
                         }
                     };
                     let mut profiles = match config::MiningProfiles::load_optional(&profiles_path) {
                         Ok(profiles) => profiles,
                         Err(error) => {
                             eprintln!("error: {error}");
-                            std::process::exit(2);
+                            exit_after_error(2);
                         }
                     };
                     // Servers and nodes once saved inside profiles move to the
@@ -1347,7 +1434,7 @@ fn main() {
                             .and_then(|()| profiles.save(&profiles_path))
                         {
                             eprintln!("error: {error}");
-                            std::process::exit(2);
+                            exit_after_error(2);
                         }
                     }
                     let overrides = tui::SetupOverrides {
@@ -1380,7 +1467,7 @@ fn main() {
                         Ok(None) => return,
                         Err(error) => {
                             eprintln!("error: {error}");
-                            std::process::exit(1);
+                            exit_after_error(1);
                         }
                     };
                     (
@@ -1400,14 +1487,14 @@ fn main() {
                             persist_session_profile(&profiles_path, &name, intensity, &address)
                         {
                             eprintln!("error: save mining profile: {error}");
-                            std::process::exit(1);
+                            exit_after_error(1);
                         }
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(1);
+                    exit_after_error(1);
                 }
             }
         }

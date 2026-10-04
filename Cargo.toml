@@ -35,7 +35,7 @@ rand = "0.10"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "metal", "webgpu", "wgsl"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tungstenite = { version = "0.30", features = ["native-tls"] }
