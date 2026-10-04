@@ -18,7 +18,7 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 
 - Operating systems: Windows x86_64 and Linux x86_64
 - NVIDIA: CUDA PTX `sm_120`
-- AMD and Intel: discrete GPUs through the portable T2 engine on Vulkan, selected automatically. Integrated GPUs mine only when chosen with `--device`. AMD HIP `gfx1036` remains available with `--backend hip`.
+- AMD and Intel: GPUs mine through the portable T2 engine on Vulkan, selected automatically. A discrete GPU always comes first; an integrated GPU is used automatically only when no discrete GPU is present, or when chosen with `--device`. AMD HIP `gfx1036` remains available with `--backend hip`.
 - Apple Silicon (Metal) and browser (WebGPU/WASM) builds: [portable build instructions](docs/portable.md).
 
 ## Quick start: mainnet TUI

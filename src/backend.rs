@@ -74,17 +74,14 @@ pub fn resolve_mining_device(
                     Some(index) => format!(
                         "no GPU device at backend-local ordinal {index}; run `pickaxe devices`"
                     ),
-                    None => NO_DISCRETE_GPU.into(),
+                    None => "no GPU device found; run `pickaxe devices`".into(),
                 },
             )
         }
     }
 }
 
-const NO_DISCRETE_GPU: &str =
-    "no discrete GPU found; integrated GPUs mine only when chosen with --device (run `pickaxe devices`)";
-
-/// Picks a device of one backend: the requested ordinal, or its first discrete GPU.
+/// Picks a device of one backend: the requested ordinal, or its preferred GPU.
 fn select_backend_device(
     devices: Vec<GpuDevice>,
     requested_index: Option<u32>,
@@ -92,28 +89,39 @@ fn select_backend_device(
 ) -> Result<GpuDevice, String> {
     match requested_index {
         Some(index) => find_device(devices, index, backend),
-        None => devices
-            .into_iter()
-            .find(allowed_without_device_choice)
-            .ok_or_else(|| NO_DISCRETE_GPU.into()),
+        None => prefer_discrete(devices).ok_or_else(|| {
+            format!(
+                "no {} GPU found; run `pickaxe devices`",
+                backend.as_str().to_ascii_uppercase()
+            )
+        }),
     }
 }
 
-/// Integrated GPUs need an explicit --device, except Apple Silicon's own GPU.
-fn allowed_without_device_choice(device: &GpuDevice) -> bool {
-    !device.integrated || cfg!(target_os = "macos")
+/// The first discrete GPU in priority order; an integrated GPU (such as an
+/// AMD APU or Apple Silicon) only when no discrete GPU is present.
+fn prefer_discrete(devices: impl IntoIterator<Item = GpuDevice>) -> Option<GpuDevice> {
+    let mut integrated = None;
+    for device in devices {
+        if !device.integrated {
+            return Some(device);
+        }
+        integrated.get_or_insert(device);
+    }
+    integrated
 }
 
 /// Chooses the preferred supported GPU automatically.
 // #### PR #22: discrete GPUs first, AMD and Intel on the T2 engine
 // What: without --device, auto takes the first discrete GPU from CUDA, then
 // the portable WGPU engine, then HIP; an explicit --backend also takes its
-// first discrete GPU. Integrated GPUs mine only when chosen with --device,
-// except Apple Silicon.
+// first discrete GPU. An integrated GPU is used automatically only when no
+// discrete GPU is present (AMD APU-only PCs, Apple Silicon); otherwise it
+// mines only when chosen with --device.
 // Why: native HIP has no T2 window search and ships code objects for one
 // chip (gfx1036, an integrated Radeon); the WGPU engine runs T2 on any
-// Vulkan GPU. Mining on an integrated GPU loads the CPU package, which most
-// operators do not want. NVIDIA still selects CUDA first.
+// Vulkan GPU. Mining on an integrated GPU loads the CPU package, which
+// operators with a discrete GPU do not want. NVIDIA still selects CUDA first.
 // Check: `pickaxe devices` on AMD-only and NVIDIA+integrated machines; HIP
 // stays available with `--backend hip --device N`.
 fn select_auto_device(
@@ -126,7 +134,7 @@ fn select_auto_device(
     match wanted {
         // An explicit ordinal is the operator's choice, integrated GPUs included.
         Some(index) => candidates.find(|device| device.index == index),
-        None => candidates.find(allowed_without_device_choice),
+        None => prefer_discrete(candidates),
     }
 }
 
@@ -669,29 +677,17 @@ mod tests {
         assert!(selected.integrated);
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn auto_selection_does_not_fall_back_to_an_integrated_gpu() {
+    fn auto_selection_uses_an_integrated_gpu_when_no_discrete_gpu_exists() {
         let selected = select_auto_device(
             Vec::new(),
             vec![integrated_fixture(0, "AMD", BackendKind::Hip)],
             vec![integrated_fixture(0, "AMD", BackendKind::Wgpu)],
             None,
-        );
-        assert!(selected.is_none());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn apple_silicon_auto_selects_its_integrated_gpu() {
-        let selected = select_auto_device(
-            Vec::new(),
-            Vec::new(),
-            vec![integrated_fixture(0, "Apple", BackendKind::Wgpu)],
-            None,
         )
         .unwrap();
         assert!(selected.integrated);
+        assert_eq!(selected.backend, BackendKind::Wgpu);
     }
 
     #[test]
@@ -706,8 +702,18 @@ mod tests {
 
     #[test]
     fn explicit_backend_and_device_can_select_an_integrated_gpu() {
-        let devices = vec![integrated_fixture(0, "AMD", BackendKind::Hip)];
+        let devices = vec![
+            integrated_fixture(0, "AMD", BackendKind::Hip),
+            fixture_device(1, "AMD", BackendKind::Hip),
+        ];
         let selected = select_backend_device(devices, Some(0), BackendKind::Hip).unwrap();
+        assert!(selected.integrated);
+    }
+
+    #[test]
+    fn explicit_backend_without_device_falls_back_to_a_lone_integrated_gpu() {
+        let devices = vec![integrated_fixture(0, "AMD", BackendKind::Hip)];
+        let selected = select_backend_device(devices, None, BackendKind::Hip).unwrap();
         assert!(selected.integrated);
     }
 

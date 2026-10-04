@@ -671,6 +671,20 @@ impl HipPhotonEngine {
         )?;
         let architecture = device_architecture(&api, device_ordinal)?;
         let directory = resolve_code_object_dir(&architecture)?;
+        // #### PR #22: native HIP stays off on Windows until its launch works
+        // What: refuse to start the HIP engine on Windows after the code-object
+        // check, before any module load or launch.
+        // Why: the only shipped target, gfx1036, loads its v5 code objects on
+        // the HIP 5.7 runtime in AMD's Windows driver, but the first launch
+        // never completes, so mining would hang instead of failing.
+        // Check: remove once a Windows gfx1036 benchmark completes; the default
+        // WGPU engine mines on the same GPU through Vulkan.
+        if cfg!(windows) {
+            return Err(format!(
+                "native HIP mining does not complete a launch on Windows yet ({architecture}); \
+                 use the default Vulkan engine (--backend wgpu)"
+            ));
+        }
         for name in HIP_CODE_OBJECT_NAMES {
             let path = directory.join(name);
             verify_code_object_architecture(&path, &architecture)?;
