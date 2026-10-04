@@ -86,11 +86,13 @@ Windows' two-second GPU timeout well before the 524,288-candidate maximum.
 
 With an empty driver cache the Radeon creates the engine in 7.1 s with the
 shared stages and 13.4 s with the original; the shared stages compile in
-about 5 s and the original 34k-line module is not parsed. Chrome on the same
-Radeon passes the browser engine check (6,256 candidates) in 24 s with the
-shared stages; the original stages failed there with a lost buffer mapping.
+about 5 s and the original 34k-line module is not parsed. The browser engine
+check (6,256 candidates) passes in Chrome with the shared stages on both GPUs:
+in 24 s on the Radeon and 37 s on the RTX 5070 Ti, mostly shader compilation.
+The original stages pass on the RTX 5070 Ti but failed on the Radeon with a
+lost buffer mapping.
 
 ## Not yet run on hardware
 
-Discrete AMD GPUs (both HIP builds), Intel GPUs, Linux GPUs, Apple Silicon
-execution and the browser miner on NVIDIA.
+Discrete AMD GPUs (both HIP builds), Intel GPUs, Linux GPUs and Apple Silicon
+execution.

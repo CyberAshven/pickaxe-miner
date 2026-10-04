@@ -154,7 +154,7 @@ the forced RFC6979 retry steps, complete signatures, transaction words for
 all 17 layouts and the target rule with independent oracles.
 `signing_stages_match_cpu_per_window` and the T2 and non-T2 end-to-end tests
 pass on NVIDIA and AMD (Vulkan); the browser engine check passes in Chrome on
-AMD (WebGPU). `PICKAXE_BUILD_SHARED_STAGES=debug` builds a development shader
+both (WebGPU). `PICKAXE_BUILD_SHARED_STAGES=debug` builds a development shader
 with an arithmetic entry point for `shared_stages_arithmetic_matches_integers`;
 it is never shipped. Measurements are in the
 [GPU code map](../../docs/gpu-sources.md).
