@@ -60,7 +60,6 @@ async function run() {
   let candidates = 0, wins = 0;
   const started = performance.now();
   const controls = new BrowserControls(started);
-  let lastRender = 0;
   let lastSnapshot = 0, feeChecked = 0, endpointIndex = 0;
   let fee = '';
   function connected(): Electrum { if (!session) throw new Error('Not connected'); return session; }
@@ -104,6 +103,15 @@ async function run() {
       else log('Previous work is stale; using the current baton.');
     }
   }
+  // #### PR #22: show recent completed work per wall second. Active-only GPU
+  // speed hides intensity pauses; a lifetime average reacts too slowly.
+  const render = (stopped = false) => {
+    const now = performance.now();
+    const rate = stopped ? 0 : controls.current_rate(now);
+    const average = now > started ? candidates / (now - started) / 1000 : 0;
+    $('stats').textContent = `Hashrate ${(rate / 1e6).toFixed(2)} MH/s · average ${average.toFixed(2)} MH/s\n${wins} accepted · ${Math.floor((now - started) / 1000)}s elapsed`;
+  };
+  const renderTimer = setInterval(render, 1000);
   try {
     address = validate_payout_address(network, address);
     $('address').value = address;
@@ -131,10 +139,6 @@ async function run() {
         const rest = controls.record(result.candidates, elapsed, now, Number($('intensity').value));
         // A driver may compile on first submission. Do not turn that startup wait into a long throttle delay.
         if (firstBatch) controls.reset(now);
-        if (now - lastRender >= 1000) {
-          $('stats').textContent = `Active GPU ${(controls.active_rate() / 1e6).toFixed(2)} MH/s · wall average ${(candidates / (now - started) / 1000).toFixed(2)} MH/s\n${wins} accepted · ${Math.floor((now - started) / 1000)}s elapsed`;
-          lastRender = now;
-        }
         if (isPendingReward(result) && (await snapshot()).context === result.context) {
           localStorage.setItem(journal, JSON.stringify(result));
           await settle(result);
@@ -152,6 +156,8 @@ async function run() {
     }
     status('Stopped');
   } finally {
+    clearInterval(renderTimer);
+    render(true);
     session?.close(); miner?.free(); controls.free();
     settings.forEach(input => { input.disabled = false; });
     $('start').disabled = false; $('stop').disabled = true;

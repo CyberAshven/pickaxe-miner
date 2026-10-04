@@ -57,7 +57,10 @@ for (const intensity of [10, 25, 50, 75, 100]) {
   }
   assert.ok(Math.abs(work / now - intensity / 100) < .02);
   assert.ok(Math.abs(controls.active_rate() - 1e9) < .001);
+  assert.ok(Math.abs(controls.current_rate(now) / 1e9 - intensity / 100) < .03);
+  assert.equal(controls.current_rate(now + 6000), 0);
   controls.reset(now + 10000);
+  assert.equal(controls.current_rate(now + 10000), 0);
   assert.ok(controls.record(1_000_000, 60, now + 10060, 50) >= 50);
   controls.free();
 }

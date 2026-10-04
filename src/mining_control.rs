@@ -115,6 +115,57 @@ pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
     Duration::from_nanos(u64::try_from(rest_ns).unwrap_or(u64::MAX))
 }
 
+/// Recent completed throughput, including throttling and network waits.
+// #### PR #22: the browser's primary rate must include intensity pauses and
+// network waits. Retain bounded recent completion samples, counted only once,
+// so moving the slider changes the displayed rate and an idle miner reaches zero.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) struct WallRate {
+    samples: VecDeque<(Duration, u64)>,
+    completed: u64,
+    last_completed: Duration,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl WallRate {
+    pub(crate) fn new(now: Duration) -> Self {
+        Self {
+            samples: VecDeque::from([(now, 0)]),
+            completed: 0,
+            last_completed: now,
+        }
+    }
+
+    pub(crate) fn record(&mut self, candidates: u32, now: Duration) {
+        self.completed += u64::from(candidates);
+        if candidates > 0 {
+            self.last_completed = now;
+        }
+        if now.saturating_sub(self.samples.back().unwrap().0) >= Duration::from_millis(250) {
+            self.samples.push_back((now, self.completed));
+        }
+        self.trim(now);
+    }
+
+    fn trim(&mut self, now: Duration) {
+        let cutoff = now.saturating_sub(Duration::from_secs(5));
+        while self.samples.len() > 1 && self.samples[1].0 <= cutoff {
+            self.samples.pop_front();
+        }
+    }
+
+    pub(crate) fn rate(&mut self, now: Duration) -> f64 {
+        self.trim(now);
+        let (start, completed) = *self.samples.front().unwrap();
+        let seconds = now.saturating_sub(start).as_secs_f64();
+        if seconds == 0.0 || now.saturating_sub(self.last_completed) >= Duration::from_secs(5) {
+            0.0
+        } else {
+            (self.completed - completed) as f64 / seconds
+        }
+    }
+}
+
 /// Time-weighted active throughput over eight completed time buckets.
 /// Batches are counted once; short batches cannot dominate by averaging rates.
 #[derive(Debug)]
@@ -174,6 +225,26 @@ impl ActiveRate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_rate_tracks_live_intensity_and_becomes_zero_when_idle() {
+        let mut rate = WallRate::new(Duration::ZERO);
+        assert_eq!(rate.rate(Duration::ZERO), 0.0);
+        for tick in 1..=1000 {
+            rate.record(100, Duration::from_millis(tick * 10));
+        }
+        assert_eq!(rate.rate(Duration::from_secs(10)), 10_000.0);
+        for tick in 1..=300 {
+            rate.record(100, Duration::from_millis(10_000 + tick * 20));
+        }
+        assert_eq!(rate.rate(Duration::from_secs(16)), 5_000.0);
+        // Include a partial sample bucket before a long network/submission wait.
+        rate.record(100, Duration::from_millis(16_020));
+        assert_eq!(rate.rate(Duration::from_secs(22)), 0.0);
+        let mut fresh = WallRate::new(Duration::from_secs(30));
+        fresh.record(100, Duration::from_millis(30_100));
+        assert_eq!(fresh.rate(Duration::from_millis(30_100)), 1_000.0);
+    }
 
     #[test]
     fn portable_allocation_allows_growth_and_conserves_a_full_work_cycle() {

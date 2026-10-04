@@ -113,8 +113,12 @@ Browser intensity starts at 50 percent and can be changed in Advanced.
 Changes apply after the current batch without restarting, including when the
 same page runs in a headless browser. Turning off the display does not itself
 stop mining; operating-system sleep or browser suspension can stop execution.
-The shared duty pacer accounts for timer delays; active throughput is a
-time-weighted measurement, while wall average includes startup and network waits.
+The shared duty pacer accounts for timer delays. The browser's primary hashrate
+measures completed work over roughly five wall-clock seconds, including intensity
+pauses and network waits; it updates once per second and reaches zero when idle.
+Its session average also includes startup. Active-only GPU timing remains available
+to diagnostics, but is not the primary display because it hides intensity changes.
+Pause desktop mining while using the browser: both otherwise compete for the GPU.
 
 ## Validation and distribution
 

@@ -244,6 +244,7 @@ impl BrowserMiner {
 pub struct BrowserControls {
     pacer: crate::mining_control::DutyPacer,
     rate: crate::mining_control::ActiveRate,
+    wall_rate: crate::mining_control::WallRate,
 }
 
 fn milliseconds(value: f64) -> std::time::Duration {
@@ -260,6 +261,7 @@ impl BrowserControls {
     pub fn new(now_ms: f64) -> Self {
         Self {
             pacer: crate::mining_control::DutyPacer::new(milliseconds(now_ms)),
+            wall_rate: crate::mining_control::WallRate::new(milliseconds(now_ms)),
             rate: crate::mining_control::ActiveRate::with_bucket_duration(
                 std::time::Duration::from_secs(1),
             ),
@@ -267,10 +269,12 @@ impl BrowserControls {
     }
     pub fn reset(&mut self, now_ms: f64) {
         self.pacer.reset(milliseconds(now_ms));
+        self.wall_rate = crate::mining_control::WallRate::new(milliseconds(now_ms));
     }
     pub fn record(&mut self, candidates: u32, elapsed_ms: f64, now_ms: f64, intensity: u8) -> f64 {
         let elapsed = milliseconds(elapsed_ms);
         self.rate.record(candidates, elapsed);
+        self.wall_rate.record(candidates, milliseconds(now_ms));
         self.pacer
             .record_batch(intensity, elapsed, milliseconds(now_ms))
             .as_secs_f64()
@@ -278,5 +282,8 @@ impl BrowserControls {
     }
     pub fn active_rate(&self) -> f64 {
         self.rate.rate()
+    }
+    pub fn current_rate(&mut self, now_ms: f64) -> f64 {
+        self.wall_rate.rate(milliseconds(now_ms))
     }
 }
