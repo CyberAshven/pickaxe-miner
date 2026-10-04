@@ -26,8 +26,9 @@ def validate_code_object_header(
         raise RuntimeError(f"{label}: truncated or invalid ELF64 code-object header")
     if payload[4:7] != bytes((2, 1, 1)):
         raise RuntimeError(f"{label}: expected ELF64, little-endian, current ELF version")
-    if payload[7] != 64 or payload[8] not in (1, 2, 3, 4):
-        raise RuntimeError(f"{label}: expected AMDGPU/HSA code-object ABI V3 through V6")
+    # Code-object v6 (ABI 4) needs a newer HIP runtime than Windows drivers ship.
+    if payload[7] != 64 or payload[8] not in (1, 2, 3):
+        raise RuntimeError(f"{label}: expected AMDGPU/HSA code-object ABI V3 through V5")
 
     file_type, machine, version = struct.unpack_from("<HHI", payload, 16)
     if file_type != 3 or machine != 224 or version != 1:

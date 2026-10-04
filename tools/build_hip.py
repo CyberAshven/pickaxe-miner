@@ -127,8 +127,16 @@ def build(compiler: str, is_hipcc: bool, arch: str, output_dir: Path) -> None:
     for stem in SOURCES:
         source = ROOT / "hip" / f"{stem}.hip.cpp"
         output = output_dir / f"{stem}.hsaco"
+        # #### PR #22: AMD code objects load on Windows drivers
+        # What: pin code-object v5 instead of ROCm 7's default v6.
+        # Why: the HIP 5.7 runtime in current AMD Windows drivers rejects v6
+        # with HIP error 303 ("shared object initialization failed"); ROCm on
+        # Linux loads v5 as well.
+        # Check: verify_hip_artifacts.py rejects v6; a gfx1036 Windows
+        # benchmark must load all four code objects.
         common = [
             "-O3",
+            "-mcode-object-version=5",
             "-std=c++17",
             f"-ffile-prefix-map={ROOT}=.",
             f"-fdebug-prefix-map={ROOT}=.",

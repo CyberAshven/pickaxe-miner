@@ -184,7 +184,7 @@ class ArtifactTests(unittest.TestCase):
 
     def test_rejects_invalid_header_fields(self) -> None:
         cases = ({"elf_class": 1}, {"endian": 2}, {"ident_version": 0},
-                 {"osabi": 0}, {"abi": 0}, {"abi": 255},
+                 {"osabi": 0}, {"abi": 0}, {"abi": 4}, {"abi": 255},
                  {"file_type": 1}, {"file_type": 2}, {"machine": 62},
                  {"version": 0}, {"ehsize": 0})
         for case in cases:
