@@ -2,7 +2,8 @@
 
 The macOS Apple Silicon command-line miner and the browser WebGPU miner build
 from the same Rust crate as Windows and Linux. They share transaction layouts,
-protocol rules, signatures, independent winner checks, dynamic fee calculations
+protocol rules, signatures, intensity pacing, measured active rates, independent
+winner checks, dynamic fee calculations
 and the token's donation policy. The browser uses the same WGSL backend that
 the native portable build runs through Metal on macOS or Vulkan elsewhere.
 
@@ -16,7 +17,8 @@ promise CUDA T2 performance.
 
 ## Apple Silicon
 
-The **Portable builds** workflow creates a `pickaxe-miner-v0.0.3-macos-arm64.tar.gz`
+The **CI** workflow builds Windows, Linux, macOS and the browser from the same
+commit. Its reusable portable jobs create a `pickaxe-miner-v0.0.3-macos-arm64.tar.gz`
 archive on each pull request and master/dev update. Extract it, verify its
 checksum and source commit, then run:
 
@@ -51,7 +53,8 @@ cargo build --locked --release --no-default-features --features portable-wgpu
 ## Browser
 
 The same workflow creates `pickaxe-web-experimental.tar.gz`, a static bundle
-with the compiled Rust WASM, JavaScript bindings, page and verified GPU table.
+with the compiled Rust WASM, JavaScript compiled from the TypeScript interface,
+generated WASM bindings, page and verified GPU table.
 Anyone can host its `web/` directory over HTTPS. No Pickaxe-operated website,
 pool, account service or backend server is required. Browsers still download
 the application and its approximately 64 MiB lookup table.
@@ -88,15 +91,24 @@ Build the browser bundle (Rust, Python 3.11+, Clang and Node.js 24):
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install --locked wasm-bindgen-cli --version 0.2.128
+npm --prefix web ci --ignore-scripts
 python tools/build-browser.py
+npm --prefix web run check
 node --test web/rpc.test.mjs web/submission.test.mjs web/platform.test.mjs
 node web/smoke.mjs
 python -m http.server 8080 --bind 127.0.0.1 --directory dist/web
 ```
 
 Use the wasm-bindgen CLI version in `Cargo.lock`; the build script checks it.
-Windows also needs Clang on PATH. Browser JavaScript contains platform I/O
-and presentation, not a second implementation of the mining protocol.
+Windows also needs Clang on PATH. The browser interface uses strict TypeScript,
+including generated Rust WASM declarations. A type error fails the build and CI.
+It contains platform I/O and presentation; the mining protocol remains in Rust.
+Browser intensity starts at 50 percent and can be changed in Advanced.
+Changes apply after the current batch without restarting, including when the
+same page runs in a headless browser. Turning off the display does not itself
+stop mining; operating-system sleep or browser suspension can stop execution.
+The shared duty pacer accounts for timer delays; active throughput is a
+time-weighted measurement, while wall average includes startup and network waits.
 
 ## Validation and distribution
 

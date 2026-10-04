@@ -61,11 +61,18 @@ impl BrowserMiner {
         let policy = MiningToken::Photon.fee_policy(network);
         crate::donation::require_direct_reward_policy(policy.scheme).map_err(error)?;
         let payouts = policy.payouts(network, &address).map_err(error)?;
-        let engine =
-            WgpuPhotonEngine::new_async(0, 524_288, 8, (table, m29_table::M29TableSource::Cache))
-                .await
-                .map_err(error)?;
-        let quantum = u64::from(engine.recommended_batch_candidates()) * 64;
+        let engine = WgpuPhotonEngine::new_async(
+            0,
+            crate::wgpu_photon::WGPU_T2_MAX_BATCH,
+            8,
+            (table, m29_table::M29TableSource::Cache),
+        )
+        .await
+        .map_err(error)?;
+        // An allocation unit must accommodate the largest adaptive dispatch.
+        // Using the startup size here capped every batch at 65,536 candidates,
+        // so T2 spent most of its time submitting short signature/hash jobs.
+        let quantum = u64::from(crate::wgpu_photon::WGPU_T2_MAX_BATCH);
         let schedule =
             Schedule::new(policy.scheme, quantum, rand::rng().random()).map_err(error)?;
         let recipient = schedule.recipient();
@@ -188,6 +195,7 @@ impl BrowserMiner {
             .map_err(error)?;
             response["transaction"] = json!(hex::encode(&verified.transaction));
             response["txid"] = json!(reward::transaction_id(&verified.transaction));
+            response["tail_j"] = json!(winner.tail_j);
         }
         Ok(response.to_string())
     }
@@ -225,5 +233,47 @@ impl BrowserMiner {
         self.prepared = Some(prepared);
         self.nonce = 0;
         Ok(())
+    }
+}
+
+/// Browser clock adapter for the same pacing and rate measurement used by the TUI.
+#[wasm_bindgen]
+pub struct BrowserControls {
+    pacer: crate::mining_control::DutyPacer,
+    rate: crate::mining_control::ActiveRate,
+}
+
+fn milliseconds(value: f64) -> std::time::Duration {
+    if value.is_finite() && (0.0..=1e15).contains(&value) {
+        std::time::Duration::from_secs_f64(value / 1000.0)
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+#[wasm_bindgen]
+impl BrowserControls {
+    #[wasm_bindgen(constructor)]
+    pub fn new(now_ms: f64) -> Self {
+        Self {
+            pacer: crate::mining_control::DutyPacer::new(milliseconds(now_ms)),
+            rate: crate::mining_control::ActiveRate::with_bucket_duration(
+                std::time::Duration::from_secs(1),
+            ),
+        }
+    }
+    pub fn reset(&mut self, now_ms: f64) {
+        self.pacer.reset(milliseconds(now_ms));
+    }
+    pub fn record(&mut self, candidates: u32, elapsed_ms: f64, now_ms: f64, intensity: u8) -> f64 {
+        let elapsed = milliseconds(elapsed_ms);
+        self.rate.record(candidates, elapsed);
+        self.pacer
+            .record_batch(intensity, elapsed, milliseconds(now_ms))
+            .as_secs_f64()
+            * 1000.0
+    }
+    pub fn active_rate(&self) -> f64 {
+        self.rate.rate()
     }
 }

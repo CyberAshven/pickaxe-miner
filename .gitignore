@@ -19,3 +19,6 @@ __pycache__/
 
 
 /dist/
+
+/web/node_modules/
+/web/pkg/

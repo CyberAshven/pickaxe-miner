@@ -1,9 +1,10 @@
 // Exercise the actual generated WASM, without consuming a GPU or broadcasting.
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import init, { browser_config, BrowserMiner, validate_payout_address } from '../dist/web/pkg/pickaxe_miner.js';
+import { buildFile, buildModule } from './test-build.mjs';
+const { default: init, browser_config, BrowserMiner, BrowserControls, validate_payout_address } = await buildModule('pkg/pickaxe_miner.js');
 
-await init({ module_or_path: await readFile(new URL('../dist/web/pkg/pickaxe_miner_bg.wasm', import.meta.url)) });
+await init({ module_or_path: await readFile(buildFile('pkg/pickaxe_miner_bg.wasm')) });
 const main = JSON.parse(browser_config('mainnet'));
 const chip = JSON.parse(browser_config('chipnet'));
 const manifest = await readFile(new URL('../Cargo.toml', import.meta.url), 'utf8');
@@ -44,3 +45,20 @@ for (const [network, valid] of Object.entries(addresses)) {
   }
 }
 console.log(`Generated WASM configuration, 16 valid address forms and ${invalidCases} invalid startup cases passed.`);
+
+// Exercise the actual shared Rust pacing through WASM with coarse browser timers.
+for (const intensity of [10, 25, 50, 75, 100]) {
+  const controls = new BrowserControls(0);
+  let now = 0, work = 0;
+  while (now < 30000) {
+    now += 1; work++;
+    const rest = controls.record(1_000_000, 1, now, intensity);
+    if (rest > 0) now += Math.ceil(rest / 16) * 16;
+  }
+  assert.ok(Math.abs(work / now - intensity / 100) < .02);
+  assert.ok(Math.abs(controls.active_rate() - 1e9) < .001);
+  controls.reset(now + 10000);
+  assert.ok(controls.record(1_000_000, 60, now + 10060, 50) >= 50);
+  controls.free();
+}
+console.log('Shared Rust pacing and time-weighted rate passed through generated WASM.');

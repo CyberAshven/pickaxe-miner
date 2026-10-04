@@ -71,3 +71,5 @@ pub mod browser;
 pub mod fee;
 pub mod live_job;
 pub mod mining_job;
+
+mod mining_control;

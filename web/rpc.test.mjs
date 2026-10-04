@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Electrum } from './rpc.js';
+import { buildModule } from './test-build.mjs';
+const { Electrum } = await buildModule('rpc.js');
 
 test('WebSocket framing preserves notifications, matches IDs, and rejects server errors', async () => {
   const sent = [];

@@ -3,12 +3,16 @@ main { max-width: 48rem; margin: 3rem auto; padding: 0 1.2rem; }
 h1 { letter-spacing: -.04em; font-size: 2.5rem; margin-bottom: .2rem; }
 p { color: #b6c6cd; line-height: 1.6; }
 label { display: block; margin: 1rem 0; }
-input, select, button { font: inherit; padding: .7rem; border: 1px solid #667881; border-radius: .4rem; }
+input:not([type=range]), select, button { font: inherit; padding: .7rem; border: 1px solid #667881; border-radius: .4rem; }
 input:not([type=range]), select { box-sizing: border-box; width: 100%; margin-top: .4rem; background: #1c262c; color: inherit; }
-input[type=range] { width: 70%; vertical-align: middle; }
+.intensity-control { display: grid; grid-template-columns: auto minmax(0, 1fr) 4ch; align-items: center; gap: .75rem; margin: 1rem 0; }
+.intensity-control label { margin: 0; }
+input[type=range] { box-sizing: border-box; display: block; width: 100%; min-width: 0; margin: 0; padding: 0; border: 0; accent-color: #a7dfac; }
+.intensity-control output { text-align: right; font-variant-numeric: tabular-nums; }
 button { margin: 1rem .4rem 0 0; background: #a7dfac; color: #17251a; cursor: pointer; }
 button:disabled { opacity: .45; cursor: default; }
 :focus-visible { outline: 3px solid #e4c576; outline-offset: 3px; }
 summary { cursor: pointer; padding: .5rem 0; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+#stats { min-height: 3em; font-variant-numeric: tabular-nums; }
 #events { max-height: 15rem; overflow-y: auto; color: #b6c6cd; }

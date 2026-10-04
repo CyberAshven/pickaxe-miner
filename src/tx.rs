@@ -383,6 +383,28 @@ pub fn require_covenant_hash_preimage(
     Ok(())
 }
 
+/// Checks full-window eligibility shared by the CUDA and portable T2 engines.
+pub fn supports_t2_window(template: &[u8]) -> Result<bool, String> {
+    let shift = PhotonLayout::for_tx_len(template.len())?.shift();
+    if template[490 + shift] != 0xff || template[577 + shift] != 0xff {
+        return Ok(false);
+    }
+    let baton = u64::from_le_bytes(template[491 + shift..499 + shift].try_into().unwrap());
+    let reward = u64::from_le_bytes(template[578 + shift..586 + shift].try_into().unwrap());
+    let total = u128::from(baton) + u128::from(reward);
+    // CUDA's cached middle SHA schedule requires the high baton bytes to stay
+    // unchanged. Keep the same job eligibility across all accelerated engines.
+    let block_bytes = 512 - (491 + shift).min(512);
+    if block_bytes < 8
+        && baton
+            .checked_add(u64::from(u16::MAX))
+            .is_none_or(|last| last >> (8 * block_bytes) != baton >> (8 * block_bytes))
+    {
+        return Ok(false);
+    }
+    Ok(t2_reward_amount(total, u128::from(reward), u16::MAX).is_ok())
+}
+
 /// Moves `j` tokens from the reward back to the baton while preserving the
 /// covenant's fixed nine-byte CompactSize amount serialization.
 pub fn t2_reward_amount(

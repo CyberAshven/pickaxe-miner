@@ -16,7 +16,11 @@
     <label>Payout address <input id="address" required autocomplete="off" spellcheck="false"></label>
     <details><summary>Advanced</summary>
       <label>Fulcrum servers <input id="endpoints" placeholder="Automatic — wss://server1, wss://server2" spellcheck="false"></label>
-      <label>Intensity <input id="intensity" type="range" min="10" max="100" step="5" value="100"><output id="intensityLabel">100%</output></label>
+      <div class="intensity-control">
+        <label for="intensity">Intensity</label>
+        <input id="intensity" type="range" min="10" max="100" step="5" value="50">
+        <output id="intensityLabel" for="intensity">50%</output>
+      </div>
     </details>
     <button id="start" type="submit">Start mining</button>
     <button id="stop" type="button" disabled>Stop</button>

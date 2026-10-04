@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveSubmission } from './submission.js';
+import { buildModule } from './test-build.mjs';
+const { resolveSubmission } = await buildModule('submission.js');
 
 const pending = { txid: 'ab'.repeat(32), transaction: '01020304', baton: `${'cd'.repeat(32)}:0`, context: 'original' };
 const defaults = { pending, stopped: () => false, wait: async () => {}, progress() {} };

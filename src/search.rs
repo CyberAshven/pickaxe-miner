@@ -38,7 +38,7 @@ pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 262_144;
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 565_248;
 #[cfg(feature = "tail-grind")]
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 65_536;
-const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 524_288;
+const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 16_777_216;
 /// Throttled batches are a quarter of the full batch: small enough for
 /// fine duty pacing, large enough to keep the GPU busy during a burst.
 const THROTTLED_BATCH_DIVISOR: u32 = 4;
@@ -213,7 +213,7 @@ pub struct SearchStats {
     pub rate: f64,
     pub current_rate: f64,
     pub peak_rate: f64,
-    /// Throughput of the last completed GPU batch, excluding host verification.
+    /// Time-weighted throughput of recent GPU batches, excluding host verification.
     /// Retained while settlement pauses GPU work.
     pub active_rate: f64,
     pub winners: u64,
@@ -325,100 +325,37 @@ impl NonceSweep {
     }
 }
 
-/// How much busy/wall history the duty pacer keeps before halving it.
-const DUTY_WINDOW: Duration = Duration::from_secs(2);
-/// Throttled work runs as one burst then one rest per period of this length.
-const DUTY_PERIOD: Duration = Duration::from_millis(100);
-
-/// Paces throttled GPU batches to the requested duty cycle.
-///
-/// Sleeps round up to the OS timer tick (about 15.6 ms on Windows), so a
-/// per-batch rest of a fraction of a millisecond becomes a 15 ms stall and
-/// every intensity below 100 collapses to the same low rate. The pacer
-/// instead accounts GPU-busy time against wall time and asks for rest only
-/// while busy time is ahead of the requested share; an oversleep is repaid
-/// by running the following batches back to back. Rest is taken in whole
-/// periods (25% runs about 25 ms, then rests about 75 ms), so the GPU works
-/// at full clocks instead of idling between tiny bursts.
+// Keep the native clock adapter small; the browser uses the same pacing core.
 #[derive(Debug, Clone)]
 pub(crate) struct DutyPacer {
-    intensity: u8,
-    window_start: Instant,
-    busy: Duration,
+    origin: Instant,
+    core: crate::mining_control::DutyPacer,
 }
-
 impl DutyPacer {
-    /// Starts an empty pacing window.
     pub(crate) fn new(now: Instant) -> Self {
         Self {
-            intensity: 100,
-            window_start: now,
-            busy: Duration::ZERO,
+            origin: now,
+            core: crate::mining_control::DutyPacer::new(Duration::ZERO),
         }
     }
-
-    /// Forgets pacing history, e.g. after a pause, so idle time is not
-    /// spent later as a full-speed burst.
     pub(crate) fn reset(&mut self, now: Instant) {
-        self.window_start = now;
-        self.busy = Duration::ZERO;
+        self.core.reset(now.saturating_duration_since(self.origin));
     }
-
-    /// Records one finished batch and returns how long to rest before the
-    /// next one.
     pub(crate) fn record_batch(
         &mut self,
         intensity: u8,
-        compute_time: Duration,
+        compute: Duration,
         now: Instant,
     ) -> Duration {
-        let intensity = intensity.clamp(10, 100);
-        if intensity != self.intensity {
-            self.intensity = intensity;
-            self.window_start = now.checked_sub(compute_time).unwrap_or(now);
-            self.busy = Duration::ZERO;
-        }
-        if intensity >= 100 {
-            self.reset(now);
-            return Duration::ZERO;
-        }
-        self.busy = self.busy.saturating_add(compute_time);
-        let elapsed = now.saturating_duration_since(self.window_start);
-        let required = self.busy.saturating_add(duty_rest(self.busy, intensity));
-        let rest = required.saturating_sub(elapsed);
-        if elapsed >= DUTY_WINDOW {
-            // Halve the history: the ratio is kept, old surplus or debt fades.
-            self.busy /= 2;
-            self.window_start = now.checked_sub(elapsed / 2).unwrap_or(now);
-        }
-        // Rest only in whole-period chunks. Short bursts between short rests
-        // keep the GPU in a low clock state and cost throughput per busy ms.
-        if rest < duty_rest_quantum(intensity) {
-            return Duration::ZERO;
-        }
-        rest
+        self.core.record_batch(
+            intensity,
+            compute,
+            now.saturating_duration_since(self.origin),
+        )
     }
 }
-
-/// Idle part of one pacing period at the given intensity.
-fn duty_rest_quantum(intensity: u8) -> Duration {
-    DUTY_PERIOD * u32::from(100 - intensity.clamp(10, 100)) / 100
-}
-
-/// Calculates the pause needed to honor GPU intensity.
-pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
-    let intensity = intensity.clamp(10, 100);
-    if intensity >= 100 || compute_time.is_zero() {
-        return Duration::ZERO;
-    }
-    // Occupancy is intensity/100. A fixed short cap leaves 10% nearly as busy
-    // as a full batch and collapses the 100%-to-10% candidate ratio.
-    let rest_ns = compute_time
-        .as_nanos()
-        .saturating_mul(u128::from(100 - intensity))
-        / u128::from(intensity);
-    Duration::from_nanos(u64::try_from(rest_ns).unwrap_or(u64::MAX))
-}
+#[cfg(test)]
+use crate::mining_control::duty_rest;
 
 // #### PR #11: winner delivery never blocks ####
 // What: the GPU worker hands host-verified winners to the supervisor through
@@ -467,6 +404,7 @@ struct WorkerDiagnostics {
     job_exhausted: AtomicBool,
     key_rotations: AtomicU64,
     active_rate_bits: AtomicU64,
+    active_rate: Mutex<crate::mining_control::ActiveRate>,
     work_candidates: [AtomicU64; 3],
 }
 
@@ -478,13 +416,18 @@ impl WorkerDiagnostics {
             job_exhausted: AtomicBool::new(false),
             key_rotations: AtomicU64::new(0),
             active_rate_bits: AtomicU64::new(0),
+            active_rate: Mutex::new(crate::mining_control::ActiveRate::default()),
             work_candidates: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
     fn record_active_batch(&self, candidates: u32, elapsed: Duration) {
         if candidates != 0 {
-            let rate = f64::from(candidates) / elapsed.as_secs_f64().max(1e-9);
+            let rate = self
+                .active_rate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record(candidates, elapsed);
             self.active_rate_bits
                 .store(rate.to_bits(), Ordering::Relaxed);
         }

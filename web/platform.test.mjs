@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MiningError, searchBatch, unsupportedReason } from './platform.js';
+import { buildModule } from './test-build.mjs';
+const { MiningError, searchBatch, unsupportedReason } = await buildModule('platform.js');
 
 const supported = () => ({ isSecureContext: true, navigator: { gpu: {}, locks: { request() {} } }, WebAssembly: {} });
 
@@ -34,4 +35,12 @@ test('failed GPU searches and malformed engine responses are fatal mining errors
   await assert.rejects(searchBatch({ async search() { return 'invalid JSON'; } }), MiningError);
   const result = { candidates: 1024, context: 'job', baton: 'outpoint' };
   assert.deepEqual(await searchBatch({ async search() { return JSON.stringify(result); } }), result);
+});
+
+test('typed mining boundary rejects malformed successful responses', async () => {
+  for (const result of [null, {}, { candidates: '100', context: 'job', baton: 'point' },
+    { candidates: -1, context: 'job', baton: 'point' }, { candidates: 1.5, context: 'job', baton: 'point' },
+    { candidates: 100, context: 'job', baton: 'point', transaction: '00' }]) {
+    await assert.rejects(searchBatch({ async search() { return JSON.stringify(result); } }), MiningError);
+  }
 });

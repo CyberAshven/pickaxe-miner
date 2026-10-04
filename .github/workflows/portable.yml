@@ -1,17 +1,15 @@
 name: Portable builds
 
 on:
-  push:
-    branches: [master, dev]
-  pull_request:
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Exact source revision shared with the calling build
+        required: true
+        type: string
 
 permissions:
   contents: read
-
-concurrency:
-  group: portable-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   apple-silicon:
@@ -21,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ inputs.source-ref }}
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component clippy
@@ -45,7 +44,7 @@ jobs:
           (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS.txt)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pickaxe-macos-arm64-${{ github.sha }}
+          name: pickaxe-macos-arm64-${{ inputs.source-ref }}
           path: |
             dist/*.tar.gz
             dist/SHA256SUMS.txt
@@ -58,6 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ inputs.source-ref }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -72,8 +72,10 @@ jobs:
       - name: Check browser engine and transport
         run: |
           cargo clippy --locked --lib --no-default-features --features portable-wgpu --target wasm32-unknown-unknown -- -D warnings
-          node --test web/rpc.test.mjs web/submission.test.mjs web/platform.test.mjs
+          npm --prefix web ci --ignore-scripts --no-audit --no-fund
           python3 tools/build-browser.py
+          npm --prefix web run check
+          npm --prefix web test
           node web/smoke.mjs
       - name: Package static browser application
         run: |
@@ -83,7 +85,7 @@ jobs:
           (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pickaxe-web-experimental-${{ github.sha }}
+          name: pickaxe-web-experimental-${{ inputs.source-ref }}
           path: |
             dist/*.tar.gz
             dist/SHA256SUMS.txt

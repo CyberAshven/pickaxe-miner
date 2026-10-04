@@ -1,0 +1,13 @@
+{
+  "name": "pickaxe-browser",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "tsc",
+    "test": "node --test rpc.test.mjs submission.test.mjs platform.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}

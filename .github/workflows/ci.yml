@@ -20,6 +20,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # #### PR #22
+  # Native and browser portability checks belong to the same commit-level CI.
+  # Packaging remains read-only; this call cannot create a tag or release.
+  portable:
+    name: Shared portable application
+    uses: ./.github/workflows/portable.yml
+    with:
+      source-ref: ${{ github.sha }}
+
   rust-ptx:
     name: Rust PTX ${{ matrix.arch }} (${{ matrix.backend }})
     runs-on: ubuntu-latest
