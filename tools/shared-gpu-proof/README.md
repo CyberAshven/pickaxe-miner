@@ -2,6 +2,12 @@
 
 #### PR #22
 
+The historical proof below has progressed to an integrated portable T2 filter:
+see [the filter report](filter/README.md) for measured performance, provenance
+checks and current limits. The production filter imports the native Rust
+hashing and layout files; signature/field/point migration remains unfinished.
+The original probe itself remains a separate offline test.
+
 This isolated, offline probe evaluates compiling the production SHA-256 hot
 path for CUDA and SPIR-V, then translating SPIR-V to WGSL and Metal source.
 It is not wired into the miner or release workflows. No keys, payout addresses,

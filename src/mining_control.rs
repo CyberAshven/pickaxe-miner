@@ -10,6 +10,21 @@ const DUTY_WINDOW: Duration = Duration::from_secs(2);
 /// Throttled work runs as one burst then one rest per period of this length.
 const DUTY_PERIOD: Duration = Duration::from_millis(100);
 
+// #### PR #22: share allocation capacity across both launchers. The portable
+// engine starts with a tiny adaptive batch; using it as the allocation unit
+// prevents later full batches. Preserve existing CUDA/HIP allocation cadence.
+pub(crate) const fn work_allocation_quantum(
+    backend: crate::backend_kind::BackendKind,
+    initial_batch: u32,
+) -> u64 {
+    match backend {
+        crate::backend_kind::BackendKind::Wgpu => {
+            crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES as u64
+        }
+        _ => initial_batch as u64 * 64,
+    }
+}
+
 /// Paces throttled GPU batches to the requested duty cycle.
 ///
 /// Sleeps round up to the OS timer tick (about 15.6 ms on Windows), so a
@@ -159,6 +174,39 @@ impl ActiveRate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_allocation_allows_growth_and_conserves_a_full_work_cycle() {
+        use crate::backend_kind::BackendKind;
+        use crate::donation::{Schedule, Scheme};
+        let quantum = work_allocation_quantum(BackendKind::Wgpu, 1024);
+        let mut schedule = Schedule::new(Scheme::Work([200, 200]), quantum, 0).unwrap();
+        let mut requested = 1024u32;
+        let mut remaining = quantum * 50;
+        let mut largest = 0;
+        let mut completed = [0u64; 3];
+        while remaining > 0 {
+            let count = schedule.limit_batch(requested).min(remaining as u32);
+            assert!(count > 0);
+            completed[schedule.recipient() as usize] += u64::from(count);
+            largest = largest.max(count);
+            schedule.record(count).unwrap();
+            remaining -= u64::from(count);
+            requested = requested
+                .saturating_mul(2)
+                .min(crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES);
+        }
+        assert_eq!(largest, crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES);
+        assert_eq!(completed, [quantum * 48, quantum, quantum]);
+        assert_eq!(
+            work_allocation_quantum(BackendKind::Cuda, 16_777_216),
+            16_777_216 * 64
+        );
+        assert_eq!(
+            work_allocation_quantum(BackendKind::Hip, 65_536),
+            65_536 * 64
+        );
+    }
     #[test]
     fn rates_weight_work_by_time_and_forget_old_speed() {
         let mut rate = ActiveRate::default();

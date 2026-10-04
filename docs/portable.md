@@ -125,6 +125,14 @@ validated without a GPU in the Rust suite. Hardware checks are deliberately
 separate from those compile checks. Apple Silicon passes the ARM64 build and
 CPU checks in CI; live mining on a physical Mac has not yet been tested.
 
+The portable T2 filter is compiled directly from the native Rust hashing and
+layout files. Generated shaders are checked by Cargo against their source
+manifest and regenerated in CI, so a native source change cannot silently leave
+the browser's hot path stale. Developers update them with
+`python tools/shared-gpu-proof/sync_filter.py --write`. GPU signature and field
+arithmetic still use the established portable implementation; their migration
+to the native source remains separate work.
+
 This workflow does not create tags or publish releases. Package version remains
 0.0.3. The Mac archive can be attached to the existing release after merge;
 tested Windows/Linux downloads do not need replacement for this change.

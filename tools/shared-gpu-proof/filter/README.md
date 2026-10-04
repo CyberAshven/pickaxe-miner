@@ -1,16 +1,82 @@
-# Shared Rust T2 filter experiment
+# Shared Rust T2 filter
 
 #### PR #22
 
-This is an archived, opt-in compiler/performance experiment based on PR head
-`57bf702fea7d64c61599a79bb8f4e3e454c441e7`. It is not selected by the
-production browser or native miner. Complete GPU signature/math sharing is
-not implemented by this experiment.
+Portable builds import the production Rust hashing and transaction-layout
+source. CUDA retains its existing compiler and instructions. The original
+V3/V4 experiments below were archived at `ff26949`; the subsequent larger-batch
+comparison is recorded separately below. Complete GPU signature/field/point
+source sharing is still unfinished.
 
 The portable filter imports the production `rust-engine/src/sha256.rs` and
 `t2_block.rs`. Seventeen thin entry points adapt workgroups, storage, atomics
 and winner output for SPIR-V. Naga generates WGSL and Metal. The existing
 portable signature pipeline remains unchanged.
+
+## Build without source drift
+
+`reference/shared-t2` contains generated compiler output, not another maintained
+implementation. Every portable Cargo build verifies the SHA-256 manifest of
+its source and artifacts. After editing shared Rust, regenerate it with:
+
+```powershell
+python tools/shared-gpu-proof/sync_filter.py --write
+```
+
+CI runs this command without `--write`: it recompiles with the pinned Rust-GPU
+and Naga versions and rejects differences. It also compiles the generated
+Metal sources and executes the production filter's independent transaction and
+signature checks on software Vulkan. An ordinary portable application build
+uses the checked generated files and does not need Rust-GPU installed locally.
+
+## Larger bounded batches
+
+The portable capacity is shared by the browser and native launcher at
+33,554,432 candidates. The elapsed-time ladder still starts at 1,024 and
+reduces slow dispatches; a signature still covers 65,536 amount pairs.
+The native portable allocation schedule now uses this capacity instead of
+capping adaptive batches by the tiny startup size. CUDA scheduling is unchanged.
+
+Brave/NVIDIA comparisons used actual browser WASM, 20-second warmups and
+45-second trials in B/S, S/B, B/S order. Completed candidates are counted once.
+The existing 16M browser averaged 841.409 MH/s; shared Rust at 32M averaged
+972.859 MH/s. The three pair differences were +14.95%, +18.47% and +13.56%.
+These are local offline measurements, not a 1.6 GH/s result or a universal claim.
+
+At the same 32M batch size, the previous filter measured 950.164, 952.893 and
+952.385 MH/s; shared Rust measured 959.650, 953.645 and 949.729 MH/s.
+The filters are within measurement noise. Batching supplies the clear gain;
+the shared filter alone is not claimed to be faster. Raw counts, elapsed times
+and tested WASM hashes are in `batch32-measurements.json`.
+
+Chrome/AMD RDNA 2 used the actual adaptive browser pipeline, with 10-second
+warmups and 30-second B/S, S/B, B/S trials. Baseline rates were 30.155,
+30.444 and 30.802 MH/s; shared rates were 31.012, 31.278 and 31.364 MH/s.
+All three pairs improved (approximately +2.5% on their means). Cold shader
+compilation was excluded. Raw trials are in `amd-batch32-measurements.json`.
+This is not a comparison against AMD HIP or a claim about untested AMD cards.
+
+The larger dispatch passed on both NVIDIA and AMD: 33,554,319 candidates
+matched serial chunks and all 549 returned winners passed independent CPU
+reconstruction. Both GPUs also passed the 6,256 boundary/key/job tests. Five
+actual browser-generated synthetic rewards passed BCH 2026 standard and
+consensus VM checks, and a full compiled recipient-work cycle passed. These
+are offline proofs, not additional mainnet wins.
+
+The integrated production WASM is
+`4f78967a77b3369f173ad677a48f6c377044aeb17ad02e9274f8ca952eff3a8d`.
+It passed the same 6,256 checks on each GPU, a full browser work cycle and five
+independent browser reward VM samples after using the common allocation helper.
+The host suite passed 297 library and 16 binary tests, with GPU cases excluded
+from those counts; GPU tests ran separately and serially. Strict Clippy,
+TypeScript, ten browser transport/submission tests and three release-channel
+tests passed. A deliberately changed generated shader was rejected by Cargo;
+the original was restored and the build passed again.
+
+The local proof harness now warms until a sufficiently large batch completes.
+Its previous elapsed-only warmup could end after a cold first shader compilation
+and then demand a winner from only a few thousand candidates. That was a test
+assumption failure, not evidence of an invalid mining result.
 
 ## Correctness
 
@@ -64,7 +130,7 @@ the same complete portable pipeline; both variants used the candidate host
 adapter, including its extra control upload. It is not a HIP comparison or an
 Apple performance result. No default backend changed.
 
-## Reproduce the opt-in experiment
+## Reproduce the archived experiment
 
 Compile the generated files before enabling the candidate feature:
 
@@ -75,10 +141,10 @@ Remove-Item Env:PICKAXE_BUILD_SHARED_FILTER
 cargo test --locked --release --lib --no-default-features --features shared-rust-t2 --no-run
 ```
 
-The builder checks that all 17 entry points exist and validates generated
+The archived builder checks that all 17 entry points exist and validates generated
 SPIR-V through Naga. It writes ignored files under `artifacts/shared-gpu-proof/filter`.
-This archived prototype intentionally requires that explicit generation step;
-automatic CI generation and drift checks are required before production integration.
+That prototype required explicit generation. The integrated build above adds
+the generation and drift checks; use its command for the current source.
 
 With mining stopped, run the ignored `wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations`
 and `t2_gpu_large_dispatch_matches_serial_and_cpu` tests serially. Adapter ordinals
@@ -90,7 +156,7 @@ browser result with native Vulkan as a matched pair.
 No Apple hardware was available. Successful source translation or Mac compilation
 must not be described as live Apple GPU mining or a performance result.
 
-## Final one-upload adapter (V4)
+## Archived one-upload adapter (V4)
 
 Same 45-second browser trials, 20-second warmups and balanced B/S, S/B, B/S order:
 

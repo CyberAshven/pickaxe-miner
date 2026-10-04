@@ -16,9 +16,9 @@ tail-grind = []
 rust-t2 = ["tail-grind"]
 # GPU V-coordinate diagnostic only; live mining keeps the reward at 700 sats.
 tail-value-grind = ["tail-grind"]
-portable-wgpu = ["dep:pollster", "dep:wgpu"]
-# Offline candidate; promotion requires independent GPU and speed gates.
-shared-rust-t2 = ["portable-wgpu"]
+portable-wgpu = ["dep:pollster", "dep:wgpu", "shared-rust-t2"]
+# Internal compiler selection: portable builds import the native Rust hot path.
+shared-rust-t2 = []
 
 [dependencies]
 sha2 = "0.11"
@@ -56,3 +56,6 @@ js-sys = "0.3"
 
 [dev-dependencies]
 naga = { version = "30.0.0", features = ["wgsl-in"] }
+
+[build-dependencies]
+sha2 = "0.11"

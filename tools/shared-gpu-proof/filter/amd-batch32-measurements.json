@@ -1,0 +1,58 @@
+{
+  "device": "AMD Radeon integrated graphics (RDNA 2)",
+  "browser": "Chrome WebGPU",
+  "conditions": "Adaptive production BrowserMiner; serial GPU ownership; B/S S/B B/S; 10 second warmups and 30 second trials; first cold shader compilation excluded",
+  "baseline_wasm_sha256": "434a9966e8c096e42c7f6992c136bbb75a1bf45e8f69c27144cd9d3b24d0ca78",
+  "candidate_wasm_sha256": "af3020084fde61428f2f90ac33a14d47113bf9d5f453e8e438e495222ed610f3",
+  "trials": [
+    {
+      "variant": "baseline",
+      "round": 1,
+      "candidates": 909345126,
+      "seconds": 30.156,
+      "mh_s": 30.154699761241545,
+      "batches": 122
+    },
+    {
+      "variant": "shared",
+      "round": 1,
+      "candidates": 937310617,
+      "seconds": 30.224599999904633,
+      "mh_s": 31.011514362570804,
+      "batches": 124
+    },
+    {
+      "variant": "shared",
+      "round": 2,
+      "candidates": 939524096,
+      "seconds": 30.038,
+      "mh_s": 31.277851255076904,
+      "batches": 112
+    },
+    {
+      "variant": "baseline",
+      "round": 2,
+      "candidates": 914358272,
+      "seconds": 30.034300000071525,
+      "mh_s": 30.443801653370397,
+      "batches": 109
+    },
+    {
+      "variant": "baseline",
+      "round": 3,
+      "candidates": 931135488,
+      "seconds": 30.230100000023842,
+      "mh_s": 30.801601317867476,
+      "batches": 111
+    },
+    {
+      "variant": "shared",
+      "round": 3,
+      "candidates": 947912704,
+      "seconds": 30.222899999976157,
+      "mh_s": 31.364055203198497,
+      "batches": 113
+    }
+  ],
+  "errors": []
+}

@@ -1,5 +1,9 @@
 //! Bounded candidate results shared by GPU backends.
 
+// #### PR #22: one portable capacity for the browser and native launchers.
+// Adaptive dispatches start small; work allocation must allow their full size.
+pub(crate) const PORTABLE_MAX_BATCH_CANDIDATES: u32 = 33_554_432;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotonCudaWinner {
     pub nonce: u32,

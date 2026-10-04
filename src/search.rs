@@ -38,7 +38,7 @@ pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 262_144;
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 565_248;
 #[cfg(feature = "tail-grind")]
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 65_536;
-const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 16_777_216;
+const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES;
 /// Throttled batches are a quarter of the full batch: small enough for
 /// fine duty pacing, large enough to keep the GPU busy during a burst.
 const THROTTLED_BATCH_DIVISOR: u32 = 4;
@@ -519,7 +519,16 @@ fn run_worker(
 ) {
     let t2_coordinate = cfg!(feature = "tail-grind") && matches!(&engine, PhotonEngine::Cuda(_));
     let mut rng = rand::rng();
-    let quantum = u64::from(engine.scheduled_batch_candidates(100)) * 64;
+    let backend = match &engine {
+        PhotonEngine::Cuda(_) => BackendKind::Cuda,
+        PhotonEngine::Hip(_) => BackendKind::Hip,
+        #[cfg(feature = "portable-wgpu")]
+        PhotonEngine::Wgpu(_) => BackendKind::Wgpu,
+    };
+    let quantum = crate::mining_control::work_allocation_quantum(
+        backend,
+        engine.scheduled_batch_candidates(100),
+    );
     let allocation = work_fee
         .map(|policy| {
             let schedule = crate::donation::Schedule::new(policy.scheme, quantum, rng.random())?;

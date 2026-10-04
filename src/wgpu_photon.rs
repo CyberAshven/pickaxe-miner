@@ -33,7 +33,10 @@ const WINNER_RECORD_WORDS: usize = 9;
 const WINNER_RECORD_BYTES: usize = WINNER_RECORD_WORDS * 4;
 const WGPU_MIN_LADDER_BATCH: u32 = 1_024;
 pub(crate) const WGPU_REFERENCE_MAX_BATCH: u32 = 524_288;
-pub(crate) const WGPU_T2_MAX_BATCH: u32 = 16_777_216;
+// #### PR #22: amortize the portable queue/readback handoff on fast devices.
+// The existing elapsed-time ladder still limits slower GPUs to shorter work.
+// CUDA geometry and the conserved 65,536-candidate signature window are unchanged.
+pub(crate) const WGPU_T2_MAX_BATCH: u32 = crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES;
 const WGPU_TARGET_BATCH: Duration = Duration::from_millis(350);
 const WGPU_ESCALATE_BATCH: Duration = Duration::from_millis(175);
 
@@ -457,8 +460,8 @@ fn create_bind_group(
     })
 }
 
-// #### PR #22: isolated shared-source filter candidate. Generated from the
-// pinned Rust-GPU compiler; no alternative signature or payout policy.
+// #### PR #22: import the native Rust hash/layout through the pinned compiler.
+// The provenance check and regeneration CI reject separately edited WGSL.
 #[cfg(feature = "shared-rust-t2")]
 fn create_shared_t2_filter(
     device: &wgpu::Device,
@@ -469,23 +472,23 @@ fn create_shared_t2_filter(
     winners: &wgpu::Buffer,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroup) {
     let source = match shift {
-        0 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_0.wgsl"),
-        1 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_1.wgsl"),
-        2 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_2.wgsl"),
-        3 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_3.wgsl"),
-        4 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_4.wgsl"),
-        5 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_5.wgsl"),
-        6 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_6.wgsl"),
-        7 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_7.wgsl"),
-        8 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_8.wgsl"),
-        9 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_9.wgsl"),
-        10 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_10.wgsl"),
-        11 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_11.wgsl"),
-        12 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_12.wgsl"),
-        13 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_13.wgsl"),
-        14 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_14.wgsl"),
-        15 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_15.wgsl"),
-        16 => include_str!("../artifacts/shared-gpu-proof/filter/pickaxe_shared_t2_16.wgsl"),
+        0 => include_str!("../reference/shared-t2/pickaxe_shared_t2_0.wgsl"),
+        1 => include_str!("../reference/shared-t2/pickaxe_shared_t2_1.wgsl"),
+        2 => include_str!("../reference/shared-t2/pickaxe_shared_t2_2.wgsl"),
+        3 => include_str!("../reference/shared-t2/pickaxe_shared_t2_3.wgsl"),
+        4 => include_str!("../reference/shared-t2/pickaxe_shared_t2_4.wgsl"),
+        5 => include_str!("../reference/shared-t2/pickaxe_shared_t2_5.wgsl"),
+        6 => include_str!("../reference/shared-t2/pickaxe_shared_t2_6.wgsl"),
+        7 => include_str!("../reference/shared-t2/pickaxe_shared_t2_7.wgsl"),
+        8 => include_str!("../reference/shared-t2/pickaxe_shared_t2_8.wgsl"),
+        9 => include_str!("../reference/shared-t2/pickaxe_shared_t2_9.wgsl"),
+        10 => include_str!("../reference/shared-t2/pickaxe_shared_t2_10.wgsl"),
+        11 => include_str!("../reference/shared-t2/pickaxe_shared_t2_11.wgsl"),
+        12 => include_str!("../reference/shared-t2/pickaxe_shared_t2_12.wgsl"),
+        13 => include_str!("../reference/shared-t2/pickaxe_shared_t2_13.wgsl"),
+        14 => include_str!("../reference/shared-t2/pickaxe_shared_t2_14.wgsl"),
+        15 => include_str!("../reference/shared-t2/pickaxe_shared_t2_15.wgsl"),
+        16 => include_str!("../reference/shared-t2/pickaxe_shared_t2_16.wgsl"),
         _ => unreachable!("Validated T2 layout"),
     };
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1609,7 +1612,7 @@ mod tests {
             PublicKey::from_secret_key(&SecretKey::from_secret_bytes(key).unwrap()).serialize();
         let mut target = [0xff; 32];
         target[31] = 0;
-        target[30] = 0x10;
+        target[30] = 0;
         let total = 2_100_000_000_000_000_000u128;
         let reward = 4_999_999_999_999u128;
         let template = tx::build_photon_template_bytes_for_deployment(
@@ -1634,7 +1637,9 @@ mod tests {
         engine.set_proof_rule(crate::protocol::ProofRule::Positive);
         engine.set_job(&template, &target, &key).unwrap();
         let base = 65500;
-        let count = 4_194_432;
+        // Exercise the full enlarged 2D grid, an unaligned first window and
+        // a partial final workgroup against many independent serial searches.
+        let count = WGPU_T2_MAX_BATCH - 113;
         let large = engine.search_batch(base, count).unwrap();
         assert!(!large.truncated());
         let mut serial = std::collections::BTreeMap::new();

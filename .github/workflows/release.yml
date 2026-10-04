@@ -37,6 +37,7 @@ on:
       - "web/**"
       - "tools/build-browser.py"
       - "tools/shared-gpu-proof/**"
+      - "reference/shared-t2/**"
       - "protocol/**"
       - "build.rs"
   workflow_dispatch:

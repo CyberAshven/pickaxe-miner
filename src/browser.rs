@@ -72,7 +72,10 @@ impl BrowserMiner {
         // An allocation unit must accommodate the largest adaptive dispatch.
         // Using the startup size here capped every batch at 65,536 candidates,
         // so T2 spent most of its time submitting short signature/hash jobs.
-        let quantum = u64::from(crate::wgpu_photon::WGPU_T2_MAX_BATCH);
+        let quantum = crate::mining_control::work_allocation_quantum(
+            crate::backend_kind::BackendKind::Wgpu,
+            engine.recommended_batch_candidates(),
+        );
         let schedule =
             Schedule::new(policy.scheme, quantum, rand::rng().random()).map_err(error)?;
         let recipient = schedule.recipient();

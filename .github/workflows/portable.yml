@@ -33,11 +33,15 @@ jobs:
         run: |
           cargo +stable test --locked --manifest-path tools/shared-gpu-proof/Cargo.toml --release -p pickaxe-shared-hash-proof --tests -- --nocapture
           cargo +nightly-2026-04-11 run --locked --manifest-path tools/shared-gpu-proof/Cargo.toml --release -p pickaxe-shared-hash-builder
+          # Rebuild the production filters from native Rust and reject drift.
+          python3 tools/shared-gpu-proof/sync_filter.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: pickaxe-shared-gpu-${{ inputs.source-ref }}
           path: |
             artifacts/shared-gpu-proof/shared-t2-hash.*
+            artifacts/shared-gpu-proof/filter/*.metal
+            artifacts/shared-gpu-proof/filter/*.spv
           if-no-files-found: error
 
   software-vulkan:
@@ -83,7 +87,11 @@ jobs:
           name: pickaxe-shared-gpu-${{ inputs.source-ref }}
           path: artifacts/shared-gpu-proof
       - name: Compile generated shared Rust shader with Apple Metal
-        run: xcrun -sdk macosx metal -c artifacts/shared-gpu-proof/shared-t2-hash.metal -o artifacts/shared-gpu-proof/shared-t2-hash.air
+        run: |
+          xcrun -sdk macosx metal -c artifacts/shared-gpu-proof/shared-t2-hash.metal -o artifacts/shared-gpu-proof/shared-t2-hash.air
+          for shader in artifacts/shared-gpu-proof/filter/*.metal; do
+            xcrun -sdk macosx metal -c "$shader" -o "${shader%.metal}.air"
+          done
       - name: Check shared application and Metal backend
         run: |
           rustup default stable
