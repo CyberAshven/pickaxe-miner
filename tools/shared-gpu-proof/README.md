@@ -83,8 +83,33 @@ The AMD fixture loader rejected sizes on its first attempt before dispatch;
 a fresh module load then passed. Four native arithmetic tests, the complete
 host fixture oracle, formatting and warnings-denied Clippy passed.
 
-Remaining: shared T2 transaction-block assembly, full-pipeline performance,
+Remaining: full-pipeline performance,
 GPU signatures, complete-target/winner integration, software Vulkan CI and
 Apple execution. Generated Metal source has not been compiled by Apple tooling
 or run on a Mac. Earlier interface shapes changed native PTX and were rejected.
 This probe is not selected by any production miner.
+
+## Shared transaction layout (2026-10-04)
+
+The native T2 block assembler now imports `rust-engine/src/t2_block.rs`.
+Its byte layout and padding have one definition, with native byte loads and
+portable packed-word/u32-pair primitives at the compiler boundary. The portable
+probe imports this exact file, rather than a translated copy of the layout.
+
+All 1,632 independently serialized assembly cases and 13,056 complete hash
+cases passed on both NVIDIA (Brave) and AMD (Chrome) WebGPU, serially with
+the native miner paused. Assembly covers all 17 shifts, carry/borrow cases,
+window endpoints, padding and an excess workgroup. The same CPU oracles,
+warnings-denied Clippy and formatting passed. Generated WGSL SHA-256:
+`f5ffc94c242e85d8fdf9f80b184fa8b08ec79a8ece14799d7485044e3ddb100f`.
+
+All 50 native kernels and the whole PTX remain byte-identical to the baseline
+hash above. Keeping the native closure while using a portable byte accessor
+preserved the register schedule. Direct bounds comparisons avoided private
+range objects in SPIR-V, reducing generated WGSL from 7.4 MB to 1.2 MB.
+Earlier interface variants that changed native PTX were rejected.
+
+Run both CPU oracles with `--tests` in place of `--test oracle` above. For GPU
+fixtures, `verifySharedHash({ assembly: true })` runs the layout oracle, and
+`verifySharedHash()` runs the hash oracle. Each call releases its GPU device.
+This is correctness evidence, not a portable mining performance result.

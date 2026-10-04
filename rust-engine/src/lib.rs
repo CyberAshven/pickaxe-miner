@@ -13,6 +13,7 @@ pub mod nonce;
 pub mod point;
 pub mod scalar;
 pub mod sha256;
+pub mod t2_block;
 #[cfg(all(target_os = "cuda", feature = "upstream-rust"))]
 mod upstream;
 
