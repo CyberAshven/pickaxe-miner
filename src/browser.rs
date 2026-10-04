@@ -5,9 +5,9 @@ use crate::live_job::{
     live_job_from_fulcrum_values_for_deployment, stable_fulcrum_tip_hash, LiveJob,
 };
 use crate::mining_job::{prepare_job, verify_gpu_winner, PreparedJob};
-use crate::{fee, m29_table, reward, wgpu_photon::WgpuPhotonEngine};
-use rand::Rng;
-use secp256k1::{PublicKey, SecretKey};
+use crate::{crypto, fee, m29_table, reward, wgpu_photon::WgpuPhotonEngine};
+use rand::RngExt;
+use secp256k1::PublicKey;
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
@@ -221,7 +221,7 @@ impl BrowserMiner {
             &self.payouts[self.recipient as usize],
             self.network,
         );
-        let key = SecretKey::new(&mut rand::rng());
+        let key = crypto::random_secret_key();
         self.key = key.to_secret_bytes();
         self.public_key = PublicKey::from_secret_key(&key).serialize();
         let prepared = prepare_job(job, &self.key, &self.public_key).map_err(error)?;

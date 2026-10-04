@@ -4,7 +4,6 @@
 
 use crate::backend::BackendKind;
 use crate::config::{MiningNetwork, MiningToken};
-#[cfg(test)]
 use crate::crypto;
 use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::hip_photon::HipPhotonEngine;
@@ -13,8 +12,8 @@ use crate::protocol::ProofRule;
 use crate::tx;
 #[cfg(feature = "portable-wgpu")]
 use crate::wgpu_photon::WgpuPhotonEngine;
-use rand::Rng;
-use secp256k1::{PublicKey, SecretKey};
+use rand::RngExt;
+use secp256k1::PublicKey;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -264,7 +263,7 @@ fn rotate_search_identity(
     engine: &mut PhotonEngine,
     job: &MiningJob,
 ) -> Result<(PreparedJob, [u8; 32], [u8; 33]), String> {
-    let secret = SecretKey::new(&mut rand::rng());
+    let secret = crypto::random_secret_key();
     let sk = secret.to_secret_bytes();
     let public_key = PublicKey::from_secret_key(&secret).serialize();
     let prepared = prepare_job(job.clone(), &sk, &public_key)?;
@@ -875,7 +874,7 @@ impl SearchHandle {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
         }
-        let secret = SecretKey::new(&mut rand::rng());
+        let secret = crypto::random_secret_key();
         let sk = secret.to_secret_bytes();
         let public_key = PublicKey::from_secret_key(&secret).serialize();
         let prepared = prepare_job(job, &sk, &public_key)?;
@@ -1122,6 +1121,7 @@ impl Drop for SearchHandle {
 mod tests {
     use super::*;
     use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
+    use secp256k1::SecretKey;
 
     #[test]
     fn search_batch_error_is_retained_and_stops_the_worker() {
