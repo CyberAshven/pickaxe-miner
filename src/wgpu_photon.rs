@@ -7,6 +7,7 @@
 
 use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
+use crate::tx::PhotonLayout;
 use secp256k1::SecretKey;
 use sha2::compress256;
 use sha2::digest::generic_array::GenericArray;
@@ -14,11 +15,19 @@ use std::borrow::Cow;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Length of the v0 reference transaction. A job's layout is `TX_BYTES + shift`.
 const TX_BYTES: usize = 615;
+/// Target offset in the v0 layout; a shifted layout adds its shift.
 const TARGET_OFFSET: usize = 394;
-const INPUT_WORDS: usize = 155;
+/// Widest layout shift (the live v3.2 contract at baton age 128 and later).
+/// 615 + 16 + 9 bytes of SHA-256 padding is exactly ten blocks.
+const MAX_LAYOUT_SHIFT: usize = PhotonLayout::MAX_SHIFT;
+/// Words reserved for the transaction template, enough for the widest layout.
+const TEMPLATE_WORDS: usize = (TX_BYTES + MAX_LAYOUT_SHIFT).div_ceil(4);
+/// Template words, then the nonce slot, then the layout shift.
+const INPUT_WORDS: usize = TEMPLATE_WORDS + 2;
 const INPUT_BYTES: usize = INPUT_WORDS * 4;
-const BASE_NONCE_OFFSET: u64 = 154 * 4;
+const BASE_NONCE_OFFSET: u64 = (TEMPLATE_WORDS * 4) as u64;
 const M38_RECORD_BYTES: usize = 160;
 const SIGNATURE_BYTES: usize = 64;
 const HASH_BYTES: usize = 32;
@@ -80,6 +89,78 @@ fn pickaxe_photon_c3_bounded_wg64(
 }
 "#;
 
+/// Layout-dependent byte positions in the reference shader, with how often
+/// each appears. Every occurrence becomes `(<literal> + input.layoutShift)` so
+/// one compiled shader serves every layout the job's age and contract produce.
+const SHADER_LAYOUT_LITERALS: [(&str, usize); 6] = [
+    ("390u", 2), // nonce
+    ("394u", 5), // target
+    ("426u", 2), // signature r
+    ("458u", 3), // signature s
+    ("490u", 1), // end of signature
+    ("615u", 2), // transaction length
+];
+
+/// The reference shader's input block, which the layout patch extends.
+const SHADER_INPUT_STRUCT: &str =
+    "struct SharedInput {\n    words: array<u32, 154>,\n    byteLength: u32,\n};";
+
+/// Replaces each standalone `literal` token and returns the new source and count.
+fn replace_standalone_literal(source: &str, literal: &str, replacement: &str) -> (String, usize) {
+    let bytes = source.as_bytes();
+    let is_token_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.';
+    let mut out = String::with_capacity(source.len());
+    let mut copied = 0;
+    let mut count = 0;
+    for (start, _) in source.match_indices(literal) {
+        let end = start + literal.len();
+        let standalone = (start == 0 || !is_token_byte(bytes[start - 1]))
+            && (end >= bytes.len() || !is_token_byte(bytes[end]));
+        if standalone {
+            out.push_str(&source[copied..start]);
+            out.push_str(replacement);
+            copied = end;
+            count += 1;
+        }
+    }
+    out.push_str(&source[copied..]);
+    (out, count)
+}
+
+/// Makes the reference shader's transaction layout a runtime input.
+///
+/// The reference file is hard-wired to the 615-byte v0 transaction. The live
+/// v3.2 contract is longer, and the baton age push adds more bytes, so every
+/// byte after it moves by a per-job shift. The in-memory copy reads that shift
+/// from the input block; the authoritative file stays exact.
+fn apply_layout_shift(mut source: String) -> Result<String, String> {
+    if source.matches(SHADER_INPUT_STRUCT).count() != 1 {
+        return Err("authoritative WGSL input block changed; layout patch needs review".into());
+    }
+    source = source.replace(
+        SHADER_INPUT_STRUCT,
+        &format!(
+            "struct SharedInput {{\n    words: array<u32, {TEMPLATE_WORDS}>,\n    byteLength: u32,\n    layoutShift: u32,\n}};"
+        ),
+    );
+    for (literal, expected) in SHADER_LAYOUT_LITERALS {
+        let replacement = format!("({literal} + input.layoutShift)");
+        let (patched, count) = replace_standalone_literal(&source, literal, &replacement);
+        if count != expected {
+            return Err(format!(
+                "authoritative WGSL uses {literal} {count} times, expected {expected}; layout patch needs review"
+            ));
+        }
+        source = patched;
+    }
+    Ok(source)
+}
+
+/// Returns the layout shift of a mining transaction template of `len` bytes.
+fn template_layout_shift(len: usize) -> Result<usize, String> {
+    PhotonLayout::for_tx_len(len).map(PhotonLayout::shift)
+}
+
 /// Constructs the reference WGSL shader for portable GPU search.
 fn reference_shader_source_for_wgpu() -> Result<String, String> {
     let mut source = include_str!("../reference/photon-miner.wgsl").replace("\r\n", "\n");
@@ -96,6 +177,7 @@ fn reference_shader_source_for_wgpu() -> Result<String, String> {
         .map(|offset| function_start + offset)
         .ok_or_else(|| "could not locate field_inv_binary closing brace".to_string())?;
     source.insert_str(function_close, "\n    return x1;");
+    let mut source = apply_layout_shift(source)?;
     source.push('\n');
     source.push_str(BOUNDED_C3_WGSL);
     Ok(source)
@@ -212,7 +294,7 @@ fn m27_precomputed_words(private_key: &[u8; 32]) -> [u32; 16] {
 }
 
 /// Builds the reusable PHOTON M30 message prefix.
-fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
+fn m30_prefix_words(template: &[u8]) -> [u32; 8] {
     let mut state = SHA256_IV;
     for block in template[..384].as_chunks::<64>().0 {
         compress_block(&mut state, block);
@@ -222,12 +304,16 @@ fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
 
 /// Checks GPU job material against authoritative PHOTON fields.
 fn validate_job_material(
-    template: &[u8; TX_BYTES],
+    template: &[u8],
     target: &[u8; 32],
     private_key: &[u8; 32],
 ) -> Result<(), String> {
-    if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
-        return Err("PHOTON WGPU target must match transaction template bytes 394..425".into());
+    let target_offset = TARGET_OFFSET + template_layout_shift(template.len())?;
+    if template[target_offset..target_offset + 32] != target[..] {
+        return Err(format!(
+            "PHOTON WGPU target must match transaction template bytes {target_offset}..{}",
+            target_offset + 31
+        ));
     }
     SecretKey::from_secret_bytes(*private_key)
         .map_err(|error| format!("invalid PHOTON WGPU signing key: {error}"))?;
@@ -657,14 +743,18 @@ impl WgpuPhotonEngine {
     /// Writes validated PHOTON job data to WGPU buffers.
     pub fn set_job(
         &mut self,
-        template: &[u8; TX_BYTES],
+        template: &[u8],
         target: &[u8; 32],
         private_key: &[u8; 32],
     ) -> Result<(), String> {
         validate_job_material(template, target, private_key)?;
+        let shift = template_layout_shift(template.len())?;
 
-        let mut input = pack_big_endian_words(template, 154);
+        // Template words, the nonce slot that search_batch overwrites, then the
+        // layout shift the shader adds to every byte position after the age push.
+        let mut input = pack_big_endian_words(template, TEMPLATE_WORDS);
         input.extend_from_slice(&0u32.to_le_bytes());
+        input.extend_from_slice(&(shift as u32).to_le_bytes());
         debug_assert_eq!(input.len(), INPUT_BYTES);
         let private_words = pack_big_endian_words(private_key, 8);
         let m27 = u32_words_to_le_bytes(&m27_precomputed_words(private_key));
@@ -978,6 +1068,113 @@ mod tests {
         assert!(BOUNDED_C3_WGSL.contains("atomicAdd(&benchmarkOutput.winners, 1u)"));
         assert!(BOUNDED_C3_WGSL.contains("atomicLoad(&benchmarkOutput.checksum)"));
         assert!(BOUNDED_C3_WGSL.contains("arrayLength(&pickaxeWinnerRecords) / 9u"));
+    }
+
+    #[test]
+    fn layout_shift_accepts_only_the_gpu_layouts() {
+        for (len, shift) in [
+            (615, 0),
+            (616, 1),
+            (618, 3),
+            (629, 14),
+            (630, 15),
+            (631, 16),
+        ] {
+            assert_eq!(template_layout_shift(len), Ok(shift), "length {len}");
+        }
+        for len in [0, 614, 619, 628, 632, 700] {
+            assert!(template_layout_shift(len).is_err(), "length {len}");
+        }
+    }
+
+    #[test]
+    fn replace_standalone_literal_respects_token_boundaries() {
+        let (out, count) = replace_standalone_literal(
+            "0x615da2b7u 615u x615u 615u1 a.615u (615u) 615u;",
+            "615u",
+            "N",
+        );
+        assert_eq!(count, 3);
+        assert_eq!(out, "0x615da2b7u N x615u 615u1 a.615u (N) N;");
+    }
+
+    #[test]
+    fn shader_layout_patch_covers_every_reference_literal() {
+        let source = reference_shader_source_for_wgpu().unwrap();
+        assert!(source.contains(&format!("words: array<u32, {TEMPLATE_WORDS}>,")));
+        assert!(source.contains("layoutShift: u32,"));
+        for (literal, expected) in SHADER_LAYOUT_LITERALS {
+            let patched = format!("({literal} + input.layoutShift)");
+            assert_eq!(source.matches(&patched).count(), expected, "{literal}");
+            let (_, standalone) = replace_standalone_literal(&source, literal, literal);
+            assert_eq!(standalone, expected, "{literal} left unpatched somewhere");
+        }
+    }
+
+    #[test]
+    fn patched_shader_still_parses_and_validates() {
+        let source = reference_shader_source_for_wgpu().unwrap();
+        let module = wgpu::naga::front::wgsl::parse_str(&source).expect("patched WGSL parses");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("patched WGSL validates");
+    }
+
+    /// Inserts `shift` bytes ahead of the nonce, as a longer age push or
+    /// redeem script does, so every later field moves by `shift`.
+    fn shifted_template_with_target(shift: usize, target: [u8; 32]) -> Vec<u8> {
+        let base = reference_template_with_target(target);
+        let mut template = Vec::with_capacity(TX_BYTES + shift);
+        template.extend_from_slice(&base[..100]);
+        template.extend((0..shift).map(|i| 0xa0u8.wrapping_add(i as u8)));
+        template.extend_from_slice(&base[100..]);
+        template
+    }
+
+    fn assert_reconstructs_shifted(
+        template: &[u8],
+        target: &[u8; 32],
+        private_key: &[u8; 32],
+        winner: &PhotonCudaWinner,
+    ) {
+        let layout = PhotonLayout::for_tx_len(template.len()).unwrap();
+        let message = tx::photon_message_sha256(winner.nonce, &hex::encode(target)).unwrap();
+        let signature = crypto::bch_schnorr_sign(private_key, &message).unwrap();
+        let mut completed = template.to_vec();
+        let nonce_at = layout.nonce_offset();
+        let signature_at = layout.signature_offset();
+        completed[nonce_at..nonce_at + 4].copy_from_slice(&winner.nonce.to_le_bytes());
+        completed[signature_at..signature_at + 64].copy_from_slice(&signature);
+        let expected = search::hash256(&completed);
+        assert_eq!(winner.digest, expected, "shift {}", layout.shift());
+        assert!(search::meets_target_le(&expected, target));
+    }
+
+    #[test]
+    fn every_gpu_layout_matches_host_hash256_if_wgpu_present() {
+        let target = [0xffu8; 32];
+        let mut private_key = [0u8; 32];
+        private_key[31] = 1;
+        let mut engine = match WgpuPhotonEngine::new(0, 128, 4) {
+            Ok(engine) => engine,
+            Err(error) if error.contains("no hardware WGPU adapter") => {
+                eprintln!("skip PHOTON WGPU hardware test: {error}");
+                return;
+            }
+            Err(error) => panic!("PHOTON WGPU init failed: {error}"),
+        };
+        for shift in [0usize, 1, 2, 3, 14, 15, 16] {
+            let template = shifted_template_with_target(shift, target);
+            engine.set_job(&template, &target, &private_key).unwrap();
+            let nonce = 0x1234_5678 + shift as u32;
+            let batch = engine.search_batch(nonce, 1).unwrap();
+            assert_eq!(batch.total_winners, 1, "shift {shift}");
+            assert_eq!(batch.winners[0].nonce, nonce);
+            assert_reconstructs_shifted(&template, &target, &private_key, &batch.winners[0]);
+        }
     }
 
     #[test]

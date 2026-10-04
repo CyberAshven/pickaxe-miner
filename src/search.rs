@@ -128,9 +128,7 @@ impl PhotonEngine {
                 engine.set_job(template, target, private_key)
             }
             #[cfg(feature = "portable-wgpu")]
-            Self::Wgpu(engine) => {
-                engine.set_job(base_layout_template(template, "wgpu")?, target, private_key)
-            }
+            Self::Wgpu(engine) => engine.set_job(template, target, private_key),
         }
     }
 
@@ -299,16 +297,6 @@ pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
             u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).map_err(|_| "invalid hex".to_string())?;
     }
     Ok(out)
-}
-
-/// Returns the 615-byte template the wgpu kernels are built for.
-fn base_layout_template<'a>(template: &'a [u8], backend: &str) -> Result<&'a [u8; 615], String> {
-    template.try_into().map_err(|_| {
-        format!(
-            "{backend} kernels support only the 615-byte PHOTON layout (baton age 0..=16); this job is {} bytes",
-            template.len()
-        )
-    })
 }
 
 /// Applies the covenant's proof-of-work rule to a little-endian digest.
@@ -1796,6 +1784,68 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "worker remained parked after live intensity change: {elapsed:?}"
         );
+    }
+
+    #[cfg(feature = "portable-wgpu")]
+    #[test]
+    fn wgpu_mines_real_v32_layouts_at_every_age_if_hardware_present() {
+        let sk = [1u8; 32];
+        let secret = SecretKey::from_secret_bytes(sk).unwrap();
+        let public_key = PublicKey::from_secret_key(&secret).serialize();
+        // About half of all hashes meet this positive target.
+        let target_hex = format!("{}7f", "ff".repeat(31));
+        let mut engine = match WgpuPhotonEngine::new(0, 128, 4) {
+            Ok(engine) => engine,
+            Err(error) if error.contains("no hardware WGPU adapter") => {
+                eprintln!("skip PHOTON WGPU hardware test: {error}");
+                return;
+            }
+            Err(error) => panic!("PHOTON WGPU init failed: {error}"),
+        };
+        for (age, bytes) in [
+            (0u32, 629usize),
+            (16, 629),
+            (17, 630),
+            (127, 630),
+            (128, 631),
+        ] {
+            let job = MiningJob {
+                height: 1,
+                baton_txid: "42a02ec4f58b50f23df4591dcc999ca1bcae2f378997fe6547ae124712000000"
+                    .into(),
+                baton_vout: 0,
+                baton_value_sats: 15_971_500,
+                relay_fee_sats_per_kb: 1_000,
+                age,
+                target_le_hex: target_hex.clone(),
+                token_amount: 2_099_905_002_035_715,
+                reward_raw: 4_999_773_813,
+                payout_address: "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh".into(),
+                generation_id: 1,
+                ..MiningJob::default()
+            };
+            let prepared = prepare_job(job, &sk, &public_key).unwrap();
+            assert_eq!(prepared.template.len(), bytes, "age {age}");
+            let layout = tx::PhotonLayout::for_tx_len(prepared.template.len()).unwrap();
+            engine
+                .set_job(&prepared.template, &prepared.target, &sk)
+                .unwrap();
+            let batch = engine.search_batch(0x0100_0000, 64).unwrap();
+            assert_eq!(batch.candidates, 64);
+            assert!(batch.total_winners > 0, "age {age}: no winner in 64 nonces");
+            for winner in &batch.winners {
+                let message = tx::photon_message_sha256(winner.nonce, &target_hex).unwrap();
+                let signature = crypto::bch_schnorr_sign(&sk, &message).unwrap();
+                let mut completed = prepared.template.clone();
+                let nonce_at = layout.nonce_offset();
+                let signature_at = layout.signature_offset();
+                completed[nonce_at..nonce_at + 4].copy_from_slice(&winner.nonce.to_le_bytes());
+                completed[signature_at..signature_at + 64].copy_from_slice(&signature);
+                let expected = hash256(&completed);
+                assert_eq!(winner.digest, expected, "age {age} nonce {}", winner.nonce);
+                assert!(meets_target_le(&expected, &prepared.target));
+            }
+        }
     }
 
     #[test]
