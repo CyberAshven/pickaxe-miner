@@ -18,56 +18,72 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-// #### PR #22: shared Rust signing stages for portable GPUs
-// What: stages A, B and C1 come from the shared Rust engine
-// (reference/shared-signer) by default; PICKAXE_WGPU_SIGNER=wgsl selects the
-// original PHOTON WGSL stages. Buffers and the later stages are shared.
-// Why: one signing source for every GPU. Measured per batch, signing takes
-// 0.9 ms instead of 3.4 ms on an RTX 5070 Ti Laptop GPU and 2.6 ms instead of
+// #### PR #22: shared Rust stages for portable GPUs
+// What: stages A, B and C1 (signing), T2 preparation, and the non-T2 C2 and C3
+// come from the shared Rust engine (reference/shared-stages) by default, like
+// the T2 filter (reference/shared-t2). PICKAXE_WGPU_STAGES=wgsl selects the
+// original hand-written WGSL stages. Both use the same buffers.
+// Why: one source for every GPU. Measured per batch, signing takes 0.9 ms
+// instead of 3.4 ms on an RTX 5070 Ti Laptop GPU and 2.6 ms instead of
 // 90 ms on the integrated Radeon gfx1036, and the stages compile in seconds.
-// Check: both signers pass the same GPU tests and CPU reconstruction.
+// Check: both sets pass the same GPU tests and CPU reconstruction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PortableSigner {
+pub enum PortableStages {
     Wgsl,
     #[default]
     Rust,
 }
 
-impl PortableSigner {
-    /// Parses PICKAXE_WGPU_SIGNER; unset or empty selects the shared Rust stages.
+/// Entry points of one stage set.
+struct StageEntries {
+    a: &'static str,
+    b: &'static [&'static str],
+    c1: &'static str,
+    t2_prepare: &'static str,
+    c2: &'static str,
+    c3: &'static str,
+}
+
+impl PortableStages {
+    /// Parses PICKAXE_WGPU_STAGES; unset or empty selects the shared Rust stages.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
             None | Some("") | Some("rust") => Ok(Self::Rust),
             Some("wgsl") => Ok(Self::Wgsl),
             Some(other) => Err(format!(
-                "PICKAXE_WGPU_SIGNER must be wgsl or rust, not {other:?}"
+                "PICKAXE_WGPU_STAGES must be wgsl or rust, not {other:?}"
             )),
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_env() -> Result<Self, String> {
-        Self::parse(std::env::var("PICKAXE_WGPU_SIGNER").ok().as_deref())
+        Self::parse(std::env::var("PICKAXE_WGPU_STAGES").ok().as_deref())
     }
 
-    /// Entry points of stage A, the stage B dispatches and stage C1.
-    fn entry_points(self) -> (&'static str, &'static [&'static str], &'static str) {
+    fn entry_points(self) -> StageEntries {
         match self {
-            Self::Wgsl => (
-                "photon_m38_stage_a_wg128",
-                &[
+            Self::Wgsl => StageEntries {
+                a: "photon_m38_stage_a_wg128",
+                b: &[
                     "photon_m45_b4a_wg32",
                     "photon_m45_b4b_wg32",
                     "photon_m45_b4c_wg32",
                     "photon_m45_b4d_wg32",
                 ],
-                "photon_m6729_c1_znorm_wg64",
-            ),
-            Self::Rust => (
-                "pickaxe_shared_stage_a",
-                &["pickaxe_shared_stage_b"],
-                "pickaxe_shared_c1_signature",
-            ),
+                c1: "photon_m6729_c1_znorm_wg64",
+                t2_prepare: "pickaxe_t2_prepare",
+                c2: "photon_m6725_c2_hash_only_wg64",
+                c3: "pickaxe_photon_c3_bounded_wg64",
+            },
+            Self::Rust => StageEntries {
+                a: "pickaxe_shared_stage_a",
+                b: &["pickaxe_shared_stage_b"],
+                c1: "pickaxe_shared_c1_signature",
+                t2_prepare: "pickaxe_shared_t2_prepare",
+                c2: "pickaxe_shared_c2_hash",
+                c3: "pickaxe_shared_c3_winners",
+            },
         }
     }
 }
@@ -79,8 +95,8 @@ const DEBUG_READABLE_STORAGE: wgpu::BufferUsages =
 #[cfg(not(test))]
 const DEBUG_READABLE_STORAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE;
 
-const SHARED_SIGNER_WGSL: &str =
-    include_str!("../reference/shared-signer/pickaxe_shared_signer.wgsl");
+const SHARED_STAGES_WGSL: &str =
+    include_str!("../reference/shared-stages/pickaxe_shared_stages.wgsl");
 
 #[cfg(test)]
 const TX_BYTES: usize = 615;
@@ -578,7 +594,8 @@ fn create_shared_t2_filter(
 
 pub struct WgpuPhotonEngine {
     _instance: wgpu::Instance,
-    _shader: wgpu::ShaderModule,
+    /// The original hand-written WGSL, created only when a stage uses it.
+    _shader: Option<wgpu::ShaderModule>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     stage_a: wgpu::ComputePipeline,
@@ -629,7 +646,7 @@ pub struct WgpuPhotonEngine {
     _adapter_name: String,
     job_ready: bool,
     positive_target_rule: bool,
-    signer: PortableSigner,
+    stages: PortableStages,
 }
 
 impl WgpuPhotonEngine {
@@ -646,7 +663,7 @@ impl WgpuPhotonEngine {
             max_candidates,
             winner_cap,
             table,
-            PortableSigner::from_env()?,
+            PortableStages::from_env()?,
         ))
     }
 
@@ -656,7 +673,7 @@ impl WgpuPhotonEngine {
         max_candidates: u32,
         winner_cap: u32,
         table: (Vec<u8>, M29TableSource),
-        signer: PortableSigner,
+        stages: PortableStages,
     ) -> Result<Self, String> {
         if !m29_table::valid_table(&table.0) {
             return Err("invalid PHOTON generator table".into());
@@ -762,30 +779,43 @@ impl WgpuPhotonEngine {
             .await
             .map_err(|error| format!("request WGPU device {}: {error}", adapter_info.name))?;
 
-        let shader_source = reference_shader_source_for_wgpu()?;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Pickaxe M67.38 PHOTON reference shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
-        });
-        let signer_shader = (signer == PortableSigner::Rust).then(|| {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Shared Rust signer"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHARED_SIGNER_WGSL)),
-            })
-        });
-        let signing = signer_shader.as_ref().unwrap_or(&shader);
-        let (a, b, c1) = signer.entry_points();
-        let stage_a = create_pipeline(&device, signing, a);
-        let stage_b: Vec<_> = b
+        // #### PR #22: the shared stages never touch the 34k-line original
+        // module, so it is parsed only for PICKAXE_WGPU_STAGES=wgsl (or the
+        // legacy non-shared filter build); startup is seconds shorter.
+        let shader = if stages == PortableStages::Wgsl || cfg!(not(feature = "shared-rust-t2")) {
+            Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Pickaxe M67.38 PHOTON reference shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(reference_shader_source_for_wgpu()?)),
+            }))
+        } else {
+            None
+        };
+        let module = match (stages, &shader) {
+            (PortableStages::Wgsl, Some(reference)) => reference,
+            _ => &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Shared Rust stages"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHARED_STAGES_WGSL)),
+            }),
+        };
+        let entries = stages.entry_points();
+        let stage_a = create_pipeline(&device, module, entries.a);
+        let stage_b: Vec<_> = entries
+            .b
             .iter()
-            .map(|entry| create_pipeline(&device, signing, entry))
+            .map(|entry| create_pipeline(&device, module, entry))
             .collect();
-        let stage_c1 = create_pipeline(&device, signing, c1);
-        let stage_c2 = create_pipeline(&device, &shader, "photon_m6725_c2_hash_only_wg64");
-        let stage_c3 = create_pipeline(&device, &shader, "pickaxe_photon_c3_bounded_wg64");
-        let t2_prepare = create_pipeline(&device, &shader, "pickaxe_t2_prepare");
+        let stage_c1 = create_pipeline(&device, module, entries.c1);
+        let stage_c2 = create_pipeline(&device, module, entries.c2);
+        let stage_c3 = create_pipeline(&device, module, entries.c3);
+        let t2_prepare = create_pipeline(&device, module, entries.t2_prepare);
         #[cfg(not(feature = "shared-rust-t2"))]
-        let t2_filter = create_pipeline(&device, &shader, "pickaxe_t2_filter");
+        let t2_filter = create_pipeline(
+            &device,
+            shader
+                .as_ref()
+                .expect("the legacy filter build parses the original module"),
+            "pickaxe_t2_filter",
+        );
 
         let (table_bytes, table_source) = table;
         let table_gpu = create_buffer(
@@ -1077,7 +1107,7 @@ impl WgpuPhotonEngine {
             _adapter_name: adapter_info.name,
             job_ready: false,
             positive_target_rule: false,
-            signer,
+            stages,
         })
     }
 
@@ -1095,8 +1125,8 @@ impl WgpuPhotonEngine {
     }
 
     /// Returns the source of the portable GPU lookup table.
-    pub fn signer(&self) -> PortableSigner {
-        self.signer
+    pub fn stages(&self) -> PortableStages {
+        self.stages
     }
 
     pub fn table_source(&self) -> M29TableSource {
@@ -1207,7 +1237,10 @@ impl WgpuPhotonEngine {
                             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                                 label: Some("PHOTON T2 specialized filter"),
                                 layout: None,
-                                module: &self._shader,
+                                module: self
+                                    ._shader
+                                    .as_ref()
+                                    .expect("the legacy filter build parses the original module"),
                                 entry_point: Some("pickaxe_t2_filter"),
                                 compilation_options: wgpu::PipelineCompilationOptions {
                                     constants: &[("T2_SHIFT", shift as f64)],
@@ -1819,13 +1852,21 @@ mod tests {
         } else {
             256
         };
+        let reference = engine
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Pickaxe M67.38 PHOTON reference shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(
+                    reference_shader_source_for_wgpu().unwrap(),
+                )),
+            });
         let mut alternate =
             engine
                 .device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("T2 baseline comparison"),
                     layout: None,
-                    module: &engine._shader,
+                    module: &reference,
                     entry_point: Some("pickaxe_t2_filter"),
                     compilation_options: wgpu::PipelineCompilationOptions {
                         constants: &[
@@ -1913,26 +1954,33 @@ mod tests {
         let started = Instant::now();
         let engine = WgpuPhotonEngine::new(0, 4096, 8).unwrap();
         eprintln!(
-            "ENGINE_CREATED signer={:?} adapter={} seconds={:.1}",
-            engine.signer,
+            "ENGINE_CREATED stages={:?} adapter={} seconds={:.1}",
+            engine.stages,
             engine._adapter_name,
             started.elapsed().as_secs_f64()
         );
     }
 
-    // Compile time of each shared signer pipeline (clear the driver cache first).
+    // Compile time of each shared stage pipeline (clear the driver cache first).
     #[test]
     #[ignore = "requires exclusive access to a physical GPU"]
-    fn shared_signer_pipeline_compile_times() {
+    fn shared_stages_pipeline_compile_times() {
         let engine = WgpuPhotonEngine::new(0, 4096, 8).unwrap();
         let module = engine
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Shared Rust signer"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHARED_SIGNER_WGSL)),
+                label: Some("Shared Rust stages"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHARED_STAGES_WGSL)),
             });
-        let (a, b, c1) = PortableSigner::Rust.entry_points();
-        for entry in [a, b[0], c1] {
+        let entries = PortableStages::Rust.entry_points();
+        for entry in [
+            entries.a,
+            entries.b[0],
+            entries.c1,
+            entries.t2_prepare,
+            entries.c2,
+            entries.c3,
+        ] {
             let started = Instant::now();
             let _pipeline = create_pipeline(&engine.device, &module, entry);
             eprintln!(
@@ -1942,16 +1990,22 @@ mod tests {
         }
     }
 
-    // #### PR #22: per-stage GPU time of both signers on the same GPU and job.
+    // #### PR #22: per-stage GPU time of both stage sets on the same GPU and job.
     // Run with PICKAXE_WGPU_TIMESTAMPS=1; prints mean milliseconds per stage.
     #[test]
     #[ignore = "requires exclusive access to a physical GPU"]
-    fn signer_stage_timing_comparison() {
+    fn stage_timing_comparison() {
         let table = m29_table::load_or_generate_m29_g16().unwrap();
+        // PICKAXE_BENCH_NON_T2=1 times the non-T2 C2/C3 path instead.
+        let non_t2 = std::env::var_os("PICKAXE_BENCH_NON_T2").is_some();
         let candidates = std::env::var("PICKAXE_BENCH_CANDIDATES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(WGPU_T2_MAX_BATCH);
+            .unwrap_or(if non_t2 {
+                WGPU_REFERENCE_MAX_BATCH
+            } else {
+                WGPU_T2_MAX_BATCH
+            });
         let rounds: usize = std::env::var("PICKAXE_TRIAL_ROUNDS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1959,17 +2013,17 @@ mod tests {
         // Creation order decides which engine gets device memory first;
         // PICKAXE_BENCH_RUST_FIRST=1 reverses it to separate that from signing.
         let order = if std::env::var_os("PICKAXE_BENCH_RUST_FIRST").is_some() {
-            [PortableSigner::Rust, PortableSigner::Wgsl]
+            [PortableStages::Rust, PortableStages::Wgsl]
         } else {
-            [PortableSigner::Wgsl, PortableSigner::Rust]
+            [PortableStages::Wgsl, PortableStages::Rust]
         };
-        let mut engines = order.map(|signer| {
+        let mut engines = order.map(|stages| {
             pollster::block_on(WgpuPhotonEngine::new_async(
                 0,
                 WGPU_T2_MAX_BATCH,
                 8,
                 table.clone(),
-                signer,
+                stages,
             ))
             .unwrap()
         });
@@ -2005,6 +2059,7 @@ mod tests {
             engine.set_proof_rule(crate::protocol::ProofRule::Positive);
             engine.set_job(&template, &target, &key).unwrap();
             assert!(engine.t2_active);
+            engine.t2_active = !non_t2;
             for _ in 0..2 {
                 engine.search_batch(0, candidates).unwrap();
             }
@@ -2028,14 +2083,16 @@ mod tests {
         for (index, sum) in sums.iter().enumerate() {
             let mean = sum.map(|value| value / rounds as f64);
             eprintln!(
-                "SIGNER_TIMING signer={:?} adapter={} candidates={candidates} a={:.4} b={:.4} c1={:.4} signing={:.4} prepare={:.4} filter={:.4} ms",
-                engines[index].signer,
+                "STAGE_TIMING stages={:?} adapter={} candidates={candidates} a={:.4} b={:.4} c1={:.4} signing={:.4} {}={:.4} {}={:.4} ms",
+                engines[index].stages,
                 engines[index]._adapter_name,
                 mean[0],
                 mean[1],
                 mean[2],
                 mean[0] + mean[1] + mean[2],
+                if non_t2 { "c2" } else { "prepare" },
                 mean[3],
+                if non_t2 { "c3" } else { "filter" },
                 mean[4],
             );
         }
@@ -2198,18 +2255,18 @@ mod tests {
             failures.is_empty(),
             "{} of {windows} windows failed ({:?}): {:?}",
             failures.len(),
-            engine.signer,
+            engine.stages,
             &failures[..failures.len().min(8)]
         );
     }
 
-    // #### PR #22: development check of the shared signer's arithmetic on GPU.
-    // Needs `PICKAXE_BUILD_SHARED_SIGNER=debug` output; skipped without it.
+    // #### PR #22: development check of the shared stages' arithmetic on GPU.
+    // Needs `PICKAXE_BUILD_SHARED_STAGES=debug` output; skipped without it.
     #[test]
     #[ignore = "requires exclusive access to a physical GPU"]
-    fn shared_signer_arithmetic_matches_integers() {
+    fn shared_stages_arithmetic_matches_integers() {
         use num_bigint::BigUint;
-        let path = "artifacts/shared-gpu-proof/signer-debug/pickaxe_shared_signer.wgsl";
+        let path = "artifacts/shared-gpu-proof/stages-debug/pickaxe_shared_stages.wgsl";
         let Ok(source) = std::fs::read_to_string(path) else {
             eprintln!("skip: build {path} first");
             return;
@@ -2218,7 +2275,7 @@ mod tests {
         let module = engine
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("debug signer"),
+                label: Some("debug stages"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
             });
         let pipeline = create_pipeline(&engine.device, &module, "pickaxe_debug_arithmetic");
@@ -2403,31 +2460,37 @@ mod tests {
     }
 
     #[test]
-    fn portable_signer_defaults_to_shared_rust_and_keeps_wgsl_selectable() {
-        assert_eq!(PortableSigner::parse(None), Ok(PortableSigner::Rust));
-        assert_eq!(PortableSigner::parse(Some(" ")), Ok(PortableSigner::Rust));
+    fn portable_stages_default_to_shared_rust_and_keep_wgsl_selectable() {
+        assert_eq!(PortableStages::parse(None), Ok(PortableStages::Rust));
+        assert_eq!(PortableStages::parse(Some(" ")), Ok(PortableStages::Rust));
         assert_eq!(
-            PortableSigner::parse(Some("rust")),
-            Ok(PortableSigner::Rust)
+            PortableStages::parse(Some("rust")),
+            Ok(PortableStages::Rust)
         );
         assert_eq!(
-            PortableSigner::parse(Some("wgsl")),
-            Ok(PortableSigner::Wgsl)
+            PortableStages::parse(Some("wgsl")),
+            Ok(PortableStages::Wgsl)
         );
-        assert!(PortableSigner::parse(Some("cuda")).is_err());
-        assert_eq!(PortableSigner::default(), PortableSigner::Rust);
-        // Every entry point either signer names exists in its shader.
+        assert!(PortableStages::parse(Some("cuda")).is_err());
+        assert_eq!(PortableStages::default(), PortableStages::Rust);
+        // Every entry point either set names exists in its shader.
         let reference = reference_shader_source_for_wgpu().unwrap();
-        for signer in [PortableSigner::Wgsl, PortableSigner::Rust] {
-            let source = match signer {
-                PortableSigner::Wgsl => reference.as_str(),
-                PortableSigner::Rust => SHARED_SIGNER_WGSL,
+        for stages in [PortableStages::Wgsl, PortableStages::Rust] {
+            let source = match stages {
+                PortableStages::Wgsl => reference.as_str(),
+                PortableStages::Rust => SHARED_STAGES_WGSL,
             };
-            let (a, b, c1) = signer.entry_points();
-            for entry in b.iter().copied().chain([a, c1]) {
+            let entries = stages.entry_points();
+            for entry in entries.b.iter().copied().chain([
+                entries.a,
+                entries.c1,
+                entries.t2_prepare,
+                entries.c2,
+                entries.c3,
+            ]) {
                 assert!(
                     source.contains(&format!("fn {entry}(")),
-                    "{signer:?} lacks {entry}"
+                    "{stages:?} lacks {entry}"
                 );
             }
         }

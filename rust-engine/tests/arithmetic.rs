@@ -392,3 +392,93 @@ fn portable_rfc6979_retry_steps_match_model() {
         }
     }
 }
+
+#[test]
+fn portable_transaction_words_match_serialized_bytes() {
+    use pickaxe_rust_engine::window;
+    for shift in 0..=16usize {
+        let length = 615 + shift;
+        let seed = |tag: &str| -> [u8; 32] { Sha256::digest(format!("{tag}{shift}")).into() };
+        let mut template: Vec<u8> = (0..length).map(|i| (i * 7 + shift) as u8).collect();
+        template[394 + shift..426 + shift].copy_from_slice(&seed("target"));
+        let nonce = 0x0102_0304u32 + shift as u32;
+        let (r, s) = (seed("r"), seed("s"));
+        let mut completed = template.clone();
+        completed[390 + shift..394 + shift].copy_from_slice(&nonce.to_le_bytes());
+        completed[426 + shift..458 + shift].copy_from_slice(&r);
+        completed[458 + shift..490 + shift].copy_from_slice(&s);
+        let mut padded = completed.clone();
+        padded.push(0x80);
+        padded.resize(632, 0);
+        padded.extend_from_slice(&(length as u64 * 8).to_be_bytes());
+        assert_eq!(padded.len(), 640);
+        let mut packed = template.clone();
+        packed.resize(632, 0);
+        let packed: Vec<u32> = packed
+            .chunks(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+        for w in 0..64 {
+            let expected = u32::from_be_bytes(padded[384 + w * 4..388 + w * 4].try_into().unwrap());
+            assert_eq!(
+                window::tx_word(&packed, shift, length, nonce, be_words(&r), be_words(&s), w),
+                expected,
+                "shift {shift}, word {w}"
+            );
+        }
+        // The same words and schedule SHA-256 produces over the last block.
+        let block: [u32; 16] = core::array::from_fn(|i| {
+            u32::from_be_bytes(padded[576 + i * 4..580 + i * 4].try_into().unwrap())
+        });
+        let schedule = window::schedule(block);
+        let mut expected = [0u32; 64];
+        expected[..16].copy_from_slice(&block);
+        for i in 16..64 {
+            let (x, y) = (expected[i - 15], expected[i - 2]);
+            expected[i] = expected[i - 16]
+                .wrapping_add(x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3))
+                .wrapping_add(expected[i - 7])
+                .wrapping_add(y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10));
+        }
+        assert_eq!(schedule, expected);
+    }
+}
+
+#[test]
+fn portable_target_rule_matches_little_endian_comparison() {
+    use pickaxe_rust_engine::window;
+    let mut cases: Vec<([u8; 32], [u8; 32])> = Vec::new();
+    for i in 0..512u32 {
+        let digest: [u8; 32] = Sha256::digest(i.to_le_bytes()).into();
+        let mut target: [u8; 32] = Sha256::digest(i.to_be_bytes()).into();
+        if i % 4 == 0 {
+            // Equal high bytes force the comparison deeper.
+            target[16..].copy_from_slice(&digest[16..]);
+        }
+        if i % 8 == 1 {
+            target = digest;
+        }
+        cases.push((digest, target));
+    }
+    cases.push(([0; 32], [0xff; 32]));
+    for (digest, target) in cases {
+        let mut masked = digest;
+        masked[31] &= 0x7f;
+        let below = masked.iter().rev().cmp(target.iter().rev()) == core::cmp::Ordering::Less;
+        let positive_ok = digest[31] & 0x80 == 0 && digest.iter().any(|b| *b != 0);
+        let mut template = vec![0u8; 400 + 32];
+        template[400..].copy_from_slice(&target);
+        let packed: Vec<u32> = template
+            .chunks(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            window::below_target(be_words(&digest), &packed, 400, false),
+            below
+        );
+        assert_eq!(
+            window::below_target(be_words(&digest), &packed, 400, true),
+            below && positive_ok
+        );
+    }
+}

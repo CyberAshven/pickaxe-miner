@@ -4,8 +4,8 @@
 Generated WGSL is a build artifact, never an independently maintained engine.
 CI rebuilds it with the pinned compiler and compares every byte. Use --write
 after changing shared Rust source; normal Cargo builds verify its manifests.
-Outputs: the 17 T2 filters (reference/shared-t2) and the signing stages
-(reference/shared-signer).
+Outputs: the 17 T2 filters (reference/shared-t2) and the other portable
+stages (reference/shared-stages).
 """
 from pathlib import Path
 import argparse
@@ -36,9 +36,9 @@ TARGETS = (
         "shaders": tuple(f"pickaxe_shared_t2_{i}.wgsl" for i in range(17)),
     },
     {
-        "name": "signer",
-        "environment": "PICKAXE_BUILD_SHARED_SIGNER",
-        "output": "reference/shared-signer",
+        "name": "stages",
+        "environment": "PICKAXE_BUILD_SHARED_STAGES",
+        "output": "reference/shared-stages",
         "sources": (
             "rust-engine/src/field.rs",
             "rust-engine/src/point.rs",
@@ -46,10 +46,11 @@ TARGETS = (
             "rust-engine/src/sha256.rs",
             "rust-engine/src/sign.rs",
             "rust-engine/src/wide.rs",
-            "tools/shared-gpu-proof/signer/Cargo.toml",
-            "tools/shared-gpu-proof/signer/src/lib.rs",
+            "rust-engine/src/window.rs",
+            "tools/shared-gpu-proof/stages/Cargo.toml",
+            "tools/shared-gpu-proof/stages/src/lib.rs",
         ),
-        "shaders": ("pickaxe_shared_signer.wgsl",),
+        "shaders": ("pickaxe_shared_stages.wgsl",),
     },
 )
 

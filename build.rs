@@ -10,7 +10,7 @@ fn main() {
     }
     // (generated directory, shaders, shared sources) per portable artifact set.
     verify("reference/shared-t2", 17, 10);
-    verify("reference/shared-signer", 1, 14);
+    verify("reference/shared-stages", 1, 15);
 }
 
 fn verify(directory: &str, expected_shaders: usize, expected_sources: usize) {

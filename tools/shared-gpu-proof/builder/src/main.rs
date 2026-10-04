@@ -5,12 +5,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let output = root.join("artifacts/shared-gpu-proof");
     fs::create_dir_all(&output)?;
-    // #### PR #22: the portable signing stages, one module with six entry points.
-    // PICKAXE_BUILD_SHARED_SIGNER=debug adds a development-only arithmetic entry.
-    if let Some(mode) = std::env::var_os("PICKAXE_BUILD_SHARED_SIGNER") {
+    // #### PR #22: the portable shared stages, one module.
+    // PICKAXE_BUILD_SHARED_STAGES=debug adds a development-only arithmetic entry.
+    if let Some(mode) = std::env::var_os("PICKAXE_BUILD_SHARED_STAGES") {
         let debug = mode == "debug";
         let result = spirv_builder::SpirvBuilder::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../signer"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../stages"),
             "spirv-unknown-vulkan1.1",
         )
         .shader_crate_features(debug.then(|| "debug".to_string()))
@@ -22,10 +22,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             naga::valid::Capabilities::empty(),
         )
         .validate(&module)?;
-        let directory = output.join(if debug { "signer-debug" } else { "signer" });
+        let directory = output.join(if debug { "stages-debug" } else { "stages" });
         fs::create_dir_all(&directory)?;
         fs::write(
-            directory.join("pickaxe_shared_signer.wgsl"),
+            directory.join("pickaxe_shared_stages.wgsl"),
             naga::back::wgsl::write_string(
                 &module,
                 &info,
@@ -34,9 +34,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         let (metal, _) =
             naga::back::msl::write_string(&module, &info, &Default::default(), &Default::default())?;
-        fs::write(directory.join("pickaxe_shared_signer.metal"), metal)?;
-        fs::copy(path, directory.join("pickaxe_shared_signer.spv"))?;
-        println!("Shared signer generated in {}", directory.display());
+        fs::write(directory.join("pickaxe_shared_stages.metal"), metal)?;
+        fs::copy(path, directory.join("pickaxe_shared_stages.spv"))?;
+        println!("Shared stages generated in {}", directory.display());
         return Ok(());
     }
     if std::env::var_os("PICKAXE_BUILD_SHARED_FILTER").is_some() {

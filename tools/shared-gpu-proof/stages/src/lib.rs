@@ -1,15 +1,17 @@
-//! Thin portable entry points for the shared Rust BCH Schnorr signer.
+//! Thin portable entry points for the shared Rust mining stages.
 #![cfg_attr(target_arch = "spirv", no_std)]
 
-// #### PR #22: buffer and index adapters only. Signing arithmetic, RFC6979 and
-// hashing are imported from rust-engine; the original WGSL stages remain the
-// default until these pass the per-stage timing gates on each GPU.
-// Bindings and record layouts match the original stages A, B and C1, so the
-// host swaps pipelines without touching buffers:
-//   0 template words (big-endian), then nonce base and layout shift
-//   3 generator table, 4 private key words, 5 RFC6979 midstates
+// #### PR #22: buffer and index adapters only. Signing, transaction words and
+// hashing are imported from rust-engine. Bindings and record layouts match the
+// original hand-written stages (A, B, C1, T2 preparation, C2, C3), so the host
+// swaps pipelines without touching buffers; PICKAXE_WGPU_STAGES=wgsl selects
+// the originals. The T2 filter is generated separately (reference/shared-t2).
+//   0 template words (big-endian), then nonce base, layout shift, length, rule
+//   2 counters: candidates, completed, winners; 3 generator table
+//   4 private key words, 5 RFC6979 midstates, 6 state after template byte 384
 //   10 records: message[8] k[8] x[8] y[8] z[8]; 12 B dispatch (groups, count)
-//   13 signatures: r[8] s[8], big-endian words
+//   13 signatures: r[8] s[8]; 14 hashes; 16 winners: nonce + digest[8]
+//   17 T2 windows (128 words each); 18 T2 dispatch (offset, count, windows)
 // Entry points sit at the crate root and their names do not end in a digit,
 // so SPIR-V and the generated WGSL keep exactly the names the host requests.
 #[cfg(target_arch = "spirv")]
@@ -30,6 +32,9 @@ pub mod sign;
 #[cfg(target_arch = "spirv")]
 #[path = "../../../../rust-engine/src/wide.rs"]
 pub mod wide;
+#[cfg(target_arch = "spirv")]
+#[path = "../../../../rust-engine/src/window.rs"]
+pub mod window;
 
 #[cfg(target_arch = "spirv")]
 use {
@@ -50,6 +55,10 @@ const TEMPLATE_WORDS: usize = 158;
 const NONCE_BASE: usize = TEMPLATE_WORDS;
 #[cfg(target_arch = "spirv")]
 const LAYOUT_SHIFT: usize = TEMPLATE_WORDS + 1;
+#[cfg(target_arch = "spirv")]
+const TX_LENGTH: usize = TEMPLATE_WORDS + 2;
+#[cfg(target_arch = "spirv")]
+const POSITIVE_RULE: usize = TEMPLATE_WORDS + 3;
 #[cfg(target_arch = "spirv")]
 const RECORD_WORDS: usize = 40;
 // Unshifted public key and shifted PHOTON target inside the template.
@@ -238,5 +247,172 @@ pub fn pickaxe_debug_arithmetic(
         store8(results, out + 40, sum.x.0);
         store8(results, out + 48, sum.y.0);
         store8(results, out + 56, sum.z.0);
+    }
+}
+
+#[cfg(target_arch = "spirv")]
+#[inline(always)]
+unsafe fn load16(words: &[u32], start: usize) -> [u32; 16] {
+    let [a0, a1, a2, a3, a4, a5, a6, a7] = load8(words, start);
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = load8(words, start + 8);
+    [
+        a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7,
+    ]
+}
+
+/// Second SHA-256 of a finished first hash: the digest as big-endian words.
+#[cfg(target_arch = "spirv")]
+#[inline(always)]
+fn hash256_tail(first: [u32; 8]) -> [u32; 8] {
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = first;
+    let mut state = sha256::INITIAL;
+    sha256::compress(
+        &mut state,
+        [
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            s6,
+            s7,
+            0x8000_0000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            256,
+        ],
+    );
+    state
+}
+
+/// T2 preparation: each signed window's transaction words from byte 448, its
+/// SHA-256 state after byte 448 and the head of block 7 for the shared filter.
+/// Window 0 also stores block 8's schedule, which every window shares.
+#[cfg(target_arch = "spirv")]
+#[spirv(compute(threads(64)))]
+pub fn pickaxe_shared_t2_prepare(
+    #[spirv(global_invocation_id)] id: UVec3,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] input: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] prefix: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 13)] signatures: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 17)] windows: &mut [u32],
+    #[spirv(uniform, descriptor_set = 0, binding = 18)] control: &UVec4,
+) {
+    unsafe {
+        let index = id.x as usize + id.y as usize * 1_048_576;
+        if index >= control.z as usize {
+            return;
+        }
+        let shift = *input.index_unchecked(LAYOUT_SHIFT) as usize;
+        let length = *input.index_unchecked(TX_LENGTH) as usize;
+        let nonce = input.index_unchecked(NONCE_BASE).wrapping_add(index as u32);
+        let r = load8(signatures, index * 16);
+        let s = load8(signatures, index * 16 + 8);
+        let base = index * 128;
+        let mut block = [0u32; 16];
+        let mut w = 0;
+        while w < 16 {
+            *block.index_unchecked_mut(w) = window::tx_word(input, shift, length, nonce, r, s, w);
+            w += 1;
+        }
+        while w < 64 {
+            *windows.index_unchecked_mut(base + w - 8) =
+                window::tx_word(input, shift, length, nonce, r, s, w);
+            w += 1;
+        }
+        let mut state = load8(prefix, 0);
+        sha256::compress(&mut state, block);
+        store8(windows, base, state);
+        store8(windows, base + 56, sha256::head10(state, load16(windows, base + 8)));
+        if index == 0 {
+            let schedule = window::schedule(load16(windows, 24));
+            let mut i = 0;
+            while i < 64 {
+                *windows.index_unchecked_mut(64 + i) = *schedule.index_unchecked(i);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Non-T2 stage C2: HASH256 of each signed candidate transaction.
+#[cfg(target_arch = "spirv")]
+#[spirv(compute(threads(64)))]
+pub fn pickaxe_shared_c2_hash(
+    #[spirv(global_invocation_id)] id: UVec3,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] input: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] prefix: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 13)] signatures: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 14)] hashes: &mut [u32],
+) {
+    unsafe {
+        let index = id.x as usize;
+        let shift = *input.index_unchecked(LAYOUT_SHIFT) as usize;
+        let length = *input.index_unchecked(TX_LENGTH) as usize;
+        let nonce = input.index_unchecked(NONCE_BASE).wrapping_add(id.x);
+        let r = load8(signatures, index * 16);
+        let s = load8(signatures, index * 16 + 8);
+        let mut state = load8(prefix, 0);
+        let mut first = 0;
+        while first < 64 {
+            let mut block = [0u32; 16];
+            let mut w = 0;
+            while w < 16 {
+                *block.index_unchecked_mut(w) =
+                    window::tx_word(input, shift, length, nonce, r, s, first + w);
+                w += 1;
+            }
+            sha256::compress(&mut state, block);
+            first += 16;
+        }
+        store8(hashes, index * 8, hash256_tail(state));
+    }
+}
+
+/// Non-T2 stage C3: counts completed candidates and keeps those below the
+/// target, as nonce and digest records up to the winner capacity.
+#[cfg(target_arch = "spirv")]
+#[spirv(compute(threads(64)))]
+pub fn pickaxe_shared_c3_winners(
+    #[spirv(global_invocation_id)] id: UVec3,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] input: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] counters: &mut [u32; 4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 14)] hashes: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 16)] winners: &mut [u32],
+) {
+    use spirv_std::memory::Scope;
+    unsafe {
+        let index = id.x;
+        let count = *counters.index_unchecked(0);
+        if index >= count {
+            return;
+        }
+        // One completion update per workgroup of 64 candidates.
+        if index % 64 == 0 {
+            spirv_std::arch::atomic_i_add::<u32, { Scope::QueueFamily as u32 }, 0>(
+                counters.index_unchecked_mut(1),
+                (count - index).min(64),
+            );
+        }
+        let digest = load8(hashes, index as usize * 8);
+        let shift = *input.index_unchecked(LAYOUT_SHIFT) as usize;
+        let positive = *input.index_unchecked(POSITIVE_RULE) != 0;
+        if !window::below_target(digest, input, TARGET_OFFSET + shift, positive) {
+            return;
+        }
+        let slot = spirv_std::arch::atomic_i_add::<u32, { Scope::QueueFamily as u32 }, 0>(
+            counters.index_unchecked_mut(2),
+            1,
+        ) as usize;
+        if slot < winners.len() / 9 {
+            *winners.index_unchecked_mut(slot * 9) =
+                input.index_unchecked(NONCE_BASE).wrapping_add(index);
+            store8(winners, slot * 9 + 1, digest);
+        }
     }
 }

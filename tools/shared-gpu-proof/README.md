@@ -120,15 +120,18 @@ fixtures, `verifySharedHash({ assembly: true })` runs the layout oracle, and
 `verifySharedHash()` runs the hash oracle. Each call releases its GPU device.
 This is correctness evidence, not a portable mining performance result.
 
-## Shared signer (2026-10-04)
+## Shared stages (2026-10-04)
 
-The portable signing stages now come from the shared Rust engine too.
-`signer/` holds thin entry points for stages A (message hash and RFC6979),
-B (k·G from the generator table) and C1 (the BCH Schnorr signature). They
-import `rust-engine/src/{field,point,scalar,sha256,sign,wide}.rs`;
-`sync_filter.py` compiles them into `reference/shared-signer`. They replace the
-original stages with the same bindings and record layouts, so the host swaps
-pipelines only. `PICKAXE_WGPU_SIGNER=wgsl` restores the original stages.
+Every other portable mining stage now comes from the shared Rust engine too.
+`stages/` holds thin entry points for signing (A: message hash and RFC6979,
+B: k·G from the generator table, C1: the BCH Schnorr signature), the T2
+window preparation that feeds the shared filter, and the non-T2 hash and
+winner stages (C2, C3). They import
+`rust-engine/src/{field,point,scalar,sha256,sign,wide,window}.rs`;
+`sync_filter.py` compiles them into `reference/shared-stages`. They use the
+original stages' bindings and record layouts, so the host swaps pipelines
+only. `PICKAXE_WGPU_STAGES=wgsl` restores the original hand-written stages,
+and only then is the 34k-line original module parsed.
 
 What portable shaders need from the shared source, without changing native code:
 
@@ -138,17 +141,20 @@ What portable shaders need from the shared source, without changing native code:
   access on SPIR-V. A bounds check, a signed remainder or an array iterator
   adds a panic path, and rust-gpu then inlines whole multiplications.
 - Array equality and `Debug` are native-only derives; SPIR-V compares words.
-- `sign.rs` holds the word-based signing steps and binary inverse and
-  Legendre algorithms. Native GPU builds exclude it.
+- `sign.rs` (word-based signing, binary inverse and Legendre) and
+  `window.rs` (transaction words, block schedule, target rule) are
+  portable-only; native GPU builds exclude them.
 - RFC6979 runs its HMAC chain as a table of steps around one compression,
   so drivers compile one SHA-256 body. Fifteen unrolled copies took AMD's
   compiler 114 s for stage A; the table form takes 0.2 s.
 
 Checks: both native PTX hashes are unchanged (`380967a5…` with
 `upstream-rust`, `5ef8fada…` without). Host tests compare every word form,
-the forced RFC6979 retry steps and complete signatures with independent
-oracles. `signing_stages_match_cpu_per_window` and the T2 end-to-end oracle
-pass on NVIDIA and AMD (Vulkan) and in Chrome on AMD (WebGPU).
-`PICKAXE_BUILD_SHARED_SIGNER=debug` builds a development shader with an
-arithmetic entry point for `shared_signer_arithmetic_matches_integers`; it is
-never shipped. Measurements are in the [GPU code map](../../docs/gpu-sources.md).
+the forced RFC6979 retry steps, complete signatures, transaction words for
+all 17 layouts and the target rule with independent oracles.
+`signing_stages_match_cpu_per_window` and the T2 and non-T2 end-to-end tests
+pass on NVIDIA and AMD (Vulkan); the browser engine check passes in Chrome on
+AMD (WebGPU). `PICKAXE_BUILD_SHARED_STAGES=debug` builds a development shader
+with an arithmetic entry point for `shared_stages_arithmetic_matches_integers`;
+it is never shipped. Measurements are in the
+[GPU code map](../../docs/gpu-sources.md).

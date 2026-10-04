@@ -849,7 +849,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pickaxe-shared-signer"
+name = "pickaxe-shared-stages"
 version = "0.0.0"
 dependencies = [
  "spirv-std",

@@ -1,4 +1,4 @@
 [workspace]
-members = ["builder", "kernel", "filter", "signer"]
+members = ["builder", "kernel", "filter", "stages"]
 default-members = ["builder"]
 resolver = "2"

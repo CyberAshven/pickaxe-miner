@@ -30,6 +30,8 @@ pub mod t2_block;
 ))]
 mod upstream;
 pub mod wide;
+#[cfg(not(any(target_os = "cuda", target_os = "amdhsa")))]
+pub mod window;
 
 #[cfg(target_os = "cuda")]
 #[panic_handler]

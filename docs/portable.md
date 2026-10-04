@@ -6,9 +6,10 @@ protocol rules, signatures, intensity pacing, measured active rates, independent
 winner checks, dynamic fee calculations
 and the token's donation policy. The browser miner and the native portable
 build run the same WGSL shaders through the wgpu library: on Metal on macOS, on
-Vulkan on Windows and Linux, and on the browser's WebGPU. The signing stages
-come from the shared Rust engine; on native builds `PICKAXE_WGPU_SIGNER=wgsl`
-selects the original PHOTON WGSL stages instead. See [GPU code map](gpu-sources.md).
+Vulkan on Windows and Linux, and on the browser's WebGPU. Every mining stage
+comes from the shared Rust engine; on native builds `PICKAXE_WGPU_STAGES=wgsl`
+selects the original hand-written WGSL stages instead. See
+[GPU code map](gpu-sources.md).
 
 All platforms share payout validation: Mainnet accepts `bitcoincash:` and Chipnet
 accepts `bchtest:`. Wrong-network addresses, invalid checksums and mixed case are
@@ -112,8 +113,8 @@ python -m http.server 8080 --bind 127.0.0.1 --directory dist/web
 ```
 
 `python tools/build-browser.py --check` builds a development bundle that also
-exports `verify_portable_engine(table, signer)`: it signs and searches T2 windows
-in the browser with the chosen signer (`"rust"` or `"wgsl"`) and reconstructs
+exports `verify_portable_engine(table, stages)`: it signs and searches T2 windows
+in the browser with the chosen stages (`"rust"` or `"wgsl"`) and reconstructs
 every candidate on the CPU. Release bundles do not include it.
 
 Use the wasm-bindgen CLI version in `Cargo.lock`; the build script checks it.
