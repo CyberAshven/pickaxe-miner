@@ -26,6 +26,12 @@ checksum and source commit, then run:
 ./pickaxe mine --network mainnet --backend wgpu
 ```
 
+The release workflow calls these same portable jobs using its validated source
+commit. Its dry run checks archive checksums and rejects a Mac or browser
+archive from a different commit. On an authorized release, all platform
+packages are included together. Pull requests and dev merges do not publish
+a release or create a tag.
+
 This opens the mainnet TUI setup. Enter your payout address and choose
 **Start mining**; connection settings are automatic. To open the mining TUI
 and start immediately with a known address, run:

@@ -1,15 +1,55 @@
 """Exercise the actual workflow gate against disposable Git branch histories."""
 import os
+import hashlib
+import io
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+import tarfile
 import textwrap
 import unittest
 
 
 class ReleaseChannelTest(unittest.TestCase):
+    def test_portable_archives_require_the_same_source_commit(self):
+        workflow = (Path(__file__).resolve().parents[1] /
+                    '.github/workflows/release.yml').read_text(encoding='utf-8')
+        block = re.search(
+            r'      - name: Verify portable package provenance\n.*?        run: \|\n'
+            r'((?:          [^\n]*\n|\n)+)', workflow, re.S)
+        self.assertIsNotNone(block)
+        script = textwrap.dedent(block[1])
+        tag, sha = 'pickaxe-miner-v0.0.3', 'a' * 40
+        for wrong_platform in (None, 'mac', 'web'):
+            with self.subTest(wrong_platform=wrong_platform), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'dist').mkdir()
+                for platform, filename, member in [
+                    ('mac', f'{tag}-macos-arm64.tar.gz', f'{tag}-macos-arm64/SOURCE_COMMIT.txt'),
+                    ('web', 'pickaxe-web-experimental.tar.gz', 'web/SOURCE_COMMIT.txt'),
+                ]:
+                    destination = root / 'portable' / platform
+                    destination.mkdir(parents=True)
+                    archive = destination / filename
+                    content = ((('b' * 40) if platform == wrong_platform else sha) + '\n').encode()
+                    with tarfile.open(archive, 'w:gz') as output:
+                        info = tarfile.TarInfo(member)
+                        info.size = len(content)
+                        output.addfile(info, io.BytesIO(content))
+                    (destination / 'SHA256SUMS.txt').write_bytes(
+                        (hashlib.sha256(archive.read_bytes()).hexdigest() + f'  {filename}\n').encode())
+                result = subprocess.run(
+                    [shutil.which('bash'), '--noprofile', '--norc', '-c', script],
+                    cwd=root, env=dict(os.environ, TAG=tag, SHA=sha),
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, wrong_platform is None,
+                                 result.stdout + result.stderr)
+                if wrong_platform is None:
+                    self.assertTrue((root / 'dist' / f'{tag}-macos-arm64.tar.gz').is_file())
+                    self.assertTrue((root / 'dist' / f'{tag}-web.tar.gz').is_file())
+
     def test_download_replacement_never_creates_a_release(self):
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
