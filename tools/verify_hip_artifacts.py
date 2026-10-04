@@ -576,6 +576,8 @@ def verify_artifact(
                 raise RuntimeError(f"{path}:{symbol}: explicit kernel arg lacks offset/size")
             if value_kind == "by_value" and int(arg["size"]) == 4:
                 kind = "u32"
+            elif value_kind == "by_value" and int(arg["size"]) == 8:
+                kind = "u64"
             elif value_kind in {"global_buffer", "dynamic_shared_pointer"} and int(arg["size"]) == 8:
                 kind = "ptr"
             else:
@@ -617,9 +619,10 @@ def main() -> int:
     args = parser.parse_args()
 
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
-    if args.arch != contract["architecture"]:
+    architectures = contract.get("architectures", [contract["architecture"]])
+    if args.arch not in architectures:
         print(
-            f"error: contract is for {contract['architecture']}, requested {args.arch}",
+            f"error: contract covers {', '.join(architectures)}, requested {args.arch}",
             file=sys.stderr,
         )
         return 2

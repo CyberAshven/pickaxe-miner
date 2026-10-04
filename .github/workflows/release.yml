@@ -259,11 +259,70 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  hip-discrete:
+    name: Build HIP ${{ matrix.arch }} code objects
+    needs: validate
+    if: needs.validate.outputs.mode != 'skip'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Discrete Radeon RDNA2, RDNA3 and RDNA4 targets for native HIP T2.
+        arch: [gfx1030, gfx1031, gfx1032, gfx1034, gfx1100, gfx1101, gfx1102, gfx1200, gfx1201]
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install pinned ROCm HIP compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gpg python3
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key |
+            gpg --batch --yes --dearmor |
+            sudo tee /etc/apt/keyrings/rocm.gpg >/dev/null
+          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.0.2 noble main' |
+            sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libxml2 \
+            rocm-llvm=20.0.0.25385.70002-56~24.04 \
+            rocm-device-libs=1.0.0.70002-56~24.04 \
+            hip-dev=7.0.51831.70002-56~24.04 \
+            hipcc=1.1.1.70002-56~24.04
+
+      - name: Build and verify ${{ matrix.arch }} HSACO set
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/opt/rocm/llvm/bin:${PATH}"
+          python3 tools/build_hip.py --arch "${{ matrix.arch }}" --check-reproducible
+          (cd "hip/build/${{ matrix.arch }}" && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
+          cat "hip/build/${{ matrix.arch }}/SHA256SUMS.txt"
+
+      - name: Upload ${{ matrix.arch }} code objects
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hip-${{ matrix.arch }}-codeobjects
+          path: hip/build/${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 14
+
   build:
     name: Build ${{ matrix.name }}
     needs:
       - validate
       - hip-gfx1036
+      - hip-discrete
     strategy:
       fail-fast: false
       matrix:
@@ -306,11 +365,24 @@ jobs:
         working-directory: tools/reward-policy-vm
         run: npm test
 
-      - name: Download verified gfx1036 HIP code objects
+      - name: Download verified HIP code objects
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: hip-gfx1036-codeobjects
-          path: hip/build/gfx1036
+          pattern: hip-*-codeobjects
+          path: hip/downloaded
+
+      - name: Place HIP code objects by architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in hip/downloaded/hip-*-codeobjects; do
+            arch="${directory#hip/downloaded/hip-}"
+            arch="${arch%-codeobjects}"
+            mkdir -p "hip/build/${arch}"
+            cp -R "${directory}/." "hip/build/${arch}/"
+          done
+          rm -rf hip/downloaded
+          ls hip/build
 
       - name: Release tests
         run: cargo test --locked --release --all-features --no-fail-fast -- --skip if_cuda
@@ -383,12 +455,15 @@ jobs:
             cp "cuda/build/${artifact}" "dist/${package}/cuda/build/"
           done
 
-          for artifact in \
-            stage_a_rfc6979.hsaco \
-            photon_stage_b16.hsaco \
-            photon_c1_schnorr.hsaco \
-            stage_c_hash.hsaco; do
-            test -s "hip/build/gfx1036/${artifact}"
+          for arch in gfx1030 gfx1031 gfx1032 gfx1034 gfx1036 gfx1100 gfx1101 gfx1102 gfx1200 gfx1201; do
+            for artifact in \
+              stage_a_rfc6979.hsaco \
+              photon_stage_b16.hsaco \
+              photon_c1_schnorr.hsaco \
+              stage_c_hash.hsaco \
+              photon_t2_tail.hsaco; do
+              test -s "hip/build/${arch}/${artifact}"
+            done
           done
           mkdir -p "dist/${package}/hip"
           cp -R hip/build "dist/${package}/hip/"
@@ -399,8 +474,9 @@ jobs:
             echo "Interactive TUI: ./pickaxe mine. Headless: ./pickaxe mine --no-tui."
             echo "NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required."
             echo "NVIDIA CUDA T2 mining uses the Rust backend."
-            echo "AMD HIP code objects in hip/build/gfx1036 are gfx1036 only and were built by this workflow."
-            echo "No CPU mining fallback. wgpu is not a verified production mining backend in this asset."
+            echo "AMD HIP T2 code objects in hip/build/<arch> cover gfx1030, gfx1031, gfx1032, gfx1034, gfx1036, gfx1100, gfx1101, gfx1102, gfx1200, gfx1201 and were built by this workflow."
+            echo "Other AMD and Intel GPUs, and integrated GPUs, mine through the included Vulkan (wgpu) T2 engine."
+            echo "No CPU mining fallback."
           } > "dist/${package}/BACKENDS.txt"
 
           if [[ -f README.md ]]; then
@@ -486,12 +562,15 @@ jobs:
             'stage_a_rfc6979.hsaco',
             'photon_stage_b16.hsaco',
             'photon_c1_schnorr.hsaco',
-            'stage_c_hash.hsaco'
+            'stage_c_hash.hsaco',
+            'photon_t2_tail.hsaco'
           )
-          foreach ($artifact in $requiredHipArtifacts) {
-            $artifactPath = Join-Path 'hip\build\gfx1036' $artifact
-            if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
-              throw "Required gfx1036 HIP artifact not found: $artifactPath"
+          foreach ($arch in @('gfx1030', 'gfx1031', 'gfx1032', 'gfx1034', 'gfx1036', 'gfx1100', 'gfx1101', 'gfx1102', 'gfx1200', 'gfx1201')) {
+            foreach ($artifact in $requiredHipArtifacts) {
+              $artifactPath = Join-Path (Join-Path 'hip\build' $arch) $artifact
+              if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+                throw "Required $arch HIP artifact not found: $artifactPath"
+              }
             }
           }
           $hipDir = Join-Path $packageDir 'hip'
@@ -504,8 +583,9 @@ jobs:
             'Interactive TUI: .\pickaxe.exe mine. Headless: .\pickaxe.exe mine --no-tui.'
             'NVIDIA CUDA PTX in cuda/build is sm_120 only. A driver that can load sm_120 is required.'
             'NVIDIA CUDA T2 mining uses the Rust backend.'
-            'AMD HIP code objects in hip/build/gfx1036 are gfx1036 only and were built by this workflow.'
-            'No CPU mining fallback. wgpu is not a verified production mining backend in this asset.'
+            'AMD HIP T2 code objects in hip/build/<arch> cover gfx1030, gfx1031, gfx1032, gfx1034, gfx1036, gfx1100, gfx1101, gfx1102, gfx1200, gfx1201 and were built by this workflow.'
+            'Other AMD and Intel GPUs, and integrated GPUs, mine through the included Vulkan (wgpu) T2 engine.'
+            'No CPU mining fallback.'
           ) | Set-Content -LiteralPath (Join-Path $packageDir 'BACKENDS.txt') -Encoding utf8
 
           if (Test-Path -LiteralPath 'README.md') {
@@ -598,7 +678,8 @@ jobs:
             echo "Every package is built from the same source commit."
             echo "Bundled NVIDIA CUDA PTX is sm_120 only."
             echo "NVIDIA CUDA T2 mining uses the Rust backend."
-            echo "Bundled AMD HIP code objects are gfx1036 only."
+            echo "Bundled AMD HIP T2 code objects cover gfx1030, gfx1031, gfx1032, gfx1034, gfx1036, gfx1100, gfx1101, gfx1102, gfx1200, gfx1201."
+            echo "Other AMD and Intel GPUs, and integrated GPUs, mine through the bundled Vulkan (wgpu) T2 engine."
             echo "The default interface is the interactive TUI. Headless mode is --no-tui."
             echo "There is no CPU mining fallback."
             echo "Source commit: ${SHA}"

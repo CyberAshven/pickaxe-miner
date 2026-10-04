@@ -16,9 +16,12 @@ pub struct GpuDevice {
     pub vram_bytes: Option<u64>,
     pub backend: BackendKind,
     pub detail: String,
-    /// Integrated GPUs share the CPU package; auto selection skips them
-    /// except on Apple Silicon, where the integrated GPU is the GPU.
+    /// Integrated GPUs share the CPU package; auto selection uses one only
+    /// when no discrete GPU is present (AMD APU-only PCs, Apple Silicon).
     pub integrated: bool,
+    /// Whether this backend can mine on the device as installed; native HIP
+    /// needs code objects built for the device's architecture.
+    pub ready: bool,
 }
 
 /// Enumerates devices available to each mining backend.
@@ -112,47 +115,41 @@ fn prefer_discrete(devices: impl IntoIterator<Item = GpuDevice>) -> Option<GpuDe
 }
 
 /// Chooses the preferred supported GPU automatically.
-// #### PR #22: discrete GPUs first, AMD and Intel on the T2 engine
+// #### PR #22: discrete GPUs on their native T2 engines, integrated on Vulkan
 // What: without --device, auto takes the first discrete GPU from CUDA, then
-// the portable WGPU engine, then HIP; an explicit --backend also takes its
-// first discrete GPU. An integrated GPU is used automatically only when no
-// discrete GPU is present (AMD APU-only PCs, Apple Silicon); otherwise it
-// mines only when chosen with --device.
-// Why: native HIP has no T2 window search and ships code objects for one
-// chip (gfx1036, an integrated Radeon); the WGPU engine runs T2 on any
-// Vulkan GPU. Mining on an integrated GPU loads the CPU package, which
-// operators with a discrete GPU do not want. NVIDIA still selects CUDA first.
-// Check: `pickaxe devices` on AMD-only and NVIDIA+integrated machines; HIP
-// stays available with `--backend hip --device N`.
+// native HIP (when code objects for its architecture are installed), then
+// the portable WGPU engine. With no discrete GPU, an integrated one mines on
+// WGPU first (AMD APU-only PCs, Apple Silicon). An explicit --backend takes
+// its first discrete GPU; --device picks any GPU, integrated included.
+// Why: native HIP now runs the T2 window search, AMD's native path for
+// discrete Radeon GPUs. Integrated GPUs share the CPU package and, under
+// Windows, never complete a HIP launch, so they stay on Vulkan.
+// Check: `pickaxe devices` on AMD-only and NVIDIA+integrated machines; a
+// discrete Radeon without matching code objects falls back to WGPU.
 fn select_auto_device(
     cuda: Vec<GpuDevice>,
     hip: Vec<GpuDevice>,
     wgpu: Vec<GpuDevice>,
     wanted: Option<u32>,
 ) -> Option<GpuDevice> {
-    let mut candidates = cuda.into_iter().chain(wgpu).chain(hip);
-    match wanted {
+    if let Some(index) = wanted {
         // An explicit ordinal is the operator's choice, integrated GPUs included.
-        Some(index) => candidates.find(|device| device.index == index),
-        None => prefer_discrete(candidates),
+        return cuda
+            .into_iter()
+            .chain(hip)
+            .chain(wgpu)
+            .find(|device| device.index == index);
     }
-}
-
-/// AMD APU targets (integrated Radeon GPUs) from the LLVM AMDGPU processor list.
-fn is_amd_apu_architecture(architecture: &str) -> bool {
-    matches!(
-        architecture,
-        "gfx902"
-            | "gfx909"
-            | "gfx90c"
-            | "gfx1033"
-            | "gfx1035"
-            | "gfx1036"
-            | "gfx1103"
-            | "gfx1150"
-            | "gfx1151"
-            | "gfx1152"
-    )
+    let hip: Vec<GpuDevice> = hip.into_iter().filter(|device| device.ready).collect();
+    if let Some(discrete) = cuda
+        .iter()
+        .chain(&hip)
+        .chain(&wgpu)
+        .find(|device| !device.integrated)
+    {
+        return Some(discrete.clone());
+    }
+    wgpu.into_iter().chain(hip).next()
 }
 
 /// Rejects GPU backends that are not production-ready.
@@ -254,6 +251,7 @@ fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
             backend: BackendKind::Wgpu,
             detail,
             integrated: info.device_type == wgpu::DeviceType::IntegratedGpu,
+            ready: true,
         });
     }
 
@@ -293,6 +291,7 @@ fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
             backend: BackendKind::Cuda,
             detail,
             integrated: false,
+            ready: true,
         });
     }
     Ok(out)
@@ -442,7 +441,9 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
                 vendor: "AMD".into(),
                 vram_bytes: vram,
                 backend: BackendKind::Hip,
-                integrated: is_amd_apu_architecture(&architecture),
+                integrated: crate::hip_photon::is_apu_architecture(&architecture),
+                ready: crate::hip_photon::code_objects_installed(&architecture)
+                    && !(cfg!(windows) && crate::hip_photon::is_apu_architecture(&architecture)),
                 detail,
             });
         }
@@ -588,6 +589,7 @@ mod tests {
             backend: BackendKind::Hip,
             detail: String::new(),
             integrated: false,
+            ready: true,
         }];
         let selected = find_device(devices, 2, BackendKind::Hip).unwrap();
         assert_eq!(selected.backend, BackendKind::Hip);
@@ -603,6 +605,7 @@ mod tests {
             backend,
             detail: String::new(),
             integrated: false,
+            ready: true,
         }
     }
 
@@ -626,10 +629,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_selection_prefers_t2_wgpu_over_legacy_hip_for_amd() {
+    fn auto_selection_prefers_native_hip_t2_for_a_discrete_amd_gpu() {
         let selected = select_auto_device(
             Vec::new(),
             vec![fixture_device(0, "AMD", BackendKind::Hip)],
+            vec![fixture_device(0, "AMD", BackendKind::Wgpu)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.backend, BackendKind::Hip);
+    }
+
+    #[test]
+    fn auto_selection_uses_vulkan_when_hip_code_objects_are_missing() {
+        let selected = select_auto_device(
+            Vec::new(),
+            vec![GpuDevice {
+                ready: false,
+                ..fixture_device(0, "AMD", BackendKind::Hip)
+            }],
             vec![fixture_device(0, "AMD", BackendKind::Wgpu)],
             None,
         )
@@ -715,13 +733,5 @@ mod tests {
         let devices = vec![integrated_fixture(0, "AMD", BackendKind::Hip)];
         let selected = select_backend_device(devices, None, BackendKind::Hip).unwrap();
         assert!(selected.integrated);
-    }
-
-    #[test]
-    fn amd_apu_targets_are_integrated() {
-        assert!(is_amd_apu_architecture("gfx1036"));
-        assert!(is_amd_apu_architecture("gfx1103"));
-        assert!(!is_amd_apu_architecture("gfx1100"));
-        assert!(!is_amd_apu_architecture("gfx1201"));
     }
 }

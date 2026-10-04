@@ -181,7 +181,14 @@ impl PhotonEngine {
                 let _ = engine;
                 production_max_batch_candidates(BackendKind::Cuda)
             }
-            Self::Hip(_) => production_max_batch_candidates(BackendKind::Hip),
+            Self::Hip(engine) => {
+                #[cfg(feature = "tail-grind")]
+                if let Some(capacity) = engine.t2_group_batch_candidates() {
+                    return intensity_batch_candidates(capacity, intensity);
+                }
+                let _ = engine;
+                production_max_batch_candidates(BackendKind::Hip)
+            }
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.recommended_batch_candidates(),
         };
@@ -516,7 +523,8 @@ fn run_worker(
     winner_tx: SyncSender<VerifiedWinner>,
     work_fee: Option<crate::donation::Policy>,
 ) {
-    let t2_coordinate = cfg!(feature = "tail-grind") && matches!(&engine, PhotonEngine::Cuda(_));
+    let t2_coordinate = cfg!(feature = "tail-grind")
+        && matches!(&engine, PhotonEngine::Cuda(_) | PhotonEngine::Hip(_));
     let mut rng = rand::rng();
     let backend = match &engine {
         PhotonEngine::Cuda(_) => BackendKind::Cuda,
@@ -891,6 +899,10 @@ impl SearchHandle {
         if let PhotonEngine::Cuda(cuda) = &mut engine {
             // The parent reward BCH output must remain exactly 700 sats.
             cuda.enable_t2_search()?;
+        }
+        #[cfg(feature = "tail-grind")]
+        if let PhotonEngine::Hip(hip) = &mut engine {
+            hip.enable_t2_search()?;
         }
         #[cfg(all(feature = "incremental-k", not(feature = "tail-grind")))]
         if let PhotonEngine::Cuda(cuda) = &mut engine {

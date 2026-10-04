@@ -24,6 +24,7 @@ SOURCES = (
     "photon_stage_b16",
     "photon_c1_schnorr",
     "stage_c_hash",
+    "photon_t2_tail",
 )
 CLANG_OFFLOAD_BUNDLE_MAGIC = b"__CLANG_OFFLOAD_BUNDLE__"
 

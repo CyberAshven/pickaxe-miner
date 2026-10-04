@@ -1,5 +1,6 @@
 {
   "architecture": "gfx1036",
+  "architectures": ["gfx1030", "gfx1031", "gfx1032", "gfx1034", "gfx1036", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"],
   "code_objects": [
     {
       "file": "stage_a_rfc6979.hsaco",
@@ -72,6 +73,20 @@
             { "kind": "ptr", "offset": 40, "size": 8 },
             { "kind": "u32", "offset": 48, "size": 4 }
           ]
+        },
+        {
+          "symbol": "pickaxe_photon_c1_schnorr_dual_batched",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "u32", "offset": 56, "size": 4 },
+            { "kind": "u32", "offset": 60, "size": 4 }
+          ]
         }
       ]
     },
@@ -92,6 +107,242 @@
             { "kind": "ptr", "offset": 56, "size": 8 },
             { "kind": "u32", "offset": 64, "size": 4 },
             { "kind": "u32", "offset": 68, "size": 4 }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "photon_t2_tail.hsaco",
+      "kernels": [
+        {
+          "symbol": "pickaxe_t2_prepare_shift0",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "u32", "offset": 40, "size": 4 },
+            { "kind": "u32", "offset": 44, "size": 4 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "ptr", "offset": 56, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_prepare_shift1",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "u32", "offset": 40, "size": 4 },
+            { "kind": "u32", "offset": 44, "size": 4 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "ptr", "offset": 56, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_prepare_shift2",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "u32", "offset": 40, "size": 4 },
+            { "kind": "u32", "offset": 44, "size": 4 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "ptr", "offset": 56, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_prepare_shift3",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "u32", "offset": 40, "size": 4 },
+            { "kind": "u32", "offset": 44, "size": 4 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "ptr", "offset": 56, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_prepare_shift14",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "u32", "offset": 40, "size": 4 },
+            { "kind": "u32", "offset": 44, "size": 4 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "ptr", "offset": 56, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_prepare_shift15",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "u32", "offset": 40, "size": 4 },
+            { "kind": "u32", "offset": 44, "size": 4 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "ptr", "offset": 56, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_prepare_shift16",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "ptr", "offset": 24, "size": 8 },
+            { "kind": "ptr", "offset": 32, "size": 8 },
+            { "kind": "u32", "offset": 40, "size": 4 },
+            { "kind": "u32", "offset": 44, "size": 4 },
+            { "kind": "ptr", "offset": 48, "size": 8 },
+            { "kind": "ptr", "offset": 56, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_filter_group_shift0",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u64", "offset": 24, "size": 8 },
+            { "kind": "u64", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "u32", "offset": 48, "size": 4 },
+            { "kind": "u32", "offset": 52, "size": 4 },
+            { "kind": "u32", "offset": 56, "size": 4 },
+            { "kind": "u32", "offset": 60, "size": 4 },
+            { "kind": "ptr", "offset": 64, "size": 8 },
+            { "kind": "ptr", "offset": 72, "size": 8 },
+            { "kind": "ptr", "offset": 80, "size": 8 },
+            { "kind": "ptr", "offset": 88, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_filter_group_shift1",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u64", "offset": 24, "size": 8 },
+            { "kind": "u64", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "u32", "offset": 48, "size": 4 },
+            { "kind": "u32", "offset": 52, "size": 4 },
+            { "kind": "u32", "offset": 56, "size": 4 },
+            { "kind": "u32", "offset": 60, "size": 4 },
+            { "kind": "ptr", "offset": 64, "size": 8 },
+            { "kind": "ptr", "offset": 72, "size": 8 },
+            { "kind": "ptr", "offset": 80, "size": 8 },
+            { "kind": "ptr", "offset": 88, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_filter_group_shift2",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u64", "offset": 24, "size": 8 },
+            { "kind": "u64", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "u32", "offset": 48, "size": 4 },
+            { "kind": "u32", "offset": 52, "size": 4 },
+            { "kind": "u32", "offset": 56, "size": 4 },
+            { "kind": "u32", "offset": 60, "size": 4 },
+            { "kind": "ptr", "offset": 64, "size": 8 },
+            { "kind": "ptr", "offset": 72, "size": 8 },
+            { "kind": "ptr", "offset": 80, "size": 8 },
+            { "kind": "ptr", "offset": 88, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_filter_group_shift3",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u64", "offset": 24, "size": 8 },
+            { "kind": "u64", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "u32", "offset": 48, "size": 4 },
+            { "kind": "u32", "offset": 52, "size": 4 },
+            { "kind": "u32", "offset": 56, "size": 4 },
+            { "kind": "u32", "offset": 60, "size": 4 },
+            { "kind": "ptr", "offset": 64, "size": 8 },
+            { "kind": "ptr", "offset": 72, "size": 8 },
+            { "kind": "ptr", "offset": 80, "size": 8 },
+            { "kind": "ptr", "offset": 88, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_filter_group_shift14",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u64", "offset": 24, "size": 8 },
+            { "kind": "u64", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "u32", "offset": 48, "size": 4 },
+            { "kind": "u32", "offset": 52, "size": 4 },
+            { "kind": "u32", "offset": 56, "size": 4 },
+            { "kind": "u32", "offset": 60, "size": 4 },
+            { "kind": "ptr", "offset": 64, "size": 8 },
+            { "kind": "ptr", "offset": 72, "size": 8 },
+            { "kind": "ptr", "offset": 80, "size": 8 },
+            { "kind": "ptr", "offset": 88, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_filter_group_shift15",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u64", "offset": 24, "size": 8 },
+            { "kind": "u64", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "u32", "offset": 48, "size": 4 },
+            { "kind": "u32", "offset": 52, "size": 4 },
+            { "kind": "u32", "offset": 56, "size": 4 },
+            { "kind": "u32", "offset": 60, "size": 4 },
+            { "kind": "ptr", "offset": 64, "size": 8 },
+            { "kind": "ptr", "offset": 72, "size": 8 },
+            { "kind": "ptr", "offset": 80, "size": 8 },
+            { "kind": "ptr", "offset": 88, "size": 8 }
+          ]
+        },
+        {
+          "symbol": "pickaxe_t2_filter_group_shift16",
+          "args": [
+            { "kind": "ptr", "offset": 0, "size": 8 },
+            { "kind": "ptr", "offset": 8, "size": 8 },
+            { "kind": "ptr", "offset": 16, "size": 8 },
+            { "kind": "u64", "offset": 24, "size": 8 },
+            { "kind": "u64", "offset": 32, "size": 8 },
+            { "kind": "ptr", "offset": 40, "size": 8 },
+            { "kind": "u32", "offset": 48, "size": 4 },
+            { "kind": "u32", "offset": 52, "size": 4 },
+            { "kind": "u32", "offset": 56, "size": 4 },
+            { "kind": "u32", "offset": 60, "size": 4 },
+            { "kind": "ptr", "offset": 64, "size": 8 },
+            { "kind": "ptr", "offset": 72, "size": 8 },
+            { "kind": "ptr", "offset": 80, "size": 8 },
+            { "kind": "ptr", "offset": 88, "size": 8 }
           ]
         }
       ]

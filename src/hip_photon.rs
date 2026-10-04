@@ -2,7 +2,7 @@
 
 use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
-use crate::tx::PhotonLayout;
+use crate::tx::{self, PhotonLayout};
 use libloading::Library;
 use num_bigint::BigUint;
 use secp256k1::{PublicKey, SecretKey};
@@ -21,11 +21,12 @@ const FIXED_D_WORDS: usize = 32 * 256 * 8;
 const HIP_SUCCESS: c_int = 0;
 const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
-const HIP_CODE_OBJECT_NAMES: [&str; 4] = [
+const HIP_CODE_OBJECT_NAMES: [&str; 5] = [
     "stage_a_rfc6979.hsaco",
     "photon_stage_b16.hsaco",
     "photon_c1_schnorr.hsaco",
     "stage_c_hash.hsaco",
+    "photon_t2_tail.hsaco",
 ];
 const HIP_STAGE_A_SYMBOL: &str = "pickaxe_stage_a_rfc6979";
 const HIP_STAGE_B_SYMBOLS: [&str; 4] = [
@@ -36,11 +37,34 @@ const HIP_STAGE_B_SYMBOLS: [&str; 4] = [
 ];
 const HIP_STAGE_C1_SYMBOL: &str = "pickaxe_photon_c1_schnorr";
 const HIP_STAGE_C3_SYMBOL: &str = "pickaxe_stage_c_hash_filter";
+const HIP_STAGE_C1_DUAL_SYMBOL: &str = "pickaxe_photon_c1_schnorr_dual_batched";
+/// T2 searches 65,536 token amounts under each signature.
+const T2_CANDIDATES: u32 = 65_536;
+/// Signature windows per T2 batch, matching the CUDA T2 group.
+const T2_GROUP_WINDOWS: u32 = 256;
+pub(crate) const HIP_T2_GROUP_CANDIDATES: u32 = T2_GROUP_WINDOWS * T2_CANDIDATES;
+/// A batch that starts inside a window spans one extra signature window.
+const T2_MAX_WINDOWS: usize = T2_GROUP_WINDOWS as usize + 1;
+/// The C++ group kernel's block size; a block crosses at most one window edge.
+const T2_THREADS: u32 = 128;
+/// Transaction bytes 0..384 stay fixed for every nonce and amount.
+const T2_MIDSTATE_BYTES: usize = 384;
+const SHA256_INITIAL_STATE: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HipArgKind {
     Ptr,
     U32,
+    U64,
 }
 
 const HIP_STAGE_A_ABI: [HipArgKind; 6] = [
@@ -79,7 +103,45 @@ const HIP_STAGE_C3_ABI: [HipArgKind; 11] = [
     HipArgKind::U32,
     HipArgKind::U32,
 ];
-const MAX_HIP_KERNEL_ARGS: usize = HIP_STAGE_C3_ABI.len();
+const HIP_STAGE_C1_DUAL_ABI: [HipArgKind; 9] = [
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+    HipArgKind::U32,
+];
+const HIP_T2_PREPARE_ABI: [HipArgKind; 9] = [
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+    HipArgKind::U32,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+];
+const HIP_T2_FILTER_GROUP_ABI: [HipArgKind; 14] = [
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::U64,
+    HipArgKind::U64,
+    HipArgKind::Ptr,
+    HipArgKind::U32,
+    HipArgKind::U32,
+    HipArgKind::U32,
+    HipArgKind::U32,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+    HipArgKind::Ptr,
+];
+const MAX_HIP_KERNEL_ARGS: usize = HIP_T2_FILTER_GROUP_ABI.len();
 
 type HipError = c_int;
 type HipInit = unsafe extern "C" fn(c_uint) -> HipError;
@@ -395,6 +457,10 @@ pub struct HipPhotonEngine {
     stage_b: [usize; 4],
     stage_c1: usize,
     stage_c3: usize,
+    _t2_module: HipModule,
+    stage_c1_dual: usize,
+    t2_prepare: [usize; PhotonLayout::GPU_SHIFTS.len()],
+    t2_filter_group: [usize; PhotonLayout::GPU_SHIFTS.len()],
     table_gpu: HipBuffer,
     target_gpu: HipBuffer,
     private_key_gpu: HipBuffer,
@@ -408,6 +474,13 @@ pub struct HipPhotonEngine {
     winner_count_gpu: HipBuffer,
     winner_nonces_gpu: HipBuffer,
     winner_hashes_gpu: HipBuffer,
+    negated_s_gpu: HipBuffer,
+    midstate_gpu: HipBuffer,
+    middle_schedule_gpu: HipBuffer,
+    window_txs_gpu: HipBuffer,
+    window_prefixes_gpu: HipBuffer,
+    t2_target_gpu: HipBuffer,
+    winner_j_gpu: HipBuffer,
     max_candidates: u32,
     winner_cap: u32,
     #[allow(dead_code)]
@@ -417,6 +490,15 @@ pub struct HipPhotonEngine {
     layout: PhotonLayout,
     positive_target: bool,
     job_ready: bool,
+    t2_requested: bool,
+    t2: Option<HipT2Amounts>,
+}
+
+/// Token amounts of the active T2 job; amount j moves from the reward to the baton.
+#[derive(Clone, Copy)]
+struct HipT2Amounts {
+    baton: u64,
+    reward: u64,
 }
 
 #[repr(C, align(64))]
@@ -654,6 +736,83 @@ fn u32_arg(value: &mut u32) -> HipKernelArg {
     }
 }
 
+/// Packs a 64-bit value as a HIP kernel argument.
+fn u64_arg(value: &mut u64) -> HipKernelArg {
+    HipKernelArg {
+        raw: (value as *mut u64).cast(),
+        kind: HipArgKind::U64,
+    }
+}
+
+/// Splits a flattened T2 batch into its first nonce, first amount and window count.
+fn t2_group_windows(base: u32, count: u32) -> Result<(u32, u32, u32), String> {
+    if count == 0 || count > HIP_T2_GROUP_CANDIDATES {
+        return Err(format!(
+            "HIP T2 batch of {count} candidates must hold 1..={HIP_T2_GROUP_CANDIDATES}"
+        ));
+    }
+    let j_base = base % T2_CANDIDATES;
+    Ok((
+        base / T2_CANDIDATES,
+        j_base,
+        (j_base + count).div_ceil(T2_CANDIDATES),
+    ))
+}
+
+/// SHA-256 state after the transaction bytes 0..384, fixed for every nonce and amount.
+fn t2_midstate(template: &[u8]) -> [u32; 8] {
+    let mut state = SHA256_INITIAL_STATE;
+    sha2::block_api::compress256(
+        &mut state,
+        template[..T2_MIDSTATE_BYTES].as_chunks::<64>().0,
+    );
+    state
+}
+
+/// Message schedule of bytes 512..575, which `supports_t2_window` keeps free
+/// of the varying amounts.
+fn t2_middle_schedule(template: &[u8]) -> [u32; 64] {
+    let mut schedule = [0u32; 64];
+    for (word, bytes) in template[512..576].as_chunks::<4>().0.iter().enumerate() {
+        schedule[word] = u32::from_be_bytes(*bytes);
+    }
+    for word in 16..64 {
+        let a = schedule[word - 15];
+        let b = schedule[word - 2];
+        let sigma0 = a.rotate_right(7) ^ a.rotate_right(18) ^ (a >> 3);
+        let sigma1 = b.rotate_right(17) ^ b.rotate_right(19) ^ (b >> 10);
+        schedule[word] = schedule[word - 16]
+            .wrapping_add(sigma0)
+            .wrapping_add(schedule[word - 7])
+            .wrapping_add(sigma1);
+    }
+    schedule
+}
+
+/// AMD APU targets (integrated Radeon GPUs) from the LLVM AMDGPU processor list.
+pub(crate) fn is_apu_architecture(architecture: &str) -> bool {
+    matches!(
+        architecture,
+        "gfx902"
+            | "gfx909"
+            | "gfx90c"
+            | "gfx1033"
+            | "gfx1035"
+            | "gfx1036"
+            | "gfx1103"
+            | "gfx1150"
+            | "gfx1151"
+            | "gfx1152"
+    )
+}
+
+/// Whether a complete PHOTON code-object set is installed for an architecture.
+pub(crate) fn code_objects_installed(architecture: &str) -> bool {
+    code_object_candidate_dirs_for_runtime(architecture)
+        .iter()
+        .any(|directory| directory_has_complete_code_objects(directory))
+}
+
 impl HipPhotonEngine {
     /// Creates a HipPhotonEngine for the HIP GPU pipeline.
     pub fn new(
@@ -671,18 +830,19 @@ impl HipPhotonEngine {
         )?;
         let architecture = device_architecture(&api, device_ordinal)?;
         let directory = resolve_code_object_dir(&architecture)?;
-        // #### PR #22: native HIP stays off on Windows until its launch works
-        // What: refuse to start the HIP engine on Windows after the code-object
-        // check, before any module load or launch.
-        // Why: the only shipped target, gfx1036, loads its v5 code objects on
-        // the HIP 5.7 runtime in AMD's Windows driver, but the first launch
-        // never completes, so mining would hang instead of failing.
-        // Check: remove once a Windows gfx1036 benchmark completes; the default
-        // WGPU engine mines on the same GPU through Vulkan.
-        if cfg!(windows) {
+        // #### PR #22: native HIP stays off integrated GPUs under Windows
+        // What: refuse integrated (APU) targets on Windows after the
+        // code-object check, before any module load or launch.
+        // Why: on a gfx1036 APU the HIP 5.7 runtime in AMD's Windows driver
+        // loads v4 and v5 code objects but never completes the first launch,
+        // so mining would hang. AMD's Windows HIP runtime targets discrete
+        // Radeon GPUs; integrated GPUs mine through the Vulkan engine.
+        // Check: discrete Windows HIP is untested on hardware; remove this
+        // once an APU benchmark completes.
+        if cfg!(windows) && is_apu_architecture(&architecture) {
             return Err(format!(
-                "native HIP mining does not complete a launch on Windows yet ({architecture}); \
-                 use the default Vulkan engine (--backend wgpu)"
+                "native HIP does not complete a launch on integrated {architecture} GPUs \
+                 under Windows; use the default Vulkan engine (--backend wgpu)"
             ));
         }
         for name in HIP_CODE_OBJECT_NAMES {
@@ -704,6 +864,18 @@ impl HipPhotonEngine {
         ];
         let stage_c1 = stage_c1_module.function(HIP_STAGE_C1_SYMBOL)?;
         let stage_c3 = stage_c3_module.function(HIP_STAGE_C3_SYMBOL)?;
+        let stage_c1_dual = stage_c1_module.function(HIP_STAGE_C1_DUAL_SYMBOL)?;
+        let t2_module = HipModule::load(&api, &directory.join("photon_t2_tail.hsaco"))?;
+        let shift_functions = |kernel: &str| {
+            let mut functions = [0usize; PhotonLayout::GPU_SHIFTS.len()];
+            for (slot, shift) in PhotonLayout::GPU_SHIFTS.iter().enumerate() {
+                functions[slot] =
+                    t2_module.function(&format!("pickaxe_t2_{kernel}_shift{shift}"))?;
+            }
+            Ok::<_, String>(functions)
+        };
+        let t2_prepare = shift_functions("prepare")?;
+        let t2_filter_group = shift_functions("filter_group")?;
 
         let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
         let table_gpu = HipBuffer::allocate(&api, table_bytes.len(), "64 MiB M29 table")?;
@@ -743,6 +915,21 @@ impl HipPhotonEngine {
                 winner_cap as usize * 32,
                 "winner hashes",
             )?,
+            negated_s_gpu: HipBuffer::allocate(&api, T2_MAX_WINDOWS * 32, "negated nonce scalars")?,
+            midstate_gpu: HipBuffer::allocate(&api, 8 * 4, "T2 transaction midstate")?,
+            middle_schedule_gpu: HipBuffer::allocate(&api, 64 * 4, "T2 middle schedule")?,
+            window_txs_gpu: HipBuffer::allocate(
+                &api,
+                T2_MAX_WINDOWS * MAX_TX_BYTES,
+                "T2 window transactions",
+            )?,
+            window_prefixes_gpu: HipBuffer::allocate(
+                &api,
+                T2_MAX_WINDOWS * 8 * 4,
+                "T2 window prefixes",
+            )?,
+            t2_target_gpu: HipBuffer::allocate(&api, 33, "T2 target and proof rule")?,
+            winner_j_gpu: HipBuffer::allocate(&api, winner_cap as usize * 4, "winner amounts")?,
             api,
             stream,
             _stage_a_module: stage_a_module,
@@ -753,6 +940,10 @@ impl HipPhotonEngine {
             stage_b,
             stage_c1,
             stage_c3,
+            _t2_module: t2_module,
+            stage_c1_dual,
+            t2_prepare,
+            t2_filter_group,
             table_gpu,
             max_candidates,
             winner_cap,
@@ -761,6 +952,8 @@ impl HipPhotonEngine {
             layout: PhotonLayout::BASE,
             positive_target: false,
             job_ready: false,
+            t2_requested: false,
+            t2: None,
         })
     }
 
@@ -791,6 +984,32 @@ impl HipPhotonEngine {
             + self.winner_count_gpu.bytes
             + self.winner_nonces_gpu.bytes
             + self.winner_hashes_gpu.bytes
+            + self.negated_s_gpu.bytes
+            + self.midstate_gpu.bytes
+            + self.middle_schedule_gpu.bytes
+            + self.window_txs_gpu.bytes
+            + self.window_prefixes_gpu.bytes
+            + self.t2_target_gpu.bytes
+            + self.winner_j_gpu.bytes
+    }
+
+    /// Searches 65,536 token amounts under each signature (T2), as CUDA does.
+    pub fn enable_t2_search(&mut self) -> Result<(), String> {
+        if self.job_ready {
+            return Err("enable HIP T2 search before the first job".into());
+        }
+        if (self.max_candidates as usize) < T2_MAX_WINDOWS {
+            return Err(format!(
+                "HIP T2 needs signature buffers for {T2_MAX_WINDOWS} windows"
+            ));
+        }
+        self.t2_requested = true;
+        Ok(())
+    }
+
+    /// Candidates per batch while the current job runs in T2 mode.
+    pub fn t2_group_batch_candidates(&self) -> Option<u32> {
+        self.t2.map(|_| HIP_T2_GROUP_CANDIDATES)
     }
 
     /// Selects the positive ScriptNum proof rule for the next job.
@@ -825,9 +1044,40 @@ impl HipPhotonEngine {
             .copy_from(&fixed_d, "upload fixed-d table")?;
         self.template_gpu
             .copy_from(template, "upload transaction template")?;
+        self.t2 = None;
+        if self.t2_requested && tx::supports_t2_window(template)? {
+            self.t2 = Some(self.set_t2_template(template, target, layout)?);
+        }
         self.layout = layout;
         self.job_ready = true;
         Ok(())
+    }
+
+    /// Uploads the per-job T2 material: fixed midstate, middle schedule and target rule.
+    fn set_t2_template(
+        &mut self,
+        template: &[u8],
+        target: &[u8; 32],
+        layout: PhotonLayout,
+    ) -> Result<HipT2Amounts, String> {
+        let shift = layout.shift();
+        let baton = u64::from_le_bytes(template[491 + shift..499 + shift].try_into().unwrap());
+        let reward = u64::from_le_bytes(template[578 + shift..586 + shift].try_into().unwrap());
+        tx::t2_reward_amount(
+            u128::from(baton) + u128::from(reward),
+            u128::from(reward),
+            u16::MAX,
+        )?;
+        self.midstate_gpu
+            .copy_from(&t2_midstate(template), "upload T2 midstate")?;
+        self.middle_schedule_gpu
+            .copy_from(&t2_middle_schedule(template), "upload T2 middle schedule")?;
+        let mut rule_target = [0u8; 33];
+        rule_target[..32].copy_from_slice(target);
+        rule_target[32] = u8::from(self.positive_target);
+        self.t2_target_gpu
+            .copy_from(&rule_target, "upload T2 target")?;
+        Ok(HipT2Amounts { baton, reward })
     }
 
     /// Runs a bounded PHOTON candidate batch on the HIP GPU.
@@ -846,12 +1096,22 @@ impl HipPhotonEngine {
                 winners: Vec::new(),
             });
         }
+        if let Some(amounts) = self.t2 {
+            return self.search_t2_batch(nonce_base, candidate_count, amounts);
+        }
         if candidate_count > self.max_candidates {
             return Err(format!(
                 "PHOTON HIP batch {candidate_count} exceeds persistent capacity {}",
                 self.max_candidates
             ));
         }
+        self.reset_winner_count()?;
+        self.launch_stage_a(nonce_base, candidate_count)?;
+        self.search_batch_finish(nonce_base, candidate_count)
+    }
+
+    /// Clears the device winner counter before a filter launch.
+    fn reset_winner_count(&self) -> Result<(), String> {
         self.api.check(
             unsafe {
                 (self.api.memset_async)(
@@ -862,8 +1122,11 @@ impl HipPhotonEngine {
                 )
             },
             "reset HIP winner count",
-        )?;
+        )
+    }
 
+    /// Runs the HIP stage A RFC6979 nonce kernel for consecutive nonces.
+    fn launch_stage_a(&mut self, nonce_base: u32, candidate_count: u32) -> Result<(), String> {
         let mut nonce_arg = nonce_base;
         let mut target = self.target_gpu.ptr;
         let mut private_key = self.private_key_gpu.ptr;
@@ -886,9 +1149,160 @@ impl HipPhotonEngine {
             &mut stage_a_params,
             &HIP_STAGE_A_ABI,
             "launch PHOTON HIP Stage A",
+        )
+    }
+
+    // #### PR #22: native HIP T2 window search for AMD GPUs
+    // What: one batch signs each 65,536-amount window (Stage A nonces, Stage B
+    // points, dual C1 signatures and negated s), prepares the windows, then
+    // filters every amount with the CUDA C++ T2 kernels compiled for HIP.
+    // Why: native HIP previously signed every candidate, the slow pre-T2 path.
+    // The kernels, launch geometry and winner records match CUDA's C++ T2.
+    // Check: tail_j winners must rebuild on the CPU; the HIP vector test
+    // compares every returned digest with a CPU-signed transaction.
+    fn search_t2_batch(
+        &mut self,
+        base: u32,
+        count: u32,
+        amounts: HipT2Amounts,
+    ) -> Result<PhotonCudaBatchResult, String> {
+        let (nonce_base, j_base, window_count) = t2_group_windows(base, count)?;
+        self.launch_stage_a(nonce_base, window_count)?;
+        self.search_stage_b(window_count)?;
+        self.launch_stage_c1_dual(window_count)?;
+
+        let kernel = self.layout.kernel_index();
+        let mut template = self.template_gpu.ptr;
+        let mut midstate = self.midstate_gpu.ptr;
+        let mut signatures = self.signatures_gpu.ptr;
+        let mut negated_s = self.negated_s_gpu.ptr;
+        let mut points = self.points_gpu.ptr;
+        let mut nonce_arg = nonce_base;
+        let mut windows = window_count;
+        let mut window_txs = self.window_txs_gpu.ptr;
+        let mut window_prefixes = self.window_prefixes_gpu.ptr;
+        let mut prepare_params = [
+            ptr_arg(&mut template),
+            ptr_arg(&mut midstate),
+            ptr_arg(&mut signatures),
+            ptr_arg(&mut negated_s),
+            ptr_arg(&mut points),
+            u32_arg(&mut nonce_arg),
+            u32_arg(&mut windows),
+            ptr_arg(&mut window_txs),
+            ptr_arg(&mut window_prefixes),
+        ];
+        launch(
+            &self.api,
+            &self.stream,
+            self.t2_prepare[kernel],
+            (window_count.div_ceil(T2_THREADS), T2_THREADS),
+            &mut prepare_params,
+            &HIP_T2_PREPARE_ABI,
+            "launch PHOTON HIP T2 window prepare",
         )?;
 
-        self.search_batch_finish(nonce_base, candidate_count)
+        self.reset_winner_count()?;
+        let mut middle_schedule = self.middle_schedule_gpu.ptr;
+        let mut baton = amounts.baton;
+        let mut reward = amounts.reward;
+        let mut target = self.t2_target_gpu.ptr;
+        let mut j_base_arg = j_base;
+        let mut count_arg = count;
+        let mut winner_cap = self.winner_cap;
+        let mut winner_count = self.winner_count_gpu.ptr;
+        let mut winner_nonces = self.winner_nonces_gpu.ptr;
+        let mut winner_j = self.winner_j_gpu.ptr;
+        let mut winner_hashes = self.winner_hashes_gpu.ptr;
+        let mut filter_params = [
+            ptr_arg(&mut window_txs),
+            ptr_arg(&mut window_prefixes),
+            ptr_arg(&mut middle_schedule),
+            u64_arg(&mut baton),
+            u64_arg(&mut reward),
+            ptr_arg(&mut target),
+            u32_arg(&mut nonce_arg),
+            u32_arg(&mut j_base_arg),
+            u32_arg(&mut count_arg),
+            u32_arg(&mut winner_cap),
+            ptr_arg(&mut winner_count),
+            ptr_arg(&mut winner_nonces),
+            ptr_arg(&mut winner_j),
+            ptr_arg(&mut winner_hashes),
+        ];
+        launch(
+            &self.api,
+            &self.stream,
+            self.t2_filter_group[kernel],
+            (count.div_ceil(T2_THREADS), T2_THREADS),
+            &mut filter_params,
+            &HIP_T2_FILTER_GROUP_ABI,
+            "launch PHOTON HIP T2 amount filter",
+        )?;
+        self.stream.synchronize()?;
+
+        let mut total_winners = [0u32; 1];
+        self.winner_count_gpu
+            .copy_to(&mut total_winners, "read HIP T2 winner count")?;
+        let returned = total_winners[0].min(self.winner_cap) as usize;
+        let mut nonces = vec![0u32; returned];
+        let mut js = vec![0u32; returned];
+        let mut hashes = vec![0u8; returned * 32];
+        if returned != 0 {
+            self.winner_nonces_gpu
+                .copy_to(&mut nonces, "read HIP T2 winner nonces")?;
+            self.winner_j_gpu
+                .copy_to(&mut js, "read HIP T2 winner amounts")?;
+            self.winner_hashes_gpu
+                .copy_to(&mut hashes, "read HIP T2 winner hashes")?;
+        }
+        let winners = (0..returned)
+            .map(|slot| PhotonCudaWinner {
+                nonce: nonces[slot],
+                digest: hashes[slot * 32..(slot + 1) * 32].try_into().unwrap(),
+                schnorr_k: None,
+                tail_j: Some(js[slot] as u16),
+                tail_value_sats: None,
+            })
+            .collect();
+        Ok(PhotonCudaBatchResult {
+            candidates: count,
+            total_winners: total_winners[0],
+            winners,
+        })
+    }
+
+    /// Runs the dual C1 kernel: signatures plus negated s for the T2 square check.
+    fn launch_stage_c1_dual(&mut self, window_count: u32) -> Result<(), String> {
+        let mut message_hashes = self.message_hashes_gpu.ptr;
+        let mut rfc6979 = self.rfc6979_gpu.ptr;
+        let mut points = self.points_gpu.ptr;
+        let mut public_key = self.public_key_gpu.ptr;
+        let mut fixed_d = self.fixed_d_gpu.ptr;
+        let mut signatures = self.signatures_gpu.ptr;
+        let mut negated_s = self.negated_s_gpu.ptr;
+        let mut count = window_count;
+        let mut per_thread = 1u32;
+        let mut params = [
+            ptr_arg(&mut message_hashes),
+            ptr_arg(&mut rfc6979),
+            ptr_arg(&mut points),
+            ptr_arg(&mut public_key),
+            ptr_arg(&mut fixed_d),
+            ptr_arg(&mut signatures),
+            ptr_arg(&mut negated_s),
+            u32_arg(&mut count),
+            u32_arg(&mut per_thread),
+        ];
+        launch(
+            &self.api,
+            &self.stream,
+            self.stage_c1_dual,
+            (window_count.div_ceil(64), 64),
+            &mut params,
+            &HIP_STAGE_C1_DUAL_ABI,
+            "launch PHOTON HIP T2 Stage C1",
+        )
     }
 
     /// Reads back and verifies a completed HIP search batch.
@@ -1044,6 +1458,7 @@ mod tests {
             .map(|kind| match kind {
                 HipArgKind::Ptr => "ptr",
                 HipArgKind::U32 => "u32",
+                HipArgKind::U64 => "u64",
             })
             .collect()
     }
@@ -1069,15 +1484,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(files, HIP_CODE_OBJECT_NAMES);
 
-        let expected = [
-            (HIP_STAGE_A_SYMBOL, abi_kinds(&HIP_STAGE_A_ABI)),
-            (HIP_STAGE_B_SYMBOLS[0], abi_kinds(&HIP_STAGE_B_ABI)),
-            (HIP_STAGE_B_SYMBOLS[1], abi_kinds(&HIP_STAGE_B_ABI)),
-            (HIP_STAGE_B_SYMBOLS[2], abi_kinds(&HIP_STAGE_B_ABI)),
-            (HIP_STAGE_B_SYMBOLS[3], abi_kinds(&HIP_STAGE_B_ABI)),
-            (HIP_STAGE_C1_SYMBOL, abi_kinds(&HIP_STAGE_C1_ABI)),
-            (HIP_STAGE_C3_SYMBOL, abi_kinds(&HIP_STAGE_C3_ABI)),
+        let mut expected = vec![
+            (HIP_STAGE_A_SYMBOL.to_string(), abi_kinds(&HIP_STAGE_A_ABI)),
+            (
+                HIP_STAGE_B_SYMBOLS[0].to_string(),
+                abi_kinds(&HIP_STAGE_B_ABI),
+            ),
+            (
+                HIP_STAGE_B_SYMBOLS[1].to_string(),
+                abi_kinds(&HIP_STAGE_B_ABI),
+            ),
+            (
+                HIP_STAGE_B_SYMBOLS[2].to_string(),
+                abi_kinds(&HIP_STAGE_B_ABI),
+            ),
+            (
+                HIP_STAGE_B_SYMBOLS[3].to_string(),
+                abi_kinds(&HIP_STAGE_B_ABI),
+            ),
+            (
+                HIP_STAGE_C1_SYMBOL.to_string(),
+                abi_kinds(&HIP_STAGE_C1_ABI),
+            ),
+            (
+                HIP_STAGE_C1_DUAL_SYMBOL.to_string(),
+                abi_kinds(&HIP_STAGE_C1_DUAL_ABI),
+            ),
+            (
+                HIP_STAGE_C3_SYMBOL.to_string(),
+                abi_kinds(&HIP_STAGE_C3_ABI),
+            ),
         ];
+        for shift in PhotonLayout::GPU_SHIFTS {
+            expected.push((
+                format!("pickaxe_t2_prepare_shift{shift}"),
+                abi_kinds(&HIP_T2_PREPARE_ABI),
+            ));
+        }
+        for shift in PhotonLayout::GPU_SHIFTS {
+            expected.push((
+                format!("pickaxe_t2_filter_group_shift{shift}"),
+                abi_kinds(&HIP_T2_FILTER_GROUP_ABI),
+            ));
+        }
         let actual = objects
             .iter()
             .flat_map(|object| {
@@ -1093,10 +1542,156 @@ mod tests {
                     .iter()
                     .map(|arg| arg["kind"].as_str().expect("HIP arg kind"))
                     .collect::<Vec<_>>();
-                (symbol, kinds)
+                (symbol.to_string(), kinds)
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn t2_group_windows_split_flattened_candidates() {
+        assert_eq!(t2_group_windows(0, 16).unwrap(), (0, 0, 1));
+        // A batch starting 16 amounts before a window edge needs two signatures.
+        assert_eq!(t2_group_windows(65_520, 32).unwrap(), (0, 65_520, 2));
+        assert_eq!(t2_group_windows(65_536, 16).unwrap(), (1, 0, 1));
+        assert_eq!(
+            t2_group_windows(3 * 65_536 + 1, HIP_T2_GROUP_CANDIDATES).unwrap(),
+            (3, 1, T2_MAX_WINDOWS as u32)
+        );
+        assert!(t2_group_windows(0, 0).is_err());
+        assert!(t2_group_windows(0, HIP_T2_GROUP_CANDIDATES + 1).is_err());
+    }
+
+    /// One SHA-256 compression driven by a precomputed 64-word schedule.
+    fn compress_with_schedule(state: &mut [u32; 8], schedule: &[u32; 64]) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for round in 0..64 {
+            let t1 = h
+                .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+                .wrapping_add((e & f) ^ (!e & g))
+                .wrapping_add(K[round])
+                .wrapping_add(schedule[round]);
+            let t2 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+                .wrapping_add((a & b) ^ (a & c) ^ (b & c));
+            (h, g, f, e, d, c, b, a) = (g, f, e, d.wrapping_add(t1), c, b, a, t1.wrapping_add(t2));
+        }
+        for (word, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *word = word.wrapping_add(value);
+        }
+    }
+
+    #[test]
+    fn t2_midstate_and_middle_schedule_rebuild_the_confirmed_parent_hash() {
+        // The confirmed Chipnet v3.2 parent: the GPU resumes from the 384-byte
+        // midstate and drives block 8 (bytes 512..575) from the host schedule.
+        let template = hex::decode(
+            include_str!("../reference/photon_v32_chipnet_confirmed_parent.hex").trim(),
+        )
+        .unwrap();
+        let mut padded = template.clone();
+        padded.push(0x80);
+        while padded.len() % 64 != 56 {
+            padded.push(0);
+        }
+        padded.extend_from_slice(&((template.len() as u64) * 8).to_be_bytes());
+        assert_eq!(padded.len(), 640);
+
+        let mut state = t2_midstate(&template);
+        for (index, block) in padded[T2_MIDSTATE_BYTES..]
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            if T2_MIDSTATE_BYTES + index * 64 == 512 {
+                compress_with_schedule(&mut state, &t2_middle_schedule(&template));
+            } else {
+                sha2::block_api::compress256(&mut state, std::slice::from_ref(block));
+            }
+        }
+        let first: Vec<u8> = state.iter().flat_map(|word| word.to_be_bytes()).collect();
+        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&first).into();
+        assert_eq!(digest, crate::proof::hash256(&template));
+    }
+
+    #[test]
+    fn integrated_amd_targets_are_recognized() {
+        assert!(is_apu_architecture("gfx1036"));
+        assert!(is_apu_architecture("gfx1103"));
+        assert!(!is_apu_architecture("gfx1030"));
+        assert!(!is_apu_architecture("gfx1100"));
+        assert!(!is_apu_architecture("gfx1201"));
+    }
+
+    /// A fully CPU-signed PHOTON claim for one nonce and reward amount.
+    fn signed_t2_template(target: [u8; 32], reward: u128, nonce: u32) -> Vec<u8> {
+        let key = [0x11; 32];
+        let public = crate::crypto::compressed_pubkey(&key).unwrap();
+        let message = tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
+        let signature = crate::crypto::bch_schnorr_sign(&key, &message).unwrap();
+        tx::template_for_shift(0, |age| tx::TemplateParams {
+            prev_tx_hash_hex: "aa".repeat(32),
+            prev_index: 0,
+            age,
+            public_key_hex: hex::encode(public),
+            target_hex: hex::encode(target),
+            signature_hex: hex::encode(signature),
+            nonce,
+            contract_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
+            contract_token_amount: 2_099_905_002_035_715,
+            reward_amount: reward,
+            payout_locking: tx::cashaddr_to_p2pkh_locking(
+                "zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3",
+            )
+            .unwrap(),
+        })
+    }
+
+    #[test]
+    fn t2_group_winners_match_cpu_signed_windows_if_hip_present() {
+        const REWARD: u128 = 4_999_773_813;
+        let target = [0xff; 32];
+        let key = [0x11; 32];
+        let mut engine = match HipPhotonEngine::new(0, 65_536, 8) {
+            Ok(engine) => engine,
+            Err(error) => {
+                eprintln!("skip HIP T2 vector: {error}");
+                return;
+            }
+        };
+        engine.enable_t2_search().unwrap();
+        engine
+            .set_job(&signed_t2_template(target, REWARD, 0), &target, &key)
+            .unwrap();
+        assert_eq!(
+            engine.t2_group_batch_candidates(),
+            Some(HIP_T2_GROUP_CANDIDATES)
+        );
+        // Within one window, across a window edge, and in a later window.
+        for (base, count) in [(65_520, 16), (65_536, 16), (131_056, 16)] {
+            let result = engine.search_batch(base, count).unwrap();
+            assert_eq!(result.candidates, count);
+            assert_eq!(result.total_winners, count);
+            for winner in result.winners {
+                let j = winner.tail_j.unwrap();
+                assert_eq!(winner.nonce, base >> 16);
+                let raw = signed_t2_template(target, REWARD - u128::from(j), winner.nonce);
+                assert_eq!(winner.digest, crate::proof::hash256(&raw));
+            }
+        }
     }
 
     #[test]

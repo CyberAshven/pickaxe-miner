@@ -3370,6 +3370,7 @@ mod tests {
                 backend: BackendKind::Cuda,
                 detail: String::new(),
                 integrated: false,
+                ready: true,
             },
             GpuDevice {
                 index: 0,
@@ -3379,6 +3380,7 @@ mod tests {
                 backend: BackendKind::Hip,
                 detail: String::new(),
                 integrated: false,
+                ready: true,
             },
         ]
     }
