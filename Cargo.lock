@@ -1532,7 +1532,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "pollster",
- "rand 0.9.5",
+ "rand 0.10.3",
  "ratatui",
  "ripemd",
  "secp256k1",
