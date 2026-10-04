@@ -493,25 +493,7 @@ pub(super) struct T2Live {
 
 impl T2Live {
     pub(super) fn supports_job(template: &[u8]) -> Result<bool, String> {
-        let shift = PhotonLayout::for_tx_len(template.len())?.shift();
-        if template[490 + shift] != 0xff || template[577 + shift] != 0xff {
-            return Ok(false);
-        }
-        let baton = u64::from_le_bytes(template[491 + shift..499 + shift].try_into().unwrap());
-        let reward = u64::from_le_bytes(template[578 + shift..586 + shift].try_into().unwrap());
-        let total = u128::from(baton) + u128::from(reward);
-        // The group kernel reuses one SHA-256 schedule for bytes 512..575.
-        // Wide layouts put the baton's top bytes there, so every T2 amount
-        // must leave those bytes unchanged.
-        let block7_bytes = 512 - (491 + shift).min(512);
-        if block7_bytes < 8
-            && baton
-                .checked_add(u64::from(u16::MAX))
-                .is_none_or(|last| last >> (8 * block7_bytes) != baton >> (8 * block7_bytes))
-        {
-            return Ok(false);
-        }
-        Ok(tx::t2_reward_amount(total, u128::from(reward), u16::MAX).is_ok())
+        tx::supports_t2_window(template)
     }
 
     pub(super) fn new(

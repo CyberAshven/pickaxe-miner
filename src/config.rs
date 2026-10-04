@@ -202,11 +202,7 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     pub fn set_network(&mut self, network: MiningNetwork) {
         if self.network != network {
-            if !self.payout_address.is_empty() {
-                if let Ok(converted) = reprefix_p2pkh_payout(&self.payout_address, network) {
-                    self.payout_address = converted;
-                }
-            }
+            // Keep the entered address intact; validation requires an address for the new chain.
             // Configured sources are chain-specific. CLI overrides are applied after the network.
             self.fulcrum_url = None;
             self.node_url = None;
@@ -225,18 +221,10 @@ impl RuntimeConfig {
     }
 
     pub fn validate_payout_network(&self) -> Result<(), String> {
-        if self.payout_address.is_empty()
-            || self
-                .payout_address
-                .starts_with(&format!("{}:", self.network.cashaddr_prefix()))
-        {
+        if self.payout_address.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "payout address must use {}: on {}",
-                self.network.cashaddr_prefix(),
-                self.network.as_str()
-            ))
+            validate_payout_address(self.network, &self.payout_address).map(|_| ())
         }
     }
 
@@ -256,40 +244,7 @@ impl RuntimeConfig {
 
     /// Validates and stores the miner payout CashAddr.
     pub fn set_payout(&mut self, addr: String) -> Result<(), String> {
-        let trimmed = addr.trim().to_string();
-        if trimmed.is_empty() {
-            return Err("payout address required".into());
-        }
-        if trimmed.chars().any(|ch| ch.is_ascii_lowercase())
-            && trimmed.chars().any(|ch| ch.is_ascii_uppercase())
-        {
-            return Err(
-                "invalid payout CashAddr: CashAddr must not mix upper and lower case".into(),
-            );
-        }
-        let canonical = if trimmed.contains(':') {
-            trimmed.to_ascii_lowercase()
-        } else {
-            format!(
-                "{}:{}",
-                self.network.cashaddr_prefix(),
-                trimmed.to_ascii_lowercase()
-            )
-        };
-        crate::tx::cashaddr_to_p2pkh_locking(&canonical)
-            .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
-        let selected = if canonical.starts_with(&format!("{}:", self.network.cashaddr_prefix())) {
-            canonical
-        } else if self.network == MiningNetwork::Chipnet && canonical.starts_with("bitcoincash:") {
-            reprefix_p2pkh_payout(&canonical, self.network)
-                .map_err(|e| format!("invalid payout CashAddr: {e}"))?
-        } else {
-            return Err(format!(
-                "payout address must use {}: on {}",
-                self.network.cashaddr_prefix(),
-                self.network.as_str()
-            ));
-        };
+        let selected = validate_payout_address(self.network, &addr)?;
         if self.payout_address != selected {
             self.bump_generation();
         }
@@ -435,7 +390,41 @@ impl RuntimeConfig {
     }
 }
 
-/// Re-encodes a validated P2PKH payout for another chain without changing its key hash.
+/// Validates a payout for the selected chain and returns its canonical CashAddr.
+/// An omitted prefix uses the selected chain's checksum, never another network's.
+pub fn validate_payout_address(network: MiningNetwork, address: &str) -> Result<String, String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err("payout address required".into());
+    }
+    if trimmed.chars().any(|ch| ch.is_ascii_lowercase())
+        && trimmed.chars().any(|ch| ch.is_ascii_uppercase())
+    {
+        return Err("invalid payout CashAddr: CashAddr must not mix upper and lower case".into());
+    }
+    let canonical = if trimmed.contains(':') {
+        trimmed.to_ascii_lowercase()
+    } else {
+        format!(
+            "{}:{}",
+            network.cashaddr_prefix(),
+            trimmed.to_ascii_lowercase()
+        )
+    };
+    crate::tx::cashaddr_to_p2pkh_locking(&canonical)
+        .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
+    if !canonical.starts_with(&format!("{}:", network.cashaddr_prefix())) {
+        return Err(format!(
+            "payout address must use {}: on {}",
+            network.cashaddr_prefix(),
+            network.as_str()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Re-encodes an internal P2PKH recipient for another chain without changing its key hash.
+/// User-entered payouts must use `validate_payout_address` instead.
 pub(crate) fn reprefix_p2pkh_payout(
     address: &str,
     network: MiningNetwork,
@@ -533,7 +522,7 @@ impl SavedConfig {
     /// Rejects inconsistent or unsupported saved configuration values.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(value) = &self.backend {
-            crate::backend::BackendKind::parse(value)?;
+            crate::backend_kind::BackendKind::parse(value)?;
         }
         let mut runtime = RuntimeConfig::default();
         self.apply_to_runtime(&mut runtime)?;
@@ -980,6 +969,7 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
     if !replacing {
         if let Err(error) = restrict_private_config(path) {
+            #[cfg(not(target_arch = "wasm32"))]
             drop(file);
             let _ = fs::remove_file(path);
             return Err(error);
@@ -993,6 +983,8 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn restrict_private_config(path: &Path) -> Result<(), String> {
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1093,7 +1085,13 @@ mod tests {
             chipnet.addresses,
             [CHIPNET_DONATION_ADDRESS, CHIPNET_DONATION_ADDRESS]
         );
-        let payouts = chipnet.payouts(MiningNetwork::Chipnet, PAYOUT).unwrap();
+        let miner = crate::tx::token_p2pkh_hash_to_cashaddr_for_network(
+            &[0x42; 20],
+            MiningNetwork::Chipnet,
+        )
+        .unwrap();
+        let payouts = chipnet.payouts(MiningNetwork::Chipnet, &miner).unwrap();
+        assert_eq!(payouts[0], miner);
         assert_eq!(payouts[1], CHIPNET_DONATION_ADDRESS);
         assert_eq!(payouts[2], CHIPNET_DONATION_ADDRESS);
     }
@@ -1404,42 +1402,91 @@ mod tests {
 
     #[test]
     fn payout_address_must_match_selected_network() {
-        let mut cfg = RuntimeConfig::default();
-        cfg.set_network(MiningNetwork::Chipnet);
-        cfg.set_payout(SHREC_DONATION_ADDRESS.into()).unwrap();
-        assert!(cfg.payout_address.starts_with("bchtest:z"));
-        assert_eq!(
-            crate::tx::cashaddr_to_p2pkh_locking(&cfg.payout_address).unwrap(),
-            crate::tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS).unwrap()
-        );
-        let chipnet_address = cfg.payout_address.clone();
-        cfg.set_network(MiningNetwork::Mainnet);
-        assert!(cfg.payout_address.starts_with("bitcoincash:z"));
-        assert!(cfg.set_payout(chipnet_address).is_err());
-        cfg.set_payout(PAYOUT.into()).unwrap();
-        cfg.set_network(MiningNetwork::Chipnet);
-        assert!(cfg.validate_payout_network().is_ok());
-        assert!(cfg.payout_address.starts_with("bchtest:"));
-        assert!(cfg
-            .set_payout("bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv4".into())
-            .is_err());
-        assert!(cfg
-            .set_payout("bchreg:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3".into())
-            .is_err());
+        for (network, other) in [
+            (MiningNetwork::Mainnet, MiningNetwork::Chipnet),
+            (MiningNetwork::Chipnet, MiningNetwork::Mainnet),
+        ] {
+            for encode in [
+                crate::tx::p2pkh_hash_to_cashaddr_for_network,
+                crate::tx::token_p2pkh_hash_to_cashaddr_for_network,
+            ] {
+                let address = encode(&[0x42; 20], network).unwrap();
+                let foreign = encode(&[0x42; 20], other).unwrap();
+                assert!(MiningToken::Photon
+                    .fee_policy(network)
+                    .payouts(network, &foreign)
+                    .is_err());
+                let mut cfg = RuntimeConfig {
+                    network,
+                    ..Default::default()
+                };
+                cfg.set_payout(address.clone()).unwrap();
+                let generation = cfg.generation_id;
+                for invalid in [foreign.clone(), foreign.split_once(':').unwrap().1.into()] {
+                    assert!(cfg.set_payout(invalid).is_err());
+                    assert_eq!(cfg.payout_address, address);
+                    assert_eq!(cfg.generation_id, generation);
+                }
+                for valid in [
+                    address.to_ascii_uppercase(),
+                    address.split_once(':').unwrap().1.into(),
+                    format!("  {address}  "),
+                ] {
+                    cfg.set_payout(valid).unwrap();
+                    assert_eq!(cfg.payout_address, address);
+                    assert!(cfg.validate_payout_network().is_ok());
+                }
+                cfg.set_network(other);
+                assert_eq!(
+                    cfg.payout_address, address,
+                    "network switching must not rewrite the wallet"
+                );
+                assert!(cfg.ensure_mining_supported().is_err());
+                cfg.set_payout(foreign).unwrap();
+                assert!(cfg.ensure_mining_supported().is_ok());
+            }
+        }
     }
 
     #[test]
-    fn chipnet_saved_config_reprefixes_mainnet_token_payout() {
-        let saved = SavedConfig {
-            network: Some("chipnet".into()),
-            address: Some(SHREC_DONATION_ADDRESS.into()),
-            ..SavedConfig::default()
-        };
-        let mut cfg = RuntimeConfig::default();
-        saved.apply_to_runtime(&mut cfg).unwrap();
-        assert_eq!(cfg.network, MiningNetwork::Chipnet);
-        assert!(cfg.payout_address.starts_with("bchtest:z"));
-        assert!(cfg.validate_payout_network().is_ok());
+    fn saved_config_and_profiles_reject_foreign_payouts() {
+        for (network, other) in [
+            (MiningNetwork::Mainnet, MiningNetwork::Chipnet),
+            (MiningNetwork::Chipnet, MiningNetwork::Mainnet),
+        ] {
+            let saved = SavedConfig {
+                network: Some(network.as_str().into()),
+                address: Some(
+                    crate::tx::token_p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], other)
+                        .unwrap(),
+                ),
+                ..SavedConfig::default()
+            };
+            assert!(saved
+                .apply_to_runtime(&mut RuntimeConfig::default())
+                .is_err());
+            assert!(saved.validate().is_err());
+            assert!(MiningProfiles::default()
+                .upsert(None, "Wrong network", saved)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn payout_validation_rechecks_checksum_case_and_type() {
+        for address in [
+            "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6q",
+            "bitcoincash:Qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a",
+            "bitcoincash:ppm2qsznhks23z7629mms6s4cwef74vcwvn0h829pq",
+            "bchreg:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a",
+        ] {
+            let mut cfg = RuntimeConfig {
+                payout_address: address.into(),
+                ..Default::default()
+            };
+            assert!(cfg.ensure_mining_supported().is_err(), "{address}");
+            assert!(cfg.set_payout(address.into()).is_err(), "{address}");
+        }
     }
 
     #[test]

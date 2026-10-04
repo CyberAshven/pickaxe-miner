@@ -5,19 +5,25 @@
 //! intermediates stay on the GPU; the host reads only counters plus a fixed
 //! number of winner nonce/HASH256 records.
 
-use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
+use crate::gpu_types::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};
+use crate::{protocol::ProofRule, tx::PhotonLayout};
 use secp256k1::SecretKey;
 use sha2::block_api::compress256;
 use std::borrow::Cow;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::fmt::Write;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
+#[cfg(test)]
 const TX_BYTES: usize = 615;
-const TARGET_OFFSET: usize = 394;
-const INPUT_WORDS: usize = 155;
+const TEMPLATE_WORDS: usize = (615 + PhotonLayout::MAX_SHIFT).div_ceil(4);
+const INPUT_WORDS: usize = TEMPLATE_WORDS + 4;
 const INPUT_BYTES: usize = INPUT_WORDS * 4;
-const BASE_NONCE_OFFSET: u64 = 154 * 4;
+const BASE_NONCE_OFFSET: u64 = (TEMPLATE_WORDS * 4) as u64;
 const M38_RECORD_BYTES: usize = 160;
 const SIGNATURE_BYTES: usize = 64;
 const HASH_BYTES: usize = 32;
@@ -27,8 +33,108 @@ const WINNER_RECORD_WORDS: usize = 9;
 const WINNER_RECORD_BYTES: usize = WINNER_RECORD_WORDS * 4;
 const WGPU_MIN_LADDER_BATCH: u32 = 1_024;
 pub(crate) const WGPU_REFERENCE_MAX_BATCH: u32 = 524_288;
+pub(crate) const WGPU_T2_MAX_BATCH: u32 = 16_777_216;
 const WGPU_TARGET_BATCH: Duration = Duration::from_millis(350);
 const WGPU_ESCALATE_BATCH: Duration = Duration::from_millis(175);
+
+fn t2_window_bytes(candidates: u32) -> usize {
+    (candidates.div_ceil(65536) as usize + 1) * 128 * 4
+}
+
+/// Emit constant schedule indices, following the Rust CUDA SHA implementation.
+/// This lets WGSL compilers keep the 16-word ring in registers instead of a
+/// dynamically indexed 64-word private array. The reference fallback is intact.
+fn t2_compression_source() -> String {
+    let mut source = String::new();
+    for (name, start, end, scheduled) in [
+        ("t2_compress", 0, 64, false),
+        ("t2_head10", 0, 10, false),
+        ("t2_compress_after10", 10, 64, false),
+        ("t2_compress_middle", 0, 64, true),
+    ] {
+        write!(source, "\nfn {name}(initial: array<u32, 8>").unwrap();
+        if !scheduled {
+            source.push_str(", block: array<u32, 16>");
+        }
+        if start != 0 {
+            source.push_str(", head: array<u32, 8>");
+        }
+        source.push_str(") -> array<u32, 8> {\n");
+        if !scheduled {
+            for i in 0..16 {
+                writeln!(source, "var w{i} = block[{i}];").unwrap();
+            }
+        }
+        let roles = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for (i, role) in roles.iter().enumerate() {
+            let state = if start == 0 { "initial" } else { "head" };
+            writeln!(source, "var {role} = {state}[{}];", (i + start) & 7).unwrap();
+        }
+        for i in start..end {
+            let ring = i & 15;
+            let word = if scheduled {
+                format!("t2Middle[{i}]")
+            } else {
+                format!("w{ring}")
+            };
+            if !scheduled && i >= 16 {
+                writeln!(
+                    source,
+                    "w{ring} += smallSigma0(w{}) + w{} + smallSigma1(w{});",
+                    (i + 1) & 15,
+                    (i + 9) & 15,
+                    (i + 14) & 15
+                )
+                .unwrap();
+            }
+            let [a, b, c, d, e, f, g, h] = std::array::from_fn(|j| roles[(j + 8 - (i & 7)) & 7]);
+            writeln!(source, "let t{i} = {h} + bigSigma1({e}) + choose({e}, {f}, {g}) + K[{i}] + {word};\n{d} += t{i};\n{h} = t{i} + bigSigma0({a}) + majority({a}, {b}, {c});").unwrap();
+        }
+        source.push_str("return array<u32, 8>(");
+        for i in 0..8 {
+            let role = roles[(i + 8 - (end & 7)) & 7];
+            if end == 64 {
+                write!(source, "initial[{i}] + {role},").unwrap();
+            } else {
+                write!(source, "{role},").unwrap();
+            }
+        }
+        source.push_str(");\n}\n");
+    }
+    source
+}
+
+/// Match the native T2 constant-offset block assembly. Pipeline specialization
+/// folds all amount-byte tests before GPU execution; no private-array indexing.
+fn t2_blocks_source() -> String {
+    let mut source = String::from("\noverride T2_SHIFT: u32 = 0u;\n");
+    for block in 0..3 {
+        writeln!(source, "fn t2_block{block}(window: u32, batonLo: u32, batonHi: u32, rewardLo: u32, rewardHi: u32) -> array<u32, 16> {{").unwrap();
+        for word in 0..16 {
+            writeln!(
+                source,
+                "var w{word} = t2Windows[window * 128u + {}u];",
+                8 + block * 16 + word
+            )
+            .unwrap();
+            for byte in 0..4 {
+                let offset = 448 + block * 64 + word * 4 + byte;
+                let shift = (3 - byte) * 8;
+                for (name, start) in [("baton", 491), ("reward", 578)] {
+                    if (start..start + PhotonLayout::MAX_SHIFT + 8).contains(&offset) {
+                        writeln!(source, "if ({offset}u >= {start}u + T2_SHIFT && {offset}u < {}u + T2_SHIFT) {{ let n = ({offset}u + 32u - {start}u - T2_SHIFT) & 31u; let value = (select({name}Lo, {name}Hi, n >= 4u) >> ((n & 3u) * 8u)) & 255u; w{word} = (w{word} & ~({}u << {shift}u)) | (value << {shift}u); }}", start + 8, 255).unwrap();
+                    }
+                }
+            }
+        }
+        source.push_str("return array<u32, 16>(");
+        for i in 0..16 {
+            write!(source, "w{i},").unwrap();
+        }
+        source.push_str(");\n}\n");
+    }
+    source
+}
 
 const SHA256_IV: [u32; 8] = [
     0x6a09_e667,
@@ -96,12 +202,75 @@ fn reference_shader_source_for_wgpu() -> Result<String, String> {
         .ok_or_else(|| "could not locate field_inv_binary closing brace".to_string())?;
     source.insert_str(function_close, "\n    return x1;");
     source.push('\n');
+    // Keep the upstream reference intact; update only the functions reachable
+    // from our production entry points. Native Metal/Vulkan and browser WebGPU
+    // compile this same source and consume the same PhotonLayout fields.
+    source = source.replace(
+        "words: array<u32, 154>,",
+        &format!("words: array<u32, {TEMPLATE_WORDS}>,"),
+    );
+    source = source.replacen(
+        "byteLength: u32,",
+        "byteLength: u32,\n    layoutShift: u32,\n    txLength: u32,\n    positiveProof: u32,",
+        1,
+    );
+    for (name, offsets) in [
+        ("m9_message_hash", &[394usize][..]),
+        ("m9_completed_tx_byte", &[390, 394, 426, 458, 490][..]),
+    ] {
+        let start = source
+            .find(&format!("fn {name}("))
+            .ok_or("missing WGSL layout function")?;
+        let end = start
+            + source[start..]
+                .find("\n}")
+                .ok_or("missing WGSL function end")?
+            + 2;
+        let mut body = source[start..end].to_string();
+        for offset in offsets {
+            body = body.replace(
+                &format!("{offset}u"),
+                &format!("({offset}u + input.layoutShift)"),
+            );
+        }
+        source.replace_range(start..end, &body);
+    }
+    let start = source
+        .find("fn m30_transaction_hashes_prefixed(")
+        .ok_or("missing prefixed HASH256")?;
+    let end = start
+        + source[start..]
+            .find("\n}")
+            .ok_or("missing HASH256 function end")?
+        + 2;
+    let body = source[start..end].replace("615u", "input.txLength");
+    source.replace_range(start..end, &body);
+    let start = source
+        .find("fn m10_hash_is_below_target(")
+        .ok_or("missing target predicate")?;
+    let end = start
+        + source[start..]
+            .find("\n}")
+            .ok_or("missing target predicate end")?
+        + 2;
+    source.replace_range(start..end, include_str!("wgpu_target.wgsl"));
     source.push_str(BOUNDED_C3_WGSL);
+    source.push_str(include_str!("wgpu_t2.wgsl"));
+    source.push_str(&t2_compression_source());
+    source.push_str(&t2_blocks_source());
     Ok(source)
 }
 
 /// Rejects non-hardware WGPU adapters for mining.
+#[cfg(not(target_arch = "wasm32"))]
 fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
+    // #### PR #22
+    // CI executes the real kernels on lavapipe. This opt-in exists only in a
+    // test binary, requires a software device, and is never a mining fallback.
+    #[cfg(test)]
+    if std::env::var("PICKAXE_TEST_SOFTWARE_WGPU").as_deref() == Ok("1") {
+        return info.device_type == wgpu::DeviceType::Cpu;
+    }
     matches!(
         info.device_type,
         wgpu::DeviceType::DiscreteGpu
@@ -210,7 +379,7 @@ fn m27_precomputed_words(private_key: &[u8; 32]) -> [u32; 16] {
 }
 
 /// Builds the reusable PHOTON M30 message prefix.
-fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
+fn m30_prefix_words(template: &[u8]) -> [u32; 8] {
     let mut state = SHA256_IV;
     for block in template[..384].as_chunks::<64>().0 {
         compress_block(&mut state, block);
@@ -220,12 +389,14 @@ fn m30_prefix_words(template: &[u8; TX_BYTES]) -> [u32; 8] {
 
 /// Checks GPU job material against authoritative PHOTON fields.
 fn validate_job_material(
-    template: &[u8; TX_BYTES],
+    template: &[u8],
     target: &[u8; 32],
     private_key: &[u8; 32],
 ) -> Result<(), String> {
-    if template[TARGET_OFFSET..TARGET_OFFSET + 32] != target[..] {
-        return Err("PHOTON WGPU target must match transaction template bytes 394..425".into());
+    let layout = PhotonLayout::for_tx_len(template.len())?;
+    let offset = layout.target_offset();
+    if template[offset..offset + 32] != target[..] {
+        return Err("PHOTON WGPU target must match transaction template".into());
     }
     SecretKey::from_secret_bytes(*private_key)
         .map_err(|error| format!("invalid PHOTON WGPU signing key: {error}"))?;
@@ -287,7 +458,8 @@ fn create_bind_group(
 }
 
 pub struct WgpuPhotonEngine {
-    instance: wgpu::Instance,
+    _instance: wgpu::Instance,
+    shader: wgpu::ShaderModule,
     device: wgpu::Device,
     queue: wgpu::Queue,
     stage_a: wgpu::ComputePipeline,
@@ -295,6 +467,16 @@ pub struct WgpuPhotonEngine {
     stage_c1: wgpu::ComputePipeline,
     stage_c2: wgpu::ComputePipeline,
     stage_c3: wgpu::ComputePipeline,
+    t2_prepare: wgpu::ComputePipeline,
+    t2_filter: wgpu::ComputePipeline,
+    bind_t2_prepare: wgpu::BindGroup,
+    bind_t2_filter: wgpu::BindGroup,
+    _t2_windows_gpu: wgpu::Buffer,
+    t2_control_gpu: wgpu::Buffer,
+    t2_active: bool,
+    t2_group_size: u32,
+    t2_filter_shift: usize,
+    t2_filter_cache: std::collections::HashMap<usize, (wgpu::ComputePipeline, wgpu::BindGroup)>,
     bind_a: wgpu::BindGroup,
     bind_b: [wgpu::BindGroup; 4],
     bind_c1: wgpu::BindGroup,
@@ -314,21 +496,45 @@ pub struct WgpuPhotonEngine {
     readback_gpu: wgpu::Buffer,
     max_candidates: u32,
     storage_candidates: u32,
+    t2_max_candidates: u32,
     winner_cap: u32,
     readback_bytes: usize,
+    #[cfg(test)]
+    profile: Option<(wgpu::QuerySet, wgpu::Buffer)>,
     table_source: M29TableSource,
     recommended_candidates: u32,
     _adapter_name: String,
     job_ready: bool,
+    positive_target_rule: bool,
 }
 
 impl WgpuPhotonEngine {
     /// Creates a WgpuPhotonEngine for the portable GPU pipeline.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(
         device_ordinal: usize,
         max_candidates: u32,
         winner_cap: u32,
     ) -> Result<Self, String> {
+        let table = m29_table::load_or_generate_m29_g16()?;
+        pollster::block_on(Self::new_async(
+            device_ordinal,
+            max_candidates,
+            winner_cap,
+            table,
+        ))
+    }
+
+    /// Uses the same asynchronous pipeline on native and browser devices.
+    pub async fn new_async(
+        device_ordinal: usize,
+        max_candidates: u32,
+        winner_cap: u32,
+        table: (Vec<u8>, M29TableSource),
+    ) -> Result<Self, String> {
+        if !m29_table::valid_table(&table.0) {
+            return Err("invalid PHOTON generator table".into());
+        }
         if max_candidates == 0 {
             return Err("PHOTON WGPU max_candidates must be greater than zero".into());
         }
@@ -336,18 +542,39 @@ impl WgpuPhotonEngine {
             return Err("PHOTON WGPU winner_cap must be greater than zero".into());
         }
 
-        let backends = crate::backend::production_wgpu_backends();
+        let backends = production_wgpu_backends();
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_descriptor.backends = backends;
         let instance = wgpu::Instance::new(instance_descriptor);
-        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+        #[cfg(not(target_arch = "wasm32"))]
+        let adapters = instance.enumerate_adapters(backends).await;
+        #[cfg(not(target_arch = "wasm32"))]
         let adapter = adapters
             .into_iter()
             .filter(|adapter| is_hardware_adapter(&adapter.get_info()))
             .nth(device_ordinal)
             .ok_or_else(|| {
+                #[cfg(test)]
+                if std::env::var("PICKAXE_TEST_SOFTWARE_WGPU").as_deref() == Ok("1") {
+                    return "required software WGPU test adapter is unavailable".into();
+                }
                 format!("no hardware WGPU adapter at backend-local ordinal {device_ordinal}")
             })?;
+        #[cfg(target_arch = "wasm32")]
+        let adapter = {
+            if device_ordinal != 0 {
+                return Err("the browser selects the GPU adapter".into());
+            }
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| format!("WebGPU adapter: {error}"))?
+        };
         let adapter_info = adapter.get_info();
         let limits = adapter.limits();
         if (limits.max_storage_buffer_binding_size as usize) < m29_table::M29_G16_BYTES {
@@ -366,6 +593,7 @@ impl WgpuPhotonEngine {
                 m29_table::M29_G16_BYTES
             ));
         }
+        let t2_max_candidates = max_candidates.min(WGPU_T2_MAX_BATCH);
         let max_candidates = device_limited_wgpu_max_candidates(
             max_candidates,
             limits.max_storage_buffer_binding_size,
@@ -378,12 +606,23 @@ impl WgpuPhotonEngine {
             ));
         }
 
+        #[cfg(test)]
+        let profile_enabled = std::env::var_os("PICKAXE_WGPU_TIMESTAMPS").is_some();
+        #[cfg(not(test))]
+        let profile_enabled = false;
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("Pickaxe PHOTON WGPU device"),
             required_limits: limits,
+            required_features: if profile_enabled {
+                wgpu::Features::TIMESTAMP_QUERY
+            } else {
+                wgpu::Features::empty()
+            },
             ..Default::default()
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
+        let (device, queue) = adapter
+            .request_device(&descriptor)
+            .await
             .map_err(|error| format!("request WGPU device {}: {error}", adapter_info.name))?;
 
         let shader_source = reference_shader_source_for_wgpu()?;
@@ -401,8 +640,10 @@ impl WgpuPhotonEngine {
         let stage_c1 = create_pipeline(&device, &shader, "photon_m6729_c1_znorm_wg64");
         let stage_c2 = create_pipeline(&device, &shader, "photon_m6725_c2_hash_only_wg64");
         let stage_c3 = create_pipeline(&device, &shader, "pickaxe_photon_c3_bounded_wg64");
+        let t2_prepare = create_pipeline(&device, &shader, "pickaxe_t2_prepare");
+        let t2_filter = create_pipeline(&device, &shader, "pickaxe_t2_filter");
 
-        let (table_bytes, table_source) = m29_table::load_or_generate_m29_g16()?;
+        let (table_bytes, table_source) = table;
         let table_gpu = create_buffer(
             &device,
             "PHOTON M29 16-bit generator table",
@@ -493,7 +734,26 @@ impl WgpuPhotonEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             false,
         );
-        let readback_bytes = RESULT_BYTES + winner_cap as usize * WINNER_RECORD_BYTES;
+        #[cfg(test)]
+        let profile = profile_enabled.then(|| {
+            (
+                device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("T2 stage timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 16,
+                }),
+                create_buffer(
+                    &device,
+                    "T2 timestamp resolve",
+                    128,
+                    wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    false,
+                ),
+            )
+        });
+        let readback_bytes = RESULT_BYTES
+            + winner_cap as usize * WINNER_RECORD_BYTES
+            + if profile_enabled { 128 } else { 0 };
         let readback_gpu = create_buffer(
             &device,
             "PHOTON bounded result readback",
@@ -589,8 +849,47 @@ impl WgpuPhotonEngine {
             ],
         );
 
+        let t2_windows_gpu = create_buffer(
+            &device,
+            "PHOTON T2 signed windows",
+            t2_window_bytes(t2_max_candidates),
+            wgpu::BufferUsages::STORAGE,
+            false,
+        );
+        let t2_control_gpu = create_buffer(
+            &device,
+            "PHOTON T2 dispatch",
+            16,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            false,
+        );
+        let bind_t2_prepare = create_bind_group(
+            &device,
+            &t2_prepare,
+            "PHOTON T2 prepare",
+            &[
+                (0, &input_gpu),
+                (6, &m30_gpu),
+                (13, &signatures_gpu),
+                (17, &t2_windows_gpu),
+                (18, &t2_control_gpu),
+            ],
+        );
+        let bind_t2_filter = create_bind_group(
+            &device,
+            &t2_filter,
+            "PHOTON T2 filter",
+            &[
+                (0, &input_gpu),
+                (2, &result_gpu),
+                (16, &winner_records_gpu),
+                (17, &t2_windows_gpu),
+                (18, &t2_control_gpu),
+            ],
+        );
         Ok(Self {
-            instance,
+            _instance: instance,
+            shader,
             device,
             queue,
             stage_a,
@@ -598,6 +897,16 @@ impl WgpuPhotonEngine {
             stage_c1,
             stage_c2,
             stage_c3,
+            t2_prepare,
+            t2_filter,
+            bind_t2_prepare,
+            bind_t2_filter,
+            _t2_windows_gpu: t2_windows_gpu,
+            t2_control_gpu,
+            t2_active: false,
+            t2_group_size: 64,
+            t2_filter_shift: 0,
+            t2_filter_cache: std::collections::HashMap::new(),
             bind_a,
             bind_b,
             bind_c1,
@@ -617,13 +926,30 @@ impl WgpuPhotonEngine {
             readback_gpu,
             max_candidates,
             storage_candidates,
+            t2_max_candidates,
             winner_cap,
             readback_bytes,
+            #[cfg(test)]
+            profile,
             table_source,
             recommended_candidates: initial_wgpu_batch_size(max_candidates),
             _adapter_name: adapter_info.name,
             job_ready: false,
+            positive_target_rule: false,
         })
+    }
+
+    fn timestamps(&self, index: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        #[cfg(test)]
+        if let Some((queries, _)) = &self.profile {
+            return Some(wgpu::ComputePassTimestampWrites {
+                query_set: queries,
+                beginning_of_pass_write_index: Some(index),
+                end_of_pass_write_index: Some(index + 1),
+            });
+        }
+        let _ = index;
+        None
     }
 
     /// Returns the source of the portable GPU lookup table.
@@ -645,24 +971,49 @@ impl WgpuPhotonEngine {
             + RESULT_BYTES
             + self.winner_cap as usize * WINNER_RECORD_BYTES
             + self.readback_bytes
+            + t2_window_bytes(self.t2_max_candidates)
+            + 16
     }
 
     /// Suggests a batch size within device and workgroup limits.
+    fn active_capacity(&self) -> u32 {
+        if self.t2_active {
+            self.t2_max_candidates
+        } else {
+            self.max_candidates
+        }
+    }
+
     pub fn recommended_batch_candidates(&self) -> u32 {
         self.recommended_candidates
+    }
+
+    pub fn set_proof_rule(&mut self, rule: ProofRule) {
+        self.positive_target_rule = rule == ProofRule::Positive;
+        self.job_ready = false;
     }
 
     /// Writes validated PHOTON job data to WGPU buffers.
     pub fn set_job(
         &mut self,
-        template: &[u8; TX_BYTES],
+        template: &[u8],
         target: &[u8; 32],
         private_key: &[u8; 32],
     ) -> Result<(), String> {
+        self.job_ready = false;
+        self.t2_active = false;
         validate_job_material(template, target, private_key)?;
-
-        let mut input = pack_big_endian_words(template, 154);
-        input.extend_from_slice(&0u32.to_le_bytes());
+        let layout = PhotonLayout::for_tx_len(template.len())?;
+        if self.positive_target_rule && (target[31] & 0x80 != 0 || target.iter().all(|b| *b == 0)) {
+            return Err("PHOTON target must be a positive ScriptNum".into());
+        }
+        let mut input = pack_big_endian_words(template, TEMPLATE_WORDS);
+        input.extend_from_slice(&u32_words_to_le_bytes(&[
+            0,
+            layout.shift() as u32,
+            template.len() as u32,
+            u32::from(self.positive_target_rule),
+        ]));
         debug_assert_eq!(input.len(), INPUT_BYTES);
         let private_words = pack_big_endian_words(private_key, 8);
         let m27 = u32_words_to_le_bytes(&m27_precomputed_words(private_key));
@@ -673,12 +1024,62 @@ impl WgpuPhotonEngine {
             .write_buffer(&self.private_key_gpu, 0, &private_words);
         self.queue.write_buffer(&self.m27_gpu, 0, &m27);
         self.queue.write_buffer(&self.m30_gpu, 0, &m30);
+        self.t2_active = crate::tx::supports_t2_window(template)?;
+        if self.t2_active && self.t2_filter_shift != layout.shift() {
+            let shift = layout.shift();
+            let (pipeline, binding) = self.t2_filter_cache.remove(&shift).unwrap_or_else(|| {
+                let pipeline =
+                    self.device
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("PHOTON T2 specialized filter"),
+                            layout: None,
+                            module: &self.shader,
+                            entry_point: Some("pickaxe_t2_filter"),
+                            compilation_options: wgpu::PipelineCompilationOptions {
+                                constants: &[("T2_SHIFT", shift as f64)],
+                                ..Default::default()
+                            },
+                            cache: None,
+                        });
+                let binding = create_bind_group(
+                    &self.device,
+                    &pipeline,
+                    "PHOTON T2 filter",
+                    &[
+                        (0, &self.input_gpu),
+                        (2, &self.result_gpu),
+                        (16, &self.winner_records_gpu),
+                        (17, &self._t2_windows_gpu),
+                        (18, &self.t2_control_gpu),
+                    ],
+                );
+                (pipeline, binding)
+            });
+            self.t2_filter_cache.insert(
+                self.t2_filter_shift,
+                (
+                    std::mem::replace(&mut self.t2_filter, pipeline),
+                    std::mem::replace(&mut self.bind_t2_filter, binding),
+                ),
+            );
+            self.t2_filter_shift = shift;
+        }
+
         self.job_ready = true;
         Ok(())
     }
 
     /// Dispatches a bounded portable GPU candidate search.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn search_batch(
+        &mut self,
+        nonce_base: u32,
+        candidate_count: u32,
+    ) -> Result<PhotonCudaBatchResult, String> {
+        pollster::block_on(self.search_batch_async(nonce_base, candidate_count))
+    }
+
+    pub async fn search_batch_async(
         &mut self,
         nonce_base: u32,
         candidate_count: u32,
@@ -693,16 +1094,34 @@ impl WgpuPhotonEngine {
                 winners: Vec::new(),
             });
         }
-        if candidate_count > self.max_candidates {
+        if candidate_count > self.active_capacity() {
             return Err(format!(
                 "PHOTON WGPU batch {candidate_count} exceeds persistent capacity {}",
-                self.max_candidates
+                self.active_capacity()
             ));
         }
+        nonce_base
+            .checked_add(candidate_count - 1)
+            .ok_or("PHOTON WGPU candidate range crosses the key-rotation boundary")?;
         let adapt_batch = candidate_count == self.recommended_candidates;
+        #[cfg(not(target_arch = "wasm32"))]
         let batch_started = Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        let batch_started = js_sys::Date::now();
 
-        let active_candidates = candidate_count.div_ceil(128) * 128;
+        let (signature_base, signatures) = if self.t2_active {
+            let offset = nonce_base & 65535;
+            let windows = (offset + candidate_count).div_ceil(65536);
+            self.queue.write_buffer(
+                &self.t2_control_gpu,
+                0,
+                &u32_words_to_le_bytes(&[offset, candidate_count, windows, 0]),
+            );
+            (nonce_base / 65536, windows)
+        } else {
+            (nonce_base, candidate_count)
+        };
+        let active_candidates = signatures.div_ceil(128) * 128;
         let groups_a = active_candidates / 128;
         let groups_b = active_candidates / 32;
         let groups_c = active_candidates / 64;
@@ -711,7 +1130,7 @@ impl WgpuPhotonEngine {
         self.queue.write_buffer(
             &self.input_gpu,
             BASE_NONCE_OFFSET,
-            &nonce_base.to_le_bytes(),
+            &signature_base.to_le_bytes(),
         );
         self.queue
             .write_buffer(&self.dispatch_params_gpu, 0, &dispatch_params);
@@ -725,7 +1144,7 @@ impl WgpuPhotonEngine {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("PHOTON Stage A"),
-                timestamp_writes: None,
+                timestamp_writes: self.timestamps(0),
             });
             pass.set_pipeline(&self.stage_a);
             pass.set_bind_group(0, &self.bind_a, &[]);
@@ -742,7 +1161,7 @@ impl WgpuPhotonEngine {
             };
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
-                timestamp_writes: None,
+                timestamp_writes: self.timestamps((index as u32 + 1) * 2),
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
@@ -751,29 +1170,55 @@ impl WgpuPhotonEngine {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("PHOTON Stage C1 normalized Schnorr"),
-                timestamp_writes: None,
+                timestamp_writes: self.timestamps(10),
             });
             pass.set_pipeline(&self.stage_c1);
             pass.set_bind_group(0, &self.bind_c1, &[]);
             pass.dispatch_workgroups(groups_c, 1, 1);
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("PHOTON Stage C2 HASH256"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.stage_c2);
-            pass.set_bind_group(0, &self.bind_c2, &[]);
-            pass.dispatch_workgroups(groups_c, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("PHOTON Stage C3 bounded winners"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.stage_c3);
-            pass.set_bind_group(0, &self.bind_c3, &[]);
-            pass.dispatch_workgroups(groups_c, 1, 1);
+        if self.t2_active {
+            for (stage, (pipeline, binding, groups)) in [
+                (
+                    &self.t2_prepare,
+                    &self.bind_t2_prepare,
+                    signatures.div_ceil(64),
+                ),
+                (
+                    &self.t2_filter,
+                    &self.bind_t2_filter,
+                    candidate_count.div_ceil(self.t2_group_size),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("PHOTON T2 search"),
+                    timestamp_writes: self.timestamps(12 + stage as u32 * 2),
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, binding, &[]);
+                pass.dispatch_workgroups(groups.min(16_384), groups.div_ceil(16_384), 1);
+            }
+        } else {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("PHOTON Stage C2 HASH256"),
+                    timestamp_writes: self.timestamps(12),
+                });
+                pass.set_pipeline(&self.stage_c2);
+                pass.set_bind_group(0, &self.bind_c2, &[]);
+                pass.dispatch_workgroups(groups_c, 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("PHOTON Stage C3 bounded winners"),
+                    timestamp_writes: self.timestamps(14),
+                });
+                pass.set_pipeline(&self.stage_c3);
+                pass.set_bind_group(0, &self.bind_c3, &[]);
+                pass.dispatch_workgroups(groups_c, 1, 1);
+            }
         }
 
         encoder.copy_buffer_to_buffer(
@@ -790,23 +1235,69 @@ impl WgpuPhotonEngine {
             RESULT_BYTES as u64,
             (self.winner_cap as usize * WINNER_RECORD_BYTES) as u64,
         );
+        #[cfg(test)]
+        if let Some((queries, buffer)) = &self.profile {
+            encoder.resolve_query_set(queries, 0..16, buffer, 0);
+            encoder.copy_buffer_to_buffer(
+                buffer,
+                0,
+                &self.readback_gpu,
+                (self.readback_bytes - 128) as u64,
+                128,
+            );
+        }
         self.queue.submit([encoder.finish()]);
 
         let slice = self.readback_gpu.slice(..self.readback_bytes as u64);
-        let (map_tx, map_rx) = mpsc::sync_channel(1);
+        let ready = Arc::new(Mutex::new((None, None::<std::task::Waker>)));
+        let callback = Arc::clone(&ready);
         slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = map_tx.send(result);
+            let mut state = callback.lock().unwrap();
+            state.0 = Some(result);
+            if let Some(waker) = state.1.take() {
+                waker.wake();
+            }
         });
-        self.instance.poll_all(true);
-        map_rx
-            .recv()
-            .map_err(|_| "WGPU result map callback disconnected".to_string())?
-            .map_err(|error| format!("map WGPU bounded result: {error}"))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self._instance.poll_all(true);
+        std::future::poll_fn(|cx| {
+            let mut state = ready.lock().unwrap();
+            if let Some(result) = state.0.take() {
+                Poll::Ready(result)
+            } else {
+                state.1 = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+        .map_err(|error| format!("map WGPU bounded result: {error}"))?;
 
         let view = slice
             .get_mapped_range()
             .map_err(|error| format!("read mapped WGPU bounded result: {error}"))?;
         let bytes = view.as_ref();
+        #[cfg(test)]
+        if self.profile.is_some() {
+            let stamps: Vec<u64> = bytes[self.readback_bytes - 128..]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| u64::from_le_bytes(*v))
+                .collect();
+            let times: Vec<f64> = stamps
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| {
+                    v[1].saturating_sub(v[0]) as f64 * f64::from(self.queue.get_timestamp_period())
+                        / 1e6
+                })
+                .collect();
+            eprintln!(
+                "T2_PROFILE candidates={candidate_count} group={} ms={times:?}",
+                self.t2_group_size
+            );
+        }
         let completed = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let total_winners = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         if completed != candidate_count {
@@ -829,21 +1320,23 @@ impl WgpuPhotonEngine {
                 digest[word_index * 4..word_index * 4 + 4].copy_from_slice(&word.to_be_bytes());
             }
             winners.push(PhotonCudaWinner {
-                nonce,
+                nonce: if self.t2_active { nonce / 65536 } else { nonce },
                 digest,
                 schnorr_k: None,
-                tail_j: None,
+                tail_j: self.t2_active.then_some((nonce & 65535) as u16),
                 tail_value_sats: None,
             });
         }
         drop(view);
         self.readback_gpu.unmap();
+        #[cfg(not(target_arch = "wasm32"))]
+        let elapsed = batch_started.elapsed();
+        #[cfg(target_arch = "wasm32")]
+        let elapsed =
+            Duration::from_secs_f64(((js_sys::Date::now() - batch_started) / 1000.0).max(0.0));
         if adapt_batch {
-            self.recommended_candidates = next_wgpu_batch_size(
-                candidate_count,
-                batch_started.elapsed(),
-                self.max_candidates,
-            );
+            self.recommended_candidates =
+                next_wgpu_batch_size(candidate_count, elapsed, self.active_capacity());
         }
 
         Ok(PhotonCudaBatchResult {
@@ -854,11 +1347,319 @@ impl WgpuPhotonEngine {
     }
 }
 
+/// Platform APIs used by both discovery and execution.
+pub fn production_wgpu_backends() -> wgpu::Backends {
+    if cfg!(target_arch = "wasm32") {
+        wgpu::Backends::BROWSER_WEBGPU
+    } else if cfg!(target_os = "macos") {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{crypto, search, tx};
     use secp256k1::{PublicKey, SecretKey};
+
+    // An explicit serial GPU gate: actual serializer -> GPU signatures/search
+    // -> independent CPU signature, complete transaction and digest checks.
+    #[test]
+    #[ignore = "requires exclusive access to a physical GPU"]
+    fn t2_gpu_end_to_end_boundaries_and_rotations() {
+        let ordinal = std::env::var("PICKAXE_TEST_WGPU_ORDINAL")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
+        let mut engine = WgpuPhotonEngine::new(ordinal, 4096, 4096).unwrap();
+        let mut checked = 0usize;
+        for (key_index, deployment) in [
+            crate::protocol::MAINNET_V0_PHOTON,
+            crate::protocol::MAINNET_PHOTON,
+            crate::protocol::CHIPNET_PHOTON,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = [0x11 + key_index as u8; 32];
+            let public_key =
+                PublicKey::from_secret_key(&SecretKey::from_secret_bytes(key).unwrap()).serialize();
+            let mut target = [0xff; 32];
+            target[31] = 0x7f;
+            for age in [0, 1, 8, 17, 128, 32768] {
+                let Ok(layout) = PhotonLayout::for_age_with_deployment(age, &deployment) else {
+                    continue;
+                };
+                // Both limbs exercise a carry/borrow within the amount window.
+                let reward = (1u128 << 33) + 7;
+                let baton = (1u128 << 49) + u128::from(u32::MAX) - 7;
+                let template = tx::build_photon_template_bytes_for_deployment(
+                    &tx::TemplateParams {
+                        prev_tx_hash_hex: "11".repeat(32),
+                        prev_index: key_index as u32,
+                        age,
+                        public_key_hex: hex::encode(public_key),
+                        target_hex: hex::encode(target),
+                        signature_hex: "00".repeat(64),
+                        nonce: 0,
+                        contract_value_sats: 48_635_000,
+                        relay_fee_sats_per_kb: 1100,
+                        contract_token_amount: baton + reward,
+                        reward_amount: reward,
+                        payout_locking: tx::cashaddr_to_p2pkh_locking(
+                            crate::config::DONATION_ADDRESS,
+                        )
+                        .unwrap(),
+                    },
+                    &deployment,
+                )
+                .unwrap();
+                engine.set_proof_rule(deployment.proof_rule);
+                engine.set_job(&template, &target, &key).unwrap();
+                assert!(engine.t2_active);
+                for (base, count) in [
+                    (0, 67),
+                    (65500, 128),
+                    (0x1234ffff, 129),
+                    (u32::MAX - 66, 67),
+                ] {
+                    let actual = engine.search_batch(base, count).unwrap();
+                    let mut expected = std::collections::BTreeMap::new();
+                    for candidate in u64::from(base)..u64::from(base) + u64::from(count) {
+                        let nonce = (candidate / 65536) as u32;
+                        let j = (candidate & 65535) as u16;
+                        let message =
+                            tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
+                        let signature = crypto::bch_schnorr_sign(&key, &message).unwrap();
+                        assert!(
+                            crypto::bch_schnorr_verify(&public_key, &message, &signature).unwrap()
+                        );
+                        let mut completed = template.clone();
+                        let n = layout.nonce_offset();
+                        completed[n..n + 4].copy_from_slice(&nonce.to_le_bytes());
+                        let s = layout.signature_offset();
+                        completed[s..s + 64].copy_from_slice(&signature);
+                        let shift = layout.shift();
+                        completed[491 + shift..499 + shift]
+                            .copy_from_slice(&((baton + u128::from(j)) as u64).to_le_bytes());
+                        completed[578 + shift..586 + shift]
+                            .copy_from_slice(&((reward - u128::from(j)) as u64).to_le_bytes());
+                        let digest = search::hash256(&completed);
+                        if search::meets_target_le_for_rule(&digest, &target, deployment.proof_rule)
+                        {
+                            expected.insert((nonce, j), digest);
+                        }
+                        checked += 1;
+                    }
+                    assert_eq!(actual.candidates, count);
+                    assert_eq!(actual.total_winners as usize, expected.len());
+                    assert!(!actual.truncated());
+                    let returned: std::collections::BTreeMap<_, _> = actual
+                        .winners
+                        .iter()
+                        .map(|w| ((w.nonce, w.tail_j.unwrap()), w.digest))
+                        .collect();
+                    assert_eq!(returned, expected, "age {age} base {base}");
+                }
+                assert!(engine.search_batch(u32::MAX, 2).is_err());
+            }
+        }
+        eprintln!(
+            "T2 independent candidate checks={checked}; adapter={}",
+            engine._adapter_name
+        );
+    }
+
+    #[test]
+    #[ignore = "requires exclusive access to a physical GPU"]
+    fn t2_gpu_large_dispatch_matches_serial_and_cpu() {
+        let ordinal = std::env::var("PICKAXE_TEST_WGPU_ORDINAL")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
+        let mut engine = WgpuPhotonEngine::new(ordinal, WGPU_T2_MAX_BATCH, 4096).unwrap();
+        let key = [0x31; 32];
+        let public =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(key).unwrap()).serialize();
+        let mut target = [0xff; 32];
+        target[31] = 0;
+        target[30] = 0x10;
+        let total = 2_100_000_000_000_000_000u128;
+        let reward = 4_999_999_999_999u128;
+        let template = tx::build_photon_template_bytes_for_deployment(
+            &tx::TemplateParams {
+                prev_tx_hash_hex: "11".repeat(32),
+                prev_index: 0,
+                age: 128,
+                public_key_hex: hex::encode(public),
+                target_hex: hex::encode(target),
+                signature_hex: "00".repeat(64),
+                nonce: 0,
+                contract_value_sats: 48_635_000,
+                relay_fee_sats_per_kb: 1100,
+                contract_token_amount: total,
+                reward_amount: reward,
+                payout_locking: tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS)
+                    .unwrap(),
+            },
+            &crate::protocol::MAINNET_PHOTON,
+        )
+        .unwrap();
+        engine.set_proof_rule(crate::protocol::ProofRule::Positive);
+        engine.set_job(&template, &target, &key).unwrap();
+        let base = 65500;
+        let count = 4_194_432;
+        let large = engine.search_batch(base, count).unwrap();
+        assert!(!large.truncated());
+        let mut serial = std::collections::BTreeMap::new();
+        let mut offset = 0;
+        while offset < count {
+            let size = (count - offset).min(524288);
+            let batch = engine.search_batch(base + offset, size).unwrap();
+            assert!(!batch.truncated());
+            for winner in batch.winners {
+                serial.insert((winner.nonce, winner.tail_j.unwrap()), winner.digest);
+            }
+            offset += size;
+        }
+        let actual: std::collections::BTreeMap<_, _> = large
+            .winners
+            .iter()
+            .map(|w| ((w.nonce, w.tail_j.unwrap()), w.digest))
+            .collect();
+        assert_eq!(large.total_winners as usize, actual.len());
+        assert_eq!(actual, serial);
+        assert!(actual.keys().any(|(nonce, _)| *nonce >= 32));
+        let layout = PhotonLayout::for_tx_len(template.len()).unwrap();
+        for ((nonce, j), digest) in &actual {
+            let message = tx::photon_message_sha256(*nonce, &hex::encode(target)).unwrap();
+            let sig = crypto::bch_schnorr_sign(&key, &message).unwrap();
+            assert!(crypto::bch_schnorr_verify(&public, &message, &sig).unwrap());
+            let mut tx = template.clone();
+            let n = layout.nonce_offset();
+            let p = layout.signature_offset();
+            let shift = layout.shift();
+            tx[n..n + 4].copy_from_slice(&nonce.to_le_bytes());
+            tx[p..p + 64].copy_from_slice(&sig);
+            tx[491 + shift..499 + shift]
+                .copy_from_slice(&((total - reward + u128::from(*j)) as u64).to_le_bytes());
+            tx[578 + shift..586 + shift]
+                .copy_from_slice(&((reward - u128::from(*j)) as u64).to_le_bytes());
+            assert_eq!(*digest, search::hash256(&tx));
+            assert!(search::meets_target_le_for_rule(
+                digest,
+                &target,
+                crate::protocol::ProofRule::Positive
+            ));
+        }
+        eprintln!("T2 large dispatch: {count} candidates, {} independently checked winners, serial/full sets identical", actual.len());
+    }
+
+    #[test]
+    #[ignore = "serial complete-pipeline performance comparison on an idle GPU"]
+    fn t2_gpu_interleaved_pipeline_benchmark() {
+        let ordinal = std::env::var("PICKAXE_TEST_WGPU_ORDINAL")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
+        let mut engine = WgpuPhotonEngine::new(ordinal, WGPU_T2_MAX_BATCH, 8).unwrap();
+        let mut key = [0x11; 32];
+        let mut target = [0; 32];
+        target[0] = 1;
+        engine.set_proof_rule(crate::protocol::ProofRule::Positive);
+        let template_for_key = |key: [u8; 32]| {
+            let public_key =
+                PublicKey::from_secret_key(&SecretKey::from_secret_bytes(key).unwrap()).serialize();
+            tx::build_photon_template_bytes_for_deployment(
+                &tx::TemplateParams {
+                    prev_tx_hash_hex: "11".repeat(32),
+                    prev_index: 0,
+                    age: 128,
+                    public_key_hex: hex::encode(public_key),
+                    target_hex: hex::encode(target),
+                    signature_hex: "00".repeat(64),
+                    nonce: 0,
+                    contract_value_sats: 48_635_000,
+                    relay_fee_sats_per_kb: 1100,
+                    contract_token_amount: 2_100_000_000_000_000_000,
+                    reward_amount: 4_999_999_999_999,
+                    payout_locking: tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS)
+                        .unwrap(),
+                },
+                &crate::protocol::MAINNET_PHOTON,
+            )
+            .unwrap()
+        };
+        engine
+            .set_job(&template_for_key(key), &target, &key)
+            .unwrap();
+        assert!(engine.t2_active);
+        let mut alternate =
+            engine
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("T2 comparison with 64-thread groups"),
+                    layout: None,
+                    module: &engine.shader,
+                    entry_point: Some("pickaxe_t2_filter"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[("T2_SHIFT", 16.0), ("T2_GROUP_SIZE", 256.0)],
+                        ..Default::default()
+                    },
+                    cache: None,
+                });
+        let mut alternate_bind = create_bind_group(
+            &engine.device,
+            &alternate,
+            "T2 comparison",
+            &[
+                (0, &engine.input_gpu),
+                (2, &engine.result_gpu),
+                (16, &engine.winner_records_gpu),
+                (17, &engine._t2_windows_gpu),
+                (18, &engine.t2_control_gpu),
+            ],
+        );
+        let seconds = std::env::var("PICKAXE_TRIAL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20)
+            .clamp(1, 120);
+        let rounds = std::env::var("PICKAXE_TRIAL_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(6)
+            .clamp(2, 8);
+        for round in 0..rounds {
+            std::mem::swap(&mut engine.t2_filter, &mut alternate);
+            std::mem::swap(&mut engine.bind_t2_filter, &mut alternate_bind);
+            let group_size = if round % 2 == 1 { 64 } else { 256 };
+            engine.t2_group_size = group_size;
+            let count = WGPU_T2_MAX_BATCH;
+            engine.search_batch(0, count).unwrap();
+            let start = Instant::now();
+            let mut candidates = 0u64;
+            let mut position = u64::from(count);
+            let mut rotations = 0;
+            while start.elapsed() < Duration::from_secs(seconds) {
+                if position == 1u64 << 32 {
+                    key[0] += 1;
+                    engine
+                        .set_job(&template_for_key(key), &target, &key)
+                        .unwrap();
+                    position = 0;
+                    rotations += 1;
+                }
+                let result = engine.search_batch(position as u32, count).unwrap();
+                assert_eq!(result.total_winners, 0);
+                candidates += u64::from(result.candidates);
+                position += u64::from(result.candidates);
+            }
+            eprintln!("T2_TRIAL round={round} group_size={group_size} candidates={candidates} elapsed_s={:.6} mh_s={:.4} rotations={rotations} adapter={}", start.elapsed().as_secs_f64(), candidates as f64 / start.elapsed().as_secs_f64() / 1e6, engine._adapter_name);
+        }
+    }
 
     fn reference_template_with_target(target: [u8; 32]) -> [u8; TX_BYTES] {
         let raw = hex::decode(include_str!("../reference/photon_vector_tx.hex").trim()).unwrap();
@@ -870,7 +1671,7 @@ mod tests {
     }
 
     fn assert_reconstructs(
-        template: &[u8; TX_BYTES],
+        template: &[u8],
         target: &[u8; 32],
         private_key: &[u8; 32],
         winner: &PhotonCudaWinner,
@@ -882,12 +1683,45 @@ mod tests {
                 .serialize();
         assert!(crypto::bch_schnorr_verify(&public_key, &message, &signature).unwrap());
 
-        let mut completed = *template;
+        let mut completed = template.to_vec();
         completed[390..394].copy_from_slice(&winner.nonce.to_le_bytes());
         completed[426..490].copy_from_slice(&signature);
         let expected = search::hash256(&completed);
         assert_eq!(winner.digest, expected);
         assert!(search::meets_target_le(&expected, target));
+    }
+
+    #[test]
+    fn portable_shader_validates_current_layout_and_proof_fields_without_a_gpu() {
+        let source = reference_shader_source_for_wgpu().unwrap();
+        let module = naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+        assert!(source.contains("words: array<u32, 158>"));
+        for shift in PhotonLayout::GPU_SHIFTS {
+            let layout = PhotonLayout::for_tx_len(615 + shift).unwrap();
+            let target = [0x42; 32];
+            let mut template = vec![0; layout.tx_bytes()];
+            template[layout.target_offset()..layout.target_offset() + 32].copy_from_slice(&target);
+            let mut key = [0; 32];
+            key[31] = 1;
+            validate_job_material(&template, &target, &key).unwrap();
+            let packed = pack_big_endian_words(&template, TEMPLATE_WORDS);
+            let byte_at = |i: usize| {
+                let start = i / 4 * 4;
+                let word = u32::from_le_bytes(packed[start..start + 4].try_into().unwrap());
+                ((word >> ((3 - i % 4) * 8)) & 255) as u8
+            };
+            for (i, expected) in target.iter().enumerate() {
+                assert_eq!(byte_at(394 + shift + i), *expected);
+            }
+            assert!(layout.tx_bytes() <= 631);
+        }
     }
 
     #[test]
@@ -996,6 +1830,7 @@ mod tests {
             Err(error) => panic!("PHOTON WGPU init failed: {error}"),
         };
         engine.set_job(&template, &target, &private_key).unwrap();
+        engine.t2_active = false; // Retain coverage of the reference fallback.
 
         let single_nonce = 0x1234_5678;
         let single = engine.search_batch(single_nonce, 1).unwrap();
@@ -1040,6 +1875,71 @@ mod tests {
             + RESULT_BYTES
             + winner_cap as usize * WINNER_RECORD_BYTES
             + (RESULT_BYTES + winner_cap as usize * WINNER_RECORD_BYTES);
-        assert_eq!(engine.persistent_device_bytes(), expected_bytes);
+        assert_eq!(
+            engine.persistent_device_bytes(),
+            expected_bytes + t2_window_bytes(candidate_count) + 16
+        );
+
+        // Exercise actual serializer layouts, including both current deployments.
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        let public_key =
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes(private_key).unwrap())
+                .serialize();
+        for deployment in [
+            crate::protocol::MAINNET_V0_PHOTON,
+            crate::protocol::MAINNET_PHOTON,
+            crate::protocol::CHIPNET_PHOTON,
+        ] {
+            for age in [8, 17, 128, 32_768] {
+                let Ok(layout) = PhotonLayout::for_age_with_deployment(age, &deployment) else {
+                    continue;
+                };
+                let template = tx::build_photon_template_bytes_for_deployment(
+                    &tx::TemplateParams {
+                        prev_tx_hash_hex: "11".repeat(32),
+                        prev_index: 0,
+                        age,
+                        public_key_hex: hex::encode(public_key),
+                        target_hex: hex::encode(target),
+                        signature_hex: "00".repeat(64),
+                        nonce: 0,
+                        contract_value_sats: 48_635_000,
+                        relay_fee_sats_per_kb: 1_100,
+                        contract_token_amount: 2_095_454_920_205_042,
+                        reward_amount: 4_989_178_380,
+                        payout_locking: tx::cashaddr_to_p2pkh_locking(
+                            crate::config::DONATION_ADDRESS,
+                        )
+                        .unwrap(),
+                    },
+                    &deployment,
+                )
+                .unwrap();
+                engine.set_proof_rule(deployment.proof_rule);
+                engine.set_job(&template, &target, &private_key).unwrap();
+                engine.t2_active = false;
+                let actual = engine.search_batch(nonce_base, candidate_count).unwrap();
+                let mut expected = std::collections::BTreeMap::new();
+                for nonce in nonce_base..nonce_base + candidate_count {
+                    let message = tx::photon_message_sha256(nonce, &hex::encode(target)).unwrap();
+                    let signature = crypto::bch_schnorr_sign(&private_key, &message).unwrap();
+                    assert!(crypto::bch_schnorr_verify(&public_key, &message, &signature).unwrap());
+                    let mut completed = template.clone();
+                    let offset = layout.nonce_offset();
+                    completed[offset..offset + 4].copy_from_slice(&nonce.to_le_bytes());
+                    let offset = layout.signature_offset();
+                    completed[offset..offset + 64].copy_from_slice(&signature);
+                    let digest = search::hash256(&completed);
+                    if search::meets_target_le_for_rule(&digest, &target, deployment.proof_rule) {
+                        expected.insert(nonce, digest);
+                    }
+                }
+                assert_eq!(actual.total_winners as usize, expected.len());
+                for winner in actual.winners {
+                    assert_eq!(expected.get(&winner.nonce), Some(&winner.digest));
+                }
+            }
+        }
     }
 }

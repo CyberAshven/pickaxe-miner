@@ -4,6 +4,9 @@ version = "0.0.3"
 edition = "2021"
 license = "AGPL-3.0-only"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 default = ["rust-t2"]
 incremental-k = []
@@ -20,22 +23,34 @@ sha2 = "0.11"
 ripemd = "0.2"
 hex = "0.4"
 secp256k1 = { version = "0.33.1", features = ["global-context", "rand"] }
-tungstenite = { version = "0.30", features = ["native-tls"] }
-native-tls = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 num-bigint = "0.4"
 num-traits = "0.2"
-cudarc = { version = "0.19.10", features = ["cuda-12000"] }
-clap = { version = "4.6.7", features = ["derive"] }
 hmac = "0.13"
 rand = "0.9"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "metal", "webgpu", "wgsl"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tungstenite = { version = "0.30", features = ["native-tls"] }
+native-tls = "0.2"
+cudarc = { version = "0.19.10", features = ["cuda-12000"] }
+clap = { version = "4.6.7", features = ["derive"] }
 ctrlc = "3.4"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
 crossterm = "0.29"
 libloading = "0.9"
 pollster = { version = "0.4", optional = true }
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"], optional = true }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }

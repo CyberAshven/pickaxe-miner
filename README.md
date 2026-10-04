@@ -19,7 +19,23 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 - Operating systems: Windows x86_64 and Linux x86_64
 - NVIDIA: CUDA PTX `sm_120`
 - AMD: HIP `gfx1036`
-- No ARM, ARM64, or macOS build
+- Apple Silicon (Metal) and browser (WebGPU/WASM) builds: [portable build instructions](docs/portable.md).
+
+## Quick start: mainnet TUI
+
+From the extracted download folder, run the command for your platform:
+
+| Platform | Command |
+| --- | --- |
+| Windows PowerShell | `.\pickaxe.exe mine --network mainnet` |
+| Linux | `./pickaxe mine --network mainnet` |
+| Apple Silicon Mac | `./pickaxe mine --network mainnet --backend wgpu` |
+
+The interactive setup opens with Mainnet selected. Enter your payout address
+and choose **Start mining**. Saved profiles keep your settings for next time.
+To skip setup and start directly in the mining TUI, append
+`--address "YOUR_MAINNET_PAYOUT_ADDRESS"`, replacing the placeholder with your
+valid payout CashAddr. Servers are selected automatically.
 
 ## Install
 
@@ -68,10 +84,10 @@ Fulcrum servers and nodes you add are saved once per network in `config.sources.
 Use v0.0.3 or newer, which includes Chipnet support. After building this branch, run from the project root with the GPU files in place:
 
 ```bash
-./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bitcoincash:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
+./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bchtest:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
 ```
 
-Replace the quoted address with your valid token-aware P2PKH payout CashAddr. The miner converts a valid mainnet payout CashAddr to the equivalent `bchtest:` address with the same key hash. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoint; mainnet remains the default without `--chipnet`.
+Replace the quoted address with your valid Chipnet P2PKH or token-aware P2PKH payout CashAddr. Mainnet requires `bitcoincash:` addresses and Chipnet requires `bchtest:` addresses; mismatched networks are rejected, never converted. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoints; mainnet remains the default without `--chipnet`.
 
 New Chipnet wins pay the selected wallet directly, using the same donation policy. No local reward wallet or payout batching is created for new mining.
 

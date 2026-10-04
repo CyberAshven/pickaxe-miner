@@ -4,48 +4,10 @@
 //! Each supported token declares its fee policy.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
-mod backend;
-mod benchmark;
-mod cli;
-mod config;
-mod crypto;
-#[cfg(test)]
-#[allow(dead_code, clippy::needless_range_loop)]
-mod cuda_miner;
-#[allow(dead_code)]
-mod cuda_photon;
-#[cfg(test)]
-mod cuda_stage_a;
-#[cfg(test)]
-mod cuda_stage_a_ref;
-#[cfg(test)]
-mod cuda_stage_b;
-#[allow(dead_code)]
-mod cuda_stage_c;
-mod donation;
-#[allow(dead_code)]
-mod electrum;
-mod hip_photon;
-#[allow(dead_code)]
-mod m29_table;
-mod mining_lock;
-#[allow(dead_code)]
-mod node;
-#[allow(dead_code)]
-mod protocol;
-mod reward;
-mod runtime;
-#[allow(dead_code)]
-mod search;
-mod self_test;
-#[cfg(test)]
-mod stage_b;
-mod telemetry;
-#[allow(dead_code)]
-mod tui;
-mod tx;
-#[cfg(feature = "portable-wgpu")]
-mod wgpu_photon;
+use pickaxe_miner::{
+    backend, benchmark, cli, config, electrum, mining_lock, node, runtime, search, self_test,
+    telemetry, tui, tx,
+};
 
 use config::RuntimeConfig;
 use electrum::{ElectrumSession, LiveJob};
@@ -1612,9 +1574,13 @@ mod tests {
             windows.trim_end_matches("-windows-x86_64")
         );
 
-        assert!(!workflow.to_ascii_lowercase().contains("aarch64"));
-        assert!(!workflow.contains("apple-darwin"));
-        assert!(!workflow.contains("-arm64"));
+        // #### PR #22: ARM64 is supported by the shared macOS package. Keep
+        // excluding unsupported Windows/Linux ARM packages from this release.
+        assert!(workflow.contains("\"${TAG}-macos-arm64.tar.gz\""));
+        assert!(workflow.contains("\"${TAG}-web.tar.gz\""));
+        assert!(workflow.contains("name: Verify portable package provenance"));
+        assert!(!workflow.contains("-linux-arm64"));
+        assert!(!workflow.contains("-windows-arm64"));
         assert!(workflow.contains("GH_REPO: ${{ github.repository }}"));
         assert!(workflow.contains("--repo \"${GH_REPO}\""));
     }
@@ -1734,6 +1700,32 @@ mod tests {
         assert_eq!(args.device, Some(0));
         assert_eq!(cfg.intensity, 60);
         assert_eq!(cfg.payout_address, crate::config::DONATION_ADDRESS);
+    }
+
+    #[test]
+    fn cli_rejects_foreign_network_payouts() {
+        for (network, other) in [
+            (
+                config::MiningNetwork::Mainnet,
+                config::MiningNetwork::Chipnet,
+            ),
+            (
+                config::MiningNetwork::Chipnet,
+                config::MiningNetwork::Mainnet,
+            ),
+        ] {
+            let address = tx::p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], other).unwrap();
+            let args = cli::Cli::try_parse_from([
+                "pickaxe",
+                "mine",
+                "--network",
+                network.as_str(),
+                "--address",
+                &address,
+            ])
+            .unwrap();
+            assert!(runtime_config_from_cli(&args).is_err());
+        }
     }
 
     #[test]

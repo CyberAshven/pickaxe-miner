@@ -57,7 +57,7 @@ const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
 type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 #[derive(Debug, Clone)]
-pub(crate) struct SetupResult {
+pub struct SetupResult {
     pub config: RuntimeConfig,
     pub backend: BackendKind,
     pub device: u32,
@@ -65,7 +65,7 @@ pub(crate) struct SetupResult {
 }
 
 #[derive(Default)]
-pub(crate) struct SetupOverrides {
+pub struct SetupOverrides {
     pub network: Option<MiningNetwork>,
     pub token: Option<String>,
     pub intensity: Option<u8>,
@@ -616,7 +616,10 @@ impl SetupFlow {
                     self.status_line = "Enter a payout address first.".into();
                     self.open_settings(SettingsRow::Address);
                 }
-                SettingsRow::Start => return SetupAction::Complete,
+                SettingsRow::Start => match self.config.ensure_mining_supported() {
+                    Ok(()) => return SetupAction::Complete,
+                    Err(error) => self.status_line = error,
+                },
                 SettingsRow::Gpu | SettingsRow::Intensity | SettingsRow::AsicTarget => {
                     self.status_line = "Use Left/Right to change this row.".into();
                 }
@@ -1169,7 +1172,7 @@ impl TuiState {
 
 /// Runs the interactive setup flow before starting mining.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_setup(
+pub fn run_setup(
     config: RuntimeConfig,
     devices: Vec<GpuDevice>,
     default_device: &GpuDevice,
@@ -3624,6 +3627,24 @@ mod tests {
         assert_eq!(setup.config.intensity, 90);
         setup.handle_key(key(KeyCode::Esc));
         assert_eq!(setup.step, SetupStep::Profiles);
+    }
+
+    #[test]
+    fn setup_network_change_requires_a_matching_payout_before_start() {
+        let (mut setup, saved) = setup_with_saved_profile();
+        setup.handle_key(key(KeyCode::Enter));
+        setup.step = SetupStep::Network;
+        setup.handle_key(key(KeyCode::Down));
+        assert_eq!(setup.config.network, MiningNetwork::Chipnet);
+        assert_eq!(setup.config.payout_address, saved.payout_address);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert!(setup.status_line.contains("bchtest:"));
+        let chipnet =
+            crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], MiningNetwork::Chipnet)
+                .unwrap();
+        setup.config.set_payout(chipnet).unwrap();
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
     }
 
     #[test]

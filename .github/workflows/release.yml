@@ -25,6 +25,7 @@ on:
       - dev
     paths:
       - ".github/workflows/release.yml"
+      - ".github/workflows/portable.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "cuda/build/**"
@@ -32,6 +33,10 @@ on:
       - "tools/build-rust-kernels.ps1"
       - "tools/test_release_channel.py"
       - "rust-engine/**"
+      - "src/**"
+      - "web/**"
+      - "tools/build-browser.py"
+      - "tools/shared-gpu-proof/**"
       - "protocol/**"
       - "build.rs"
   workflow_dispatch:
@@ -56,6 +61,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # #### PR #22: package every platform from the validated source revision.
+  # The reusable workflow only builds artifacts; publication stays below and
+  # remains skipped for pull requests, dev merges and unchanged versions.
+  portable:
+    name: Portable release packages
+    needs: validate
+    if: needs.validate.outputs.mode != 'skip'
+    uses: ./.github/workflows/portable.yml
+    with:
+      source-ref: ${{ needs.validate.outputs.sha }}
+
   validate:
     name: Validate release tag
     runs-on: ubuntu-latest
@@ -515,6 +531,7 @@ jobs:
     needs:
       - validate
       - build
+      - portable
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -527,6 +544,32 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+
+      - name: Download matching macOS package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pickaxe-macos-arm64-${{ needs.validate.outputs.sha }}
+          path: portable/mac
+
+      - name: Download matching browser package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pickaxe-web-experimental-${{ needs.validate.outputs.sha }}
+          path: portable/web
+
+      - name: Verify portable package provenance
+        shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          (cd portable/mac && sha256sum -c SHA256SUMS.txt)
+          (cd portable/web && sha256sum -c SHA256SUMS.txt)
+          test "$(tar -xOf "portable/mac/${TAG}-macos-arm64.tar.gz" "${TAG}-macos-arm64/SOURCE_COMMIT.txt")" = "${SHA}"
+          test "$(tar -xOf portable/web/pickaxe-web-experimental.tar.gz web/SOURCE_COMMIT.txt)" = "${SHA}"
+          cp "portable/mac/${TAG}-macos-arm64.tar.gz" dist/
+          cp portable/web/pickaxe-web-experimental.tar.gz "dist/${TAG}-web.tar.gz"
 
       - name: Generate SHA-256 checksums
         shell: bash
@@ -544,13 +587,14 @@ jobs:
             exit 1
           fi
           cd dist
-          sha256sum             "${TAG}-linux-x86_64.tar.gz"             "${TAG}-windows-x86_64.zip"             > SHA256SUMS.txt
+          sha256sum "${TAG}-linux-x86_64.tar.gz" "${TAG}-windows-x86_64.zip" \
+            "${TAG}-macos-arm64.tar.gz" "${TAG}-web.tar.gz" > SHA256SUMS.txt
           cat SHA256SUMS.txt
           {
             echo "Pickaxe Miner v${version}"
             echo
-            echo "Verified assets are Windows x86_64 and Linux x86_64 only."
-            echo "No ARM or ARM64 binary is published."
+            echo "Packages: Windows x86_64, Linux x86_64, macOS Apple Silicon and browser WebGPU."
+            echo "Every package is built from the same source commit."
             echo "Bundled NVIDIA CUDA PTX is sm_120 only."
             echo "NVIDIA CUDA T2 mining uses the Rust backend."
             echo "Bundled AMD HIP code objects are gfx1036 only."
@@ -559,7 +603,7 @@ jobs:
             echo "Source commit: ${SHA}"
             if [[ -n "${REBUILD_SHA}" ]]; then
               echo
-              echo "Downloads rebuilt $(date -u +%F) with the PHOTON transaction-fee fix. Existing installations are unchanged."
+            echo "Downloads rebuilt $(date -u +%F). Existing installations are unchanged."
               echo "The original tag is unchanged. Updated source: [${SHA}](${SOURCE_URL}/tree/${SHA}) ([archive](${SOURCE_URL}/archive/${SHA}.tar.gz))."
             fi
             echo
@@ -646,6 +690,8 @@ jobs:
           assets=(
             "dist/${TAG}-linux-x86_64.tar.gz"
             "dist/${TAG}-windows-x86_64.zip"
+            "dist/${TAG}-macos-arm64.tar.gz"
+            "dist/${TAG}-web.tar.gz"
             "dist/SHA256SUMS.txt"
           )
 

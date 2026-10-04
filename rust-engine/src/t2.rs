@@ -10,57 +10,7 @@ const WINDOW_BYTES: usize = 631;
 // Must match cuda_t2.rs: 256 full windows plus one partial boundary window.
 const HEAD_OFFSET: usize = 257 * 8;
 
-#[inline(always)]
-unsafe fn block<const SHIFT: usize, const BLOCK: usize>(
-    tx: *const u8,
-    baton: u64,
-    reward: u64,
-    j: u32,
-) -> [u32; 16] {
-    let byte = |pos: usize| {
-        if (491 + SHIFT..499 + SHIFT).contains(&pos) {
-            ((baton + u64::from(j)) >> (8 * (pos - 491 - SHIFT))) as u8
-        } else if (578 + SHIFT..586 + SHIFT).contains(&pos) {
-            ((reward - u64::from(j)) >> (8 * (pos - 578 - SHIFT))) as u8
-        } else if pos < 615 + SHIFT {
-            *tx.add(pos)
-        } else if pos == 615 + SHIFT {
-            0x80
-        } else if pos >= 632 {
-            (((615 + SHIFT) as u64 * 8) >> (8 * (639 - pos))) as u8
-        } else {
-            0
-        }
-    };
-    macro_rules! word {
-        ($i:literal) => {
-            u32::from_be_bytes([
-                byte(BLOCK * 64 + $i * 4),
-                byte(BLOCK * 64 + $i * 4 + 1),
-                byte(BLOCK * 64 + $i * 4 + 2),
-                byte(BLOCK * 64 + $i * 4 + 3),
-            ])
-        };
-    }
-    [
-        word!(0),
-        word!(1),
-        word!(2),
-        word!(3),
-        word!(4),
-        word!(5),
-        word!(6),
-        word!(7),
-        word!(8),
-        word!(9),
-        word!(10),
-        word!(11),
-        word!(12),
-        word!(13),
-        word!(14),
-        word!(15),
-    ]
-}
+use crate::t2_block::block;
 
 #[inline(always)]
 unsafe fn hash<const SHIFT: usize>(
