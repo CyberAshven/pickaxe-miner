@@ -8,7 +8,8 @@ license = "AGPL-3.0-only"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["rust-t2"]
+# Native builds carry the portable T2 engine so AMD and Intel GPUs mine through Vulkan.
+default = ["rust-t2", "portable-wgpu"]
 incremental-k = []
 tail-grind = []
 # Default Rust implementation of the complete CUDA T2 mining path.

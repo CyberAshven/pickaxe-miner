@@ -3369,6 +3369,7 @@ mod tests {
                 vram_bytes: None,
                 backend: BackendKind::Cuda,
                 detail: String::new(),
+                integrated: false,
             },
             GpuDevice {
                 index: 0,
@@ -3377,6 +3378,7 @@ mod tests {
                 vram_bytes: None,
                 backend: BackendKind::Hip,
                 detail: String::new(),
+                integrated: false,
             },
         ]
     }

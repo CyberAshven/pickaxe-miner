@@ -705,6 +705,7 @@ mod tests {
             vram_bytes: None,
             backend,
             detail: String::new(),
+            integrated: false,
         }
     }
 
