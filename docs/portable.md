@@ -19,6 +19,24 @@ an address alone cannot distinguish those test networks.
 Backend performance depends on the GPU and driver; Metal and WebGPU do not
 promise CUDA T2 performance.
 
+## DirectX 12 on Windows (optional)
+
+On Windows the portable engine uses Vulkan. For a GPU whose Vulkan driver fails
+but whose DirectX 12 driver works, set `PICKAXE_WGPU_API=dx12`:
+
+```powershell
+$env:PICKAXE_WGPU_API = 'dx12'
+.\pickaxe.exe devices --backend wgpu
+.\pickaxe.exe mine --backend wgpu
+```
+
+DirectX 12 needs Microsoft's DXC shader compiler, which Windows does not
+include: copy `dxcompiler.dll` and `dxil.dll` from the `bin\x64` folder of a
+[DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases)
+(v1.8.2502 or newer) next to `pickaxe.exe`. The miner stops with that
+instruction when they are missing; Windows' built-in FXC compiler cannot build
+these shaders. `PICKAXE_WGPU_API=vulkan`, or no variable, keeps Vulkan.
+
 ## Apple Silicon
 
 The **CI** workflow builds Windows, Linux, macOS and the browser from the same

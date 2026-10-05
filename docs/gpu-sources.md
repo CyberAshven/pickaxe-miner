@@ -22,6 +22,7 @@ selectable until its replacement is proven on hardware.
 | NVIDIA | CUDA | Shared Rust engine: `cuda/build/photon_rust.ptx` | CUDA C++ kernels: build with `--no-default-features --features tail-grind` |
 | AMD Radeon RX 6000, 7000, 9000 | HIP | CUDA C++ kernels compiled for HIP: `hip/build/<arch>/*.hsaco` | Shared Rust engine: set `PICKAXE_HIP_KERNELS=rust` to load `hip/build/<arch>/photon_rust.hsaco` |
 | Other AMD GPUs, Intel GPUs, integrated GPUs | wgpu on Vulkan | Shared Rust stages (`reference/shared-stages/`) and T2 filter (`reference/shared-t2/`) | Original hand-written WGSL stages: set `PICKAXE_WGPU_STAGES=wgsl` |
+| Windows GPUs whose Vulkan driver fails | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan | Same as Vulkan |
 | Apple Silicon | wgpu on Metal | Same as Vulkan | Same as Vulkan |
 | Browser miner | wgpu on WebGPU | Same as Vulkan | Development builds only (`verify_portable_engine`) |
 

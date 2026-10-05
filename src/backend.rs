@@ -213,17 +213,17 @@ fn wgpu_vendor_name(vendor: u32) -> String {
 
 #[cfg(feature = "portable-wgpu")]
 /// Limits WGPU discovery to production-capable APIs.
-pub(crate) fn production_wgpu_backends() -> wgpu::Backends {
+pub(crate) fn production_wgpu_backends() -> Result<wgpu::Backends, String> {
     crate::wgpu_photon::production_wgpu_backends()
 }
 
 #[cfg(feature = "portable-wgpu")]
 /// Enumerates supported WGPU hardware adapters.
 fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
-    let backends = production_wgpu_backends();
-    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    descriptor.backends = backends;
-    let instance = wgpu::Instance::new(descriptor);
+    let backends = production_wgpu_backends()?;
+    let instance = wgpu::Instance::new(crate::wgpu_photon::production_instance_descriptor(
+        backends,
+    )?);
     let adapters = pollster::block_on(instance.enumerate_adapters(backends));
     let mut out = Vec::new();
 
@@ -583,13 +583,16 @@ mod tests {
     #[cfg(feature = "portable-wgpu")]
     #[test]
     fn production_wgpu_surface_matches_platform() {
+        if std::env::var_os("PICKAXE_WGPU_API").is_some() {
+            return;
+        }
         assert_eq!(
             production_wgpu_backends(),
-            if cfg!(target_os = "macos") {
+            Ok(if cfg!(target_os = "macos") {
                 wgpu::Backends::METAL
             } else {
                 wgpu::Backends::VULKAN
-            }
+            })
         );
     }
 

@@ -728,10 +728,8 @@ impl WgpuPhotonEngine {
             return Err("PHOTON WGPU winner_cap must be greater than zero".into());
         }
 
-        let backends = production_wgpu_backends();
-        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        instance_descriptor.backends = backends;
-        let instance = wgpu::Instance::new(instance_descriptor);
+        let backends = production_wgpu_backends()?;
+        let instance = wgpu::Instance::new(production_instance_descriptor(backends)?);
         #[cfg(not(target_arch = "wasm32"))]
         let adapters = instance.enumerate_adapters(backends).await;
         #[cfg(not(target_arch = "wasm32"))]
@@ -1620,14 +1618,86 @@ impl WgpuPhotonEngine {
 }
 
 /// Platform APIs used by both discovery and execution.
-pub fn production_wgpu_backends() -> wgpu::Backends {
+pub fn production_wgpu_backends() -> Result<wgpu::Backends, String> {
     if cfg!(target_arch = "wasm32") {
-        wgpu::Backends::BROWSER_WEBGPU
-    } else if cfg!(target_os = "macos") {
-        wgpu::Backends::METAL
-    } else {
-        wgpu::Backends::VULKAN
+        return Ok(wgpu::Backends::BROWSER_WEBGPU);
     }
+    native_wgpu_backends(
+        std::env::var("PICKAXE_WGPU_API").ok().as_deref(),
+        cfg!(windows),
+        cfg!(target_os = "macos"),
+    )
+}
+
+// #### PR #22: optional DirectX 12 on Windows
+// What: PICKAXE_WGPU_API=dx12 runs the portable engine on DirectX 12 instead
+// of Vulkan, compiling shaders with Microsoft's DXC (dxcompiler.dll and
+// dxil.dll beside the executable or on PATH). Vulkan stays the default, and
+// macOS always uses Metal.
+// Why: some Windows GPUs have a broken Vulkan driver but a working DirectX 12
+// one (issue #30). Windows' built-in FXC compiler cannot build these shaders,
+// so a missing DXC is reported instead of wgpu's silent FXC fallback.
+// Check: `PICKAXE_WGPU_API=dx12 pickaxe_miner devices --backend wgpu` lists
+// the DirectX 12 adapters, and the GPU checks pass there as on Vulkan.
+fn native_wgpu_backends(
+    api: Option<&str>,
+    windows: bool,
+    macos: bool,
+) -> Result<wgpu::Backends, String> {
+    let api = api.map(str::trim).unwrap_or_default();
+    if macos {
+        return if api.is_empty() {
+            Ok(wgpu::Backends::METAL)
+        } else {
+            Err("PICKAXE_WGPU_API is for Windows and Linux; macOS always uses Metal".into())
+        };
+    }
+    match api {
+        "" | "vulkan" => Ok(wgpu::Backends::VULKAN),
+        "dx12" if windows => Ok(wgpu::Backends::DX12),
+        "dx12" => Err("DirectX 12 (PICKAXE_WGPU_API=dx12) is only available on Windows".into()),
+        other => Err(format!(
+            "PICKAXE_WGPU_API must be vulkan or dx12, not {other:?}"
+        )),
+    }
+}
+
+/// Instance settings for `backends`; DirectX 12 compiles with Microsoft's DXC.
+pub(crate) fn production_instance_descriptor(
+    backends: wgpu::Backends,
+) -> Result<wgpu::InstanceDescriptor, String> {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = backends;
+    #[cfg(windows)]
+    if backends.contains(wgpu::Backends::DX12) {
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::DynamicDxc {
+            dxc_path: dxc_compiler_path()?,
+        };
+    }
+    Ok(descriptor)
+}
+
+/// Finds `dxcompiler.dll` beside the executable or on the DLL search path.
+#[cfg(windows)]
+fn dxc_compiler_path() -> Result<String, String> {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("dxcompiler.dll")))
+        .filter(|path| path.is_file())
+        .map_or_else(
+            || "dxcompiler.dll".to_owned(),
+            |path| path.to_string_lossy().into_owned(),
+        );
+    // SAFETY: loads Microsoft's DXC library only to confirm it is present;
+    // wgpu loads it again for compilation.
+    unsafe { libloading::Library::new(&path) }.map_err(|error| {
+        format!(
+            "DirectX 12 needs Microsoft's DXC shader compiler: put dxcompiler.dll and dxil.dll \
+             from a DirectXShaderCompiler release (v1.8.2502 or newer) next to the miner \
+             executable ({error})"
+        )
+    })?;
+    Ok(path)
 }
 
 /// #### PR #22: an independent CPU check of the portable T2 search
@@ -2500,6 +2570,38 @@ mod tests {
             }
             assert!(layout.tx_bytes() <= 631);
         }
+    }
+
+    // #### PR #22: optional DirectX 12 on Windows
+    #[test]
+    fn graphics_api_defaults_to_vulkan_and_offers_dx12_on_windows() {
+        use wgpu::Backends;
+        // (PICKAXE_WGPU_API, windows, macos)
+        assert_eq!(
+            native_wgpu_backends(None, false, false),
+            Ok(Backends::VULKAN)
+        );
+        assert_eq!(
+            native_wgpu_backends(None, true, false),
+            Ok(Backends::VULKAN)
+        );
+        assert_eq!(
+            native_wgpu_backends(Some(" "), true, false),
+            Ok(Backends::VULKAN)
+        );
+        assert_eq!(
+            native_wgpu_backends(Some("vulkan"), true, false),
+            Ok(Backends::VULKAN)
+        );
+        assert_eq!(
+            native_wgpu_backends(Some("dx12"), true, false),
+            Ok(Backends::DX12)
+        );
+        assert!(native_wgpu_backends(Some("dx12"), false, false).is_err());
+        assert!(native_wgpu_backends(Some("dx11"), true, false).is_err());
+        assert_eq!(native_wgpu_backends(None, false, true), Ok(Backends::METAL));
+        assert!(native_wgpu_backends(Some("dx12"), false, true).is_err());
+        assert!(native_wgpu_backends(Some("vulkan"), false, true).is_err());
     }
 
     // #### PR #22: shared stages per shader translator
