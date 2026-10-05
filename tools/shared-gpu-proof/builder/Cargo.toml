@@ -1,0 +1,12 @@
+[package]
+name = "pickaxe-shared-hash-builder"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu", rev = "e2e4d529a5ead1364228530d301ebbca4ef90262" }
+naga = { version = "27.0.3", features = ["spv-in", "wgsl-out", "msl-out"] }
+
+

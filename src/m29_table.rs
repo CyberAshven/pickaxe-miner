@@ -50,7 +50,7 @@ fn table_hash_hex(bytes: &[u8]) -> String {
 }
 
 /// Checks the shape and checksum of a cached M29 table.
-fn valid_table(bytes: &[u8]) -> bool {
+pub fn valid_table(bytes: &[u8]) -> bool {
     bytes.len() == M29_G16_BYTES && table_hash_hex(bytes) == M29_G16_SHA256
 }
 

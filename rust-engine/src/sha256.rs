@@ -43,7 +43,29 @@ pub fn compress(state: &mut [u32; 8], w: [u32; 16]) {
 /// Resume compression with an already computed round state.
 #[inline(always)]
 pub fn compress_from<const START: usize>(state: &mut [u32; 8], w: [u32; 16], head: [u32; 8]) {
+    #[cfg(not(target_arch = "spirv"))]
     compress_from_limited::<START>(state, w, head, None);
+    #[cfg(target_arch = "spirv")]
+    compress_from_limited::<START>(
+        state,
+        w,
+        head,
+        HashLimit {
+            enabled: 0,
+            limit: 0,
+            strict_positive: 0,
+        },
+    );
+}
+
+// #### PR #22
+// SPIR-V has no portable byte/enum ABI. Keep this boundary in plain words,
+// while preserving the native interface and the shared SHA round arithmetic.
+#[cfg(target_arch = "spirv")]
+struct HashLimit {
+    enabled: u32,
+    limit: u32,
+    strict_positive: u32,
 }
 
 #[inline(always)]
@@ -51,11 +73,24 @@ fn compress_from_limited<const START: usize>(
     state: &mut [u32; 8],
     mut w: [u32; 16],
     head: [u32; 8],
-    high_byte: Option<(u8, bool)>,
+    #[cfg(not(target_arch = "spirv"))] high_byte: Option<(u8, bool)>,
+    #[cfg(target_arch = "spirv")] high_byte: HashLimit,
 ) -> bool {
     // Unrolled rounds rotate variable roles rather than copying eight words.
     // Map a resumed logical state back to those roles at START.
+    #[cfg(not(target_arch = "spirv"))]
     let head: [u32; 8] = core::array::from_fn(|i| head[(i + START) & 7]);
+    #[cfg(target_arch = "spirv")]
+    let head = [
+        head[START & 7],
+        head[(1 + START) & 7],
+        head[(2 + START) & 7],
+        head[(3 + START) & 7],
+        head[(4 + START) & 7],
+        head[(5 + START) & 7],
+        head[(6 + START) & 7],
+        head[(7 + START) & 7],
+    ];
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = head;
     // Constant ring indices let the GPU compiler retain the schedule in registers.
     macro_rules! round {
@@ -84,6 +119,19 @@ fn compress_from_limited<const START: usize>(
                 if $i == 60 {
                     // Logical e after round 60 becomes final h after round 63.
                     // Its low byte is digest[31], PHOTON's first comparison byte.
+                    #[cfg(target_arch = "spirv")]
+                    if high_byte.enabled != 0 {
+                        let high = state[7].wrapping_add($d) & 0xff;
+                        let comparable = if high_byte.strict_positive != 0 {
+                            high
+                        } else {
+                            high & 0x7f
+                        };
+                        if comparable > high_byte.limit {
+                            return false;
+                        }
+                    }
+                    #[cfg(not(target_arch = "spirv"))]
                     if let Some((limit, strict_positive)) = high_byte {
                         let high = state[7].wrapping_add($d) as u8;
                         let comparable = if strict_positive { high } else { high & 0x7f };
@@ -232,11 +280,13 @@ pub fn hash_state(first_hash: [u32; 8]) -> [u8; 32] {
 
 /// Reject a PHOTON hash as soon as its highest comparison byte is known.
 /// Surviving hashes still require the complete strict target comparison.
+#[cfg(not(target_arch = "spirv"))]
 #[inline(always)]
 pub fn hash_state_filtered(first_hash: [u32; 8], high_byte: u8) -> Option<[u8; 32]> {
     hash_state_filtered_with_rule(first_hash, high_byte, false)
 }
 
+#[cfg(not(target_arch = "spirv"))]
 #[inline(always)]
 pub fn hash_state_filtered_with_rule(
     first_hash: [u32; 8],
@@ -255,6 +305,61 @@ pub fn hash_state_filtered_with_rule(
         Some((high_byte, strict_positive)),
     )
     .then(|| bytes(state))
+}
+
+/// #### PR #22
+/// The same round-60 filter with a plain word output for SPIR-V/WGSL.
+/// Avoids translating an enum containing a byte array through pointer casts.
+/// A false return leaves the output unspecified; callers must ignore it.
+#[cfg(not(target_os = "cuda"))]
+#[inline(always)]
+pub fn hash_state_words_filtered(
+    first_hash: [u32; 8],
+    high_byte: u32,
+    strict_positive: bool,
+    state: &mut [u32; 8],
+) -> bool {
+    let block = [
+        first_hash[0],
+        first_hash[1],
+        first_hash[2],
+        first_hash[3],
+        first_hash[4],
+        first_hash[5],
+        first_hash[6],
+        first_hash[7],
+        0x80000000,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        256,
+    ];
+    *state = INITIAL;
+    #[cfg(not(target_arch = "spirv"))]
+    {
+        compress_from_limited::<0>(
+            state,
+            block,
+            INITIAL,
+            Some((high_byte as u8, strict_positive)),
+        )
+    }
+    #[cfg(target_arch = "spirv")]
+    {
+        compress_from_limited::<0>(
+            state,
+            block,
+            INITIAL,
+            HashLimit {
+                enabled: 1,
+                limit: high_byte & 0xff,
+                strict_positive: u32::from(strict_positive),
+            },
+        )
+    }
 }
 
 #[inline(always)]

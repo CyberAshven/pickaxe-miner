@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' wss: ws://localhost:* ws://127.0.0.1:*; style-src 'self'; object-src 'none'; base-uri 'none'">
+<title>Pickaxe Miner</title>
+<link rel="stylesheet" href="style.css">
+<main>
+  <h1>Pickaxe Miner</h1>
+  <p>Browser miner · WebGPU</p>
+  <p>Runs on your GPU. Close any desktop miner before starting. Keep this tab open while mining.</p>
+  <form id="setup">
+    <label>Network <select id="network"><option value="mainnet">Mainnet</option><option value="chipnet">Chipnet</option></select></label>
+    <label>Token <select id="token"></select></label>
+    <label>Payout address <input id="address" required autocomplete="off" spellcheck="false"></label>
+    <details><summary>Advanced</summary>
+      <label>Fulcrum servers <input id="endpoints" placeholder="Automatic — wss://server1, wss://server2" spellcheck="false"></label>
+      <div class="intensity-control">
+        <label for="intensity">Intensity</label>
+        <input id="intensity" type="range" min="10" max="100" step="5" value="50">
+        <output id="intensityLabel" for="intensity">50%</output>
+      </div>
+    </details>
+    <button id="start" type="submit">Start mining</button>
+    <button id="stop" type="button" disabled>Stop</button>
+  </form>
+  <p>Pause other miners on this GPU before starting here.</p>
+  <p id="status" role="status" aria-live="polite">Loading shared Rust engine…</p>
+  <pre id="stats"></pre>
+  <pre id="events" aria-label="Recent events"></pre>
+  <p>No installation or wallet key needed. Use only a host you trust; its scripts run on your computer.</p>
+  <p><a href="https://github.com/CyberAshven/pickaxe-miner" rel="noopener noreferrer">Source code · AGPL-3.0</a></p>
+</main>
+<script type="module" src="app.js"></script>
+</html>

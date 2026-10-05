@@ -4,17 +4,18 @@
 
 use crate::backend::BackendKind;
 use crate::config::{MiningNetwork, MiningToken};
+use crate::crypto;
 use crate::cuda_photon::{CudaPhotonEngine, PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::hip_photon::HipPhotonEngine;
 use crate::protocol::ProofRule;
+#[cfg(test)]
+use crate::tx;
 #[cfg(feature = "portable-wgpu")]
 use crate::wgpu_photon::WgpuPhotonEngine;
-use crate::{crypto, tx};
-use rand::Rng;
-use secp256k1::{PublicKey, SecretKey};
-use sha2::{Digest, Sha256};
+use rand::RngExt;
+use secp256k1::PublicKey;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -36,13 +37,12 @@ pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 262_144;
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 565_248;
 #[cfg(feature = "tail-grind")]
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 65_536;
-const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = 524_288;
+const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES;
 /// Throttled batches are a quarter of the full batch: small enough for
 /// fine duty pacing, large enough to keep the GPU busy during a burst.
 const THROTTLED_BATCH_DIVISOR: u32 = 4;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
-const JOB_UPDATE_CHANNEL_CAP: usize = 2;
 const PAUSE_POLL: Duration = Duration::from_millis(25);
 
 pub(crate) enum PhotonEngine {
@@ -129,7 +129,8 @@ impl PhotonEngine {
             }
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => {
-                engine.set_job(base_layout_template(template, "wgpu")?, target, private_key)
+                engine.set_proof_rule(MiningToken::Photon.photon_deployment(network).proof_rule);
+                engine.set_job(template, target, private_key)
             }
         }
     }
@@ -179,7 +180,14 @@ impl PhotonEngine {
                 let _ = engine;
                 production_max_batch_candidates(BackendKind::Cuda)
             }
-            Self::Hip(_) => production_max_batch_candidates(BackendKind::Hip),
+            Self::Hip(engine) => {
+                #[cfg(feature = "tail-grind")]
+                if let Some(capacity) = engine.t2_group_batch_candidates() {
+                    return intensity_batch_candidates(capacity, intensity);
+                }
+                let _ = engine;
+                production_max_batch_candidates(BackendKind::Hip)
+            }
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.recommended_batch_candidates(),
         };
@@ -196,39 +204,8 @@ pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct MiningJob {
-    pub network: MiningNetwork,
-    pub height: u32,
-    pub baton_txid: String,
-    pub baton_vout: u32,
-    pub baton_height: u32,
-    pub baton_value_sats: u64,
-    pub relay_fee_sats_per_kb: u64,
-    pub age: u32,
-    pub target_le_hex: String,
-    pub token_amount: u128,
-    pub reward_raw: u128,
-    pub payout_address: String,
-    pub source_identity: String,
-    pub generation_id: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedWinner {
-    pub generation_id: u64,
-    pub height: u32,
-    pub baton_txid: String,
-    pub baton_vout: u32,
-    /// Base reward of the job that produced this winner; anchors T2 validation.
-    pub job_reward_raw: u128,
-    pub nonce: u32,
-    pub digest: [u8; 32],
-    pub public_key: [u8; 33],
-    pub signature: [u8; 64],
-    pub transaction: Vec<u8>,
-}
-
+use crate::mining_job::{prepare_job, validate_job, verify_gpu_winner, PreparedJob};
+pub use crate::mining_job::{MiningJob, VerifiedWinner};
 #[derive(Debug, Clone, Default)]
 pub struct SearchStats {
     pub candidates: u64,
@@ -241,7 +218,7 @@ pub struct SearchStats {
     pub rate: f64,
     pub current_rate: f64,
     pub peak_rate: f64,
-    /// Throughput of the last completed GPU batch, excluding host verification.
+    /// Time-weighted throughput of recent GPU batches, excluding host verification.
     /// Retained while settlement pauses GPU work.
     pub active_rate: f64,
     pub winners: u64,
@@ -252,6 +229,33 @@ pub struct SearchStats {
     /// Fresh signing keys installed after a job's 2^32 nonces ran out.
     pub key_rotations: u64,
     pub last_error: Option<String>,
+    /// Each GPU's share, in the order the GPUs were selected.
+    pub gpus: Vec<GpuSearchStats>,
+}
+
+/// One GPU's part of a multi-GPU search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuSearchStats {
+    pub backend: BackendKind,
+    pub device: u32,
+    pub candidates: u64,
+    /// Average candidates per second since the search started.
+    pub rate: f64,
+    pub active_rate: f64,
+    pub winners: u64,
+    pub status: GpuStatus,
+    pub last_error: Option<String>,
+}
+
+/// Whether one GPU of a search is mining.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuStatus {
+    #[default]
+    Mining,
+    /// The GPU failed and its worker waits to rebuild the engine.
+    Recovering,
+    /// The worker ended; this GPU no longer mines.
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -269,14 +273,7 @@ pub enum RuntimeCommand {
     Resume,
 }
 
-/// Double SHA-256 (HASH256) ├â┬ó├óΓÇÜ┬¼├óΓé¼┬¥ tests / rare winner verify only.
-pub fn hash256(data: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(data);
-    let second = Sha256::digest(first);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&second);
-    out
-}
+pub use crate::proof::{hash256, meets_target_le, meets_target_le_for_rule, parse_hex32};
 
 #[cfg(test)]
 /// Builds the PHOTON M1 signing message for a candidate.
@@ -287,70 +284,6 @@ pub fn photon_m1_message(nonce: u32, target32: &[u8; 32]) -> [u8; 36] {
     msg
 }
 
-/// Decodes an exactly 32-byte hexadecimal value.
-pub fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
-    let h = hex.trim();
-    if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("target must be 64 hex chars (32 bytes)".into());
-    }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] =
-            u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).map_err(|_| "invalid hex".to_string())?;
-    }
-    Ok(out)
-}
-
-/// Returns the 615-byte template the wgpu kernels are built for.
-fn base_layout_template<'a>(template: &'a [u8], backend: &str) -> Result<&'a [u8; 615], String> {
-    template.try_into().map_err(|_| {
-        format!(
-            "{backend} kernels support only the 615-byte PHOTON layout (baton age 0..=16); this job is {} bytes",
-            template.len()
-        )
-    })
-}
-
-/// Applies the covenant's proof-of-work rule to a little-endian digest.
-///
-/// The covenant checks `ABS(BIN2NUM(HASH256(tx))) < target`. BIN2NUM reads
-/// the digest as a little-endian script number whose top bit is the sign
-/// and ABS drops it, so bit 255 never matters. Equality is not a win.
-pub fn meets_target_le(digest: &[u8; 32], target_le: &[u8; 32]) -> bool {
-    let top = digest[31] & 0x7f;
-    if top != target_le[31] {
-        return top < target_le[31];
-    }
-    for i in (0..31).rev() {
-        if digest[i] < target_le[i] {
-            return true;
-        }
-        if digest[i] > target_le[i] {
-            return false;
-        }
-    }
-    false
-}
-
-/// Applies the selected covenant's proof rule.
-pub fn meets_target_le_for_rule(digest: &[u8; 32], target_le: &[u8; 32], rule: ProofRule) -> bool {
-    if rule == ProofRule::Positive
-        && (digest[31] & 0x80 != 0
-            || digest.iter().all(|byte| *byte == 0)
-            || target_le[31] & 0x80 != 0
-            || target_le.iter().all(|byte| *byte == 0))
-    {
-        return false;
-    }
-    meets_target_le(digest, target_le)
-}
-
-struct PreparedJob {
-    job: MiningJob,
-    template: Vec<u8>,
-    target: [u8; 32],
-}
-
 enum WorkerCommand {
     ReplaceJob {
         job: MiningJob,
@@ -358,91 +291,12 @@ enum WorkerCommand {
     },
 }
 
-/// Rejects incomplete or invalid PHOTON search material.
-fn validate_job(job: &MiningJob) -> Result<[u8; 32], String> {
-    if job.generation_id == 0 {
-        return Err("mining job generation_id must be nonzero".into());
-    }
-    tx::PhotonLayout::for_age_with_deployment(
-        job.age,
-        MiningToken::Photon.photon_deployment(job.network),
-    )?;
-    tx::require_covenant_hash_preimage(job.token_amount, job.reward_raw)?;
-    if job.payout_address.trim().is_empty() {
-        return Err("mining payout address is required".into());
-    }
-    let target = parse_hex32(&job.target_le_hex)?;
-    if MiningToken::Photon
-        .photon_deployment(job.network)
-        .proof_rule
-        == ProofRule::Positive
-        && (target[31] & 0x80 != 0 || target.iter().all(|byte| *byte == 0))
-    {
-        return Err("PHOTON target must be a positive ScriptNum".into());
-    }
-    Ok(target)
-}
-
-/// Prepares validated job bytes and target for GPU search.
-fn prepare_job(
-    job: MiningJob,
-    sk: &[u8; 32],
-    public_key: &[u8; 33],
-) -> Result<PreparedJob, String> {
-    let target = validate_job(&job)?;
-    let payout_locking = tx::cashaddr_to_p2pkh_locking(&job.payout_address)?;
-    if payout_locking == crate::reward::p2pkh_locking_from_public_key(public_key) {
-        return Err(
-            "PHOTON search identity must be separate from the funded reward identity".into(),
-        );
-    }
-    let message = tx::photon_message_sha256(0, &job.target_le_hex)?;
-    let signature = crypto::bch_schnorr_sign(sk, &message)?;
-    if !crypto::bch_schnorr_verify(public_key, &message, &signature)? {
-        return Err("generated PHOTON setup signature failed verification".into());
-    }
-    let params = tx::TemplateParams {
-        prev_tx_hash_hex: job.baton_txid.clone(),
-        prev_index: job.baton_vout,
-        age: job.age,
-        public_key_hex: hex::encode(public_key),
-        target_hex: job.target_le_hex.clone(),
-        signature_hex: hex::encode(signature),
-        nonce: 0,
-        contract_value_sats: job.baton_value_sats,
-        relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
-        contract_token_amount: job.token_amount,
-        reward_amount: job.reward_raw,
-        payout_locking,
-    };
-    let deployment = MiningToken::Photon.photon_deployment(job.network);
-    let template = tx::build_photon_template_bytes_for_deployment(&params, deployment)?;
-    let layout = tx::PhotonLayout::for_age_with_deployment(job.age, deployment)?;
-    if template.len() != layout.tx_bytes() {
-        return Err(format!(
-            "PHOTON live template is {} bytes; age {} needs {}",
-            template.len(),
-            job.age,
-            layout.tx_bytes()
-        ));
-    }
-    let target_offset = layout.target_offset();
-    if template[target_offset..target_offset + 32] != target[..] {
-        return Err("PHOTON template target bytes do not match live target".into());
-    }
-    Ok(PreparedJob {
-        job,
-        template,
-        target,
-    })
-}
-
 /// Installs the current job under a fresh random signing key.
 fn rotate_search_identity(
     engine: &mut PhotonEngine,
     job: &MiningJob,
 ) -> Result<(PreparedJob, [u8; 32], [u8; 33]), String> {
-    let secret = SecretKey::new(&mut rand::rng());
+    let secret = crypto::random_secret_key();
     let sk = secret.to_secret_bytes();
     let public_key = PublicKey::from_secret_key(&secret).serialize();
     let prepared = prepare_job(job.clone(), &sk, &public_key)?;
@@ -453,82 +307,6 @@ fn rotate_search_identity(
         prepared.job.network,
     )?;
     Ok((prepared, sk, public_key))
-}
-
-/// Reconstructs a GPU winner and checks its PHOTON proof.
-fn verify_gpu_winner(
-    prepared: &PreparedJob,
-    sk: &[u8; 32],
-    public_key: &[u8; 33],
-    winner: &PhotonCudaWinner,
-) -> Result<VerifiedWinner, String> {
-    if winner.tail_j.is_some() && winner.schnorr_k.is_some() {
-        return Err("GPU winner cannot combine T2 amount and incremental scalar modes".into());
-    }
-    if let Some(sats) = winner.tail_value_sats {
-        return Err(format!(
-            "GPU payout BCH value must remain 700 sats (got {sats})"
-        ));
-    }
-    let actual_reward = match winner.tail_j {
-        Some(j) => tx::t2_reward_amount(prepared.job.token_amount, prepared.job.reward_raw, j)?,
-        None => prepared.job.reward_raw,
-    };
-    let message = tx::photon_message_sha256(winner.nonce, &prepared.job.target_le_hex)?;
-    let signature = match winner.schnorr_k {
-        Some(k) => crypto::bch_schnorr_sign_search_candidate(sk, &message, k)?,
-        None => crypto::bch_schnorr_sign(sk, &message)?,
-    };
-    if !crypto::bch_schnorr_verify(public_key, &message, &signature)? {
-        return Err("returned GPU winner failed BCH Schnorr verification".into());
-    }
-    let context = tx::ReferenceJobContext {
-        prev_txid: prepared.job.baton_txid.clone(),
-        prev_vout: prepared.job.baton_vout,
-        age: prepared.job.age,
-        target_le_hex: prepared.job.target_le_hex.clone(),
-        contract_value_sats: prepared.job.baton_value_sats,
-        relay_fee_sats_per_kb: prepared.job.relay_fee_sats_per_kb,
-        contract_token_amount: prepared.job.token_amount,
-        reward_raw: actual_reward,
-    };
-    let transaction = tx::apply_reference_signature_for_deployment(
-        &context,
-        &prepared.job.payout_address,
-        &hex::encode(public_key),
-        winner.nonce,
-        &hex::encode(signature),
-        MiningToken::Photon.photon_deployment(prepared.job.network),
-    )?;
-    let digest = hash256(&transaction);
-    if digest != winner.digest {
-        return Err(format!(
-            "GPU winner HASH256 mismatch: gpu={} host={}",
-            hex::encode(winner.digest),
-            hex::encode(digest)
-        ));
-    }
-    if !meets_target_le_for_rule(
-        &digest,
-        &prepared.target,
-        MiningToken::Photon
-            .photon_deployment(prepared.job.network)
-            .proof_rule,
-    ) {
-        return Err("returned GPU winner failed strict host hash < target verification".into());
-    }
-    Ok(VerifiedWinner {
-        generation_id: prepared.job.generation_id,
-        height: prepared.job.height,
-        baton_txid: prepared.job.baton_txid.clone(),
-        baton_vout: prepared.job.baton_vout,
-        job_reward_raw: prepared.job.reward_raw,
-        nonce: winner.nonce,
-        digest,
-        public_key: *public_key,
-        signature,
-        transaction,
-    })
 }
 
 /// Scales GPU batch candidates with requested intensity.
@@ -579,100 +357,37 @@ impl NonceSweep {
     }
 }
 
-/// How much busy/wall history the duty pacer keeps before halving it.
-const DUTY_WINDOW: Duration = Duration::from_secs(2);
-/// Throttled work runs as one burst then one rest per period of this length.
-const DUTY_PERIOD: Duration = Duration::from_millis(100);
-
-/// Paces throttled GPU batches to the requested duty cycle.
-///
-/// Sleeps round up to the OS timer tick (about 15.6 ms on Windows), so a
-/// per-batch rest of a fraction of a millisecond becomes a 15 ms stall and
-/// every intensity below 100 collapses to the same low rate. The pacer
-/// instead accounts GPU-busy time against wall time and asks for rest only
-/// while busy time is ahead of the requested share; an oversleep is repaid
-/// by running the following batches back to back. Rest is taken in whole
-/// periods (25% runs about 25 ms, then rests about 75 ms), so the GPU works
-/// at full clocks instead of idling between tiny bursts.
+// Keep the native clock adapter small; the browser uses the same pacing core.
 #[derive(Debug, Clone)]
 pub(crate) struct DutyPacer {
-    intensity: u8,
-    window_start: Instant,
-    busy: Duration,
+    origin: Instant,
+    core: crate::mining_control::DutyPacer,
 }
-
 impl DutyPacer {
-    /// Starts an empty pacing window.
     pub(crate) fn new(now: Instant) -> Self {
         Self {
-            intensity: 100,
-            window_start: now,
-            busy: Duration::ZERO,
+            origin: now,
+            core: crate::mining_control::DutyPacer::new(Duration::ZERO),
         }
     }
-
-    /// Forgets pacing history, e.g. after a pause, so idle time is not
-    /// spent later as a full-speed burst.
     pub(crate) fn reset(&mut self, now: Instant) {
-        self.window_start = now;
-        self.busy = Duration::ZERO;
+        self.core.reset(now.saturating_duration_since(self.origin));
     }
-
-    /// Records one finished batch and returns how long to rest before the
-    /// next one.
     pub(crate) fn record_batch(
         &mut self,
         intensity: u8,
-        compute_time: Duration,
+        compute: Duration,
         now: Instant,
     ) -> Duration {
-        let intensity = intensity.clamp(10, 100);
-        if intensity != self.intensity {
-            self.intensity = intensity;
-            self.window_start = now.checked_sub(compute_time).unwrap_or(now);
-            self.busy = Duration::ZERO;
-        }
-        if intensity >= 100 {
-            self.reset(now);
-            return Duration::ZERO;
-        }
-        self.busy = self.busy.saturating_add(compute_time);
-        let elapsed = now.saturating_duration_since(self.window_start);
-        let required = self.busy.saturating_add(duty_rest(self.busy, intensity));
-        let rest = required.saturating_sub(elapsed);
-        if elapsed >= DUTY_WINDOW {
-            // Halve the history: the ratio is kept, old surplus or debt fades.
-            self.busy /= 2;
-            self.window_start = now.checked_sub(elapsed / 2).unwrap_or(now);
-        }
-        // Rest only in whole-period chunks. Short bursts between short rests
-        // keep the GPU in a low clock state and cost throughput per busy ms.
-        if rest < duty_rest_quantum(intensity) {
-            return Duration::ZERO;
-        }
-        rest
+        self.core.record_batch(
+            intensity,
+            compute,
+            now.saturating_duration_since(self.origin),
+        )
     }
 }
-
-/// Idle part of one pacing period at the given intensity.
-fn duty_rest_quantum(intensity: u8) -> Duration {
-    DUTY_PERIOD * u32::from(100 - intensity.clamp(10, 100)) / 100
-}
-
-/// Calculates the pause needed to honor GPU intensity.
-pub(crate) fn duty_rest(compute_time: Duration, intensity: u8) -> Duration {
-    let intensity = intensity.clamp(10, 100);
-    if intensity >= 100 || compute_time.is_zero() {
-        return Duration::ZERO;
-    }
-    // Occupancy is intensity/100. A fixed short cap leaves 10% nearly as busy
-    // as a full batch and collapses the 100%-to-10% candidate ratio.
-    let rest_ns = compute_time
-        .as_nanos()
-        .saturating_mul(u128::from(100 - intensity))
-        / u128::from(intensity);
-    Duration::from_nanos(u64::try_from(rest_ns).unwrap_or(u64::MAX))
-}
+#[cfg(test)]
+use crate::mining_control::duty_rest;
 
 // #### PR #11: winner delivery never blocks ####
 // What: the GPU worker hands host-verified winners to the supervisor through
@@ -721,7 +436,12 @@ struct WorkerDiagnostics {
     job_exhausted: AtomicBool,
     key_rotations: AtomicU64,
     active_rate_bits: AtomicU64,
+    active_rate: Mutex<crate::mining_control::ActiveRate>,
     work_candidates: [AtomicU64; 3],
+    /// The GPU failed and waits to restart.
+    recovering: AtomicBool,
+    /// The worker ended.
+    stopped: AtomicBool,
 }
 
 impl WorkerDiagnostics {
@@ -732,13 +452,20 @@ impl WorkerDiagnostics {
             job_exhausted: AtomicBool::new(false),
             key_rotations: AtomicU64::new(0),
             active_rate_bits: AtomicU64::new(0),
+            active_rate: Mutex::new(crate::mining_control::ActiveRate::default()),
             work_candidates: std::array::from_fn(|_| AtomicU64::new(0)),
+            recovering: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
         }
     }
 
     fn record_active_batch(&self, candidates: u32, elapsed: Duration) {
         if candidates != 0 {
-            let rate = f64::from(candidates) / elapsed.as_secs_f64().max(1e-9);
+            let rate = self
+                .active_rate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record(candidates, elapsed);
             self.active_rate_bits
                 .store(rate.to_bits(), Ordering::Relaxed);
         }
@@ -808,29 +535,240 @@ fn absorb_search_batch(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Runs the GPU worker, processing commands between batches.
-fn run_worker(
-    mut engine: PhotonEngine,
-    mut prepared: PreparedJob,
-    mut sk: [u8; 32],
-    mut public_key: [u8; 33],
-    stop: Arc<AtomicBool>,
+/// Why a GPU worker's search loop ended.
+enum WorkerExit {
+    /// The handle stopped the search or went away.
+    Stopped,
+    /// The GPU failed; its thread rebuilds the engine and resumes this job.
+    GpuFailed(MiningJob),
+    /// A setting no new engine can fix; this GPU stays stopped.
+    Fatal,
+}
+
+/// Controls every GPU worker shares: a winner or a pause stops all of them
+/// at their next batch boundary, and they all mine one generation.
+#[derive(Clone)]
+struct SharedControl {
     paused: Arc<AtomicBool>,
-    batch_in_flight: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
+    generation_id: Arc<AtomicU64>,
+}
+
+/// One GPU worker's own state.
+#[derive(Clone)]
+struct GpuCounters {
+    stop: Arc<AtomicBool>,
+    batch_in_flight: Arc<AtomicBool>,
     candidates: Arc<AtomicU64>,
     batches: Arc<AtomicU64>,
     winners: Arc<AtomicU64>,
-    generation_id: Arc<AtomicU64>,
     diagnostics: Arc<WorkerDiagnostics>,
-    job_rx: Receiver<WorkerCommand>,
+    /// The newest job for this GPU. A newer job replaces one the worker has
+    /// not taken yet, so a GPU that falls behind resumes on the current job
+    /// and a stuck GPU never blocks the others.
+    mailbox: Arc<Mutex<Option<WorkerCommand>>>,
+}
+
+impl GpuCounters {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            batch_in_flight: Arc::new(AtomicBool::new(false)),
+            candidates: Arc::new(AtomicU64::new(0)),
+            batches: Arc::new(AtomicU64::new(0)),
+            winners: Arc::new(AtomicU64::new(0)),
+            diagnostics: Arc::new(WorkerDiagnostics::new()),
+            mailbox: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Takes the job waiting for this GPU, if any.
+    fn take_command(&self) -> Option<WorkerCommand> {
+        self.mailbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+/// Creates the engine for one GPU, with the search mode this build mines.
+fn create_engine(backend: BackendKind, device_ordinal: usize) -> Result<PhotonEngine, String> {
+    #[allow(unused_mut)]
+    let mut engine = PhotonEngine::new(
+        backend,
+        device_ordinal,
+        production_max_batch_candidates(backend),
+        WINNER_BUFFER_CAP,
+    )?;
+    #[cfg(feature = "tail-grind")]
+    if let PhotonEngine::Cuda(cuda) = &mut engine {
+        // The parent reward BCH output must remain exactly 700 sats.
+        cuda.enable_t2_search()?;
+    }
+    #[cfg(feature = "tail-grind")]
+    if let PhotonEngine::Hip(hip) = &mut engine {
+        hip.enable_t2_search()?;
+    }
+    #[cfg(all(feature = "incremental-k", not(feature = "tail-grind")))]
+    if let PhotonEngine::Cuda(cuda) = &mut engine {
+        cuda.enable_incremental_search()?;
+    }
+    Ok(engine)
+}
+
+// #### PR #22: one worker per GPU, restarted after a GPU failure
+// What: each GPU runs this loop on its own thread with its own engine and
+// random signing keys, so GPUs never repeat each other's work. When a batch
+// or a job install fails, the worker drops its engine, waits (2, 5, 10, 30,
+// then 60 s) while still accepting job changes, builds a new engine and
+// resumes on the current job. Other GPUs keep mining throughout.
+// Why: one bad card, riser or driver reset must not stop a rig, and a
+// single GPU recovers from a transient driver reset instead of staying down.
+// Check: a GPU that keeps failing shows its error and retries once a minute;
+// the search reports Stopped only while no GPU is mining.
+const GPU_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+#[allow(clippy::too_many_arguments)]
+/// Runs one GPU for the lifetime of the search, restarting it after failures.
+fn run_gpu(
+    backend: BackendKind,
+    device_ordinal: usize,
+    mut engine: Option<PhotonEngine>,
+    mut job: MiningJob,
+    shared: SharedControl,
+    gpu: GpuCounters,
     winner_tx: SyncSender<VerifiedWinner>,
     work_fee: Option<crate::donation::Policy>,
 ) {
-    let t2_coordinate = cfg!(feature = "tail-grind") && matches!(&engine, PhotonEngine::Cuda(_));
+    let mut failures = 0usize;
+    while !gpu.stop.load(Ordering::Relaxed) {
+        let next = engine
+            .take()
+            .map_or_else(|| create_engine(backend, device_ordinal), Ok);
+        let engine_ready = match next {
+            Ok(engine) => engine,
+            Err(error) => {
+                gpu.diagnostics
+                    .record_batch_error(format!("GPU engine start failed: {error}"));
+                gpu.diagnostics.recovering.store(true, Ordering::Relaxed);
+                let delay = GPU_RETRY_DELAYS[failures.min(GPU_RETRY_DELAYS.len() - 1)];
+                failures += 1;
+                if !wait_for_retry(delay, &mut job, &shared, &gpu) {
+                    break;
+                }
+                continue;
+            }
+        };
+        let batches_before = gpu.batches.load(Ordering::Relaxed);
+        gpu.diagnostics.recovering.store(false, Ordering::Relaxed);
+        match run_worker(
+            engine_ready,
+            job.clone(),
+            &shared,
+            &gpu,
+            &winner_tx,
+            work_fee,
+        ) {
+            WorkerExit::Stopped => break,
+            WorkerExit::Fatal => break,
+            WorkerExit::GpuFailed(last_job) => {
+                job = last_job;
+                if gpu.batches.load(Ordering::Relaxed) > batches_before {
+                    failures = 0;
+                }
+                gpu.diagnostics.recovering.store(true, Ordering::Relaxed);
+                let delay = GPU_RETRY_DELAYS[failures.min(GPU_RETRY_DELAYS.len() - 1)];
+                failures += 1;
+                if !wait_for_retry(delay, &mut job, &shared, &gpu) {
+                    break;
+                }
+            }
+        }
+    }
+    gpu.diagnostics.recovering.store(false, Ordering::Relaxed);
+    gpu.diagnostics.stopped.store(true, Ordering::Relaxed);
+}
+
+/// Waits before restarting a failed GPU while accepting job changes, so it
+/// restarts on the current job. Returns false when the search stops.
+fn wait_for_retry(
+    delay: Duration,
+    job: &mut MiningJob,
+    shared: &SharedControl,
+    gpu: &GpuCounters,
+) -> bool {
+    let until = Instant::now() + delay;
+    loop {
+        if gpu.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        if let Some(WorkerCommand::ReplaceJob { job: next, reply }) = gpu.take_command() {
+            shared
+                .generation_id
+                .store(next.generation_id, Ordering::Release);
+            *job = next;
+            let _ = reply.send(Ok(()));
+        }
+        let now = Instant::now();
+        if now >= until {
+            return true;
+        }
+        thread::park_timeout(PAUSE_POLL.min(until - now));
+    }
+}
+// #### end PR #22 ####
+
+/// Runs the GPU worker, processing commands between batches.
+fn run_worker(
+    mut engine: PhotonEngine,
+    mut base_job: MiningJob,
+    shared: &SharedControl,
+    gpu: &GpuCounters,
+    winner_tx: &SyncSender<VerifiedWinner>,
+    work_fee: Option<crate::donation::Policy>,
+) -> WorkerExit {
+    let SharedControl {
+        paused,
+        intensity,
+        generation_id,
+    } = shared;
+    let GpuCounters {
+        stop,
+        batch_in_flight,
+        candidates,
+        batches,
+        winners,
+        diagnostics,
+        mailbox: _,
+    } = gpu;
+    // Every start, including a restart, signs under a fresh random key.
+    let (mut prepared, mut sk, mut public_key) =
+        match rotate_search_identity(&mut engine, &base_job) {
+            Ok(identity) => identity,
+            Err(error) => {
+                diagnostics.record_batch_error(format!("install job on GPU: {error}"));
+                return WorkerExit::GpuFailed(base_job);
+            }
+        };
+    let t2_coordinate = cfg!(feature = "tail-grind")
+        && matches!(&engine, PhotonEngine::Cuda(_) | PhotonEngine::Hip(_));
     let mut rng = rand::rng();
-    let quantum = u64::from(engine.scheduled_batch_candidates(100)) * 64;
+    let backend = match &engine {
+        PhotonEngine::Cuda(_) => BackendKind::Cuda,
+        PhotonEngine::Hip(_) => BackendKind::Hip,
+        #[cfg(feature = "portable-wgpu")]
+        PhotonEngine::Wgpu(_) => BackendKind::Wgpu,
+    };
+    let quantum = crate::mining_control::work_allocation_quantum(
+        backend,
+        engine.scheduled_batch_candidates(100),
+    );
     let allocation = work_fee
         .map(|policy| {
             let schedule = crate::donation::Schedule::new(policy.scheme, quantum, rng.random())?;
@@ -842,8 +780,7 @@ fn run_worker(
         Ok(allocation) => allocation,
         Err(error) => {
             diagnostics.record_batch_error(error);
-            stop.store(true, Ordering::Relaxed);
-            return;
+            return WorkerExit::Fatal;
         }
     };
     let mut nonce_base = if t2_coordinate {
@@ -854,53 +791,52 @@ fn run_worker(
     let mut sweep = NonceSweep::default();
     let mut pacer = DutyPacer::new(Instant::now());
     while !stop.load(Ordering::Relaxed) {
-        loop {
-            match job_rx.try_recv() {
-                Ok(WorkerCommand::ReplaceJob { mut job, reply }) => {
-                    let next_payouts = if let Some((schedule, _, policy)) = &allocation {
-                        match policy.payouts(job.network, &job.payout_address) {
-                            Ok(payouts) => {
-                                job.payout_address = payouts[schedule.recipient() as usize].clone();
-                                Some(payouts)
-                            }
-                            Err(error) => {
-                                let _ = reply.send(Err(error));
-                                continue;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let result = prepare_job(job, &sk, &public_key).and_then(|next| {
-                        engine.set_job_for_network(
-                            &next.template,
-                            &next.target,
-                            &sk,
-                            next.job.network,
-                        )?;
-                        generation_id.store(next.job.generation_id, Ordering::Release);
-                        prepared = next;
-                        if let (Some((_, payouts, _)), Some(next)) = (&mut allocation, next_payouts)
-                        {
-                            *payouts = next;
-                        }
-                        nonce_base = if t2_coordinate {
-                            0
-                        } else {
-                            rng.random::<u32>()
-                        };
-                        sweep = NonceSweep::default();
-                        diagnostics.job_exhausted.store(false, Ordering::Relaxed);
-                        Ok(())
-                    });
-                    let _ = reply.send(result);
+        while let Some(WorkerCommand::ReplaceJob { mut job, reply }) = gpu.take_command() {
+            let requested = job.clone();
+            let next_payouts = if let Some((schedule, _, policy)) = &allocation {
+                match policy.payouts(job.network, &job.payout_address) {
+                    Ok(payouts) => {
+                        job.payout_address = payouts[schedule.recipient() as usize].clone();
+                        Some(payouts)
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        continue;
+                    }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
+            } else {
+                None
+            };
+            let next = match prepare_job(job, &sk, &public_key) {
+                Ok(next) => next,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    continue;
                 }
+            };
+            if let Err(error) =
+                engine.set_job_for_network(&next.template, &next.target, &sk, next.job.network)
+            {
+                // The GPU could not take the new job: rebuild it on
+                // that job rather than keep mining the old one.
+                diagnostics.record_batch_error(format!("install job on GPU: {error}"));
+                let _ = reply.send(Err(error));
+                return WorkerExit::GpuFailed(requested);
             }
+            generation_id.store(next.job.generation_id, Ordering::Release);
+            prepared = next;
+            base_job = requested;
+            if let (Some((_, payouts, _)), Some(next)) = (&mut allocation, next_payouts) {
+                *payouts = next;
+            }
+            nonce_base = if t2_coordinate {
+                0
+            } else {
+                rng.random::<u32>()
+            };
+            sweep = NonceSweep::default();
+            diagnostics.job_exhausted.store(false, Ordering::Relaxed);
+            let _ = reply.send(Ok(()));
         }
 
         if stop.load(Ordering::Relaxed) {
@@ -947,8 +883,7 @@ fn run_worker(
                         "mining-work recipient change failed: {error}"
                     ));
                     batch_in_flight.store(false, Ordering::SeqCst);
-                    stop.store(true, Ordering::Relaxed);
-                    break;
+                    return WorkerExit::GpuFailed(base_job);
                 }
             }
         }
@@ -996,14 +931,13 @@ fn run_worker(
         if let Ok(ref result) = batch {
             diagnostics.record_active_batch(result.candidates, gpu_elapsed);
         }
-        let control = absorb_search_batch(&diagnostics, batch, |gpu_winner| {
+        let control = absorb_search_batch(diagnostics, batch, |gpu_winner| {
             verify_gpu_winner(&prepared, &sk, &public_key, gpu_winner)
         });
         let accepted = match control {
             BatchControl::Stop => {
                 batch_in_flight.store(false, Ordering::SeqCst);
-                stop.store(true, Ordering::Relaxed);
-                break;
+                return WorkerExit::GpuFailed(base_job);
             }
             BatchControl::Continue(accepted) => accepted,
         };
@@ -1013,8 +947,7 @@ fn run_worker(
             if let Err(error) = schedule.record(accepted.candidates) {
                 diagnostics.record_batch_error(error);
                 batch_in_flight.store(false, Ordering::SeqCst);
-                stop.store(true, Ordering::Relaxed);
-                break;
+                return WorkerExit::Fatal;
             }
             diagnostics.work_candidates[recipient as usize]
                 .fetch_add(u64::from(accepted.candidates), Ordering::Relaxed);
@@ -1022,7 +955,7 @@ fn run_worker(
         candidates.fetch_add(u64::from(accepted.candidates), Ordering::Relaxed);
         batches.fetch_add(1, Ordering::Release);
 
-        if !deliver_verified_batch(accepted.verified, &paused, &winners, &winner_tx) {
+        if !deliver_verified_batch(accepted.verified, paused, winners, winner_tx) {
             stop.store(true, Ordering::Relaxed);
         }
         batch_in_flight.store(false, Ordering::SeqCst);
@@ -1034,21 +967,44 @@ fn run_worker(
             thread::park_timeout(rest);
         }
     }
+    WorkerExit::Stopped
+}
+
+/// One GPU in a running search.
+struct GpuWorker {
+    backend: BackendKind,
+    device_ordinal: usize,
+    counters: GpuCounters,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl GpuWorker {
+    /// Whether the worker still runs, possibly while recovering.
+    fn alive(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+            && !self.counters.diagnostics.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Whether the worker mines now: alive and not waiting to restart.
+    fn mining(&self) -> bool {
+        self.alive()
+            && !self.counters.stop.load(Ordering::Relaxed)
+            && !self.counters.diagnostics.recovering.load(Ordering::Relaxed)
+    }
+
+    fn unpark(&self) {
+        if let Some(thread) = self.thread.as_ref() {
+            thread.thread().unpark();
+        }
+    }
 }
 
 pub struct SearchHandle {
-    stop: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    batch_in_flight: Arc<AtomicBool>,
-    intensity: Arc<AtomicU8>,
-    candidates: Arc<AtomicU64>,
-    batches: Arc<AtomicU64>,
-    winners: Arc<AtomicU64>,
-    generation_id: Arc<AtomicU64>,
-    diagnostics: Arc<WorkerDiagnostics>,
-    job_tx: SyncSender<WorkerCommand>,
+    shared: SharedControl,
+    workers: Vec<GpuWorker>,
     winner_rx: Receiver<VerifiedWinner>,
-    worker: Option<JoinHandle<()>>,
     started: Instant,
 }
 
@@ -1092,7 +1048,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, false, None)
+        Self::start_inner(&[(backend, device_ordinal)], intensity, job, false, None)
     }
 
     /// Start exact GPU search under the live runtime supervisor. The GPU keeps
@@ -1119,7 +1075,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, false, None)
+        Self::start_inner(&[(backend, device_ordinal)], intensity, job, false, None)
     }
 
     /// Start supervised search in a paused state. This is used while a
@@ -1150,7 +1106,7 @@ impl SearchHandle {
         intensity: u8,
         job: MiningJob,
     ) -> Result<Self, String> {
-        Self::start_inner(backend, device_ordinal, intensity, job, true, None)
+        Self::start_inner(&[(backend, device_ordinal)], intensity, job, true, None)
     }
 
     /// Starts production PHOTON mining with direct 96/2/2 work allocation.
@@ -1161,14 +1117,24 @@ impl SearchHandle {
         job: MiningJob,
         policy: crate::donation::Policy,
     ) -> Result<Self, String> {
-        policy.payouts(job.network, &job.payout_address)?;
-        Self::start_inner(backend, device_ordinal, intensity, job, false, Some(policy))
+        Self::start_devices_with_work_fee(&[(backend, device_ordinal)], intensity, job, policy)
     }
 
-    /// Creates the shared GPU worker and its control channels.
+    /// Starts production PHOTON mining on every listed GPU, each with direct
+    /// 96/2/2 work allocation of its own completed hashes.
+    pub fn start_devices_with_work_fee(
+        devices: &[(BackendKind, usize)],
+        intensity: u8,
+        job: MiningJob,
+        policy: crate::donation::Policy,
+    ) -> Result<Self, String> {
+        policy.payouts(job.network, &job.payout_address)?;
+        Self::start_inner(devices, intensity, job, false, Some(policy))
+    }
+
+    /// Creates one worker per GPU and their control channels.
     fn start_inner(
-        backend: BackendKind,
-        device_ordinal: usize,
+        devices: &[(BackendKind, usize)],
         intensity: u8,
         job: MiningJob,
         initially_paused: bool,
@@ -1177,131 +1143,172 @@ impl SearchHandle {
         if !(10..=100).contains(&intensity) {
             return Err("intensity must be 10..=100".into());
         }
-        let secret = SecretKey::new(&mut rand::rng());
-        let sk = secret.to_secret_bytes();
+        if devices.is_empty() {
+            return Err("no GPU selected for mining".into());
+        }
+        // Check the job once on the host; each GPU installs it under its own key.
+        let secret = crypto::random_secret_key();
         let public_key = PublicKey::from_secret_key(&secret).serialize();
-        let prepared = prepare_job(job, &sk, &public_key)?;
+        prepare_job(job.clone(), &secret.to_secret_bytes(), &public_key)?;
 
-        // Fail fast and create exactly one native GPU context. The configured
-        // engine is moved into the worker and remains resident across controls.
-        let mut engine = PhotonEngine::new(
-            backend,
-            device_ordinal,
-            production_max_batch_candidates(backend),
-            WINNER_BUFFER_CAP,
-        )?;
-        #[cfg(feature = "tail-grind")]
-        if let PhotonEngine::Cuda(cuda) = &mut engine {
-            // The parent reward BCH output must remain exactly 700 sats.
-            cuda.enable_t2_search()?;
+        // Create every engine at once, so a many-GPU rig starts in the time
+        // of its slowest GPU. A GPU whose engine fails retries in its worker;
+        // the search fails only when no GPU can start.
+        let engines: Vec<Result<PhotonEngine, String>> = thread::scope(|scope| {
+            let starting: Vec<_> = devices
+                .iter()
+                .map(|&(backend, device)| scope.spawn(move || create_engine(backend, device)))
+                .collect();
+            starting
+                .into_iter()
+                .map(|start| {
+                    start
+                        .join()
+                        .unwrap_or_else(|_| Err("GPU engine start panicked".into()))
+                })
+                .collect()
+        });
+        if engines.iter().all(Result::is_err) {
+            let errors: Vec<String> = engines.into_iter().filter_map(Result::err).collect();
+            return Err(if devices.len() == 1 {
+                errors.into_iter().next().unwrap_or_default()
+            } else {
+                devices
+                    .iter()
+                    .zip(errors)
+                    .map(|((backend, device), error)| {
+                        format!("{}:{device}: {error}", backend.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            });
         }
-        #[cfg(all(feature = "incremental-k", not(feature = "tail-grind")))]
-        if let PhotonEngine::Cuda(cuda) = &mut engine {
-            cuda.enable_incremental_search()?;
-        }
-        engine.set_job_for_network(
-            &prepared.template,
-            &prepared.target,
-            &sk,
-            prepared.job.network,
-        )?;
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let paused = Arc::new(AtomicBool::new(initially_paused));
-        let batch_in_flight = Arc::new(AtomicBool::new(false));
-        let intensity_state = Arc::new(AtomicU8::new(intensity));
-        let candidates = Arc::new(AtomicU64::new(0));
-        let batches = Arc::new(AtomicU64::new(0));
-        let winners = Arc::new(AtomicU64::new(0));
-        let generation_id = Arc::new(AtomicU64::new(prepared.job.generation_id));
-        let diagnostics = Arc::new(WorkerDiagnostics::new());
-        let (job_tx, job_rx) = mpsc::sync_channel(JOB_UPDATE_CHANNEL_CAP);
+        let shared = SharedControl {
+            paused: Arc::new(AtomicBool::new(initially_paused)),
+            intensity: Arc::new(AtomicU8::new(intensity)),
+            generation_id: Arc::new(AtomicU64::new(job.generation_id)),
+        };
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
-
-        let worker = thread::Builder::new()
-            .name(format!(
-                "pickaxe-photon-{}-{device_ordinal}",
-                backend.as_str()
-            ))
-            .spawn({
-                let worker_stop = Arc::clone(&stop);
-                let worker_paused = Arc::clone(&paused);
-                let worker_batch_in_flight = Arc::clone(&batch_in_flight);
-                let worker_intensity = Arc::clone(&intensity_state);
-                let worker_candidates = Arc::clone(&candidates);
-                let worker_batches = Arc::clone(&batches);
-                let worker_winners = Arc::clone(&winners);
-                let worker_generation = Arc::clone(&generation_id);
-                let worker_diagnostics = Arc::clone(&diagnostics);
-                move || {
-                    run_worker(
-                        engine,
-                        prepared,
-                        sk,
-                        public_key,
-                        worker_stop,
-                        worker_paused,
-                        worker_batch_in_flight,
-                        worker_intensity,
-                        worker_candidates,
-                        worker_batches,
-                        worker_winners,
-                        worker_generation,
-                        worker_diagnostics,
-                        job_rx,
-                        winner_tx,
-                        work_fee,
-                    )
-                }
-            })
-            .map_err(|error| format!("start PHOTON CUDA worker: {error}"))?;
-
-        Ok(Self {
-            stop,
-            paused,
-            batch_in_flight,
-            intensity: intensity_state,
-            candidates,
-            batches,
-            winners,
-            generation_id,
-            diagnostics,
-            job_tx,
+        let mut handle = Self {
+            shared,
+            workers: Vec::with_capacity(devices.len()),
             winner_rx,
-            worker: Some(worker),
             started: Instant::now(),
-        })
+        };
+        for (&(backend, device_ordinal), engine) in devices.iter().zip(engines) {
+            let counters = GpuCounters::new();
+            if let Err(error) = &engine {
+                counters
+                    .diagnostics
+                    .record_batch_error(format!("GPU engine start failed: {error}"));
+                counters
+                    .diagnostics
+                    .recovering
+                    .store(true, Ordering::Relaxed);
+            }
+            let thread = thread::Builder::new()
+                .name(format!(
+                    "pickaxe-photon-{}-{device_ordinal}",
+                    backend.as_str()
+                ))
+                .spawn({
+                    let shared = handle.shared.clone();
+                    let counters = counters.clone();
+                    let job = job.clone();
+                    let winner_tx = winner_tx.clone();
+                    move || {
+                        run_gpu(
+                            backend,
+                            device_ordinal,
+                            engine.ok(),
+                            job,
+                            shared,
+                            counters,
+                            winner_tx,
+                            work_fee,
+                        )
+                    }
+                })
+                .map_err(|error| format!("start PHOTON GPU worker: {error}"))?;
+            handle.workers.push(GpuWorker {
+                backend,
+                device_ordinal,
+                counters,
+                thread: Some(thread),
+            });
+        }
+        Ok(handle)
     }
 
-    /// Replaces search material with a verified new generation.
+    // #### PR #22: a job change reaches every GPU without waiting for the slowest
+    // What: each GPU has a one-job mailbox. A new generation goes into every
+    // running GPU's mailbox, replacing a job that GPU has not taken yet, and
+    // this returns once one GPU mines it. Every other GPU takes it at its next
+    // batch boundary, or when it restarts after a failure.
+    // Why: a GPU stuck in a long batch or an engine rebuild must not hold up
+    // job changes, winners and claims for the rest of the rig, and a GPU that
+    // falls behind resumes on the newest job, never an old one.
+    // Safe because: winners carry their generation. A winner from a GPU still
+    // finishing an older batch is stale, and the supervisor only counts it.
+    // Check: `stale_winners` rising on a rig, or a GPU whose rate stays at
+    // zero after a job change.
+    /// Replaces search material with a verified new generation on every GPU.
     pub fn replace_job(&self, job: MiningJob) -> Result<(), String> {
         validate_job(&job)?;
         if job.generation_id == self.generation_id() {
             return Ok(());
         }
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.job_tx
-            .send(WorkerCommand::ReplaceJob {
-                job,
-                reply: reply_tx,
-            })
-            .map_err(|_| "PHOTON CUDA worker is not running".to_string())?;
-        if let Some(worker) = self.worker.as_ref() {
-            worker.thread().unpark();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(self.workers.len());
+        let mut sent = 0;
+        for worker in self.workers.iter().filter(|worker| worker.alive()) {
+            *worker
+                .counters
+                .mailbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(WorkerCommand::ReplaceJob {
+                    job: job.clone(),
+                    reply: reply_tx.clone(),
+                });
+            worker.unpark();
+            sent += 1;
+        }
+        drop(reply_tx);
+        if sent == 0 {
+            return Err("PHOTON GPU worker is not running".into());
         }
         // A production GPU batch is allowed to finish before a replacement is
         // applied. On slower adapters or a large reference batch, the kernel
         // can legitimately exceed the old fixed 30 second supervisor window.
         // Keep the bounded failure path, but give the worker enough time to
         // reach the command boundary without falsely reporting a dead worker.
-        reply_rx
-            .recv_timeout(Duration::from_secs(120))
-            .map_err(|_| "timed out applying PHOTON job generation".to_string())?
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut first_error = None;
+        for _ in 0..sent {
+            match reply_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                // One GPU on the new job is enough: the others take it at
+                // their next batch boundary, and a GPU that cannot restarts
+                // on it. A slow or stuck GPU never holds up the rest.
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(first_error.unwrap_or_else(|| {
+                        "timed out applying PHOTON job generation".to_string()
+                    }));
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Err(first_error.unwrap_or_else(|| "PHOTON GPU worker is not running".to_string()))
     }
+    // #### end PR #22 ####
 
     /// Returns the current search generation identifier.
     pub fn generation_id(&self) -> u64 {
-        self.generation_id.load(Ordering::Acquire)
+        self.shared.generation_id.load(Ordering::Acquire)
     }
 
     /// Drains host-verified GPU winners for settlement.
@@ -1309,81 +1316,136 @@ impl SearchHandle {
         self.winner_rx.try_iter().collect()
     }
 
-    /// Reports whether the GPU is currently processing a batch.
+    /// Reports whether any GPU is currently processing a batch.
     pub fn batch_in_flight(&self) -> bool {
-        self.batch_in_flight.load(Ordering::SeqCst)
+        self.workers
+            .iter()
+            .any(|worker| worker.counters.batch_in_flight.load(Ordering::SeqCst))
     }
 
-    /// Returns a handle for pausing the GPU search worker.
+    /// Returns a handle for pausing every GPU search worker.
     pub(crate) fn pause_handle(&self) -> SearchPauseHandle {
         SearchPauseHandle {
-            paused: Arc::clone(&self.paused),
+            paused: Arc::clone(&self.shared.paused),
         }
     }
 
-    /// Applies a worker intensity or pause control message.
+    /// Applies a worker intensity or pause control message to every GPU.
     pub fn apply_control(&self, command: RuntimeCommand) -> Result<SearchStats, String> {
         match command {
             RuntimeCommand::SetIntensity(value) => {
                 if !(10..=100).contains(&value) {
                     return Err("intensity must be 10..=100".into());
                 }
-                self.intensity.store(value, Ordering::Relaxed);
+                self.shared.intensity.store(value, Ordering::Relaxed);
             }
-            RuntimeCommand::Pause => self.paused.store(true, Ordering::SeqCst),
-            RuntimeCommand::Resume => self.paused.store(false, Ordering::SeqCst),
+            RuntimeCommand::Pause => self.shared.paused.store(true, Ordering::SeqCst),
+            RuntimeCommand::Resume => self.shared.paused.store(false, Ordering::SeqCst),
         }
-        if let Some(worker) = self.worker.as_ref() {
-            worker.thread().unpark();
+        for worker in &self.workers {
+            worker.unpark();
         }
         Ok(self.snapshot())
     }
 
-    /// Returns the current GPU worker state.
+    /// Returns the search state: Stopped while no GPU is mining.
     fn state(&self) -> MiningState {
-        if self.stop.load(Ordering::Relaxed) {
+        if !self.workers.iter().any(GpuWorker::mining) {
             MiningState::Stopped
-        } else if self.paused.load(Ordering::Relaxed) {
+        } else if self.shared.paused.load(Ordering::Relaxed) {
             MiningState::Paused
         } else {
             MiningState::Mining
         }
     }
 
-    /// Stops the GPU search worker and waits for outstanding work.
+    /// Stops every GPU worker and waits for outstanding work.
     pub fn stop(mut self) -> SearchStats {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            worker.thread().unpark();
-            let _ = worker.join();
-        }
+        self.stop_workers();
         self.snapshot_final()
     }
 
-    /// Captures a final GPU search snapshot after stopping.
+    fn stop_workers(&mut self) {
+        for worker in &self.workers {
+            worker.counters.stop.store(true, Ordering::Relaxed);
+            worker.unpark();
+        }
+        for worker in &mut self.workers {
+            if let Some(thread) = worker.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Captures a search snapshot: totals over every GPU, plus each GPU.
     fn snapshot_final(&self) -> SearchStats {
-        let candidates = self.candidates.load(Ordering::Relaxed);
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
+        let several = self.workers.len() > 1;
         let mut stats = SearchStats {
-            candidates,
-            work_candidates: std::array::from_fn(|i| {
-                self.diagnostics.work_candidates[i].load(Ordering::Relaxed)
-            }),
-            batches: self.batches.load(Ordering::Acquire),
-            intensity: self.intensity.load(Ordering::Relaxed),
+            intensity: self.shared.intensity.load(Ordering::Relaxed),
             state: self.state(),
             elapsed_secs: elapsed as u64,
-            rate: candidates as f64 / elapsed,
-            current_rate: 0.0,
-            peak_rate: 0.0,
-            active_rate: 0.0,
-            winners: self.winners.load(Ordering::Relaxed),
-            rejected_winners: 0,
-            waiting_for_job: false,
-            key_rotations: 0,
-            last_error: None,
+            waiting_for_job: !self.workers.is_empty(),
+            ..SearchStats::default()
         };
-        self.diagnostics.publish(&mut stats);
+        let mut failing_error = None;
+        let mut any_error = None;
+        for worker in &self.workers {
+            let counters = &worker.counters;
+            let diagnostics = &counters.diagnostics;
+            let mut gpu_stats = SearchStats::default();
+            diagnostics.publish(&mut gpu_stats);
+            let candidates = counters.candidates.load(Ordering::Relaxed);
+            let winners = counters.winners.load(Ordering::Relaxed);
+            stats.candidates += candidates;
+            for (total, gpu) in stats
+                .work_candidates
+                .iter_mut()
+                .zip(&diagnostics.work_candidates)
+            {
+                *total += gpu.load(Ordering::Relaxed);
+            }
+            stats.batches += counters.batches.load(Ordering::Acquire);
+            stats.winners += winners;
+            stats.active_rate += gpu_stats.active_rate;
+            stats.rejected_winners += gpu_stats.rejected_winners;
+            stats.key_rotations += gpu_stats.key_rotations;
+            stats.waiting_for_job &= gpu_stats.waiting_for_job;
+            let status = if worker.mining() {
+                GpuStatus::Mining
+            } else if worker.alive() {
+                GpuStatus::Recovering
+            } else {
+                GpuStatus::Stopped
+            };
+            if let Some(error) = gpu_stats.last_error.clone() {
+                let error = if several {
+                    format!(
+                        "{}:{}: {error}",
+                        worker.backend.as_str(),
+                        worker.device_ordinal
+                    )
+                } else {
+                    error
+                };
+                if status != GpuStatus::Mining {
+                    failing_error.get_or_insert_with(|| error.clone());
+                }
+                any_error.get_or_insert(error);
+            }
+            stats.gpus.push(GpuSearchStats {
+                backend: worker.backend,
+                device: worker.device_ordinal as u32,
+                candidates,
+                rate: candidates as f64 / elapsed,
+                active_rate: gpu_stats.active_rate,
+                winners,
+                status,
+                last_error: gpu_stats.last_error,
+            });
+        }
+        stats.rate = stats.candidates as f64 / elapsed;
+        stats.last_error = failing_error.or(any_error);
         stats
     }
 
@@ -1399,7 +1461,7 @@ impl SearchHandle {
 
     /// Switches GPU search between paused and running states.
     pub fn toggle_pause(&self) -> bool {
-        let next = !self.paused.load(Ordering::Relaxed);
+        let next = !self.shared.paused.load(Ordering::Relaxed);
         if next {
             let _ = self.apply_control(RuntimeCommand::Pause);
         } else {
@@ -1412,11 +1474,7 @@ impl SearchHandle {
 impl Drop for SearchHandle {
     /// Releases resources owned by SearchHandle.
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            worker.thread().unpark();
-            let _ = worker.join();
-        }
+        self.stop_workers();
     }
 }
 
@@ -1424,6 +1482,7 @@ impl Drop for SearchHandle {
 mod tests {
     use super::*;
     use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
+    use secp256k1::SecretKey;
 
     #[test]
     fn search_batch_error_is_retained_and_stops_the_worker() {
@@ -1759,44 +1818,230 @@ mod tests {
         // #### end PR #11 test ####
     }
 
+    /// A search handle over test threads standing in for GPU workers, one
+    /// CUDA device per entry.
+    fn test_handle(
+        workers: Vec<(JoinHandle<()>, GpuCounters)>,
+        winner_rx: Receiver<VerifiedWinner>,
+        generation_id: Arc<AtomicU64>,
+    ) -> SearchHandle {
+        SearchHandle {
+            shared: SharedControl {
+                paused: Arc::new(AtomicBool::new(false)),
+                intensity: Arc::new(AtomicU8::new(10)),
+                generation_id,
+            },
+            workers: workers
+                .into_iter()
+                .enumerate()
+                .map(|(device_ordinal, (thread, counters))| GpuWorker {
+                    backend: BackendKind::Cuda,
+                    device_ordinal,
+                    counters,
+                    thread: Some(thread),
+                })
+                .collect(),
+            winner_rx,
+            started: Instant::now(),
+        }
+    }
+
+    /// A test thread standing in for a GPU worker until the search stops. It
+    /// answers each job change with `answer`, or never takes one when `None`.
+    fn fake_gpu(counters: &GpuCounters, answer: Option<Result<(), String>>) -> JoinHandle<()> {
+        let counters = counters.clone();
+        thread::spawn(move || {
+            while !counters.stop.load(Ordering::Relaxed) {
+                if let Some(answer) = &answer {
+                    if let Some(WorkerCommand::ReplaceJob { reply, .. }) = counters.take_command() {
+                        let _ = reply.send(answer.clone());
+                    }
+                }
+                thread::park_timeout(Duration::from_millis(5));
+            }
+        })
+    }
+
+    /// A search handle over fake GPUs, one per answer.
+    fn fake_search(answers: Vec<Option<Result<(), String>>>) -> (SearchHandle, Vec<GpuCounters>) {
+        let counters: Vec<GpuCounters> = answers.iter().map(|_| GpuCounters::new()).collect();
+        let workers = counters
+            .iter()
+            .zip(answers)
+            .map(|(gpu, answer)| (fake_gpu(gpu, answer), gpu.clone()))
+            .collect();
+        let (_winner_tx, winner_rx) = mpsc::sync_channel(1);
+        let handle = test_handle(workers, winner_rx, Arc::new(AtomicU64::new(1)));
+        (handle, counters)
+    }
+
     #[test]
     fn runtime_intensity_change_wakes_parked_worker() {
-        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
-            let started = Instant::now();
-            thread::park_timeout(Duration::from_secs(5));
-            let _ = wake_tx.send(started.elapsed());
-        });
-
-        let (job_tx, _job_rx) = mpsc::sync_channel(1);
-        let (_winner_tx, winner_rx) = mpsc::sync_channel(1);
-        let handle = SearchHandle {
-            stop: Arc::new(AtomicBool::new(false)),
-            paused: Arc::new(AtomicBool::new(false)),
-            batch_in_flight: Arc::new(AtomicBool::new(false)),
-            intensity: Arc::new(AtomicU8::new(10)),
-            candidates: Arc::new(AtomicU64::new(0)),
-            batches: Arc::new(AtomicU64::new(0)),
-            winners: Arc::new(AtomicU64::new(0)),
-            generation_id: Arc::new(AtomicU64::new(1)),
-            diagnostics: Arc::new(WorkerDiagnostics::new()),
-            job_tx,
-            winner_rx,
-            worker: Some(worker),
-            started: Instant::now(),
+        let (wake_tx, wake_rx) = mpsc::sync_channel(2);
+        let parked_gpu = |wake_tx: SyncSender<Duration>| {
+            thread::spawn(move || {
+                let started = Instant::now();
+                thread::park_timeout(Duration::from_secs(5));
+                let _ = wake_tx.send(started.elapsed());
+            })
         };
+        let workers = vec![
+            (parked_gpu(wake_tx.clone()), GpuCounters::new()),
+            (parked_gpu(wake_tx), GpuCounters::new()),
+        ];
+        let (_winner_tx, winner_rx) = mpsc::sync_channel(1);
+        let handle = test_handle(workers, winner_rx, Arc::new(AtomicU64::new(1)));
 
         handle
             .apply_control(RuntimeCommand::SetIntensity(100))
             .unwrap();
-        let elapsed = wake_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect("intensity control must wake a worker parked for duty throttling");
+        // Every GPU of the search wakes, not only the first.
+        for _ in 0..2 {
+            let elapsed = wake_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("intensity control must wake a worker parked for duty throttling");
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "worker remained parked after live intensity change: {elapsed:?}"
+            );
+        }
+    }
+
+    // #### PR #22 test: one search over several GPUs ####
+    #[test]
+    fn replace_job_needs_one_gpu_and_a_stuck_gpu_keeps_only_the_newest_job() {
+        let (handle, gpus) = fake_search(vec![Some(Ok(())), None]);
+        let started = Instant::now();
+        handle.replace_job(integration_job(2)).unwrap();
+        handle.replace_job(integration_job(3)).unwrap();
         assert!(
-            elapsed < Duration::from_secs(1),
-            "worker remained parked after live intensity change: {elapsed:?}"
+            started.elapsed() < Duration::from_secs(5),
+            "a GPU that never answers must not hold up job changes"
+        );
+        match gpus[1].take_command() {
+            Some(WorkerCommand::ReplaceJob { job, .. }) => assert_eq!(job.generation_id, 3),
+            None => panic!("the stuck GPU must find the newest job when it returns"),
+        }
+    }
+
+    #[test]
+    fn replace_job_fails_only_when_no_gpu_takes_the_job() {
+        let (handle, _gpus) = fake_search(vec![Some(Err("install failed".into())), Some(Ok(()))]);
+        handle.replace_job(integration_job(2)).unwrap();
+
+        let (handle, _gpus) = fake_search(vec![
+            Some(Err("install failed".into())),
+            Some(Err("install failed".into())),
+        ]);
+        assert_eq!(
+            handle.replace_job(integration_job(2)).unwrap_err(),
+            "install failed"
         );
     }
+
+    #[test]
+    fn search_state_is_stopped_only_while_no_gpu_mines() {
+        let (handle, gpus) = fake_search(vec![None, None]);
+        gpus[1]
+            .diagnostics
+            .recovering
+            .store(true, Ordering::Relaxed);
+        assert_eq!(handle.snapshot().state, MiningState::Mining);
+
+        handle.apply_control(RuntimeCommand::Pause).unwrap();
+        assert_eq!(handle.snapshot().state, MiningState::Paused);
+        handle.apply_control(RuntimeCommand::Resume).unwrap();
+
+        gpus[0]
+            .diagnostics
+            .recovering
+            .store(true, Ordering::Relaxed);
+        assert_eq!(handle.snapshot().state, MiningState::Stopped);
+        gpus[1]
+            .diagnostics
+            .recovering
+            .store(false, Ordering::Relaxed);
+        assert_eq!(handle.snapshot().state, MiningState::Mining);
+    }
+
+    #[test]
+    fn snapshot_adds_up_every_gpu_and_names_the_failing_one() {
+        let (handle, gpus) = fake_search(vec![None, None]);
+        gpus[0].candidates.store(3_000, Ordering::Relaxed);
+        gpus[0].batches.store(3, Ordering::Relaxed);
+        gpus[0].winners.store(1, Ordering::Relaxed);
+        gpus[0].diagnostics.work_candidates[0].store(2_900, Ordering::Relaxed);
+        gpus[0].diagnostics.record_batch_error("slow batch".into());
+        gpus[1].candidates.store(1_000, Ordering::Relaxed);
+        gpus[1].batches.store(1, Ordering::Relaxed);
+        gpus[1].diagnostics.work_candidates[0].store(1_000, Ordering::Relaxed);
+        gpus[1].diagnostics.record_batch_error("device lost".into());
+        gpus[1]
+            .diagnostics
+            .recovering
+            .store(true, Ordering::Relaxed);
+
+        let stats = handle.snapshot();
+        assert_eq!(stats.candidates, 4_000);
+        assert_eq!(stats.work_candidates, [3_900, 0, 0]);
+        assert_eq!(stats.batches, 4);
+        assert_eq!(stats.winners, 1);
+        assert_eq!(stats.state, MiningState::Mining);
+        assert_eq!(
+            stats
+                .gpus
+                .iter()
+                .map(|gpu| (gpu.device, gpu.candidates, gpu.status))
+                .collect::<Vec<_>>(),
+            [
+                (0, 3_000, GpuStatus::Mining),
+                (1, 1_000, GpuStatus::Recovering)
+            ]
+        );
+        assert_eq!(stats.gpus[1].last_error.as_deref(), Some("device lost"));
+        // The failing GPU's error leads, named so a rig shows which card.
+        assert_eq!(stats.last_error.as_deref(), Some("cuda:1: device lost"));
+
+        let (single, gpus) = fake_search(vec![None]);
+        gpus[0].diagnostics.record_batch_error("device lost".into());
+        assert_eq!(single.snapshot().last_error.as_deref(), Some("device lost"));
+    }
+
+    #[test]
+    fn failed_gpu_takes_job_changes_while_waiting_to_restart() {
+        let shared = SharedControl {
+            paused: Arc::new(AtomicBool::new(false)),
+            intensity: Arc::new(AtomicU8::new(100)),
+            generation_id: Arc::new(AtomicU64::new(1)),
+        };
+        let gpu = GpuCounters::new();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        *gpu.mailbox.lock().unwrap() = Some(WorkerCommand::ReplaceJob {
+            job: integration_job(2),
+            reply: reply_tx,
+        });
+        let mut job = integration_job(1);
+        assert!(wait_for_retry(
+            Duration::from_millis(50),
+            &mut job,
+            &shared,
+            &gpu
+        ));
+        assert_eq!(job.generation_id, 2);
+        assert_eq!(shared.generation_id.load(Ordering::Acquire), 2);
+        assert_eq!(reply_rx.try_recv().unwrap(), Ok(()));
+
+        gpu.stop.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        assert!(!wait_for_retry(
+            Duration::from_secs(60),
+            &mut job,
+            &shared,
+            &gpu
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    // #### end PR #22 test ####
 
     #[test]
     fn production_search_rejects_unpublished_generation() {
@@ -2088,7 +2333,8 @@ mod tests {
 
     #[test]
     fn generation_replacement_wakes_parked_worker() {
-        let (job_tx, job_rx) = mpsc::sync_channel(1);
+        let gpu = GpuCounters::new();
+        let worker_gpu = gpu.clone();
         let (_winner_tx, winner_rx) = mpsc::sync_channel(1);
         let generation_id = Arc::new(AtomicU64::new(1));
         let worker_generation = Arc::clone(&generation_id);
@@ -2096,9 +2342,16 @@ mod tests {
         let worker = thread::spawn(move || {
             let started = Instant::now();
             thread::park_timeout(Duration::from_secs(5));
-            let command = job_rx
-                .recv_timeout(Duration::from_millis(500))
-                .expect("replacement command must be available after wake");
+            let command = loop {
+                if let Some(command) = worker_gpu.take_command() {
+                    break command;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "replacement command must be available after wake"
+                );
+                thread::park_timeout(Duration::from_millis(5));
+            };
             match command {
                 WorkerCommand::ReplaceJob { job, reply } => {
                     worker_generation.store(job.generation_id, Ordering::Release);
@@ -2108,21 +2361,7 @@ mod tests {
             let _ = wake_tx.send(started.elapsed());
         });
 
-        let handle = SearchHandle {
-            stop: Arc::new(AtomicBool::new(false)),
-            paused: Arc::new(AtomicBool::new(false)),
-            batch_in_flight: Arc::new(AtomicBool::new(false)),
-            intensity: Arc::new(AtomicU8::new(10)),
-            candidates: Arc::new(AtomicU64::new(0)),
-            batches: Arc::new(AtomicU64::new(0)),
-            winners: Arc::new(AtomicU64::new(0)),
-            generation_id,
-            diagnostics: Arc::new(WorkerDiagnostics::new()),
-            job_tx,
-            winner_rx,
-            worker: Some(worker),
-            started: Instant::now(),
-        };
+        let handle = test_handle(vec![(worker, gpu)], winner_rx, generation_id);
 
         handle.replace_job(integration_job(2)).unwrap();
         let elapsed = wake_rx
@@ -2153,6 +2392,8 @@ mod tests {
             let policy = crate::config::MiningToken::Photon.fee_policy(network);
             let mut job = integration_job(1);
             job.network = network;
+            job.payout_address =
+                crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], network).unwrap();
             job.age = 1;
             job.relay_fee_sats_per_kb = if network == MiningNetwork::Mainnet {
                 1_100
@@ -2345,4 +2586,126 @@ mod tests {
         );
         let _ = handle.stop();
     }
+
+    // #### PR #22 test: one search on several real GPUs ####
+    /// Waits until `done` holds for the search, or panics after `limit`.
+    fn wait_for(
+        handle: &SearchHandle,
+        limit: Duration,
+        what: &str,
+        done: impl Fn(&SearchStats) -> bool,
+    ) {
+        let deadline = Instant::now() + limit;
+        while !done(&handle.snapshot()) {
+            assert!(Instant::now() < deadline, "{what}: {:?}", handle.snapshot());
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Mines on several GPUs at once: `PICKAXE_TEST_MULTI_GPU` lists them as
+    /// `backend:ordinal` (default `wgpu:0,wgpu:1`). With
+    /// `PICKAXE_TEST_WGPU_ADAPTER` set, every wgpu entry opens that adapter,
+    /// so two workers can share one GPU and no other GPU is touched.
+    #[cfg(feature = "portable-wgpu")]
+    #[test]
+    fn several_gpus_share_job_changes_pauses_and_stop_if_wgpu_present() {
+        let devices: Vec<(BackendKind, usize)> = std::env::var("PICKAXE_TEST_MULTI_GPU")
+            .unwrap_or_else(|_| "wgpu:0,wgpu:1".into())
+            .split(',')
+            .map(|entry| {
+                let (backend, ordinal) = entry.trim().split_once(':').expect("backend:ordinal");
+                (
+                    BackendKind::parse(backend).unwrap(),
+                    ordinal.parse().unwrap(),
+                )
+            })
+            .collect();
+        let handle = match SearchHandle::start_inner(&devices, 100, control_job(1), false, None) {
+            Ok(handle) => handle,
+            Err(error)
+                if error.contains("no hardware WGPU adapter")
+                    || crate::cuda_photon::cuda_unavailable_for_tests(&error) =>
+            {
+                eprintln!("skip multi-GPU search test: {error}");
+                return;
+            }
+            Err(error) => panic!("multi-GPU search start failed: {error}"),
+        };
+        let every_gpu = |stats: &SearchStats, test: fn(&GpuSearchStats) -> bool| {
+            stats.gpus.len() == devices.len() && stats.gpus.iter().all(test)
+        };
+        wait_for(
+            &handle,
+            Duration::from_secs(120),
+            "every GPU mines",
+            |stats| {
+                every_gpu(stats, |gpu| {
+                    gpu.candidates > 0 && gpu.status == GpuStatus::Mining
+                })
+            },
+        );
+
+        // A job change reaches every GPU, not only the first to answer.
+        handle.replace_job(control_job(2)).unwrap();
+        assert_eq!(handle.generation_id(), 2);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while handle
+            .workers
+            .iter()
+            .any(|worker| worker.counters.mailbox.lock().unwrap().is_some())
+        {
+            assert!(Instant::now() < deadline, "a GPU never took the new job");
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        // A pause holds every GPU, and a resume restarts every GPU.
+        handle.apply_control(RuntimeCommand::Pause).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while handle.batch_in_flight() {
+            assert!(Instant::now() < deadline, "a GPU kept a batch in flight");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let paused = handle.snapshot();
+        assert_eq!(paused.state, MiningState::Paused);
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(handle.snapshot().candidates, paused.candidates);
+        handle.apply_control(RuntimeCommand::Resume).unwrap();
+        wait_for(
+            &handle,
+            Duration::from_secs(30),
+            "every GPU resumes",
+            |stats| {
+                stats
+                    .gpus
+                    .iter()
+                    .zip(&paused.gpus)
+                    .all(|(now, before)| now.candidates > before.candidates)
+            },
+        );
+
+        handle.set_intensity(25).unwrap();
+        assert_eq!(handle.snapshot().intensity, 25);
+        let stats = handle.stop();
+        eprintln!(
+            "multi-GPU search: {} candidates in {}s; per GPU {:?}",
+            stats.candidates,
+            stats.elapsed_secs,
+            stats
+                .gpus
+                .iter()
+                .map(|gpu| (
+                    gpu.backend.as_str(),
+                    gpu.device,
+                    gpu.candidates,
+                    gpu.active_rate
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            stats.candidates,
+            stats.gpus.iter().map(|gpu| gpu.candidates).sum::<u64>()
+        );
+        assert!(stats.last_error.is_none(), "{:?}", stats.last_error);
+    }
+    // #### end PR #22 test ####
 }

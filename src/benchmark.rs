@@ -506,6 +506,10 @@ pub fn run_gpu_benchmark(
         // Benchmark the same fixed-700-sat search path used by live mining.
         cuda.enable_t2_search()?;
     }
+    #[cfg(feature = "tail-grind")]
+    if let search::PhotonEngine::Hip(hip) = &mut engine {
+        hip.enable_t2_search()?;
+    }
     let persistent_device_bytes = engine.persistent_device_bytes();
     let table_source = engine.table_source();
     engine.set_job(&fixture.template, &fixture.target, &fixture.private_key)?;
@@ -705,6 +709,9 @@ mod tests {
             vram_bytes: None,
             backend,
             detail: String::new(),
+            integrated: false,
+            ready: true,
+            pci: None,
         }
     }
 

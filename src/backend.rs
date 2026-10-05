@@ -4,38 +4,10 @@
 use cudarc::driver::{sys, CudaContext};
 use libloading::Library;
 use std::ffi::CStr;
+use std::fmt;
 use std::os::raw::{c_char, c_int};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind {
-    Auto,
-    Cuda,
-    Hip,
-    Wgpu,
-}
-
-impl BackendKind {
-    /// Parses a requested GPU backend by name.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "cuda" => Ok(Self::Cuda),
-            "hip" | "rocm" => Ok(Self::Hip),
-            "wgpu" => Ok(Self::Wgpu),
-            other => Err(format!("unknown backend `{other}` (auto|cuda|hip|wgpu)")),
-        }
-    }
-
-    /// Returns the canonical CLI name of the GPU backend.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Cuda => "cuda",
-            Self::Hip => "hip",
-            Self::Wgpu => "wgpu",
-        }
-    }
-}
+pub use crate::backend_kind::{BackendKind, DeviceSelection};
 
 #[derive(Debug, Clone)]
 pub struct GpuDevice {
@@ -45,6 +17,54 @@ pub struct GpuDevice {
     pub vram_bytes: Option<u64>,
     pub backend: BackendKind,
     pub detail: String,
+    /// Integrated GPUs share the CPU package; auto selection uses one only
+    /// when no discrete GPU is present (AMD APU-only PCs, Apple Silicon).
+    pub integrated: bool,
+    /// Whether this backend can mine on the device as installed; native HIP
+    /// needs code objects built for the device's architecture.
+    pub ready: bool,
+    /// PCI location; the same physical GPU reports it through every engine.
+    pub pci: Option<PciAddress>,
+}
+
+/// A GPU's PCI location: domain, bus, device and function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PciAddress {
+    pub domain: u32,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+}
+
+impl PciAddress {
+    /// Parses the hexadecimal `domain:bus:device.function` form that CUDA,
+    /// HIP and wgpu report, with or without the domain.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim().trim_end_matches('\0');
+        let (location, function) = text.rsplit_once('.')?;
+        let fields: Vec<&str> = location.split(':').collect();
+        let (domain, bus, device) = match fields.as_slice() {
+            [domain, bus, device] => (*domain, *bus, *device),
+            [bus, device] => ("0", *bus, *device),
+            _ => return None,
+        };
+        Some(Self {
+            domain: u32::from_str_radix(domain, 16).ok()?,
+            bus: u8::from_str_radix(bus, 16).ok()?,
+            device: u8::from_str_radix(device, 16).ok()?,
+            function: u8::from_str_radix(function, 16).ok()?,
+        })
+    }
+}
+
+impl fmt::Display for PciAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:04x}:{:02x}:{:02x}.{}",
+            self.domain, self.bus, self.device, self.function
+        )
+    }
 }
 
 /// Enumerates devices available to each mining backend.
@@ -82,38 +102,173 @@ pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
     }
 }
 
-/// Resolves the selected backend and GPU ordinal.
+/// Resolves one GPU, for commands that run a single GPU at a time.
 pub fn resolve_mining_device(
     prefer: BackendKind,
     requested_index: Option<u32>,
 ) -> Result<GpuDevice, String> {
-    let wanted = requested_index.unwrap_or(0);
+    let selection = requested_index.map_or(DeviceSelection::Default, |index| {
+        DeviceSelection::Indices(vec![index])
+    });
+    let gpus = resolve_mining_devices(prefer, &selection)?;
+    Ok(gpus
+        .into_iter()
+        .next()
+        .expect("a resolved GPU selection is never empty"))
+}
+
+/// Resolves every GPU that mines under `selection`.
+pub fn resolve_mining_devices(
+    prefer: BackendKind,
+    selection: &DeviceSelection,
+) -> Result<Vec<GpuDevice>, String> {
     match prefer {
-        BackendKind::Cuda => find_device(list_cuda_devices()?, wanted, BackendKind::Cuda),
-        BackendKind::Hip => find_device(list_hip_devices()?, wanted, BackendKind::Hip),
-        BackendKind::Wgpu => find_device(list_wgpu_devices()?, wanted, BackendKind::Wgpu),
-        BackendKind::Auto => {
-            let cuda = list_cuda_devices().unwrap_or_default();
-            let hip = list_hip_devices().unwrap_or_default();
-            let wgpu = list_wgpu_devices().unwrap_or_default();
-            select_auto_device(cuda, hip, wgpu, wanted).ok_or_else(|| {
-                format!("no GPU device at backend-local ordinal {wanted}; run `pickaxe devices`")
-            })
-        }
+        BackendKind::Cuda => select_gpus(list_cuda_devices()?, selection, prefer),
+        BackendKind::Hip => select_gpus(list_hip_devices()?, selection, prefer),
+        BackendKind::Wgpu => select_gpus(list_wgpu_devices()?, selection, prefer),
+        BackendKind::Auto => select_gpus(mining_gpus(), selection, prefer),
     }
 }
 
-/// Chooses the preferred supported GPU automatically.
-fn select_auto_device(
+/// Every GPU automatic selection can mine on: one entry per physical GPU.
+pub fn mining_gpus() -> Vec<GpuDevice> {
+    physical_gpus(
+        list_cuda_devices().unwrap_or_default(),
+        list_hip_devices().unwrap_or_default(),
+        list_wgpu_devices().unwrap_or_default(),
+    )
+}
+
+/// Applies a selection to a GPU list. With `--backend auto` the numbers are
+/// positions in the physical GPU list that `devices` prints; with an explicit
+/// backend they are that backend's own ordinals.
+fn select_gpus(
+    gpus: Vec<GpuDevice>,
+    selection: &DeviceSelection,
+    backend: BackendKind,
+) -> Result<Vec<GpuDevice>, String> {
+    let selected = match selection {
+        DeviceSelection::Indices(wanted) => wanted
+            .iter()
+            .map(|&index| {
+                let found = if backend == BackendKind::Auto {
+                    gpus.get(index as usize).cloned()
+                } else {
+                    gpus.iter().find(|gpu| gpu.index == index).cloned()
+                };
+                found.ok_or_else(|| {
+                    if backend == BackendKind::Auto {
+                        format!("no GPU {index}; run `pickaxe devices` for the GPU numbers")
+                    } else {
+                        format!(
+                            "{} device {index} not found; run `pickaxe devices --backend {}`",
+                            backend.as_str().to_ascii_uppercase(),
+                            backend.as_str()
+                        )
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        DeviceSelection::WithIntegrated => gpus,
+        DeviceSelection::Default => {
+            let discrete: Vec<GpuDevice> =
+                gpus.iter().filter(|gpu| !gpu.integrated).cloned().collect();
+            if discrete.is_empty() {
+                gpus
+            } else {
+                discrete
+            }
+        }
+    };
+    if selected.is_empty() {
+        return Err(if backend == BackendKind::Auto {
+            "no GPU device found; run `pickaxe devices`".into()
+        } else {
+            format!(
+                "no {} GPU found; run `pickaxe devices`",
+                backend.as_str().to_ascii_uppercase()
+            )
+        });
+    }
+    Ok(selected)
+}
+
+// #### PR #22: every GPU mines once, on its best engine
+// What: CUDA, HIP and wgpu each list the GPUs they can drive, so one card can
+// appear in several lists. Entries with the same PCI address are one GPU;
+// when a driver reports no address, the same vendor and name from another
+// engine is. A discrete GPU mines on the first engine ready for it: CUDA,
+// then native HIP (code objects for its architecture), then wgpu. An
+// integrated GPU prefers wgpu, because under Windows integrated GPUs never
+// complete a HIP launch. By default every discrete GPU mines, and integrated
+// GPUs only when no discrete GPU exists; --include-integrated adds them and
+// --device picks GPUs by the numbers `devices` prints.
+// Why: one miner drives all of a machine's GPUs, so they share one job and
+// never compete for the same reward, and no card may mine twice.
+// Check: `pickaxe devices` lists each physical GPU once with its engine.
+fn physical_gpus(
     cuda: Vec<GpuDevice>,
     hip: Vec<GpuDevice>,
     wgpu: Vec<GpuDevice>,
-    wanted: u32,
-) -> Option<GpuDevice> {
-    cuda.into_iter()
-        .chain(hip)
-        .chain(wgpu)
-        .find(|device| device.index == wanted)
+) -> Vec<GpuDevice> {
+    let mut groups: Vec<Vec<GpuDevice>> = Vec::new();
+    for device in cuda.into_iter().chain(hip).chain(wgpu) {
+        match groups
+            .iter_mut()
+            .find(|group| same_physical_gpu(group, &device))
+        {
+            Some(group) => group.push(device),
+            None => groups.push(vec![device]),
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let integrated = group.iter().any(|device| device.integrated);
+            let pci = group.iter().find_map(|device| device.pci);
+            let priority = if integrated {
+                [BackendKind::Wgpu, BackendKind::Hip, BackendKind::Cuda]
+            } else {
+                [BackendKind::Cuda, BackendKind::Hip, BackendKind::Wgpu]
+            };
+            priority
+                .iter()
+                .find_map(|backend| {
+                    group
+                        .iter()
+                        .find(|device| device.backend == *backend && device.ready)
+                })
+                .cloned()
+                .map(|mut chosen| {
+                    chosen.integrated = integrated;
+                    chosen.pci = chosen.pci.or(pci);
+                    chosen
+                })
+        })
+        .collect()
+}
+
+/// Whether `device` is another engine's entry for the GPU in `group`.
+fn same_physical_gpu(group: &[GpuDevice], device: &GpuDevice) -> bool {
+    if group.iter().any(|member| member.backend == device.backend) {
+        return false;
+    }
+    if let Some(pci) = device.pci {
+        if group.iter().any(|member| member.pci.is_some()) {
+            return group.iter().any(|member| member.pci == Some(pci));
+        }
+    }
+    group.iter().any(|member| {
+        member.vendor.eq_ignore_ascii_case(&device.vendor) && same_name(&member.name, &device.name)
+    })
+}
+
+/// Equal names, allowing a driver suffix such as Mesa's " (RADV NAVI31)".
+fn same_name(left: &str, right: &str) -> bool {
+    let (left, right) = (left.to_ascii_lowercase(), right.to_ascii_lowercase());
+    left == right
+        || left.starts_with(&format!("{right} ("))
+        || right.starts_with(&format!("{left} ("))
 }
 
 /// Rejects GPU backends that are not production-ready.
@@ -131,24 +286,6 @@ pub fn require_production_mining_backend(backend: BackendKind) -> Result<(), Str
             Err("auto backend must be resolved before production mining starts".into())
         }
     }
-}
-
-/// Finds the GPU matching a backend and device ordinal.
-fn find_device(
-    devices: Vec<GpuDevice>,
-    wanted: u32,
-    backend: BackendKind,
-) -> Result<GpuDevice, String> {
-    devices
-        .into_iter()
-        .find(|device| device.index == wanted)
-        .ok_or_else(|| {
-            format!(
-                "{} device {wanted} not found; run `pickaxe devices --backend {}`",
-                backend.as_str().to_ascii_uppercase(),
-                backend.as_str()
-            )
-        })
 }
 
 #[cfg(feature = "portable-wgpu")]
@@ -177,17 +314,17 @@ fn wgpu_vendor_name(vendor: u32) -> String {
 
 #[cfg(feature = "portable-wgpu")]
 /// Limits WGPU discovery to production-capable APIs.
-pub(crate) fn production_wgpu_backends() -> wgpu::Backends {
-    wgpu::Backends::VULKAN
+pub(crate) fn production_wgpu_backends() -> Result<wgpu::Backends, String> {
+    crate::wgpu_photon::production_wgpu_backends()
 }
 
 #[cfg(feature = "portable-wgpu")]
 /// Enumerates supported WGPU hardware adapters.
 fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
-    let backends = production_wgpu_backends();
-    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    descriptor.backends = backends;
-    let instance = wgpu::Instance::new(descriptor);
+    let backends = production_wgpu_backends()?;
+    let instance = wgpu::Instance::new(crate::wgpu_photon::production_instance_descriptor(
+        backends,
+    )?);
     let adapters = pollster::block_on(instance.enumerate_adapters(backends));
     let mut out = Vec::new();
 
@@ -214,11 +351,14 @@ fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
             vram_bytes: None,
             backend: BackendKind::Wgpu,
             detail,
+            integrated: info.device_type == wgpu::DeviceType::IntegratedGpu,
+            ready: true,
+            pci: PciAddress::parse(&info.device_pci_bus_id),
         });
     }
 
     if out.is_empty() {
-        Err("WGPU found no hardware Vulkan GPU adapters".into())
+        Err("WGPU found no hardware GPU adapters".into())
     } else {
         Ok(out)
     }
@@ -232,6 +372,21 @@ fn list_wgpu_devices() -> Result<Vec<GpuDevice>, String> {
 
 /// Enumerates CUDA devices usable for mining.
 fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
+    if cfg!(target_os = "macos") {
+        return Err("CUDA is unavailable on macOS; use the wgpu Metal backend".into());
+    }
+    // #### PR #22: a missing NVIDIA driver is an error, not a crash
+    // What: check that the driver library loads before the first CUDA call.
+    // Why: cudarc panics when it cannot load nvcuda.dll or libcuda.so, and
+    // auto discovery (the dashboard at startup, `devices`) probes CUDA first,
+    // so PCs without an NVIDIA driver crashed before reaching HIP or WGPU
+    // (issue #30).
+    // Check: on such a PC, `devices` and `mine` list the AMD or Intel GPUs.
+    // SAFETY: loads and releases the driver library by name, as cudarc does on
+    // first use; no CUDA function is called.
+    if !unsafe { sys::is_culib_present() } {
+        return Err("CUDA unavailable: no NVIDIA driver found".into());
+    }
     // Driver must be initialized before get_count (same path CudaContext::new uses).
     cudarc::driver::result::init()
         .map_err(|e| format!("CUDA unavailable: {e}. Install or fix the CUDA runtime."))?;
@@ -241,14 +396,20 @@ fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
     for i in 0..n {
         let ctx = CudaContext::new(i as usize)
             .map_err(|e| format!("CUDA device {i} init failed: {e}"))?;
-        let (name, detail, vram) = cuda_device_info(i as u32, &ctx);
+        let info = cuda_device_info(i as u32, &ctx);
         out.push(GpuDevice {
             index: i as u32,
-            name,
+            name: info.name,
             vendor: "NVIDIA".into(),
-            vram_bytes: vram,
+            vram_bytes: info.vram,
             backend: BackendKind::Cuda,
-            detail,
+            detail: info.detail,
+            integrated: false,
+            // #### PR #22: the shipped CUDA kernels are PTX for sm_120, which
+            // the driver compiles for compute capability 12.0 and newer only.
+            // Other NVIDIA GPUs mine on the portable engine instead.
+            ready: info.compute >= (12, 0),
+            pci: info.pci,
         });
     }
     Ok(out)
@@ -265,6 +426,7 @@ type HipMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> HipError;
 type HipRuntimeGetVersion = unsafe extern "C" fn(*mut c_int) -> HipError;
 type HipDriverGetVersion = unsafe extern "C" fn(*mut c_int) -> HipError;
 type HipGetErrorString = unsafe extern "C" fn(HipError) -> *const c_char;
+type HipDeviceGetPciBusId = unsafe extern "C" fn(*mut c_char, c_int, HipDevice) -> HipError;
 
 #[cfg(target_os = "windows")]
 const HIP_LIBRARY_CANDIDATES: &[&str] = &["amdhip64.dll", "amdhip64_6.dll"];
@@ -333,6 +495,10 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
         let hip_driver_get_version = library
             .get::<HipDriverGetVersion>(b"hipDriverGetVersion\0")
             .map_err(|error| format!("load hipDriverGetVersion: {error}"))?;
+        // Optional: matches this GPU with the same card in the wgpu list.
+        let hip_device_get_pci_bus_id = library
+            .get::<HipDeviceGetPciBusId>(b"hipDeviceGetPCIBusId\0")
+            .ok();
 
         let init_code = hip_init(0);
         if init_code != 0 {
@@ -388,7 +554,14 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
             let detail = format!(
                 "hip ordinal={ordinal}; gfx={architecture}; runtime={runtime_version}; driver={driver_version}; vram={vram_gb}"
             );
+            let pci = hip_device_get_pci_bus_id.as_ref().and_then(|get_bus_id| {
+                let mut bus_id = [0 as c_char; 64];
+                (get_bus_id(bus_id.as_mut_ptr(), bus_id.len() as c_int, device) == 0)
+                    .then(|| PciAddress::parse(&CStr::from_ptr(bus_id.as_ptr()).to_string_lossy()))
+                    .flatten()
+            });
             out.push(GpuDevice {
+                pci,
                 index: ordinal as u32,
                 name: if name.is_empty() {
                     format!("AMD GPU {ordinal}")
@@ -398,6 +571,9 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
                 vendor: "AMD".into(),
                 vram_bytes: vram,
                 backend: BackendKind::Hip,
+                integrated: crate::hip_photon::is_apu_architecture(&architecture),
+                ready: crate::hip_photon::code_objects_installed(&architecture)
+                    && !(cfg!(windows) && crate::hip_photon::is_apu_architecture(&architecture)),
                 detail,
             });
         }
@@ -405,8 +581,17 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
     }
 }
 
+/// CUDA device details for selection and display.
+struct CudaInfo {
+    name: String,
+    detail: String,
+    vram: Option<u64>,
+    compute: (i32, i32),
+    pci: Option<PciAddress>,
+}
+
 /// Reads CUDA device details for selection and display.
-fn cuda_device_info(index: u32, ctx: &CudaContext) -> (String, String, Option<u64>) {
+fn cuda_device_info(index: u32, ctx: &CudaContext) -> CudaInfo {
     // Best-effort via driver sys; fall back to ordinal if attrs fail.
     let mut name_buf = [0i8; 256];
     let name = unsafe {
@@ -430,6 +615,8 @@ fn cuda_device_info(index: u32, ctx: &CudaContext) -> (String, String, Option<u6
     let mut major = 0i32;
     let mut minor = 0i32;
     let mut total_mem: usize = 0;
+    let mut bus_id = [0i8; 64];
+    let mut pci = None;
     unsafe {
         let mut dev: sys::CUdevice = 0;
         if sys::cuDeviceGet(&mut dev, index as i32) == sys::CUresult::CUDA_SUCCESS {
@@ -444,6 +631,11 @@ fn cuda_device_info(index: u32, ctx: &CudaContext) -> (String, String, Option<u6
                 dev,
             );
             let _ = sys::cuDeviceTotalMem_v2(&mut total_mem, dev);
+            if sys::cuDeviceGetPCIBusId(bus_id.as_mut_ptr(), bus_id.len() as i32, dev)
+                == sys::CUresult::CUDA_SUCCESS
+            {
+                pci = PciAddress::parse(&CStr::from_ptr(bus_id.as_ptr()).to_string_lossy());
+            }
         }
     }
     let _ = ctx; // keep context live for future probes
@@ -459,7 +651,13 @@ fn cuda_device_info(index: u32, ctx: &CudaContext) -> (String, String, Option<u6
         minor,
         vram_gb.unwrap_or_else(|| "N/A".into())
     );
-    (name, detail, vram)
+    CudaInfo {
+        name,
+        detail,
+        vram,
+        compute: (major, minor),
+        pci,
+    }
 }
 
 /// Prints available backend and GPU device information.
@@ -481,6 +679,33 @@ pub fn print_devices(prefer: BackendKind) -> Result<(), String> {
             d.detail
         );
     }
+    if prefer == BackendKind::Auto {
+        let gpus = mining_gpus();
+        let mines_by_default =
+            select_gpus(gpus.clone(), &DeviceSelection::Default, prefer).unwrap_or_default();
+        println!("mining GPUs (numbers for --device):");
+        for (number, gpu) in gpus.iter().enumerate() {
+            let default = mines_by_default
+                .iter()
+                .any(|other| (other.backend, other.index) == (gpu.backend, gpu.index));
+            println!(
+                "  {number}: {} | {}:{} | {} | {}",
+                gpu.name,
+                gpu.backend.as_str(),
+                gpu.index,
+                if gpu.integrated {
+                    "integrated"
+                } else {
+                    "discrete"
+                },
+                if default {
+                    "mines by default"
+                } else {
+                    "add with --include-integrated or --device"
+                }
+            );
+        }
+    }
     Ok(())
 }
 
@@ -497,6 +722,19 @@ mod tests {
         assert_eq!(BackendKind::parse("wgpu").unwrap(), BackendKind::Wgpu);
     }
 
+    // #### PR #22: a missing NVIDIA driver is an error, not a crash
+    #[test]
+    fn cuda_discovery_without_a_driver_reports_an_error() {
+        // Runs where no NVIDIA driver is installed, such as the CI runners.
+        if cfg!(target_os = "macos") || unsafe { sys::is_culib_present() } {
+            return;
+        }
+        let error = list_cuda_devices().unwrap_err();
+        assert!(error.contains("no NVIDIA driver"), "{error}");
+        // Auto discovery moves on to HIP and WGPU instead of panicking.
+        let _ = list_devices(BackendKind::Auto);
+    }
+
     #[cfg(feature = "portable-wgpu")]
     #[test]
     fn wgpu_discovery_excludes_cpu_and_other_adapters() {
@@ -511,8 +749,18 @@ mod tests {
 
     #[cfg(feature = "portable-wgpu")]
     #[test]
-    fn production_wgpu_surface_is_vulkan_only() {
-        assert_eq!(production_wgpu_backends(), wgpu::Backends::VULKAN);
+    fn production_wgpu_surface_matches_platform() {
+        if std::env::var_os("PICKAXE_WGPU_API").is_some() {
+            return;
+        }
+        assert_eq!(
+            production_wgpu_backends(),
+            Ok(if cfg!(target_os = "macos") {
+                wgpu::Backends::METAL
+            } else {
+                wgpu::Backends::VULKAN
+            })
+        );
     }
 
     #[test]
@@ -535,8 +783,11 @@ mod tests {
             vram_bytes: Some(1024),
             backend: BackendKind::Hip,
             detail: String::new(),
+            integrated: false,
+            ready: true,
+            pci: None,
         }];
-        let selected = find_device(devices, 2, BackendKind::Hip).unwrap();
+        let selected = backend_pick(devices, Some(2), BackendKind::Hip).unwrap();
         assert_eq!(selected.backend, BackendKind::Hip);
         assert_eq!(selected.index, 2);
     }
@@ -549,30 +800,362 @@ mod tests {
             vram_bytes: None,
             backend,
             detail: String::new(),
+            integrated: false,
+            ready: true,
+            pci: None,
         }
+    }
+
+    fn integrated_fixture(index: u32, vendor: &str, backend: BackendKind) -> GpuDevice {
+        GpuDevice {
+            integrated: true,
+            ..fixture_device(index, vendor, backend)
+        }
+    }
+
+    fn at_bus(device: GpuDevice, bus: u8) -> GpuDevice {
+        GpuDevice {
+            pci: Some(PciAddress {
+                domain: 0,
+                bus,
+                device: 0,
+                function: 0,
+            }),
+            ..device
+        }
+    }
+
+    /// The first GPU automatic selection mines on, or the GPU numbered `wanted`.
+    fn auto(
+        cuda: Vec<GpuDevice>,
+        hip: Vec<GpuDevice>,
+        wgpu: Vec<GpuDevice>,
+        wanted: Option<u32>,
+    ) -> Option<GpuDevice> {
+        let selection = wanted.map_or(DeviceSelection::Default, |index| {
+            DeviceSelection::Indices(vec![index])
+        });
+        select_gpus(
+            physical_gpus(cuda, hip, wgpu),
+            &selection,
+            BackendKind::Auto,
+        )
+        .ok()?
+        .into_iter()
+        .next()
+    }
+
+    /// The first GPU an explicit backend mines on, or its ordinal `wanted`.
+    fn backend_pick(
+        devices: Vec<GpuDevice>,
+        wanted: Option<u32>,
+        backend: BackendKind,
+    ) -> Result<GpuDevice, String> {
+        let selection = wanted.map_or(DeviceSelection::Default, |index| {
+            DeviceSelection::Indices(vec![index])
+        });
+        select_gpus(devices, &selection, backend).map(|gpus| gpus[0].clone())
     }
 
     #[test]
     fn auto_selection_prefers_cuda_over_wgpu_for_nvidia() {
-        let selected = select_auto_device(
+        let selected = auto(
             vec![fixture_device(0, "NVIDIA", BackendKind::Cuda)],
             Vec::new(),
             vec![fixture_device(0, "NVIDIA", BackendKind::Wgpu)],
-            0,
+            None,
         )
         .unwrap();
         assert_eq!(selected.backend, BackendKind::Cuda);
     }
 
     #[test]
-    fn auto_selection_prefers_hip_over_wgpu_for_amd() {
-        let selected = select_auto_device(
+    fn auto_selection_prefers_native_hip_t2_for_a_discrete_amd_gpu() {
+        let selected = auto(
             Vec::new(),
             vec![fixture_device(0, "AMD", BackendKind::Hip)],
             vec![fixture_device(0, "AMD", BackendKind::Wgpu)],
-            0,
+            None,
         )
         .unwrap();
         assert_eq!(selected.backend, BackendKind::Hip);
+    }
+
+    #[test]
+    fn auto_selection_uses_vulkan_when_hip_code_objects_are_missing() {
+        let selected = auto(
+            Vec::new(),
+            vec![GpuDevice {
+                ready: false,
+                ..fixture_device(0, "AMD", BackendKind::Hip)
+            }],
+            vec![fixture_device(0, "AMD", BackendKind::Wgpu)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.backend, BackendKind::Wgpu);
+    }
+
+    #[test]
+    fn auto_selection_falls_back_to_hip_without_a_wgpu_device() {
+        let selected = auto(
+            Vec::new(),
+            vec![fixture_device(0, "AMD", BackendKind::Hip)],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.backend, BackendKind::Hip);
+    }
+
+    #[test]
+    fn auto_selection_skips_an_integrated_gpu_listed_before_the_discrete_one() {
+        let selected = auto(
+            Vec::new(),
+            vec![integrated_fixture(0, "AMD", BackendKind::Hip)],
+            vec![
+                integrated_fixture(0, "AMD", BackendKind::Wgpu),
+                fixture_device(1, "AMD", BackendKind::Wgpu),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(!selected.integrated);
+        assert_eq!((selected.backend, selected.index), (BackendKind::Wgpu, 1));
+    }
+
+    #[test]
+    fn explicit_device_can_select_an_integrated_gpu() {
+        let selected = auto(
+            vec![fixture_device(0, "NVIDIA", BackendKind::Cuda)],
+            Vec::new(),
+            vec![integrated_fixture(1, "AMD", BackendKind::Wgpu)],
+            Some(1),
+        )
+        .unwrap();
+        assert!(selected.integrated);
+    }
+
+    #[test]
+    fn auto_selection_uses_an_integrated_gpu_when_no_discrete_gpu_exists() {
+        let selected = auto(
+            Vec::new(),
+            vec![integrated_fixture(0, "AMD", BackendKind::Hip)],
+            vec![integrated_fixture(0, "AMD", BackendKind::Wgpu)],
+            None,
+        )
+        .unwrap();
+        assert!(selected.integrated);
+        assert_eq!(selected.backend, BackendKind::Wgpu);
+    }
+
+    #[test]
+    fn explicit_backend_without_device_skips_integrated_gpus() {
+        let devices = vec![
+            integrated_fixture(0, "AMD", BackendKind::Wgpu),
+            fixture_device(1, "NVIDIA", BackendKind::Wgpu),
+        ];
+        let selected = backend_pick(devices, None, BackendKind::Wgpu).unwrap();
+        assert_eq!(selected.index, 1);
+    }
+
+    #[test]
+    fn explicit_backend_and_device_can_select_an_integrated_gpu() {
+        let devices = vec![
+            integrated_fixture(0, "AMD", BackendKind::Hip),
+            fixture_device(1, "AMD", BackendKind::Hip),
+        ];
+        let selected = backend_pick(devices, Some(0), BackendKind::Hip).unwrap();
+        assert!(selected.integrated);
+    }
+
+    #[test]
+    fn explicit_backend_without_device_falls_back_to_a_lone_integrated_gpu() {
+        let devices = vec![integrated_fixture(0, "AMD", BackendKind::Hip)];
+        let selected = backend_pick(devices, None, BackendKind::Hip).unwrap();
+        assert!(selected.integrated);
+    }
+
+    // #### PR #22: every GPU mines once, on its best engine
+    #[test]
+    fn pci_addresses_parse_in_every_engine_format() {
+        let expected = PciAddress {
+            domain: 0,
+            bus: 1,
+            device: 0,
+            function: 0,
+        };
+        for text in [
+            "0000:01:00.0",
+            "00000000:01:00.0",
+            "01:00.0",
+            " 0000:01:00.0 ",
+        ] {
+            assert_eq!(PciAddress::parse(text), Some(expected), "{text}");
+        }
+        assert_eq!(
+            PciAddress::parse("0001:C5:1F.7"),
+            Some(PciAddress {
+                domain: 1,
+                bus: 0xc5,
+                device: 0x1f,
+                function: 7,
+            })
+        );
+        for text in ["", "01:00", "x:01:00.0", "0000:01:00:00.0", "0000:100:00.0"] {
+            assert_eq!(PciAddress::parse(text), None, "{text}");
+        }
+        assert_eq!(expected.to_string(), "0000:01:00.0");
+    }
+
+    #[test]
+    fn device_selection_takes_all_one_number_or_a_list() {
+        assert_eq!(DeviceSelection::parse("all"), Ok(DeviceSelection::Default));
+        assert_eq!(DeviceSelection::parse("ALL"), Ok(DeviceSelection::Default));
+        assert_eq!(
+            DeviceSelection::parse("2"),
+            Ok(DeviceSelection::Indices(vec![2]))
+        );
+        assert_eq!(
+            DeviceSelection::parse(" 0, 2,5 "),
+            Ok(DeviceSelection::Indices(vec![0, 2, 5]))
+        );
+        for bad in ["", "x", "0,", "0,0", "-1"] {
+            assert!(DeviceSelection::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            DeviceSelection::Default.with_integrated(true),
+            DeviceSelection::WithIntegrated
+        );
+        assert_eq!(
+            DeviceSelection::Default.with_integrated(false),
+            DeviceSelection::Default
+        );
+        assert_eq!(
+            DeviceSelection::Indices(vec![1]).with_integrated(true),
+            DeviceSelection::Indices(vec![1])
+        );
+        assert_eq!(
+            DeviceSelection::Indices(vec![3]).single_index(),
+            Ok(Some(3))
+        );
+        assert_eq!(DeviceSelection::Default.single_index(), Ok(None));
+        assert!(DeviceSelection::Indices(vec![0, 1]).single_index().is_err());
+        assert_eq!(DeviceSelection::Indices(vec![0, 2]).to_string(), "0,2");
+    }
+
+    #[test]
+    fn one_card_listed_by_cuda_and_wgpu_mines_once_on_cuda() {
+        // An RTX 50 laptop with an AMD iGPU, as wgpu and CUDA list it.
+        let gpus = physical_gpus(
+            vec![at_bus(fixture_device(0, "NVIDIA", BackendKind::Cuda), 1)],
+            Vec::new(),
+            vec![
+                at_bus(integrated_fixture(0, "AMD", BackendKind::Wgpu), 0xc5),
+                at_bus(fixture_device(1, "NVIDIA", BackendKind::Wgpu), 1),
+            ],
+        );
+        let engines: Vec<_> = gpus
+            .iter()
+            .map(|gpu| (gpu.backend, gpu.index, gpu.integrated))
+            .collect();
+        assert_eq!(
+            engines,
+            [(BackendKind::Cuda, 0, false), (BackendKind::Wgpu, 0, true)]
+        );
+        let default =
+            select_gpus(gpus.clone(), &DeviceSelection::Default, BackendKind::Auto).unwrap();
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].backend, BackendKind::Cuda);
+        let both = select_gpus(gpus, &DeviceSelection::WithIntegrated, BackendKind::Auto).unwrap();
+        assert_eq!(both.len(), 2);
+    }
+
+    #[test]
+    fn nvidia_cards_without_sm120_mine_on_wgpu() {
+        let gpus = physical_gpus(
+            vec![at_bus(
+                GpuDevice {
+                    ready: false,
+                    ..fixture_device(0, "NVIDIA", BackendKind::Cuda)
+                },
+                3,
+            )],
+            Vec::new(),
+            vec![at_bus(fixture_device(0, "NVIDIA", BackendKind::Wgpu), 3)],
+        );
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].backend, BackendKind::Wgpu);
+    }
+
+    #[test]
+    fn identical_cards_at_different_addresses_both_mine() {
+        let gpus = physical_gpus(
+            vec![
+                at_bus(fixture_device(0, "NVIDIA", BackendKind::Cuda), 1),
+                at_bus(fixture_device(1, "NVIDIA", BackendKind::Cuda), 2),
+            ],
+            Vec::new(),
+            vec![
+                at_bus(fixture_device(0, "NVIDIA", BackendKind::Wgpu), 2),
+                at_bus(fixture_device(1, "NVIDIA", BackendKind::Wgpu), 1),
+            ],
+        );
+        let engines: Vec<_> = gpus.iter().map(|gpu| (gpu.backend, gpu.index)).collect();
+        assert_eq!(engines, [(BackendKind::Cuda, 0), (BackendKind::Cuda, 1)]);
+        let picked =
+            select_gpus(gpus, &DeviceSelection::Indices(vec![1]), BackendKind::Auto).unwrap();
+        assert_eq!((picked[0].backend, picked[0].index), (BackendKind::Cuda, 1));
+    }
+
+    #[test]
+    fn without_addresses_each_engine_entry_pairs_with_one_card() {
+        // Two identical cards; wgpu reports no PCI addresses (for example DirectX 12).
+        let gpus = physical_gpus(
+            vec![
+                fixture_device(0, "NVIDIA", BackendKind::Cuda),
+                fixture_device(1, "NVIDIA", BackendKind::Cuda),
+            ],
+            Vec::new(),
+            vec![
+                fixture_device(0, "NVIDIA", BackendKind::Wgpu),
+                fixture_device(1, "NVIDIA", BackendKind::Wgpu),
+            ],
+        );
+        assert_eq!(gpus.len(), 2);
+        assert!(gpus.iter().all(|gpu| gpu.backend == BackendKind::Cuda));
+        // A Mesa suffix still names the same card; a different model does not.
+        assert!(same_name(
+            "AMD Radeon RX 7900 XTX",
+            "AMD Radeon RX 7900 XTX (RADV NAVI31)"
+        ));
+        assert!(!same_name("AMD Radeon RX 7900", "AMD Radeon RX 7900 XTX"));
+    }
+
+    #[test]
+    fn explicit_backend_selects_every_discrete_gpu_by_default() {
+        let devices = vec![
+            fixture_device(0, "NVIDIA", BackendKind::Cuda),
+            fixture_device(1, "NVIDIA", BackendKind::Cuda),
+        ];
+        let all = select_gpus(
+            devices.clone(),
+            &DeviceSelection::Default,
+            BackendKind::Cuda,
+        )
+        .unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(select_gpus(
+            devices,
+            &DeviceSelection::Indices(vec![5]),
+            BackendKind::Cuda
+        )
+        .unwrap_err()
+        .contains("CUDA device 5 not found"));
+        assert!(
+            select_gpus(Vec::new(), &DeviceSelection::Default, BackendKind::Auto)
+                .unwrap_err()
+                .contains("no GPU device found")
+        );
     }
 }

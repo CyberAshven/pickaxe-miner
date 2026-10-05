@@ -1,6 +1,11 @@
-﻿# Third-party/reference PHOTON implementation and upstream source.
+# Third-party/reference PHOTON implementation and upstream source.
 reference/** linguist-vendored
 
 # Generated CUDA compiler output.
 cuda/build/** linguist-generated
 cuda/build/*.ptx -text
+
+# Portable shaders are generated from rust-engine, not maintained separately.
+reference/shared-t2/** linguist-generated text eol=lf
+# Preserve Naga's exact compiler output, including spaces after attributes.
+reference/shared-t2/*.wgsl whitespace=-blank-at-eol

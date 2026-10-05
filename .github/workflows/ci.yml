@@ -20,6 +20,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # #### PR #22
+  # Native and browser portability checks belong to the same commit-level CI.
+  # Packaging remains read-only; this call cannot create a tag or release.
+  portable:
+    name: Shared portable application
+    uses: ./.github/workflows/portable.yml
+    with:
+      source-ref: ${{ github.sha }}
+
   rust-ptx:
     name: Rust PTX ${{ matrix.arch }} (${{ matrix.backend }})
     runs-on: ubuntu-latest
@@ -52,7 +61,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -105,6 +114,12 @@ jobs:
             hip-dev=7.0.51831.70002-56~24.04 \
             hipcc=1.1.1.70002-56~24.04
 
+      - name: Install pinned Rust GPU compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src
+
       - name: Build and verify gfx1036 HSACO set
         shell: bash
         run: |
@@ -113,6 +128,7 @@ jobs:
           hipcc --version
           python3 tools/build_hip.py --arch gfx1036 --check-reproducible
           python3 -m unittest tools.test_verify_hip_artifacts -v
+          python3 tools/build_rust_amd.py --arch gfx1036
           (cd hip/build/gfx1036 && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
           cat hip/build/gfx1036/SHA256SUMS.txt
 
@@ -121,6 +137,66 @@ jobs:
         with:
           name: hip-gfx1036-${{ github.sha }}
           path: hip/build/gfx1036/
+          if-no-files-found: error
+          retention-days: 14
+
+  hip-discrete:
+    name: HIP ${{ matrix.arch }} code objects
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Discrete Radeon RDNA2, RDNA3 and RDNA4 targets for native HIP T2.
+        arch: [gfx1030, gfx1031, gfx1032, gfx1034, gfx1100, gfx1101, gfx1102, gfx1200, gfx1201]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned ROCm HIP compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gpg python3
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key |
+            gpg --batch --yes --dearmor |
+            sudo tee /etc/apt/keyrings/rocm.gpg >/dev/null
+          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.0.2 noble main' |
+            sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libxml2 \
+            rocm-llvm=20.0.0.25385.70002-56~24.04 \
+            rocm-device-libs=1.0.0.70002-56~24.04 \
+            hip-dev=7.0.51831.70002-56~24.04 \
+            hipcc=1.1.1.70002-56~24.04
+
+      - name: Install pinned Rust GPU compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-04-02 --profile minimal --component rust-src
+
+      - name: Build and verify ${{ matrix.arch }} HSACO set
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/opt/rocm/llvm/bin:${PATH}"
+          python3 tools/build_hip.py --arch "${{ matrix.arch }}" --check-reproducible
+          python3 tools/build_rust_amd.py --arch "${{ matrix.arch }}"
+          (cd "hip/build/${{ matrix.arch }}" && sha256sum *.hsaco | sort -k2 > SHA256SUMS.txt)
+          cat "hip/build/${{ matrix.arch }}/SHA256SUMS.txt"
+
+      - name: Upload verified ${{ matrix.arch }} code objects
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hip-${{ matrix.arch }}-${{ github.sha }}
+          path: hip/build/${{ matrix.arch }}/
           if-no-files-found: error
           retention-days: 14
 

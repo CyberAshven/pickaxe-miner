@@ -4,8 +4,12 @@ version = "0.0.3"
 edition = "2021"
 license = "AGPL-3.0-only"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
-default = ["rust-t2"]
+# Native builds carry the portable T2 engine so AMD and Intel GPUs mine through Vulkan.
+default = ["rust-t2", "portable-wgpu"]
 incremental-k = []
 tail-grind = []
 # Default Rust implementation of the complete CUDA T2 mining path.
@@ -13,29 +17,49 @@ tail-grind = []
 rust-t2 = ["tail-grind"]
 # GPU V-coordinate diagnostic only; live mining keeps the reward at 700 sats.
 tail-value-grind = ["tail-grind"]
-portable-wgpu = ["dep:pollster", "dep:wgpu"]
+portable-wgpu = ["dep:pollster", "dep:wgpu", "shared-rust-t2"]
+# Internal compiler selection: portable builds import the native Rust hot path.
+shared-rust-t2 = []
+# #### PR #22: development-only browser export that checks the portable
+# engine against the CPU (tools/build-browser.py --check). Not in releases.
+browser-check = ["portable-wgpu"]
 
 [dependencies]
-sha2 = { version = "0.10", features = ["compress"] }
-ripemd = "0.1"
+sha2 = "0.11"
+ripemd = "0.2"
 hex = "0.4"
-secp256k1 = { version = "0.33.1", features = ["global-context", "rand"] }
-tungstenite = { version = "0.24", features = ["native-tls"] }
-native-tls = "0.2"
+secp256k1 = { version = "0.33.1", features = ["global-context"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
-cudarc = { version = "0.19.9", features = ["cuda-12000"] }
-clap = { version = "4.6.7", features = ["derive"] }
-hmac = "0.12"
-rand = "0.9"
-ctrlc = "3.4"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_28", "layout-cache", "underline-color"] }
-crossterm = "0.28"
-libloading = "0.9"
-pollster = { version = "0.4", optional = true }
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"], optional = true }
+hmac = "0.13"
+rand = "0.10"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "vulkan", "metal", "webgpu", "wgsl"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tungstenite = { version = "0.30", features = ["native-tls"] }
+native-tls = "0.2"
+cudarc = { version = "0.19.10", features = ["cuda-12000"] }
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.4"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
+crossterm = "0.29"
+libloading = "0.9"
+pollster = { version = "1.0", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }
+
+[build-dependencies]
+sha2 = "0.11"

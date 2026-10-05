@@ -55,30 +55,7 @@ const SHA256_INITIAL_STATE: [u32; 8] = [
     0x5be0_cd19,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhotonCudaWinner {
-    pub nonce: u32,
-    pub digest: [u8; 32],
-    /// Explicit signing scalar for incremental search; never a reward-key nonce.
-    pub schnorr_k: Option<u64>,
-    /// T2 amount offset from the job's base reward, when amount grinding is active.
-    pub tail_j: Option<u16>,
-    /// BCH value of the miner payout output for the V search coordinate.
-    pub tail_value_sats: Option<u16>,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhotonCudaBatchResult {
-    pub candidates: u32,
-    pub total_winners: u32,
-    pub winners: Vec<PhotonCudaWinner>,
-}
-
-impl PhotonCudaBatchResult {
-    /// Checks whether a reported GPU result exceeds the readback limit.
-    pub fn truncated(&self) -> bool {
-        self.total_winners as usize > self.winners.len()
-    }
-}
+pub use crate::gpu_types::{PhotonCudaBatchResult, PhotonCudaWinner};
 
 pub struct CudaPhotonEngine {
     _ctx: Arc<CudaContext>,
@@ -230,13 +207,7 @@ pub(crate) fn cuda_unavailable_for_tests(error: &str) -> bool {
 /// SHA-256 state after the job-fixed transaction bytes 0..384.
 fn transaction_midstate(template: &[u8]) -> [u32; 8] {
     let mut state = SHA256_INITIAL_STATE;
-    let blocks = template[..MIDSTATE_BYTES]
-        .as_chunks::<64>()
-        .0
-        .iter()
-        .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
-        .collect::<Vec<_>>();
-    sha2::compress256(&mut state, &blocks);
+    sha2::block_api::compress256(&mut state, template[..MIDSTATE_BYTES].as_chunks::<64>().0);
     state
 }
 
@@ -765,13 +736,7 @@ mod tests {
             tail.push(0);
         }
         tail.extend_from_slice(&((TX_BYTES as u64) * 8).to_be_bytes());
-        let blocks = tail
-            .as_chunks::<64>()
-            .0
-            .iter()
-            .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
-            .collect::<Vec<_>>();
-        sha2::compress256(&mut state, &blocks);
+        sha2::block_api::compress256(&mut state, tail.as_chunks::<64>().0);
         let resumed = state
             .iter()
             .flat_map(|word| word.to_be_bytes())

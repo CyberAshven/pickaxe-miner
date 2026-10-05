@@ -1,0 +1,19 @@
+[package]
+name = "pickaxe-shared-hash-proof"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[dependencies]
+spirv-std = { git = "https://github.com/Rust-GPU/rust-gpu", rev = "e2e4d529a5ead1364228530d301ebbca4ef90262" }
+
+[dev-dependencies]
+sha2 = { version = "0.10", features = ["compress"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+

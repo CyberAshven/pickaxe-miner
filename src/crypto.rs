@@ -8,7 +8,7 @@
 //! The signer is shared by deterministic vector tests, live job setup, and rare
 //! returned-winner reconstruction. Mining identities remain runtime-only.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use secp256k1::{PublicKey, Scalar, SecretKey};
@@ -25,6 +25,17 @@ const SECP_N_BE: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
     0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
 ];
+
+/// Draws a uniformly random mining identity from the thread CSPRNG.
+/// Same procedure as secp256k1's `SecretKey::new`, which is tied to the
+/// crate's own rand version: retry the ~2^-128 chance of an invalid scalar.
+pub fn random_secret_key() -> SecretKey {
+    loop {
+        if let Ok(secret) = SecretKey::from_secret_bytes(rand::random()) {
+            return secret;
+        }
+    }
+}
 
 #[cfg(test)]
 /// Derives a compressed public key from test secret key bytes.
@@ -249,6 +260,14 @@ mod tests {
             hex::encode(pk),
             "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
         );
+    }
+
+    #[test]
+    fn random_secret_keys_are_fresh_each_draw() {
+        let first = random_secret_key().to_secret_bytes();
+        let second = random_secret_key().to_secret_bytes();
+        assert_ne!(first, second);
+        assert!(compressed_pubkey(&first).is_ok() && compressed_pubkey(&second).is_ok());
     }
 
     #[test]

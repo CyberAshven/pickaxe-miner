@@ -184,7 +184,7 @@ class ArtifactTests(unittest.TestCase):
 
     def test_rejects_invalid_header_fields(self) -> None:
         cases = ({"elf_class": 1}, {"endian": 2}, {"ident_version": 0},
-                 {"osabi": 0}, {"abi": 0}, {"abi": 255},
+                 {"osabi": 0}, {"abi": 0}, {"abi": 4}, {"abi": 255},
                  {"file_type": 1}, {"file_type": 2}, {"machine": 62},
                  {"version": 0}, {"ehsize": 0})
         for case in cases:
@@ -264,15 +264,15 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.verify(metadata=text)
 
-    def test_complete_four_file_set_and_all_seven_kernels(self) -> None:
+    def test_complete_five_file_set_and_all_twenty_two_kernels(self) -> None:
         for code in CONTRACT["code_objects"]:
             with self.subTest(file=code["file"]):
                 self.code = copy.deepcopy(code)
                 self.path = self.directory / self.code["file"]
                 self.path.write_bytes(elf_fixture())
                 self.verify()
-        self.assertEqual(len(CONTRACT["code_objects"]), 4)
-        self.assertEqual(sum(len(obj["kernels"]) for obj in CONTRACT["code_objects"]), 7)
+        self.assertEqual(len(CONTRACT["code_objects"]), 5)
+        self.assertEqual(sum(len(obj["kernels"]) for obj in CONTRACT["code_objects"]), 22)
 
     def test_missing_any_required_file_rejected(self) -> None:
         for absent in CONTRACT["code_objects"]:

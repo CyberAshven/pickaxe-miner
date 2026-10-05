@@ -78,7 +78,7 @@ impl Policy {
         self.scheme.validate()?;
         let [a, b] = self.addresses;
         Ok([
-            config::reprefix_p2pkh_payout(miner, network)?,
+            config::validate_payout_address(network, miner)?,
             config::reprefix_p2pkh_payout(a, network)?,
             config::reprefix_p2pkh_payout(b, network)?,
         ])
@@ -148,6 +148,17 @@ impl Schedule {
             ((u128::from(self.position) + u128::from(completed)) % u128::from(cycle)) as u64;
         Ok(())
     }
+}
+
+pub(crate) fn require_direct_reward_policy(scheme: crate::donation::Scheme) -> Result<(), String> {
+    scheme.validate()?;
+    if scheme.reward() != [0, 0] {
+        return Err(
+            "this PHOTON deployment supports work fees only; a reward-split adapter is required"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

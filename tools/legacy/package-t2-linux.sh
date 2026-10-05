@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
 package="pickaxe-miner-v${version}-t2-gpu-linux-x86_64"
 binary="${CARGO_TARGET_DIR:-target}/release/pickaxe_miner"

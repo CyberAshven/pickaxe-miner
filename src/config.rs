@@ -1,5 +1,6 @@
 //! Distribution and runtime config. Each token selects its own fee policy.
 
+use crate::backend_kind::DeviceSelection;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -202,11 +203,7 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     pub fn set_network(&mut self, network: MiningNetwork) {
         if self.network != network {
-            if !self.payout_address.is_empty() {
-                if let Ok(converted) = reprefix_p2pkh_payout(&self.payout_address, network) {
-                    self.payout_address = converted;
-                }
-            }
+            // Keep the entered address intact; validation requires an address for the new chain.
             // Configured sources are chain-specific. CLI overrides are applied after the network.
             self.fulcrum_url = None;
             self.node_url = None;
@@ -225,18 +222,10 @@ impl RuntimeConfig {
     }
 
     pub fn validate_payout_network(&self) -> Result<(), String> {
-        if self.payout_address.is_empty()
-            || self
-                .payout_address
-                .starts_with(&format!("{}:", self.network.cashaddr_prefix()))
-        {
+        if self.payout_address.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "payout address must use {}: on {}",
-                self.network.cashaddr_prefix(),
-                self.network.as_str()
-            ))
+            validate_payout_address(self.network, &self.payout_address).map(|_| ())
         }
     }
 
@@ -256,40 +245,7 @@ impl RuntimeConfig {
 
     /// Validates and stores the miner payout CashAddr.
     pub fn set_payout(&mut self, addr: String) -> Result<(), String> {
-        let trimmed = addr.trim().to_string();
-        if trimmed.is_empty() {
-            return Err("payout address required".into());
-        }
-        if trimmed.chars().any(|ch| ch.is_ascii_lowercase())
-            && trimmed.chars().any(|ch| ch.is_ascii_uppercase())
-        {
-            return Err(
-                "invalid payout CashAddr: CashAddr must not mix upper and lower case".into(),
-            );
-        }
-        let canonical = if trimmed.contains(':') {
-            trimmed.to_ascii_lowercase()
-        } else {
-            format!(
-                "{}:{}",
-                self.network.cashaddr_prefix(),
-                trimmed.to_ascii_lowercase()
-            )
-        };
-        crate::tx::cashaddr_to_p2pkh_locking(&canonical)
-            .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
-        let selected = if canonical.starts_with(&format!("{}:", self.network.cashaddr_prefix())) {
-            canonical
-        } else if self.network == MiningNetwork::Chipnet && canonical.starts_with("bitcoincash:") {
-            reprefix_p2pkh_payout(&canonical, self.network)
-                .map_err(|e| format!("invalid payout CashAddr: {e}"))?
-        } else {
-            return Err(format!(
-                "payout address must use {}: on {}",
-                self.network.cashaddr_prefix(),
-                self.network.as_str()
-            ));
-        };
+        let selected = validate_payout_address(self.network, &addr)?;
         if self.payout_address != selected {
             self.bump_generation();
         }
@@ -435,7 +391,41 @@ impl RuntimeConfig {
     }
 }
 
-/// Re-encodes a validated P2PKH payout for another chain without changing its key hash.
+/// Validates a payout for the selected chain and returns its canonical CashAddr.
+/// An omitted prefix uses the selected chain's checksum, never another network's.
+pub fn validate_payout_address(network: MiningNetwork, address: &str) -> Result<String, String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err("payout address required".into());
+    }
+    if trimmed.chars().any(|ch| ch.is_ascii_lowercase())
+        && trimmed.chars().any(|ch| ch.is_ascii_uppercase())
+    {
+        return Err("invalid payout CashAddr: CashAddr must not mix upper and lower case".into());
+    }
+    let canonical = if trimmed.contains(':') {
+        trimmed.to_ascii_lowercase()
+    } else {
+        format!(
+            "{}:{}",
+            network.cashaddr_prefix(),
+            trimmed.to_ascii_lowercase()
+        )
+    };
+    crate::tx::cashaddr_to_p2pkh_locking(&canonical)
+        .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
+    if !canonical.starts_with(&format!("{}:", network.cashaddr_prefix())) {
+        return Err(format!(
+            "payout address must use {}: on {}",
+            network.cashaddr_prefix(),
+            network.as_str()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Re-encodes an internal P2PKH recipient for another chain without changing its key hash.
+/// User-entered payouts must use `validate_payout_address` instead.
 pub(crate) fn reprefix_p2pkh_payout(
     address: &str,
     network: MiningNetwork,
@@ -489,13 +479,51 @@ fn normalize_endpoint_list(
     Ok(Some(unique.join(", ")))
 }
 
+/// The GPUs a saved configuration mines on: one GPU number (the form older
+/// versions saved) or a list. Absent means every discrete GPU.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SavedDevices {
+    One(u32),
+    List(Vec<u32>),
+}
+
+impl SavedDevices {
+    /// The saved form of a GPU choice; `None` for every GPU.
+    pub fn from_selection(selection: &DeviceSelection) -> Option<Self> {
+        match selection {
+            DeviceSelection::Indices(indices) => match indices.as_slice() {
+                [index] => Some(Self::One(*index)),
+                _ => Some(Self::List(indices.clone())),
+            },
+            DeviceSelection::Default | DeviceSelection::WithIntegrated => None,
+        }
+    }
+
+    /// The saved GPU numbers.
+    pub fn indices(&self) -> &[u32] {
+        match self {
+            Self::One(index) => std::slice::from_ref(index),
+            Self::List(indices) => indices,
+        }
+    }
+
+    /// The GPU choice this saved value names.
+    pub fn selection(&self) -> DeviceSelection {
+        DeviceSelection::Indices(self.indices().to_vec())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SavedConfig {
     pub network: Option<String>,
     pub token: Option<String>,
     pub backend: Option<String>,
-    pub device: Option<u32>,
+    pub device: Option<SavedDevices>,
+    /// Mine on integrated GPUs too when `device` names no GPU.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_integrated: Option<bool>,
     pub intensity: Option<u8>,
     pub address: Option<String>,
     pub fulcrum: Option<String>,
@@ -533,7 +561,19 @@ impl SavedConfig {
     /// Rejects inconsistent or unsupported saved configuration values.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(value) = &self.backend {
-            crate::backend::BackendKind::parse(value)?;
+            crate::backend_kind::BackendKind::parse(value)?;
+        }
+        if let Some(SavedDevices::List(indices)) = &self.device {
+            if indices.is_empty() {
+                return Err("device list is empty; omit device to mine on every GPU".into());
+            }
+            if let Some(twice) = indices
+                .iter()
+                .enumerate()
+                .find_map(|(position, index)| indices[..position].contains(index).then_some(index))
+            {
+                return Err(format!("device lists GPU {twice} twice"));
+            }
         }
         let mut runtime = RuntimeConfig::default();
         self.apply_to_runtime(&mut runtime)?;
@@ -576,8 +616,20 @@ impl SavedConfig {
         write_private_config(path, &bytes)
     }
 
+    /// The saved GPU choice, integrated GPUs included when saved so.
+    pub fn device_selection(&self) -> DeviceSelection {
+        self.device
+            .as_ref()
+            .map_or_else(DeviceSelection::default, SavedDevices::selection)
+            .with_integrated(self.include_integrated == Some(true))
+    }
+
     /// Captures the effective runtime settings for persistence.
-    pub fn from_effective(backend: &str, device: Option<u32>, runtime: &RuntimeConfig) -> Self {
+    pub fn from_effective(
+        backend: &str,
+        devices: &DeviceSelection,
+        runtime: &RuntimeConfig,
+    ) -> Self {
         let address = if runtime.payout_address.is_empty() {
             None
         } else {
@@ -587,7 +639,8 @@ impl SavedConfig {
             network: Some(runtime.network.as_str().to_string()),
             token: Some(runtime.token.as_str().to_string()),
             backend: Some(backend.to_string()),
-            device,
+            device: SavedDevices::from_selection(devices),
+            include_integrated: (*devices == DeviceSelection::WithIntegrated).then_some(true),
             intensity: Some(runtime.intensity),
             address,
             fulcrum: runtime.fulcrum_url.clone(),
@@ -980,6 +1033,7 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("write config {}: {error}", path.display()))?;
     if !replacing {
         if let Err(error) = restrict_private_config(path) {
+            #[cfg(not(target_arch = "wasm32"))]
             drop(file);
             let _ = fs::remove_file(path);
             return Err(error);
@@ -993,6 +1047,8 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn restrict_private_config(path: &Path) -> Result<(), String> {
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1093,7 +1149,13 @@ mod tests {
             chipnet.addresses,
             [CHIPNET_DONATION_ADDRESS, CHIPNET_DONATION_ADDRESS]
         );
-        let payouts = chipnet.payouts(MiningNetwork::Chipnet, PAYOUT).unwrap();
+        let miner = crate::tx::token_p2pkh_hash_to_cashaddr_for_network(
+            &[0x42; 20],
+            MiningNetwork::Chipnet,
+        )
+        .unwrap();
+        let payouts = chipnet.payouts(MiningNetwork::Chipnet, &miner).unwrap();
+        assert_eq!(payouts[0], miner);
         assert_eq!(payouts[1], CHIPNET_DONATION_ADDRESS);
         assert_eq!(payouts[2], CHIPNET_DONATION_ADDRESS);
     }
@@ -1200,14 +1262,14 @@ mod tests {
             .upsert(
                 None,
                 "Chip",
-                SavedConfig::from_effective("cuda", Some(0), &chipnet),
+                SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &chipnet),
             )
             .unwrap();
         profiles
             .upsert(
                 None,
                 "Main",
-                SavedConfig::from_effective("cuda", Some(0), &mainnet),
+                SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &mainnet),
             )
             .unwrap();
 
@@ -1226,14 +1288,19 @@ mod tests {
         ));
         assert!(!sources.adopt_profile_sources(&mut profiles));
 
-        let base = SavedConfig::from_effective("cuda", Some(0), &chipnet);
+        let base =
+            SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &chipnet);
         assert!(
             !sources.adopt_saved_config(&base),
             "already saved entries add nothing"
         );
         let mut other = mainnet.clone();
         other.set_fulcrum_url("wss://base.test:50004").unwrap();
-        assert!(sources.adopt_saved_config(&SavedConfig::from_effective("cuda", Some(0), &other)));
+        assert!(sources.adopt_saved_config(&SavedConfig::from_effective(
+            "cuda",
+            &DeviceSelection::Indices(vec![0]),
+            &other
+        )));
         assert_eq!(
             sources.list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum),
             ["wss://base.test:50004"]
@@ -1247,7 +1314,11 @@ mod tests {
             .upsert(
                 None,
                 "Only",
-                SavedConfig::from_effective("cuda", Some(0), &RuntimeConfig::default()),
+                SavedConfig::from_effective(
+                    "cuda",
+                    &DeviceSelection::Indices(vec![0]),
+                    &RuntimeConfig::default(),
+                ),
             )
             .unwrap();
         assert!(profiles.remove(1).is_err());
@@ -1292,7 +1363,7 @@ mod tests {
             .upsert(
                 None,
                 "",
-                SavedConfig::from_effective("cuda", Some(0), &runtime),
+                SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &runtime),
             )
             .unwrap();
         assert!(random_name.starts_with("Miner "));
@@ -1404,42 +1475,91 @@ mod tests {
 
     #[test]
     fn payout_address_must_match_selected_network() {
-        let mut cfg = RuntimeConfig::default();
-        cfg.set_network(MiningNetwork::Chipnet);
-        cfg.set_payout(SHREC_DONATION_ADDRESS.into()).unwrap();
-        assert!(cfg.payout_address.starts_with("bchtest:z"));
-        assert_eq!(
-            crate::tx::cashaddr_to_p2pkh_locking(&cfg.payout_address).unwrap(),
-            crate::tx::cashaddr_to_p2pkh_locking(SHREC_DONATION_ADDRESS).unwrap()
-        );
-        let chipnet_address = cfg.payout_address.clone();
-        cfg.set_network(MiningNetwork::Mainnet);
-        assert!(cfg.payout_address.starts_with("bitcoincash:z"));
-        assert!(cfg.set_payout(chipnet_address).is_err());
-        cfg.set_payout(PAYOUT.into()).unwrap();
-        cfg.set_network(MiningNetwork::Chipnet);
-        assert!(cfg.validate_payout_network().is_ok());
-        assert!(cfg.payout_address.starts_with("bchtest:"));
-        assert!(cfg
-            .set_payout("bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv4".into())
-            .is_err());
-        assert!(cfg
-            .set_payout("bchreg:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3".into())
-            .is_err());
+        for (network, other) in [
+            (MiningNetwork::Mainnet, MiningNetwork::Chipnet),
+            (MiningNetwork::Chipnet, MiningNetwork::Mainnet),
+        ] {
+            for encode in [
+                crate::tx::p2pkh_hash_to_cashaddr_for_network,
+                crate::tx::token_p2pkh_hash_to_cashaddr_for_network,
+            ] {
+                let address = encode(&[0x42; 20], network).unwrap();
+                let foreign = encode(&[0x42; 20], other).unwrap();
+                assert!(MiningToken::Photon
+                    .fee_policy(network)
+                    .payouts(network, &foreign)
+                    .is_err());
+                let mut cfg = RuntimeConfig {
+                    network,
+                    ..Default::default()
+                };
+                cfg.set_payout(address.clone()).unwrap();
+                let generation = cfg.generation_id;
+                for invalid in [foreign.clone(), foreign.split_once(':').unwrap().1.into()] {
+                    assert!(cfg.set_payout(invalid).is_err());
+                    assert_eq!(cfg.payout_address, address);
+                    assert_eq!(cfg.generation_id, generation);
+                }
+                for valid in [
+                    address.to_ascii_uppercase(),
+                    address.split_once(':').unwrap().1.into(),
+                    format!("  {address}  "),
+                ] {
+                    cfg.set_payout(valid).unwrap();
+                    assert_eq!(cfg.payout_address, address);
+                    assert!(cfg.validate_payout_network().is_ok());
+                }
+                cfg.set_network(other);
+                assert_eq!(
+                    cfg.payout_address, address,
+                    "network switching must not rewrite the wallet"
+                );
+                assert!(cfg.ensure_mining_supported().is_err());
+                cfg.set_payout(foreign).unwrap();
+                assert!(cfg.ensure_mining_supported().is_ok());
+            }
+        }
     }
 
     #[test]
-    fn chipnet_saved_config_reprefixes_mainnet_token_payout() {
-        let saved = SavedConfig {
-            network: Some("chipnet".into()),
-            address: Some(SHREC_DONATION_ADDRESS.into()),
-            ..SavedConfig::default()
-        };
-        let mut cfg = RuntimeConfig::default();
-        saved.apply_to_runtime(&mut cfg).unwrap();
-        assert_eq!(cfg.network, MiningNetwork::Chipnet);
-        assert!(cfg.payout_address.starts_with("bchtest:z"));
-        assert!(cfg.validate_payout_network().is_ok());
+    fn saved_config_and_profiles_reject_foreign_payouts() {
+        for (network, other) in [
+            (MiningNetwork::Mainnet, MiningNetwork::Chipnet),
+            (MiningNetwork::Chipnet, MiningNetwork::Mainnet),
+        ] {
+            let saved = SavedConfig {
+                network: Some(network.as_str().into()),
+                address: Some(
+                    crate::tx::token_p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], other)
+                        .unwrap(),
+                ),
+                ..SavedConfig::default()
+            };
+            assert!(saved
+                .apply_to_runtime(&mut RuntimeConfig::default())
+                .is_err());
+            assert!(saved.validate().is_err());
+            assert!(MiningProfiles::default()
+                .upsert(None, "Wrong network", saved)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn payout_validation_rechecks_checksum_case_and_type() {
+        for address in [
+            "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6q",
+            "bitcoincash:Qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a",
+            "bitcoincash:ppm2qsznhks23z7629mms6s4cwef74vcwvn0h829pq",
+            "bchreg:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a",
+        ] {
+            let mut cfg = RuntimeConfig {
+                payout_address: address.into(),
+                ..Default::default()
+            };
+            assert!(cfg.ensure_mining_supported().is_err(), "{address}");
+            assert!(cfg.set_payout(address.into()).is_err(), "{address}");
+        }
     }
 
     #[test]
@@ -1453,7 +1573,8 @@ mod tests {
         runtime
             .set_node_url("http://user:secret-pass@127.0.0.1:8332")
             .unwrap();
-        let saved = SavedConfig::from_effective("cuda", Some(0), &runtime);
+        let saved =
+            SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &runtime);
         saved.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("secret-pass"), "{text}");
@@ -1461,7 +1582,8 @@ mod tests {
         runtime
             .set_node_url("http://user:second-secret@127.0.0.1:8332")
             .unwrap();
-        let replaced = SavedConfig::from_effective("cuda", Some(0), &runtime);
+        let replaced =
+            SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &runtime);
         replaced.save(&path).unwrap();
         let replaced_text = fs::read_to_string(&path).unwrap();
         assert!(replaced_text.contains("second-secret"), "{replaced_text}");
@@ -1580,7 +1702,7 @@ mod tests {
         assert!(serde_json::from_str::<SavedConfig>(r#"{"donation_bps":0}"#).is_err());
         let mut cfg = RuntimeConfig::default();
         cfg.set_payout(PAYOUT.into()).unwrap();
-        let saved = SavedConfig::from_effective("cuda", Some(0), &cfg);
+        let saved = SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &cfg);
         let value = serde_json::to_value(&saved).unwrap();
         assert!(value.get("donation_bps").is_none());
         assert!(value.get("donation").is_none());
@@ -1603,5 +1725,39 @@ mod tests {
         let (original, shrec) = RuntimeConfig::split_donation(total_donation);
         assert_eq!(original + shrec, total_donation);
         assert_eq!(original, shrec);
+    }
+
+    #[test]
+    fn saved_gpu_choice_reads_old_numbers_and_writes_lists() {
+        // Configs and profiles saved before several GPUs could mine.
+        let old: SavedConfig = serde_json::from_str(r#"{"backend":"cuda","device":0}"#).unwrap();
+        assert_eq!(old.device, Some(SavedDevices::One(0)));
+        assert_eq!(old.device_selection(), DeviceSelection::Indices(vec![0]));
+
+        let save = |devices: DeviceSelection| {
+            let saved = SavedConfig::from_effective("auto", &devices, &RuntimeConfig::default());
+            (serde_json::to_value(&saved).unwrap(), saved)
+        };
+        let (one, _) = save(DeviceSelection::Indices(vec![3]));
+        assert_eq!(one["device"], 3);
+        let (pair, saved) = save(DeviceSelection::Indices(vec![0, 2]));
+        assert_eq!(pair["device"], serde_json::json!([0, 2]));
+        assert!(pair.get("include_integrated").is_none());
+        assert_eq!(
+            saved.device_selection(),
+            DeviceSelection::Indices(vec![0, 2])
+        );
+        let (every, saved) = save(DeviceSelection::WithIntegrated);
+        assert!(every["device"].is_null());
+        assert_eq!(every["include_integrated"], true);
+        assert_eq!(saved.device_selection(), DeviceSelection::WithIntegrated);
+        let (default, saved) = save(DeviceSelection::Default);
+        assert!(default["device"].is_null());
+        assert_eq!(saved.device_selection(), DeviceSelection::Default);
+
+        let twice: SavedConfig = serde_json::from_str(r#"{"device":[1,1]}"#).unwrap();
+        assert!(twice.validate().unwrap_err().contains("twice"));
+        let empty: SavedConfig = serde_json::from_str(r#"{"device":[]}"#).unwrap();
+        assert!(empty.validate().is_err());
     }
 }

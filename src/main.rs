@@ -4,48 +4,10 @@
 //! Each supported token declares its fee policy.
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
-mod backend;
-mod benchmark;
-mod cli;
-mod config;
-mod crypto;
-#[cfg(test)]
-#[allow(dead_code, clippy::needless_range_loop)]
-mod cuda_miner;
-#[allow(dead_code)]
-mod cuda_photon;
-#[cfg(test)]
-mod cuda_stage_a;
-#[cfg(test)]
-mod cuda_stage_a_ref;
-#[cfg(test)]
-mod cuda_stage_b;
-#[allow(dead_code)]
-mod cuda_stage_c;
-mod donation;
-#[allow(dead_code)]
-mod electrum;
-mod hip_photon;
-#[allow(dead_code)]
-mod m29_table;
-mod mining_lock;
-#[allow(dead_code)]
-mod node;
-#[allow(dead_code)]
-mod protocol;
-mod reward;
-mod runtime;
-#[allow(dead_code)]
-mod search;
-mod self_test;
-#[cfg(test)]
-mod stage_b;
-mod telemetry;
-#[allow(dead_code)]
-mod tui;
-mod tx;
-#[cfg(feature = "portable-wgpu")]
-mod wgpu_photon;
+use pickaxe_miner::{
+    backend, benchmark, cli, config, electrum, mining_lock, node, runtime, search, self_test,
+    telemetry, tui, tx,
+};
 
 use config::RuntimeConfig;
 use electrum::{ElectrumSession, LiveJob};
@@ -940,6 +902,25 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
     let efficiency = snapshot
         .gpu_telemetry
         .candidates_per_watt(snapshot.search.current_rate);
+    let gpus: Vec<serde_json::Value> = snapshot
+        .gpus
+        .iter()
+        .zip(&snapshot.search.gpus)
+        .map(|(gpu, search)| {
+            serde_json::json!({
+                "backend": gpu.backend.as_str(),
+                "device": gpu.device,
+                "name": gpu.name,
+                "status": gpu_status_name(search.status),
+                "candidates": search.candidates,
+                "rate": search.rate,
+                "active_rate": search.active_rate,
+                "winners": search.winners,
+                "last_error": search.last_error,
+                "gpu_telemetry": &gpu.telemetry,
+            })
+        })
+        .collect();
     serde_json::json!({
         "event": "status",
         "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
@@ -978,7 +959,36 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "last_error": snapshot.last_error,
         "gpu_telemetry": &snapshot.gpu_telemetry,
         "gpu_efficiency_candidates_per_watt": efficiency,
+        "gpus": gpus,
     })
+}
+
+/// Lower-case name of one GPU's mining status.
+fn gpu_status_name(status: search::GpuStatus) -> &'static str {
+    match status {
+        search::GpuStatus::Mining => "mining",
+        search::GpuStatus::Recovering => "recovering",
+        search::GpuStatus::Stopped => "stopped",
+    }
+}
+
+/// Each GPU's engine, recent rate and status, for a status line of a rig.
+fn runtime_gpus_text(snapshot: &runtime::RuntimeSnapshot) -> String {
+    snapshot
+        .gpus
+        .iter()
+        .zip(&snapshot.search.gpus)
+        .map(|(gpu, search)| {
+            format!(
+                "{}:{} {} {}",
+                gpu.backend.as_str(),
+                gpu.device,
+                crate::telemetry::format_hash_rate(search.active_rate),
+                gpu_status_name(search.status)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Formats a runtime metric when telemetry is present.
@@ -1028,6 +1038,9 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             runtime_metric(telemetry.vram_used_mib, "MiB"),
             runtime_metric(efficiency, " cand/s/W"),
         );
+        if snapshot.gpus.len() > 1 {
+            println!("gpus={}", runtime_gpus_text(snapshot));
+        }
     }
 }
 
@@ -1058,8 +1071,7 @@ fn spawn_intensity_commands() -> std::sync::mpsc::Receiver<u8> {
 /// Runs the mining supervisor without the terminal UI.
 fn run_headless_mining(
     cfg: RuntimeConfig,
-    backend: backend::BackendKind,
-    device_ordinal: u32,
+    gpus: &[backend::GpuDevice],
     json: bool,
     use_tui: bool,
 ) -> Result<Option<(u8, String)>, String> {
@@ -1072,8 +1084,7 @@ fn run_headless_mining(
     } else {
         Vec::new()
     };
-    let supervisor =
-        runtime::RuntimeSupervisor::start_on_backend_device(cfg, backend, device_ordinal)?;
+    let supervisor = runtime::RuntimeSupervisor::start_on_gpus(cfg, gpus)?;
     if use_tui {
         let final_snapshot = tui::run(supervisor, tui_devices)?;
         print_runtime_snapshot(&final_snapshot, false);
@@ -1141,78 +1152,173 @@ fn persist_session_profile(
 }
 
 /// Dispatches the requested CLI command and mining mode.
+// #### PR #22: starting the miner by double-click
+// What: with no command the miner opens the mining setup (as `mine` does)
+// instead of the hidden command prompt, now `pickaxe repl`. A console opened
+// just for the miner stays open after an error until Enter, and on Linux a
+// launch without a terminal reopens the miner inside the desktop's terminal.
+// Why: users double-click the executable; the prompt looked like nothing
+// happened, Windows closed the window on errors, and Linux file managers run
+// terminal programs invisibly.
+// Check: double-click on Windows, Linux (GNOME/KDE) and macOS; `pickaxe` from
+// a shell must not pause on errors.
+#[cfg(not(windows))]
+const TERMINAL_RELAUNCH_ENV: &str = "PICKAXE_TERMINAL_LAUNCHED";
+
+/// Exits after an error, keeping a console opened just for the miner open.
+fn exit_after_error(code: i32) -> ! {
+    if console_closes_on_exit() {
+        eprintln!();
+        eprintln!("Press Enter to close.");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+    std::process::exit(code)
+}
+
+/// A Windows console whose only process is the miner was opened by Explorer.
+#[cfg(windows)]
+fn console_closes_on_exit() -> bool {
+    let mut processes = [0u32; 2];
+    let attached = unsafe {
+        windows_sys::Win32::System::Console::GetConsoleProcessList(
+            processes.as_mut_ptr(),
+            processes.len() as u32,
+        )
+    };
+    attached == 1
+}
+
+/// The Linux launcher marks the terminal it opened for the miner.
+#[cfg(not(windows))]
+fn console_closes_on_exit() -> bool {
+    std::env::var_os(TERMINAL_RELAUNCH_ENV).is_some()
+}
+
+/// Started from a Linux file manager without a terminal: reopen in one.
+#[cfg(target_os = "linux")]
+fn relaunch_in_terminal() {
+    use std::io::IsTerminal;
+    let desktop =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::env::var_os(TERMINAL_RELAUNCH_ENV).is_some()
+        || !desktop
+    {
+        return;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // Each terminal with the arguments that precede the command it runs.
+    const TERMINALS: [(&str, &[&str]); 9] = [
+        ("x-terminal-emulator", &["-e"]),
+        ("gnome-terminal", &["--"]),
+        ("konsole", &["-e"]),
+        ("xfce4-terminal", &["-x"]),
+        ("mate-terminal", &["-x"]),
+        ("kitty", &[]),
+        ("alacritty", &["-e"]),
+        ("foot", &[]),
+        ("xterm", &["-e"]),
+    ];
+    for (terminal, prefix) in TERMINALS {
+        let launched = std::process::Command::new(terminal)
+            .args(prefix)
+            .arg(&executable)
+            .args(&args)
+            .env(TERMINAL_RELAUNCH_ENV, "1")
+            .spawn();
+        if launched.is_ok() {
+            std::process::exit(0);
+        }
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    relaunch_in_terminal();
     let args = cli::parse();
     let config_path = match config::config_path(args.config.as_deref()) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     };
     let saved_config = match config::SavedConfig::load_optional(&config_path) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     };
     let mut effective_backend = "auto".to_string();
-    let mut effective_device = None;
+    let mut effective_device = backend::DeviceSelection::Default;
+    let mut include_integrated = args.include_integrated;
     if let Some(config) = &saved_config {
         if let Some(value) = &config.backend {
             effective_backend = value.clone();
         }
-        effective_device = config.device;
+        if let Some(saved) = &config.device {
+            effective_device = saved.selection();
+        }
+        include_integrated |= config.include_integrated == Some(true);
     }
     if let Some(value) = &args.backend {
         effective_backend = value.clone();
     }
-    if let Some(value) = args.device {
-        effective_device = Some(value);
+    if let Some(value) = &args.device {
+        effective_device = value.clone();
     }
+    let effective_device = effective_device.with_integrated(include_integrated);
     let backend_kind = match backend::BackendKind::parse(&effective_backend) {
         Ok(kind) => kind,
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     };
     let mut base_cfg = RuntimeConfig::default();
     if let Some(config) = &saved_config {
         if let Err(error) = config.apply_to_runtime(&mut base_cfg) {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     }
     let cfg = match runtime_config_from_cli_with_base(&args, base_cfg) {
         Ok(cfg) => cfg,
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(2);
+            exit_after_error(2);
         }
     };
 
-    match args.command.unwrap_or(cli::Commands::Repl) {
+    match args.command.unwrap_or(cli::Commands::Mine) {
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {
                 eprintln!("error: {error}");
-                std::process::exit(1);
+                exit_after_error(1);
             }
         }
         cli::Commands::SelfTest => {
-            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
+            let selected = match effective_device
+                .single_index()
+                .and_then(|index| backend::resolve_mining_device(backend_kind, index))
+            {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             };
             match self_test::run_self_test(selected.backend, selected.index) {
                 Ok(report) => self_test::print_report(&report, args.json),
                 Err(error) => {
                     eprintln!("error: self-test failed: {error}");
-                    std::process::exit(1);
+                    exit_after_error(1);
                 }
             }
         }
@@ -1220,11 +1326,14 @@ fn main() {
             seconds,
             ui_compare,
         } => {
-            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
+            let selected = match effective_device
+                .single_index()
+                .and_then(|index| backend::resolve_mining_device(backend_kind, index))
+            {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             };
             match benchmark::run_gpu_benchmark(&selected, seconds, args.intensity, ui_compare) {
@@ -1232,12 +1341,12 @@ fn main() {
                     let passed = report.passed();
                     benchmark::print_report(&report, args.json);
                     if !passed {
-                        std::process::exit(1);
+                        exit_after_error(1);
                     }
                 }
                 Err(error) => {
                     eprintln!("error: benchmark failed: {error}");
-                    std::process::exit(1);
+                    exit_after_error(1);
                 }
             }
         }
@@ -1250,7 +1359,9 @@ fn main() {
                             "backend": effective_backend,
                             "network": cfg.network.as_str(),
                             "token": cfg.token.as_str(),
-                            "device": effective_device,
+                            "device": config::SavedDevices::from_selection(&effective_device),
+                            "include_integrated":
+                                effective_device == backend::DeviceSelection::WithIntegrated,
                             "intensity": cfg.intensity,
                             "address": cfg.payout_address,
                             "fulcrum": cfg.fulcrum_url,
@@ -1264,7 +1375,7 @@ fn main() {
                     println!("backend: {}", effective_backend);
                     println!("network: {}", cfg.network.as_str());
                     println!("token: {}", cfg.token.as_str());
-                    println!("device: {:?}", effective_device);
+                    println!("device: {effective_device}");
                     println!("intensity: {}%", cfg.intensity);
                     println!("address: {}", cfg.payout_address);
                     println!("source: {}", cfg.source.as_str());
@@ -1279,11 +1390,14 @@ fn main() {
                 }
             }
             cli::ConfigCommand::Save => {
-                let saved =
-                    config::SavedConfig::from_effective(&effective_backend, effective_device, &cfg);
+                let saved = config::SavedConfig::from_effective(
+                    &effective_backend,
+                    &effective_device,
+                    &cfg,
+                );
                 if let Err(error) = saved.save(&config_path) {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
                 if args.json {
                     println!(
@@ -1305,7 +1419,7 @@ fn main() {
                 Ok(sources) => sources,
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             };
             if saved_config
@@ -1314,7 +1428,7 @@ fn main() {
             {
                 if let Err(error) = sources.save(&sources_path) {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             }
             let startup = mine_startup(&args);
@@ -1338,7 +1452,7 @@ fn main() {
                 });
                 if let Err(error) = applied {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             }
             if matches!(startup, MineStartup::Direct)
@@ -1346,35 +1460,43 @@ fn main() {
                 && cfg.payout_address.trim().is_empty()
             {
                 eprintln!("error: --address is required with --no-tui or --json");
-                std::process::exit(2);
+                exit_after_error(2);
             }
             if matches!(startup, MineStartup::Direct) {
                 if let Err(error) = cfg.ensure_mining_supported() {
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    exit_after_error(2);
                 }
             }
-            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
-                Ok(device) => device,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    std::process::exit(2);
-                }
-            };
-            let (cfg, selected_backend, selected_device, profile_name) = match startup {
+            let selected_gpus =
+                match backend::resolve_mining_devices(backend_kind, &effective_device) {
+                    Ok(gpus) => gpus,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        exit_after_error(2);
+                    }
+                };
+            let (cfg, gpus, profile_name) = match startup {
                 MineStartup::InteractiveSetup => {
-                    let devices = match backend::list_devices(backend_kind) {
+                    // Setup lists each physical GPU once, numbered as
+                    // `--device` numbers them; a named backend lists its own.
+                    let devices = if backend_kind == backend::BackendKind::Auto {
+                        Ok(backend::mining_gpus())
+                    } else {
+                        backend::list_devices(backend_kind)
+                    };
+                    let devices = match devices {
                         Ok(devices) => devices,
                         Err(error) => {
                             eprintln!("error: {error}");
-                            std::process::exit(2);
+                            exit_after_error(2);
                         }
                     };
                     let mut profiles = match config::MiningProfiles::load_optional(&profiles_path) {
                         Ok(profiles) => profiles,
                         Err(error) => {
                             eprintln!("error: {error}");
-                            std::process::exit(2);
+                            exit_after_error(2);
                         }
                     };
                     // Servers and nodes once saved inside profiles move to the
@@ -1385,7 +1507,7 @@ fn main() {
                             .and_then(|()| profiles.save(&profiles_path))
                         {
                             eprintln!("error: {error}");
-                            std::process::exit(2);
+                            exit_after_error(2);
                         }
                     }
                     let overrides = tui::SetupOverrides {
@@ -1401,13 +1523,21 @@ fn main() {
                         fulcrum: args.fulcrum.clone(),
                         node_rpc: args.node_rpc.clone(),
                         source: args.source.clone(),
-                        device: (args.backend.is_some() || args.device.is_some())
-                            .then_some((selected.backend, selected.index)),
+                        gpus: (args.backend.is_some()
+                            || args.device.is_some()
+                            || args.include_integrated)
+                            .then(|| {
+                                selected_gpus
+                                    .iter()
+                                    .map(|gpu| (gpu.backend, gpu.index))
+                                    .collect()
+                            }),
                     };
                     let setup = match tui::run_setup(
                         cfg,
                         devices,
-                        &selected,
+                        backend_kind,
+                        &selected_gpus,
                         &profiles_path,
                         profiles,
                         &sources_path,
@@ -1418,34 +1548,29 @@ fn main() {
                         Ok(None) => return,
                         Err(error) => {
                             eprintln!("error: {error}");
-                            std::process::exit(1);
+                            exit_after_error(1);
                         }
                     };
-                    (
-                        setup.config,
-                        setup.backend,
-                        setup.device,
-                        Some(setup.profile_name),
-                    )
+                    (setup.config, setup.gpus, Some(setup.profile_name))
                 }
-                MineStartup::Direct => (cfg, selected.backend, selected.index, None),
+                MineStartup::Direct => (cfg, selected_gpus, None),
             };
             let use_tui = !(args.no_tui || args.json);
-            match run_headless_mining(cfg, selected_backend, selected_device, args.json, use_tui) {
+            match run_headless_mining(cfg, &gpus, args.json, use_tui) {
                 Ok(Some((intensity, address))) => {
                     if let Some(name) = profile_name {
                         if let Err(error) =
                             persist_session_profile(&profiles_path, &name, intensity, &address)
                         {
                             eprintln!("error: save mining profile: {error}");
-                            std::process::exit(1);
+                            exit_after_error(1);
                         }
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!("error: {error}");
-                    std::process::exit(1);
+                    exit_after_error(1);
                 }
             }
         }
@@ -1511,7 +1636,11 @@ mod tests {
             .upsert(
                 None,
                 "Rig A",
-                config::SavedConfig::from_effective("cuda", Some(0), &runtime),
+                config::SavedConfig::from_effective(
+                    "cuda",
+                    &backend::DeviceSelection::Indices(vec![0]),
+                    &runtime,
+                ),
             )
             .unwrap();
         profiles.save(&path).unwrap();
@@ -1612,9 +1741,13 @@ mod tests {
             windows.trim_end_matches("-windows-x86_64")
         );
 
-        assert!(!workflow.to_ascii_lowercase().contains("aarch64"));
-        assert!(!workflow.contains("apple-darwin"));
-        assert!(!workflow.contains("-arm64"));
+        // #### PR #22: ARM64 is supported by the shared macOS package. Keep
+        // excluding unsupported Windows/Linux ARM packages from this release.
+        assert!(workflow.contains("\"${TAG}-macos-arm64.tar.gz\""));
+        assert!(workflow.contains("\"${TAG}-browser.tar.gz\""));
+        assert!(workflow.contains("name: Verify portable package provenance"));
+        assert!(!workflow.contains("-linux-arm64"));
+        assert!(!workflow.contains("-windows-arm64"));
         assert!(workflow.contains("GH_REPO: ${{ github.repository }}"));
         assert!(workflow.contains("--repo \"${GH_REPO}\""));
     }
@@ -1637,6 +1770,20 @@ mod tests {
             state: runtime::SupervisorState::Mining,
             gpu_backend: "cuda".into(),
             gpu_device: 0,
+            gpus: vec![
+                runtime::RuntimeGpu {
+                    backend: backend::BackendKind::Cuda,
+                    device: 0,
+                    name: "NVIDIA GeForce RTX 5070 Ti Laptop GPU".into(),
+                    telemetry: telemetry::GpuTelemetry::default(),
+                },
+                runtime::RuntimeGpu {
+                    backend: backend::BackendKind::Wgpu,
+                    device: 1,
+                    name: "AMD Radeon(TM) 610M".into(),
+                    telemetry: telemetry::GpuTelemetry::default(),
+                },
+            ],
             generation_id: 2,
             network: config::MiningNetwork::Mainnet,
             fee_scheme: config::MiningToken::Photon
@@ -1678,6 +1825,28 @@ mod tests {
                 last_error: Some(
                     "GPU winner rejected by host verification: HASH256 mismatch".into(),
                 ),
+                gpus: vec![
+                    search::GpuSearchStats {
+                        backend: backend::BackendKind::Cuda,
+                        device: 0,
+                        candidates: 60_000,
+                        rate: 60_000.0,
+                        active_rate: 2_400_000_000.0,
+                        winners: 0,
+                        status: search::GpuStatus::Mining,
+                        last_error: None,
+                    },
+                    search::GpuSearchStats {
+                        backend: backend::BackendKind::Wgpu,
+                        device: 1,
+                        candidates: 5_536,
+                        rate: 5_536.0,
+                        active_rate: 30_000_000.0,
+                        winners: 0,
+                        status: search::GpuStatus::Recovering,
+                        last_error: Some("device lost".into()),
+                    },
+                ],
             },
             gpu_telemetry: telemetry::GpuTelemetry {
                 samples: 3,
@@ -1712,6 +1881,15 @@ mod tests {
         assert_eq!(status["gpu_telemetry"]["samples"], 3);
         assert_eq!(status["gpu_telemetry"]["gpu_utilization_percent"], 77.0);
         assert_eq!(status["gpu_efficiency_candidates_per_watt"], 1_000.0);
+        assert_eq!(status["gpus"][1]["backend"], "wgpu");
+        assert_eq!(status["gpus"][1]["name"], "AMD Radeon(TM) 610M");
+        assert_eq!(status["gpus"][1]["status"], "recovering");
+        assert_eq!(status["gpus"][1]["last_error"], "device lost");
+        assert_eq!(status["gpus"][0]["active_rate"], 2_400_000_000.0);
+        assert_eq!(
+            runtime_gpus_text(&snapshot),
+            "cuda:0 2.40 GH/s mining; wgpu:1 30.00 MH/s recovering"
+        );
     }
 
     #[test]
@@ -1731,9 +1909,38 @@ mod tests {
         .unwrap();
         let cfg = runtime_config_from_cli(&args).unwrap();
         assert_eq!(mine_startup(&args), MineStartup::Direct);
-        assert_eq!(args.device, Some(0));
+        assert_eq!(
+            args.device,
+            Some(backend::DeviceSelection::Indices(vec![0]))
+        );
         assert_eq!(cfg.intensity, 60);
         assert_eq!(cfg.payout_address, crate::config::DONATION_ADDRESS);
+    }
+
+    #[test]
+    fn cli_rejects_foreign_network_payouts() {
+        for (network, other) in [
+            (
+                config::MiningNetwork::Mainnet,
+                config::MiningNetwork::Chipnet,
+            ),
+            (
+                config::MiningNetwork::Chipnet,
+                config::MiningNetwork::Mainnet,
+            ),
+        ] {
+            let address = tx::p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], other).unwrap();
+            let args = cli::Cli::try_parse_from([
+                "pickaxe",
+                "mine",
+                "--network",
+                network.as_str(),
+                "--address",
+                &address,
+            ])
+            .unwrap();
+            assert!(runtime_config_from_cli(&args).is_err());
+        }
     }
 
     #[test]

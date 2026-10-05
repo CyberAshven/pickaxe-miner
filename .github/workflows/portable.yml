@@ -1,0 +1,165 @@
+name: Portable builds
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Exact source revision shared with the calling build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  shared-rust-gpu:
+    name: Shared Rust GPU compilation
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - name: Install pinned SPIR-V compiler
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly-2026-04-11 --profile minimal --component rust-src,rustc-dev,llvm-tools-preview
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang cmake ninja-build
+      - name: Check shared Rust hashes and compile portable shaders
+        env:
+          PICKAXE_PROOF_FIXTURES: artifacts/shared-gpu-proof/fixtures
+        run: |
+          cargo +stable test --locked --manifest-path tools/shared-gpu-proof/Cargo.toml --release -p pickaxe-shared-hash-proof --tests -- --nocapture
+          cargo +nightly-2026-04-11 run --locked --manifest-path tools/shared-gpu-proof/Cargo.toml --release -p pickaxe-shared-hash-builder
+          # Rebuild the production filters from native Rust and reject drift.
+          python3 tools/shared-gpu-proof/sync_filter.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pickaxe-shared-gpu-${{ inputs.source-ref }}
+          path: |
+            artifacts/shared-gpu-proof/shared-t2-hash.*
+            artifacts/shared-gpu-proof/filter/*.metal
+            artifacts/shared-gpu-proof/filter/*.spv
+            artifacts/shared-gpu-proof/stages/*.metal
+            artifacts/shared-gpu-proof/stages/*.spv
+          if-no-files-found: error
+
+  software-vulkan:
+    name: Portable GPU correctness (lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - name: Install Rust and software Vulkan
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+      - name: Run shared signature, transaction and digest oracles
+        env:
+          PICKAXE_TEST_SOFTWARE_WGPU: '1'
+        run: |
+          export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)"
+          test -n "$VK_DRIVER_FILES"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/vulkan-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
+          # #### PR #22: the same oracle with the original hand-written WGSL stages.
+          PICKAXE_WGPU_STAGES=wgsl cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
+
+  apple-silicon:
+    name: macOS ARM64
+    needs: shared-rust-gpu
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pickaxe-shared-gpu-${{ inputs.source-ref }}
+          path: artifacts/shared-gpu-proof
+      - name: Compile generated shared Rust shader with Apple Metal
+        run: |
+          xcrun -sdk macosx metal -c artifacts/shared-gpu-proof/shared-t2-hash.metal -o artifacts/shared-gpu-proof/shared-t2-hash.air
+          for shader in artifacts/shared-gpu-proof/filter/*.metal artifacts/shared-gpu-proof/stages/*.metal; do
+            xcrun -sdk macosx metal -c "$shader" -o "${shader%.metal}.air"
+          done
+      - name: Check shared application and Metal backend
+        run: |
+          rustup default stable
+          test "$(uname -m)" = arm64
+          cargo clippy --locked --all-targets --no-default-features --features portable-wgpu -- -D warnings
+          cargo test --locked --no-default-features --features portable-wgpu -- --skip if_cuda --skip if_wgpu
+          cargo build --locked --release --no-default-features --features portable-wgpu
+          target/release/pickaxe_miner --version
+          target/release/pickaxe_miner --help
+      - name: Package command-line archive
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          archive="pickaxe-miner-v${version}-macos-arm64"
+          mkdir -p "dist/$archive"
+          cp target/release/pickaxe_miner "dist/$archive/pickaxe"
+          cp LICENSE docs/portable.md "dist/$archive/"
+          git rev-parse HEAD > "dist/$archive/SOURCE_COMMIT.txt"
+          tar -czf "dist/$archive.tar.gz" -C dist "$archive"
+          (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pickaxe-macos-arm64-${{ inputs.source-ref }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  browser:
+    name: Shared Rust WebGPU WASM
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Install build tools
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
+          rustup default stable
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang
+          cargo install --locked wasm-bindgen-cli --version 0.2.128
+      - name: Check browser engine and transport
+        run: |
+          cargo clippy --locked --lib --no-default-features --features portable-wgpu --target wasm32-unknown-unknown -- -D warnings
+          npm --prefix web ci --ignore-scripts --no-audit --no-fund
+          python3 tools/build-browser.py
+          npm --prefix web run check
+          npm --prefix web test
+          node web/smoke.mjs
+      - name: Package static browser application
+        run: |
+          git rev-parse HEAD > dist/web/SOURCE_COMMIT.txt
+          cp docs/portable.md dist/web/README.md
+          tar -czf dist/pickaxe-browser.tar.gz -C dist web
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pickaxe-browser-${{ inputs.source-ref }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
