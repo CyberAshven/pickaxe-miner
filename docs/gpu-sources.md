@@ -22,9 +22,9 @@ selectable until its replacement is proven on hardware.
 | NVIDIA | CUDA | Shared Rust engine: `cuda/build/photon_rust.ptx` | CUDA C++ kernels: build with `--no-default-features --features tail-grind` |
 | AMD Radeon RX 6000, 7000, 9000 | HIP | CUDA C++ kernels compiled for HIP: `hip/build/<arch>/*.hsaco` | Shared Rust engine: set `PICKAXE_HIP_KERNELS=rust` to load `hip/build/<arch>/photon_rust.hsaco` |
 | Other AMD GPUs, Intel GPUs, integrated GPUs | wgpu on Vulkan | Shared Rust stages (`reference/shared-stages/`) and T2 filter (`reference/shared-t2/`) | Original hand-written WGSL stages: set `PICKAXE_WGPU_STAGES=wgsl` |
-| Windows GPUs whose Vulkan driver fails | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan | Same as Vulkan |
-| Apple Silicon | wgpu on Metal | Same as Vulkan | Same as Vulkan |
-| Browser miner | wgpu on WebGPU | Same as Vulkan | Development builds only (`verify_portable_engine`) |
+| Windows GPUs whose Vulkan driver fails | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
+| Apple Silicon | wgpu on Metal | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
+| Browser miner | wgpu on WebGPU | Same as Vulkan; browsers other than Chromium use the DirectX 12/Metal copy | Development builds only (`verify_portable_engine`) |
 
 Automatic selection takes the first discrete GPU from CUDA, then HIP (when
 code objects for its architecture are installed), then WGPU. An integrated GPU
@@ -41,7 +41,7 @@ under Windows, where their launches never complete.
 | `hip/` | HIP wrappers and kernel contracts | | `kernel_contract.json` (C++ set), `rust_kernel_contract.json` (Rust set) |
 | `reference/photon-miner.wgsl` | The original PHOTON web miner, hand-written in WGSL; its stages are the alternative (`PICKAXE_WGPU_STAGES=wgsl`) | Included by `src/wgpu_photon.rs` | |
 | `reference/shared-t2/` | WGSL generated from the shared Rust T2 filter; never edited by hand | `tools/shared-gpu-proof/sync_filter.py --write` | |
-| `reference/shared-stages/` | WGSL generated from the shared Rust stages: signing (A, B, C1), T2 preparation and the non-T2 hash and winner stages (C2, C3); never edited by hand | `tools/shared-gpu-proof/sync_filter.py --write` | |
+| `reference/shared-stages/` | WGSL generated from the shared Rust stages: signing (A, B, C1), T2 preparation and the non-T2 hash and winner stages (C2, C3); never edited by hand. `pickaxe_shared_stages.wgsl` runs on Vulkan and Chromium; `pickaxe_shared_stages_dx12_metal.wgsl`, the same code with loop values kept for naga's HLSL and MSL writers, runs on DirectX 12, Metal and other browsers | `tools/shared-gpu-proof/sync_filter.py --write` | |
 | `src/wgpu_t2.wgsl`, `src/wgpu_target.wgsl` | Glue for the original stages: T2 preparation and the target check | Included by `src/wgpu_photon.rs` | |
 | `reference/legacy-engine-by-cyberashven/` | Historic engine snapshot | Not built | |
 

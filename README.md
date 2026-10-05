@@ -16,11 +16,19 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 
 ## Supported platforms
 
-- Operating systems: Windows x86_64 and Linux x86_64
-- NVIDIA: CUDA PTX `sm_120`
-- AMD: discrete Radeon RX 6000, 7000 and 9000 GPUs (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) mine with native HIP T2 (C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine); other AMD and Intel GPUs mine through the portable T2 engine on Vulkan. The engine is selected automatically. A discrete GPU always comes first; an integrated GPU is used automatically only when no discrete GPU is present, or when chosen with `--device`.
-- Apple Silicon (Metal) and browser (WebGPU/WASM) builds: [portable build instructions](docs/portable.md).
-- Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
+Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebGPU and WebAssembly).
+
+| GPU | Engine | Tested |
+| --- | --- | --- |
+| NVIDIA GeForce RTX 50 series (`sm_120`) | CUDA | RTX 5070 Ti Laptop: about 1.48 GH/s |
+| AMD Radeon RX 6000, 7000 and 9000 (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) | Native HIP T2 | Code objects verified; no discrete card measured yet |
+| AMD integrated (Ryzen) and other AMD GPUs | Portable engine on Vulkan | Ryzen 9 9955HX3D integrated Radeon: about 20 MH/s |
+| Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails | Not yet |
+| Other NVIDIA GPUs | Portable engine with `--backend wgpu` (the CUDA files target `sm_120` only) | Not yet |
+| Apple Silicon (M1 and later) | Portable engine on Metal | Built by CI; not yet run on a Mac |
+| Browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly | Chrome, on the integrated Radeon and the RTX 5070 Ti |
+
+The engine is selected automatically: a discrete GPU always comes first, and an integrated GPU is used automatically only when no discrete GPU is present, or when chosen with `--device`. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
 
 ## Quick start: mainnet TUI
 
@@ -37,6 +45,19 @@ and choose **Start mining**. Saved profiles keep your settings for next time.
 To skip setup and start directly in the mining TUI, append
 `--address "YOUR_MAINNET_PAYOUT_ADDRESS"`, replacing the placeholder with your
 valid payout CashAddr. Servers are selected automatically.
+
+### Portable engine: TUI and browser
+
+The portable engine mines on any GPU above that has no native engine, in the TUI or in a browser:
+
+| Where | How |
+| --- | --- |
+| TUI, Windows | `.\pickaxe.exe mine --network mainnet --backend wgpu` |
+| TUI, Linux | `./pickaxe mine --network mainnet --backend wgpu` |
+| TUI, Windows on DirectX 12 | Put Microsoft's `dxcompiler.dll` and `dxil.dll` next to `pickaxe.exe` ([details](docs/portable.md#directx-12-on-windows-optional)), run `$env:PICKAXE_WGPU_API = 'dx12'`, then the Windows command |
+| Browser | Extract the `-web.tar.gz` download, run `python -m http.server 8080 --bind 127.0.0.1 --directory web`, open `http://127.0.0.1:8080` and press **Start mining** |
+
+Automatic selection already picks the portable engine for AMD integrated and Intel GPUs; `--backend wgpu` forces it. The browser miner needs WebGPU on HTTPS or localhost and a tab that stays open; see [portable builds](docs/portable.md).
 
 ## Install
 
@@ -185,13 +206,11 @@ Benchmark:
 ```bash
 cargo run --release -- benchmark
 ```
-## Note
-- `wgpu` is not a verified production backend. Production mining is CUDA or HIP.
-  
 ## Limitations
 
 - There is no CPU mining fallback.
 - CUDA performance was measured on the local NVIDIA GPU; HIP artifacts are build-verified, without a physical AMD performance claim.
+- The portable engine (`wgpu` on Vulkan, DirectX 12 and WebGPU) was verified on an integrated Radeon and an RTX 5070 Ti. Intel GPUs, Linux GPUs and Apple Silicon have not run it yet.
 
 ## Features
 
@@ -208,7 +227,7 @@ cargo run --release -- benchmark
 - Stale-job and generation protection
 - Device discovery and benchmark tools
 
-The `reference/` directory contains PHOTON reference material used for implementation and correctness testing.
+The `reference/` directory contains PHOTON reference material used for implementation and correctness testing. Its `shared-t2/` and `shared-stages/` folders are different: they hold the portable engine's WGSL, generated from `rust-engine/` by `tools/shared-gpu-proof/sync_filter.py` and never edited by hand.
 
 ## Development
 

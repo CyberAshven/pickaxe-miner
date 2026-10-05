@@ -1,16 +1,26 @@
-# Shared Rust GPU feasibility probe
+# Shared Rust GPU shaders
 
-#### PR #22
+This folder turns the shared Rust engine (`rust-engine/src`) into the WGSL that
+the portable wgpu engine ships. It began as a feasibility probe, hence its
+name; the sections after this one are its dated history.
 
-The historical proof below has progressed to an integrated portable T2 filter:
-see [the filter report](filter/README.md) for measured performance, provenance
-checks and current limits. The production filter imports the native Rust
-hashing and layout files; signature/field/point migration remains unfinished.
-The original probe itself remains a separate offline test.
+| Path | Purpose |
+|---|---|
+| `sync_filter.py` | Generates and checks every portable shader. `--write` regenerates `reference/shared-t2/` (17 T2 filters) and `reference/shared-stages/` (the other stages and their DirectX 12/Metal copy) with their `SHA256SUMS`; without `--write` it fails on any drift. CI runs it on every pull request. |
+| `builder/` | Compiles the shader crates with rust-gpu (pinned nightly) and translates SPIR-V to WGSL and Metal source |
+| `filter/` | Shader crate for the T2 filter, one entry point per layout shift, with its report and measurements |
+| `stages/` | Shader crate for signing (A, B, C1), T2 preparation, C2 and C3 |
+| `kernel/` | The first hashing probe and its CPU oracle tests |
+| `compare_ptx.py` | Compares exported PTX kernels, ignoring comments and source-line annotations |
 
-This isolated, offline probe evaluates compiling the production SHA-256 hot
-path for CUDA and SPIR-V, then translating SPIR-V to WGSL and Metal source.
-It is not wired into the miner or release workflows. No keys, payout addresses,
+A normal `cargo build` does not need rust-gpu: `build.rs` checks the committed
+WGSL against the recorded hashes of its Rust sources.
+
+## The first probe
+
+The first probe evaluated compiling the production SHA-256 hot path for CUDA
+and SPIR-V, then translating SPIR-V to WGSL and Metal source. The probe itself
+is not wired into the miner or release workflows. No keys, payout addresses,
 RPC connections or mining submissions are used by the probe.
 
 The shader imports `rust-engine/src/sha256.rs` directly. It runs the T2

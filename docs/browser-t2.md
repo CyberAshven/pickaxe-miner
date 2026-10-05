@@ -54,8 +54,8 @@ Three 30-second offline complete-pipeline trials on that build measured
 910.305, 894.552 and 880.051 million candidates/second. These trials were
 not interleaved with the older build, so they do not establish a speedup.
 The actual full recipient work cycle and five independent covenant VM samples
-also passed on this build. Shared GPU source migration remains unfinished;
-see `tools/shared-gpu-proof/README.md` for the separate compiler proof.
+also passed on this build. Since then every portable stage has moved to the
+shared Rust engine; see the [GPU code map](gpu-sources.md).
 
 Temporary local telemetry verified continued work while the page was hidden.
 The telemetry hook is not included in distributed files. Browser discard and

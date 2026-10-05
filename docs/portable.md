@@ -6,7 +6,8 @@ protocol rules, signatures, intensity pacing, measured active rates, independent
 winner checks, dynamic fee calculations
 and the token's donation policy. The browser miner and the native portable
 build run the same WGSL shaders through the wgpu library: on Metal on macOS, on
-Vulkan on Windows and Linux, and on the browser's WebGPU. Every mining stage
+Vulkan on Windows and Linux (optionally DirectX 12 on Windows, below), and on
+the browser's WebGPU. Every mining stage
 comes from the shared Rust engine; on native builds `PICKAXE_WGPU_STAGES=wgsl`
 selects the original hand-written WGSL stages instead. See
 [GPU code map](gpu-sources.md).
