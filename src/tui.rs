@@ -1,8 +1,10 @@
 use crate::{
     backend::{BackendKind, GpuDevice},
     config::{
-        ConnectionKind, MiningNetwork, MiningProfiles, RuntimeConfig, SavedConfig, SharedSources,
+        ConnectionKind, MiningNetwork, MiningProfiles, MiningToken, RuntimeConfig, SavedConfig,
+        SharedSources,
     },
+    protocol::ProofRule,
     runtime::{RuntimeEvent, RuntimeSnapshot, RuntimeSupervisor, SupervisorState},
 };
 use crossterm::{
@@ -1274,10 +1276,25 @@ fn expected_winner_seconds(target_le_hex: &str, rate: f64, network: MiningNetwor
     win_probability(target_le_hex, network).map(|probability| 1.0 / (probability * rate))
 }
 
-/// Chance that one candidate wins against a little-endian hex target. The
-/// mainnet covenant ignores digest bit 255 while chipnet requires a positive
-/// digest. Thus their denominators are 2^255 and 2^256 respectively.
+/// Chance that one candidate wins against a little-endian hex target under
+/// the network's PHOTON deployment.
 fn win_probability(target_le_hex: &str, network: MiningNetwork) -> Option<f64> {
+    win_probability_for_rule(
+        target_le_hex,
+        MiningToken::Photon.photon_deployment(network).proof_rule,
+    )
+}
+
+// #### PR #22: win odds follow the deployment's proof rule
+// What: the v0 covenant compares ABS(hash), so digest bit 255 never matters
+// and a candidate wins with probability target / 2^255. v3.2 requires a
+// positive hash: target / 2^256.
+// Why: mainnet moved to v3.2 on 2026-10-03, but the odds still treated
+// mainnet as v0, so the dashboard and expected_winner_s promised twice the
+// real win rate.
+// Check: display only; the search and the winner checks already apply the
+// rule. Look here if the dashboard's odds disagree with the observed wins.
+fn win_probability_for_rule(target_le_hex: &str, rule: ProofRule) -> Option<f64> {
     let bytes = hex::decode(target_le_hex.trim()).ok()?;
     if bytes.len() != 32 {
         return None;
@@ -1286,9 +1303,9 @@ fn win_probability(target_le_hex: &str, network: MiningNetwork) -> Option<f64> {
         .iter()
         .rev()
         .fold(0.0_f64, |value, byte| value * 256.0 + f64::from(*byte))
-        / match network {
-            MiningNetwork::Mainnet => 2f64.powi(255),
-            MiningNetwork::Chipnet => 2f64.powi(256),
+        / match rule {
+            ProofRule::Absolute => 2f64.powi(255),
+            ProofRule::Positive => 2f64.powi(256),
         };
     (probability > 0.0).then_some(probability)
 }
@@ -3870,13 +3887,13 @@ mod tests {
     #[test]
     /// Checks the expected time between winners from the live target.
     fn expected_winner_seconds_follows_target_and_rate() {
-        // Target 2^224 (LE byte 28 = 1): with digest bit 255 ignored, one
-        // winner per 2^31 candidates.
+        // Target 2^224 (LE byte 28 = 1): v3.2 needs a positive digest, so one
+        // winner per 2^32 candidates.
         let mut target = [0u8; 32];
         target[28] = 1;
         let target = hex::encode(target);
         let seconds =
-            expected_winner_seconds(&target, 2f64.powi(31) / 100.0, MiningNetwork::Mainnet)
+            expected_winner_seconds(&target, 2f64.powi(32) / 100.0, MiningNetwork::Mainnet)
                 .unwrap();
         assert!((seconds - 100.0).abs() < 1e-6, "{seconds}");
         assert!(expected_winner_seconds(&target, 0.0, MiningNetwork::Mainnet).is_none());
@@ -3899,9 +3916,17 @@ mod tests {
             (10_300.0..10_400.0).contains(&candidates_per_win),
             "{candidates_per_win}"
         );
-        let mainnet_candidates_per_win =
-            1.0 / win_probability(&target, MiningNetwork::Mainnet).unwrap();
-        assert!((5_100.0..5_300.0).contains(&mainnet_candidates_per_win));
+        // #### PR #22: win odds follow the deployment's proof rule
+        // Mainnet runs the same v3.2 contract; only the retired v0 rule, which
+        // ignores digest bit 255, wins twice as often.
+        assert_eq!(
+            win_probability(&target, MiningNetwork::Mainnet),
+            Some(probability)
+        );
+        let v0_candidates_per_win = 1.0
+            / win_probability_for_rule(&target, crate::protocol::MAINNET_V0_PHOTON.proof_rule)
+                .unwrap();
+        assert!((5_100.0..5_300.0).contains(&v0_candidates_per_win));
 
         let mut snapshot = test_snapshot();
         snapshot.network = MiningNetwork::Chipnet;
