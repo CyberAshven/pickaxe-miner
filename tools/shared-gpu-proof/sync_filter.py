@@ -11,6 +11,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import os
+import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -51,12 +52,116 @@ TARGETS = (
             "tools/shared-gpu-proof/stages/src/lib.rs",
         ),
         "shaders": ("pickaxe_shared_stages.wgsl",),
+        "loop_copies": {"pickaxe_shared_stages.wgsl": "pickaxe_shared_stages_dx12_metal.wgsl"},
     },
 )
 
 
 def normalized(path):
     return path.read_bytes().replace(b"\r\n", b"\n")
+
+
+# #### PR #22: loop values for DirectX 12 and Metal
+# What: naga's HLSL and MSL writers emit a WGSL `continuing` block at the top
+# of the next iteration and recompute any loop-body `let` it uses there, after
+# the block's own assignments. A value that loads a variable written later in
+# the body, or in the continuing block, then reads the new contents: the
+# shared field inverse tested the dummy value it had just stored, never left
+# its loop, and the whole stage produced nothing on DirectX 12. A second copy
+# of the shared stages copies each such value to a function variable where it
+# is computed, and its continuing blocks read the copy; DirectX 12, Metal and
+# non-Chromium browsers run that copy. Vulkan and Chromium (Tint) were already
+# correct and keep the original shader byte-identical. The T2 filters need no
+# copies; generation stops if a shader without a variant ever does.
+LET = re.compile(r"^(\s*)let (_e\d+): (.+?) = (.*);$")
+VALUE = re.compile(r"\b_e\d+\b")
+VARIABLE = re.compile(r"\b(?:phi_\w+|local_\w+|global\w*)\b")
+ASSIGN = re.compile(r"^\s*([A-Za-z_]\w*)[^=]*?(?<![=!<>])=(?!=)")
+
+
+def block_end(lines, start):
+    """Returns the index of the line closing the block opened on `start`."""
+    depth = 0
+    for index in range(start, len(lines)):
+        depth += lines[index].count("{") - lines[index].count("}")
+        if depth == 0:
+            return index
+    raise ValueError(f"unbalanced block at line {start + 1}")
+
+
+def written(lines):
+    roots = set()
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(("let ", "var ", "break if", "if ", "} else", "return")):
+            continue
+        match = ASSIGN.match(line)
+        if match:
+            roots.add(match.group(1))
+    return roots
+
+
+def capture_loop_values(text):
+    """Copies continuing-block values that naga's HLSL/MSL would read late."""
+    lines = text.split("\n")
+    captures = {}  # function start -> {value: type}
+    function = None
+    index = 0
+    while index < len(lines):
+        if re.match(r"^fn \w+\(", lines[index]):
+            function = index
+        stripped = lines[index].strip()
+        if stripped == "loop {":
+            indent = len(lines[index]) - len(lines[index].lstrip())
+            end = block_end(lines, index)
+            cont = next((i for i in range(index + 1, end)
+                         if lines[i] == " " * (indent + 4) + "continuing {"), None)
+            if cont is not None:
+                cont_end = block_end(lines, cont)
+                top = " " * (indent + 4)
+                lets = {}
+                for i in range(index + 1, cont):
+                    match = LET.match(lines[i])
+                    if match and match.group(1) == top:
+                        lets[match.group(2)] = (i, match.group(3), match.group(4))
+                later_writes = written(lines[cont + 1:cont_end])
+
+                def hazardous(name, seen=()):
+                    line, _, value = lets[name]
+                    loads = set(VARIABLE.findall(value))
+                    if loads & (written(lines[line + 1:cont]) | later_writes):
+                        return True
+                    return any(dep in lets and dep not in seen and hazardous(dep, seen + (name,))
+                               for dep in VALUE.findall(value))
+
+                used = {name for i in range(cont + 1, cont_end)
+                        for name in VALUE.findall(lines[i]) if name in lets}
+                for name in sorted(used):
+                    if hazardous(name):
+                        line, kind, _ = lets[name]
+                        captures.setdefault(function, {})[name] = (line, kind, cont, cont_end)
+        index += 1
+    if not captures:
+        return text, 0
+    count = 0
+    replace = {}
+    inserts = {}
+    for function, values in captures.items():
+        for name, (line, kind, cont, cont_end) in values.items():
+            inserts.setdefault(line, []).append(f"{LET.match(lines[line]).group(1)}{name}_late = {name};")
+            for i in range(cont + 1, cont_end):
+                replace.setdefault(i, set()).add(name)
+            count += 1
+    out = []
+    for i, line in enumerate(lines):
+        for name in sorted(replace.get(i, ())):
+            line = re.sub(rf"\b{name}\b", f"{name}_late", line)
+        out.append(line)
+        if i in captures:
+            out.extend(f"    var {name}_late: {kind};"
+                       for name, (_, kind, _, _) in sorted(captures[i].items()))
+        out.extend(inserts.get(i, ()))
+    return "\n".join(out), count
 
 
 def manifest(files):
@@ -75,8 +180,19 @@ def sync(target, write):
     generated = ROOT / "artifacts/shared-gpu-proof" / target["name"]
     output = ROOT / target["output"]
     files = {path: normalized(ROOT / path) for path in target["sources"] + COMMON}
+    outputs = {}
     for name in target["shaders"]:
         data = normalized(generated / name)
+        outputs[name] = data
+        copy, copied = capture_loop_values(data.decode())
+        variant = target.get("loop_copies", {}).get(name)
+        if variant:
+            outputs[variant] = copy.encode()
+            print(f"{variant}: copied {copied} loop values for naga's HLSL and MSL writers")
+        elif copied:
+            raise SystemExit(f"{name} needs {copied} loop copies for DirectX 12 and Metal; "
+                             "name a loop_copies variant for it")
+    for name, data in outputs.items():
         path = output / name
         if write:
             output.mkdir(parents=True, exist_ok=True)
@@ -90,7 +206,7 @@ def sync(target, write):
         path.write_bytes(expected)
     elif not path.is_file() or normalized(path) != expected:
         raise SystemExit(f"Shared Rust provenance changed ({target['name']}); run sync_filter.py --write")
-    print(f"All {len(target['shaders'])} portable {target['name']} shaders match the pinned shared Rust source.")
+    print(f"All {len(outputs)} portable {target['name']} shaders match the pinned shared Rust source.")
 
 
 def main():

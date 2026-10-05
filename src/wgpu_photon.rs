@@ -97,6 +97,49 @@ const DEBUG_READABLE_STORAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE;
 
 const SHARED_STAGES_WGSL: &str =
     include_str!("../reference/shared-stages/pickaxe_shared_stages.wgsl");
+const SHARED_STAGES_LOOP_COPIES_WGSL: &str =
+    include_str!("../reference/shared-stages/pickaxe_shared_stages_dx12_metal.wgsl");
+
+// #### PR #22: shared stages per shader translator
+// What: Vulkan (naga's SPIR-V writer) and Chromium browsers (Tint) run the
+// generated shared stages unchanged. DirectX 12 and Metal (naga's HLSL and MSL
+// writers) and other browsers run the copy whose loop values survive naga's
+// continuing-block translation (tools/shared-gpu-proof/sync_filter.py).
+// Why: without the copies those translations lose every result of the stage,
+// while on Vulkan they cost the RTX 5070 Ti about 0.9% more C1 time, so Vulkan
+// and Chromium keep the original byte-identical.
+// Check: a stage that returns nothing or hangs on DirectX 12 or Metal means a
+// loop needs a copy that the generator did not make.
+fn shared_stages_source(backends: wgpu::Backends) -> &'static str {
+    if backends == wgpu::Backends::VULKAN
+        || (backends == wgpu::Backends::BROWSER_WEBGPU && browser_translates_with_tint())
+    {
+        SHARED_STAGES_WGSL
+    } else {
+        SHARED_STAGES_LOOP_COPIES_WGSL
+    }
+}
+
+/// Chromium's WebGPU translates WGSL with Tint; Firefox uses naga, and Safari
+/// and every iOS browser use WebKit's translator.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn user_agent_uses_tint(user_agent: &str) -> bool {
+    user_agent.contains("Chrome/")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_translates_with_tint() -> bool {
+    js_sys::Reflect::get(&js_sys::global(), &"navigator".into())
+        .and_then(|navigator| js_sys::Reflect::get(&navigator, &"userAgent".into()))
+        .ok()
+        .and_then(|agent| agent.as_string())
+        .is_some_and(|agent| user_agent_uses_tint(&agent))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn browser_translates_with_tint() -> bool {
+    false
+}
 
 #[cfg(test)]
 const TX_BYTES: usize = 615;
@@ -794,7 +837,7 @@ impl WgpuPhotonEngine {
             (PortableStages::Wgsl, Some(reference)) => reference,
             _ => &device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Shared Rust stages"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHARED_STAGES_WGSL)),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shared_stages_source(backends))),
             }),
         };
         let entries = stages.entry_points();
@@ -2459,6 +2502,49 @@ mod tests {
         }
     }
 
+    // #### PR #22: shared stages per shader translator
+    #[test]
+    fn shared_stages_follow_the_shader_translator() {
+        use wgpu::Backends;
+        // Compared by content: consts need not share an address.
+        assert!(shared_stages_source(Backends::VULKAN) == SHARED_STAGES_WGSL);
+        for backends in [Backends::DX12, Backends::METAL, Backends::BROWSER_WEBGPU] {
+            assert!(shared_stages_source(backends) == SHARED_STAGES_LOOP_COPIES_WGSL);
+        }
+        let chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36";
+        assert!(user_agent_uses_tint(chrome));
+        assert!(user_agent_uses_tint(&format!("{chrome} Edg/154.0.0.0")));
+        assert!(!user_agent_uses_tint(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+        ));
+        assert!(!user_agent_uses_tint("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"));
+        assert!(!user_agent_uses_tint("Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/154.0.0.0 Mobile/15E148 Safari/604.1"));
+        // The copy is the original plus loop-value copies, nothing else.
+        let mut copies = 0;
+        let restored: Vec<String> = SHARED_STAGES_LOOP_COPIES_WGSL
+            .lines()
+            .filter(|line| {
+                let copy = line.contains("_late = ")
+                    || (line.trim_start().starts_with("var _e") && line.contains("_late:"));
+                copies += usize::from(copy);
+                !copy
+            })
+            .map(|line| line.replace("_late", ""))
+            .collect();
+        assert!(copies > 0);
+        assert_eq!(restored, SHARED_STAGES_WGSL.lines().collect::<Vec<_>>());
+        // Both copies parse and validate as WGSL.
+        for source in [SHARED_STAGES_WGSL, SHARED_STAGES_LOOP_COPIES_WGSL] {
+            let module = naga::front::wgsl::parse_str(source).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap();
+        }
+    }
+
     #[test]
     fn portable_stages_default_to_shared_rust_and_keep_wgsl_selectable() {
         assert_eq!(PortableStages::parse(None), Ok(PortableStages::Rust));
@@ -2475,11 +2561,11 @@ mod tests {
         assert_eq!(PortableStages::default(), PortableStages::Rust);
         // Every entry point either set names exists in its shader.
         let reference = reference_shader_source_for_wgpu().unwrap();
-        for stages in [PortableStages::Wgsl, PortableStages::Rust] {
-            let source = match stages {
-                PortableStages::Wgsl => reference.as_str(),
-                PortableStages::Rust => SHARED_STAGES_WGSL,
-            };
+        for (stages, source) in [
+            (PortableStages::Wgsl, reference.as_str()),
+            (PortableStages::Rust, SHARED_STAGES_WGSL),
+            (PortableStages::Rust, SHARED_STAGES_LOOP_COPIES_WGSL),
+        ] {
             let entries = stages.entry_points();
             for entry in entries.b.iter().copied().chain([
                 entries.a,

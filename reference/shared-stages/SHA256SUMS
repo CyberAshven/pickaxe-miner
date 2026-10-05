@@ -1,4 +1,5 @@
 2f21cb0a8996684daaea823b7c21b1e0f10d3f11cfd9c4af600cda03857b9053  reference/shared-stages/pickaxe_shared_stages.wgsl
+1db733663300c9a6093bc9b46dd75bb3432b734c3e84a2d76bf49aa7b2390d1f  reference/shared-stages/pickaxe_shared_stages_dx12_metal.wgsl
 f39d8235ee9285030e733bed68b8817c3a2465c44bf04751d815f57b9f6b1a58  rust-engine/src/field.rs
 6258de967f9529cc12184fadb1fe71f92f42dcb1647cee150b5670d44f24c9ff  rust-engine/src/point.rs
 5535e94c691c8955795a3b89b1855a566030e8ddf430e4c92da944e137884ee5  rust-engine/src/scalar.rs
@@ -13,4 +14,4 @@ a5391259557e2f549b8d43f6282f1ad916613e4d3197627f92275ee23a319d47  tools/shared-g
 2f198d5251432cf4714cf8fb08d323fbd5bdc0573f06da61ee15aba4bd4775f0  tools/shared-gpu-proof/rust-toolchain.toml
 617bacaa6692b6ae671cfa67bf01939b3637dbacdd56ba040389feb1c4d8e52d  tools/shared-gpu-proof/stages/Cargo.toml
 5fbfd8c53ae8b6b03bda1c426b4396a220a86ac339c806a5fd49ca0648dd2085  tools/shared-gpu-proof/stages/src/lib.rs
-64eb2cf65d391017a0eecede7bf701d5cb6e90673d6a814268828bb9fb50550e  tools/shared-gpu-proof/sync_filter.py
+f4eca76438b5b8ee6415dbda9d48a1b54b769395d24e4923819ebe5160f79693  tools/shared-gpu-proof/sync_filter.py

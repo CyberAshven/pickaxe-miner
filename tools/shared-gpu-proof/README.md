@@ -158,3 +158,27 @@ both (WebGPU). `PICKAXE_BUILD_SHARED_STAGES=debug` builds a development shader
 with an arithmetic entry point for `shared_stages_arithmetic_matches_integers`;
 it is never shipped. Measurements are in the
 [GPU code map](../../docs/gpu-sources.md).
+
+## DirectX 12 and Metal loops (2026-10-05)
+
+wgpu translates WGSL with naga. Its HLSL (DirectX 12) and MSL (Metal) writers
+emit a loop's `continuing` block at the top of the next iteration and recompute
+the loop-body values that block uses there, after the block's own assignments.
+SPIR-V (Vulkan) keeps a real continue block, and Chrome's Tint keeps the
+values, so both were correct. On DirectX 12 the shared field inverse's inner
+loop stored a dummy value for its successor and then tested that dummy instead
+of the value it had computed, so it never ended. The compiler then dropped
+every result of the stage: the debug arithmetic entry returned zeros on both
+GPUs, and on the Radeon stage B returned no points and C1 hung until Windows
+reset the driver.
+
+`sync_filter.py` now also writes `pickaxe_shared_stages_dx12_metal.wgsl`. In
+that copy each continuing-block value at risk is stored in a function variable
+where the loop body computes it, and the continuing block reads the variable. A
+value is at risk when it loads a variable that the body writes after it, or
+that the continuing block writes. The shared stages have 15 such loop
+conditions, all booleans; the T2 filters have none, and generation stops if a
+shader without a copy ever needs one. DirectX 12, Metal and browsers other than
+Chromium run the copy. Vulkan and Chromium keep the original byte-identical:
+interleaved runs found the copy about 0.9% slower in C1 on the RTX 5070 Ti over
+Vulkan (no difference on the Radeon). CI regenerates both files.

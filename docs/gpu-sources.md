@@ -59,6 +59,19 @@ under Windows, where their launches never complete.
   hand edits. Portable-only helpers (`rust-engine/src/sign.rs`, `window.rs`)
   are excluded from native GPU builds, and native code expands to its original
   form, so `photon_rust.ptx` stays byte-identical.
+- **DirectX 12 and Metal translation:** naga, wgpu's shader translator, writes
+  a WGSL loop's `continuing` block at the top of the next iteration for HLSL
+  (DirectX 12) and MSL (Metal), and recomputes loop-body values that block uses
+  after the block's own assignments. Where such a value loads a variable
+  written in between, the translated loop reads the new contents: the shared
+  field inverse tested the dummy value it had just stored, never left its loop,
+  and the stage produced nothing. `sync_filter.py` also writes
+  `pickaxe_shared_stages_dx12_metal.wgsl`, a copy in which each such value is
+  stored in a variable where it is computed and the continuing block reads the
+  variable (15 loop conditions; the T2 filters have none). DirectX 12, Metal
+  and non-Chromium browsers run that copy. SPIR-V (Vulkan) and Tint (Chromium)
+  were already correct and keep the original shader byte-identical; on Vulkan
+  the copy cost the RTX 5070 Ti about 0.9% more C1 time.
 - **Portable stages:** `signing_stages_match_cpu_per_window` checks each
   signing stage's output against the CPU; the T2 and non-T2 end-to-end tests
   reconstruct every candidate; `stage_timing_comparison` times both stage sets
