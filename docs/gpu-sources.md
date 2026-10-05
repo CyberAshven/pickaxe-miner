@@ -22,18 +22,36 @@ selectable until its replacement is proven on hardware.
 
 | GPU | Engine | Default kernels | Alternative |
 |---|---|---|---|
-| NVIDIA | CUDA | Shared Rust engine: `cuda/build/photon_rust.ptx` | CUDA C++ kernels: build with `--no-default-features --features tail-grind` |
+| NVIDIA RTX 50 series (compute capability 12.0 and newer) | CUDA | Shared Rust engine: `cuda/build/photon_rust.ptx` | CUDA C++ kernels: build with `--no-default-features --features tail-grind` |
 | AMD Radeon RX 6000, 7000, 9000 | HIP | CUDA C++ kernels compiled for HIP: `hip/build/<arch>/*.hsaco` | Shared Rust engine: set `PICKAXE_HIP_KERNELS=rust` to load `hip/build/<arch>/photon_rust.hsaco` |
-| Other AMD GPUs, Intel GPUs, integrated GPUs | wgpu on Vulkan | Shared Rust stages (`reference/shared-stages/`) and T2 filter (`reference/shared-t2/`) | Original hand-written WGSL stages: set `PICKAXE_WGPU_STAGES=wgsl` |
+| Older NVIDIA GPUs, other AMD GPUs, Intel GPUs, integrated GPUs | wgpu on Vulkan | Shared Rust stages (`reference/shared-stages/`) and T2 filter (`reference/shared-t2/`) | Original hand-written WGSL stages: set `PICKAXE_WGPU_STAGES=wgsl` |
 | Windows GPUs whose Vulkan driver fails | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
 | Apple Silicon | wgpu on Metal | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
 | Browser miner | wgpu on browser WebGPU | Same as Vulkan; browsers other than Chromium use the DirectX 12/Metal copy | Development builds only (`verify_portable_engine`) |
 
-Automatic selection takes the first discrete GPU from CUDA, then HIP (when
-code objects for its architecture are installed), then WGPU. An integrated GPU
-mines automatically only when no discrete GPU is present; `--device` selects
-any GPU, and `--backend` forces an engine. Native HIP refuses integrated GPUs
-under Windows, where their launches never complete.
+## Which GPUs mine
+
+Automatic selection lists each physical GPU once. CUDA, HIP and wgpu each list
+the GPUs they can drive; entries with the same PCI address, or without one the
+same vendor and name, are one card. A discrete GPU mines on CUDA when its
+compute capability is 12.0 or newer (the kernels are `sm_120` PTX), else on
+HIP when code objects for its architecture are installed, else on wgpu. An
+integrated GPU prefers wgpu: native HIP refuses integrated GPUs under Windows,
+where their launches never complete.
+
+Every discrete GPU mines by default; integrated GPUs mine only when no discrete
+GPU exists, or with `--include-integrated`. `--device` takes `all`, one number
+from `pickaxe devices`, or a list such as `0,2`. `--backend` forces an engine,
+and the numbers are then that engine's ordinals. `benchmark` and `self-test`
+run one GPU: the first selected, or the one `--device N` names.
+
+All GPUs mine one job in one miner, each with its own signing keys, so their
+work never overlaps. A winner or a pause stops every GPU at its next batch
+boundary. A job change reaches each GPU at its next batch boundary without
+waiting for the slowest one. A GPU that fails rebuilds its engine after 2, 5,
+10 and 30 seconds, then every minute, while the others keep mining. Telemetry
+reads each card through `nvidia-smi` or `amd-smi`, by PCI address when the
+tool's numbering could differ from the engine's.
 
 ## Sources
 

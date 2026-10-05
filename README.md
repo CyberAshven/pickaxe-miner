@@ -24,11 +24,11 @@ Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebA
 | AMD Radeon RX 6000, 7000 and 9000 (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) | Native HIP T2 | Code objects verified; no discrete card measured yet |
 | AMD integrated (Ryzen) and other AMD GPUs | Portable engine on Vulkan | Ryzen 9 9955HX3D integrated Radeon: about 20 MH/s |
 | Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails | Not yet |
-| Other NVIDIA GPUs | Portable engine with `--backend wgpu` (the CUDA files target `sm_120` only) | Not yet |
+| Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) | Not yet |
 | Apple Silicon (M1 and later) | Portable engine on Metal | Built by CI; not yet run on a Mac |
 | Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU | Chrome, on the integrated Radeon and the RTX 5070 Ti |
 
-The engine is selected automatically: a discrete GPU always comes first, and an integrated GPU is used automatically only when no discrete GPU is present, or when chosen with `--device`. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
+The engine is selected automatically, and one miner mines on every discrete GPU of the machine, each on its best engine ([several GPUs](#several-gpus)). An integrated GPU mines automatically only when no discrete GPU is present. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
 
 ## Quick start: mainnet TUI
 
@@ -56,7 +56,19 @@ The portable engine mines on any GPU above that has no native engine:
 | Linux | `./pickaxe mine --network mainnet --backend wgpu` |
 | Windows on DirectX 12 | Put Microsoft's `dxcompiler.dll` and `dxil.dll` next to `pickaxe.exe` ([details](docs/portable.md#directx-12-on-windows-optional)), run `$env:PICKAXE_WGPU_API = 'dx12'`, then the Windows command |
 
-Automatic selection already picks the portable engine for AMD integrated and Intel GPUs; `--backend wgpu` forces it.
+Automatic selection already picks the portable engine for every GPU without a native engine; `--backend wgpu` forces it.
+
+### Several GPUs
+
+One miner drives all of a machine's GPUs: they mine the same job for your address with separate work, so they never compete for the same reward. By default every discrete GPU mines:
+
+| Mine on | Add to the mine command |
+| --- | --- |
+| Every discrete GPU | nothing (default) |
+| Every GPU, integrated included | `--include-integrated` |
+| Chosen GPUs | `--device 0,2`, with the numbers `devices` prints |
+
+In setup, Enter on the GPU row lists the GPUs with a checkbox each, and a profile remembers the choice. The dashboard shows each GPU's rate and temperature. A GPU that fails restarts by itself while the others keep mining.
 
 ### Browser miner
 
@@ -224,6 +236,7 @@ cargo run --release -- benchmark
 ## Features
 
 - High-performance native GPU mining
+- Every GPU of a machine in one miner, with per-GPU status
 - Live PHOTON CashToken baton discovery
 - Automatic winner verification and submission
 - Runtime intensity control from 10% to 100%
