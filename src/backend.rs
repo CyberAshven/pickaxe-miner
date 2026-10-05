@@ -273,6 +273,18 @@ fn list_cuda_devices() -> Result<Vec<GpuDevice>, String> {
     if cfg!(target_os = "macos") {
         return Err("CUDA is unavailable on macOS; use the wgpu Metal backend".into());
     }
+    // #### PR #22: a missing NVIDIA driver is an error, not a crash
+    // What: check that the driver library loads before the first CUDA call.
+    // Why: cudarc panics when it cannot load nvcuda.dll or libcuda.so, and
+    // auto discovery (the dashboard at startup, `devices`) probes CUDA first,
+    // so PCs without an NVIDIA driver crashed before reaching HIP or WGPU
+    // (issue #30).
+    // Check: on such a PC, `devices` and `mine` list the AMD or Intel GPUs.
+    // SAFETY: loads and releases the driver library by name, as cudarc does on
+    // first use; no CUDA function is called.
+    if !unsafe { sys::is_culib_present() } {
+        return Err("CUDA unavailable: no NVIDIA driver found".into());
+    }
     // Driver must be initialized before get_count (same path CudaContext::new uses).
     cudarc::driver::result::init()
         .map_err(|e| format!("CUDA unavailable: {e}. Install or fix the CUDA runtime."))?;
@@ -541,6 +553,19 @@ mod tests {
         assert_eq!(BackendKind::parse("hip").unwrap(), BackendKind::Hip);
         assert_eq!(BackendKind::parse("rocm").unwrap(), BackendKind::Hip);
         assert_eq!(BackendKind::parse("wgpu").unwrap(), BackendKind::Wgpu);
+    }
+
+    // #### PR #22: a missing NVIDIA driver is an error, not a crash
+    #[test]
+    fn cuda_discovery_without_a_driver_reports_an_error() {
+        // Runs where no NVIDIA driver is installed, such as the CI runners.
+        if cfg!(target_os = "macos") || unsafe { sys::is_culib_present() } {
+            return;
+        }
+        let error = list_cuda_devices().unwrap_err();
+        assert!(error.contains("no NVIDIA driver"), "{error}");
+        // Auto discovery moves on to HIP and WGPU instead of panicking.
+        let _ = list_devices(BackendKind::Auto);
     }
 
     #[cfg(feature = "portable-wgpu")]
