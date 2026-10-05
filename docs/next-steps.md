@@ -18,12 +18,14 @@ with a short design check before code.
 
 ## Goals
 
-1. Solo miners with many GPUs, up to farms of 100 GPUs on many machines, mine
-   as one: one job, one dashboard, no competition between their own GPUs.
+1. Solo miners first. One person's GPUs, up to farms of 100 GPUs on many
+   machines, mine as one: one job, one dashboard, no competition between their
+   own GPUs, and their own node.
 2. Pickaxe stays a general miner: GPU tokens today, ASIC tokens and BCH itself
    next.
 3. Merge-mine CashTokens with BCH. No other miner can do this yet.
-4. Work with pools as they adopt Stratum V2, with pool failover.
+4. Pools stay optional: a solo miner can switch to a Stratum V2 pool and still
+   build block templates with their own node.
 
 ## Phase 1: rigs and farms
 
@@ -43,9 +45,9 @@ One coordinator mines for many machines.
 - On a winner the coordinator re-verifies it, pauses every rig, journals and
   broadcasts the claim, then sends the successor job. A second winner for the
   same baton is stale and only counted.
-- Transport: authenticated and encrypted TCP with binary framing and
-  heartbeats. Reusing the Stratum V2 transport (Noise handshake and framing,
-  from the Rust reference implementation) keeps phase 2 cheap.
+- Transport: Stratum V2 (Noise-encrypted, binary framing, heartbeats), from
+  the Rust reference implementation. Rigs and SV2 ASIC firmware connect to the
+  miner's own coordinator the same way.
 - Dashboard: rigs and their GPUs in one view (rate, temperature, power,
   errors, last seen), in the TUI and as JSON for farm tools such as Hive OS.
 - Failover: rigs reconnect to a backup coordinator; a restarted coordinator
@@ -58,15 +60,24 @@ the laptop plus a second PC on mainnet.
 
 ## Phase 2: Stratum V2
 
-- Speak Stratum V2 rather than compete with it. When a pool offers SV2,
-  Pickaxe connects with its encrypted transport and fails over between pools.
-- Pickaxe's own role stays: the token layer (covenant mining and claims), the
-  GPU engines, the farm coordinator, and merge mining on top of BCH work.
-- Job Declaration lets a miner build its own block templates, which merge
-  mining needs: the template must carry the token commitments.
+- Solo, the default: Stratum V2 is how the miner's own rigs and ASICs talk to
+  their own coordinator, which builds block templates from their own node.
+- Nodes do not offer the miner side of SV2 (template provider, Job Declaration
+  client, non-custodial payouts), so the coordinator provides it. Templates come
+  from the miner's own node over its JSON-RPC `getblocktemplate`, with long
+  polling or ZMQ block notifications; no node IPC is needed.
+- Pool, optional: the miner picks a pool from a list of pools that support
+  SV2 with Job Declaration. Pickaxe declares jobs built from the miner's own
+  node (transactions, coinbase and token commitments), and the pool only counts
+  shares and pays. The list is ordered for failover. No BCH pool offers SV2
+  today, so this mode waits for one.
+- Pickaxe's own role stays either way: the token layer (covenant mining and
+  claims), the GPU engines, the coordinator, and merge mining on top of BCH
+  work. Merge mining needs the miner's own templates, which both modes keep.
 
-Decision needed: which BCH pools offer SV2, and whether Pickaxe should also
-act as an SV2 proxy for a farm's ASICs.
+Pools may be a transition: with Job Declaration a pool only counts shares and
+pays, and a sharechain (phase 5) does both without custody. Pooled payouts
+without a pool therefore come from P2Pool, not from pool support.
 
 ## Phase 3: BCH ASIC solo mining
 
@@ -98,8 +109,13 @@ layouts in `tools/reward-policy-vm`.
 ## Phase 5: P2Pool (maybe)
 
 A decentralized pool for BCH and merge-mined tokens, after phases 3 and 4.
-DATUM, where miners build their own templates and the pool only pays, is the
-nearer model to study.
+With P2Pool every participant runs the sharechain: here the coordinator keeps
+it beside the miner's own BCH node, and the miner's rigs and ASICs connect to
+their coordinator as in phase 1. Using someone else's P2Pool node would make it
+an ordinary pool, so that is not a goal. It helps BCH ASIC solo miners most,
+whose blocks are rare; PHOTON wins already come every few minutes across the
+network. DATUM, where miners build their own templates and the pool only
+pays, is the nearer model to study.
 
 ## Follow-ups from #22
 
@@ -118,8 +134,14 @@ nearer model to study.
 
 ## Decisions for the operator
 
+Agreed on 2026-10-05: solo miners first; rigs and ASICs talk Stratum V2 to the
+miner's own coordinator and node; pools are an option with the miner's own
+templates (Job Declaration); P2Pool means running the sharechain beside one's
+own node.
+
+Still open:
+
 1. Order: rigs and farms first (recommended), or SV2 first.
-2. Rig protocol: reuse the Stratum V2 transport (recommended) or a simpler
-   private protocol.
-3. Whether to open the merge-mining covenant design with PHOTON's author now.
-4. Whether phase 3 targets solo only, or solo plus a farm proxy for ASICs.
+2. Whether to open the merge-mining covenant design with PHOTON's author now.
+3. Which pools to list for the optional pool mode, once their SV2 and Job
+   Declaration support for BCH is checked.
