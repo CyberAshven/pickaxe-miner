@@ -8,12 +8,15 @@ selectable until its replacement is proven on hardware.
 
 - **wgpu**: the open-source Rust graphics library (gfx-rs) behind the
   portable engine and the `--backend wgpu` option. It is not a GPU API itself.
-- **Vulkan** and **Metal**: the native GPU APIs wgpu runs on: Vulkan on
-  Windows and Linux, Metal on macOS.
-- **WebGPU**: the W3C browser GPU API. The **browser miner** runs the same
+- **Vulkan**, **DirectX 12** and **Metal**: the native GPU APIs wgpu runs on:
+  Vulkan on Windows and Linux, optionally DirectX 12 on Windows, Metal on macOS.
+- **WebGPU**: the W3C browser GPU API. The **browser GPU miner** runs the same
   engine through it; native builds never use WebGPU.
 - **WGSL**: the WebGPU Shading Language, the standard language every
   portable shader is written or generated in.
+- **naga**: wgpu's shader translator, from WGSL to SPIR-V for Vulkan, HLSL for
+  DirectX 12 and MSL for Metal. Firefox's WebGPU uses it too; Chromium uses its
+  own translator, Tint.
 
 ## Engines and defaults
 

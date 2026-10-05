@@ -16,7 +16,7 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 
 ## Supported platforms
 
-Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebGPU and WebAssembly).
+Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser GPU miner (WebAssembly on the browser's WebGPU).
 
 | GPU | Engine | Tested |
 | --- | --- | --- |
@@ -46,18 +46,27 @@ To skip setup and start directly in the mining TUI, append
 `--address "YOUR_MAINNET_PAYOUT_ADDRESS"`, replacing the placeholder with your
 valid payout CashAddr. Servers are selected automatically.
 
-### Portable engine: TUI and browser
+### Portable engine in the TUI
 
-The portable engine mines on any GPU above that has no native engine, in the TUI or in a browser:
+The portable engine mines on any GPU above that has no native engine:
 
-| Where | How |
+| Where | Command |
 | --- | --- |
-| TUI, Windows | `.\pickaxe.exe mine --network mainnet --backend wgpu` |
-| TUI, Linux | `./pickaxe mine --network mainnet --backend wgpu` |
-| TUI, Windows on DirectX 12 | Put Microsoft's `dxcompiler.dll` and `dxil.dll` next to `pickaxe.exe` ([details](docs/portable.md#directx-12-on-windows-optional)), run `$env:PICKAXE_WGPU_API = 'dx12'`, then the Windows command |
-| Browser | Extract the `-web.tar.gz` download, run `python -m http.server 8080 --bind 127.0.0.1 --directory web`, open `http://127.0.0.1:8080` and press **Start mining** |
+| Windows | `.\pickaxe.exe mine --network mainnet --backend wgpu` |
+| Linux | `./pickaxe mine --network mainnet --backend wgpu` |
+| Windows on DirectX 12 | Put Microsoft's `dxcompiler.dll` and `dxil.dll` next to `pickaxe.exe` ([details](docs/portable.md#directx-12-on-windows-optional)), run `$env:PICKAXE_WGPU_API = 'dx12'`, then the Windows command |
 
-Automatic selection already picks the portable engine for AMD integrated and Intel GPUs; `--backend wgpu` forces it. The browser miner needs WebGPU on HTTPS or localhost and a tab that stays open; see [portable builds](docs/portable.md).
+Automatic selection already picks the portable engine for AMD integrated and Intel GPUs; `--backend wgpu` forces it.
+
+### Browser GPU miner
+
+The browser GPU miner is the same portable engine compiled to WebAssembly, mining on the browser's WebGPU in Chrome, Edge, Firefox or Safari. In the extracted `-web.tar.gz` download, run this one command (Python required), then open `http://127.0.0.1:8080`, enter your payout address and press **Start mining**:
+
+```sh
+python -m http.server 8080 --bind 127.0.0.1 --directory web
+```
+
+Keep the tab open while mining. Names: `wgpu` is the Rust GPU library inside Pickaxe (the `--backend wgpu` option), and WebGPU is the browser's GPU API that the browser GPU miner runs on ([names](docs/gpu-sources.md#names), [portable builds](docs/portable.md)).
 
 ## Install
 

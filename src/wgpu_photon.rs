@@ -1,9 +1,15 @@
-//! Persistent reference-correct PHOTON WGPU pipeline.
+//! Portable mining engine on the wgpu library.
 //!
-//! This is the M67.38 WebGPU A -> split-B -> normalized-C1 -> C2 pipeline from
-//! `reference/photon-miner.wgsl`, with a bounded C3 result tail. Candidate
-//! intermediates stay on the GPU; the host reads only counters plus a fixed
-//! number of winner nonce/HASH256 records.
+//! One engine for every GPU without a native CUDA or HIP engine. wgpu runs it on
+//! Vulkan (Windows, Linux), optionally DirectX 12 (Windows,
+//! `PICKAXE_WGPU_API=dx12`) and Metal (macOS); compiled to WebAssembly it is the
+//! browser GPU miner on the browser's WebGPU (`browser.rs`). Its stages (A, B,
+//! C1, T2 preparation, C2, C3) and T2 filters are WGSL generated from the shared
+//! Rust engine (`reference/shared-*`); `PICKAXE_WGPU_STAGES=wgsl` selects the
+//! original hand-written PHOTON pipeline in `reference/photon-miner.wgsl`.
+//! Candidate intermediates stay on the GPU; the host reads only counters plus a
+//! bounded number of winner nonce/HASH256 records. Names (wgpu, WebGPU, WGSL,
+//! naga): docs/gpu-sources.md.
 
 use crate::gpu_types::{PhotonCudaBatchResult, PhotonCudaWinner};
 use crate::m29_table::{self, M29TableSource};

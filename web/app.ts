@@ -1,3 +1,6 @@
+// Browser GPU miner page. Mining runs in the Rust WebAssembly module
+// (src/browser.rs) on the browser's WebGPU; this file wires the page,
+// network I/O and display. See docs/portable.md.
 import init, { BrowserMiner, BrowserControls, browser_config, validate_payout_address } from './pkg/pickaxe_miner.js';
 import { Electrum, rpcErrorCode } from './rpc.js';
 import { resolveSubmission } from './submission.js';
