@@ -1476,10 +1476,16 @@ fn main() {
                         exit_after_error(2);
                     }
                 };
-            let selected = &selected_gpus[0];
             let (cfg, gpus, profile_name) = match startup {
                 MineStartup::InteractiveSetup => {
-                    let devices = match backend::list_devices(backend_kind) {
+                    // Setup lists each physical GPU once, numbered as
+                    // `--device` numbers them; a named backend lists its own.
+                    let devices = if backend_kind == backend::BackendKind::Auto {
+                        Ok(backend::mining_gpus())
+                    } else {
+                        backend::list_devices(backend_kind)
+                    };
+                    let devices = match devices {
                         Ok(devices) => devices,
                         Err(error) => {
                             eprintln!("error: {error}");
@@ -1517,13 +1523,21 @@ fn main() {
                         fulcrum: args.fulcrum.clone(),
                         node_rpc: args.node_rpc.clone(),
                         source: args.source.clone(),
-                        device: (args.backend.is_some() || args.device.is_some())
-                            .then_some((selected.backend, selected.index)),
+                        gpus: (args.backend.is_some()
+                            || args.device.is_some()
+                            || args.include_integrated)
+                            .then(|| {
+                                selected_gpus
+                                    .iter()
+                                    .map(|gpu| (gpu.backend, gpu.index))
+                                    .collect()
+                            }),
                     };
                     let setup = match tui::run_setup(
                         cfg,
                         devices,
-                        selected,
+                        backend_kind,
+                        &selected_gpus,
                         &profiles_path,
                         profiles,
                         &sources_path,

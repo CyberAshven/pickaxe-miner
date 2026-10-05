@@ -1726,4 +1726,38 @@ mod tests {
         assert_eq!(original + shrec, total_donation);
         assert_eq!(original, shrec);
     }
+
+    #[test]
+    fn saved_gpu_choice_reads_old_numbers_and_writes_lists() {
+        // Configs and profiles saved before several GPUs could mine.
+        let old: SavedConfig = serde_json::from_str(r#"{"backend":"cuda","device":0}"#).unwrap();
+        assert_eq!(old.device, Some(SavedDevices::One(0)));
+        assert_eq!(old.device_selection(), DeviceSelection::Indices(vec![0]));
+
+        let save = |devices: DeviceSelection| {
+            let saved = SavedConfig::from_effective("auto", &devices, &RuntimeConfig::default());
+            (serde_json::to_value(&saved).unwrap(), saved)
+        };
+        let (one, _) = save(DeviceSelection::Indices(vec![3]));
+        assert_eq!(one["device"], 3);
+        let (pair, saved) = save(DeviceSelection::Indices(vec![0, 2]));
+        assert_eq!(pair["device"], serde_json::json!([0, 2]));
+        assert!(pair.get("include_integrated").is_none());
+        assert_eq!(
+            saved.device_selection(),
+            DeviceSelection::Indices(vec![0, 2])
+        );
+        let (every, saved) = save(DeviceSelection::WithIntegrated);
+        assert!(every["device"].is_null());
+        assert_eq!(every["include_integrated"], true);
+        assert_eq!(saved.device_selection(), DeviceSelection::WithIntegrated);
+        let (default, saved) = save(DeviceSelection::Default);
+        assert!(default["device"].is_null());
+        assert_eq!(saved.device_selection(), DeviceSelection::Default);
+
+        let twice: SavedConfig = serde_json::from_str(r#"{"device":[1,1]}"#).unwrap();
+        assert!(twice.validate().unwrap_err().contains("twice"));
+        let empty: SavedConfig = serde_json::from_str(r#"{"device":[]}"#).unwrap();
+        assert!(empty.validate().is_err());
+    }
 }
