@@ -18,15 +18,16 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 
 Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).
 
-| GPU | Engine | Tested |
-| --- | --- | --- |
-| NVIDIA GeForce RTX 50 series (`sm_120`) | CUDA | RTX 5070 Ti Laptop: about 1.48 GH/s |
-| AMD Radeon RX 6000, 7000 and 9000 (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) | Native HIP T2 | Code objects verified; no discrete card measured yet |
-| AMD integrated (Ryzen) and other AMD GPUs | Portable engine on Vulkan | Ryzen 9 9955HX3D integrated Radeon: about 20 MH/s |
-| Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails | Not yet |
-| Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) | Not yet |
-| Apple Silicon (M1 and later) | Portable engine on Metal | Built by CI; not yet run on a Mac |
-| Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU | Chrome, on the integrated Radeon and the RTX 5070 Ti |
+| GPU | Engine |
+| --- | --- |
+| NVIDIA GeForce RTX 50 series (`sm_120`) | CUDA |
+| AMD Radeon RX 6000, 7000 and 9000 (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) | Native HIP T2 |
+| AMD integrated (Ryzen) and other AMD GPUs | Portable engine on Vulkan |
+| Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails |
+| Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) |
+| Apple Silicon (M1 and later) | Portable engine on Metal |
+| Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU |
+
 
 The engine is selected automatically, and one miner mines on every discrete GPU of the machine, each on its best engine ([several GPUs](#several-gpus)). An integrated GPU mines automatically only when no discrete GPU is present. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
 
