@@ -13,7 +13,7 @@
 
 ## Planning
 
-- [Next steps](next-steps.md): rigs and farms, Stratum V2, BCH ASIC solo mining and merge mining
+- [Next steps](next-steps.md): decided order and research: BCH Stratum V2, GPU scaling, P2Pool, merge mining
 - [Definition of done](DEFINITION_OF_DONE.md)
 - [GPU ship path](GPU_SHIP_PATH.md) (historical plan, 2026-09-20)
 
