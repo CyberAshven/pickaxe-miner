@@ -7,7 +7,7 @@
 
 use crate::donation::require_direct_reward_policy;
 
-use crate::backend::BackendKind;
+use crate::backend::{BackendKind, GpuDevice};
 use crate::config::{JobSource, MiningNetwork, RuntimeConfig};
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::reward;
@@ -2454,13 +2454,25 @@ pub enum SupervisorState {
     Stopped,
 }
 
+/// One mining GPU of the runtime.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeGpu {
+    pub backend: BackendKind,
+    pub device: u32,
+    pub name: String,
+    pub telemetry: GpuTelemetry,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
     pub state: SupervisorState,
     pub network: MiningNetwork,
     pub fee_scheme: crate::donation::Scheme,
+    /// The first mining GPU; `gpus` lists every one.
     pub gpu_backend: String,
     pub gpu_device: u32,
+    /// Every mining GPU, in selection order; `search.gpus` follows the same order.
+    pub gpus: Vec<RuntimeGpu>,
     pub generation_id: u64,
     pub payout_address: String,
     pub endpoint: String,
@@ -2482,6 +2494,7 @@ pub struct RuntimeSnapshot {
     pub pending_winners: u64,
     pub last_error: Option<String>,
     pub search: SearchStats,
+    /// Telemetry of all mining GPUs together; each GPU's is in `gpus`.
     pub gpu_telemetry: GpuTelemetry,
 }
 
@@ -2567,29 +2580,15 @@ pub struct RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
-    #[allow(dead_code)]
-    /// Starts the mining runtime on a selected device ordinal.
-    pub fn start_on_device(cfg: RuntimeConfig, device_ordinal: u32) -> Result<Self, String> {
-        Self::start_on_backend_device(cfg, BackendKind::Cuda, device_ordinal)
-    }
-
-    /// Starts the runtime on an explicit backend and device.
-    pub fn start_on_backend_device(
-        cfg: RuntimeConfig,
-        backend: BackendKind,
-        device_ordinal: u32,
-    ) -> Result<Self, String> {
-        Self::start_inner(cfg, backend, device_ordinal)
-    }
-
-    /// Starts supervised GPU search after runtime preflight.
-    fn start_inner(
-        mut cfg: RuntimeConfig,
-        backend: BackendKind,
-        device_ordinal: u32,
-    ) -> Result<Self, String> {
+    /// Starts supervised GPU search on every selected GPU after runtime
+    /// preflight. The GPUs share one job, pause together on a winner and
+    /// claim through this one supervisor.
+    pub fn start_on_gpus(mut cfg: RuntimeConfig, gpus: &[GpuDevice]) -> Result<Self, String> {
         cfg.ensure_mining_supported()?;
-        crate::backend::require_production_mining_backend(backend)?;
+        let first = gpus.first().ok_or("no GPU selected for mining")?;
+        for gpu in gpus {
+            crate::backend::require_production_mining_backend(gpu.backend)?;
+        }
         if cfg.payout_address.trim().is_empty() {
             return Err("mining payout address is required".into());
         }
@@ -2630,22 +2629,34 @@ impl RuntimeSupervisor {
 
         let initial_job =
             initial.to_mining_job_for_network(cfg.generation_id, &cfg.payout_address, cfg.network);
-        let search = SearchHandle::start_with_work_fee(
-            backend,
-            device_ordinal as usize,
+        let devices: Vec<(BackendKind, usize)> = gpus
+            .iter()
+            .map(|gpu| (gpu.backend, gpu.index as usize))
+            .collect();
+        let search = SearchHandle::start_devices_with_work_fee(
+            &devices,
             cfg.intensity,
             initial_job,
             cfg.token.fee_policy(cfg.network),
         )?;
         let initial_search = search.snapshot();
-        let telemetry = LiveTelemetrySampler::start(backend, device_ordinal);
+        let telemetry = LiveTelemetrySampler::start(crate::telemetry::telemetry_sources(gpus));
         let shutdown = ShutdownSignal::new(search.pause_handle());
         let initial_snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,
             network: cfg.network,
             fee_scheme: cfg.token.fee_policy(cfg.network).scheme,
-            gpu_backend: backend.as_str().into(),
-            gpu_device: device_ordinal,
+            gpu_backend: first.backend.as_str().into(),
+            gpu_device: first.index,
+            gpus: gpus
+                .iter()
+                .map(|gpu| RuntimeGpu {
+                    backend: gpu.backend,
+                    device: gpu.index,
+                    name: gpu.name.clone(),
+                    telemetry: GpuTelemetry::default(),
+                })
+                .collect(),
             generation_id: cfg.generation_id,
             payout_address: cfg.payout_address.clone(),
             endpoint: initial.url.clone(),
@@ -2715,7 +2726,11 @@ impl RuntimeSupervisor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        snapshot.gpu_telemetry = self.telemetry.snapshot();
+        let each = self.telemetry.snapshot_each();
+        snapshot.gpu_telemetry = crate::telemetry::combined_telemetry(&each);
+        for (gpu, telemetry) in snapshot.gpus.iter_mut().zip(each) {
+            gpu.telemetry = telemetry;
+        }
         snapshot
     }
 
@@ -4414,6 +4429,7 @@ mod tests {
             waiting_for_job: false,
             key_rotations: 0,
             last_error: None,
+            gpus: Vec::new(),
         }
     }
 

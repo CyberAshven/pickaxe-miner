@@ -61,8 +61,8 @@ type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
 #[derive(Debug, Clone)]
 pub struct SetupResult {
     pub config: RuntimeConfig,
-    pub backend: BackendKind,
-    pub device: u32,
+    /// The GPUs to mine on.
+    pub gpus: Vec<GpuDevice>,
     pub profile_name: String,
 }
 
@@ -314,9 +314,12 @@ impl SetupFlow {
         let mut config = RuntimeConfig::default();
         profile.settings.apply_to_runtime(&mut config)?;
         self.overrides.apply(&mut config)?;
-        if let (Some(backend), Some(device)) =
-            (profile.settings.backend.as_deref(), profile.settings.device)
-        {
+        let device = profile
+            .settings
+            .device
+            .as_ref()
+            .and_then(|saved| saved.indices().first().copied());
+        if let (Some(backend), Some(device)) = (profile.settings.backend.as_deref(), device) {
             if let Ok(backend) = BackendKind::parse(backend) {
                 if let Some(selected) = self
                     .devices
@@ -1218,10 +1221,12 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
             SetupAction::Continue => {}
             SetupAction::Cancel => return Ok(None),
             SetupAction::Complete => {
-                let selected = state.selected_device();
-                let (backend, device) = (selected.backend, selected.index);
-                let mut settings =
-                    SavedConfig::from_effective(backend.as_str(), Some(device), &state.config);
+                let selected = state.selected_device().clone();
+                let mut settings = SavedConfig::from_effective(
+                    selected.backend.as_str(),
+                    &crate::backend::DeviceSelection::Indices(vec![selected.index]),
+                    &state.config,
+                );
                 // Servers and nodes live in the shared per-network store.
                 settings.fulcrum = None;
                 settings.node_rpc = None;
@@ -1237,8 +1242,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
                     Ok(profile_name) => {
                         return Ok(Some(SetupResult {
                             config: state.config.clone(),
-                            backend,
-                            device,
+                            gpus: vec![selected],
                             profile_name,
                         }));
                     }
@@ -1413,6 +1417,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         state: SupervisorState::Mining,
         gpu_backend: "cuda".into(),
         gpu_device: 0,
+        gpus: Vec::new(),
         generation_id: 1,
         network: MiningNetwork::Mainnet,
         fee_scheme: crate::config::MiningToken::Photon
@@ -2007,9 +2012,14 @@ fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 .as_deref()
                 .and_then(|backend| BackendKind::parse(backend).ok())
                 .and_then(|backend| {
-                    state.devices.iter().find(|device| {
-                        device.backend == backend && Some(device.index) == settings.device
-                    })
+                    let first = settings
+                        .device
+                        .as_ref()
+                        .and_then(|saved| saved.indices().first().copied());
+                    state
+                        .devices
+                        .iter()
+                        .find(|device| device.backend == backend && Some(device.index) == first)
                 })
                 .map(|device| device.name.clone())
                 .unwrap_or_else(|| "GPU".into());
@@ -3388,6 +3398,7 @@ mod tests {
                 detail: String::new(),
                 integrated: false,
                 ready: true,
+                pci: None,
             },
             GpuDevice {
                 index: 0,
@@ -3398,6 +3409,7 @@ mod tests {
                 detail: String::new(),
                 integrated: false,
                 ready: true,
+                pci: None,
             },
         ]
     }
@@ -3413,6 +3425,7 @@ mod tests {
             state: SupervisorState::Mining,
             gpu_backend: "cuda".into(),
             gpu_device: 0,
+            gpus: Vec::new(),
             generation_id: 1,
             network: MiningNetwork::Mainnet,
             fee_scheme: crate::config::MiningToken::Photon
@@ -3623,7 +3636,11 @@ mod tests {
             .upsert(
                 None,
                 "Rig A",
-                SavedConfig::from_effective("cuda", Some(0), &saved),
+                SavedConfig::from_effective(
+                    "cuda",
+                    &crate::backend::DeviceSelection::Indices(vec![0]),
+                    &saved,
+                ),
             )
             .unwrap();
         setup.step = SetupStep::Profiles;
@@ -4437,6 +4454,7 @@ mod tests {
             state: SupervisorState::Mining,
             gpu_backend: "cuda".into(),
             gpu_device: 2,
+            gpus: Vec::new(),
             generation_id: 1,
             network: MiningNetwork::Mainnet,
             fee_scheme: crate::config::MiningToken::Photon

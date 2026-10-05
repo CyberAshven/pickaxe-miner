@@ -20,8 +20,15 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = ["auto", "cuda", "hip", "wgpu"])]
     pub backend: Option<String>,
 
+    /// GPUs to mine on: all, one number from `pickaxe devices`, or a list like 0,2.
+    /// By default every discrete GPU mines (integrated GPUs only when there is
+    /// no discrete GPU).
+    #[arg(long, global = true, value_name = "all|N|N,M", value_parser = crate::backend::DeviceSelection::parse)]
+    pub device: Option<crate::backend::DeviceSelection>,
+
+    /// Mine on integrated GPUs too when --device is all (the default).
     #[arg(long, global = true)]
-    pub device: Option<u32>,
+    pub include_integrated: bool,
 
     #[arg(
         long,
@@ -107,7 +114,10 @@ mod tests {
         .unwrap();
         assert!(matches!(cli.command, Some(Commands::Mine)));
         assert_eq!(cli.backend.as_deref(), Some("cuda"));
-        assert_eq!(cli.device, Some(0));
+        assert_eq!(
+            cli.device,
+            Some(crate::backend::DeviceSelection::Indices(vec![0]))
+        );
         assert_eq!(cli.intensity, Some(75));
         assert!(cli.no_tui);
 
@@ -134,6 +144,25 @@ mod tests {
     fn clap_rejects_out_of_range_intensity() {
         assert!(Cli::try_parse_from(["pickaxe", "mine", "--intensity", "9"]).is_err());
         assert!(Cli::try_parse_from(["pickaxe", "mine", "--intensity", "101"]).is_err());
+    }
+
+    #[test]
+    fn device_flag_takes_all_a_number_or_a_list() {
+        use crate::backend::DeviceSelection;
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.device);
+        assert_eq!(
+            parse(&["pickaxe", "mine", "--device", "all"]).unwrap(),
+            Some(DeviceSelection::Default)
+        );
+        assert_eq!(
+            parse(&["pickaxe", "mine", "--device", "0,2"]).unwrap(),
+            Some(DeviceSelection::Indices(vec![0, 2]))
+        );
+        assert!(parse(&["pickaxe", "mine", "--device", "gpu0"]).is_err());
+        assert!(parse(&["pickaxe", "mine", "--device", "1,1"]).is_err());
+        let cli = Cli::try_parse_from(["pickaxe", "mine", "--include-integrated"]).unwrap();
+        assert!(cli.include_integrated);
+        assert_eq!(cli.device, None);
     }
 
     #[test]

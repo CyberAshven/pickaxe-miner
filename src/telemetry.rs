@@ -3,7 +3,7 @@
 //! Telemetry is deliberately outside the mining/search worker. A slow or
 //! unavailable provider must never stall PHOTON candidate scheduling.
 
-use crate::backend::BackendKind;
+use crate::backend::{BackendKind, GpuDevice};
 use serde::Serialize;
 use serde_json::Value;
 use std::process::Command;
@@ -95,10 +95,10 @@ pub(crate) fn parse_nvidia_smi_line(line: &str) -> Option<GpuTelemetry> {
     })
 }
 
-/// Samples telemetry from the selected NVIDIA GPU.
-pub(crate) fn sample_nvidia_telemetry(device: u32) -> Option<GpuTelemetry> {
+/// Samples telemetry from one NVIDIA GPU, by nvidia-smi index or PCI address.
+pub(crate) fn sample_nvidia_telemetry(id: &str) -> Option<GpuTelemetry> {
     let output = Command::new("nvidia-smi")
-        .arg(format!("--id={device}"))
+        .arg(format!("--id={id}"))
         .arg("--query-gpu=utilization.gpu,power.draw,temperature.gpu,memory.used,clocks.gr,clocks.mem,fan.speed")
         .arg("--format=csv,noheader,nounits")
         .output()
@@ -192,12 +192,12 @@ pub(crate) fn parse_amd_smi_json(stdout: &str) -> Option<GpuTelemetry> {
     .then_some(telemetry)
 }
 
-/// Samples telemetry from the selected AMD GPU.
-pub(crate) fn sample_amd_telemetry(device: u32) -> Option<GpuTelemetry> {
+/// Samples telemetry from one AMD GPU, by amd-smi index or PCI address.
+pub(crate) fn sample_amd_telemetry(id: &str) -> Option<GpuTelemetry> {
     let output = Command::new("amd-smi")
         .arg("monitor")
         .arg("--gpu")
-        .arg(device.to_string())
+        .arg(id)
         .args([
             "--power-usage",
             "--temperature",
@@ -218,47 +218,140 @@ pub(crate) fn sample_amd_telemetry(device: u32) -> Option<GpuTelemetry> {
 /// Samples metrics from the selected GPU backend.
 pub(crate) fn sample_gpu_telemetry(backend: BackendKind, device: u32) -> Option<GpuTelemetry> {
     match backend {
-        BackendKind::Cuda => sample_nvidia_telemetry(device),
-        BackendKind::Hip => sample_amd_telemetry(device),
+        BackendKind::Cuda => sample_nvidia_telemetry(&device.to_string()),
+        BackendKind::Hip => sample_amd_telemetry(&device.to_string()),
         BackendKind::Auto | BackendKind::Wgpu => None,
     }
 }
 
+/// The vendor tool that reports one GPU, and the GPU id that tool takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelemetrySource {
+    Nvidia(String),
+    Amd(String),
+}
+
+impl TelemetrySource {
+    fn sample(&self) -> Option<GpuTelemetry> {
+        match self {
+            Self::Nvidia(id) => sample_nvidia_telemetry(id),
+            Self::Amd(id) => sample_amd_telemetry(id),
+        }
+    }
+}
+
+/// Picks each mining GPU's telemetry source: nvidia-smi for NVIDIA cards and
+/// amd-smi for AMD cards, whichever engine mines them. A lone CUDA or HIP GPU
+/// keeps its ordinal; otherwise the PCI address names the card, because the
+/// vendor tools number GPUs in their own order.
+pub fn telemetry_sources(gpus: &[GpuDevice]) -> Vec<Option<TelemetrySource>> {
+    let vendor_count = |vendor: &str| {
+        gpus.iter()
+            .filter(|gpu| gpu.vendor.eq_ignore_ascii_case(vendor))
+            .count()
+    };
+    gpus.iter()
+        .map(|gpu| {
+            let (native, source): (BackendKind, fn(String) -> TelemetrySource) =
+                if gpu.vendor.eq_ignore_ascii_case("NVIDIA") {
+                    (BackendKind::Cuda, TelemetrySource::Nvidia)
+                } else if gpu.vendor.eq_ignore_ascii_case("AMD") {
+                    (BackendKind::Hip, TelemetrySource::Amd)
+                } else {
+                    return None;
+                };
+            let lone_native = gpu.backend == native && vendor_count(&gpu.vendor) == 1;
+            let id = match gpu.pci {
+                Some(pci) if !lone_native => pci.to_string(),
+                _ if gpu.backend == native => gpu.index.to_string(),
+                _ => return None,
+            };
+            Some(source(id))
+        })
+        .collect()
+}
+
+/// Several GPUs' telemetry as one machine: total power and VRAM (only when
+/// every GPU reports them), the hottest temperature, the average utilization
+/// and the fastest fan. Clocks only mean something per GPU. A single GPU's
+/// telemetry is returned unchanged.
+pub fn combined_telemetry(gpus: &[GpuTelemetry]) -> GpuTelemetry {
+    if let [only] = gpus {
+        return only.clone();
+    }
+    let reported = |metric: fn(&GpuTelemetry) -> Option<f64>| {
+        gpus.iter().filter_map(metric).collect::<Vec<f64>>()
+    };
+    let total = |metric: fn(&GpuTelemetry) -> Option<f64>| {
+        let values = reported(metric);
+        (!values.is_empty() && values.len() == gpus.len()).then(|| values.iter().sum())
+    };
+    let highest =
+        |metric: fn(&GpuTelemetry) -> Option<f64>| reported(metric).into_iter().reduce(f64::max);
+    let utilization = reported(|gpu| gpu.gpu_utilization_percent);
+    GpuTelemetry {
+        samples: gpus.iter().map(|gpu| gpu.samples).max().unwrap_or(0),
+        gpu_utilization_percent: (!utilization.is_empty())
+            .then(|| utilization.iter().sum::<f64>() / utilization.len() as f64),
+        power_watts: total(|gpu| gpu.power_watts),
+        temperature_c: highest(|gpu| gpu.temperature_c),
+        vram_used_mib: total(|gpu| gpu.vram_used_mib),
+        graphics_clock_mhz: None,
+        memory_clock_mhz: None,
+        fan_percent: highest(|gpu| gpu.fan_percent),
+    }
+}
+
 pub struct LiveTelemetrySampler {
-    latest: Arc<Mutex<GpuTelemetry>>,
+    latest: Arc<Mutex<Vec<GpuTelemetry>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl LiveTelemetrySampler {
-    /// Starts the background GPU telemetry sampler.
-    pub fn start(backend: BackendKind, device: u32) -> Self {
-        let latest = Arc::new(Mutex::new(GpuTelemetry::default()));
+    /// Starts one background thread that samples every GPU about once a
+    /// second, in the order of `sources`.
+    pub fn start(sources: Vec<Option<TelemetrySource>>) -> Self {
+        let latest = Arc::new(Mutex::new(vec![GpuTelemetry::default(); sources.len()]));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_latest = Arc::clone(&latest);
         let worker_stop = Arc::clone(&stop);
-        let worker = thread::Builder::new()
-            .name(format!("pickaxe-telemetry-{}-{device}", backend.as_str()))
-            .spawn(move || {
-                while !worker_stop.load(Ordering::Relaxed) {
-                    if let Some(mut sample) = sample_gpu_telemetry(backend, device) {
-                        let mut latest = worker_latest
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        sample.samples = latest.samples.saturating_add(1);
-                        *latest = sample;
-                    }
+        let worker = if sources.iter().any(Option::is_some) {
+            thread::Builder::new()
+                .name("pickaxe-telemetry".into())
+                .spawn(move || {
+                    while !worker_stop.load(Ordering::Relaxed) {
+                        for (index, source) in sources.iter().enumerate() {
+                            if worker_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let Some(mut sample) =
+                                source.as_ref().and_then(TelemetrySource::sample)
+                            else {
+                                continue;
+                            };
+                            let mut latest = worker_latest
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            sample.samples = latest[index].samples.saturating_add(1);
+                            latest[index] = sample;
+                        }
 
-                    let mut slept = Duration::ZERO;
-                    while slept < LIVE_TELEMETRY_INTERVAL && !worker_stop.load(Ordering::Relaxed) {
-                        let remaining = LIVE_TELEMETRY_INTERVAL.saturating_sub(slept);
-                        let sleep_for = remaining.min(LIVE_TELEMETRY_SLEEP_SLICE);
-                        thread::sleep(sleep_for);
-                        slept += sleep_for;
+                        let mut slept = Duration::ZERO;
+                        while slept < LIVE_TELEMETRY_INTERVAL
+                            && !worker_stop.load(Ordering::Relaxed)
+                        {
+                            let remaining = LIVE_TELEMETRY_INTERVAL.saturating_sub(slept);
+                            let sleep_for = remaining.min(LIVE_TELEMETRY_SLEEP_SLICE);
+                            thread::sleep(sleep_for);
+                            slept += sleep_for;
+                        }
                     }
-                }
-            })
-            .ok();
+                })
+                .ok()
+        } else {
+            None
+        };
 
         Self {
             latest,
@@ -267,12 +360,17 @@ impl LiveTelemetrySampler {
         }
     }
 
-    /// Returns the most recent GPU telemetry sample.
-    pub fn snapshot(&self) -> GpuTelemetry {
+    /// Returns the most recent sample of each GPU, in the order given at start.
+    pub fn snapshot_each(&self) -> Vec<GpuTelemetry> {
         self.latest
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Returns the most recent telemetry of all GPUs together.
+    pub fn snapshot(&self) -> GpuTelemetry {
+        combined_telemetry(&self.snapshot_each())
     }
 
     /// Stops the GPU telemetry sampler and joins its thread.
@@ -393,5 +491,108 @@ mod tests {
         assert_eq!(format_photon_target("abcd"), "abcd");
         let target = "ab".repeat(32);
         assert_eq!(format_photon_target(&target), "abababab...abababab");
+    }
+
+    fn gpu(vendor: &str, backend: BackendKind, index: u32, bus: Option<u8>) -> GpuDevice {
+        GpuDevice {
+            index,
+            name: format!("{vendor} GPU"),
+            vendor: vendor.into(),
+            vram_bytes: None,
+            backend,
+            detail: String::new(),
+            integrated: false,
+            ready: true,
+            pci: bus.map(|bus| crate::backend::PciAddress {
+                domain: 0,
+                bus,
+                device: 0,
+                function: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn each_gpu_is_read_by_its_vendor_tool_and_named_by_pci_when_ambiguous() {
+        let nvidia = |id: &str| Some(TelemetrySource::Nvidia(id.into()));
+        let amd = |id: &str| Some(TelemetrySource::Amd(id.into()));
+        // A lone CUDA GPU keeps the ordinal used before several GPUs could mine.
+        assert_eq!(
+            telemetry_sources(&[gpu("NVIDIA", BackendKind::Cuda, 0, Some(1))]),
+            [nvidia("0")]
+        );
+        // Several NVIDIA cards, or one mined through wgpu, go by PCI address;
+        // an iGPU without a vendor tool or address has no telemetry.
+        assert_eq!(
+            telemetry_sources(&[
+                gpu("NVIDIA", BackendKind::Cuda, 0, Some(1)),
+                gpu("NVIDIA", BackendKind::Wgpu, 1, Some(2)),
+                gpu("AMD", BackendKind::Wgpu, 2, Some(0x65)),
+                gpu("AMD", BackendKind::Hip, 0, Some(3)),
+                gpu("Intel", BackendKind::Wgpu, 3, Some(0)),
+                gpu("AMD", BackendKind::Wgpu, 4, None),
+            ]),
+            [
+                nvidia("0000:01:00.0"),
+                nvidia("0000:02:00.0"),
+                amd("0000:65:00.0"),
+                amd("0000:03:00.0"),
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            telemetry_sources(&[
+                gpu("NVIDIA", BackendKind::Cuda, 0, None),
+                gpu("NVIDIA", BackendKind::Cuda, 1, None),
+            ]),
+            [nvidia("0"), nvidia("1")]
+        );
+    }
+
+    #[test]
+    fn combined_telemetry_reports_the_machine_and_keeps_a_single_gpu_unchanged() {
+        let card = GpuTelemetry {
+            samples: 4,
+            gpu_utilization_percent: Some(100.0),
+            power_watts: Some(120.0),
+            temperature_c: Some(70.0),
+            vram_used_mib: Some(900.0),
+            graphics_clock_mhz: Some(2500.0),
+            memory_clock_mhz: Some(12000.0),
+            fan_percent: Some(40.0),
+        };
+        assert_eq!(combined_telemetry(std::slice::from_ref(&card)), card);
+        assert_eq!(combined_telemetry(&[]), GpuTelemetry::default());
+
+        let other = GpuTelemetry {
+            samples: 3,
+            gpu_utilization_percent: Some(80.0),
+            power_watts: Some(30.0),
+            temperature_c: Some(75.0),
+            vram_used_mib: Some(100.0),
+            graphics_clock_mhz: Some(1800.0),
+            memory_clock_mhz: None,
+            fan_percent: None,
+        };
+        assert_eq!(
+            combined_telemetry(&[card.clone(), other]),
+            GpuTelemetry {
+                samples: 4,
+                gpu_utilization_percent: Some(90.0),
+                power_watts: Some(150.0),
+                temperature_c: Some(75.0),
+                vram_used_mib: Some(1000.0),
+                graphics_clock_mhz: None,
+                memory_clock_mhz: None,
+                fan_percent: Some(40.0),
+            }
+        );
+
+        // Power from only some GPUs would overstate efficiency: none is shown.
+        let silent = combined_telemetry(&[card, GpuTelemetry::default()]);
+        assert_eq!(silent.power_watts, None);
+        assert_eq!(silent.vram_used_mib, None);
+        assert_eq!(silent.temperature_c, Some(70.0));
     }
 }

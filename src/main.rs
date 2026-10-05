@@ -902,6 +902,25 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
     let efficiency = snapshot
         .gpu_telemetry
         .candidates_per_watt(snapshot.search.current_rate);
+    let gpus: Vec<serde_json::Value> = snapshot
+        .gpus
+        .iter()
+        .zip(&snapshot.search.gpus)
+        .map(|(gpu, search)| {
+            serde_json::json!({
+                "backend": gpu.backend.as_str(),
+                "device": gpu.device,
+                "name": gpu.name,
+                "status": gpu_status_name(search.status),
+                "candidates": search.candidates,
+                "rate": search.rate,
+                "active_rate": search.active_rate,
+                "winners": search.winners,
+                "last_error": search.last_error,
+                "gpu_telemetry": &gpu.telemetry,
+            })
+        })
+        .collect();
     serde_json::json!({
         "event": "status",
         "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
@@ -940,7 +959,36 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "last_error": snapshot.last_error,
         "gpu_telemetry": &snapshot.gpu_telemetry,
         "gpu_efficiency_candidates_per_watt": efficiency,
+        "gpus": gpus,
     })
+}
+
+/// Lower-case name of one GPU's mining status.
+fn gpu_status_name(status: search::GpuStatus) -> &'static str {
+    match status {
+        search::GpuStatus::Mining => "mining",
+        search::GpuStatus::Recovering => "recovering",
+        search::GpuStatus::Stopped => "stopped",
+    }
+}
+
+/// Each GPU's engine, recent rate and status, for a status line of a rig.
+fn runtime_gpus_text(snapshot: &runtime::RuntimeSnapshot) -> String {
+    snapshot
+        .gpus
+        .iter()
+        .zip(&snapshot.search.gpus)
+        .map(|(gpu, search)| {
+            format!(
+                "{}:{} {} {}",
+                gpu.backend.as_str(),
+                gpu.device,
+                crate::telemetry::format_hash_rate(search.active_rate),
+                gpu_status_name(search.status)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Formats a runtime metric when telemetry is present.
@@ -990,6 +1038,9 @@ fn print_runtime_snapshot(snapshot: &runtime::RuntimeSnapshot, json: bool) {
             runtime_metric(telemetry.vram_used_mib, "MiB"),
             runtime_metric(efficiency, " cand/s/W"),
         );
+        if snapshot.gpus.len() > 1 {
+            println!("gpus={}", runtime_gpus_text(snapshot));
+        }
     }
 }
 
@@ -1020,8 +1071,7 @@ fn spawn_intensity_commands() -> std::sync::mpsc::Receiver<u8> {
 /// Runs the mining supervisor without the terminal UI.
 fn run_headless_mining(
     cfg: RuntimeConfig,
-    backend: backend::BackendKind,
-    device_ordinal: u32,
+    gpus: &[backend::GpuDevice],
     json: bool,
     use_tui: bool,
 ) -> Result<Option<(u8, String)>, String> {
@@ -1034,8 +1084,7 @@ fn run_headless_mining(
     } else {
         Vec::new()
     };
-    let supervisor =
-        runtime::RuntimeSupervisor::start_on_backend_device(cfg, backend, device_ordinal)?;
+    let supervisor = runtime::RuntimeSupervisor::start_on_gpus(cfg, gpus)?;
     if use_tui {
         let final_snapshot = tui::run(supervisor, tui_devices)?;
         print_runtime_snapshot(&final_snapshot, false);
@@ -1207,19 +1256,24 @@ fn main() {
         }
     };
     let mut effective_backend = "auto".to_string();
-    let mut effective_device = None;
+    let mut effective_device = backend::DeviceSelection::Default;
+    let mut include_integrated = args.include_integrated;
     if let Some(config) = &saved_config {
         if let Some(value) = &config.backend {
             effective_backend = value.clone();
         }
-        effective_device = config.device;
+        if let Some(saved) = &config.device {
+            effective_device = saved.selection();
+        }
+        include_integrated |= config.include_integrated == Some(true);
     }
     if let Some(value) = &args.backend {
         effective_backend = value.clone();
     }
-    if let Some(value) = args.device {
-        effective_device = Some(value);
+    if let Some(value) = &args.device {
+        effective_device = value.clone();
     }
+    let effective_device = effective_device.with_integrated(include_integrated);
     let backend_kind = match backend::BackendKind::parse(&effective_backend) {
         Ok(kind) => kind,
         Err(error) => {
@@ -1250,7 +1304,10 @@ fn main() {
             }
         }
         cli::Commands::SelfTest => {
-            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
+            let selected = match effective_device
+                .single_index()
+                .and_then(|index| backend::resolve_mining_device(backend_kind, index))
+            {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
@@ -1269,7 +1326,10 @@ fn main() {
             seconds,
             ui_compare,
         } => {
-            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
+            let selected = match effective_device
+                .single_index()
+                .and_then(|index| backend::resolve_mining_device(backend_kind, index))
+            {
                 Ok(device) => device,
                 Err(error) => {
                     eprintln!("error: {error}");
@@ -1299,7 +1359,9 @@ fn main() {
                             "backend": effective_backend,
                             "network": cfg.network.as_str(),
                             "token": cfg.token.as_str(),
-                            "device": effective_device,
+                            "device": config::SavedDevices::from_selection(&effective_device),
+                            "include_integrated":
+                                effective_device == backend::DeviceSelection::WithIntegrated,
                             "intensity": cfg.intensity,
                             "address": cfg.payout_address,
                             "fulcrum": cfg.fulcrum_url,
@@ -1313,7 +1375,7 @@ fn main() {
                     println!("backend: {}", effective_backend);
                     println!("network: {}", cfg.network.as_str());
                     println!("token: {}", cfg.token.as_str());
-                    println!("device: {:?}", effective_device);
+                    println!("device: {effective_device}");
                     println!("intensity: {}%", cfg.intensity);
                     println!("address: {}", cfg.payout_address);
                     println!("source: {}", cfg.source.as_str());
@@ -1328,8 +1390,11 @@ fn main() {
                 }
             }
             cli::ConfigCommand::Save => {
-                let saved =
-                    config::SavedConfig::from_effective(&effective_backend, effective_device, &cfg);
+                let saved = config::SavedConfig::from_effective(
+                    &effective_backend,
+                    &effective_device,
+                    &cfg,
+                );
                 if let Err(error) = saved.save(&config_path) {
                     eprintln!("error: {error}");
                     exit_after_error(2);
@@ -1403,14 +1468,16 @@ fn main() {
                     exit_after_error(2);
                 }
             }
-            let selected = match backend::resolve_mining_device(backend_kind, effective_device) {
-                Ok(device) => device,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    exit_after_error(2);
-                }
-            };
-            let (cfg, selected_backend, selected_device, profile_name) = match startup {
+            let selected_gpus =
+                match backend::resolve_mining_devices(backend_kind, &effective_device) {
+                    Ok(gpus) => gpus,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        exit_after_error(2);
+                    }
+                };
+            let selected = &selected_gpus[0];
+            let (cfg, gpus, profile_name) = match startup {
                 MineStartup::InteractiveSetup => {
                     let devices = match backend::list_devices(backend_kind) {
                         Ok(devices) => devices,
@@ -1456,7 +1523,7 @@ fn main() {
                     let setup = match tui::run_setup(
                         cfg,
                         devices,
-                        &selected,
+                        selected,
                         &profiles_path,
                         profiles,
                         &sources_path,
@@ -1470,17 +1537,12 @@ fn main() {
                             exit_after_error(1);
                         }
                     };
-                    (
-                        setup.config,
-                        setup.backend,
-                        setup.device,
-                        Some(setup.profile_name),
-                    )
+                    (setup.config, setup.gpus, Some(setup.profile_name))
                 }
-                MineStartup::Direct => (cfg, selected.backend, selected.index, None),
+                MineStartup::Direct => (cfg, selected_gpus, None),
             };
             let use_tui = !(args.no_tui || args.json);
-            match run_headless_mining(cfg, selected_backend, selected_device, args.json, use_tui) {
+            match run_headless_mining(cfg, &gpus, args.json, use_tui) {
                 Ok(Some((intensity, address))) => {
                     if let Some(name) = profile_name {
                         if let Err(error) =
@@ -1560,7 +1622,11 @@ mod tests {
             .upsert(
                 None,
                 "Rig A",
-                config::SavedConfig::from_effective("cuda", Some(0), &runtime),
+                config::SavedConfig::from_effective(
+                    "cuda",
+                    &backend::DeviceSelection::Indices(vec![0]),
+                    &runtime,
+                ),
             )
             .unwrap();
         profiles.save(&path).unwrap();
@@ -1690,6 +1756,20 @@ mod tests {
             state: runtime::SupervisorState::Mining,
             gpu_backend: "cuda".into(),
             gpu_device: 0,
+            gpus: vec![
+                runtime::RuntimeGpu {
+                    backend: backend::BackendKind::Cuda,
+                    device: 0,
+                    name: "NVIDIA GeForce RTX 5070 Ti Laptop GPU".into(),
+                    telemetry: telemetry::GpuTelemetry::default(),
+                },
+                runtime::RuntimeGpu {
+                    backend: backend::BackendKind::Wgpu,
+                    device: 1,
+                    name: "AMD Radeon(TM) 610M".into(),
+                    telemetry: telemetry::GpuTelemetry::default(),
+                },
+            ],
             generation_id: 2,
             network: config::MiningNetwork::Mainnet,
             fee_scheme: config::MiningToken::Photon
@@ -1731,6 +1811,28 @@ mod tests {
                 last_error: Some(
                     "GPU winner rejected by host verification: HASH256 mismatch".into(),
                 ),
+                gpus: vec![
+                    search::GpuSearchStats {
+                        backend: backend::BackendKind::Cuda,
+                        device: 0,
+                        candidates: 60_000,
+                        rate: 60_000.0,
+                        active_rate: 2_400_000_000.0,
+                        winners: 0,
+                        status: search::GpuStatus::Mining,
+                        last_error: None,
+                    },
+                    search::GpuSearchStats {
+                        backend: backend::BackendKind::Wgpu,
+                        device: 1,
+                        candidates: 5_536,
+                        rate: 5_536.0,
+                        active_rate: 30_000_000.0,
+                        winners: 0,
+                        status: search::GpuStatus::Recovering,
+                        last_error: Some("device lost".into()),
+                    },
+                ],
             },
             gpu_telemetry: telemetry::GpuTelemetry {
                 samples: 3,
@@ -1765,6 +1867,15 @@ mod tests {
         assert_eq!(status["gpu_telemetry"]["samples"], 3);
         assert_eq!(status["gpu_telemetry"]["gpu_utilization_percent"], 77.0);
         assert_eq!(status["gpu_efficiency_candidates_per_watt"], 1_000.0);
+        assert_eq!(status["gpus"][1]["backend"], "wgpu");
+        assert_eq!(status["gpus"][1]["name"], "AMD Radeon(TM) 610M");
+        assert_eq!(status["gpus"][1]["status"], "recovering");
+        assert_eq!(status["gpus"][1]["last_error"], "device lost");
+        assert_eq!(status["gpus"][0]["active_rate"], 2_400_000_000.0);
+        assert_eq!(
+            runtime_gpus_text(&snapshot),
+            "cuda:0 2.40 GH/s mining; wgpu:1 30.00 MH/s recovering"
+        );
     }
 
     #[test]
@@ -1784,7 +1895,10 @@ mod tests {
         .unwrap();
         let cfg = runtime_config_from_cli(&args).unwrap();
         assert_eq!(mine_startup(&args), MineStartup::Direct);
-        assert_eq!(args.device, Some(0));
+        assert_eq!(
+            args.device,
+            Some(backend::DeviceSelection::Indices(vec![0]))
+        );
         assert_eq!(cfg.intensity, 60);
         assert_eq!(cfg.payout_address, crate::config::DONATION_ADDRESS);
     }

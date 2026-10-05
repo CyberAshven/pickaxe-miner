@@ -711,6 +711,7 @@ mod tests {
             detail: String::new(),
             integrated: false,
             ready: true,
+            pci: None,
         }
     }
 

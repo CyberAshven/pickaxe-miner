@@ -1,5 +1,6 @@
 //! Distribution and runtime config. Each token selects its own fee policy.
 
+use crate::backend_kind::DeviceSelection;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -478,13 +479,51 @@ fn normalize_endpoint_list(
     Ok(Some(unique.join(", ")))
 }
 
+/// The GPUs a saved configuration mines on: one GPU number (the form older
+/// versions saved) or a list. Absent means every discrete GPU.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SavedDevices {
+    One(u32),
+    List(Vec<u32>),
+}
+
+impl SavedDevices {
+    /// The saved form of a GPU choice; `None` for every GPU.
+    pub fn from_selection(selection: &DeviceSelection) -> Option<Self> {
+        match selection {
+            DeviceSelection::Indices(indices) => match indices.as_slice() {
+                [index] => Some(Self::One(*index)),
+                _ => Some(Self::List(indices.clone())),
+            },
+            DeviceSelection::Default | DeviceSelection::WithIntegrated => None,
+        }
+    }
+
+    /// The saved GPU numbers.
+    pub fn indices(&self) -> &[u32] {
+        match self {
+            Self::One(index) => std::slice::from_ref(index),
+            Self::List(indices) => indices,
+        }
+    }
+
+    /// The GPU choice this saved value names.
+    pub fn selection(&self) -> DeviceSelection {
+        DeviceSelection::Indices(self.indices().to_vec())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SavedConfig {
     pub network: Option<String>,
     pub token: Option<String>,
     pub backend: Option<String>,
-    pub device: Option<u32>,
+    pub device: Option<SavedDevices>,
+    /// Mine on integrated GPUs too when `device` names no GPU.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_integrated: Option<bool>,
     pub intensity: Option<u8>,
     pub address: Option<String>,
     pub fulcrum: Option<String>,
@@ -523,6 +562,18 @@ impl SavedConfig {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(value) = &self.backend {
             crate::backend_kind::BackendKind::parse(value)?;
+        }
+        if let Some(SavedDevices::List(indices)) = &self.device {
+            if indices.is_empty() {
+                return Err("device list is empty; omit device to mine on every GPU".into());
+            }
+            if let Some(twice) = indices
+                .iter()
+                .enumerate()
+                .find_map(|(position, index)| indices[..position].contains(index).then_some(index))
+            {
+                return Err(format!("device lists GPU {twice} twice"));
+            }
         }
         let mut runtime = RuntimeConfig::default();
         self.apply_to_runtime(&mut runtime)?;
@@ -565,8 +616,20 @@ impl SavedConfig {
         write_private_config(path, &bytes)
     }
 
+    /// The saved GPU choice, integrated GPUs included when saved so.
+    pub fn device_selection(&self) -> DeviceSelection {
+        self.device
+            .as_ref()
+            .map_or_else(DeviceSelection::default, SavedDevices::selection)
+            .with_integrated(self.include_integrated == Some(true))
+    }
+
     /// Captures the effective runtime settings for persistence.
-    pub fn from_effective(backend: &str, device: Option<u32>, runtime: &RuntimeConfig) -> Self {
+    pub fn from_effective(
+        backend: &str,
+        devices: &DeviceSelection,
+        runtime: &RuntimeConfig,
+    ) -> Self {
         let address = if runtime.payout_address.is_empty() {
             None
         } else {
@@ -576,7 +639,8 @@ impl SavedConfig {
             network: Some(runtime.network.as_str().to_string()),
             token: Some(runtime.token.as_str().to_string()),
             backend: Some(backend.to_string()),
-            device,
+            device: SavedDevices::from_selection(devices),
+            include_integrated: (*devices == DeviceSelection::WithIntegrated).then_some(true),
             intensity: Some(runtime.intensity),
             address,
             fulcrum: runtime.fulcrum_url.clone(),
@@ -1198,14 +1262,14 @@ mod tests {
             .upsert(
                 None,
                 "Chip",
-                SavedConfig::from_effective("cuda", Some(0), &chipnet),
+                SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &chipnet),
             )
             .unwrap();
         profiles
             .upsert(
                 None,
                 "Main",
-                SavedConfig::from_effective("cuda", Some(0), &mainnet),
+                SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &mainnet),
             )
             .unwrap();
 
@@ -1224,14 +1288,19 @@ mod tests {
         ));
         assert!(!sources.adopt_profile_sources(&mut profiles));
 
-        let base = SavedConfig::from_effective("cuda", Some(0), &chipnet);
+        let base =
+            SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &chipnet);
         assert!(
             !sources.adopt_saved_config(&base),
             "already saved entries add nothing"
         );
         let mut other = mainnet.clone();
         other.set_fulcrum_url("wss://base.test:50004").unwrap();
-        assert!(sources.adopt_saved_config(&SavedConfig::from_effective("cuda", Some(0), &other)));
+        assert!(sources.adopt_saved_config(&SavedConfig::from_effective(
+            "cuda",
+            &DeviceSelection::Indices(vec![0]),
+            &other
+        )));
         assert_eq!(
             sources.list(MiningNetwork::Mainnet, ConnectionKind::Fulcrum),
             ["wss://base.test:50004"]
@@ -1245,7 +1314,11 @@ mod tests {
             .upsert(
                 None,
                 "Only",
-                SavedConfig::from_effective("cuda", Some(0), &RuntimeConfig::default()),
+                SavedConfig::from_effective(
+                    "cuda",
+                    &DeviceSelection::Indices(vec![0]),
+                    &RuntimeConfig::default(),
+                ),
             )
             .unwrap();
         assert!(profiles.remove(1).is_err());
@@ -1290,7 +1363,7 @@ mod tests {
             .upsert(
                 None,
                 "",
-                SavedConfig::from_effective("cuda", Some(0), &runtime),
+                SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &runtime),
             )
             .unwrap();
         assert!(random_name.starts_with("Miner "));
@@ -1500,7 +1573,8 @@ mod tests {
         runtime
             .set_node_url("http://user:secret-pass@127.0.0.1:8332")
             .unwrap();
-        let saved = SavedConfig::from_effective("cuda", Some(0), &runtime);
+        let saved =
+            SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &runtime);
         saved.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("secret-pass"), "{text}");
@@ -1508,7 +1582,8 @@ mod tests {
         runtime
             .set_node_url("http://user:second-secret@127.0.0.1:8332")
             .unwrap();
-        let replaced = SavedConfig::from_effective("cuda", Some(0), &runtime);
+        let replaced =
+            SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &runtime);
         replaced.save(&path).unwrap();
         let replaced_text = fs::read_to_string(&path).unwrap();
         assert!(replaced_text.contains("second-secret"), "{replaced_text}");
@@ -1627,7 +1702,7 @@ mod tests {
         assert!(serde_json::from_str::<SavedConfig>(r#"{"donation_bps":0}"#).is_err());
         let mut cfg = RuntimeConfig::default();
         cfg.set_payout(PAYOUT.into()).unwrap();
-        let saved = SavedConfig::from_effective("cuda", Some(0), &cfg);
+        let saved = SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &cfg);
         let value = serde_json::to_value(&saved).unwrap();
         assert!(value.get("donation_bps").is_none());
         assert!(value.get("donation").is_none());
