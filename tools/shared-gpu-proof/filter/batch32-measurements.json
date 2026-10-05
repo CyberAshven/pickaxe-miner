@@ -1,0 +1,110 @@
+{
+  "device": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+  "browser": "Brave, WebGPU",
+  "conditions": "One GPU workload; 100% intensity; offline target-1 jobs; key/recipient rotation; 20 second warmups; 45 second trials; B/S, S/B, B/S; no clock or power changes",
+  "existing_wasm_sha256": "434a9966e8c096e42c7f6992c136bbb75a1bf45e8f69c27144cd9d3b24d0ca78",
+  "legacy32_wasm_sha256": "6e44117493e6bac3046cbfe5ee32aba67c4315328de93632079a88cd47931bc5",
+  "shared32_wasm_sha256": "71a148ca3fd3898a4ea822151741e3ea4694f52d35f60b67715b80870ff5a42c",
+  "existing16_vs_shared32": [
+    {
+      "variant": "baseline",
+      "round": 1,
+      "candidates": 38889586688,
+      "seconds": 45.00530000007153,
+      "mh_s": 864.1112644052632,
+      "batches": 2324
+    },
+    {
+      "variant": "shared",
+      "round": 1,
+      "candidates": 44728057856,
+      "seconds": 45.02880000007153,
+      "mh_s": 993.3211157287991,
+      "batches": 1336
+    },
+    {
+      "variant": "shared",
+      "round": 2,
+      "candidates": 43553652736,
+      "seconds": 45.1245,
+      "mh_s": 965.1885945772253,
+      "batches": 1301
+    },
+    {
+      "variant": "baseline",
+      "round": 2,
+      "candidates": 36809211904,
+      "seconds": 45.18209999990463,
+      "mh_s": 814.6857251893493,
+      "batches": 2201
+    },
+    {
+      "variant": "baseline",
+      "round": 3,
+      "candidates": 38050725888,
+      "seconds": 45.0075,
+      "mh_s": 845.4307812697884,
+      "batches": 2270
+    },
+    {
+      "variant": "shared",
+      "round": 3,
+      "candidates": 43587207168,
+      "seconds": 45.40020000004768,
+      "mh_s": 960.0664130984935,
+      "batches": 1301
+    }
+  ],
+  "legacy32_vs_shared32": [
+    {
+      "variant": "baseline",
+      "round": 1,
+      "candidates": 42781900800,
+      "seconds": 45.02579999995232,
+      "mh_s": 950.1641458906961,
+      "batches": 1277
+    },
+    {
+      "variant": "shared",
+      "round": 1,
+      "candidates": 43184553984,
+      "seconds": 45.00029999995232,
+      "mh_s": 959.6503575319666,
+      "batches": 1291
+    },
+    {
+      "variant": "shared",
+      "round": 2,
+      "candidates": 42916118528,
+      "seconds": 45.00219999992847,
+      "mh_s": 953.6449002063947,
+      "batches": 1282
+    },
+    {
+      "variant": "baseline",
+      "round": 2,
+      "candidates": 42882564096,
+      "seconds": 45.0025,
+      "mh_s": 952.8929303038722,
+      "batches": 1279
+    },
+    {
+      "variant": "baseline",
+      "round": 3,
+      "candidates": 42882564096,
+      "seconds": 45.0265,
+      "mh_s": 952.3850198438698,
+      "batches": 1279
+    },
+    {
+      "variant": "shared",
+      "round": 3,
+      "candidates": 42748346368,
+      "seconds": 45.011100000023845,
+      "mh_s": 949.7289861384714,
+      "batches": 1277
+    }
+  ],
+  "errors": [],
+  "scope": "Completed valid candidates counted once, not live payout rate or native CUDA speed; matched filters at 32M are within measurement noise."
+}

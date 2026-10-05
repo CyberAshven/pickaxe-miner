@@ -17,3 +17,8 @@ __pycache__/
 !cuda/build/stage_a_rfc6979.ptx
 !cuda/build/photon_c3_dual.ptx
 
+
+/dist/
+
+/web/node_modules/
+/web/pkg/

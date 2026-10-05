@@ -19,3 +19,6 @@ hmac = { version = "0.13", default-features = false }
 [dev-dependencies]
 num-bigint = "0.5"
 secp256k1 = "0.33.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }

@@ -1,5 +1,7 @@
 ﻿# Pickaxe GPU ship path (locked 2026-09-20)
 
+> Historical plan. For the engines that ship now, see the [GPU code map](gpu-sources.md).
+
 Researchy brief + CoS product lock.
 
 ## Ship path (Windows RTX)

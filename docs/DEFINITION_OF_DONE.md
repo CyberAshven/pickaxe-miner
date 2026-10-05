@@ -9,12 +9,13 @@ GPU-only product. No CPU mining fallback.
 - Linux + AMD
 
 ## Backends
-`--backend auto|cuda|hip|wgpu` (default auto). CUDA and HIP are the validated
-production mining engines. WGPU hardware adapter discovery is part of the CLI
-surface and must exclude CPU/software adapters. Production `--backend wgpu`
-mining remains fail-closed until the authoritative PHOTON WGSL path is wired,
-verified against the reference vectors, and validated on supported hardware.
-That validated WGPU mining path remains a Definition-of-Done blocker.
+`--backend auto|cuda|hip|wgpu` (default auto). CUDA, HIP and the portable
+WGPU engine mine in production. WGPU hardware adapter discovery must exclude
+CPU/software adapters. The WGPU engine runs the stages generated from the
+shared Rust engine; its T2 end-to-end oracle checks every candidate against an
+independent CPU reconstruction on Vulkan, DirectX 12 and browser WebGPU (see
+[GPU code map](gpu-sources.md)). Still to validate on hardware: Intel GPUs,
+Linux GPUs, Apple Silicon and discrete AMD GPUs.
 
 ## Intensity
 10–100% (default 100). Must scale **real GPU work** live. Pause separate (Space/P ≠ 10%).

@@ -1,9 +1,12 @@
 use crate::{
-    backend::{BackendKind, GpuDevice},
+    backend::{BackendKind, DeviceSelection, GpuDevice},
     config::{
-        ConnectionKind, MiningNetwork, MiningProfiles, RuntimeConfig, SavedConfig, SharedSources,
+        ConnectionKind, MiningNetwork, MiningProfiles, MiningToken, RuntimeConfig, SavedConfig,
+        SharedSources,
     },
+    protocol::ProofRule,
     runtime::{RuntimeEvent, RuntimeSnapshot, RuntimeSupervisor, SupervisorState},
+    search::GpuStatus,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -57,22 +60,23 @@ const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
 type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 #[derive(Debug, Clone)]
-pub(crate) struct SetupResult {
+pub struct SetupResult {
     pub config: RuntimeConfig,
-    pub backend: BackendKind,
-    pub device: u32,
+    /// The GPUs to mine on.
+    pub gpus: Vec<GpuDevice>,
     pub profile_name: String,
 }
 
 #[derive(Default)]
-pub(crate) struct SetupOverrides {
+pub struct SetupOverrides {
     pub network: Option<MiningNetwork>,
     pub token: Option<String>,
     pub intensity: Option<u8>,
     pub fulcrum: Option<String>,
     pub node_rpc: Option<String>,
     pub source: Option<String>,
-    pub device: Option<(BackendKind, u32)>,
+    /// GPUs chosen on the command line, as (engine, ordinal) pairs.
+    pub gpus: Option<Vec<(BackendKind, u32)>>,
 }
 
 impl SetupOverrides {
@@ -107,6 +111,8 @@ enum SetupStep {
     Token,
     Settings,
     Connections,
+    /// The GPU list, opened from the Settings page.
+    Gpus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,27 +178,54 @@ struct SetupFlow {
     connection_kind: ConnectionKind,
     connection_selected: usize,
     devices: Vec<GpuDevice>,
+    /// How `devices` was listed. With `Auto` it holds each physical GPU once
+    /// and a saved choice names GPUs by position, as `--device` does; with a
+    /// backend it is that backend's list and a choice names its ordinals.
+    prefer: BackendKind,
+    /// Which of `devices` mine.
+    chosen: Vec<bool>,
+    /// The GPU under the cursor on the GPU list.
     selected: usize,
     config: RuntimeConfig,
     status_line: String,
 }
 
+/// The GPUs that mine unless chosen otherwise: every discrete GPU, or every
+/// GPU when none is discrete.
+fn default_choice(devices: &[GpuDevice]) -> Vec<bool> {
+    let any_discrete = devices.iter().any(|device| !device.integrated);
+    devices
+        .iter()
+        .map(|device| !device.integrated || !any_discrete)
+        .collect()
+}
+
 impl SetupFlow {
-    /// Creates a SetupFlow for the terminal interface.
+    /// Creates a SetupFlow for the terminal interface; `default_gpus` start
+    /// ticked.
     fn new(
         config: RuntimeConfig,
         devices: Vec<GpuDevice>,
-        default_device: &GpuDevice,
+        prefer: BackendKind,
+        default_gpus: &[GpuDevice],
     ) -> Result<Self, String> {
         if devices.is_empty() {
             return Err("no validated production GPU device found".into());
         }
-        let selected = devices
+        let ticked: Vec<bool> = devices
             .iter()
-            .position(|device| {
-                device.backend == default_device.backend && device.index == default_device.index
+            .map(|device| {
+                default_gpus
+                    .iter()
+                    .any(|gpu| gpu.backend == device.backend && gpu.index == device.index)
             })
-            .unwrap_or(0);
+            .collect();
+        let chosen = if ticked.contains(&true) {
+            ticked
+        } else {
+            default_choice(&devices)
+        };
+        let selected = chosen.iter().position(|chosen| *chosen).unwrap_or(0);
         Ok(Self {
             step: SetupStep::Hardware,
             profiles: MiningProfiles::default(),
@@ -215,15 +248,98 @@ impl SetupFlow {
             connection_kind: ConnectionKind::Fulcrum,
             connection_selected: 0,
             devices,
+            prefer,
+            chosen,
             selected,
             config,
             status_line: String::new(),
         })
     }
 
-    /// Returns the GPU device selected in the setup wizard.
-    fn selected_device(&self) -> &GpuDevice {
-        &self.devices[self.selected]
+    /// The GPUs ticked in the setup wizard, in list order.
+    fn chosen_gpus(&self) -> Vec<GpuDevice> {
+        self.devices
+            .iter()
+            .zip(&self.chosen)
+            .filter(|(_, chosen)| **chosen)
+            .map(|(device, _)| device.clone())
+            .collect()
+    }
+
+    /// Which listed GPUs a saved or command-line choice names; `None` when
+    /// it names none of them.
+    fn choice_for(&self, backend: BackendKind, selection: &DeviceSelection) -> Option<Vec<bool>> {
+        let chosen = match selection {
+            DeviceSelection::Default => default_choice(&self.devices),
+            DeviceSelection::WithIntegrated => vec![true; self.devices.len()],
+            DeviceSelection::Indices(indices) => self
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(position, device)| {
+                    if backend == BackendKind::Auto {
+                        indices.contains(&(position as u32))
+                    } else {
+                        device.backend == backend && indices.contains(&device.index)
+                    }
+                })
+                .collect(),
+        };
+        chosen.contains(&true).then_some(chosen)
+    }
+
+    /// Ticks exactly `chosen` and puts the cursor on the first ticked GPU.
+    fn set_choice(&mut self, chosen: Vec<bool>) {
+        self.selected = chosen.iter().position(|chosen| *chosen).unwrap_or(0);
+        self.chosen = chosen;
+    }
+
+    /// The ticked GPUs as a saved choice. Every discrete GPU, or every GPU,
+    /// stays a general choice, so a GPU added later mines too.
+    fn saved_choice(&self) -> DeviceSelection {
+        if self.chosen == default_choice(&self.devices) {
+            DeviceSelection::Default
+        } else if self.chosen.iter().all(|chosen| *chosen) {
+            DeviceSelection::WithIntegrated
+        } else {
+            DeviceSelection::Indices(
+                self.devices
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| self.chosen[*position])
+                    .map(|(position, device)| {
+                        if self.prefer == BackendKind::Auto {
+                            position as u32
+                        } else {
+                            device.index
+                        }
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    /// The GPUs a saved profile mines on, for the profile list.
+    fn profile_gpus(&self, settings: &SavedConfig) -> String {
+        let backend = settings
+            .backend
+            .as_deref()
+            .and_then(|value| BackendKind::parse(value).ok())
+            .unwrap_or(BackendKind::Auto);
+        let Some(chosen) = self.choice_for(backend, &settings.device_selection()) else {
+            return "GPU".into();
+        };
+        let names: Vec<&str> = self
+            .devices
+            .iter()
+            .zip(&chosen)
+            .filter(|(_, chosen)| **chosen)
+            .map(|(device, _)| device.name.as_str())
+            .collect();
+        match names.as_slice() {
+            [name] => (*name).to_string(),
+            names => format!("{} GPUs", names.len()),
+        }
     }
 
     fn matching_tokens(&self) -> Vec<crate::config::MiningToken> {
@@ -312,26 +428,25 @@ impl SetupFlow {
         let mut config = RuntimeConfig::default();
         profile.settings.apply_to_runtime(&mut config)?;
         self.overrides.apply(&mut config)?;
-        if let (Some(backend), Some(device)) =
-            (profile.settings.backend.as_deref(), profile.settings.device)
-        {
-            if let Ok(backend) = BackendKind::parse(backend) {
-                if let Some(selected) = self
-                    .devices
-                    .iter()
-                    .position(|candidate| candidate.backend == backend && candidate.index == device)
-                {
-                    self.selected = selected;
-                }
-            }
+        // Profiles saved before several GPUs could mine name one engine and
+        // ordinal, such as cuda and 0; they still find that GPU.
+        let backend = profile
+            .settings
+            .backend
+            .as_deref()
+            .and_then(|value| BackendKind::parse(value).ok())
+            .unwrap_or(BackendKind::Auto);
+        if let Some(chosen) = self.choice_for(backend, &profile.settings.device_selection()) {
+            self.set_choice(chosen);
         }
-        if let Some((backend, device)) = self.overrides.device {
-            if let Some(selected) = self
+        if let Some(gpus) = &self.overrides.gpus {
+            let chosen: Vec<bool> = self
                 .devices
                 .iter()
-                .position(|candidate| candidate.backend == backend && candidate.index == device)
-            {
-                self.selected = selected;
+                .map(|device| gpus.contains(&(device.backend, device.index)))
+                .collect();
+            if chosen.contains(&true) {
+                self.set_choice(chosen);
             }
         }
         self.config = config;
@@ -424,7 +539,30 @@ impl SetupFlow {
             SetupStep::Token => self.handle_token_key(key),
             SetupStep::Settings => self.handle_settings_key(key),
             SetupStep::Connections => self.handle_connections_key(key),
+            SetupStep::Gpus => self.handle_gpus_key(key),
         }
+    }
+
+    /// The GPU list: Space ticks or unticks a GPU, A ticks every GPU.
+    fn handle_gpus_key(&mut self, key: KeyEvent) -> SetupAction {
+        let count = self.devices.len();
+        self.status_line.clear();
+        match key.code {
+            KeyCode::Up => self.selected = (self.selected + count - 1) % count,
+            KeyCode::Down => self.selected = (self.selected + 1) % count,
+            KeyCode::Char(' ') | KeyCode::Char('x') | KeyCode::Char('X') => {
+                let tick = !self.chosen[self.selected];
+                if !tick && self.chosen.iter().filter(|chosen| **chosen).count() == 1 {
+                    self.status_line = "At least one GPU must mine.".into();
+                } else {
+                    self.chosen[self.selected] = tick;
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => self.chosen = vec![true; count],
+            KeyCode::Enter | KeyCode::Esc => self.open_settings(SettingsRow::Gpu),
+            _ => {}
+        }
+        SetupAction::Continue
     }
 
     fn handle_profiles_key(&mut self, key: KeyEvent) -> SetupAction {
@@ -569,13 +707,25 @@ impl SetupFlow {
             KeyCode::Left | KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('-') => {
                 let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
                 match row {
-                    SettingsRow::Gpu => {
+                    // Left/Right moves a single choice to the next GPU; with
+                    // several ticked, the list keeps them.
+                    SettingsRow::Gpu
+                        if self.chosen.iter().filter(|chosen| **chosen).count() == 1 =>
+                    {
                         let count = self.devices.len();
-                        self.selected = if forward {
-                            (self.selected + 1) % count
+                        let current = self.chosen.iter().position(|chosen| *chosen).unwrap_or(0);
+                        let next = if forward {
+                            (current + 1) % count
                         } else {
-                            (self.selected + count - 1) % count
+                            (current + count - 1) % count
                         };
+                        let mut chosen = vec![false; count];
+                        chosen[next] = true;
+                        self.set_choice(chosen);
+                    }
+                    SettingsRow::Gpu => {
+                        self.status_line =
+                            "Several GPUs are ticked; press Enter to change them.".into();
                     }
                     SettingsRow::Intensity => {
                         let next = if forward {
@@ -616,8 +766,12 @@ impl SetupFlow {
                     self.status_line = "Enter a payout address first.".into();
                     self.open_settings(SettingsRow::Address);
                 }
-                SettingsRow::Start => return SetupAction::Complete,
-                SettingsRow::Gpu | SettingsRow::Intensity | SettingsRow::AsicTarget => {
+                SettingsRow::Start => match self.config.ensure_mining_supported() {
+                    Ok(()) => return SetupAction::Complete,
+                    Err(error) => self.status_line = error,
+                },
+                SettingsRow::Gpu => self.step = SetupStep::Gpus,
+                SettingsRow::Intensity | SettingsRow::AsicTarget => {
                     self.status_line = "Use Left/Right to change this row.".into();
                 }
             },
@@ -1169,17 +1323,18 @@ impl TuiState {
 
 /// Runs the interactive setup flow before starting mining.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_setup(
+pub fn run_setup(
     config: RuntimeConfig,
     devices: Vec<GpuDevice>,
-    default_device: &GpuDevice,
+    prefer: BackendKind,
+    default_gpus: &[GpuDevice],
     profile_path: &Path,
     profiles: MiningProfiles,
     sources_path: &Path,
     sources: SharedSources,
     overrides: SetupOverrides,
 ) -> Result<Option<SetupResult>, String> {
-    let mut state = SetupFlow::new(config, devices, default_device)?;
+    let mut state = SetupFlow::new(config, devices, prefer, default_gpus)?;
     if !profiles.profiles.is_empty() {
         state.step = SetupStep::Profiles;
     }
@@ -1213,10 +1368,12 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
             SetupAction::Continue => {}
             SetupAction::Cancel => return Ok(None),
             SetupAction::Complete => {
-                let selected = state.selected_device();
-                let (backend, device) = (selected.backend, selected.index);
-                let mut settings =
-                    SavedConfig::from_effective(backend.as_str(), Some(device), &state.config);
+                let gpus = state.chosen_gpus();
+                let mut settings = SavedConfig::from_effective(
+                    state.prefer.as_str(),
+                    &state.saved_choice(),
+                    &state.config,
+                );
                 // Servers and nodes live in the shared per-network store.
                 settings.fulcrum = None;
                 settings.node_rpc = None;
@@ -1232,8 +1389,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
                     Ok(profile_name) => {
                         return Ok(Some(SetupResult {
                             config: state.config.clone(),
-                            backend,
-                            device,
+                            gpus,
                             profile_name,
                         }));
                     }
@@ -1271,10 +1427,25 @@ fn expected_winner_seconds(target_le_hex: &str, rate: f64, network: MiningNetwor
     win_probability(target_le_hex, network).map(|probability| 1.0 / (probability * rate))
 }
 
-/// Chance that one candidate wins against a little-endian hex target. The
-/// mainnet covenant ignores digest bit 255 while chipnet requires a positive
-/// digest. Thus their denominators are 2^255 and 2^256 respectively.
+/// Chance that one candidate wins against a little-endian hex target under
+/// the network's PHOTON deployment.
 fn win_probability(target_le_hex: &str, network: MiningNetwork) -> Option<f64> {
+    win_probability_for_rule(
+        target_le_hex,
+        MiningToken::Photon.photon_deployment(network).proof_rule,
+    )
+}
+
+// #### PR #22: win odds follow the deployment's proof rule
+// What: the v0 covenant compares ABS(hash), so digest bit 255 never matters
+// and a candidate wins with probability target / 2^255. v3.2 requires a
+// positive hash: target / 2^256.
+// Why: mainnet moved to v3.2 on 2026-10-03, but the odds still treated
+// mainnet as v0, so the dashboard and expected_winner_s promised twice the
+// real win rate.
+// Check: display only; the search and the winner checks already apply the
+// rule. Look here if the dashboard's odds disagree with the observed wins.
+fn win_probability_for_rule(target_le_hex: &str, rule: ProofRule) -> Option<f64> {
     let bytes = hex::decode(target_le_hex.trim()).ok()?;
     if bytes.len() != 32 {
         return None;
@@ -1283,9 +1454,9 @@ fn win_probability(target_le_hex: &str, network: MiningNetwork) -> Option<f64> {
         .iter()
         .rev()
         .fold(0.0_f64, |value, byte| value * 256.0 + f64::from(*byte))
-        / match network {
-            MiningNetwork::Mainnet => 2f64.powi(255),
-            MiningNetwork::Chipnet => 2f64.powi(256),
+        / match rule {
+            ProofRule::Absolute => 2f64.powi(255),
+            ProofRule::Positive => 2f64.powi(256),
         };
     (probability > 0.0).then_some(probability)
 }
@@ -1299,8 +1470,29 @@ fn tui_status_line(snapshot: &RuntimeSnapshot) -> String {
     )
     .map(|seconds| format!("{seconds:.0}"))
     .unwrap_or_else(|| "n/a".into());
+    // A rig also logs each GPU's recent rate and status.
+    let gpus = if snapshot.gpus.len() > 1 {
+        let each = snapshot
+            .gpus
+            .iter()
+            .zip(&snapshot.search.gpus)
+            .map(|(gpu, search)| {
+                format!(
+                    "{}:{}={:.0}/{:?}",
+                    gpu.backend.as_str(),
+                    gpu.device,
+                    search.active_rate,
+                    search.status
+                )
+                .to_ascii_lowercase()
+            })
+            .collect::<Vec<_>>();
+        format!(" gpus={}", each.join(","))
+    } else {
+        String::new()
+    };
     format!(
-        "status state={:?} waiting_for_job={} key_rotations={} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} expected_winner_s={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={} height={} target_le={} endpoint={} last_error={}",
+        "status state={:?} waiting_for_job={} key_rotations={} intensity={} rate={:.0} avg_rate={:.0} peak_rate={:.0} expected_winner_s={} reconnects={} rotations={} job_changes={} checks={} batches={} candidates={} verified_winners={} stale_winners={} rejected_winners={} pending_winners={}{gpus} height={} target_le={} endpoint={} last_error={}",
         snapshot.state,
         snapshot.search.waiting_for_job,
         snapshot.search.key_rotations,
@@ -1393,6 +1585,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         state: SupervisorState::Mining,
         gpu_backend: "cuda".into(),
         gpu_device: 0,
+        gpus: Vec::new(),
         generation_id: 1,
         network: MiningNetwork::Mainnet,
         fee_scheme: crate::config::MiningToken::Photon
@@ -1686,9 +1879,8 @@ fn apply_palette_command(
         }
         PaletteCommand::Config => {
             let config = format!(
-                "config: backend={}:{} intensity={} payout={} endpoint={} generation={}",
-                snapshot.gpu_backend,
-                snapshot.gpu_device,
+                "config: gpu={} intensity={} payout={} endpoint={} generation={}",
+                gpu_list(snapshot).to_ascii_lowercase(),
                 snapshot.search.intensity,
                 shorten(&snapshot.payout_address, 42),
                 shorten(&redact_endpoint(&snapshot.endpoint), 42),
@@ -1707,8 +1899,8 @@ fn apply_palette_command(
         PaletteCommand::Devices => {
             if state.devices.is_empty() {
                 state.push_event(format!(
-                    "device: {}:{} (startup device catalog unavailable)",
-                    snapshot.gpu_backend, snapshot.gpu_device
+                    "mining on {} (startup device catalog unavailable)",
+                    gpu_list(snapshot)
                 ));
             } else {
                 state.push_event(format!(
@@ -1736,11 +1928,15 @@ fn apply_palette_command(
             state.status_line = "GPU device catalog added to runtime log".into();
         }
         PaletteCommand::Backend => {
-            let backend = format!(
-                "backend: {} device {}",
-                snapshot.gpu_backend.to_ascii_uppercase(),
-                snapshot.gpu_device
-            );
+            let backend = if snapshot.gpus.len() > 1 {
+                format!("GPUs: {}", gpu_list(snapshot))
+            } else {
+                format!(
+                    "backend: {} device {}",
+                    snapshot.gpu_backend.to_ascii_uppercase(),
+                    snapshot.gpu_device
+                )
+            };
             state.status_line = backend.clone();
             state.push_event(backend);
         }
@@ -1880,7 +2076,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         SetupStep::Hardware => "Setup   1/4 Hardware".to_string(),
         SetupStep::Network => "Setup   2/4 Network".to_string(),
         SetupStep::Token => "Setup   3/4 Token".to_string(),
-        SetupStep::Settings | SetupStep::Connections => {
+        SetupStep::Settings | SetupStep::Connections | SetupStep::Gpus => {
             let what = match state.mode {
                 MiningMode::Gpu => format!("GPU · {network} · {}", state.config.token.as_str()),
                 MiningMode::Asic => {
@@ -1907,6 +2103,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         SetupStep::Token => render_setup_token(frame, rows[1], state),
         SetupStep::Settings => render_setup_settings(frame, rows[1], state),
         SetupStep::Connections => render_setup_connections(frame, rows[1], state),
+        SetupStep::Gpus => render_setup_gpus(frame, rows[1], state),
     }
     let keys = if state.editing.is_some() {
         "[Type] edit   [Enter] save   [Esc] cancel"
@@ -1930,6 +2127,9 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
             }
             SetupStep::Connections => {
                 "[Up/Down] choose   [Enter] add / edit   [Del] remove   [Esc] done"
+            }
+            SetupStep::Gpus => {
+                "[Up/Down] choose   [Space] mine on it or not   [A] all   [Enter/Esc] done"
             }
         }
     };
@@ -1982,17 +2182,7 @@ fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 .as_deref()
                 .and_then(|value| MiningNetwork::parse(value).ok())
                 .unwrap_or(MiningNetwork::Mainnet);
-            let device = settings
-                .backend
-                .as_deref()
-                .and_then(|backend| BackendKind::parse(backend).ok())
-                .and_then(|backend| {
-                    state.devices.iter().find(|device| {
-                        device.backend == backend && Some(device.index) == settings.device
-                    })
-                })
-                .map(|device| device.name.clone())
-                .unwrap_or_else(|| "GPU".into());
+            let device = state.profile_gpus(settings);
             let selected = state.profile_selected == index;
             let name = if selected && state.editing == Some(TextField::ProfileRename) {
                 format!("{}_", state.text_input)
@@ -2169,18 +2359,25 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
         }
         let (name, value, hint) = match row {
             SettingsRow::Gpu => {
-                let device = state.selected_device();
-                (
-                    "GPU",
-                    Span::raw(format!(
+                let gpus = state.chosen_gpus();
+                let value = match gpus.as_slice() {
+                    [gpu] => format!(
                         "{}:{}  {} {}",
-                        device.backend.as_str().to_ascii_uppercase(),
-                        device.index,
-                        device.vendor,
-                        device.name
-                    )),
-                    "< >",
-                )
+                        gpu.backend.as_str().to_ascii_uppercase(),
+                        gpu.index,
+                        gpu.vendor,
+                        gpu.name
+                    ),
+                    gpus => format!(
+                        "{} GPUs: {}",
+                        gpus.len(),
+                        gpus.iter()
+                            .map(|gpu| gpu.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                ("GPU", Span::raw(value), "< >  [Enter] list")
             }
             SettingsRow::AsicTarget => (
                 "ASIC target",
@@ -2253,6 +2450,51 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(" Settings ").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The GPU list: one checkbox per GPU that can mine.
+fn render_setup_gpus(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let mut lines = state
+        .devices
+        .iter()
+        .zip(&state.chosen)
+        .enumerate()
+        .map(|(index, (device, chosen))| {
+            Line::from(vec![
+                Span::raw(format!(
+                    "{} {} {:<40} ",
+                    selection_marker(index == state.selected),
+                    if *chosen { "[x]" } else { "[ ]" },
+                    device.name
+                )),
+                dim(format!(
+                    "{}:{} · {}",
+                    device.backend.as_str().to_ascii_uppercase(),
+                    device.index,
+                    if device.integrated {
+                        "integrated"
+                    } else {
+                        "discrete"
+                    }
+                )),
+            ])
+        })
+        .collect::<Vec<_>>();
+    lines.extend([
+        Line::from(""),
+        Line::from(dim(
+            "Every ticked GPU mines the same job for your address, so they never compete.",
+        )),
+        Line::from(dim(
+            "An integrated GPU shares the CPU's power and memory; it adds little on most PCs.",
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title(" GPUs ").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -2457,13 +2699,18 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) 
     if snapshot.search.waiting_for_job {
         state_text.push_str(" (all nonces tried, waiting for next job)");
     }
+    let gpus = if snapshot.gpus.len() > 1 {
+        format!("{} GPUs", snapshot.gpus.len())
+    } else {
+        format!(
+            "{} device {}",
+            snapshot.gpu_backend.to_ascii_uppercase(),
+            snapshot.gpu_device
+        )
+    };
     let line = Line::from(vec![
         Span::styled(" PICKAXE ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(
-            "PHOTON   {state_text}   {} device {}",
-            snapshot.gpu_backend.to_ascii_uppercase(),
-            snapshot.gpu_device,
-        )),
+        Span::raw(format!("PHOTON   {state_text}   {gpus}")),
     ]);
     frame.render_widget(
         Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
@@ -2735,8 +2982,43 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
         }
         _ => "waiting for the live target".into(),
     };
+    // A rig shows each GPU's own rate and health under the totals.
+    let several = snapshot.gpus.len() > 1;
+    let per_gpu = snapshot
+        .gpus
+        .iter()
+        .zip(&search.gpus)
+        .enumerate()
+        .filter(|_| several)
+        .map(|(position, (gpu, gpu_search))| {
+            let status = match gpu_search.status {
+                GpuStatus::Mining => String::new(),
+                GpuStatus::Recovering => " · recovering".into(),
+                GpuStatus::Stopped => " · stopped".into(),
+            };
+            // Telemetry shows only when the card reports it.
+            let reported = [
+                (gpu.telemetry.temperature_c, " C"),
+                (gpu.telemetry.power_watts, " W"),
+            ]
+            .into_iter()
+            .filter_map(|(value, unit)| value.map(|value| format!(" · {value:.1}{unit}")))
+            .collect::<String>();
+            RuntimeField::new(
+                &format!("GPU {position}"),
+                wrap(format!(
+                    "{} · {}:{} · {}{reported}{status}",
+                    gpu.name,
+                    gpu.backend.as_str(),
+                    gpu.device,
+                    hash_rate(gpu_search.active_rate),
+                )),
+                2,
+            )
+        })
+        .collect::<Vec<_>>();
 
-    vec![
+    let mut fields = vec![
         RuntimeField::new(
             "Hashrate",
             wrap(match snapshot.network {
@@ -2788,7 +3070,7 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
             4,
         ),
         RuntimeField::new(
-            "GPU",
+            if several { "All GPUs" } else { "GPU" },
             wrap(format!(
                 "util {} · {} · {} · VRAM {}",
                 format_metric(telemetry.gpu_utilization_percent, "%"),
@@ -2855,7 +3137,32 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
             wrap(last_error.to_string()),
             if snapshot.last_error.is_some() { 2 } else { 9 },
         ),
-    ]
+    ];
+    fields.splice(1..1, per_gpu);
+    fields
+}
+
+/// The mining GPUs as `CUDA:0 + WGPU:1`.
+fn gpu_list(snapshot: &RuntimeSnapshot) -> String {
+    if snapshot.gpus.is_empty() {
+        return format!(
+            "{}:{}",
+            snapshot.gpu_backend.to_ascii_uppercase(),
+            snapshot.gpu_device
+        );
+    }
+    snapshot
+        .gpus
+        .iter()
+        .map(|gpu| {
+            format!(
+                "{}:{}",
+                gpu.backend.as_str().to_ascii_uppercase(),
+                gpu.device
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 /// Rounds a positive value up to 1, 1.5, 2, 2.5, 3, 4, 5, 6 or 8 times a
@@ -3163,15 +3470,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
             shorten(&redact_endpoint(&snapshot.endpoint), 48),
             "[F] use another server   [R] reconnect",
         ),
-        row(
-            "GPU",
-            format!(
-                "{}:{}",
-                snapshot.gpu_backend.to_ascii_uppercase(),
-                snapshot.gpu_device
-            ),
-            "",
-        ),
+        row("GPU", gpu_list(snapshot), ""),
         row(
             "Network",
             network_label(snapshot.network).to_string(),
@@ -3366,6 +3665,9 @@ mod tests {
                 vram_bytes: None,
                 backend: BackendKind::Cuda,
                 detail: String::new(),
+                integrated: false,
+                ready: true,
+                pci: None,
             },
             GpuDevice {
                 index: 0,
@@ -3374,6 +3676,9 @@ mod tests {
                 vram_bytes: None,
                 backend: BackendKind::Hip,
                 detail: String::new(),
+                integrated: false,
+                ready: true,
+                pci: None,
             },
         ]
     }
@@ -3389,6 +3694,7 @@ mod tests {
             state: SupervisorState::Mining,
             gpu_backend: "cuda".into(),
             gpu_device: 0,
+            gpus: Vec::new(),
             generation_id: 1,
             network: MiningNetwork::Mainnet,
             fee_scheme: crate::config::MiningToken::Photon
@@ -3441,7 +3747,13 @@ mod tests {
     fn new_setup_walks_hardware_network_token_to_settings() {
         let devices = test_devices();
         let default_device = devices[0].clone();
-        let mut setup = SetupFlow::new(RuntimeConfig::default(), devices, &default_device).unwrap();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices,
+            BackendKind::Auto,
+            std::slice::from_ref(&default_device),
+        )
+        .unwrap();
         assert_eq!(setup.selected, 0);
         assert_eq!(setup.step, SetupStep::Hardware);
         setup.handle_key(key(KeyCode::Enter));
@@ -3460,8 +3772,13 @@ mod tests {
     /// Checks that Start needs a valid address and then completes setup.
     fn settings_start_requires_a_valid_address() {
         let devices = test_devices();
-        let mut setup =
-            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices.clone(),
+            BackendKind::Auto,
+            &devices[..1],
+        )
+        .unwrap();
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
         assert_eq!(setup.current_row(), SettingsRow::Address);
@@ -3486,8 +3803,13 @@ mod tests {
     /// Checks that Left/Right change the GPU and intensity rows within range.
     fn settings_rows_change_gpu_and_intensity_in_place() {
         let devices = test_devices();
-        let mut setup =
-            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices.clone(),
+            BackendKind::Auto,
+            &devices[..1],
+        )
+        .unwrap();
         setup.open_settings(SettingsRow::Gpu);
         setup.handle_key(key(KeyCode::Right));
         assert_eq!(setup.selected, 1);
@@ -3507,11 +3829,155 @@ mod tests {
         assert!(setup.status_line.contains("Left/Right"));
     }
 
+    /// Two discrete GPUs and an integrated one, as setup lists them.
+    fn rig_devices() -> Vec<GpuDevice> {
+        let mut devices = test_devices();
+        devices.push(GpuDevice {
+            index: 1,
+            name: "Radeon iGPU".into(),
+            vendor: "AMD".into(),
+            vram_bytes: None,
+            backend: BackendKind::Wgpu,
+            detail: String::new(),
+            integrated: true,
+            ready: true,
+            pci: None,
+        });
+        devices
+    }
+
+    // #### PR #22 test: choosing several GPUs in setup ####
+    #[test]
+    fn gpu_list_ticks_several_gpus_and_saves_the_choice() {
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            rig_devices(),
+            BackendKind::Auto,
+            &[],
+        )
+        .unwrap();
+        // Every discrete GPU mines by default, and that saves as the default.
+        assert_eq!(setup.chosen, [true, true, false]);
+        assert_eq!(setup.saved_choice(), DeviceSelection::Default);
+        setup.open_settings(SettingsRow::Gpu);
+        assert!(setup_text(&setup).contains("2 GPUs: Primary CUDA, Secondary HIP"));
+        setup.handle_key(key(KeyCode::Right));
+        assert!(setup.status_line.contains("press Enter"));
+
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Gpus);
+        assert!(setup_text(&setup).contains("[ ] Radeon iGPU"));
+        setup.handle_key(key(KeyCode::Down));
+        setup.handle_key(key(KeyCode::Down));
+        setup.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(setup.saved_choice(), DeviceSelection::WithIntegrated);
+        setup.handle_key(key(KeyCode::Up));
+        setup.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(setup.saved_choice(), DeviceSelection::Indices(vec![0, 2]));
+        setup.handle_key(key(KeyCode::Up));
+        setup.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(setup.chosen, [false, false, true]);
+        // The last ticked GPU stays ticked.
+        setup.handle_key(key(KeyCode::Up));
+        setup.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(setup.chosen, [false, false, true]);
+        assert!(setup.status_line.contains("At least one GPU"));
+
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Settings);
+        assert_eq!(setup.current_row(), SettingsRow::Gpu);
+        assert_eq!(setup.chosen_gpus()[0].name, "Radeon iGPU");
+        // With one GPU ticked, Left/Right moves the choice.
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.chosen, [true, false, false]);
+
+        let mut named = SetupFlow::new(
+            RuntimeConfig::default(),
+            rig_devices(),
+            BackendKind::Cuda,
+            &rig_devices()[..1],
+        )
+        .unwrap();
+        named.chosen = vec![true, true, true];
+        assert_eq!(named.saved_choice(), DeviceSelection::WithIntegrated);
+        named.chosen = vec![false, true, true];
+        // With a named backend, a saved choice keeps the backend's ordinals.
+        assert_eq!(named.saved_choice(), DeviceSelection::Indices(vec![0, 1]));
+    }
+
+    #[test]
+    fn profiles_restore_their_gpu_choice_and_the_command_line_wins() {
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            rig_devices(),
+            BackendKind::Auto,
+            &[],
+        )
+        .unwrap();
+        let mut payout = RuntimeConfig::default();
+        payout
+            .set_payout("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh".into())
+            .unwrap();
+        let profile = |backend: &str, devices: DeviceSelection| {
+            SavedConfig::from_effective(backend, &devices, &payout)
+        };
+        for (name, settings) in [
+            ("Old", profile("cuda", DeviceSelection::Indices(vec![0]))),
+            (
+                "Pair",
+                profile("auto", DeviceSelection::Indices(vec![0, 2])),
+            ),
+            ("Every", profile("auto", DeviceSelection::WithIntegrated)),
+        ] {
+            setup.profiles.upsert(None, name, settings).unwrap();
+        }
+        let label = |setup: &SetupFlow, name: &str| {
+            let profile = setup
+                .profiles
+                .profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            setup.profile_gpus(&profile.settings)
+        };
+        assert_eq!(label(&setup, "Old"), "Primary CUDA");
+        assert_eq!(label(&setup, "Pair"), "2 GPUs");
+        assert_eq!(label(&setup, "Every"), "3 GPUs");
+
+        let position = |setup: &SetupFlow, name: &str| {
+            setup
+                .profiles
+                .profiles
+                .iter()
+                .position(|profile| profile.name == name)
+                .unwrap()
+        };
+        let old = position(&setup, "Old");
+        setup.open_profile(old).unwrap();
+        assert_eq!(setup.chosen, [true, false, false]);
+        let pair = position(&setup, "Pair");
+        setup.open_profile(pair).unwrap();
+        assert_eq!(setup.chosen, [true, false, true]);
+        let every = position(&setup, "Every");
+        setup.open_profile(every).unwrap();
+        assert_eq!(setup.chosen, [true, true, true]);
+
+        setup.overrides.gpus = Some(vec![(BackendKind::Hip, 0)]);
+        setup.open_profile(pair).unwrap();
+        assert_eq!(setup.chosen, [false, true, false]);
+    }
+    // #### end PR #22 test ####
+
     #[test]
     fn setup_rejects_unknown_token_and_accepts_chipnet_photon() {
         let devices = test_devices();
-        let mut setup =
-            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices.clone(),
+            BackendKind::Auto,
+            &devices[..1],
+        )
+        .unwrap();
         setup.handle_key(key(KeyCode::Enter));
         setup.handle_key(key(KeyCode::Enter));
         setup.token_input = "wrong-token".into();
@@ -3537,8 +4003,13 @@ mod tests {
     #[test]
     fn asic_path_offers_both_targets_but_cannot_start() {
         let devices = test_devices();
-        let mut setup =
-            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices.clone(),
+            BackendKind::Auto,
+            &devices[..1],
+        )
+        .unwrap();
         setup.handle_key(key(KeyCode::Down));
         assert_eq!(setup.mode, MiningMode::Asic);
         setup.handle_key(key(KeyCode::Enter));
@@ -3562,8 +4033,13 @@ mod tests {
     #[test]
     fn setup_screens_render_their_choices() {
         let devices = test_devices();
-        let mut setup =
-            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices.clone(),
+            BackendKind::Auto,
+            &devices[..1],
+        )
+        .unwrap();
         for (step, expected) in [
             (SetupStep::Hardware, "ASIC mining"),
             (SetupStep::Network, "Chipnet"),
@@ -3587,8 +4063,13 @@ mod tests {
 
     fn setup_with_saved_profile() -> (SetupFlow, RuntimeConfig) {
         let devices = test_devices();
-        let mut setup =
-            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices.clone(),
+            BackendKind::Auto,
+            &devices[..1],
+        )
+        .unwrap();
         let mut saved = RuntimeConfig::default();
         saved
             .set_payout("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh".into())
@@ -3599,7 +4080,11 @@ mod tests {
             .upsert(
                 None,
                 "Rig A",
-                SavedConfig::from_effective("cuda", Some(0), &saved),
+                SavedConfig::from_effective(
+                    "cuda",
+                    &crate::backend::DeviceSelection::Indices(vec![0]),
+                    &saved,
+                ),
             )
             .unwrap();
         setup.step = SetupStep::Profiles;
@@ -3624,6 +4109,24 @@ mod tests {
         assert_eq!(setup.config.intensity, 90);
         setup.handle_key(key(KeyCode::Esc));
         assert_eq!(setup.step, SetupStep::Profiles);
+    }
+
+    #[test]
+    fn setup_network_change_requires_a_matching_payout_before_start() {
+        let (mut setup, saved) = setup_with_saved_profile();
+        setup.handle_key(key(KeyCode::Enter));
+        setup.step = SetupStep::Network;
+        setup.handle_key(key(KeyCode::Down));
+        assert_eq!(setup.config.network, MiningNetwork::Chipnet);
+        assert_eq!(setup.config.payout_address, saved.payout_address);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert!(setup.status_line.contains("bchtest:"));
+        let chipnet =
+            crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x42; 20], MiningNetwork::Chipnet)
+                .unwrap();
+        setup.config.set_payout(chipnet).unwrap();
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
     }
 
     #[test]
@@ -3655,8 +4158,13 @@ mod tests {
     #[test]
     fn connections_are_validated_and_kept_per_network() {
         let devices = test_devices();
-        let mut setup =
-            SetupFlow::new(RuntimeConfig::default(), devices.clone(), &devices[0]).unwrap();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices.clone(),
+            BackendKind::Auto,
+            &devices[..1],
+        )
+        .unwrap();
         setup.open_settings(SettingsRow::Fulcrum);
         setup.handle_key(key(KeyCode::Enter));
         assert_eq!(setup.step, SetupStep::Connections);
@@ -3845,13 +4353,13 @@ mod tests {
     #[test]
     /// Checks the expected time between winners from the live target.
     fn expected_winner_seconds_follows_target_and_rate() {
-        // Target 2^224 (LE byte 28 = 1): with digest bit 255 ignored, one
-        // winner per 2^31 candidates.
+        // Target 2^224 (LE byte 28 = 1): v3.2 needs a positive digest, so one
+        // winner per 2^32 candidates.
         let mut target = [0u8; 32];
         target[28] = 1;
         let target = hex::encode(target);
         let seconds =
-            expected_winner_seconds(&target, 2f64.powi(31) / 100.0, MiningNetwork::Mainnet)
+            expected_winner_seconds(&target, 2f64.powi(32) / 100.0, MiningNetwork::Mainnet)
                 .unwrap();
         assert!((seconds - 100.0).abs() < 1e-6, "{seconds}");
         assert!(expected_winner_seconds(&target, 0.0, MiningNetwork::Mainnet).is_none());
@@ -3874,9 +4382,17 @@ mod tests {
             (10_300.0..10_400.0).contains(&candidates_per_win),
             "{candidates_per_win}"
         );
-        let mainnet_candidates_per_win =
-            1.0 / win_probability(&target, MiningNetwork::Mainnet).unwrap();
-        assert!((5_100.0..5_300.0).contains(&mainnet_candidates_per_win));
+        // #### PR #22: win odds follow the deployment's proof rule
+        // Mainnet runs the same v3.2 contract; only the retired v0 rule, which
+        // ignores digest bit 255, wins twice as often.
+        assert_eq!(
+            win_probability(&target, MiningNetwork::Mainnet),
+            Some(probability)
+        );
+        let v0_candidates_per_win = 1.0
+            / win_probability_for_rule(&target, crate::protocol::MAINNET_V0_PHOTON.proof_rule)
+                .unwrap();
+        assert!((5_100.0..5_300.0).contains(&v0_candidates_per_win));
 
         let mut snapshot = test_snapshot();
         snapshot.network = MiningNetwork::Chipnet;
@@ -3937,6 +4453,60 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.contains("waiting for winner resolution")));
+    }
+
+    #[test]
+    fn runtime_view_lists_each_gpu_of_a_rig() {
+        let mut snapshot = test_snapshot();
+        let gpu = |backend, device, name: &str, temperature| crate::runtime::RuntimeGpu {
+            backend,
+            device,
+            name: name.into(),
+            telemetry: crate::telemetry::GpuTelemetry {
+                temperature_c: Some(temperature),
+                ..Default::default()
+            },
+        };
+        snapshot.gpus = vec![
+            gpu(BackendKind::Cuda, 0, "RTX 5070 Ti", 71.0),
+            gpu(BackendKind::Wgpu, 1, "Radeon 610M", 55.0),
+        ];
+        let search = |backend, device, active_rate, status| crate::search::GpuSearchStats {
+            backend,
+            device,
+            candidates: 1,
+            rate: active_rate,
+            active_rate,
+            winners: 0,
+            status,
+            last_error: None,
+        };
+        snapshot.search.gpus = vec![
+            search(BackendKind::Cuda, 0, 1.45e9, GpuStatus::Mining),
+            search(BackendKind::Wgpu, 1, 2.9e7, GpuStatus::Recovering),
+        ];
+        let state = TuiState::new(&snapshot);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &snapshot, &state))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("2 GPUs"));
+        assert!(rendered.contains("RTX 5070 Ti · cuda:0 · 1.45 GH/s · 71.0 C"));
+        assert!(rendered.contains("Radeon 610M · wgpu:1 · 29.00 MH/s · 55.0 C"));
+        assert!(rendered.contains("recovering"));
+        assert!(rendered.contains("All GPUs"));
+        let line = tui_status_line(&snapshot);
+        assert!(line.contains(
+            "pending_winners=0 gpus=cuda:0=1450000000/mining,wgpu:1=29000000/recovering height="
+        ));
+        assert_eq!(gpu_list(&snapshot), "CUDA:0 + WGPU:1");
     }
 
     #[test]
@@ -4387,6 +4957,7 @@ mod tests {
             state: SupervisorState::Mining,
             gpu_backend: "cuda".into(),
             gpu_device: 2,
+            gpus: Vec::new(),
             generation_id: 1,
             network: MiningNetwork::Mainnet,
             fee_scheme: crate::config::MiningToken::Photon

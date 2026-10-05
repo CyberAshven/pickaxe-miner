@@ -1,0 +1,4 @@
+[workspace]
+members = ["builder", "kernel", "filter", "stages"]
+default-members = ["builder"]
+resolver = "2"

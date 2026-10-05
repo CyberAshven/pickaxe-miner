@@ -1,6 +1,7 @@
 use crate::field::Field;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_arch = "spirv"), derive(Debug))]
 pub struct Point {
     pub x: Field,
     pub y: Field,

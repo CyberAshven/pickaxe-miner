@@ -16,10 +16,69 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 
 ## Supported platforms
 
-- Operating systems: Windows x86_64 and Linux x86_64
-- NVIDIA: CUDA PTX `sm_120`
-- AMD: HIP `gfx1036`
-- No ARM, ARM64, or macOS build
+Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).
+
+| GPU | Engine | Tested |
+| --- | --- | --- |
+| NVIDIA GeForce RTX 50 series (`sm_120`) | CUDA | RTX 5070 Ti Laptop: about 1.48 GH/s |
+| AMD Radeon RX 6000, 7000 and 9000 (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) | Native HIP T2 | Code objects verified; no discrete card measured yet |
+| AMD integrated (Ryzen) and other AMD GPUs | Portable engine on Vulkan | Ryzen 9 9955HX3D integrated Radeon: about 20 MH/s |
+| Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails | Not yet |
+| Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) | Not yet |
+| Apple Silicon (M1 and later) | Portable engine on Metal | Built by CI; not yet run on a Mac |
+| Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU | Chrome, on the integrated Radeon and the RTX 5070 Ti |
+
+The engine is selected automatically, and one miner mines on every discrete GPU of the machine, each on its best engine ([several GPUs](#several-gpus)). An integrated GPU mines automatically only when no discrete GPU is present. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
+
+## Quick start: mainnet TUI
+
+From the extracted download folder, run the command for your platform:
+
+| Platform | Command |
+| --- | --- |
+| Windows PowerShell | `.\pickaxe.exe mine --network mainnet` |
+| Linux | `./pickaxe mine --network mainnet` |
+| Apple Silicon Mac | `./pickaxe mine --network mainnet --backend wgpu` |
+
+Double-clicking the executable opens the same setup. The interactive setup opens with Mainnet selected. Enter your payout address
+and choose **Start mining**. Saved profiles keep your settings for next time.
+To skip setup and start directly in the mining TUI, append
+`--address "YOUR_MAINNET_PAYOUT_ADDRESS"`, replacing the placeholder with your
+valid payout CashAddr. Servers are selected automatically.
+
+### Portable engine in the TUI
+
+The portable engine mines on any GPU above that has no native engine:
+
+| Where | Command |
+| --- | --- |
+| Windows | `.\pickaxe.exe mine --network mainnet --backend wgpu` |
+| Linux | `./pickaxe mine --network mainnet --backend wgpu` |
+| Windows on DirectX 12 | Put Microsoft's `dxcompiler.dll` and `dxil.dll` next to `pickaxe.exe` ([details](docs/portable.md#directx-12-on-windows-optional)), run `$env:PICKAXE_WGPU_API = 'dx12'`, then the Windows command |
+
+Automatic selection already picks the portable engine for every GPU without a native engine; `--backend wgpu` forces it.
+
+### Several GPUs
+
+One miner drives all of a machine's GPUs: they mine the same job for your address with separate work, so they never compete for the same reward. By default every discrete GPU mines:
+
+| Mine on | Add to the mine command |
+| --- | --- |
+| Every discrete GPU | nothing (default) |
+| Every GPU, integrated included | `--include-integrated` |
+| Chosen GPUs | `--device 0,2`, with the numbers `devices` prints |
+
+In setup, Enter on the GPU row lists the GPUs with a checkbox each, and a profile remembers the choice. The dashboard shows each GPU's rate and temperature. A GPU that fails restarts by itself while the others keep mining.
+
+### Browser miner
+
+The browser miner is the same portable engine compiled to WebAssembly, mining on browser WebGPU in Chrome, Edge, Firefox or Safari. In the extracted `-browser.tar.gz` download, run this one command (Python required), then open `http://127.0.0.1:8080`, enter your payout address and press **Start mining**:
+
+```sh
+python -m http.server 8080 --bind 127.0.0.1 --directory web
+```
+
+Keep the tab open while mining. Names: `wgpu` is the Rust GPU library inside Pickaxe (the `--backend wgpu` option), and browser WebGPU is the browser's GPU API that the browser miner runs on ([names](docs/gpu-sources.md#names), [portable builds](docs/portable.md)).
 
 ## Install
 
@@ -68,10 +127,10 @@ Fulcrum servers and nodes you add are saved once per network in `config.sources.
 Use v0.0.3 or newer, which includes Chipnet support. After building this branch, run from the project root with the GPU files in place:
 
 ```bash
-./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bitcoincash:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
+./target/release/pickaxe_miner mine --chipnet --backend cuda --address 'bchtest:YOUR_TOKEN_AWARE_P2PKH_ADDRESS'
 ```
 
-Replace the quoted address with your valid token-aware P2PKH payout CashAddr. The miner converts a valid mainnet payout CashAddr to the equivalent `bchtest:` address with the same key hash. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoint; mainnet remains the default without `--chipnet`.
+Replace the quoted address with your valid Chipnet P2PKH or token-aware P2PKH payout CashAddr. Mainnet requires `bitcoincash:` addresses and Chipnet requires `bchtest:` addresses; mismatched networks are rejected, never converted. It uses the Chipnet PHOTON contract and Chipnet Fulcrum endpoints; mainnet remains the default without `--chipnet`.
 
 New Chipnet wins pay the selected wallet directly, using the same donation policy. No local reward wallet or payout batching is created for new mining.
 
@@ -168,17 +227,16 @@ Benchmark:
 ```bash
 cargo run --release -- benchmark
 ```
-## Note
-- `wgpu` is not a verified production backend. Production mining is CUDA or HIP.
-  
 ## Limitations
 
 - There is no CPU mining fallback.
 - CUDA performance was measured on the local NVIDIA GPU; HIP artifacts are build-verified, without a physical AMD performance claim.
+- The portable engine (`wgpu` on Vulkan and DirectX 12, and the browser miner on browser WebGPU) was verified on an integrated Radeon and an RTX 5070 Ti. Intel GPUs, Linux GPUs and Apple Silicon have not run it yet.
 
 ## Features
 
 - High-performance native GPU mining
+- Every GPU of a machine in one miner, with per-GPU status
 - Live PHOTON CashToken baton discovery
 - Automatic winner verification and submission
 - Runtime intensity control from 10% to 100%
@@ -191,7 +249,7 @@ cargo run --release -- benchmark
 - Stale-job and generation protection
 - Device discovery and benchmark tools
 
-The `reference/` directory contains PHOTON reference material used for implementation and correctness testing.
+The `reference/` directory contains PHOTON reference material used for implementation and correctness testing. Its `shared-t2/` and `shared-stages/` folders are different: they hold the portable engine's WGSL, generated from `rust-engine/` by `tools/shared-gpu-proof/sync_filter.py` and never edited by hand.
 
 ## Development
 

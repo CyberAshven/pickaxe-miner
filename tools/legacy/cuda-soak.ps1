@@ -29,7 +29,7 @@ if ($windowSeconds -gt 720) {
     throw "TotalMinutes exceeds the supported 60-minute benchmark matrix."
 }
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $outputRoot = Join-Path $repoRoot $OutputDirectory
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 

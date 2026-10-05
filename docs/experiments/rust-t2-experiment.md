@@ -36,7 +36,7 @@ Stop live mining before GPU tests or benchmarks and restart it afterward.
 Only one miner or benchmark should use the GPU at a time.
 
 ```powershell
-python tools/compare-rust-t2.py PATH_TO_RELEASE_EXE PATH_TO_RUST_EXE
+python tools/legacy/compare-rust-t2.py PATH_TO_RELEASE_EXE PATH_TO_RUST_EXE
 ```
 
 The script warms both implementations for 15 seconds each, then runs six
@@ -121,9 +121,9 @@ coverage remains intact. No production pause behavior was changed.
 Reproduce the longer comparison:
 
 ```powershell
-python tools/compare-rust-t2.py PATH_TO_RELEASE_EXE PATH_TO_RUST_EXE --seconds 60 --warmup 30
+python tools/legacy/compare-rust-t2.py PATH_TO_RELEASE_EXE PATH_TO_RUST_EXE --seconds 60 --warmup 30
 # Reverse both the warmup and trial order for a follow-up comparison:
-python tools/compare-rust-t2.py PATH_TO_RELEASE_EXE PATH_TO_RUST_EXE --seconds 60 --warmup 30 --reverse --output artifacts/rust-t2-reversed
+python tools/legacy/compare-rust-t2.py PATH_TO_RELEASE_EXE PATH_TO_RUST_EXE --seconds 60 --warmup 30 --reverse --output artifacts/rust-t2-reversed
 ```
 
 For sanitizer checks, use the Rust-feature test executable printed by
