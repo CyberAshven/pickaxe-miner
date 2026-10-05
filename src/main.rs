@@ -1664,7 +1664,7 @@ mod tests {
         // #### PR #22: ARM64 is supported by the shared macOS package. Keep
         // excluding unsupported Windows/Linux ARM packages from this release.
         assert!(workflow.contains("\"${TAG}-macos-arm64.tar.gz\""));
-        assert!(workflow.contains("\"${TAG}-web.tar.gz\""));
+        assert!(workflow.contains("\"${TAG}-browser.tar.gz\""));
         assert!(workflow.contains("name: Verify portable package provenance"));
         assert!(!workflow.contains("-linux-arm64"));
         assert!(!workflow.contains("-windows-arm64"));

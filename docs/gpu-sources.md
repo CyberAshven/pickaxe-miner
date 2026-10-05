@@ -10,7 +10,7 @@ selectable until its replacement is proven on hardware.
   portable engine and the `--backend wgpu` option. It is not a GPU API itself.
 - **Vulkan**, **DirectX 12** and **Metal**: the native GPU APIs wgpu runs on:
   Vulkan on Windows and Linux, optionally DirectX 12 on Windows, Metal on macOS.
-- **WebGPU**: the W3C browser GPU API. The **browser GPU miner** runs the same
+- **WebGPU**: the W3C browser GPU API. The **browser miner** runs the same
   engine through it; native builds never use WebGPU.
 - **WGSL**: the WebGPU Shading Language, the standard language every
   portable shader is written or generated in.
@@ -27,7 +27,7 @@ selectable until its replacement is proven on hardware.
 | Other AMD GPUs, Intel GPUs, integrated GPUs | wgpu on Vulkan | Shared Rust stages (`reference/shared-stages/`) and T2 filter (`reference/shared-t2/`) | Original hand-written WGSL stages: set `PICKAXE_WGPU_STAGES=wgsl` |
 | Windows GPUs whose Vulkan driver fails | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
 | Apple Silicon | wgpu on Metal | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
-| Browser miner | wgpu on WebGPU | Same as Vulkan; browsers other than Chromium use the DirectX 12/Metal copy | Development builds only (`verify_portable_engine`) |
+| Browser miner | wgpu on browser WebGPU | Same as Vulkan; browsers other than Chromium use the DirectX 12/Metal copy | Development builds only (`verify_portable_engine`) |
 
 Automatic selection takes the first discrete GPU from CUDA, then HIP (when
 code objects for its architecture are installed), then WGPU. An integrated GPU

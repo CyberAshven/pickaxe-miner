@@ -4,7 +4,7 @@
 
 - [Development and branch flow](development.md)
 - [GPU code map](gpu-sources.md): every GPU kernel, what builds it and where it runs
-- [Portable builds](portable.md): Apple Silicon, browser WebGPU and optional DirectX 12 on Windows
+- [Portable builds](portable.md): Apple Silicon, the browser miner and optional DirectX 12 on Windows
 - [Browser T2](browser-t2.md)
 - [PHOTON protocol profile](protocol-profile.md)
 - [Fee policy](fee-policy.md)

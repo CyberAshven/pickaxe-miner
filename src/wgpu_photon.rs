@@ -3,7 +3,7 @@
 //! One engine for every GPU without a native CUDA or HIP engine. wgpu runs it on
 //! Vulkan (Windows, Linux), optionally DirectX 12 (Windows,
 //! `PICKAXE_WGPU_API=dx12`) and Metal (macOS); compiled to WebAssembly it is the
-//! browser GPU miner on the browser's WebGPU (`browser.rs`). Its stages (A, B,
+//! browser miner on browser WebGPU (`browser.rs`). Its stages (A, B,
 //! C1, T2 preparation, C2, C3) and T2 filters are WGSL generated from the shared
 //! Rust engine (`reference/shared-*`); `PICKAXE_WGPU_STAGES=wgsl` selects the
 //! original hand-written PHOTON pipeline in `reference/photon-miner.wgsl`.
@@ -774,7 +774,7 @@ impl WgpuPhotonEngine {
                     ..Default::default()
                 })
                 .await
-                .map_err(|error| format!("WebGPU adapter: {error}"))?
+                .map_err(|error| format!("browser WebGPU adapter: {error}"))?
         };
         let adapter_info = adapter.get_info();
         let limits = adapter.limits();

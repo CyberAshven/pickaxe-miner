@@ -154,11 +154,11 @@ jobs:
         run: |
           git rev-parse HEAD > dist/web/SOURCE_COMMIT.txt
           cp docs/portable.md dist/web/README.md
-          tar -czf dist/pickaxe-web-experimental.tar.gz -C dist web
+          tar -czf dist/pickaxe-browser.tar.gz -C dist web
           (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pickaxe-web-experimental-${{ inputs.source-ref }}
+          name: pickaxe-browser-${{ inputs.source-ref }}
           path: |
             dist/*.tar.gz
             dist/SHA256SUMS.txt

@@ -91,8 +91,8 @@ The baseline is dev commit `64cda6751a378a7e072931b7ade6d0e01bb0ecdd`,
 built for sm_120 with the pinned native compiler and upstream-rust feature.
 This does not prove identical whole-application speed across operating systems.
 
-The generated WGSL passed all 13,056 independent hash cases on NVIDIA WebGPU
-(Brave headless) and AMD WebGPU (Chrome), serially with mining stopped.
+The generated WGSL passed all 13,056 independent hash cases in browser WebGPU
+on NVIDIA (Brave headless) and AMD (Chrome), serially with mining stopped.
 WGSL SHA-256:
 `d873a6c523df43b097e9dfa2ca15cf4bda370b9050ba060fd1caf59ecff6848e`.
 The AMD fixture loader rejected sizes on its first attempt before dispatch;
@@ -113,7 +113,7 @@ portable packed-word/u32-pair primitives at the compiler boundary. The portable
 probe imports this exact file, rather than a translated copy of the layout.
 
 All 1,632 independently serialized assembly cases and 13,056 complete hash
-cases passed on both NVIDIA (Brave) and AMD (Chrome) WebGPU, serially with
+cases passed in browser WebGPU on both NVIDIA (Brave) and AMD (Chrome), serially with
 the native miner paused. Assembly covers all 17 shifts, carry/borrow cases,
 window endpoints, padding and an excess workgroup. The same CPU oracles,
 warnings-denied Clippy and formatting passed. Generated WGSL SHA-256:
@@ -164,7 +164,7 @@ the forced RFC6979 retry steps, complete signatures, transaction words for
 all 17 layouts and the target rule with independent oracles.
 `signing_stages_match_cpu_per_window` and the T2 and non-T2 end-to-end tests
 pass on NVIDIA and AMD (Vulkan); the browser engine check passes in Chrome on
-both (WebGPU). `PICKAXE_BUILD_SHARED_STAGES=debug` builds a development shader
+both (browser WebGPU). `PICKAXE_BUILD_SHARED_STAGES=debug` builds a development shader
 with an arithmetic entry point for `shared_stages_arithmetic_matches_integers`;
 it is never shipped. Measurements are in the
 [GPU code map](../../docs/gpu-sources.md).

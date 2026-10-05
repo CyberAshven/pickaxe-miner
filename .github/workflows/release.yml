@@ -653,7 +653,7 @@ jobs:
       - name: Download matching browser package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: pickaxe-web-experimental-${{ needs.validate.outputs.sha }}
+          name: pickaxe-browser-${{ needs.validate.outputs.sha }}
           path: portable/web
 
       - name: Verify portable package provenance
@@ -666,9 +666,9 @@ jobs:
           (cd portable/mac && sha256sum -c SHA256SUMS.txt)
           (cd portable/web && sha256sum -c SHA256SUMS.txt)
           test "$(tar -xOf "portable/mac/${TAG}-macos-arm64.tar.gz" "${TAG}-macos-arm64/SOURCE_COMMIT.txt")" = "${SHA}"
-          test "$(tar -xOf portable/web/pickaxe-web-experimental.tar.gz web/SOURCE_COMMIT.txt)" = "${SHA}"
+          test "$(tar -xOf portable/web/pickaxe-browser.tar.gz web/SOURCE_COMMIT.txt)" = "${SHA}"
           cp "portable/mac/${TAG}-macos-arm64.tar.gz" dist/
-          cp portable/web/pickaxe-web-experimental.tar.gz "dist/${TAG}-web.tar.gz"
+          cp portable/web/pickaxe-browser.tar.gz "dist/${TAG}-browser.tar.gz"
 
       - name: Generate SHA-256 checksums
         shell: bash
@@ -687,7 +687,7 @@ jobs:
           fi
           cd dist
           sha256sum "${TAG}-linux-x86_64.tar.gz" "${TAG}-windows-x86_64.zip" \
-            "${TAG}-macos-arm64.tar.gz" "${TAG}-web.tar.gz" > SHA256SUMS.txt
+            "${TAG}-macos-arm64.tar.gz" "${TAG}-browser.tar.gz" > SHA256SUMS.txt
           cat SHA256SUMS.txt
           {
             echo "Pickaxe Miner v${version}"
@@ -791,7 +791,7 @@ jobs:
             "dist/${TAG}-linux-x86_64.tar.gz"
             "dist/${TAG}-windows-x86_64.zip"
             "dist/${TAG}-macos-arm64.tar.gz"
-            "dist/${TAG}-web.tar.gz"
+            "dist/${TAG}-browser.tar.gz"
             "dist/SHA256SUMS.txt"
           )
 

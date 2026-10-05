@@ -16,7 +16,7 @@ PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes min
 
 ## Supported platforms
 
-Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser GPU miner (WebAssembly on the browser's WebGPU).
+Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).
 
 | GPU | Engine | Tested |
 | --- | --- | --- |
@@ -26,7 +26,7 @@ Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser GPU miner (
 | Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails | Not yet |
 | Other NVIDIA GPUs | Portable engine with `--backend wgpu` (the CUDA files target `sm_120` only) | Not yet |
 | Apple Silicon (M1 and later) | Portable engine on Metal | Built by CI; not yet run on a Mac |
-| Browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly | Chrome, on the integrated Radeon and the RTX 5070 Ti |
+| Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU | Chrome, on the integrated Radeon and the RTX 5070 Ti |
 
 The engine is selected automatically: a discrete GPU always comes first, and an integrated GPU is used automatically only when no discrete GPU is present, or when chosen with `--device`. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
 
@@ -58,15 +58,15 @@ The portable engine mines on any GPU above that has no native engine:
 
 Automatic selection already picks the portable engine for AMD integrated and Intel GPUs; `--backend wgpu` forces it.
 
-### Browser GPU miner
+### Browser miner
 
-The browser GPU miner is the same portable engine compiled to WebAssembly, mining on the browser's WebGPU in Chrome, Edge, Firefox or Safari. In the extracted `-web.tar.gz` download, run this one command (Python required), then open `http://127.0.0.1:8080`, enter your payout address and press **Start mining**:
+The browser miner is the same portable engine compiled to WebAssembly, mining on browser WebGPU in Chrome, Edge, Firefox or Safari. In the extracted `-browser.tar.gz` download, run this one command (Python required), then open `http://127.0.0.1:8080`, enter your payout address and press **Start mining**:
 
 ```sh
 python -m http.server 8080 --bind 127.0.0.1 --directory web
 ```
 
-Keep the tab open while mining. Names: `wgpu` is the Rust GPU library inside Pickaxe (the `--backend wgpu` option), and WebGPU is the browser's GPU API that the browser GPU miner runs on ([names](docs/gpu-sources.md#names), [portable builds](docs/portable.md)).
+Keep the tab open while mining. Names: `wgpu` is the Rust GPU library inside Pickaxe (the `--backend wgpu` option), and browser WebGPU is the browser's GPU API that the browser miner runs on ([names](docs/gpu-sources.md#names), [portable builds](docs/portable.md)).
 
 ## Install
 
@@ -219,7 +219,7 @@ cargo run --release -- benchmark
 
 - There is no CPU mining fallback.
 - CUDA performance was measured on the local NVIDIA GPU; HIP artifacts are build-verified, without a physical AMD performance claim.
-- The portable engine (`wgpu` on Vulkan, DirectX 12 and WebGPU) was verified on an integrated Radeon and an RTX 5070 Ti. Intel GPUs, Linux GPUs and Apple Silicon have not run it yet.
+- The portable engine (`wgpu` on Vulkan and DirectX 12, and the browser miner on browser WebGPU) was verified on an integrated Radeon and an RTX 5070 Ti. Intel GPUs, Linux GPUs and Apple Silicon have not run it yet.
 
 ## Features
 

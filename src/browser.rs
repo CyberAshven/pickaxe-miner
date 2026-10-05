@@ -1,7 +1,7 @@
-//! Browser GPU miner: the WebAssembly bindings behind the page in `web/`.
+//! Browser miner: the WebAssembly bindings behind the page in `web/`.
 //!
 //! It runs the same portable engine as native builds (`wgpu_photon`, on the wgpu
-//! library), here on the browser's WebGPU API. The TypeScript page handles only
+//! library), here on the browser WebGPU API. The TypeScript page handles only
 //! display and network I/O; protocol, payouts, fees and winner verification stay
 //! in the shared Rust library. `tools/build-browser.py` builds it;
 //! docs/portable.md explains running it and docs/gpu-sources.md the names.

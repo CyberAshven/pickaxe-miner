@@ -1,5 +1,5 @@
-// Browser GPU miner page. Mining runs in the Rust WebAssembly module
-// (src/browser.rs) on the browser's WebGPU; this file wires the page,
+// Browser miner page. Mining runs in the Rust WebAssembly module
+// (src/browser.rs) on browser WebGPU; this file wires the page,
 // network I/O and display. See docs/portable.md.
 import init, { BrowserMiner, BrowserControls, browser_config, validate_payout_address } from './pkg/pickaxe_miner.js';
 import { Electrum, rpcErrorCode } from './rpc.js';
@@ -129,7 +129,7 @@ async function run() {
   try {
     address = validate_payout_address(network, address);
     $('address').value = address;
-    status('Loading GPU table and compiling WebGPU…');
+    status('Loading GPU table and compiling browser WebGPU shaders…');
     const response = await fetch('./photon-generator-table.bin');
     if (!response.ok) throw new Error('GPU table could not be downloaded');
     miner = await BrowserMiner.create(network, address, new Uint8Array(await response.arrayBuffer()));

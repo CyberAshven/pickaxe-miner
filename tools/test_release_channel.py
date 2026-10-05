@@ -28,7 +28,7 @@ class ReleaseChannelTest(unittest.TestCase):
                 (root / 'dist').mkdir()
                 for platform, filename, member in [
                     ('mac', f'{tag}-macos-arm64.tar.gz', f'{tag}-macos-arm64/SOURCE_COMMIT.txt'),
-                    ('web', 'pickaxe-web-experimental.tar.gz', 'web/SOURCE_COMMIT.txt'),
+                    ('web', 'pickaxe-browser.tar.gz', 'web/SOURCE_COMMIT.txt'),
                 ]:
                     destination = root / 'portable' / platform
                     destination.mkdir(parents=True)
@@ -48,7 +48,7 @@ class ReleaseChannelTest(unittest.TestCase):
                                  result.stdout + result.stderr)
                 if wrong_platform is None:
                     self.assertTrue((root / 'dist' / f'{tag}-macos-arm64.tar.gz').is_file())
-                    self.assertTrue((root / 'dist' / f'{tag}-web.tar.gz').is_file())
+                    self.assertTrue((root / 'dist' / f'{tag}-browser.tar.gz').is_file())
 
     def test_download_replacement_never_creates_a_release(self):
         workflow = (Path(__file__).resolve().parents[1] /

@@ -1,6 +1,6 @@
 # Portable builds
 
-The macOS Apple Silicon command-line miner and the browser WebGPU miner build
+The macOS Apple Silicon command-line miner and the browser miner build
 from the same Rust crate as Windows and Linux. They share transaction layouts,
 protocol rules, signatures, intensity pacing, measured active rates, independent
 winner checks, dynamic fee calculations
@@ -17,7 +17,7 @@ accepts `bchtest:`. Wrong-network addresses, invalid checksums and mixed case ar
 rejected before mining. Chipnet and BCH testnets share the `bchtest:` format, so
 an address alone cannot distinguish those test networks.
 
-Backend performance depends on the GPU and driver; Metal and WebGPU do not
+Backend performance depends on the GPU and driver; Metal and browser WebGPU do not
 promise CUDA T2 performance.
 
 ## DirectX 12 on Windows (optional)
@@ -79,9 +79,10 @@ cargo build --locked --release --no-default-features --features portable-wgpu
 ./target/release/pickaxe_miner mine --backend wgpu
 ```
 
-## Browser
+## Browser miner
 
-The same workflow creates `pickaxe-web-experimental.tar.gz`, a static bundle
+The same workflow creates `pickaxe-browser.tar.gz` (released as
+`pickaxe-miner-<version>-browser.tar.gz`), a static bundle
 with the compiled Rust WASM, JavaScript compiled from the TypeScript interface,
 generated WASM bindings, page and verified GPU table.
 Anyone can host its `web/` directory over HTTPS. No Pickaxe-operated website,
@@ -102,7 +103,7 @@ open: browsers may throttle background tabs or suspend work on sleep.
 On Windows, Chromium browsers ignore a page's GPU preference: choose the GPU
 for the browser in Windows Settings, System, Display, Graphics.
 
-The application checks WebGPU, WebAssembly and Web Locks capabilities rather
+The browser miner checks browser WebGPU, WebAssembly and Web Locks support rather
 than browser names. Chromium, Firefox and Safari provide these standards on
 supported systems; actual availability depends on browser version, OS, GPU and
 driver. Unsupported environments show the reason before mining starts. A GPU
