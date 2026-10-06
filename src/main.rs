@@ -6,7 +6,7 @@
 
 use pickaxe_miner::{
     backend, benchmark, cli, config, electrum, mining_lock, node, runtime, search, self_test,
-    telemetry, tui, tx,
+    stratum_v2, telemetry, tui, tx,
 };
 
 use config::RuntimeConfig;
@@ -1410,6 +1410,11 @@ fn main() {
                 } else {
                     println!("saved configuration: {}", config_path.display());
                 }
+            }
+        },
+        cli::Commands::StratumV2 { command } => match command {
+            cli::StratumV2Command::Status => {
+                print!("{}", stratum_v2::status_report());
             }
         },
         cli::Commands::Mine => {
