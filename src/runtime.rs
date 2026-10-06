@@ -4138,7 +4138,7 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
         && winner.baton_vout == live.baton_vout
 }
 
-// #### PR #34: claim a winner without waiting for other GPUs ####
+// #### PR #35: claim a winner without waiting for other GPUs ####
 // What: once a GPU queues a host-verified winner, the claim starts at once.
 // It no longer waits until every GPU has finished its current batch, and a
 // drain acknowledges exactly the winners it took from the queue.
@@ -4160,7 +4160,7 @@ fn winner_refresh_ready(winner_refresh_pending: bool, session_connected: bool) -
 fn acknowledge_drained(observed: u64, drained: usize) -> u64 {
     observed.saturating_add(drained as u64)
 }
-// #### end PR #34 ####
+// #### end PR #35 ####
 
 /// Checks whether winner recovery needs an immediate job refresh.
 fn should_begin_winner_refresh(
@@ -6233,7 +6233,7 @@ mod tests {
         assert!(winner_refresh_ready(true, true));
     }
 
-    // #### PR #34 test: a claim does not wait for other GPUs ####
+    // #### PR #35 test: a claim does not wait for other GPUs ####
     #[test]
     fn a_winner_another_gpu_queues_during_a_claim_gets_its_own_check() {
         // Five winners handled so far; the claim drains one, while a second
@@ -6260,7 +6260,7 @@ mod tests {
             0
         ));
     }
-    // #### end PR #34 test ####
+    // #### end PR #35 test ####
 
     #[test]
     /// Checks that submission retry never rebroadcasts parent after it is known.
