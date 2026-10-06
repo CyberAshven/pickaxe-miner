@@ -1,0 +1,32 @@
+name: sync-stratum-lockfile
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/bch-stratum-v2]
+    paths:
+      - '.github/workflows/sync-stratum-lockfile.yml'
+      - 'Cargo.toml'
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/bch-stratum-v2
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Update lockfile for optional stratum-core
+        run: |
+          set -euo pipefail
+          cargo update -p stratum-core
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          if git diff --cached --quiet; then
+            echo 'Cargo.lock already current'
+            exit 0
+          fi
+          git commit -m "chore(stratum-v2): lock stratum-core 0.6.0 optional deps"
+          git push origin HEAD:feat/bch-stratum-v2
