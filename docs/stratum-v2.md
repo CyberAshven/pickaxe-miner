@@ -20,14 +20,15 @@ SV2 surface; it does not replace the portable GPU product bar.
 Build on the [stratum-mining](https://github.com/stratum-mining/stratum) reference
 crates, not a from-scratch protocol:
 
-- Prefer the umbrella **`stratum-core`** when the design is locked and the
-  lockfile can absorb it, **or** the focused crates
-  `binary_sv2` + `codec_sv2` + `framing_sv2` + `mining_sv2` +
-  `template_distribution_sv2` if a thinner dependency set is needed.
+- Prefer the umbrella **`stratum-core`** (currently **0.6.0** on crates.io),
+  which re-exports `binary_sv2`, `codec_sv2`, `framing_sv2`, `mining_sv2`,
+  `template_distribution_sv2`, and siblings.
+- Focused crates remain an option if a thinner set is needed later.
 
-Gate those deps behind Cargo feature **`stratum-v2`**. This PR only declares the
-empty feature placeholder so default CI stays green; the reference crates land
-in a follow-up after this design check is accepted.
+Gate those deps behind Cargo feature **`stratum-v2`** (not in default features).
+This branch wires optional `stratum-core` behind that feature so default CI
+stays green; enable with `cargo check --features stratum-v2` / `cargo test
+--features stratum-v2 --lib stratum_v2`.
 
 License note: Pickaxe is **AGPL-3.0-only**. Reference SV2 crates are compatible
 in principle; any AGPL bridge dependency is recorded as an open decision below.
@@ -84,19 +85,32 @@ owning that role.
 - Live Noise handshake / encrypted SV2 sessions
 - Share validation and block submission wiring
 - Dashboard device hash-rate / shares / rejects UI
-- Adding `stratum-core` (or sibling) crates to the lockfile
 - CUDA / search hot-path changes beyond the module wire in `lib.rs`
 - Donation logic
 
 ## This PR's scaffold
 
 Native module `pickaxe_miner::stratum_v2` with roles, BCH constraint constants,
-and a status report. No network I/O yet.
+status report, and an optional `reference` link-proof behind feature
+`stratum-v2`. No network I/O yet.
+
+**Leftovers removed** (main Status dispatch already landed in `src/main.rs`):
+
+- `.github/workflows/apply-stratum-main-patch.yml`
+- `src/bin/stratum_v2_status.rs` (interim bin)
+- `src/stratum_v2/main.rs.diff`
 
 **CLI status today**
 
-- Ready now: `cargo run --bin stratum_v2_status`
-- Clap subcommand `pickaxe stratum-v2 status` is present behind feature
-  `stratum-v2`, pending apply of `src/stratum_v2/main.rs.diff` to `src/main.rs`
-  (import + match arm). After that patch, ungate the clap variant if desired so
-  default builds expose the subcommand without an extra feature flag for CLI.
+- Works on this branch (default build, no extra feature):  
+  `pickaxe stratum-v2 status`  
+  (or `cargo run -- stratum-v2 status`)
+- Status reports `reference crates: linked` only when built with  
+  `--features stratum-v2`; otherwise `not linked yet`.
+
+**Next after this scaffold**
+
+- TP client wrapping `node.rs` GBT-light (Chipnet first)
+- Mining server / channel work on top of the linked reference crates
+- Still out of scope until follow-ups: Noise handshake, share validation,
+  dashboard devices

@@ -1,6 +1,7 @@
 //! Scaffold status report for CLI and tests (no live SV2 session yet).
 
 use super::bch::BchTemplateConstraints;
+use super::reference;
 use super::roles::Role;
 
 /// Snapshot of the Stratum V2 scaffold state.
@@ -22,8 +23,7 @@ impl Default for StratumV2Status {
     fn default() -> Self {
         Self {
             feature: "stratum-v2",
-            // Empty feature placeholder: true once stratum-core (etc.) is wired.
-            reference_crates_linked: false,
+            reference_crates_linked: reference::linked(),
             roles: Role::all(),
             design_doc: "docs/stratum-v2.md",
             first_network: "chipnet",
@@ -76,12 +76,25 @@ mod tests {
         assert!(report.contains("chipnet"));
         assert!(report.contains("template_provider_client"));
         assert!(report.contains("mining_server"));
-        assert!(report.contains("not linked yet"));
         assert!(report.contains("docs/stratum-v2.md"));
+        if cfg!(feature = "stratum-v2") {
+            assert!(report.contains("linked"));
+            assert!(!report.contains("not linked yet"));
+        } else {
+            assert!(report.contains("not linked yet"));
+        }
     }
 
     #[test]
     fn default_status_lists_three_roles() {
         assert_eq!(StratumV2Status::default().roles.len(), 3);
+    }
+
+    #[test]
+    fn reference_crates_linked_matches_feature() {
+        assert_eq!(
+            StratumV2Status::default().reference_crates_linked,
+            cfg!(feature = "stratum-v2")
+        );
     }
 }
