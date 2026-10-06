@@ -78,6 +78,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// BCH Stratum V2 scaffold (ASIC-facing; see docs/stratum-v2.md).
+    StratumV2 {
+        #[command(subcommand)]
+        command: StratumV2Command,
+    },
     #[command(hide = true)]
     Repl,
 }
@@ -87,6 +92,12 @@ pub enum ConfigCommand {
     Show,
     Validate,
     Save,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StratumV2Command {
+    /// Print scaffold status (no live SV2 session).
+    Status,
 }
 
 /// Parses command-line arguments into the supported miner commands.
@@ -246,5 +257,16 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--chipnet", "--network", "mainnet"]).is_err()
         );
+    }
+
+    #[test]
+    fn clap_parses_stratum_v2_status() {
+        let cli = Cli::try_parse_from(["pickaxe", "stratum-v2", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Status
+            })
+        ));
     }
 }
