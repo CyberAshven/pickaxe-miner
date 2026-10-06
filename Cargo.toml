@@ -23,6 +23,11 @@ shared-rust-t2 = []
 # #### PR #22: development-only browser export that checks the portable
 # engine against the CPU (tools/build-browser.py --check). Not in releases.
 browser-check = ["portable-wgpu"]
+# Placeholder for stratum-mining reference crates (stratum-core / binary_sv2 /
+# codec_sv2 / framing_sv2 / mining_sv2 / template_distribution_sv2). Empty for
+# now so default CI stays green; deps + lockfile update land after design lock
+# in docs/stratum-v2.md.
+stratum-v2 = []
 
 [dependencies]
 sha2 = "0.11"

@@ -55,6 +55,8 @@ pub mod search;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod self_test;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod stratum_v2;
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
 mod stage_b;
 #[cfg(not(target_arch = "wasm32"))]
