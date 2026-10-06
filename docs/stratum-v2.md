@@ -91,4 +91,12 @@ owning that role.
 ## This PR's scaffold
 
 Native module `pickaxe_miner::stratum_v2` with roles, BCH constraint constants,
-and a status report; CLI `pickaxe stratum-v2 status`. No network I/O yet.
+and a status report. No network I/O yet.
+
+**CLI status today**
+
+- Ready now: `cargo run --bin stratum_v2_status`
+- Clap subcommand `pickaxe stratum-v2 status` is present behind feature
+  `stratum-v2`, pending apply of `src/stratum_v2/main.rs.diff` to `src/main.rs`
+  (import + match arm). After that patch, ungate the clap variant if desired so
+  default builds expose the subcommand without an extra feature flag for CLI.
