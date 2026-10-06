@@ -232,7 +232,6 @@ cargo run --release -- benchmark
 
 - There is no CPU mining fallback.
 - CUDA performance was measured on the local NVIDIA GPU; HIP artifacts are build-verified, without a physical AMD performance claim.
-- The portable engine (`wgpu` on Vulkan and DirectX 12, and the browser miner on browser WebGPU) was verified on an integrated Radeon and an RTX 5070 Ti. Intel GPUs, Linux GPUs and Apple Silicon have not run it yet.
 
 ## Features
 
