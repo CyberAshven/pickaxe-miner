@@ -79,9 +79,6 @@ pub enum Commands {
         command: ConfigCommand,
     },
     /// BCH Stratum V2 scaffold (ASIC-facing; see docs/stratum-v2.md).
-    /// Enabled with `--features stratum-v2` once `src/main.rs` dispatch is applied
-    /// (see `src/stratum_v2/main.rs.diff`). Default builds stay match-exhaustive.
-    #[cfg(feature = "stratum-v2")]
     StratumV2 {
         #[command(subcommand)]
         command: StratumV2Command,
@@ -262,7 +259,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "stratum-v2")]
     #[test]
     fn clap_parses_stratum_v2_status() {
         let cli = Cli::try_parse_from(["pickaxe", "stratum-v2", "status"]).unwrap();
