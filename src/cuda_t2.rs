@@ -8,7 +8,10 @@ mod value;
 
 const T2_CANDIDATES: u32 = 65_536;
 const T2_PREFIX_BYTES: usize = 448;
-pub(super) const T2_GROUP_WINDOWS: u32 = 256;
+// Signing and preparing a group's windows is latency-bound on a few SMs and
+// costs about the same for 1,024 windows as for 256, so larger groups spend a
+// smaller share of GPU time there. Must match rust-engine/src/t2.rs HEAD_OFFSET.
+pub(super) const T2_GROUP_WINDOWS: u32 = 1024;
 pub(crate) const T2_GROUP_CANDIDATES: u32 = T2_GROUP_WINDOWS * T2_CANDIDATES;
 const T2_MAX_WINDOWS: usize = T2_GROUP_WINDOWS as usize + 1;
 
@@ -99,7 +102,7 @@ impl T2Engine {
             .alloc_zeros::<u8>(T2_MAX_WINDOWS * MAX_TX_BYTES)
             .map_err(|error| error.to_string())?;
         let window_prefixes_gpu = stream
-            // Rust stores the block-7 round-10 states after the existing prefix
+            // Rust stores the block-7 resumed states after the existing prefix
             // array, once per signature window instead of once per thread block.
             .alloc_zeros::<u32>(T2_MAX_WINDOWS * if cfg!(feature = "rust-t2") { 16 } else { 8 })
             .map_err(|error| error.to_string())?;
@@ -559,7 +562,9 @@ impl T2Live {
         let nonce_base = base / per_nonce;
         let candidate_base = base % per_nonce;
         let window_count = (candidate_base + count).div_ceil(per_nonce);
-        if window_count as usize > T2_MAX_WINDOWS {
+        // The signing buffers hold one entry per window, sized by the parent's
+        // candidate capacity; never sign past them.
+        if window_count as usize > T2_MAX_WINDOWS || window_count > parent.max_candidates {
             return Err("T2 batch needs too many signed windows".into());
         }
         launch_gpu_signatures(parent, nonce_base, window_count)?;
@@ -1003,11 +1008,14 @@ mod tests {
     fn t2_sha_filter_group_benchmark() {
         let target = [0u8; 32];
         let key = [0x11; 32];
+        // Mainnet v3.2 mines at shifts 14..=16; default 1 keeps old results comparable.
+        let shift = std::env::var("PICKAXE_T2_BENCH_SHIFT").map_or(1, |s| s.parse().unwrap());
+        eprintln!("t2_sha_filter_group_benchmark: layout shift {shift}");
         let mut engine = CudaPhotonEngine::new(0, 65_536, 8).unwrap();
         engine.enable_t2_search().unwrap();
         engine
             .set_job(
-                &signed_template_with_nonce(1, target, REWARD, 0),
+                &signed_template_with_nonce(shift, target, REWARD, 0),
                 &target,
                 &key,
             )
