@@ -15,6 +15,8 @@
 
 - [Definition of done](DEFINITION_OF_DONE.md)
 - [GPU ship path](GPU_SHIP_PATH.md) (historical plan, 2026-09-20)
+- [Next steps](next-steps.md): BCH Stratum V2 first, then GPU scaling
+- [BCH Stratum V2 design check](stratum-v2.md)
 
 ## Records
 
