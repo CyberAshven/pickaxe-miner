@@ -223,7 +223,9 @@ impl BchTemplate {
             }
             path.push(hashes[1]);
             hashes = hashes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     let mut bytes = [0; 64];
                     bytes[..32].copy_from_slice(&pair[0]);
@@ -342,7 +344,9 @@ fn merkle_root(mut hashes: Vec<Hash>) -> Hash {
             hashes.push(*hashes.last().unwrap());
         }
         hashes = hashes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let mut joined = [0; 64];
                 joined[..32].copy_from_slice(&pair[0]);
