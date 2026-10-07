@@ -4,8 +4,23 @@
 //! block reward. Integer ratios stay exact until the payout boundary; other
 //! assets retain their own policies.
 
+use crate::config::MiningNetwork;
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
+
+/// Where the BCH ASIC donation goes on mainnet.
+pub const MAINNET_ADDRESS: &str = "bitcoincash:qze95tc2dqrnltvxfa5yhunwx5952f34fvw4g6365k";
+/// Where the BCH ASIC donation goes on Chipnet.
+pub const CHIPNET_ADDRESS: &str = "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp";
+
+/// The BCH donation address of a network. Only the network chooses it; the
+/// shared payout guard checks it like any other payout.
+pub fn address(network: MiningNetwork) -> &'static str {
+    match network {
+        MiningNetwork::Mainnet => MAINNET_ADDRESS,
+        MiningNetwork::Chipnet => CHIPNET_ADDRESS,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "u16", into = "u16")]
@@ -137,6 +152,24 @@ impl BchPayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_network_donates_to_its_own_address_through_the_shared_guard() {
+        for (network, other) in [
+            (MiningNetwork::Mainnet, MiningNetwork::Chipnet),
+            (MiningNetwork::Chipnet, MiningNetwork::Mainnet),
+        ] {
+            let donation = address(network);
+            assert!(crate::config::validate_payout_address(network, donation).is_ok());
+            assert!(crate::config::validate_payout_address(other, donation).is_err());
+            assert_eq!(
+                crate::tx::cashaddr_to_p2pkh_locking(donation)
+                    .unwrap()
+                    .len(),
+                25
+            );
+        }
+    }
 
     #[test]
     fn decimal_setting_round_trips_and_rejects_invalid_values() {

@@ -90,7 +90,10 @@ fn live_chipnet_node_validates_standard_and_extended_block_proposals() {
             outputs.iter().map(|o| o.value.to_sat()).sum::<u64>(),
             template.coinbase_value
         );
-        let donor = crate::tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS).unwrap();
+        let donor = crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
+            MiningNetwork::Chipnet,
+        ))
+        .unwrap();
         if donation_work {
             assert_eq!(outputs.len(), 1);
             assert!(outputs[0].script_pubkey.as_bytes() == donor);

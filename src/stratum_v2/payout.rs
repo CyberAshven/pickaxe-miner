@@ -10,7 +10,8 @@ use crate::{
 
 pub fn scripts(network: MiningNetwork, miner: &str) -> Result<[Vec<u8>; 2], String> {
     let miner = config::validate_payout_address(network, miner)?;
-    let donation = config::reprefix_p2pkh_payout(config::DONATION_ADDRESS, network)?;
+    let donation =
+        config::validate_payout_address(network, crate::donation::bch::address(network))?;
     Ok([
         cashaddr_to_p2pkh_locking(&miner)?,
         cashaddr_to_p2pkh_locking(&donation)?,

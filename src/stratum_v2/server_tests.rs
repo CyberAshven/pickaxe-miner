@@ -87,8 +87,10 @@ impl NodeRpc for Rpc {
                 let mut expected = vec![0x76, 0xa9, 0x14];
                 expected.extend([0x12; 20]);
                 expected.extend([0x88, 0xac]);
-                let donor =
-                    crate::tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS).unwrap();
+                let donor = crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
+                    MiningNetwork::Chipnet,
+                ))
+                .unwrap();
                 if coinbase.output.len() == 1 {
                     assert_eq!(coinbase.output[0].value.to_sat(), 312_500_000);
                     assert!(coinbase.output[0].script_pubkey.as_bytes() == donor);
