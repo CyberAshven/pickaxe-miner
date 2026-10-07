@@ -26,7 +26,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local CPU device and Avalon Nano 3 pass; refresh uniqueness follow-up and upstream native SV2 device validation tracked below |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
-| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local rejection/connection diagnostics implemented and host-tested; live telemetry and vardiff pending |
+| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; transient template reconnect fix under validation; vardiff pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | Pending |
@@ -388,3 +388,46 @@ bounded reconnect history, and rendered/scrolled 100- and 140-column dashboards.
 Formatting and Rust 1.99 all-target/all-feature Clippy with warnings denied pass.
 Live telemetry and exact pushed-commit CI are separate gates. Vardiff and greater
 than 64 simultaneous devices remain unfinished; no 1,000-ASIC claim is made.
+
+## Physical telemetry and transient-template recovery (2026-10-07)
+
+#### PR #38
+
+The Linux telemetry binary for `2ee5347` (SHA256
+`917d6f035e3fdeaa348d22babcdb2712445207d7f4a941565247e8f0869221ec`)
+passed 56 focused Linux tests and node preflight. The Avalon Nano 3 appeared as
+one SV1 device row at the unchanged endpoint. An initial 120-second passive
+sample saw 25 submitted/accepted shares and no rejects. The service mined
+height 326826; the configured payout matched and both independent public
+Chipnet servers returned matching block headers. All seven existing/new journal
+receipts were intact with no pending or rejected blocks at that checkpoint.
+
+A longer four-minute observation ended at 111 accepted shares and one stale
+rejection since restart. The stale share followed a new block and was correctly
+included in the SV1-local and aggregate counters. It also captured a real
+`template unavailable` disconnect, one unsuccessful reconnection and a successful
+replacement session. The new session estimated 3.65 TH/s from 41 accepted shares
+over about 198 seconds. This is statistical work accounting, not a controlled
+performance comparison or proof of zero future connection errors.
+
+The follow-up keeps authenticated device connections for at most three seconds
+after template loss. All old jobs are revoked immediately; submissions during
+the gap are rejected rather than credited or submitted to BCHN. Recovery sends
+a clean activation on the existing channel, even for the same parent. Expired
+30-second leases remain expired, repeated failures cannot extend the grace,
+and longer outages still close the connection. Firmware can continue hashing
+the revoked job briefly during this bounded gap; no pause capability is implied.
+The TUI/JSON expose sanitized template-failure counts and the latest category.
+
+The local TCP/Noise firmware regression holds a node outage, verifies an old
+solution receives no ACK and no node submission, restores the node, rejects the
+old job again and confirms a new block on the same session. Another regression
+holds the outage beyond the grace and verifies disconnection. A deterministic
+clock test covers lease expiry and repeated failures. These are synthetic
+faults; no outage was forced on the owner's live node. Live deployment and
+exact-commit CI for this follow-up are recorded separately.
+
+The host suite passes 395 library and 16 binary tests (411 total), with 18
+opt-in tests ignored and 34 GPU tests filtered. The 59 focused protocol tests,
+formatting and all-target/all-feature Rust 1.99 Clippy also pass. No GPU kernel,
+device firmware, clock setting, permanent endpoint or payout policy changed.

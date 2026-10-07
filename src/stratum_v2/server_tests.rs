@@ -43,6 +43,7 @@ struct Node {
     lose_replies: bool,
     submitted: Vec<String>,
     known: std::collections::HashSet<String>,
+    unavailable: bool,
 }
 
 struct Rpc(Arc<Mutex<Node>>);
@@ -50,6 +51,9 @@ struct Rpc(Arc<Mutex<Node>>);
 impl NodeRpc for Rpc {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let mut node = self.0.lock().unwrap();
+        if node.unavailable {
+            return Err("simulated private RPC connection failure".into());
+        }
         match method {
             "getblockchaininfo" => Ok(json!({"chain":"chip", "initialblockdownload":false,
                 "blocks":node.height,"headers":node.height,"bestblockhash":node.tip})),
@@ -135,6 +139,7 @@ impl Running {
             lose_replies: false,
             submitted: Vec::new(),
             known: std::collections::HashSet::new(),
+            unavailable: false,
         }));
         Self::start(node, Arc::new(TestDirectory::new()))
     }
@@ -646,6 +651,61 @@ impl FirmwareDevice {
         let submit = json!({"id":id+10,"method":"mining.submit","params":params});
         (header.block_hash().to_string(), submit)
     }
+}
+
+#[test]
+fn sv1_transient_node_failure_revokes_work_and_recovers_without_reconnect() {
+    let server = Running::new(false);
+    let adapter = FirmwareAdapter::new(&server);
+    let mut device = FirmwareDevice::connect(&adapter, true, false);
+    let (_, revoked) = device.solve(0, true);
+    server.node.lock().unwrap().unavailable = true;
+    server.wait(|stats| !stats.template_ready && stats.template_failures > 0);
+    device.send(revoked.clone());
+    let response = device.receive();
+    assert_eq!(response["id"], 10);
+    assert!(response["error"].is_array());
+    assert_eq!(server.node.lock().unwrap().submissions, 0);
+    assert_eq!(server.stats.lock().unwrap().shares_accepted, 0);
+
+    server.node.lock().unwrap().unavailable = false;
+    let (hash, recovered) = device.solve(1, true);
+    assert!(device.clean, "recovery must invalidate firmware's old jobs");
+    assert_ne!(revoked["params"][1], recovered["params"][1]);
+    device.send(revoked);
+    assert_eq!(device.receive()["error"][0], 21);
+    device.send(recovered);
+    let response = device.receive();
+    assert_eq!(response["id"], 11);
+    assert_eq!(response["result"], true);
+    server.wait(|stats| stats.blocks_accepted == 1);
+    assert_eq!(server.node.lock().unwrap().tip, hash);
+    let stats = server.stats.lock().unwrap();
+    assert_eq!(stats.sessions_started, 1);
+    assert_eq!(
+        (stats.connection_errors, stats.sv1_connection_errors),
+        (0, 0)
+    );
+    assert_eq!(stats.last_template_error, Some("node RPC unavailable"));
+}
+
+#[test]
+fn persistent_node_failure_still_closes_device_after_bounded_grace() {
+    let server = Running::new(false);
+    let adapter = FirmwareAdapter::new(&server);
+    let mut device = FirmwareDevice::connect(&adapter, false, false);
+    let _ = device.solve(0, false);
+    server.node.lock().unwrap().unavailable = true;
+    server.wait(|stats| !stats.template_ready && stats.template_failures > 0);
+    server.wait(|stats| stats.connections == 0);
+    let stats = server.stats.lock().unwrap();
+    assert_eq!(stats.sessions_started, 1);
+    assert_eq!(stats.connection_errors, 1);
+    assert_eq!(stats.shares_accepted, 0);
+    assert_eq!(
+        stats.device_stats.snapshots(Instant::now())[0].connection_error,
+        Some("template unavailable")
+    );
 }
 
 #[test]

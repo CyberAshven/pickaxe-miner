@@ -27,6 +27,7 @@ use std::{
 use stratum_core::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 
 const MAX_CONNECTIONS: usize = 64;
+const TEMPLATE_RECOVERY_GRACE: Duration = Duration::from_secs(3);
 
 // No Debug: contains a local authority secret and payout configuration.
 pub struct ServerConfig {
@@ -54,6 +55,8 @@ pub struct ServerStats {
     pub sessions_started: u64,
     pub device_stats: Devices,
     pub template_ready: bool,
+    pub template_failures: u64,
+    pub last_template_error: Option<&'static str>,
     pub height: Option<u32>,
 }
 
@@ -180,7 +183,13 @@ pub fn run<R: NodeRpc + Send + 'static>(
                         );
                         refreshed = Instant::now();
                     }
-                    Err(_) => publish(&node_shared, None),
+                    Err(error) => {
+                        if let Ok(mut stats) = node_shared.stats.lock() {
+                            stats.template_failures = stats.template_failures.saturating_add(1);
+                            stats.last_template_error = Some(template_reason(&error));
+                        }
+                        publish(&node_shared, None);
+                    }
                 }
             }
         }
@@ -324,12 +333,67 @@ fn device_ended(shared: &Shared, id: u64, error: Option<&str>) {
 }
 
 fn publish(shared: &Shared, job: Option<PublishedJob>) {
-    if let Ok(mut stats) = shared.stats.lock() {
-        stats.template_ready = job.is_some();
-        stats.height = job.as_ref().map(|job| job.template.height);
-    }
+    let ready = job.is_some();
+    let height = job.as_ref().map(|job| job.template.height);
     if let Ok(mut current) = shared.job.write() {
         *current = job;
+    }
+    if let Ok(mut stats) = shared.stats.lock() {
+        stats.template_ready = ready;
+        stats.height = height;
+    }
+}
+
+// #### PR #38
+// A brief template failure is not a failed device transport. Revoke all work
+// immediately, reject submissions while unavailable, then cleanly activate a
+// fresh job on the same channel. The grace is bounded; never extend a job's
+// original freshness lease just to keep a connection alive.
+#[derive(Default)]
+struct JobAvailability {
+    generation: Option<u64>,
+    unavailable_since: Option<Instant>,
+}
+
+impl JobAvailability {
+    fn update(
+        &mut self,
+        mining: &mut MiningSession,
+        current: Option<PublishedJob>,
+        now: Instant,
+    ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
+        if let Some(job) = current.filter(|job| now < job.valid_until) {
+            self.unavailable_since = None;
+            if self.generation == Some(job.generation) {
+                return Ok(Vec::new());
+            }
+            let id = u32::try_from(job.generation).map_err(|_| "job identifiers exhausted")?;
+            let frames = mining.set_job(id, job.generation, job.template)?;
+            self.generation = Some(job.generation);
+            return Ok(frames);
+        }
+        if self.generation.take().is_some() {
+            mining.revoke_job();
+        }
+        let since = *self.unavailable_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= TEMPLATE_RECOVERY_GRACE {
+            return Err("template source unavailable; reconnect when healthy".into());
+        }
+        Ok(Vec::new())
+    }
+}
+
+fn template_reason(error: &str) -> &'static str {
+    match error {
+        "node tip changed while fetching the template" => "tip changed during refresh",
+        "node is on the wrong network" => "wrong network",
+        "node is not fully synchronized" => "node not synchronized",
+        "node omitted height" | "node omitted tip" | "node returned an invalid tip hash" => {
+            "invalid node tip"
+        }
+        "invalid block template" => "invalid block template",
+        "template generation exhausted" => "template generation exhausted",
+        _ => "node RPC unavailable",
     }
 }
 
@@ -349,32 +413,26 @@ fn serve_device(
             rand::random(),
             config.share_target,
         )?;
-        let mut generation = None;
+        let mut availability = JobAvailability::default();
         let mut accepted = 0u64;
         let mut rejected = 0u64;
         while !shared.stop.load(Ordering::Relaxed) {
-            let current = shared
-                .job
-                .read()
-                .map_err(|_| "template state unavailable")?
-                .clone();
-            match current {
-                Some(job) if Instant::now() < job.valid_until => {
-                    if generation != Some(job.generation) {
-                        let id = u32::try_from(job.generation)
-                            .map_err(|_| "job identifiers exhausted")?;
-                        for frame in mining.set_job(id, job.generation, job.template)? {
-                            sender.send(frame)?;
-                        }
-                        generation = Some(job.generation);
-                    }
-                }
-                _ if generation.is_some() => {
-                    return Err("template source unavailable; reconnect when healthy".into())
-                }
-                _ => (),
+            let current_job = || {
+                shared
+                    .job
+                    .read()
+                    .map(|job| job.clone())
+                    .map_err(|_| "template state unavailable")
+            };
+            for frame in availability.update(&mut mining, current_job()?, Instant::now())? {
+                sender.send(frame)?;
             }
             if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
+                // A node failure or tip change may have occurred while waiting
+                // for a device frame; resample before validating that frame.
+                for update in availability.update(&mut mining, current_job()?, Instant::now())? {
+                    sender.send(update)?;
+                }
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(|_| "invalid system clock")?
@@ -440,6 +498,52 @@ fn serve_device(
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[test]
+    fn expired_template_is_revoked_and_repeated_failures_do_not_extend_grace() {
+        let start = Instant::now();
+        let mut mining = MiningSession::new(
+            MiningNetwork::Chipnet,
+            super::super::template_tests::payout(),
+            [17; 12],
+            [255; 32],
+        )
+        .unwrap();
+        let job = PublishedJob {
+            generation: 1,
+            template: Arc::new(
+                BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap(),
+            ),
+            valid_until: start + Duration::from_secs(30),
+        };
+        let mut availability = JobAvailability::default();
+        availability
+            .update(&mut mining, Some(job.clone()), start)
+            .unwrap();
+        assert_eq!(availability.generation, Some(1));
+        availability
+            .update(&mut mining, Some(job.clone()), job.valid_until)
+            .unwrap();
+        assert_eq!(availability.generation, None);
+        availability
+            .update(&mut mining, None, job.valid_until + Duration::from_secs(2))
+            .unwrap();
+        assert!(availability
+            .update(
+                &mut mining,
+                Some(job.clone()),
+                job.valid_until + TEMPLATE_RECOVERY_GRACE
+            )
+            .is_err());
+        assert_eq!(
+            template_reason("private://user:secret@node/?key=secret"),
+            "node RPC unavailable"
+        );
+        assert_eq!(
+            template_reason("node tip changed while fetching the template"),
+            "tip changed during refresh"
+        );
+    }
 
     #[test]
     fn pending_retry_backoff_is_bounded_and_does_not_block_new_work() {

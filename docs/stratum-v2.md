@@ -154,6 +154,16 @@ a share acknowledgement does not establish that.
 
 #### PR #38
 
+A temporary template loss revokes jobs immediately but keeps the device
+connection for up to three seconds. Recovery cleanly replaces work on the same
+channel; a longer outage closes it. Submissions during that gap are rejected,
+and expired job leases are never extended. The TUI and JSON report template
+failure counts and a sanitized last-error category, separately from actual
+device connection errors. A brief outage can still waste firmware work; it
+does not count as accepted work merely because the connection stays open.
+
+#### PR #38
+
 Solved full blocks are saved beside the config in `chipnet.sv2-blocks.json`
 before the device receives its share acknowledgement. The journal is private,
 locked against concurrent writers and bound to the node endpoint, network and

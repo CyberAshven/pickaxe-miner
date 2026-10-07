@@ -140,12 +140,13 @@ pub fn run(
             device_offset = device_offset.min(devices.len().saturating_sub(1));
             if let Some(terminal) = terminal.as_mut() {
                 let status = format!(
-                    "{} · Node {} · Height {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nSV2 {} · SV1 {}\nAuthority {}",
+                    "{} · Node {} · Height {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\nAuthority {}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" },
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
-                    snapshot.connection_errors, snapshot.sv1_connection_errors, bound,
+                    snapshot.connection_errors, snapshot.sv1_connection_errors,
+                    snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), bound,
                     sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()), authority,
                 );
                 terminal
@@ -182,6 +183,7 @@ pub fn run(
                     "blocks_pending":snapshot.blocks_pending,"blocks_rejected":snapshot.blocks_rejected,
                     "block_retries":snapshot.block_retries,"last_block_result":snapshot.last_block_result,
                     "connection_errors":snapshot.connection_errors,"sv1_connection_errors":snapshot.sv1_connection_errors,
+                    "template_failures":snapshot.template_failures,"last_template_error":snapshot.last_template_error,
                     "sv1_local_rejected":snapshot.sv1_local_rejected,"sessions_started":snapshot.sessions_started,
                     "device_details":devices})
                 );

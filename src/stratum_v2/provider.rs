@@ -77,7 +77,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
                 "mode": "template", "capabilities": ["coinbasevalue"], "checkvalidity": true
             }]),
         )?;
-        let template = BchTemplate::from_rpc(&raw)?;
+        let template = BchTemplate::from_rpc(&raw).map_err(|_| "invalid block template")?;
         let after = self.chain_tip()?;
         let mut previous_hash = template.previous_hash;
         previous_hash.reverse();

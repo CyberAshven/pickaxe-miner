@@ -68,6 +68,15 @@ impl MiningSession {
         })
     }
 
+    /// Revoke validation immediately without destroying the authenticated
+    /// transport. Recovery must send a clean activation even on the same tip.
+    pub fn revoke_job(&mut self) {
+        self.current = None;
+        for channel in self.channels.values_mut() {
+            channel.revoke();
+        }
+    }
+
     pub fn set_job(
         &mut self,
         id: u32,
