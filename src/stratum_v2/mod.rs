@@ -1,17 +1,36 @@
-//! BCH Stratum V2 scaffold: roles, constraints, and status (no network I/O yet).
+//! BCH Stratum V2 transport, mining channels and node-backed templates.
+//! See implementation-status.md for validation evidence and unfinished roles.
 //!
 //! Design check: [`docs/stratum-v2.md`](../../docs/stratum-v2.md).
 //! Reference crates (`stratum-core`) are optional behind feature `stratum-v2`.
 
 mod bch;
+#[cfg(feature = "stratum-v2")]
+pub mod channel;
+#[cfg(feature = "stratum-v2")]
+pub mod command;
+#[cfg(feature = "stratum-v2")]
+pub mod provider;
 mod reference;
 mod roles;
+#[cfg(feature = "stratum-v2")]
+pub mod server;
+#[cfg(all(test, feature = "stratum-v2"))]
+mod server_tests;
 mod status;
+#[cfg(feature = "stratum-v2")]
+pub mod template;
+#[cfg(all(test, feature = "stratum-v2"))]
+mod template_tests;
+#[cfg(feature = "stratum-v2")]
+pub mod transport;
+#[cfg(feature = "stratum-v2")]
+pub mod wire;
 
 pub use bch::{
-    BchTemplateConstraints, asert_target_required, cashaddr_payouts_required,
-    ctor_full_templates_required, no_segwit_witness_commitment, respects_adaptive_block_size,
+    asert_target_required, cashaddr_payouts_required, ctor_full_templates_required,
+    no_segwit_witness_commitment, respects_adaptive_block_size, BchTemplateConstraints,
 };
 pub use reference::linked as reference_crates_linked;
 pub use roles::Role;
-pub use status::{StratumV2Status, status_report};
+pub use status::{status_report, StratumV2Status};

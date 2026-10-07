@@ -1,8 +1,10 @@
 # Next steps after the portable miner
 
 Decided on 2026-10-05, after #22 (the portable engine and every GPU of a
-machine in one miner) and its promotion to master in #31. Each step becomes its
-own pull request and starts with a short design check before code.
+machine in one miner) and its promotion to master in #31. The owner subsequently
+approved the shared BCH/SV2 and distributed GPU work together in PR #38. Keep
+that work in the existing PR; implementation and evidence are tracked in
+[implementation-status.md](implementation-status.md).
 
 ## Decisions
 

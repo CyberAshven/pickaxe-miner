@@ -9,7 +9,7 @@ pub enum Role {
     TemplateProviderClient,
     /// Serve SV2 mining channels to devices and check shares.
     MiningServer,
-    /// Optional later: translate SV1 firmware onto the mining server.
+    /// Translate SV1 firmware onto the same mining server.
     Sv1Translator,
 }
 

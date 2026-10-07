@@ -1046,7 +1046,7 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn restrict_private_config(path: &Path) -> Result<(), String> {
+pub(crate) fn restrict_private_config(path: &Path) -> Result<(), String> {
     #[cfg(not(any(unix, windows)))]
     let _ = path;
     #[cfg(unix)]

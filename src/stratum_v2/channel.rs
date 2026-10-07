@@ -1,0 +1,317 @@
+//! #### PR #38
+//! BCH work ownership and share checking, independent of socket/firmware.
+//! Version rolling is restricted to BIP320's general-purpose bits. Devices
+//! receive disjoint coinbases and cannot alter payouts or template tx order.
+
+use super::template::{double_sha256, meets_target, BchTemplate, Coinbase, CoinbaseParts, Hash};
+use crate::config::{validate_payout_address, MiningNetwork};
+use std::{collections::HashSet, sync::Arc};
+
+pub const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
+const MAX_SHARES_PER_JOB: usize = 16_384;
+pub const DEVICE_EXTRANONCE_SIZE: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelKind {
+    Standard,
+    Extended,
+}
+
+pub struct Channel {
+    pub id: u32,
+    pub kind: ChannelKind,
+    pub target: Hash,
+    pub extranonce_prefix: [u8; 16],
+    network: MiningNetwork,
+    payout: String,
+    job: Option<Job>,
+    sequence: Option<u32>,
+    seen: HashSet<Hash>,
+    pub accepted: u64,
+    pub rejected: u64,
+}
+
+#[derive(Clone)]
+pub struct Job {
+    pub id: u32,
+    pub generation: u64,
+    pub template: Arc<BchTemplate>,
+    pub standard_coinbase: Coinbase,
+    pub parts: CoinbaseParts,
+}
+
+pub struct Share<'a> {
+    pub channel_id: u32,
+    pub job_id: u32,
+    pub sequence: u32,
+    pub version: u32,
+    pub time: u32,
+    pub nonce: u32,
+    pub extranonce: &'a [u8],
+}
+
+pub struct ValidatedShare {
+    pub generation: u64,
+    pub coinbase: Coinbase,
+    pub header: [u8; 80],
+    pub block: bool,
+}
+
+impl Channel {
+    pub fn new(
+        id: u32,
+        kind: ChannelKind,
+        target: Hash,
+        session_salt: [u8; 12],
+        network: MiningNetwork,
+        payout: &str,
+    ) -> Result<Self, String> {
+        if target == [0; 32] {
+            return Err("max-target-out-of-range".into());
+        }
+        let payout = validate_payout_address(network, payout)
+            .map_err(|_| "invalid payout for selected network")?;
+        let mut extranonce_prefix = [0; 16];
+        extranonce_prefix[..12].copy_from_slice(&session_salt);
+        extranonce_prefix[12..].copy_from_slice(&id.to_le_bytes());
+        Ok(Self {
+            id,
+            kind,
+            target,
+            extranonce_prefix,
+            network,
+            payout,
+            job: None,
+            sequence: None,
+            seen: HashSet::new(),
+            accepted: 0,
+            rejected: 0,
+        })
+    }
+
+    pub fn install(
+        &mut self,
+        id: u32,
+        generation: u64,
+        template: Arc<BchTemplate>,
+    ) -> Result<&Job, String> {
+        self.job = None;
+        self.seen.clear();
+        let standard_coinbase =
+            template.coinbase(self.network, &self.payout, &self.extranonce_prefix)?;
+        let parts = template.coinbase_parts(
+            self.network,
+            &self.payout,
+            self.extranonce_prefix.len() + DEVICE_EXTRANONCE_SIZE,
+        )?;
+        self.job = Some(Job {
+            id,
+            generation,
+            template,
+            standard_coinbase,
+            parts,
+        });
+        Ok(self.job.as_ref().unwrap())
+    }
+
+    pub fn revoke(&mut self) {
+        self.job = None;
+        self.seen.clear();
+    }
+    pub fn job(&self) -> Option<&Job> {
+        self.job.as_ref()
+    }
+
+    pub fn check(&mut self, share: Share<'_>, now: u32) -> Result<ValidatedShare, &'static str> {
+        let result = self.check_inner(share, now);
+        if result.is_ok() {
+            self.accepted = self.accepted.saturating_add(1);
+        } else {
+            self.rejected = self.rejected.saturating_add(1);
+        }
+        result
+    }
+
+    fn check_inner(&mut self, share: Share<'_>, now: u32) -> Result<ValidatedShare, &'static str> {
+        if share.channel_id != self.id {
+            return Err("invalid-channel-id");
+        }
+        let job = self.job.as_ref().ok_or("stale-share")?;
+        if share.job_id != job.id {
+            return Err("invalid-job-id");
+        }
+        if self.sequence.is_some_and(|last| {
+            let delta = share.sequence.wrapping_sub(last);
+            delta == 0 || delta >= 1 << 31
+        }) {
+            return Err("invalid-sequence-number");
+        }
+        self.sequence = Some(share.sequence);
+        if (share.version ^ job.template.version) & !VERSION_ROLLING_MASK != 0 {
+            return Err("invalid-version");
+        }
+        if share.time < job.template.current_time
+            || share.time > now.saturating_add(60)
+            || share.time > job.template.current_time.saturating_add(60)
+        {
+            return Err("invalid-ntime");
+        }
+        let coinbase = match self.kind {
+            ChannelKind::Standard => {
+                if !share.extranonce.is_empty() {
+                    return Err("invalid-extranonce-size");
+                }
+                job.standard_coinbase.clone()
+            }
+            ChannelKind::Extended => {
+                if share.extranonce.len() != DEVICE_EXTRANONCE_SIZE {
+                    return Err("invalid-extranonce-size");
+                }
+                let mut extra = self.extranonce_prefix.to_vec();
+                extra.extend_from_slice(share.extranonce);
+                job.template
+                    .coinbase(self.network, &self.payout, &extra)
+                    .map_err(|_| "invalid-coinbase")?
+            }
+        };
+        let header = job
+            .template
+            .header(&coinbase, share.version, share.time, share.nonce)
+            .map_err(|_| "invalid-ntime")?;
+        let hash = double_sha256(&header);
+        let block = meets_target(&hash, &job.template.target);
+        if !meets_target(&hash, &self.target) && !block {
+            return Err("difficulty-too-low");
+        }
+        if self.seen.contains(&hash) {
+            return Err("duplicate-share");
+        }
+        if self.seen.len() >= MAX_SHARES_PER_JOB {
+            return Err("job-share-limit");
+        }
+        self.seen.insert(hash);
+        Ok(ValidatedShare {
+            generation: job.generation,
+            coinbase,
+            header,
+            block,
+        })
+    }
+}
+
+/// Report difficulty-one work units in SubmitSharesSuccess, not merely the
+/// number of accepted headers. Dashboard rate uses the same target accounting.
+pub fn share_work(target: &Hash) -> u64 {
+    let numerator = num_bigint::BigUint::from(1u8) << 256usize;
+    let denominator = num_bigint::BigUint::from_bytes_le(target) + num_bigint::BigUint::from(1u8);
+    let hashes = numerator / denominator;
+    let words = (hashes >> 32usize).to_u64_digits();
+    if words.len() > 1 {
+        u64::MAX
+    } else {
+        words.first().copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::template_tests::{payout, rpc_template};
+    use super::*;
+    use stratum_core::bitcoin::{consensus, Block};
+    fn channel(id: u32, kind: ChannelKind) -> Channel {
+        let mut channel = Channel::new(
+            id,
+            kind,
+            [255; 32],
+            [9; 12],
+            MiningNetwork::Chipnet,
+            &payout(),
+        )
+        .unwrap();
+        channel
+            .install(
+                1,
+                3,
+                Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+            )
+            .unwrap();
+        channel
+    }
+    fn share(sequence: u32) -> Share<'static> {
+        Share {
+            channel_id: 1,
+            job_id: 1,
+            sequence,
+            version: 0x20000000,
+            time: 1700000010,
+            nonce: 0,
+            extranonce: &[],
+        }
+    }
+    #[test]
+    fn channels_are_disjoint_and_share_header_round_trips() {
+        let mut first = channel(1, ChannelKind::Standard);
+        let second = channel(2, ChannelKind::Standard);
+        assert_ne!(
+            first.job().unwrap().standard_coinbase.merkle_root,
+            second.job().unwrap().standard_coinbase.merkle_root
+        );
+        let result = first.check(share(0), 1700000010).unwrap();
+        let block = first
+            .job()
+            .unwrap()
+            .template
+            .block(&result.coinbase, result.header)
+            .unwrap();
+        let decoded: Block = consensus::deserialize(&block).unwrap();
+        assert!(decoded.check_merkle_root());
+        assert!(first.check(share(1), 1700000010).is_err());
+        first.revoke();
+        assert!(first.check(share(2), 1700000010).is_err());
+    }
+    #[test]
+    fn share_validation_rejects_mutations_and_accepts_only_version_mask() {
+        for field in 0..7 {
+            let mut channel = channel(1, ChannelKind::Standard);
+            let mut input = share(0);
+            match field {
+                0 => input.channel_id = 2,
+                1 => input.job_id = 2,
+                2 => input.version ^= 1,
+                3 => input.time -= 1,
+                4 => input.time += 61,
+                5 => input.extranonce = &[1],
+                _ => channel.revoke(),
+            }
+            assert!(channel.check(input, 1700000010).is_err());
+        }
+        let mut channel = channel(1, ChannelKind::Standard);
+        let mut input = share(u32::MAX);
+        input.version ^= VERSION_ROLLING_MASK;
+        assert!(channel.check(input, 1700000010).is_ok());
+        let mut input = share(0);
+        input.nonce = 1;
+        assert!(channel.check(input, 1700000010).is_ok());
+        assert!(channel.check(share(0), 1700000010).is_err());
+    }
+    #[test]
+    fn extended_extranonce_and_coinbase_parts_agree_with_full_block() {
+        let mut channel = channel(1, ChannelKind::Extended);
+        let mut input = share(0);
+        input.extranonce = &[0x23; DEVICE_EXTRANONCE_SIZE];
+        let result = channel.check(input, 1700000010).unwrap();
+        let job = channel.job().unwrap();
+        let mut assembled = job.parts.prefix.clone();
+        assembled.extend(channel.extranonce_prefix);
+        assembled.extend([0x23; DEVICE_EXTRANONCE_SIZE]);
+        assembled.extend(&job.parts.suffix);
+        assert_eq!(assembled, result.coinbase.bytes);
+        let block = job.template.block(&result.coinbase, result.header).unwrap();
+        let decoded: Block = consensus::deserialize(&block).unwrap();
+        assert!(decoded.check_merkle_root());
+        let mut input = share(1);
+        input.extranonce = &[0x24; DEVICE_EXTRANONCE_SIZE];
+        assert!(channel.check(input, 1700000010).is_ok());
+        assert!(channel.check(share(2), 1700000010).is_err());
+    }
+}

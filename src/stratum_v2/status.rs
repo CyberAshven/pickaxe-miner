@@ -1,10 +1,10 @@
-//! Scaffold status report for CLI and tests (no live SV2 session yet).
+//! Implementation status, distinct from live node or ASIC validation.
 
 use super::bch::BchTemplateConstraints;
 use super::reference;
 use super::roles::Role;
 
-/// Snapshot of the Stratum V2 scaffold state.
+/// Snapshot of the Stratum V2 build capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StratumV2Status {
     /// Feature name reserved for reference crates.
@@ -41,18 +41,21 @@ pub fn status_report() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "pickaxe stratum-v2 scaffold\n\
+        "pickaxe stratum-v2 implementation in progress\n\
          feature: {feature} (reference crates: {crates})\n\
          roles: {roles}\n\
          bch: CTOR={ctor} no_segwit={no_segwit} ASERT={asert} CashAddr={cashaddr} adaptive_size={adaptive}\n\
          first_network: {network}\n\
          design: {design}\n\
-         live: Noise handshake, share validation, dashboard devices — out of scope for this scaffold\n",
+         available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates)\n\
+         validation: local TCP/CPU experiments; live Chipnet and ASIC validation pending\n\
+         pending: SV1 translator, vardiff/device rates, Knuth TP, distributed rigs and pool routing\n\
+         evidence: docs/implementation-status.md\n",
         feature = status.feature,
         crates = if status.reference_crates_linked {
             "linked"
         } else {
-            "not linked yet"
+            "not included in this build"
         },
         roles = roles,
         ctor = BchTemplateConstraints::CTOR_FULL_TEMPLATES,
@@ -70,7 +73,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_report_mentions_scaffold_and_chipnet() {
+    fn status_report_distinguishes_local_evidence_from_live_validation() {
         let report = status_report();
         assert!(report.contains("stratum-v2"));
         assert!(report.contains("chipnet"));
@@ -79,9 +82,9 @@ mod tests {
         assert!(report.contains("docs/stratum-v2.md"));
         if cfg!(feature = "stratum-v2") {
             assert!(report.contains("linked"));
-            assert!(!report.contains("not linked yet"));
+            assert!(!report.contains("not included in this build"));
         } else {
-            assert!(report.contains("not linked yet"));
+            assert!(report.contains("not included in this build"));
         }
     }
 

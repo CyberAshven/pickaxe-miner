@@ -1416,6 +1416,23 @@ fn main() {
             cli::StratumV2Command::Status => {
                 print!("{}", stratum_v2::status_report());
             }
+            action => {
+                #[cfg(feature = "stratum-v2")]
+                let result =
+                    stratum_v2::command::run(action, &cfg, &config_path, args.no_tui, args.json);
+                #[cfg(not(feature = "stratum-v2"))]
+                let result: Result<(), String> = {
+                    let _ = action;
+                    Err(
+                        "this build does not include Stratum V2; build with --features stratum-v2"
+                            .into(),
+                    )
+                };
+                if let Err(error) = result {
+                    eprintln!("error: {error}");
+                    exit_after_error(1);
+                }
+            }
         },
         cli::Commands::Mine => {
             let profiles_path = config::profiles_path(&config_path);

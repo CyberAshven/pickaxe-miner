@@ -1,0 +1,389 @@
+//! #### PR #38
+//! Exercise the real TCP/Noise server with CPU-solved headers. The node fixture
+//! uses an independent block decoder/hash oracle. This is not live chain proof.
+
+use super::{
+    provider::NodeRpc,
+    server::{self, ServerConfig, ServerStats},
+    template_tests::{payout, rpc_template},
+    transport::{Receiver, Sender, Session},
+    wire::{encoded, mining},
+};
+use crate::config::MiningNetwork;
+use serde_json::{json, Value};
+use std::{
+    net::{SocketAddr, TcpListener, TcpStream},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use stratum_core::{
+    binary_sv2,
+    bitcoin::{
+        block::Header,
+        consensus,
+        hashes::{sha256d, Hash},
+        Block,
+    },
+    codec_sv2::SerializedFrame,
+    common_messages_sv2::{Protocol, SetupConnection},
+    mining_sv2::*,
+    parsers_sv2::Mining,
+};
+
+struct Node {
+    height: u32,
+    tip: String,
+    reject: bool,
+    submissions: usize,
+}
+
+struct Rpc(Arc<Mutex<Node>>);
+
+impl NodeRpc for Rpc {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let mut node = self.0.lock().unwrap();
+        match method {
+            "getblockchaininfo" => Ok(json!({"chain":"chip", "initialblockdownload":false,
+                "blocks":node.height,"headers":node.height,"bestblockhash":node.tip})),
+            "getblocktemplate" => {
+                assert!(params[0].get("rules").is_none());
+                let mut template = rpc_template();
+                template["height"] = json!(node.height + 1);
+                template["previousblockhash"] = json!(node.tip);
+                template["curtime"] = json!(now());
+                template["mintime"] = json!(now() - 1);
+                Ok(template)
+            }
+            "submitblock" => {
+                let block: Block =
+                    consensus::deserialize(&hex::decode(params[0].as_str().unwrap()).unwrap())
+                        .unwrap();
+                assert!(block.check_merkle_root());
+                assert!(block.header.validate_pow(block.header.target()).is_ok());
+                assert_eq!(block.header.prev_blockhash.to_string(), node.tip);
+                assert_eq!(block.txdata.len(), 1);
+                let coinbase = &block.txdata[0];
+                assert!(coinbase.is_coinbase());
+                assert_eq!(coinbase.output.len(), 1);
+                assert_eq!(coinbase.output[0].value.to_sat(), 312_500_000);
+                let mut expected = vec![0x76, 0xa9, 0x14];
+                expected.extend([0x12; 20]);
+                expected.extend([0x88, 0xac]);
+                assert_eq!(coinbase.output[0].script_pubkey.as_bytes(), expected);
+                assert!(coinbase.input[0].witness.is_empty());
+                assert!((100..=200).contains(&consensus::serialize(coinbase).len()));
+                node.submissions += 1;
+                if node.reject {
+                    Ok(json!("fixture-rejection"))
+                } else {
+                    node.height += 1;
+                    node.tip = block.block_hash().to_string();
+                    Ok(Value::Null)
+                }
+            }
+            _ => panic!("unexpected RPC method"),
+        }
+    }
+}
+
+struct Running {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<Result<(), String>>>,
+    stats: Arc<Mutex<ServerStats>>,
+    node: Arc<Mutex<Node>>,
+    address: SocketAddr,
+    authority: [u8; 32],
+}
+
+impl Running {
+    fn new(reject: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(ServerStats::default()));
+        let node = Arc::new(Mutex::new(Node {
+            height: 325908,
+            tip: "ab".repeat(32),
+            reject,
+            submissions: 0,
+        }));
+        let secret = [17; 32];
+        let authority = server::authority_public(&secret).unwrap();
+        let config = ServerConfig {
+            network: MiningNetwork::Chipnet,
+            payout: payout(),
+            authority_secret: secret,
+            share_target: [255; 32],
+        };
+        let thread = {
+            let stop = stop.clone();
+            let stats = stats.clone();
+            let rpc = Rpc(node.clone());
+            thread::spawn(move || server::run(listener, rpc, config, stop, stats))
+        };
+        let running = Self {
+            stop,
+            thread: Some(thread),
+            stats,
+            node,
+            address,
+            authority,
+        };
+        running.wait(|stats| stats.template_ready);
+        running
+    }
+
+    fn wait(&self, condition: impl Fn(&ServerStats) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if condition(&self.stats.lock().unwrap()) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server progress deadline exceeded"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let result = handle.join();
+            if !thread::panicking() {
+                assert!(matches!(result, Ok(Ok(()))));
+            }
+        }
+    }
+}
+
+fn now() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
+}
+
+struct Device {
+    sender: Sender,
+    receiver: Receiver,
+    id: u32,
+    prefix: Vec<u8>,
+    extended: bool,
+}
+
+impl Device {
+    fn connect(server: &Running, extended: bool) -> Self {
+        let (mut sender, mut receiver) = Session::initiate(
+            TcpStream::connect(server.address).unwrap(),
+            server.authority,
+        )
+        .unwrap()
+        .split();
+        sender
+            .send(
+                encoded(
+                    SetupConnection {
+                        protocol: Protocol::MiningProtocol,
+                        min_version: 2,
+                        max_version: 2,
+                        flags: if extended { 4 } else { 5 },
+                        endpoint_host: "localhost".try_into().unwrap(),
+                        endpoint_port: server.address.port(),
+                        vendor: "CPU experiment".try_into().unwrap(),
+                        hardware_version: "".try_into().unwrap(),
+                        firmware: "".try_into().unwrap(),
+                        device_id: "".try_into().unwrap(),
+                    },
+                    0,
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let response = receiver.receive(Duration::from_secs(3)).unwrap().unwrap();
+        assert_eq!(response.header().msg_type(), 1);
+        let maximum = [255; 32];
+        let open = if extended {
+            Mining::OpenExtendedMiningChannel(OpenExtendedMiningChannel {
+                request_id: 1,
+                user_identity: "cpu".try_into().unwrap(),
+                nominal_hash_rate: 1000.0,
+                max_target: (&maximum).into(),
+                min_extranonce_size: 8,
+            })
+        } else {
+            Mining::OpenStandardMiningChannel(OpenStandardMiningChannel {
+                request_id: 1,
+                user_identity: "cpu".try_into().unwrap(),
+                nominal_hash_rate: 1000.0,
+                max_target: (&maximum).into(),
+            })
+        };
+        sender.send(mining(open).unwrap()).unwrap();
+        let mut response = receiver.receive(Duration::from_secs(3)).unwrap().unwrap();
+        let (id, prefix) = if extended {
+            assert_eq!(
+                response.header().msg_type(),
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
+            );
+            let opened: OpenExtendedMiningChannelSuccess =
+                binary_sv2::from_bytes(response.payload()).unwrap();
+            assert_eq!(opened.extranonce_size, 8);
+            (
+                opened.channel_id,
+                opened.extranonce_prefix.as_ref().to_vec(),
+            )
+        } else {
+            assert_eq!(
+                response.header().msg_type(),
+                MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS
+            );
+            let opened: OpenStandardMiningChannelSuccess =
+                binary_sv2::from_bytes(response.payload()).unwrap();
+            (
+                opened.channel_id,
+                opened.extranonce_prefix.as_ref().to_vec(),
+            )
+        };
+        Self {
+            sender,
+            receiver,
+            id,
+            prefix,
+            extended,
+        }
+    }
+
+    fn receive(&mut self) -> SerializedFrame {
+        self.receiver
+            .receive(Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn solve_and_submit(&mut self, sequence: u32) -> String {
+        let mut frame = self.receive();
+        let extra = [sequence as u8; 8];
+        let (job_id, version, root) = if self.extended {
+            assert_eq!(
+                frame.header().msg_type(),
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB
+            );
+            let job: NewExtendedMiningJob = binary_sv2::from_bytes(frame.payload()).unwrap();
+            assert!(job.version_rolling_allowed);
+            let mut coinbase = job.coinbase_tx_prefix.as_ref().to_vec();
+            coinbase.extend(&self.prefix);
+            coinbase.extend(extra);
+            coinbase.extend(job.coinbase_tx_suffix.as_ref());
+            let mut root = sha256d::Hash::hash(&coinbase).to_byte_array();
+            for sibling in job.merkle_path.iter() {
+                let mut pair = root.to_vec();
+                pair.extend(sibling.as_ref());
+                root = sha256d::Hash::hash(&pair).to_byte_array();
+            }
+            (job.job_id, job.version, root)
+        } else {
+            assert_eq!(frame.header().msg_type(), MESSAGE_TYPE_NEW_MINING_JOB);
+            let job: NewMiningJob = binary_sv2::from_bytes(frame.payload()).unwrap();
+            (
+                job.job_id,
+                job.version,
+                <[u8; 32]>::try_from(job.merkle_root.as_ref()).unwrap(),
+            )
+        };
+        let mut frame = self.receive();
+        assert_eq!(
+            frame.header().msg_type(),
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH
+        );
+        let previous: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
+        assert_eq!(previous.channel_id, self.id);
+        assert_eq!(previous.job_id, job_id);
+        // Flip an allowed bit: actual ASICs depend on negotiated version rolling.
+        let version = version ^ 0x2000;
+        let mut bytes = version.to_le_bytes().to_vec();
+        bytes.extend(previous.prev_hash.as_ref());
+        bytes.extend(root);
+        bytes.extend(previous.min_ntime.to_le_bytes());
+        bytes.extend(previous.nbits.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        let mut header: Header = consensus::deserialize(&bytes).unwrap();
+        let nonce = (0..10_000)
+            .find(|nonce| {
+                header.nonce = *nonce;
+                header.validate_pow(header.target()).is_ok()
+            })
+            .expect("synthetic easy target must yield a CPU solution");
+        let submit = if self.extended {
+            Mining::SubmitSharesExtended(SubmitSharesExtended {
+                channel_id: self.id,
+                sequence_number: sequence,
+                job_id,
+                nonce,
+                ntime: previous.min_ntime,
+                version,
+                extranonce: extra.as_slice().try_into().unwrap(),
+            })
+        } else {
+            Mining::SubmitSharesStandard(SubmitSharesStandard {
+                channel_id: self.id,
+                sequence_number: sequence,
+                job_id,
+                nonce,
+                ntime: previous.min_ntime,
+                version,
+            })
+        };
+        self.sender.send(mining(submit).unwrap()).unwrap();
+        let mut accepted = self.receive();
+        assert_eq!(
+            accepted.header().msg_type(),
+            MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS
+        );
+        let accepted: SubmitSharesSuccess = binary_sv2::from_bytes(accepted.payload()).unwrap();
+        assert_eq!(accepted.last_sequence_number, sequence);
+        assert_eq!(accepted.new_submits_accepted_count, 1);
+        header.block_hash().to_string()
+    }
+}
+
+#[test]
+fn encrypted_cpu_devices_submit_blocks_and_receive_successor_without_reconnect() {
+    for extended in [false, true] {
+        let server = Running::new(false);
+        let mut device = Device::connect(&server, extended);
+        for sequence in 0..2 {
+            let hash = device.solve_and_submit(sequence);
+            server.wait(|stats| stats.blocks_accepted == u64::from(sequence) + 1);
+            assert_eq!(server.node.lock().unwrap().tip, hash);
+        }
+        let stats = server.stats.lock().unwrap().clone();
+        assert_eq!(stats.shares_accepted, 2);
+        assert_eq!(stats.blocks_unconfirmed, 0);
+        assert_eq!(stats.connection_errors, 0);
+        assert_eq!(stats.connections, 1);
+        device.sender.close();
+    }
+}
+
+#[test]
+fn share_acknowledgement_does_not_claim_node_block_acceptance() {
+    let server = Running::new(true);
+    let mut device = Device::connect(&server, false);
+    device.solve_and_submit(0);
+    server.wait(|stats| stats.blocks_unconfirmed == 1);
+    let stats = server.stats.lock().unwrap().clone();
+    assert_eq!(stats.shares_accepted, 1);
+    assert_eq!(stats.blocks_accepted, 0);
+    assert_eq!(server.node.lock().unwrap().submissions, 1);
+    assert_eq!(server.node.lock().unwrap().height, 325908);
+    device.sender.close();
+}

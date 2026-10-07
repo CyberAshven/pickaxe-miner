@@ -78,7 +78,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// BCH Stratum V2 scaffold (ASIC-facing; see docs/stratum-v2.md).
+    /// BCH Stratum V2 (ASIC-facing; see docs/stratum-v2.md).
     StratumV2 {
         #[command(subcommand)]
         command: StratumV2Command,
@@ -96,8 +96,16 @@ pub enum ConfigCommand {
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StratumV2Command {
-    /// Print scaffold status (no live SV2 session).
+    /// Print implementation and validation status.
     Status,
+    /// Check the configured BCH node and full block template without mining.
+    CheckNode,
+    /// Serve encrypted BCH mining jobs to SV2 devices.
+    Serve {
+        /// Listener address. Use a LAN address to connect an external ASIC.
+        #[arg(long, default_value = "127.0.0.1:3336")]
+        listen: std::net::SocketAddr,
+    },
 }
 
 /// Parses command-line arguments into the supported miner commands.
@@ -268,5 +276,34 @@ mod tests {
                 command: StratumV2Command::Status
             })
         ));
+    }
+
+    #[test]
+    fn stratum_server_requires_a_valid_listener_and_preserves_global_network() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--chipnet",
+            "--listen",
+            "127.0.0.1:3336",
+        ])
+        .unwrap();
+        assert!(cli.chipnet);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--listen",
+            "not-a-listener"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["pickaxe", "stratum-v2", "check-node", "--chipnet"]).is_ok());
     }
 }

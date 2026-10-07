@@ -1042,7 +1042,7 @@ pub fn fetch_block_template(endpoints: &[String]) -> Result<BlockTemplate, Strin
     let mut failures = Vec::new();
     let mut backoff_ms: u64 = 400;
     let light_params = json!([{"mode": "template", "capabilities": ["coinbasetxn", "workid"]}]);
-    let gbt_params = json!([{"rules": ["segwit"], "capabilities": ["coinbasetxn", "workid"]}]);
+    let gbt_params = json!([{"capabilities": ["coinbasetxn", "workid"]}]);
     for (i, url) in endpoints.iter().enumerate() {
         if i > 0 {
             thread::sleep(Duration::from_millis(backoff_ms));
@@ -1239,7 +1239,7 @@ fn rpc_read_timeout(method: &str) -> Duration {
 }
 
 /// Sends a JSON-RPC request and validates its response.
-fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
+pub(crate) fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     let target = parse_node_rpc_target(url)?;
     let auth = node_rpc_basic_auth(target.url_auth.as_deref())?;
     let host = &target.host;
