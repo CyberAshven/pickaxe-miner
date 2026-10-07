@@ -149,7 +149,7 @@ impl MiningSession {
                 )?);
             } else {
                 self.setup_flags = Some(setup.flags);
-                // Upstream flag bit 1 means REQUIRES_FIXED_VERSION. Leave it
+                // Upstream flag bit 0 means REQUIRES_FIXED_VERSION. Leave it
                 // clear: ASIC hardware, including Bitaxe, needs version rolling.
                 frames.push(encoded(
                     SetupConnectionSuccess {

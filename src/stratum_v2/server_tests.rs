@@ -421,6 +421,110 @@ fn encrypted_cpu_devices_submit_blocks_and_receive_successor_without_reconnect()
     }
 }
 
+// #### PR #38
+// Run an independently built, unmodified SRI mining_device against synthetic
+// BCH templates. No live node, user payout or GPU is accessed by this test.
+#[test]
+#[ignore = "requires PICKAXE_SV2_REFERENCE_DEVICE built from the pinned SRI source"]
+fn upstream_reference_device_authenticates_and_mines_successor_blocks() {
+    use std::process::{Child, Command, Stdio};
+
+    struct Reference(Child);
+    impl Drop for Reference {
+        fn drop(&mut self) {
+            // Only this test's child process; never a running user miner.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let executable = std::env::var_os("PICKAXE_SV2_REFERENCE_DEVICE")
+        .expect("set PICKAXE_SV2_REFERENCE_DEVICE to the unmodified SRI mining_device binary");
+    let server = Running::new(false);
+    let start = |public: [u8; 32], name: &str| {
+        let mut encoded = vec![1, 0];
+        encoded.extend(public);
+        let authority = stratum_core::bitcoin::base58::encode_check(&encoded);
+        let log = std::fs::File::create(server.state_directory.0.join(name)).unwrap();
+        Reference(
+            Command::new(&executable)
+                .args([
+                    "--address-pool",
+                    &server.address.to_string(),
+                    "--pubkey-pool",
+                    &authority,
+                    "--id-device",
+                    "reference-cpu",
+                    "--id-user",
+                    "interop-test",
+                    "--cores",
+                    "1",
+                    "--nonces-per-call",
+                    "1",
+                    "--handicap",
+                    "1000000",
+                ])
+                .stdin(Stdio::null())
+                .stderr(log.try_clone().unwrap())
+                .stdout(log)
+                .spawn()
+                .expect("cannot start the external reference device"),
+        )
+    };
+
+    // The independent client must reject the wrong pinned authority rather
+    // than silently accepting an unauthenticated mining endpoint.
+    let mut wrong = start(
+        server::authority_public(&[18; 32]).unwrap(),
+        "wrong-key.log",
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = wrong.0.try_wait().unwrap() {
+            assert!(!status.success(), "wrong authority unexpectedly accepted");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reference client did not reject wrong authority"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(wrong);
+    server.wait(|stats| stats.connections == 0 && stats.connection_errors == 1);
+    assert_eq!(server.stats.lock().unwrap().shares_accepted, 0);
+
+    let mut valid = start(server.authority, "reference-device.log");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let snapshot = server.stats.lock().unwrap().clone();
+        if snapshot.blocks_accepted >= 2 {
+            assert_eq!(snapshot.sessions_started, 2); // one rejected key, one mining session
+            assert_eq!(snapshot.connection_errors, 1);
+            assert_eq!(snapshot.connections, 1);
+            assert!(snapshot.shares_accepted >= 2);
+            break;
+        }
+        let exited = valid.0.try_wait().unwrap();
+        if exited.is_some() || Instant::now() >= deadline {
+            let log =
+                std::fs::read_to_string(server.state_directory.0.join("reference-device.log"))
+                    .unwrap_or_default();
+            // Keep diagnostic output free of any protocol payloads/identities.
+            panic!(
+                "reference experiment failed: exited={exited:?}, setup={}, channel={}, stats={snapshot:?}",
+                log.contains("SetupConnectionSuccess"),
+                log.contains("channel opened"),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The RPC fixture independently deserializes and checks PoW, merkle, BCH
+    // coinbase serialization, configured payout and successor parent linkage.
+    assert!(server.node.lock().unwrap().known.len() >= 2);
+    drop(valid);
+}
+
 #[test]
 fn share_acknowledgement_does_not_claim_node_block_acceptance() {
     let server = Running::new(true);

@@ -146,15 +146,8 @@ fn serve_session(
         0,
         false,
     )?)?;
-    let mut reply = receive.receive(DEADLINE)?.ok_or("SV2 setup timed out")?;
-    if reply.header().msg_type() != 1 {
-        return Err("SV2 setup rejected".into());
-    }
-    let setup: SetupConnectionSuccess =
-        binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid setup reply")?;
-    if setup.used_version != 2 || setup.flags & (1 << 1) != 0 {
-        return Err("SV2 setup incompatible".into());
-    }
+    let reply = receive.receive(DEADLINE)?.ok_or("SV2 setup timed out")?;
+    validate_setup_reply(reply)?;
     let open = sv1_to_sv2::build_sv2_open_extended_mining_channel(
         1,
         "sv1-device".into(),
@@ -583,6 +576,25 @@ impl Bridge {
     }
 }
 
+// #### PR #38
+// SetupConnection.Success uses bit 0 for fixed version and bit 1 for requiring
+// extended channels. The adapter requires version rolling and opens an extended
+// channel, so only the latter requirement is compatible. Fail closed on unknown
+// requirements; see Mining Protocol section 5.3.1.
+fn validate_setup_reply(mut reply: SerializedFrame) -> Result<(), String> {
+    let header = reply.header();
+    if header.msg_type() != 1 || header.channel_msg() || header.ext_type_without_channel_msg() != 0
+    {
+        return Err("SV2 setup rejected".into());
+    }
+    let setup: SetupConnectionSuccess =
+        binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid setup reply")?;
+    if setup.used_version != 2 || setup.flags & !0b10 != 0 {
+        return Err("SV2 setup incompatible".into());
+    }
+    Ok(())
+}
+
 fn to_json(message: Message) -> Result<Value, String> {
     serde_json::to_value(message).map_err(|_| "SV1 encoding failed".into())
 }
@@ -671,6 +683,37 @@ impl Lines {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_reply_accepts_extended_channels_but_rejects_fixed_version() {
+        for (version, flags, message_type, channel, extension, expected) in [
+            (2, 0, 1, false, 0, true),
+            (2, 2, 1, false, 0, true),
+            (2, 1, 1, false, 0, false),
+            (2, 3, 1, false, 0, false),
+            (2, 1 << 31, 1, false, 0, false),
+            (3, 0, 1, false, 0, false),
+            (2, 0, 2, false, 0, false),
+            (2, 0, 1, true, 0, false),
+            (2, 0, 1, false, 42, false),
+        ] {
+            use stratum_core::codec_sv2::{EncodableFrame, MessageFrame};
+            let frame = MessageFrame::from_message(
+                SetupConnectionSuccess {
+                    used_version: version,
+                    flags,
+                },
+                message_type,
+                extension,
+                channel,
+            )
+            .unwrap();
+            let mut bytes = vec![0; frame.encoded_length()];
+            frame.encode_into(&mut bytes).unwrap();
+            let frame = SerializedFrame::from_bytes(bytes).unwrap();
+            assert_eq!(validate_setup_reply(frame).is_ok(), expected, "version={version}, flags={flags}, type={message_type}, channel={channel}, extension={extension}");
+        }
+    }
 
     fn bridge() -> Bridge {
         let target = [255; 32];

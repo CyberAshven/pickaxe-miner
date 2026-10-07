@@ -96,6 +96,10 @@ verification, node-pinned full-block submission, and an aggregate dashboard.
 An optional SV1 listener translates older firmware through the same encrypted
 SV2 path using the reference translation library.
 The tests include a local TCP CPU miner and an independent block decoder.
+CI also builds a pinned, unmodified SRI CPU mining device and checks authority
+pinning and two successor blocks on one standard-channel connection against
+synthetic BCH templates. Build instructions and the exact source/binary evidence
+are in `implementation-status.md`; this does not test a live native SV2 ASIC.
 An Avalon Nano 3 has also mined confirmed Chipnet blocks, including a header
 matched through two independent public servers. This does not establish native
 SV2 firmware compatibility or compatibility with every ASIC; see the evidence

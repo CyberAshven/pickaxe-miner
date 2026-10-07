@@ -22,11 +22,11 @@ Work continues on PR #38; this document does not narrow the requested scope.
 |---|---|---|---|
 | S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Real Chipnet full templates, confirmed ASIC blocks and independent public-server header checks pass; light/native TP pending |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending; Knuth live tests deferred, BCHN is the live-test baseline |
-| S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests pass; upstream CPU device and ASIC pending |
-| S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local CPU device and Avalon Nano 3 pass; refresh uniqueness follow-up and upstream native SV2 device validation tracked below |
+| S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests, unmodified upstream standard-channel CPU device and SV1 Avalon Nano 3 pass; native SV2 firmware and external extended-channel coverage pending |
+| S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
-| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; transient template reconnect fix under validation; vardiff pending |
+| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; vardiff pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | Pending |
@@ -431,3 +431,74 @@ The host suite passes 395 library and 16 binary tests (411 total), with 18
 opt-in tests ignored and 34 GPU tests filtered. The 59 focused protocol tests,
 formatting and all-target/all-feature Rust 1.99 Clippy also pass. No GPU kernel,
 device firmware, clock setting, permanent endpoint or payout policy changed.
+
+The deployed `67e7774` Linux executable (SHA256
+`9785379b8e5c012a431f2fbda840ff213ea0baaea7df4456831b79e7a7a1df33`)
+passed preflight and preserved ten receipts during a clean replacement. A
+six-minute observation recorded 97 accepted shares, one rejected old share and
+one real RPC failure, followed by healthy work on the same session with zero
+SV1/SV2 connection errors. No outage was forced and no block was found in that
+bounded sample. Subsequent observation recorded four accepted submissions at
+height 326830: one had a confirmation and three were on losing branches. Saved
+acceptance receipts record node acceptance, not permanent canonical rewards.
+All 40 exact-commit checks for `67e7774` passed; release publication was skipped.
+
+## Independent native SV2 reference device (2026-10-07)
+
+#### PR #38
+
+An unmodified [SRI mining_device](https://github.com/stratum-mining/sv2-apps/tree/3772e9d890dc7ec23bc82bcead41879542902402/integration-tests)
+was built from commit `3772e9d890dc7ec23bc82bcead41879542902402` with Rust
+1.98.1 on Debian 13. Its locked Stratum core revision is
+`c293d7418a07d2bf510496870c03e6dc0683db8a`; the upstream Cargo.lock SHA256 is
+`861a6f0cef29b7c69f164f2721ae5d78beaf8701180efee6e0abf26f989fc093`.
+The local reference executable SHA256 is
+`d0ded488f854de0bcaf019053dd2a39a28911c409a503fabfdb4b323a1d1c3d9`.
+No upstream source or dependency lockfile was modified or copied into Pickaxe.
+
+The opt-in `upstream_reference_device_authenticates_and_mines_successor_blocks`
+test runs the real production server against synthetic BCH node fixtures. The
+independent client first rejects the wrong pinned authority without submitting
+work. With the correct key, it opens a standard channel and solves two valid
+successor blocks on one connection. The fixture separately decodes each block,
+checking its PoW, parent, merkle root, coinbase value and configured payout, and
+BCH serialization. One CPU thread is throttled to one nonce per second; neither
+the live node, the ASIC endpoint nor a GPU is involved. The initial Linux
+experiment passed in 32.63 seconds.
+
+CI now builds that exact reference revision with locked dependencies and runs
+this test separately from the ordinary host suite. The test remains ignored
+unless explicitly selected with `PICKAXE_SV2_REFERENCE_DEVICE` set to the
+independently built executable. The source is MIT OR Apache-2.0; this experiment
+does not incorporate it into the shipped miner. Native Bitaxe firmware,
+external extended-channel clients and other upstream pools remain unproven.
+
+Review against [Mining Protocol section 5.3.1](https://stratumprotocol.org/specification/05-mining-protocol/#531-setupconnection-flags-for-mining-protocol)
+also corrected the adapter's setup-success flags: bit 0 requires a fixed
+version, and bit 1 requires extended channels. The adapter accepts the extended
+requirement, rejects fixed-version or unknown requirements, and validates the
+response version and frame header. Its local upstream sends flags zero, so
+this correction does not explain earlier physical ASIC rejects. A table-driven
+test covers both requirements and malformed negotiation variants.
+
+After the correction, the Linux protocol suite passed 59 tests (two opt-in tests
+ignored), and the independent reference experiment passed again in 21.63 seconds.
+The Windows all-feature suite passed 399 library and 16 binary tests; 19 opt-in
+tests were ignored and 31 CUDA tests filtered. Formatting and Rust 1.99
+all-target/all-feature Clippy passed with warnings denied. Remote CI for the
+new commit is a separate gate; the live ASIC service still runs `67e7774`.
+
+To reproduce on Linux, install `capnproto`, `libcapnp-dev`, `libssl-dev` and
+`pkg-config`, then build the pinned client in a separate checkout:
+
+```sh
+rustup toolchain install 1.98.1 --profile minimal
+git clone https://github.com/stratum-mining/sv2-apps.git ../sv2-reference
+git -C ../sv2-reference checkout --detach 3772e9d890dc7ec23bc82bcead41879542902402
+CARGO_PROFILE_DEV_DEBUG=0 cargo +1.98.1 build --locked --manifest-path ../sv2-reference/Cargo.toml -p integration_tests_sv2 --bin mining_device --jobs 2
+PICKAXE_SV2_REFERENCE_DEVICE="$(realpath ../sv2-reference/target/debug/mining_device)" cargo +1.98.1 test --locked --no-default-features --features stratum-v2 --lib upstream_reference_device_authenticates_and_mines_successor_blocks -- --ignored --test-threads=1
+```
+
+If a shared `CARGO_TARGET_DIR` is configured, use the executable in that target
+directory instead. Successful synthetic interoperability is not a live block
+propagation or hardware performance claim.

@@ -200,6 +200,44 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # #### PR #38
+  # Exercise the wire with an unmodified, pinned independent client. Synthetic
+  # BCH templates and one throttled CPU thread need neither a node nor a GPU.
+  sv2-reference:
+    name: Independent SV2 reference device
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/sv2-reference
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Checkout pinned SRI client
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: stratum-mining/sv2-apps
+          ref: 3772e9d890dc7ec23bc82bcead41879542902402
+          path: .reference/sv2-apps
+          persist-credentials: false
+      - name: Install reference build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev libssl-dev pkg-config
+          rustup toolchain install 1.98.1 --profile minimal
+      - name: Build unmodified reference device
+        run: |
+          cargo build --locked --manifest-path .reference/sv2-apps/Cargo.toml -p integration_tests_sv2 --bin mining_device
+          sha256sum .reference/sv2-apps/Cargo.lock "$CARGO_TARGET_DIR/debug/mining_device"
+      - name: Verify pinned identity and successor blocks
+        env:
+          PICKAXE_SV2_REFERENCE_DEVICE: ${{ github.workspace }}/target/sv2-reference/debug/mining_device
+        run: cargo test --locked --no-default-features --features stratum-v2 --lib upstream_reference_device_authenticates_and_mines_successor_blocks -- --ignored --test-threads=1
+
   rust:
     name: ${{ matrix.name }}
     strategy:
