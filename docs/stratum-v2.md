@@ -198,9 +198,12 @@ share target through subsequent target updates. SV1 adapter rejects now count
 in the shared dashboard totals; separate adapter/native connection error fields
 can both describe the same disconnected session. Vardiff, Knuth TP,
 distributed rigs and pool routing are still pending.
-BCH uses an adjustable donation, defaulting to 1.5%, shown as one percentage
-in the dashboard. `--donation 2` selects 2%; `+` / `-` changes the saved setting
-by 0.1 percentage points within 1.5%–100%. Token policies remain separate.
+BCH uses an adjustable donation, defaulting to 1.5%: one third of it is mining
+work and two thirds is the block reward (0.5% and 1% at the default). The
+dashboard shows the total and both parts, each rounded up to two decimals; the
+combined effect of the two parts is slightly below the total (1.495% at 1.5%).
+`--donation 2` selects 2%; the dashboard's Advanced settings (`a`) change the
+saved setting in 0.5% steps from 0% to 100%. Token policies remain separate.
 The BCH policy is attached to each job; changing the setting never changes an
 in-flight job's coinbase. Saved solved blocks retain that policy across restart,
 and pre-donation journal entries replay their original bytes.

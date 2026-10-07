@@ -108,7 +108,7 @@ pub enum StratumV2Command {
         /// Optional plain SV1 endpoint for ASIC firmware on a trusted LAN.
         #[arg(long)]
         sv1_listen: Option<std::net::SocketAddr>,
-        /// BCH donation percentage (minimum 1.5). Defaults to the saved setting.
+        /// BCH donation percentage, 0 to 100 (default 1.5). Defaults to the saved setting.
         #[arg(long)]
         donation: Option<crate::donation::bch::BchDonation>,
     },
@@ -285,8 +285,8 @@ mod tests {
     }
 
     #[test]
-    fn bch_donation_flag_accepts_percentages_above_the_default_only() {
-        for (text, expected) in [("1.5", 150), ("2.01", 201), ("100", 10_000)] {
+    fn bch_donation_flag_accepts_percentages_from_zero_to_one_hundred() {
+        for (text, expected) in [("0", 0), ("1.5", 150), ("2.01", 201), ("100", 10_000)] {
             let cli = Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--donation", text])
                 .unwrap();
             let Some(Commands::StratumV2 {
@@ -301,7 +301,7 @@ mod tests {
             };
             assert_eq!(u16::from(rate), expected);
         }
-        for text in ["0", "1.49", "100.01", "2.001", "NaN"] {
+        for text in ["-1", "100.01", "2.001", "NaN"] {
             assert!(
                 Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--donation", text])
                     .is_err()

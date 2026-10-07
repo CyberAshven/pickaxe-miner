@@ -1,6 +1,8 @@
 //! #### PR #38
-//! BCH's adjustable donation policy. Integer ratios stay exact until the
-//! payout boundary; other assets retain their own policies.
+//! BCH's adjustable donation policy: 1.5% by default, adjustable from 0% to
+//! 100% in 0.5% steps. One third of it is mining work and two thirds is the
+//! block reward. Integer ratios stay exact until the payout boundary; other
+//! assets retain their own policies.
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
@@ -18,8 +20,8 @@ impl Default for BchDonation {
 impl TryFrom<u16> for BchDonation {
     type Error = String;
     fn try_from(bps: u16) -> Result<Self, String> {
-        if !(150..=10_000).contains(&bps) {
-            return Err("BCH donation must be between 1.5% and 100%".into());
+        if bps > 10_000 {
+            return Err("BCH donation must be between 0% and 100%".into());
         }
         Ok(Self(bps))
     }
@@ -66,38 +68,50 @@ impl FromStr for BchDonation {
     }
 }
 
+/// A percentage in hundredths of a percent, rounded up, as "1.50%".
+fn percent(hundredths: u32) -> String {
+    format!("{}.{:02}%", hundredths / 100, hundredths % 100)
+}
+
 impl fmt::Display for BchDonation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_multiple_of(10) {
-            write!(f, "{}.{:01}%", self.0 / 100, self.0 % 100 / 10)
-        } else {
-            write!(f, "{}.{:02}%", self.0 / 100, self.0 % 100)
-        }
+        f.write_str(&percent(u32::from(self.0)))
     }
 }
 
+/// Steps of the advanced setting: 0.5%.
+const STEP_BPS: u16 = 50;
+
 impl BchDonation {
+    /// The next 0.5% step up or down, between 0% and 100%.
     pub fn adjusted(self, increase: bool) -> Self {
         Self(if increase {
-            self.0.saturating_add(10).min(10_000)
+            (self.0 / STEP_BPS + 1).saturating_mul(STEP_BPS).min(10_000)
         } else {
-            self.0.saturating_sub(10).max(150)
+            self.0.div_ceil(STEP_BPS).saturating_sub(1) * STEP_BPS
         })
     }
 
-    /// The work adapter chooses units (e.g. eligible nanoseconds). Round only
-    /// that final integer, never the internal percentage.
+    /// The work share: one third of the total (0.5% of mining work at the
+    /// 1.5% default). The work adapter chooses units (e.g. eligible
+    /// nanoseconds); only that final integer is rounded.
     pub fn work_units(self, units: u64) -> u64 {
         (u128::from(units) * u128::from(self.0)).div_ceil(30_000) as u64
     }
 
-    /// The selected total includes work already dedicated to donation. The
-    /// reward portion applies only to the remaining personal work: with
-    /// w = T/3, r = (T-w)/(1-w), so w + (1-w)*r = T. This avoids reporting
-    /// 1.5% while allocating only 1.495%. Any fractional satoshi remains with
-    /// the miner; the percentage correction does not round up a satoshi charge.
+    /// The block-reward share: two thirds of the total (1% of each block
+    /// reward at the 1.5% default). Any fractional satoshi stays with the
+    /// miner.
     pub fn reward_units(self, units: u64) -> u64 {
-        (u128::from(units) * u128::from(self.0) * 2 / (30_000 - u128::from(self.0))) as u64
+        (u128::from(units) * u128::from(self.0) * 2 / 30_000) as u64
+    }
+
+    /// The work and block-reward shares as shown to the miner, each rounded
+    /// up to two decimals: "0.50%" and "1.00%" at 1.5%, "0.67%" and "1.34%"
+    /// at 2%.
+    pub fn shares(self) -> (String, String) {
+        let bps = u32::from(self.0);
+        (percent(bps.div_ceil(3)), percent((bps * 2).div_ceil(3)))
     }
 }
 
@@ -127,10 +141,11 @@ mod tests {
     #[test]
     fn decimal_setting_round_trips_and_rejects_invalid_values() {
         for (text, bps, display) in [
-            ("1.5", 150, "1.5%"),
-            ("2", 200, "2.0%"),
+            ("0", 0, "0.00%"),
+            ("1.5", 150, "1.50%"),
+            ("2", 200, "2.00%"),
             ("2.01", 201, "2.01%"),
-            ("100", 10_000, "100.0%"),
+            ("100", 10_000, "100.00%"),
         ] {
             let rate: BchDonation = text.parse().unwrap();
             assert_eq!(u16::from(rate), bps);
@@ -141,19 +156,18 @@ mod tests {
             );
         }
         for text in [
-            "", "1.49", "0", "100.01", "NaN", "inf", "2e0", "-2", "+2", "2.001", "2.0.0", "65535",
-            " 2",
+            "", "100.01", "NaN", "inf", "2e0", "-2", "+2", "2.001", "2.0.0", "65535", " 2",
         ] {
             assert!(text.parse::<BchDonation>().is_err());
         }
-        for value in ["0", "149", "10001", "65536", "1.5"] {
+        for value in ["10001", "65536", "1.5"] {
             assert!(serde_json::from_str::<BchDonation>(value).is_err());
         }
     }
 
     #[test]
-    fn rational_split_preserves_fractional_satoshis_for_the_miner_and_conserves_value() {
-        for bps in 150..=10_000 {
+    fn work_is_a_third_and_the_reward_two_thirds_keeping_fractions_for_the_miner() {
+        for bps in 0..=10_000 {
             let donation = BchDonation::try_from(bps).unwrap();
             for value in [0, 1, 99, 100, 1001, 312_500_001, u64::MAX] {
                 let numerator = u128::from(value) * u128::from(bps);
@@ -161,9 +175,8 @@ mod tests {
                 let reward = donation.reward_units(value);
                 assert!(u128::from(work) * 30_000 >= numerator);
                 assert!(u128::from(work) * 30_000 - numerator < 30_000);
-                let denominator = 30_000 - u128::from(bps);
-                assert!(u128::from(reward) * denominator <= numerator * 2);
-                assert!(numerator * 2 - u128::from(reward) * denominator < denominator);
+                assert!(u128::from(reward) * 30_000 <= numerator * 2);
+                assert!(numerator * 2 - u128::from(reward) * 30_000 < 30_000);
                 for donation_work in [false, true] {
                     let split = BchPayout {
                         donation,
@@ -176,34 +189,44 @@ mod tests {
                     }
                 }
             }
+            // Per 30,000 units, the work share is T and the reward share 2T.
+            assert_eq!(donation.work_units(30_000), u64::from(bps));
+            assert_eq!(donation.reward_units(30_000), u64::from(bps) * 2);
         }
-        assert_eq!(BchDonation::default().reward_units(312_500_001), 3_140_703);
+        assert_eq!(BchDonation::default().reward_units(312_500_000), 3_125_000);
         assert_eq!(BchDonation::default().reward_units(1), 0);
-        let two: BchDonation = "2".parse().unwrap();
-        assert_eq!(two.work_units(30_000), 200);
-        assert_eq!(two.reward_units(30_000), 402);
         assert_eq!(
-            BchDonation::default().adjusted(false),
-            BchDonation::default()
+            BchDonation::try_from(0).unwrap().reward_units(312_500_000),
+            0
         );
-        assert_eq!(u16::from(two.adjusted(true)), 210);
     }
 
     #[test]
-    fn combined_expected_donation_matches_selected_total_instead_of_undershooting() {
-        for bps in 150..=10_000 {
-            let policy = BchDonation::try_from(bps).unwrap();
-            // A 30,000-unit ensemble contains bps donor-work units and
-            // 30,000-bps personal-work units. It must donate 3*bps units,
-            // exactly T of the ensemble, including at non-round settings.
-            let work = policy.work_units(30_000);
-            let personal = 30_000 - work;
-            assert_eq!(work + policy.reward_units(personal), u64::from(bps) * 3);
+    fn shown_shares_round_up_to_two_decimals() {
+        for (bps, work, reward) in [
+            (0, "0.00%", "0.00%"),
+            (150, "0.50%", "1.00%"),
+            (200, "0.67%", "1.34%"),
+            (250, "0.84%", "1.67%"),
+            (10_000, "33.34%", "66.67%"),
+        ] {
+            let shares = BchDonation::try_from(bps).unwrap().shares();
+            assert_eq!(shares, (work.to_owned(), reward.to_owned()));
         }
-        let default = BchDonation::default();
-        assert_eq!(
-            default.work_units(30_000) + default.reward_units(29_850),
-            450
-        );
+    }
+
+    #[test]
+    fn the_setting_moves_in_half_percent_steps_from_zero_to_one_hundred() {
+        let step = |bps: u16, up: bool| u16::from(BchDonation::try_from(bps).unwrap().adjusted(up));
+        assert_eq!(step(150, true), 200);
+        assert_eq!(step(150, false), 100);
+        assert_eq!(step(50, false), 0);
+        assert_eq!(step(0, false), 0);
+        assert_eq!(step(0, true), 50);
+        assert_eq!(step(10_000, true), 10_000);
+        // A setting saved between steps snaps to the neighbouring steps.
+        assert_eq!(step(201, true), 250);
+        assert_eq!(step(201, false), 200);
+        assert_eq!(u16::from(BchDonation::default()), 150);
     }
 }

@@ -139,6 +139,7 @@ pub fn run(
         }
         let mut device_offset = 0usize;
         let mut setting_error = None;
+        let mut advanced = false;
         while !stop.load(Ordering::Relaxed) && !worker.is_finished() {
             if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
                 break;
@@ -156,7 +157,7 @@ pub fn run(
                 let status = format!(
                     "{} · Node {} · Height {} · Donation {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" },
-                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_value, snapshot.connections, snapshot.sessions_started,
+                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
                     snapshot.connection_errors, snapshot.sv1_connection_errors,
@@ -166,15 +167,32 @@ pub fn run(
                 );
                 terminal
                     .terminal
-                    .draw(|frame| render_dashboard(frame, &status, &devices, device_offset))
+                    .draw(|frame| {
+                        if advanced {
+                            render_advanced(frame, donation_value, setting_error)
+                        } else {
+                            render_dashboard(frame, &status, &devices, device_offset)
+                        }
+                    })
                     .map_err(|_| "cannot draw mining dashboard")?;
                 if event::poll(Duration::from_millis(500)).map_err(|_| "cannot read terminal")? {
                     if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
                         if key.kind == KeyEventKind::Press {
                             match key.code {
-                                KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') => {
-                                    let next =
-                                        donation_value.adjusted(key.code != KeyCode::Char('-'));
+                                KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
+                                KeyCode::Esc => advanced = false,
+                                // The donation changes only in Advanced settings.
+                                KeyCode::Char('+')
+                                | KeyCode::Char('=')
+                                | KeyCode::Char('-')
+                                | KeyCode::Left
+                                | KeyCode::Right
+                                    if advanced =>
+                                {
+                                    let next = donation_value.adjusted(matches!(
+                                        key.code,
+                                        KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right
+                                    ));
                                     if next != donation_value {
                                         match save_donation(config_path, next) {
                                             Ok(()) => {
@@ -244,6 +262,32 @@ fn save_donation(path: &Path, value: BchDonation) -> Result<(), ()> {
         .unwrap_or_default();
     saved.bch_donation_bps = Some(value);
     saved.save(path).map_err(|_| ())
+}
+
+/// The donation as the dashboard shows it, with its two parts.
+fn donation_summary(donation: BchDonation) -> String {
+    let (work, reward) = donation.shares();
+    format!("{donation} ({work} of work · {reward} of block rewards)")
+}
+
+/// Advanced settings: the donation, adjustable from 0% to 100%.
+fn render_advanced(frame: &mut Frame<'_>, donation: BchDonation, error: Option<&str>) {
+    let (work, reward) = donation.shares();
+    let mut text = format!(
+        "Donation  {donation}\n\n{work} of mining work and {reward} of each block reward go to the \
+         Pickaxe donation address.\nThe default is 1.50%; any setting from 0% to 100% works, in \
+         0.5% steps. Changes apply to new jobs and are saved.\n\n←/→ or +/-  Change donation · \
+         a or Esc  Back"
+    );
+    if let Some(error) = error {
+        text.push_str(&format!("\n\n{error}"));
+    }
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::bordered().title("Pickaxe · Advanced settings"))
+            .wrap(Wrap { trim: false }),
+        frame.area(),
+    );
 }
 
 fn render_dashboard(
@@ -321,7 +365,7 @@ fn render_dashboard(
         .block(Block::bordered().title(title)),
         areas[1],
     );
-    frame.render_widget(Paragraph::new("↑/↓ PgUp/PgDn  Devices · +/- Donation · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
+    frame.render_widget(Paragraph::new("↑/↓ PgUp/PgDn  Devices · a  Advanced settings · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
 }
 
 fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), String> {
@@ -417,6 +461,36 @@ mod tests {
     }
 
     #[test]
+    fn donation_shows_its_parts_and_changes_only_in_advanced_settings() {
+        use ratatui::{backend::TestBackend, Terminal};
+        assert_eq!(
+            donation_summary(BchDonation::default()),
+            "1.50% (0.50% of work · 1.00% of block rewards)"
+        );
+        let two: BchDonation = "2".parse().unwrap();
+        assert_eq!(
+            donation_summary(two),
+            "2.00% (0.67% of work · 1.34% of block rewards)"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|f| render_advanced(f, BchDonation::default(), Some("Could not save donation")))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Advanced settings"));
+        assert!(text.contains("Donation  1.50%"));
+        assert!(text.contains("0.50% of mining work and 1.00% of each block reward"));
+        assert!(text.contains("from 0% to 100%"));
+        assert!(text.contains("Could not save donation"));
+    }
+
+    #[test]
     fn device_dashboard_renders_estimates_failures_and_scrolled_sessions() {
         use super::super::telemetry::{Devices, ShareEvent};
         use ratatui::{backend::TestBackend, Terminal};
@@ -447,7 +521,8 @@ mod tests {
             assert!(text.contains("stale job"));
             assert!(text.contains("TH/s"));
             assert!(text.contains("Donation 1.5%"));
-            assert!(text.contains("+/- Donation"));
+            assert!(text.contains("a  Advanced settings"));
+            assert!(!text.contains("+/- Donation"));
             assert!(!text.contains("2T/3"));
             terminal
                 .draw(|f| render_dashboard(f, "Chipnet · Node Ready", &rows, 1))

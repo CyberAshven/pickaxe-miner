@@ -94,8 +94,8 @@ impl NodeRpc for Rpc {
                     assert!(coinbase.output[0].script_pubkey.as_bytes() == donor);
                 } else {
                     assert_eq!(coinbase.output.len(), 2);
-                    assert_eq!(coinbase.output[0].value.to_sat(), 309_359_297);
-                    assert_eq!(coinbase.output[1].value.to_sat(), 3_140_703);
+                    assert_eq!(coinbase.output[0].value.to_sat(), 309_375_000);
+                    assert_eq!(coinbase.output[1].value.to_sat(), 3_125_000);
                     assert!(coinbase.output[0].script_pubkey.as_bytes() == expected);
                     assert!(coinbase.output[1].script_pubkey.as_bytes() == donor);
                 }
