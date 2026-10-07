@@ -96,11 +96,15 @@ fn serve(
     let peer = socket
         .local_addr()
         .map_err(|_| "cannot identify adapter socket")?;
-    let id = stats
-        .lock()
-        .map_err(|_| "mining statistics unavailable")?
-        .device_stats
-        .connect(peer, true, Instant::now());
+    let id = {
+        let mut stats = stats.lock().map_err(|_| "mining statistics unavailable")?;
+        let id = stats.device_stats.connect(peer, true, Instant::now());
+        // The firmware's own address, for read-only device reports.
+        if let Ok(device) = stream.peer_addr() {
+            stats.device_stats.set_address(id, device.ip());
+        }
+        id
+    };
     let result = serve_session(stream, socket, authority, stop, stats, id);
     if let Ok(mut stats) = stats.lock() {
         let error = result

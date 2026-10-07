@@ -3,12 +3,12 @@
 //! Socket addresses only join the in-process SV1 adapter to its SV2 connection;
 //! public snapshots contain generated labels, not worker identities or payouts.
 
-use super::template::Hash;
+use super::{device_api::DeviceReport, template::Hash};
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
 
@@ -48,6 +48,10 @@ pub struct DeviceSnapshot {
     pub last_share_seconds: Option<u64>,
     pub connection_error: Option<&'static str>,
     pub adapter_error: Option<&'static str>,
+    /// What the device itself reports, when it answers a read-only query.
+    pub reported_hashrate: Option<f64>,
+    pub temperature_c: Option<f64>,
+    pub fan: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +73,7 @@ struct Device {
     difficulty: Option<f64>,
     connection_error: Option<&'static str>,
     adapter_error: Option<&'static str>,
+    report: Option<DeviceReport>,
 }
 
 #[derive(Clone)]
@@ -77,6 +82,9 @@ pub struct Devices {
     next_id: u64,
     sockets: HashMap<SocketAddr, u64>,
     rows: BTreeMap<u64, Device>,
+    // Device LAN addresses, used only to query the device itself; never shown
+    // or written to JSON.
+    addresses: HashMap<u64, IpAddr>,
 }
 
 impl std::fmt::Debug for Devices {
@@ -94,6 +102,7 @@ impl Default for Devices {
             next_id: 0,
             sockets: HashMap::new(),
             rows: BTreeMap::new(),
+            addresses: HashMap::new(),
         }
     }
 }
@@ -130,10 +139,35 @@ impl Devices {
                 difficulty: None,
                 connection_error: None,
                 adapter_error: None,
+                report: None,
             },
         );
         self.prune();
         id
+    }
+
+    /// Records where a device can be asked for its own report. Loopback is
+    /// ignored: it is the SV1 adapter's link, not the device.
+    pub fn set_address(&mut self, id: u64, ip: IpAddr) {
+        if !ip.is_loopback() && self.rows.contains_key(&id) {
+            self.addresses.insert(id, ip);
+        }
+    }
+
+    /// Connected devices with a known address.
+    pub fn addresses(&self) -> Vec<(u64, IpAddr)> {
+        self.addresses
+            .iter()
+            .filter(|(id, _)| self.rows.get(id).is_some_and(|row| row.ended.is_none()))
+            .map(|(id, ip)| (*id, *ip))
+            .collect()
+    }
+
+    /// Stores what a device reported about itself.
+    pub fn set_report(&mut self, id: u64, report: Option<DeviceReport>) {
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.report = report;
+        }
     }
 
     pub fn channels(&mut self, id: u64, count: usize) {
@@ -200,6 +234,7 @@ impl Devices {
             row.connection_error = error.map(connection_reason);
         }
         self.sockets.retain(|_, existing| *existing != id);
+        self.addresses.remove(&id);
         self.prune();
     }
 
@@ -269,6 +304,9 @@ impl Devices {
                         .map(|t| now.saturating_duration_since(t).as_secs()),
                     connection_error: row.connection_error,
                     adapter_error: row.adapter_error,
+                    reported_hashrate: row.report.as_ref().and_then(|r| r.hashrate),
+                    temperature_c: row.report.as_ref().and_then(|r| r.temperature_c),
+                    fan: row.report.as_ref().and_then(|r| r.fan.clone()),
                 }
             })
             .collect();
@@ -451,5 +489,36 @@ mod tests {
         assert!(!json.contains("private credentials"));
         assert!(!json.contains("192.0.2.7"));
         assert!(!format!("{devices:?}").contains("192.0.2.7"));
+    }
+
+    #[test]
+    fn device_reports_appear_but_device_addresses_never_do() {
+        let now = Instant::now();
+        let mut devices = Devices::default();
+        let id = devices.connect("127.0.0.1:5000".parse().unwrap(), true, now);
+        // The adapter's loopback link is not the device.
+        devices.set_address(id, "127.0.0.1".parse().unwrap());
+        assert!(devices.addresses().is_empty());
+        devices.set_address(id, "192.0.2.9".parse().unwrap());
+        assert_eq!(
+            devices.addresses(),
+            vec![(id, "192.0.2.9".parse().unwrap())]
+        );
+        devices.set_report(
+            id,
+            Some(DeviceReport {
+                hashrate: Some(4.0e12),
+                temperature_c: Some(61.0),
+                fan: Some("40%".into()),
+            }),
+        );
+        let row = devices.snapshots(now).remove(0);
+        assert_eq!(row.reported_hashrate, Some(4.0e12));
+        assert_eq!(row.temperature_c, Some(61.0));
+        assert_eq!(row.fan.as_deref(), Some("40%"));
+        let json = serde_json::to_string(&devices.snapshots(now)).unwrap();
+        assert!(!json.contains("192.0.2.9"));
+        devices.close(id, true, None, now);
+        assert!(devices.addresses().is_empty());
     }
 }

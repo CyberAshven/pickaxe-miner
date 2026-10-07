@@ -125,6 +125,34 @@ pub fn run(
         }
         thread::spawn(move || super::sv1::run(listener, upstream, public, stop, stats))
     });
+    // Read-only device reports every 15 seconds, outside the stats lock.
+    let reports = {
+        let stop = stop.clone();
+        let stats = stats.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let addresses = stats
+                    .lock()
+                    .map(|stats| stats.device_stats.addresses())
+                    .unwrap_or_default();
+                for (id, ip) in addresses {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let report = super::device_api::poll(ip);
+                    if let Ok(mut stats) = stats.lock() {
+                        stats.device_stats.set_report(id, report);
+                    }
+                }
+                for _ in 0..150 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        })
+    };
     // SV2 reference authority public-key encoding: version 1 (little endian),
     // 32-byte x-only key, Base58Check. Only the public key is displayed.
     let mut encoded = vec![1, 0];
@@ -264,6 +292,7 @@ pub fn run(
         Ok(())
     })();
     stop.store(true, Ordering::Relaxed);
+    let _ = reports.join();
     let firmware_result = firmware
         .map(|worker| {
             worker
@@ -451,6 +480,15 @@ fn render_workers(frame: &mut Frame<'_>, header: &str, devices: &[DeviceSnapshot
             .to_owned(),
             rate(device.hashrate_estimate),
             rate(device.hashrate_hour),
+            device
+                .reported_hashrate
+                .map(crate::telemetry::format_hash_rate)
+                .unwrap_or_else(|| "—".into()),
+            device
+                .temperature_c
+                .map(|temperature| format!("{temperature:.0} °C"))
+                .unwrap_or_else(|| "—".into()),
+            device.fan.clone().unwrap_or_else(|| "—".into()),
             device.accepted.to_string(),
             device.rejected.to_string(),
             if total == 0 {
@@ -477,6 +515,9 @@ fn render_workers(frame: &mut Frame<'_>, header: &str, devices: &[DeviceSnapshot
                 Constraint::Length(7),
                 Constraint::Length(11),
                 Constraint::Length(11),
+                Constraint::Length(11),
+                Constraint::Length(6),
+                Constraint::Length(9),
                 Constraint::Length(9),
                 Constraint::Length(9),
                 Constraint::Length(8),
@@ -492,6 +533,9 @@ fn render_workers(frame: &mut Frame<'_>, header: &str, devices: &[DeviceSnapshot
                 "Status",
                 "Now (5m)",
                 "1 hour",
+                "Device says",
+                "Temp",
+                "Fan",
                 "Accepted",
                 "Rejected",
                 "Reject",
@@ -511,7 +555,7 @@ fn render_workers(frame: &mut Frame<'_>, header: &str, devices: &[DeviceSnapshot
     );
     frame.render_widget(
         Paragraph::new(
-            "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · a  Advanced settings · q  Stop server\nRates come from validated shares: 30s warm-up, then up to 5 minutes and up to 1 hour.",
+            "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.",
         ),
         areas[2],
     );
@@ -628,7 +672,7 @@ mod tests {
         }
         devices.share(first, ShareEvent::Rejected("stale job"), true, start);
         let rows = devices.snapshots(start + Duration::from_secs(45));
-        let mut terminal = Terminal::new(TestBackend::new(150, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(180, 20)).unwrap();
         terminal
             .draw(|f| render_workers(f, "Chipnet · Node Ready · 1 of 1 workers online", &rows, 0))
             .unwrap();
@@ -643,6 +687,9 @@ mod tests {
             "Worker",
             "Now (5m)",
             "1 hour",
+            "Device says",
+            "Temp",
+            "Fan",
             "Reject",
             "Last share",
             "Difficulty",

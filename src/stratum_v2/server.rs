@@ -231,7 +231,9 @@ pub fn run<R: NodeRpc + Send + 'static>(
                 let id = if let Ok(mut stats) = shared.stats.lock() {
                     stats.connections += 1;
                     stats.sessions_started = stats.sessions_started.saturating_add(1);
-                    stats.device_stats.connect(peer, false, Instant::now())
+                    let id = stats.device_stats.connect(peer, false, Instant::now());
+                    stats.device_stats.set_address(id, peer.ip());
+                    id
                 } else {
                     0
                 };
