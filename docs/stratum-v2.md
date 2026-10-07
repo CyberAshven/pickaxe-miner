@@ -116,7 +116,15 @@ pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json --sv1-listen 127.
 
 `check-node` is read-only and prints a redacted template summary. `serve`
 binds to `127.0.0.1:3336` unless `--listen IP:PORT` selects a LAN interface.
-The dashboard shows the public authority key that devices must pin. Its
+The dashboard shows each session's generated label, connection state, accepted
+and rejected shares, estimated hashrate and latest diagnostic. Arrow/Page keys
+scroll the rows. An address-only worker still gets its own row and unique work;
+reconnecting creates a new session label. Rates use validated shares over up to
+five minutes with a 30-second warm-up; they are statistical estimates, not ASIC
+hardware telemetry. Up to 64 closed sessions remain visible. JSON `device_details`
+contains the same rows, including last-share age and SV1-local reject counts.
+
+The dashboard also shows the public authority key that devices must pin. Its
 private key is created beside the config as `chipnet.sv2-key`, protected with
 the same owner-only file mechanism as saved RPC credentials. Invalid existing
 keys cause an error instead of silent identity replacement. Press `q` to stop;
@@ -171,8 +179,11 @@ use synthetic solved blocks; actual node/ASIC evidence is recorded separately.
 
 The initial share difficulty is 4096, reduced when the network has easier work
 so firmware does not discard valid Chipnet blocks. A device target limit that
-cannot accommodate this work is rejected. Vardiff, individual device rates,
-Knuth TP, distributed rigs and pool routing are still pending.
+cannot accommodate this work is rejected. Active jobs retain their assigned
+share target through subsequent target updates. SV1 adapter rejects now count
+in the shared dashboard totals; separate adapter/native connection error fields
+can both describe the same disconnected session. Vardiff, Knuth TP,
+distributed rigs and pool routing are still pending.
 Current BCH coinbases pay the configured mining address; integrating the
 compiled BCH donation policy remains separate from existing token policies.
 The successful Chipnet experiments do not complete those remaining capabilities.

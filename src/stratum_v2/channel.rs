@@ -43,6 +43,7 @@ pub struct Job {
     pub template: Arc<BchTemplate>,
     pub standard_coinbase: Coinbase,
     pub parts: CoinbaseParts,
+    pub target: Hash,
 }
 
 pub struct Share<'a> {
@@ -61,6 +62,7 @@ pub struct ValidatedShare {
     pub coinbase: Coinbase,
     pub header: [u8; 80],
     pub block: bool,
+    pub share_target: Hash,
 }
 
 impl Channel {
@@ -146,6 +148,7 @@ impl Channel {
             template,
             standard_coinbase,
             parts,
+            target: self.target,
         });
         Ok(self.job.as_ref().unwrap())
     }
@@ -223,7 +226,10 @@ impl Channel {
             .map_err(|_| "invalid-ntime")?;
         let hash = double_sha256(&header);
         let block = meets_target(&hash, &job.template.target);
-        if !meets_target(&hash, &self.target) && !block {
+        // #### PR #38
+        // SetTarget applies to subsequent jobs; retained active jobs keep the
+        // difficulty they advertised. Validate and account against that target.
+        if !meets_target(&hash, &job.target) && !block {
             return Err("difficulty-too-low");
         }
         if self.seen.values().any(|seen| seen.contains(&hash)) {
@@ -240,6 +246,7 @@ impl Channel {
             coinbase,
             header,
             block,
+            share_target: job.target,
         })
     }
 }
@@ -427,6 +434,57 @@ mod tests {
         channel.revoke();
         assert!(channel.previous.is_empty());
         assert!(channel.seen.is_empty());
+    }
+
+    #[test]
+    fn active_jobs_keep_their_difficulty_across_target_updates() {
+        let mut channel = channel(1, ChannelKind::Standard);
+        let non_block_nonce = |job: &Job| {
+            (0..1000)
+                .find(|nonce| {
+                    let header = job
+                        .template
+                        .header(
+                            &job.standard_coinbase,
+                            job.template.version,
+                            job.template.current_time,
+                            *nonce,
+                        )
+                        .unwrap();
+                    !meets_target(&double_sha256(&header), &job.template.target)
+                })
+                .unwrap()
+        };
+        let old_nonce = non_block_nonce(channel.job().unwrap());
+        channel.target = [1; 32];
+        channel
+            .install(
+                2,
+                4,
+                Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+            )
+            .unwrap();
+        let strict_nonce = non_block_nonce(channel.job().unwrap());
+        let mut retained = share(0);
+        retained.nonce = old_nonce;
+        let validated = channel.check(retained, 1700000010).unwrap();
+        assert!(!validated.block);
+        assert_eq!(validated.share_target, [255; 32]);
+        channel.target = [255; 32];
+        channel
+            .install(
+                3,
+                5,
+                Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+            )
+            .unwrap();
+        let mut old_strict = share(1);
+        old_strict.job_id = 2;
+        old_strict.nonce = strict_nonce;
+        assert!(matches!(
+            channel.check(old_strict, 1700000010),
+            Err("difficulty-too-low")
+        ));
     }
 
     #[test]

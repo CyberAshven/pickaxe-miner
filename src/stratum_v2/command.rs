@@ -5,6 +5,7 @@
 use super::{
     provider::{NativeNodeRpc, TemplateProvider},
     server::{self, ServerConfig, ServerStats},
+    telemetry::DeviceSnapshot,
     template::{compact_target, BchTemplate},
 };
 use crate::{
@@ -13,7 +14,12 @@ use crate::{
     tui::TerminalSession,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::{
+    layout::{Constraint, Layout},
+    style::{Modifier, Style},
+    widgets::{Block, Paragraph, Row, Table, Wrap},
+    Frame,
+};
 use std::{
     fs,
     io::{Read, Write},
@@ -24,7 +30,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub fn run(
@@ -96,6 +102,7 @@ pub fn run(
     };
     let firmware = sv1_listener.map(|listener| {
         let stop = stop.clone();
+        let stats = stats.clone();
         // Wildcard listeners are dialed through local loopback, never via an
         // arbitrary network route. The SV2 authority remains pinned.
         let mut upstream = bound;
@@ -106,7 +113,7 @@ pub fn run(
                 std::net::Ipv6Addr::LOCALHOST.into()
             });
         }
-        thread::spawn(move || super::sv1::run(listener, upstream, public, stop))
+        thread::spawn(move || super::sv1::run(listener, upstream, public, stop, stats))
     });
     // SV2 reference authority public-key encoding: version 1 (little endian),
     // 32-byte x-only key, Base58Check. Only the public key is displayed.
@@ -120,6 +127,7 @@ pub fn run(
                 serde_json::json!({"listen":bound.to_string(),"sv1_listen":sv1_bound.map(|address| address.to_string()),"authority":authority,"network":config.network.as_str()})
             );
         }
+        let mut device_offset = 0usize;
         while !stop.load(Ordering::Relaxed) && !worker.is_finished() {
             if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
                 break;
@@ -128,34 +136,40 @@ pub fn run(
                 .lock()
                 .map_err(|_| "mining statistics unavailable")?
                 .clone();
+            let devices = snapshot.device_stats.snapshots(Instant::now());
+            device_offset = device_offset.min(devices.len().saturating_sub(1));
             if let Some(terminal) = terminal.as_mut() {
                 let status = format!(
-                    "Network       {}\nSV2 listener  {}\nSV1 listener  {}\nNode          {}\nHeight        {}\nDevices       {}\nShares        {} accepted / {} rejected\nBlocks        {} accepted / {} pending / {} rejected\nBlock retries {}\nLast result   {}\nConnections   {} errors\n\nAuthority public key\n{}\n\nq  Stop mining server",
-                    config.network.as_str(), bound, sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()), if snapshot.template_ready { "Ready" } else { "Waiting for a valid template" },
-                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), snapshot.connections,
-                    snapshot.shares_accepted, snapshot.shares_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
+                    "{} · Node {} · Height {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nSV2 {} · SV1 {}\nAuthority {}",
+                    config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" },
+                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), snapshot.connections, snapshot.sessions_started,
+                    snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
-                    snapshot.connection_errors, authority,
+                    snapshot.connection_errors, snapshot.sv1_connection_errors, bound,
+                    sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()), authority,
                 );
                 terminal
                     .terminal
-                    .draw(|frame| {
-                        frame.render_widget(
-                            Paragraph::new(status)
-                                .block(Block::bordered().title("Pickaxe · BCH ASIC mining"))
-                                .wrap(Wrap { trim: false }),
-                            frame.area(),
-                        );
-                    })
+                    .draw(|frame| render_dashboard(frame, &status, &devices, device_offset))
                     .map_err(|_| "cannot draw mining dashboard")?;
                 if event::poll(Duration::from_millis(500)).map_err(|_| "cannot read terminal")? {
                     if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
-                        if key.kind == KeyEventKind::Press
-                            && (key.code == KeyCode::Char('q')
-                                || (key.code == KeyCode::Char('c')
-                                    && key.modifiers.contains(KeyModifiers::CONTROL)))
-                        {
-                            stop.store(true, Ordering::Relaxed);
+                        if key.kind == KeyEventKind::Press {
+                            match key.code {
+                                KeyCode::Char('q') => stop.store(true, Ordering::Relaxed),
+                                KeyCode::Char('c')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    stop.store(true, Ordering::Relaxed)
+                                }
+                                KeyCode::Up => device_offset = device_offset.saturating_sub(1),
+                                KeyCode::Down => device_offset = device_offset.saturating_add(1),
+                                KeyCode::PageUp => device_offset = device_offset.saturating_sub(10),
+                                KeyCode::PageDown => {
+                                    device_offset = device_offset.saturating_add(10)
+                                }
+                                _ => (),
+                            }
                         }
                     }
                 }
@@ -167,7 +181,9 @@ pub fn run(
                     "blocks_accepted":snapshot.blocks_accepted,"blocks_unconfirmed":snapshot.blocks_pending,
                     "blocks_pending":snapshot.blocks_pending,"blocks_rejected":snapshot.blocks_rejected,
                     "block_retries":snapshot.block_retries,"last_block_result":snapshot.last_block_result,
-                    "connection_errors":snapshot.connection_errors})
+                    "connection_errors":snapshot.connection_errors,"sv1_connection_errors":snapshot.sv1_connection_errors,
+                    "sv1_local_rejected":snapshot.sv1_local_rejected,"sessions_started":snapshot.sessions_started,
+                    "device_details":devices})
                 );
                 thread::sleep(Duration::from_secs(1));
             }
@@ -187,6 +203,84 @@ pub fn run(
         .join()
         .map_err(|_| "mining server stopped unexpectedly")?;
     result.and(server_result).and(firmware_result)
+}
+
+fn render_dashboard(
+    frame: &mut Frame<'_>,
+    status: &str,
+    devices: &[DeviceSnapshot],
+    offset: usize,
+) {
+    let areas = Layout::vertical([
+        Constraint::Length(9),
+        Constraint::Min(4),
+        Constraint::Length(2),
+    ])
+    .split(frame.area());
+    frame.render_widget(
+        Paragraph::new(status)
+            .block(Block::bordered().title("Pickaxe · BCH ASIC mining"))
+            .wrap(Wrap { trim: false }),
+        areas[0],
+    );
+    let rows = devices.iter().skip(offset).map(|device| {
+        Row::new(vec![
+            device.label.clone(),
+            device.protocol.to_owned(),
+            if device.connected {
+                "Online"
+            } else {
+                "Offline"
+            }
+            .to_owned(),
+            device
+                .hashrate_estimate
+                .map(crate::telemetry::format_hash_rate)
+                .unwrap_or_else(|| "Measuring".into()),
+            device.accepted.to_string(),
+            device.rejected.to_string(),
+            device
+                .adapter_error
+                .or(device.connection_error)
+                .or(device.last_rejection)
+                .unwrap_or("—")
+                .to_owned(),
+        ])
+    });
+    let title = format!(
+        "Devices · {} sessions · {} onward",
+        devices.len(),
+        if devices.is_empty() { 0 } else { offset + 1 }
+    );
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(20),
+                Constraint::Length(3),
+                Constraint::Length(7),
+                Constraint::Length(12),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Min(10),
+            ],
+        )
+        .header(
+            Row::new([
+                "Device",
+                "Via",
+                "State",
+                "Est. 5m",
+                "Accepted",
+                "Rejected",
+                "Last issue",
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .block(Block::bordered().title(title)),
+        areas[1],
+    );
+    frame.render_widget(Paragraph::new("↑/↓ PgUp/PgDn  Devices · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
 }
 
 fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), String> {
@@ -254,6 +348,52 @@ fn load_authority(path: &Path) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_dashboard_renders_estimates_failures_and_scrolled_sessions() {
+        use super::super::telemetry::{Devices, ShareEvent};
+        use ratatui::{backend::TestBackend, Terminal};
+        let start = Instant::now();
+        let mut devices = Devices::default();
+        let first = devices.connect("127.0.0.1:1000".parse().unwrap(), true, start);
+        let second = devices.connect("127.0.0.1:1001".parse().unwrap(), false, start);
+        let mut target = [0; 32];
+        target[26] = 1;
+        devices.share(first, ShareEvent::Accepted(target), false, start);
+        devices.share(second, ShareEvent::Rejected("stale job"), true, start);
+        let rows = devices.snapshots(start + Duration::from_secs(60));
+        for width in [100, 140] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|f| render_dashboard(f, "Chipnet · Node Ready", &rows, 0))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains(&rows[0].label));
+            assert!(text.contains(&rows[1].label));
+            assert!(text.contains("Est. 5m"));
+            assert!(text.contains("stale job"));
+            assert!(text.contains("TH/s"));
+            terminal
+                .draw(|f| render_dashboard(f, "Chipnet · Node Ready", &rows, 1))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(!text.contains(&rows[0].label));
+            assert!(text.contains(&rows[1].label));
+        }
+    }
+
     #[test]
     fn authority_is_reused_and_invalid_files_are_not_replaced() {
         let path =

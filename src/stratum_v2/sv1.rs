@@ -3,7 +3,10 @@
 //! jobs and shares using SRI; it never constructs payouts or accepts a share
 //! without the upstream validator. Plain SV1 belongs on a trusted mining LAN.
 
-use super::{channel::MAX_ACTIVE_JOBS, transport::Session, wire::encoded};
+use super::{
+    channel::MAX_ACTIVE_JOBS, server::ServerStats, telemetry::ShareEvent, transport::Session,
+    wire::encoded,
+};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -11,7 +14,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -38,6 +41,7 @@ pub fn run(
     upstream: SocketAddr,
     authority: [u8; 32],
     stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
     listener
         .set_nonblocking(true)
@@ -57,8 +61,9 @@ pub fn run(
             match listener.accept() {
                 Ok((stream, _)) if devices.len() < 64 => {
                     let stop = stop.clone();
+                    let stats = stats.clone();
                     devices.push(thread::spawn(move || {
-                        let _ = serve(stream, upstream, authority, &stop);
+                        let _ = serve(stream, upstream, authority, &stop, &stats);
                     }));
                 }
                 Ok(_) => (),
@@ -84,9 +89,44 @@ fn serve(
     upstream: SocketAddr,
     authority: [u8; 32],
     stop: &AtomicBool,
+    stats: &Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
     let socket =
         TcpStream::connect_timeout(&upstream, DEADLINE).map_err(|_| "SV2 server unavailable")?;
+    let peer = socket
+        .local_addr()
+        .map_err(|_| "cannot identify adapter socket")?;
+    let id = stats
+        .lock()
+        .map_err(|_| "mining statistics unavailable")?
+        .device_stats
+        .connect(peer, true, Instant::now());
+    let result = serve_session(stream, socket, authority, stop, stats, id);
+    if let Ok(mut stats) = stats.lock() {
+        let error = result
+            .as_ref()
+            .err()
+            .map(String::as_str)
+            .filter(|_| !stop.load(Ordering::Relaxed));
+        if error.is_some() {
+            stats.sv1_connection_errors = stats.sv1_connection_errors.saturating_add(1);
+        }
+        stats.device_stats.close(id, true, error, Instant::now());
+    }
+    result
+}
+
+fn serve_session(
+    stream: TcpStream,
+    socket: TcpStream,
+    authority: [u8; 32],
+    stop: &AtomicBool,
+    stats: &Arc<Mutex<ServerStats>>,
+    device: u64,
+) -> Result<(), String> {
+    let upstream = socket
+        .peer_addr()
+        .map_err(|_| "cannot identify adapter upstream")?;
     let (mut send, mut receive) = Session::initiate(socket, authority)?.split();
     send.send(encoded(
         SetupConnection {
@@ -150,6 +190,17 @@ fn serve(
         }
         if let Some(request) = downstream.read()? {
             let (responses, shares) = bridge.request(request)?;
+            if let Some(reason) = bridge.local_rejection.take() {
+                let mut stats = stats.lock().map_err(|_| "mining statistics unavailable")?;
+                stats.shares_rejected = stats.shares_rejected.saturating_add(1);
+                stats.sv1_local_rejected = stats.sv1_local_rejected.saturating_add(1);
+                stats.device_stats.share(
+                    device,
+                    ShareEvent::Rejected(reason),
+                    true,
+                    Instant::now(),
+                );
+            }
             for response in responses {
                 downstream.write(&response)?;
             }
@@ -182,6 +233,7 @@ struct Bridge {
     notify: Option<Value>,
     sequence: u32,
     pending: BTreeMap<u32, (u64, Instant)>,
+    local_rejection: Option<&'static str>,
 }
 
 impl Bridge {
@@ -208,6 +260,7 @@ impl Bridge {
             notify: None,
             sequence: 0,
             pending: BTreeMap::new(),
+            local_rejection: None,
         })
     }
 
@@ -233,6 +286,7 @@ impl Bridge {
         &mut self,
         value: Value,
     ) -> Result<(Vec<Value>, Vec<SubmitSharesExtendedOwned>), String> {
+        self.local_rejection = None;
         let id = value["id"]
             .as_u64()
             .ok_or("SV1 request requires a numeric ID")?;
@@ -383,6 +437,7 @@ impl Bridge {
                         None
                     };
                 if let Some((code, text)) = error {
+                    self.local_rejection = Some(text);
                     out.push(reject(id, code, text));
                 } else {
                     let version = self.active[&submit

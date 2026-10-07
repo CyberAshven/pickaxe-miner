@@ -24,9 +24,9 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending; Knuth live tests deferred, BCHN is the live-test baseline |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests pass; upstream CPU device and ASIC pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local CPU device and Avalon Nano 3 pass; refresh uniqueness follow-up and upstream native SV2 device validation tracked below |
-| S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Confirmed Chipnet blocks and configured payout verified, with independent public-server header matches; durable full-block journal and outcome classification implemented with local failure/restart proof; updated live validation pending |
+| S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
-| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Aggregate dashboard added; per-device rate/vardiff and live validation pending |
+| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local rejection/connection diagnostics implemented and host-tested; live telemetry and vardiff pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | Pending |
@@ -333,3 +333,58 @@ service at this checkpoint still runs `7ad0766`.
 Node outcome semantics were checked against BCHN 29.1.0's
 [submitblock implementation](https://github.com/bitcoin-cash-node/bitcoin-cash-node/blob/v29.1.0/src/rpc/mining.cpp)
 and the [getblockheader RPC documentation](https://docs.bitcoincashnode.org/doc/json-rpc/getblockheader/).
+
+## Physical durable-journal validation (2026-10-07)
+
+The Linux binary for `d9df6ec` (SHA256
+`7b47555521645fd1c2413e734a2411fbd0d5e0b7e7b2e9a77241bc4faf61ef6c`)
+passed node preflight and 51 focused Linux tests. The dedicated Avalon Nano 3
+mined heights 326820, 326821 and 326822 through it. Each configured payout
+matched; source confirmations were 3/2/1, and headers matched independently
+through both public Chipnet servers. A clean restart restored all three
+completion receipts/counts with no pending blocks. The ASIC reconnected at its
+unchanged endpoint and subsequently mined height 326823, advancing the saved
+counter to four. The journal's permissions were 0600.
+
+A 120-second passive sample had 19 accepted submissions, zero rejects and no
+repeated work. Two connection errors accumulated before the controlled restart;
+their causes were not available in that build. The live restart was graceful;
+lost replies, failed writes and destructor-free exits were synthetic tests.
+Exact-commit checks completed with 40 passes and release publication skipped.
+
+## Per-device work and rejection accounting (2026-10-07)
+
+#### PR #38
+
+The TUI and JSON status now include a row per connected mining session. Generated
+labels distinguish address-only workers; labels change on reconnect and are not
+persistent physical-device identities. The local SV1 adapter and its native SV2
+socket join the same row, so they do not count as two devices. No worker strings,
+payouts or private socket addresses appear in these rows. Recent closed sessions
+retain diagnostic reasons, with history bounded to 64 closed rows.
+
+Hashrate is an estimate from accepted shares, weighted by each job's target:
+`2^256 / (target + 1)` expected hashes per share. It uses a 30-second warm-up and
+up to five minutes of wall time, decays during inactivity, and never reports a
+device's advertised rate as measured work. Per-second aggregation bounds memory
+independently of submission rate. Rejected/duplicate shares add no work.
+
+SV1-local rejects now contribute to aggregate and per-device rejected totals,
+before the response is sent, rather than disappearing outside the SV2 validator.
+JSON distinguishes these from upstream rejects. Separate static SV1/SV2 error
+categories identify where a session ended; one physical disconnect can affect
+both transports, so those counters are not a unique-reconnect count. Normal
+operator shutdown does not add connection errors.
+
+Review of [SetTarget semantics](https://stratumprotocol.org/specification/05-mining-protocol/#5321-settarget-server---client)
+also found active jobs using the latest channel target. Each installed job now
+retains its original target for validation and work credit. Tests cover both
+raising and lowering difficulty while an older job remains active.
+
+Local validation passes 392 library and 16 binary tests, with 18 opt-in tests
+ignored and 34 GPU tests filtered. This includes the two-device TCP experiment,
+correct inclusion of SV1-local stale shares, weighted-rate/idle-decay checks,
+bounded reconnect history, and rendered/scrolled 100- and 140-column dashboards.
+Formatting and Rust 1.99 all-target/all-feature Clippy with warnings denied pass.
+Live telemetry and exact pushed-commit CI are separate gates. Vardiff and greater
+than 64 simultaneous devices remain unfinished; no 1,000-ASIC claim is made.

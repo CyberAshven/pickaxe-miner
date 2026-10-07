@@ -5,6 +5,7 @@
 use super::{
     journal::Journal,
     provider::{NodeRpc, SubmissionOutcome, TemplateProvider},
+    telemetry::Devices,
     template::{BchTemplate, Hash},
     transport::Session,
     wire::MiningSession,
@@ -48,6 +49,10 @@ pub struct ServerStats {
     pub block_retries: u64,
     pub last_block_result: Option<&'static str>,
     pub connection_errors: u64,
+    pub sv1_connection_errors: u64,
+    pub sv1_local_rejected: u64,
+    pub sessions_started: u64,
+    pub device_stats: Devices,
     pub template_ready: bool,
     pub height: Option<u32>,
 }
@@ -183,7 +188,7 @@ pub fn run<R: NodeRpc + Send + 'static>(
         Ok(())
     });
     let config = Arc::new(config);
-    let mut devices: Vec<thread::JoinHandle<()>> = Vec::new();
+    let mut devices: Vec<(u64, thread::JoinHandle<()>)> = Vec::new();
     let mut listener_error = None;
     while !stop.load(Ordering::Relaxed) {
         if node.is_finished() {
@@ -191,35 +196,38 @@ pub fn run<R: NodeRpc + Send + 'static>(
             break;
         }
         let mut remaining = Vec::new();
-        for device in devices.drain(..) {
+        for (id, device) in devices.drain(..) {
             if device.is_finished() {
                 if device.join().is_err() {
-                    connection_error(&shared);
+                    device_ended(&shared, id, Some("device worker panicked"));
                 }
             } else {
-                remaining.push(device);
+                remaining.push((id, device));
             }
         }
         devices = remaining;
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 if devices.len() >= MAX_CONNECTIONS {
                     drop(stream);
                     continue;
                 }
                 let shared = shared.clone();
                 let config = config.clone();
-                devices.push(thread::spawn(move || {
-                    if let Ok(mut stats) = shared.stats.lock() {
-                        stats.connections += 1;
-                    }
-                    if serve_device(stream, public, &config, &shared).is_err() {
-                        connection_error(&shared);
-                    }
-                    if let Ok(mut stats) = shared.stats.lock() {
-                        stats.connections = stats.connections.saturating_sub(1);
-                    }
-                }));
+                let id = if let Ok(mut stats) = shared.stats.lock() {
+                    stats.connections += 1;
+                    stats.sessions_started = stats.sessions_started.saturating_add(1);
+                    stats.device_stats.connect(peer, false, Instant::now())
+                } else {
+                    0
+                };
+                devices.push((
+                    id,
+                    thread::spawn(move || {
+                        let result = serve_device(stream, public, &config, &shared, id);
+                        device_ended(&shared, id, result.as_ref().err().map(String::as_str));
+                    }),
+                ));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20))
@@ -231,9 +239,9 @@ pub fn run<R: NodeRpc + Send + 'static>(
         }
     }
     stop.store(true, Ordering::Relaxed);
-    for device in devices {
+    for (id, device) in devices {
         if device.join().is_err() {
-            connection_error(&shared);
+            device_ended(&shared, id, Some("device worker panicked"));
         }
     }
     node.join()
@@ -303,9 +311,15 @@ pub fn authority_public(secret: &[u8; 32]) -> Result<[u8; 32], String> {
         .serialize())
 }
 
-fn connection_error(shared: &Shared) {
+fn device_ended(shared: &Shared, id: u64, error: Option<&str>) {
     if let Ok(mut stats) = shared.stats.lock() {
-        stats.connection_errors = stats.connection_errors.saturating_add(1);
+        stats.connections = stats.connections.saturating_sub(1);
+        // Closing sockets during the operator's shutdown is expected.
+        let error = error.filter(|_| !shared.stop.load(Ordering::Relaxed));
+        if error.is_some() {
+            stats.connection_errors = stats.connection_errors.saturating_add(1);
+        }
+        stats.device_stats.close(id, false, error, Instant::now());
     }
 }
 
@@ -324,6 +338,7 @@ fn serve_device(
     public: [u8; 32],
     config: &ServerConfig,
     shared: &Shared,
+    device: u64,
 ) -> Result<(), String> {
     let session = Session::accept(stream, &public, &config.authority_secret)?;
     let (mut sender, mut receiver) = session.split();
@@ -396,6 +411,12 @@ fn serve_device(
                     stats.shares_rejected = stats
                         .shares_rejected
                         .saturating_add(next_rejected.saturating_sub(rejected));
+                    stats.device_stats.channels(device, mining.channels.len());
+                    if let Some(event) = responses.share_event {
+                        stats
+                            .device_stats
+                            .share(device, event, false, Instant::now());
+                    }
                 }
                 accepted = next_accepted;
                 rejected = next_rejected;

@@ -4,6 +4,7 @@
 
 use super::{
     channel::{share_work, Channel, ChannelKind, Share, ValidatedShare, DEVICE_EXTRANONCE_SIZE},
+    telemetry::ShareEvent,
     template::{meets_target, BchTemplate, Hash},
 };
 use crate::config::MiningNetwork;
@@ -37,6 +38,7 @@ pub struct MiningSession {
 pub struct Responses {
     pub frames: Vec<SerializedFrame>,
     pub blocks: Vec<ValidatedShare>,
+    pub share_event: Option<ShareEvent>,
 }
 
 impl MiningSession {
@@ -108,6 +110,7 @@ impl MiningSession {
         }
         let mut frames = Vec::new();
         let mut blocks = Vec::new();
+        let mut share_event = None;
         if header.msg_type() == common::MESSAGE_TYPE_SETUP_CONNECTION {
             if self.setup_flags.is_some() || header.channel_msg() {
                 return Err("unexpected setup message".into());
@@ -148,7 +151,11 @@ impl MiningSession {
                     false,
                 )?);
             }
-            return Ok(Responses { frames, blocks });
+            return Ok(Responses {
+                frames,
+                blocks,
+                share_event,
+            });
         }
         let flags = self
             .setup_flags
@@ -205,7 +212,13 @@ impl MiningSession {
                     nonce: request.nonce,
                     extranonce: &[],
                 };
-                self.submit(share, ChannelKind::Standard, now, &mut frames, &mut blocks)?;
+                share_event = Some(self.submit(
+                    share,
+                    ChannelKind::Standard,
+                    now,
+                    &mut frames,
+                    &mut blocks,
+                )?);
             }
             Mining::SubmitSharesExtended(request) => {
                 let share = Share {
@@ -217,7 +230,13 @@ impl MiningSession {
                     nonce: request.nonce,
                     extranonce: request.extranonce.as_ref(),
                 };
-                self.submit(share, ChannelKind::Extended, now, &mut frames, &mut blocks)?;
+                share_event = Some(self.submit(
+                    share,
+                    ChannelKind::Extended,
+                    now,
+                    &mut frames,
+                    &mut blocks,
+                )?);
             }
             Mining::UpdateChannel(request) => {
                 let result = self
@@ -259,7 +278,11 @@ impl MiningSession {
             }
             _ => return Err("unsupported downstream mining message".into()),
         }
-        Ok(Responses { frames, blocks })
+        Ok(Responses {
+            frames,
+            blocks,
+            share_event,
+        })
     }
 
     fn open(
@@ -345,7 +368,7 @@ impl MiningSession {
         now: u32,
         frames: &mut Vec<SerializedFrame>,
         blocks: &mut Vec<ValidatedShare>,
-    ) -> Result<(), String> {
+    ) -> Result<ShareEvent, String> {
         let id = share.channel_id;
         let sequence = share.sequence;
         let result = self
@@ -356,11 +379,12 @@ impl MiningSession {
                 if channel.kind != kind {
                     return Err("invalid-channel-type");
                 }
-                let work = share_work(&channel.target);
-                channel.check(share, now).map(|share| (share, work))
+                channel.check(share, now)
             });
         match result {
-            Ok((share, work)) => {
+            Ok(share) => {
+                let event = ShareEvent::Accepted(share.share_target);
+                let work = share_work(&share.share_target);
                 self.accepted = self.accepted.saturating_add(1);
                 frames.push(mining(Mining::SubmitSharesSuccess(SubmitSharesSuccess {
                     channel_id: id,
@@ -371,6 +395,7 @@ impl MiningSession {
                 if share.block {
                     blocks.push(share);
                 }
+                Ok(event)
             }
             Err(code) => {
                 self.rejected = self.rejected.saturating_add(1);
@@ -379,9 +404,9 @@ impl MiningSession {
                     sequence_number: sequence,
                     error_code: code.try_into().unwrap(),
                 }))?);
+                Ok(ShareEvent::Rejected(code))
             }
         }
-        Ok(())
     }
 }
 

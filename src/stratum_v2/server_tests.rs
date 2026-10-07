@@ -516,7 +516,8 @@ impl FirmwareAdapter {
         let authority = server.authority;
         let thread = {
             let stop = stop.clone();
-            thread::spawn(move || super::sv1::run(listener, upstream, authority, stop))
+            let stats = server.stats.clone();
+            thread::spawn(move || super::sv1::run(listener, upstream, authority, stop, stats))
         };
         Self {
             stop,
@@ -680,6 +681,22 @@ fn sv1_same_tip_refresh_accepts_inflight_block_and_new_tip_rejects_it() {
     first.send(submit);
     let stale = first.receive();
     assert_eq!(stale["error"][0], 21);
+    let stats = server.stats.lock().unwrap().clone();
+    assert_eq!(
+        stats.shares_rejected, 1,
+        "SV1-local stale shares must reach the dashboard"
+    );
+    assert_eq!(stats.sv1_local_rejected, 1);
+    let devices = stats.device_stats.snapshots(Instant::now());
+    assert_eq!(
+        devices.len(),
+        2,
+        "adapter and native socket must not become two devices"
+    );
+    assert_ne!(devices[0].label, devices[1].label);
+    assert!(devices.iter().all(|row| row.protocol == "SV1"));
+    assert_eq!(devices.iter().map(|row| row.accepted).sum::<u64>(), 1);
+    assert_eq!(devices.iter().map(|row| row.rejected).sum::<u64>(), 1);
     first.write.shutdown(std::net::Shutdown::Both).unwrap();
     second.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
@@ -702,6 +719,15 @@ fn sv1_cpu_firmware_mines_through_noise_and_receives_successor_jobs() {
         }
         assert_eq!(server.stats.lock().unwrap().shares_rejected, 0);
         assert_eq!(server.stats.lock().unwrap().connections, 1);
+        let devices = server
+            .stats
+            .lock()
+            .unwrap()
+            .device_stats
+            .snapshots(Instant::now());
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].accepted, 2);
+        assert_eq!(devices[0].rejected, 0);
         device.write.shutdown(std::net::Shutdown::Both).unwrap();
     }
 }
