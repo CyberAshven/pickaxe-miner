@@ -21,7 +21,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
 | S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full-template fixtures pass; light/native TP and live proof pending |
-| S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending |
+| S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending; Knuth live tests deferred, BCHN is the live-test baseline |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests pass; upstream CPU device and ASIC pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle and local CPU device pass; upstream/ASIC pending |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Fixture acceptance/rejection distinguished; live proof and durable retry pending |

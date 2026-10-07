@@ -33,9 +33,9 @@ that work in the existing PR; implementation and evidence are tracked in
 - Pickaxe serves Stratum V2 to the miner's devices: SV2 firmware such as
   Bitaxe's connects directly, and SV1 firmware (most home ASICs, such as the
   Avalon Nano) connects through a translator.
-- Block templates come from the miner's own node: BCHN through a template
-  provider bridge (Pickaxe already calls `getblocktemplatelight`), or Knuth's
-  built-in Stratum V2 template provider.
+- Block templates come from the miner's own node: BCHN through Pickaxe's
+  full-template JSON-RPC client initially, with GBT-light and a Knuth native
+  Stratum V2 provider adapter remaining integration targets.
 - Pickaxe checks shares, submits blocks, and shows each device's hash rate,
   shares and rejects in the dashboard.
 - Built on the Stratum V2 reference implementation's Rust crates (encryption,
@@ -84,10 +84,12 @@ Researched on 2026-10-05.
 - [LoneStrike's BCH apps](https://github.com/danhaus93-ops/umbrel-bch-apps): the
   reference implementation's pool patched for BCH, connected to that bridge,
   with a BCH solo pool built on ASICseer pool, BCHN and Fulcrum, for Umbrel.
-- [Knuth](https://github.com/k-nuth/kth): a BCH node adding a built-in Stratum V2
-  template provider (merged in July 2026, from
-  [#534](https://github.com/k-nuth/kth/pull/534)); its JSON-RPC mining calls are
-  `getblocktemplatelight` and `submitblocklight`, backed by its C API.
+- [Knuth](https://github.com/k-nuth/kth): a BCH node developing native Stratum V2
+  support. July 2026 merges include framing
+  ([#534](https://github.com/k-nuth/kth/pull/534)) and connection-setup messages
+  ([#540](https://github.com/k-nuth/kth/pull/540)); these are protocol building
+  blocks, not proof of a complete template provider. Keep the adapter in scope,
+  but use BCHN for live Chipnet validation until Knuth interoperability is ready.
 - [ckpool](https://github.com/ckolivas/ckpool): Stratum V2 for pools and solo,
   with a Job Declaration server; Bitcoin only.
 - [SoloFury](https://solofury.com/blog/stratum-v2-bitcoin-cash-solo-mining/):

@@ -55,19 +55,21 @@ assumptions baked into some SV2 examples:
 | Source | Notes |
 |---|---|
 | **bchn-sv2-bridge** | External AGPL TP for unmodified BCHN over JSON-RPC; tested on mainnet; keeps JD off because unordered JD breaks CTOR. |
-| **Own JSON-RPC GBT-light client** | Wrap Pickaxe's existing `node.rs` `getblocktemplatelight` / `submitblocklight` path and speak TP (or feed the mining server directly). |
-| **Knuth built-in TP** | Knuth node with merged SV2 template provider; same GBT-light RPC family. |
+| **Own JSON-RPC template client** | Current implementation feeds the mining server from BCHN full `getblocktemplate` / `submitblock`. GBT-light remains pending. |
+| **Knuth native TP (future integration)** | Upstream has merged SV2 framing and message building blocks. Those changes do not establish a complete, interoperable template provider. |
 
 ## Open decision: AGPL bridge vs own TP client
 
 **Initial implementation:** an in-tree full JSON-RPC template provider, pinned
 to the source node. GBT-light and native Template Distribution remain pending.
 
-**Recommendation for Chipnet first:** implement Pickaxe's **own TP client**
-wrapping the existing `node.rs` GBT-light calls, then feed the mining server.
-Reasons: stay in-tree with AGPL-3.0-only without taking on an external AGPL
-bridge as a hard runtime dependency; reuse code already proven for Chipnet
-mining; keep deployment simple (miner runs Pickaxe + node, no third binary).
+**Chipnet test baseline:** use BCHN through the in-tree full-template client.
+This keeps deployment to Pickaxe plus the node, without an external bridge.
+Knuth remains an integration target; live Knuth testing is deferred until its
+native provider is ready for interoperability checks. Upstream
+[#534](https://github.com/k-nuth/kth/pull/534) adds plaintext framing and
+[#540](https://github.com/k-nuth/kth/pull/540) adds connection-setup messages;
+neither is evidence of a complete production template provider.
 
 Revisit the bridge if a production BCHN deployment wants an unmodified-node TP
 that already speaks SV2 Template Distribution on the wire without Pickaxe
