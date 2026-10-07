@@ -86,6 +86,8 @@ pub fn run(
         payout: config.payout_address.clone(),
         authority_secret,
         share_target: compact_target(0x1b0ffff0)?,
+        journal_path: config_path.with_extension("sv2-blocks.json"),
+        source_identity: rpc.source_identity()?,
     };
     let worker = {
         let stop = stop.clone();
@@ -128,10 +130,11 @@ pub fn run(
                 .clone();
             if let Some(terminal) = terminal.as_mut() {
                 let status = format!(
-                    "Network       {}\nSV2 listener  {}\nSV1 listener  {}\nNode          {}\nHeight        {}\nDevices       {}\nShares        {} accepted / {} rejected\nBlocks        {} accepted / {} unconfirmed\nConnections   {} errors\n\nAuthority public key\n{}\n\nq  Stop mining server",
+                    "Network       {}\nSV2 listener  {}\nSV1 listener  {}\nNode          {}\nHeight        {}\nDevices       {}\nShares        {} accepted / {} rejected\nBlocks        {} accepted / {} pending / {} rejected\nBlock retries {}\nLast result   {}\nConnections   {} errors\n\nAuthority public key\n{}\n\nq  Stop mining server",
                     config.network.as_str(), bound, sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()), if snapshot.template_ready { "Ready" } else { "Waiting for a valid template" },
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), snapshot.connections,
-                    snapshot.shares_accepted, snapshot.shares_rejected, snapshot.blocks_accepted, snapshot.blocks_unconfirmed,
+                    snapshot.shares_accepted, snapshot.shares_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
+                    snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
                     snapshot.connection_errors, authority,
                 );
                 terminal
@@ -161,7 +164,9 @@ pub fn run(
                     "{}",
                     serde_json::json!({"ready":snapshot.template_ready,"height":snapshot.height,
                     "devices":snapshot.connections,"shares_accepted":snapshot.shares_accepted,"shares_rejected":snapshot.shares_rejected,
-                    "blocks_accepted":snapshot.blocks_accepted,"blocks_unconfirmed":snapshot.blocks_unconfirmed,
+                    "blocks_accepted":snapshot.blocks_accepted,"blocks_unconfirmed":snapshot.blocks_pending,
+                    "blocks_pending":snapshot.blocks_pending,"blocks_rejected":snapshot.blocks_rejected,
+                    "block_retries":snapshot.block_retries,"last_block_result":snapshot.last_block_result,
                     "connection_errors":snapshot.connection_errors})
                 );
                 thread::sleep(Duration::from_secs(1));

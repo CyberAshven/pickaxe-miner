@@ -3,6 +3,7 @@
 //! uses an independent block decoder/hash oracle. This is not live chain proof.
 
 use super::{
+    journal::TestDirectory,
     provider::NodeRpc,
     server::{self, ServerConfig, ServerStats},
     template_tests::{payout, rpc_template},
@@ -39,6 +40,9 @@ struct Node {
     tip: String,
     reject: bool,
     submissions: usize,
+    lose_replies: bool,
+    submitted: Vec<String>,
+    known: std::collections::HashSet<String>,
 }
 
 struct Rpc(Arc<Mutex<Node>>);
@@ -59,11 +63,19 @@ impl NodeRpc for Rpc {
                 Ok(template)
             }
             "submitblock" => {
-                let block: Block =
-                    consensus::deserialize(&hex::decode(params[0].as_str().unwrap()).unwrap())
-                        .unwrap();
+                let bytes = params[0].as_str().unwrap().to_owned();
+                let block: Block = consensus::deserialize(&hex::decode(&bytes).unwrap()).unwrap();
                 assert!(block.check_merkle_root());
                 assert!(block.header.validate_pow(block.header.target()).is_ok());
+                let hash = block.block_hash().to_string();
+                node.submitted.push(bytes);
+                if node.known.contains(&hash) {
+                    return if node.lose_replies {
+                        Err("simulated lost reply".into())
+                    } else {
+                        Ok(json!("duplicate"))
+                    };
+                }
                 assert_eq!(block.header.prev_blockhash.to_string(), node.tip);
                 assert_eq!(block.txdata.len(), 1);
                 let coinbase = &block.txdata[0];
@@ -78,11 +90,24 @@ impl NodeRpc for Rpc {
                 assert!((100..=200).contains(&consensus::serialize(coinbase).len()));
                 node.submissions += 1;
                 if node.reject {
-                    Ok(json!("fixture-rejection"))
+                    Ok(json!("bad-cb-amount"))
                 } else {
                     node.height += 1;
-                    node.tip = block.block_hash().to_string();
-                    Ok(Value::Null)
+                    node.tip = hash.clone();
+                    node.known.insert(hash);
+                    if node.lose_replies {
+                        Err("simulated lost reply".into())
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+            }
+            "getblockheader" => {
+                let hash = params[0].as_str().unwrap();
+                if !node.lose_replies && node.known.contains(hash) {
+                    Ok(json!({"hash":hash,"confirmations":1}))
+                } else {
+                    Err("header temporarily unavailable".into())
                 }
             }
             _ => panic!("unexpected RPC method"),
@@ -97,20 +122,28 @@ struct Running {
     node: Arc<Mutex<Node>>,
     address: SocketAddr,
     authority: [u8; 32],
+    state_directory: Arc<TestDirectory>,
 }
 
 impl Running {
     fn new(reject: bool) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(Mutex::new(ServerStats::default()));
         let node = Arc::new(Mutex::new(Node {
             height: 325908,
             tip: "ab".repeat(32),
             reject,
             submissions: 0,
+            lose_replies: false,
+            submitted: Vec::new(),
+            known: std::collections::HashSet::new(),
         }));
+        Self::start(node, Arc::new(TestDirectory::new()))
+    }
+
+    fn start(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(ServerStats::default()));
         let secret = [17; 32];
         let authority = server::authority_public(&secret).unwrap();
         let config = ServerConfig {
@@ -118,6 +151,8 @@ impl Running {
             payout: payout(),
             authority_secret: secret,
             share_target: [255; 32],
+            journal_path: state_directory.journal(),
+            source_identity: [42; 32],
         };
         let thread = {
             let stop = stop.clone();
@@ -132,6 +167,7 @@ impl Running {
             node,
             address,
             authority,
+            state_directory,
         };
         running.wait(|stats| stats.template_ready);
         running
@@ -373,7 +409,7 @@ fn encrypted_cpu_devices_submit_blocks_and_receive_successor_without_reconnect()
         }
         let stats = server.stats.lock().unwrap().clone();
         assert_eq!(stats.shares_accepted, 2);
-        assert_eq!(stats.blocks_unconfirmed, 0);
+        assert_eq!(stats.blocks_pending, 0);
         assert_eq!(stats.connection_errors, 0);
         assert_eq!(stats.connections, 1);
         device.sender.close();
@@ -385,13 +421,85 @@ fn share_acknowledgement_does_not_claim_node_block_acceptance() {
     let server = Running::new(true);
     let mut device = Device::connect(&server, false);
     device.solve_and_submit(0);
-    server.wait(|stats| stats.blocks_unconfirmed == 1);
+    server.wait(|stats| stats.blocks_rejected == 1);
     let stats = server.stats.lock().unwrap().clone();
     assert_eq!(stats.shares_accepted, 1);
     assert_eq!(stats.blocks_accepted, 0);
     assert_eq!(server.node.lock().unwrap().submissions, 1);
     assert_eq!(server.node.lock().unwrap().height, 325908);
     device.sender.close();
+}
+
+#[test]
+fn acknowledged_block_survives_lost_replies_and_server_restart_exactly_once() {
+    let server = Running::new(false);
+    server.node.lock().unwrap().lose_replies = true;
+    let mut device = Device::connect(&server, true);
+    let hash = device.solve_and_submit(0);
+    server.wait(|stats| stats.last_block_result == Some("node-response-unavailable"));
+    assert_eq!(server.stats.lock().unwrap().blocks_accepted, 0);
+    assert_eq!(server.stats.lock().unwrap().blocks_pending, 1);
+    let disk: Value =
+        serde_json::from_slice(&std::fs::read(server.state_directory.journal()).unwrap()).unwrap();
+    assert_eq!(disk["pending"][0]["hash"], hash);
+    let exact = disk["pending"][0]["block"].as_str().unwrap().to_owned();
+    let node = server.node.clone();
+    let directory = server.state_directory.clone();
+    device.sender.close();
+    drop(device);
+    drop(server);
+    node.lock().unwrap().lose_replies = false;
+    let recovered = Running::start(node.clone(), directory.clone());
+    recovered.wait(|stats| stats.blocks_accepted == 1 && stats.blocks_pending == 0);
+    assert_eq!(
+        node.lock().unwrap().submissions,
+        1,
+        "retry must not create a second block"
+    );
+    assert!(node
+        .lock()
+        .unwrap()
+        .submitted
+        .iter()
+        .all(|bytes| bytes == &exact));
+    assert!(node.lock().unwrap().submitted.len() >= 2);
+    let attempts = node.lock().unwrap().submitted.len();
+    drop(recovered);
+    let reopened = Running::start(node.clone(), directory);
+    assert_eq!(reopened.stats.lock().unwrap().blocks_accepted, 1);
+    assert_eq!(
+        node.lock().unwrap().submitted.len(),
+        attempts,
+        "receipt must suppress another submission"
+    );
+}
+
+#[test]
+fn disk_failure_stops_server_without_acknowledging_solved_work() {
+    use std::io::BufRead;
+    let mut server = Running::new(false);
+    let adapter = FirmwareAdapter::new(&server);
+    let mut device = FirmwareDevice::connect(&adapter, false, false);
+    let (_, submit) = device.solve(0, false);
+    let path = server.state_directory.journal();
+    let original = std::fs::read(&path).unwrap();
+    let saved = server.state_directory.0.join("before-failure.json");
+    std::fs::rename(&path, &saved).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    device.send(submit);
+    let mut line = String::new();
+    let received = device.read.read_line(&mut line);
+    assert!(
+        matches!(received, Ok(0)) || received.is_err(),
+        "must not acknowledge undurable work"
+    );
+    let result = server.thread.take().unwrap().join().unwrap();
+    assert_eq!(
+        result.unwrap_err(),
+        "cannot persist solved block; mining stopped"
+    );
+    assert_eq!(server.node.lock().unwrap().submissions, 0);
+    assert_eq!(std::fs::read(&saved).unwrap(), original);
 }
 
 struct FirmwareAdapter {

@@ -1225,6 +1225,28 @@ fn parse_node_rpc_target(url: &str) -> Result<NodeRpcTarget, String> {
 }
 
 trait NodeRpcStream: Read + Write {}
+
+/// #### PR #38
+/// Bind durable ASIC work to its RPC source without persisting credentials.
+/// Credential rotation may resume pending blocks; another endpoint may not.
+#[cfg(feature = "stratum-v2")]
+pub(crate) fn rpc_source_identity(url: &str) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    let target = parse_node_rpc_target(url)?;
+    let scheme = match target.scheme {
+        NodeRpcScheme::Http => "http",
+        NodeRpcScheme::Https => "https",
+    };
+    let bytes = serde_json::to_vec(&(
+        "pickaxe-bch-full-template-v1",
+        scheme,
+        target.host.to_ascii_lowercase(),
+        target.port,
+        target.path,
+    ))
+    .map_err(|_| "cannot identify block submission source")?;
+    Ok(Sha256::digest(bytes).into())
+}
 impl<T: Read + Write> NodeRpcStream for T {}
 
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(12);

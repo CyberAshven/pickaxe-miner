@@ -3,16 +3,18 @@
 //! device connections only see immutable jobs and cannot select chain payouts.
 
 use super::{
-    channel::ValidatedShare,
-    provider::{NodeRpc, TemplateProvider},
+    journal::Journal,
+    provider::{NodeRpc, SubmissionOutcome, TemplateProvider},
     template::{BchTemplate, Hash},
     transport::Session,
     wire::MiningSession,
 };
 use crate::config::{validate_payout_address, MiningNetwork};
 use std::{
+    collections::HashMap,
     io,
     net::{TcpListener, TcpStream},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender},
@@ -31,6 +33,8 @@ pub struct ServerConfig {
     pub payout: String,
     pub authority_secret: [u8; 32],
     pub share_target: Hash,
+    pub journal_path: PathBuf,
+    pub source_identity: [u8; 32],
 }
 
 #[derive(Default, Clone, Debug)]
@@ -39,7 +43,10 @@ pub struct ServerStats {
     pub shares_accepted: u64,
     pub shares_rejected: u64,
     pub blocks_accepted: u64,
-    pub blocks_unconfirmed: u64,
+    pub blocks_pending: usize,
+    pub blocks_rejected: u64,
+    pub block_retries: u64,
+    pub last_block_result: Option<&'static str>,
     pub connection_errors: u64,
     pub template_ready: bool,
     pub height: Option<u32>,
@@ -55,7 +62,9 @@ struct PublishedJob {
 struct Shared {
     job: RwLock<Option<PublishedJob>>,
     stats: Arc<Mutex<ServerStats>>,
-    blocks: SyncSender<ValidatedShare>,
+    wake: SyncSender<()>,
+    journal: Mutex<Journal>,
+    fatal: Mutex<Option<&'static str>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -77,37 +86,80 @@ pub fn run<R: NodeRpc + Send + 'static>(
     listener
         .set_nonblocking(true)
         .map_err(|_| "cannot configure mining listener")?;
-    let (blocks, receive_blocks) = mpsc::sync_channel::<ValidatedShare>(MAX_CONNECTIONS);
+    let journal = Journal::open(
+        &config.journal_path,
+        config.network,
+        &config.payout,
+        config.source_identity,
+    )?;
+    let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
     let shared = Arc::new(Shared {
         job: RwLock::new(None),
         stats: stats.clone(),
-        blocks,
+        wake,
+        journal: Mutex::new(journal),
+        fatal: Mutex::new(None),
         stop: stop.clone(),
     });
+    update_journal_stats(&shared)?;
     let node_shared = shared.clone();
     let network = config.network;
-    let node = thread::spawn(move || {
+    let node = thread::spawn(move || -> Result<(), String> {
         let mut provider = TemplateProvider::new(rpc, network);
         let mut refreshed = Instant::now() - Duration::from_secs(60);
+        let mut retries = RetrySchedule::default();
         while !node_shared.stop.load(Ordering::Relaxed) {
             match receive_blocks.recv_timeout(Duration::from_millis(250)) {
-                Ok(share) => {
-                    let accepted = provider
-                        .submit(share.generation, &share.coinbase, share.header)
-                        .is_ok();
-                    if let Ok(mut stats) = node_shared.stats.lock() {
-                        if accepted {
-                            stats.blocks_accepted = stats.blocks_accepted.saturating_add(1);
-                        } else {
-                            stats.blocks_unconfirmed = stats.blocks_unconfirmed.saturating_add(1);
-                        }
-                    }
-                    // Refresh even if RPC acceptance is unknown. Do not count a
-                    // lost RPC response as an accepted block or keep old work.
-                    refreshed = Instant::now() - Duration::from_secs(60);
-                }
+                Ok(()) => (),
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            // #### PR #38
+            // The journal is authoritative; a coalesced wake cannot lose work.
+            // Release its lock before RPC so another device can persist a block
+            // while a reply is delayed. Retry old blocks fairly with backoff.
+            let pending = {
+                let journal = node_shared
+                    .journal
+                    .lock()
+                    .map_err(|_| "block journal unavailable")?;
+                retries
+                    .next(&journal.pending_hashes(), Instant::now())
+                    .and_then(|hash| journal.pending(&hash))
+            };
+            if let Some(pending) = pending {
+                if retries.is_retry(&pending.hash) {
+                    if let Ok(mut stats) = node_shared.stats.lock() {
+                        stats.block_retries = stats.block_retries.saturating_add(1);
+                    }
+                }
+                let outcome = provider.submit_saved(&pending);
+                let result = match outcome {
+                    SubmissionOutcome::Accepted => Some(true),
+                    SubmissionOutcome::Rejected(_) => Some(false),
+                    SubmissionOutcome::Pending(_) => None,
+                };
+                if let Some(accepted) = result {
+                    node_shared
+                        .journal
+                        .lock()
+                        .map_err(|_| "block journal unavailable")?
+                        .finish(&pending.hash, accepted)?;
+                    retries.remove(&pending.hash);
+                } else {
+                    retries.defer(&pending.hash, Instant::now());
+                }
+                update_journal_stats(&node_shared)?;
+                if let Ok(mut stats) = node_shared.stats.lock() {
+                    stats.last_block_result = Some(match outcome {
+                        SubmissionOutcome::Accepted => "accepted",
+                        SubmissionOutcome::Rejected(reason)
+                        | SubmissionOutcome::Pending(reason) => reason,
+                    });
+                }
+                // Refresh even when RPC acceptance is unknown. Saved bytes
+                // survive tip changes; no response is treated as acceptance.
+                refreshed = Instant::now() - Duration::from_secs(60);
             }
             let current = provider.tip_is_current().unwrap_or(false);
             if !current || refreshed.elapsed() >= Duration::from_secs(15) {
@@ -128,6 +180,7 @@ pub fn run<R: NodeRpc + Send + 'static>(
             }
         }
         publish(&node_shared, None);
+        Ok(())
     });
     let config = Arc::new(config);
     let mut devices: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -184,12 +237,62 @@ pub fn run<R: NodeRpc + Send + 'static>(
         }
     }
     node.join()
-        .map_err(|_| "template worker stopped unexpectedly")?;
+        .map_err(|_| "template worker stopped unexpectedly")??;
+    if let Some(reason) = *shared
+        .fatal
+        .lock()
+        .map_err(|_| "server failure state unavailable")?
+    {
+        return Err(reason.into());
+    }
     if let Some(error) = listener_error {
         Err(error)
     } else {
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct RetrySchedule(HashMap<String, (u32, Instant)>);
+
+impl RetrySchedule {
+    fn next(&mut self, pending: &[String], now: Instant) -> Option<String> {
+        self.0.retain(|hash, _| pending.contains(hash));
+        pending
+            .iter()
+            .find(|hash| self.0.get(*hash).is_none_or(|(_, due)| now >= *due))
+            .cloned()
+    }
+    fn is_retry(&self, hash: &str) -> bool {
+        self.0.contains_key(hash)
+    }
+    fn defer(&mut self, hash: &str, now: Instant) {
+        let attempts = self.0.get(hash).map_or(0, |(n, _)| *n).saturating_add(1);
+        let delay = (1u64 << attempts.saturating_sub(1).min(5)).min(30);
+        self.0.insert(
+            hash.to_owned(),
+            (attempts, now + Duration::from_secs(delay)),
+        );
+    }
+    fn remove(&mut self, hash: &str) {
+        self.0.remove(hash);
+    }
+}
+
+fn update_journal_stats(shared: &Shared) -> Result<(), String> {
+    let journal = shared
+        .journal
+        .lock()
+        .map_err(|_| "block journal unavailable")?;
+    let (pending, accepted, rejected) = journal.counts();
+    let mut stats = shared
+        .stats
+        .lock()
+        .map_err(|_| "mining statistics unavailable")?;
+    stats.blocks_pending = pending;
+    stats.blocks_accepted = accepted;
+    stats.blocks_rejected = rejected;
+    Ok(())
 }
 
 pub fn authority_public(secret: &[u8; 32]) -> Result<[u8; 32], String> {
@@ -263,13 +366,26 @@ fn serve_device(
                     .as_secs();
                 let now = u32::try_from(now).map_err(|_| "system time exceeds header range")?;
                 let responses = mining.receive(frame, now)?;
-                // Submit candidate blocks before sending acknowledgements. A
-                // full queue is an error, never a silently dropped block.
+                // Persist the complete solved block before acknowledging it.
+                // Storage failure stops the service rather than acknowledging
+                // work which would disappear on a restart.
                 for block in responses.blocks {
-                    shared
-                        .blocks
-                        .try_send(block)
-                        .map_err(|_| "block submission queue unavailable")?;
+                    let saved = shared
+                        .journal
+                        .lock()
+                        .map_err(|_| "block journal unavailable")?
+                        .enqueue(&block);
+                    if saved.is_err() {
+                        if let Ok(mut fatal) = shared.fatal.lock() {
+                            *fatal = Some("cannot persist solved block; mining stopped");
+                        }
+                        shared.stop.store(true, Ordering::Relaxed);
+                        return Err("cannot persist solved block; mining stopped".into());
+                    }
+                    update_journal_stats(shared)?;
+                    // A full wake slot already guarantees the worker wakes;
+                    // it also scans pending disk work on its bounded timeout.
+                    let _ = shared.wake.try_send(());
                 }
                 let next_accepted = mining.accepted;
                 let next_rejected = mining.rejected;
@@ -298,4 +414,29 @@ fn serve_device(
     sender.close();
     receiver.close();
     result
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn pending_retry_backoff_is_bounded_and_does_not_block_new_work() {
+        let mut schedule = RetrySchedule::default();
+        let mut now = Instant::now();
+        let hashes = vec!["old".to_owned(), "new".to_owned()];
+        assert_eq!(schedule.next(&hashes, now).as_deref(), Some("old"));
+        for expected in [1, 2, 4, 8, 16, 30, 30] {
+            schedule.defer("old", now);
+            assert_eq!(schedule.next(&hashes, now).as_deref(), Some("new"));
+            assert_eq!(
+                schedule.0["old"].1.duration_since(now),
+                Duration::from_secs(expected)
+            );
+            now += Duration::from_secs(expected);
+            assert_eq!(schedule.next(&hashes, now).as_deref(), Some("old"));
+        }
+        schedule.next(&["new".to_owned()], now);
+        assert!(!schedule.is_retry("old"));
+    }
 }

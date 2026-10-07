@@ -141,12 +141,38 @@ this is not a claim of 1,000-device capacity.
 The full-template provider checks network, synchronization, tip identity,
 CTOR, transaction bytes/IDs, header target and adaptive block size. It revokes
 work on an unavailable source. A block is counted accepted only when the
-source node returns success; a share acknowledgement does not establish that.
+source node returns success or its matching header has positive confirmations;
+a share acknowledgement does not establish that.
+
+#### PR #38
+
+Solved full blocks are saved beside the config in `chipnet.sv2-blocks.json`
+before the device receives its share acknowledgement. The journal is private,
+locked against concurrent writers and bound to the node endpoint, network and
+configured payout. Changing RPC credentials does not change that binding.
+Keep this file when upgrading or restarting: pending blocks are retried from
+their original bytes, including after the chain tip changes. Do not delete it
+to resolve a startup error or change its source while work is pending.
+
+A missing node reply is pending, not rejected or accepted. Retries back off
+from one to 30 seconds; an exact BCHN `duplicate` response means the original
+block is already accepted. Explicit permanent validation failures are counted
+separately. Pending removal and its completion receipt are one atomic update,
+so recovery does not count the same outcome twice. Accepted/rejected block
+counters persist; share and retry counters describe the current server run.
+The legacy JSON `blocks_unconfirmed` field aliases the current pending count.
+
+The journal holds up to 64 pending blocks with 64 MiB of aggregate raw block
+data and 1,024 recent completion receipts. These are storage bounds, not BCH
+consensus limits. Storage failure or exhaustion stops the server before an
+unsaved block is acknowledged. Corrupt or mismatched state is preserved and
+causes a startup error. Abrupt-exit, restart, lost-reply and failed-write tests
+use synthetic solved blocks; actual node/ASIC evidence is recorded separately.
 
 The initial share difficulty is 4096, reduced when the network has easier work
 so firmware does not discard valid Chipnet blocks. A device target limit that
-cannot accommodate this work is rejected. Vardiff, individual device rates, Knuth TP, distributed rigs,
-pool routing and a durable block-submission retry journal are still pending.
+cannot accommodate this work is rejected. Vardiff, individual device rates,
+Knuth TP, distributed rigs and pool routing are still pending.
 Current BCH coinbases pay the configured mining address; integrating the
 compiled BCH donation policy remains separate from existing token policies.
 The successful Chipnet experiments do not complete those remaining capabilities.

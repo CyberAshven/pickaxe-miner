@@ -9,6 +9,10 @@ mod bch;
 pub mod channel;
 #[cfg(feature = "stratum-v2")]
 pub mod command;
+#[cfg(feature = "stratum-v2")]
+pub mod journal;
+#[cfg(all(test, feature = "stratum-v2"))]
+mod journal_tests;
 #[cfg(all(test, feature = "stratum-v2"))]
 mod live_tests;
 #[cfg(feature = "stratum-v2")]

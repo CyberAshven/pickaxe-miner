@@ -24,7 +24,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending; Knuth live tests deferred, BCHN is the live-test baseline |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests pass; upstream CPU device and ASIC pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local CPU device and Avalon Nano 3 pass; refresh uniqueness follow-up and upstream native SV2 device validation tracked below |
-| S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Confirmed Chipnet blocks and configured payout verified, with independent public-server header matches; uncertain-outcome diagnosis and durable retry pending |
+| S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Confirmed Chipnet blocks and configured payout verified, with independent public-server header matches; durable full-block journal and outcome classification implemented with local failure/restart proof; updated live validation pending |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
 | S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Aggregate dashboard added; per-device rate/vardiff and live validation pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
@@ -282,3 +282,54 @@ The full host suite passes 375 library and 16 binary tests (18 ignored and
 with warnings denied also pass. Exact-commit CI and deployment of the uniqueness
 follow-up are recorded separately after completion. No raw packets, payouts or
 credentials are included in this evidence.
+
+## Physical unique-work validation (2026-10-07)
+
+The Linux binary for `7ad0766` (SHA256
+`49039505b4736dd81b68c11730dd8c544ff62041e96c0defb7e90d6f6fc77d73`)
+replaced the service after real-node preflight, keeping the ASIC's pool address.
+A 120-second passive sample observed 34 submitted and accepted shares, no
+rejects or repeated work, four retained-job and four clean notifications.
+BCHN confirmed heights 326809 and 326810 (two and one confirmations at the
+checkpoint), with the configured payout in each coinbase. Both block headers
+also matched responses from two independent public Chipnet servers.
+
+There were zero unconfirmed block outcomes and no service restarts at the
+checkpoint. Two connection errors still need classification; this is not a
+claim of zero errors, universal propagation or a controlled rejection-rate
+comparison. Only aggregate observations are retained.
+
+## Durable full-block submission (2026-10-07)
+
+#### PR #38
+
+A device's solved full block is now flushed to a private, exclusively locked
+journal before its share ACK. The saved state binds to the configured node,
+network and payout, without storing RPC credentials. Lost replies remain pending
+and retry the identical full block with bounded backoff. A current template is
+never substituted for saved work. Exact BCHN success/duplicate responses or a
+matching positively confirmed header establish acceptance; permanent validation
+failures are separate from inconclusive results. A completion receipt and its
+counter are committed with pending removal, preventing restart double counting.
+
+Storage failure stops the service before ACK; corrupt/foreign state is preserved
+and fails closed. Operational capacity is 64 pending blocks and 64 MiB raw data,
+plus 1,024 recent receipts. These bounds are explicit rather than silently
+dropping acknowledged work. Historical pre-journal outcomes are not imported.
+
+Local TCP tests simulate a node accepting a block while all replies are lost,
+then restart the server and verify byte-identical recovery and a single accepted
+count. Another test forces an atomic-write failure: no share ACK or node
+submission occurs. Journal tests cover locking, source/payout/network changes,
+corruption, capacity and credential rotation. Retry timing is deterministic.
+The full host suite passes 386 library and 16 binary tests, with 18 opt-in tests
+ignored and 34 GPU tests filtered. An additional abrupt-exit test and final lint
+checks also pass: the test subprocess exits without running destructors after
+both a pending write and a completion receipt, and each state reopens intact.
+Formatting and Rust 1.99 all-target/all-feature Clippy pass with warnings denied.
+These are local experiments; the live
+service at this checkpoint still runs `7ad0766`.
+
+Node outcome semantics were checked against BCHN 29.1.0's
+[submitblock implementation](https://github.com/bitcoin-cash-node/bitcoin-cash-node/blob/v29.1.0/src/rpc/mining.cpp)
+and the [getblockheader RPC documentation](https://docs.bitcoincashnode.org/doc/json-rpc/getblockheader/).

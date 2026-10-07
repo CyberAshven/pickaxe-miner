@@ -3,6 +3,7 @@
 //! work; a light-job payload must never be sent as a full block on failover.
 
 use super::channel::MAX_ACTIVE_JOBS;
+use super::journal::PendingBlock;
 use super::template::{double_sha256, meets_target, BchTemplate, Coinbase};
 use crate::config::MiningNetwork;
 use serde_json::{json, Value};
@@ -21,6 +22,17 @@ impl NativeNodeRpc {
     pub fn new(endpoint: String) -> Self {
         Self { endpoint }
     }
+
+    pub fn source_identity(&self) -> Result<[u8; 32], String> {
+        crate::node::rpc_source_identity(&self.endpoint)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmissionOutcome {
+    Accepted,
+    Rejected(&'static str),
+    Pending(&'static str),
 }
 
 impl NodeRpc for NativeNodeRpc {
@@ -141,6 +153,58 @@ impl<R: NodeRpc> TemplateProvider<R> {
         Ok(())
     }
 
+    /// #### PR #38
+    /// Recovery submits the saved full block, never a rebuilt current job.
+    /// BCHN's exact "duplicate" means accepted/known; inconclusive results do
+    /// not. A lost reply may also resolve through a confirmed matching header.
+    /// Unknown errors remain retryable rather than discarding acknowledged work.
+    pub fn submit_saved(&mut self, pending: &PendingBlock) -> SubmissionOutcome {
+        if self.chain_tip().is_err() {
+            return SubmissionOutcome::Pending("node-unavailable-or-wrong-network");
+        }
+        let result = self.rpc.call("submitblock", json!([pending.block]));
+        let outcome = match result.as_ref() {
+            Ok(Value::Null) => SubmissionOutcome::Accepted,
+            Ok(Value::String(reason)) if reason == "duplicate" => SubmissionOutcome::Accepted,
+            Ok(Value::String(reason)) => match reason.as_str() {
+                "duplicate-invalid" | "high-hash" | "bad-txnmrklroot" | "bad-txns-duplicate"
+                | "bad-cb-height" | "bad-cb-amount" | "bad-cb-length" | "bad-cb-missing"
+                | "bad-blk-length" | "bad-blk-sigops" | "bad-tx-ordering" | "bad-diffbits"
+                | "time-too-old" => SubmissionOutcome::Rejected("invalid-block"),
+                "time-too-new" => SubmissionOutcome::Pending("time-too-new"),
+                "inconclusive"
+                | "duplicate-inconclusive"
+                | "inconclusive-not-best-prevblk"
+                | "bad-prevblk"
+                | "prev-blk-not-found" => SubmissionOutcome::Pending("node-inconclusive"),
+                _ => SubmissionOutcome::Pending("unrecognized-node-result"),
+            },
+            Ok(_) => SubmissionOutcome::Pending("malformed-node-result"),
+            Err(_) => SubmissionOutcome::Pending("node-response-unavailable"),
+        };
+        let outcome = if matches!(outcome, SubmissionOutcome::Pending(_)) {
+            let known = self.rpc.call("getblockheader", json!([pending.hash, true]));
+            if known.as_ref().is_ok_and(|header| {
+                header.get("hash").and_then(Value::as_str) == Some(pending.hash.as_str())
+                    && header
+                        .get("confirmations")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|n| n > 0)
+            }) {
+                SubmissionOutcome::Accepted
+            } else {
+                outcome
+            }
+        } else {
+            outcome
+        };
+        if outcome == SubmissionOutcome::Accepted {
+            self.current = None;
+            self.previous.clear();
+        }
+        outcome
+    }
+
     fn chain_tip(&mut self) -> Result<(u64, String), String> {
         let info = self.rpc.call("getblockchaininfo", json!([]))?;
         let expected = match self.network {
@@ -167,5 +231,128 @@ impl<R: NodeRpc> TemplateProvider<R> {
             return Err("node returned an invalid tip hash".into());
         }
         Ok((height, hash.to_ascii_lowercase()))
+    }
+}
+
+#[cfg(test)]
+mod durable_tests {
+    use super::*;
+    use crate::stratum_v2::journal_tests::solved_share;
+
+    struct Rpc(VecDeque<(&'static str, Result<Value, String>)>);
+    impl NodeRpc for Rpc {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            let (expected, response) = self.0.pop_front().expect("unexpected RPC");
+            assert_eq!(method, expected);
+            if method == "submitblock" {
+                assert_eq!(params, json!([pending().block]));
+            }
+            response
+        }
+    }
+    fn pending() -> PendingBlock {
+        let share = solved_share(99);
+        let block = share.template.block(&share.coinbase, share.header).unwrap();
+        let mut hash = super::double_sha256(&share.header);
+        hash.reverse();
+        PendingBlock {
+            hash: hex::encode(hash),
+            block: hex::encode(block),
+        }
+    }
+    fn tip() -> Value {
+        json!({"chain":"chip","blocks":42,"headers":42,"bestblockhash":"ab".repeat(32),"initialblockdownload":false})
+    }
+
+    #[test]
+    fn exact_node_results_distinguish_accepted_invalid_and_uncertain_blocks() {
+        for (response, outcome) in [
+            (Value::Null, SubmissionOutcome::Accepted),
+            (json!("duplicate"), SubmissionOutcome::Accepted),
+            (
+                json!("duplicate-invalid"),
+                SubmissionOutcome::Rejected("invalid-block"),
+            ),
+            (
+                json!("bad-cb-amount"),
+                SubmissionOutcome::Rejected("invalid-block"),
+            ),
+            (
+                json!("duplicate-inconclusive"),
+                SubmissionOutcome::Pending("node-inconclusive"),
+            ),
+            (
+                json!("time-too-new"),
+                SubmissionOutcome::Pending("time-too-new"),
+            ),
+            (
+                json!("unrecognized rejection"),
+                SubmissionOutcome::Pending("unrecognized-node-result"),
+            ),
+            (
+                json!(true),
+                SubmissionOutcome::Pending("malformed-node-result"),
+            ),
+        ] {
+            let mut calls = VecDeque::from([
+                ("getblockchaininfo", Ok(tip())),
+                ("submitblock", Ok(response)),
+            ]);
+            if matches!(outcome, SubmissionOutcome::Pending(_)) {
+                calls.push_back(("getblockheader", Err("unavailable".into())));
+            }
+            let mut provider = TemplateProvider::new(Rpc(calls), MiningNetwork::Chipnet);
+            assert_eq!(provider.submit_saved(&pending()), outcome);
+            assert!(provider.rpc.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn lost_reply_requires_a_confirmed_matching_header_to_count_acceptance() {
+        for (hash, confirmations, accepted) in [
+            (pending().hash, 1, true),
+            (pending().hash, 0, false),
+            (pending().hash, -1, false),
+            ("cd".repeat(32), 5, false),
+        ] {
+            let calls = VecDeque::from([
+                ("getblockchaininfo", Ok(tip())),
+                ("submitblock", Err("lost reply".into())),
+                (
+                    "getblockheader",
+                    Ok(json!({"hash":hash,"confirmations":confirmations})),
+                ),
+            ]);
+            let mut provider = TemplateProvider::new(Rpc(calls), MiningNetwork::Chipnet);
+            assert_eq!(
+                provider.submit_saved(&pending()),
+                if accepted {
+                    SubmissionOutcome::Accepted
+                } else {
+                    SubmissionOutcome::Pending("node-response-unavailable")
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_does_not_submit_to_wrong_chain_or_unsynchronized_node() {
+        for field in ["chain", "headers", "initialblockdownload"] {
+            let mut info = tip();
+            info[field] = match field {
+                "chain" => json!("main"),
+                "headers" => json!(43),
+                _ => json!(true),
+            };
+            let mut provider = TemplateProvider::new(
+                Rpc(VecDeque::from([("getblockchaininfo", Ok(info))])),
+                MiningNetwork::Chipnet,
+            );
+            assert_eq!(
+                provider.submit_saved(&pending()),
+                SubmissionOutcome::Pending("node-unavailable-or-wrong-network")
+            );
+            assert!(provider.rpc.0.is_empty());
+        }
     }
 }
