@@ -150,13 +150,24 @@ pub fn parse_cgminer(reply: &str) -> Option<DeviceReport> {
         .and_then(|s| s.get("SUMMARY"))
         .and_then(|s| s.get(0))
         .or_else(|| value.get("SUMMARY").and_then(|s| s.get(0)));
-    let mhs = summary.and_then(|s| {
-        ["MHS 5s", "MHS 1m", "MHS av"]
-            .iter()
-            .find_map(|key| s.get(*key).and_then(Value::as_f64))
+    // Prefer the 5-minute rate, the window of "Now (5m)": the 5-second rate
+    // swings widely and "MHS av" averages over idle time since start. Stock
+    // Antminer firmware reports GH/s instead, sometimes as "13,500.00".
+    let hashrate = summary.and_then(|s| {
+        [
+            ("MHS 5m", 1e6),
+            ("MHS 1m", 1e6),
+            ("MHS 15m", 1e6),
+            ("MHS 5s", 1e6),
+            ("GHS 5s", 1e9),
+            ("MHS av", 1e6),
+            ("GHS av", 1e9),
+        ]
+        .iter()
+        .find_map(|(key, unit)| s.get(*key).and_then(number).map(|rate| rate * unit))
     });
     let mut report = DeviceReport {
-        hashrate: mhs.map(|mhs| mhs * 1e6),
+        hashrate,
         ..DeviceReport::default()
     };
     let stats = value
@@ -211,6 +222,14 @@ pub fn parse_bitaxe(body: &str) -> Option<DeviceReport> {
     (!report.is_empty()).then_some(report)
 }
 
+/// A JSON number, or a number written as text such as "13,500.00".
+fn number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.replace(',', "").trim().parse().ok())
+        .filter(|value| value.is_finite())
+}
+
 /// The text inside `Key[...]`, matched as a whole key.
 fn bracket_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let mut rest = text;
@@ -245,18 +264,22 @@ mod tests {
 
     #[test]
     fn reads_an_avalon_summary_and_its_temperature_and_fan() {
+        // Fields and values from an Avalon Nano 3 (cgminer 4.11.1) reply.
         let reply = concat!(
-            r#"{"summary":[{"STATUS":[{"STATUS":"S"}],"SUMMARY":[{"Elapsed":600,"#,
-            r#""MHS av":3912345.67,"MHS 5s":4012345.67,"Accepted":120}],"id":1}],"#,
-            r#""estats":[{"STATUS":[{"STATUS":"S"}],"STATS":[{"STATS":0,"ID":"AVALON0","#,
-            r#""MM ID0":"Ver[Nano3-25021401] DNA[0201] Elapsed[600] Temp[48] TMax[63] TAvg[55] "#,
-            r#"Fan1[3120] FanR[42%] GHSspd[4012.34] WORKMODE[2]"}],"id":1}],"id":1}"#,
+            r#"{"summary":[{"STATUS":[{"STATUS":"S"}],"SUMMARY":[{"Elapsed":40583,"#,
+            r#""MHS av":2364812.63,"MHS 5s":6048809.53,"MHS 1m":4551161.05,"#,
+            r#""MHS 5m":4176169.11,"MHS 15m":4020576.90,"Accepted":260039}],"id":1}],"#,
+            r#""estats":[{"STATUS":[{"STATUS":"S"}],"STATS":[{"STATS":0,"ID":"AVANANO0","#,
+            r#""MM ID0":"HashStatus[1] Ver[nano3-25103101_0736b2e] Elapsed[40600] "#,
+            r#"DH[1.849%] Temp[54] OTemp[46] TMax[95] TAvg[91] TarT[90] Fan1[5280] "#,
+            r#"FanR[75%] GHSspd[4115.12] WORKLEVEL[2]","MM Count":1}],"id":1}],"id":1}"#,
             "\0"
         );
         let report = parse_cgminer(reply).unwrap();
-        assert_eq!(report.hashrate, Some(4_012_345.67e6));
-        assert_eq!(report.temperature_c, Some(63.0));
-        assert_eq!(report.fan.as_deref(), Some("42%"));
+        // The 5-minute rate, not the 6.05 TH/s 5-second spike.
+        assert!((report.hashrate.unwrap() - 4.17616911e12).abs() < 1.0);
+        assert_eq!(report.temperature_c, Some(95.0));
+        assert_eq!(report.fan.as_deref(), Some("75%"));
     }
 
     #[test]
@@ -266,6 +289,9 @@ mod tests {
         assert_eq!(report.hashrate, Some(13.5e12));
         assert_eq!(report.temperature_c, None);
         assert_eq!(report.fan, None);
+        // Stock Antminer firmware: GH/s, sometimes written as text.
+        let reply = r#"{"SUMMARY":[{"GHS 5s":"13,500.00","GHS av":13400.0}],"id":1}"#;
+        assert_eq!(parse_cgminer(reply).unwrap().hashrate, Some(13.5e12));
     }
 
     #[test]
