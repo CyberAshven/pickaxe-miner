@@ -433,6 +433,7 @@ struct FirmwareDevice {
     write: TcpStream,
     read: std::io::BufReader<TcpStream>,
     prefix: Vec<u8>,
+    clean: bool,
 }
 impl FirmwareDevice {
     fn connect(adapter: &FirmwareAdapter, rolling: bool, authorize_first: bool) -> Self {
@@ -445,6 +446,7 @@ impl FirmwareDevice {
             write,
             read,
             prefix: Vec::new(),
+            clean: false,
         };
         if rolling {
             device.send(json!({"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":2}]}));
@@ -452,7 +454,7 @@ impl FirmwareDevice {
             assert_eq!(configured["result"]["version-rolling"], true);
             assert_eq!(configured["result"]["version-rolling.mask"], "1fffe000");
         }
-        let authorize = json!({"id":3,"method":"mining.authorize","params":["cpu.worker"]});
+        let authorize = json!({"id":3,"method":"mining.authorize","params":[payout()]});
         if authorize_first {
             device.send(authorize.clone());
             assert_eq!(device.receive()["result"], true);
@@ -489,6 +491,7 @@ impl FirmwareDevice {
         let notify = self.receive();
         assert_eq!(notify["method"], "mining.notify");
         let fields = notify["params"].as_array().unwrap();
+        self.clean = fields[8].as_bool().unwrap();
         let extra = [id as u8; 8];
         let mut coinbase = hex::decode(fields[2].as_str().unwrap()).unwrap();
         coinbase.extend(&self.prefix);
@@ -522,7 +525,7 @@ impl FirmwareDevice {
             })
             .unwrap();
         let mut params = vec![
-            json!("cpu.worker"),
+            json!(payout()),
             fields[0].clone(),
             json!(hex::encode(extra)),
             json!(format!("{time:08x}")),
@@ -534,6 +537,43 @@ impl FirmwareDevice {
         let submit = json!({"id":id+10,"method":"mining.submit","params":params});
         (header.block_hash().to_string(), submit)
     }
+}
+
+#[test]
+fn sv1_same_tip_refresh_accepts_inflight_block_and_new_tip_rejects_it() {
+    let server = Running::new(false);
+    let adapter = FirmwareAdapter::new(&server);
+    let mut first = FirmwareDevice::connect(&adapter, true, false);
+    let second = FirmwareDevice::connect(&adapter, true, true);
+    // Both devices identify with the same address; their hashing spaces differ.
+    assert_ne!(first.prefix, second.prefix);
+    let (hash, submit) = first.solve(0, true);
+    assert!(first.clean);
+    // Exercise the real production 15-second template refresh over TCP/Noise.
+    first
+        .read
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let (_, new_submit) = first.solve(1, true);
+    assert!(
+        !first.clean,
+        "same-tip updates must retain firmware pipeline work"
+    );
+    assert_ne!(submit["params"][1], new_submit["params"][1]);
+    first.send(submit.clone());
+    let ack = first.receive();
+    assert_eq!(ack["id"], 10);
+    assert_eq!(ack["result"], true);
+    server.wait(|stats| stats.blocks_accepted == 1);
+    assert_eq!(server.node.lock().unwrap().tip, hash);
+    first.solve(2, true);
+    assert!(first.clean, "new parent must revoke preceding jobs");
+    first.send(submit);
+    let stale = first.receive();
+    assert_eq!(stale["error"][0], 21);
+    first.write.shutdown(std::net::Shutdown::Both).unwrap();
+    second.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
 #[test]

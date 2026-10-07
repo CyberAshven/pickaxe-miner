@@ -20,12 +20,12 @@ Work continues on PR #38; this document does not narrow the requested scope.
 
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
-| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Real Chipnet full-template preflight and proposal validation pass; light/native TP and accepted block pending |
+| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Real Chipnet full templates and source-node confirmed ASIC blocks pass; light/native TP and independent propagation pending |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending; Knuth live tests deferred, BCHN is the live-test baseline |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests pass; upstream CPU device and ASIC pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle and local CPU device pass; upstream/ASIC pending |
-| S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Fixture acceptance/rejection distinguished; live proof and durable retry pending |
-| S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter and CPU firmware TCP experiments pass; physical firmware pending |
+| S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Source-node confirmed Chipnet blocks and configured payout verified; independent propagation, uncertain-outcome diagnosis and durable retry pending |
+| S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; stale-job behavior still under investigation |
 | S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Aggregate dashboard added; per-device rate/vardiff and live validation pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
@@ -165,3 +165,78 @@ the peer receives it, without adding a sleep. All three server experiments pass
 with four test threads; the full parallel host suite passes 371 library and 16
 binary tests (17 ignored, 34 hardware-filtered). Formatting and Rust 1.99
 all-feature Clippy with warnings denied pass. Exact pushed-commit CI is separate.
+
+## Physical ASIC checkpoint and address-only worker (2026-10-07)
+
+The Linux service built from `b3f3975586789e2a2ab33afbac1566712ef965b8`
+is serving an Avalon Nano 3 running cgminer 4.11.1. An address alone in
+`mining.authorize` succeeds without a worker suffix, including a real job.
+The worker string remains an identity: this private server pays its configured
+address, not an arbitrary address supplied by a connecting device. The actual
+SV1 coinbase was independently decoded by BCHN and matched the configured payout.
+
+Source-node block queries for Chipnet heights 326767 through 326770 returned
+positive confirmations (4, 3, 3, 2 in sequential queries as the tip advanced).
+Each coinbase paid the configured test address. This confirms real physical
+ASIC mining and source-node chain inclusion; it does not prove independent
+public-node propagation or complete the durable submission requirements.
+
+The ASIC's cumulative rejection percentage fell from the owner's 27.7% startup
+sample to about 5.0%. A subsequent 45-second passive server-to-ASIC sample saw
+728 successful share responses and 8 rejections (1.087%): all eight were SV1
+code 21, comprising five adapter `stale job` responses and three upstream
+validator stale/invalid-job responses. No difficulty or duplicate rejection
+was observed in that bounded sample. Firmware hardware-error counters are
+separate and are not explained by this observation. No raw packets, device
+credentials, payout addresses or network configuration are retained here.
+
+At a later server snapshot, there were 57 accepted blocks and 130 unconfirmed
+submission outcomes. The latter had stopped increasing during these samples,
+but their causes are not yet classified; they must not be called accepted or
+all described as node rejections. Current server counters also omit shares
+rejected locally by the SV1 adapter, so aggregate server/firmware totals differ.
+
+Static follow-up: every 15-second template refresh currently sends a future
+job followed by `SetNewPrevHash`, and the adapter always sets `clean_jobs=true`,
+including unchanged chain tips. The implementation therefore invalidates
+in-flight work even on same-tip refreshes. A fix must retain and validate exact
+same-tip job/transaction data while continuing to reject work for an obsolete
+chain tip; do not lower rejection counts by accepting obsolete work blindly.
+This behavior has not been changed in the running binary at this checkpoint.
+
+Connections already have distinct session salts/extranonce allocations, even
+when workers use the same address. Names are optional monitoring labels, not
+the mechanism separating hashing work. The server and adapter each cap active
+connections at 64; 1,000-ASIC capacity and persistent per-device labels are not
+implemented or load-tested. Braiins Solo and CKPool both document address-only
+usernames with optional worker suffixes:
+
+- https://academy.braiins.com/braiins-pool/solo-mining
+- https://solo.ckpool.org/
+- Job lifecycle reference: https://stratumprotocol.org/specification/05-mining-protocol/
+
+## Same-tip job retention fix (2026-10-07)
+
+#### PR #38
+
+Same-parent template updates now use immediately active SV2 jobs. The SV1
+adapter translates them with `clean_jobs=false` and retains each job's version.
+Both validators retain up to eight jobs with exact coinbase/template data;
+new parents or changed bits still clear the old jobs. Duplicate protection
+survives same-tip refreshes, including attempts to resubmit an identical header
+under a different job identifier. The provider retains the corresponding exact
+transaction lists for block submission. Existing 60-second ntime policy remains.
+
+The TCP/Noise regression uses the actual 15-second server refresh. Two simulated
+ASICs authorize with the same synthetic address and receive distinct extranonce
+prefixes. A solution held through a same-tip refresh is accepted and submitted
+as a full block checked by an independent decoder; the same job is rejected
+after the next chain tip. Additional regressions cover bounded history, multiple
+transaction-list refreshes, duplicate aliases, and standard/extended channels.
+
+Local validation: 38 focused tests pass (one real-node test remains opt-in).
+The all-feature host suite passes 375 library and 16 binary tests, with 18
+ignored and 34 hardware tests filtered. Rust 1.99 formatting and all-target,
+all-feature Clippy with warnings denied pass. No kernel or ASIC settings changed.
+Exact-commit CI and updated physical-firmware observations are checked separately.
+The durable block journal remains unfinished and is not included in this fix.

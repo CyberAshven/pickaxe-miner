@@ -181,6 +181,39 @@ fn provider_keeps_inflight_solution_across_same_tip_refresh_only() {
 }
 
 #[test]
+fn provider_retains_exact_block_transactions_across_multiple_refreshes() {
+    let mut calls = initial_calls();
+    for nonce in [8, 9, 10] {
+        let mut template = rpc_template();
+        template["transactions"] = json!([transaction(nonce)]);
+        calls.extend([
+            ("getblockchaininfo", Ok(tip())),
+            ("getblocktemplate", Ok(template)),
+            ("getblockchaininfo", Ok(tip())),
+        ]);
+    }
+    calls.push_back(("submitblock", Ok(Value::Null)));
+    let mut provider = TemplateProvider::new(RpcFixture(calls), MiningNetwork::Chipnet);
+    let (generation, old) = provider.refresh().unwrap();
+    let coinbase = old
+        .coinbase(MiningNetwork::Chipnet, &payout(), &[9; 16])
+        .unwrap();
+    let header = (0..1000)
+        .map(|nonce| {
+            old.header(&coinbase, old.version, old.current_time, nonce)
+                .unwrap()
+        })
+        .find(|header| meets_target(&double_sha256(header), &old.target))
+        .unwrap();
+    for _ in 0..3 {
+        provider.refresh().unwrap();
+    }
+    // The new tx lists cannot reconstruct the original header's merkle root.
+    // Successful full-block serialization therefore requires the exact old list.
+    assert!(provider.submit(generation, &coinbase, header).is_ok());
+}
+
+#[test]
 fn template_rejects_wrong_chain_payout_witness_and_malformed_work() {
     let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
     assert!(template

@@ -5,11 +5,15 @@
 
 use super::template::{double_sha256, meets_target, BchTemplate, Coinbase, CoinbaseParts, Hash};
 use crate::config::{validate_payout_address, MiningNetwork};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 pub const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
 const MAX_SHARES_PER_JOB: usize = 16_384;
 pub const DEVICE_EXTRANONCE_SIZE: usize = 8;
+pub const MAX_ACTIVE_JOBS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -25,8 +29,9 @@ pub struct Channel {
     network: MiningNetwork,
     payout: String,
     job: Option<Job>,
+    previous: VecDeque<Job>,
     sequence: Option<u32>,
-    seen: HashSet<Hash>,
+    seen: HashMap<u32, HashSet<Hash>>,
     pub accepted: u64,
     pub rejected: u64,
 }
@@ -52,6 +57,7 @@ pub struct Share<'a> {
 
 pub struct ValidatedShare {
     pub generation: u64,
+    pub template: Arc<BchTemplate>,
     pub coinbase: Coinbase,
     pub header: [u8; 80],
     pub block: bool,
@@ -82,8 +88,9 @@ impl Channel {
             network,
             payout,
             job: None,
+            previous: VecDeque::new(),
             sequence: None,
-            seen: HashSet::new(),
+            seen: HashMap::new(),
             accepted: 0,
             rejected: 0,
         })
@@ -95,8 +102,11 @@ impl Channel {
         generation: u64,
         template: Arc<BchTemplate>,
     ) -> Result<&Job, String> {
-        self.job = None;
-        self.seen.clear();
+        if self.job.as_ref().is_some_and(|job| job.id == id)
+            || self.previous.iter().any(|job| job.id == id)
+        {
+            return Err("job identifier already in use".into());
+        }
         let standard_coinbase =
             template.coinbase(self.network, &self.payout, &self.extranonce_prefix)?;
         let parts = template.coinbase_parts(
@@ -104,6 +114,25 @@ impl Channel {
             &self.payout,
             self.extranonce_prefix.len() + DEVICE_EXTRANONCE_SIZE,
         )?;
+        // #### PR #38
+        // A mempool/time refresh on the same parent does not invalidate work
+        // already in an ASIC pipeline. Retain exact coinbases and tx lists;
+        // a new parent or changed bits still revokes every preceding job.
+        if let Some(previous) = self.job.take() {
+            if previous.template.previous_hash == template.previous_hash
+                && previous.template.bits == template.bits
+            {
+                self.previous.push_back(previous);
+                while self.previous.len() >= MAX_ACTIVE_JOBS {
+                    if let Some(expired) = self.previous.pop_front() {
+                        self.seen.remove(&expired.id);
+                    }
+                }
+            } else {
+                self.previous.clear();
+                self.seen.clear();
+            }
+        }
         self.job = Some(Job {
             id,
             generation,
@@ -116,6 +145,7 @@ impl Channel {
 
     pub fn revoke(&mut self) {
         self.job = None;
+        self.previous.clear();
         self.seen.clear();
     }
     pub fn job(&self) -> Option<&Job> {
@@ -136,10 +166,15 @@ impl Channel {
         if share.channel_id != self.id {
             return Err("invalid-channel-id");
         }
-        let job = self.job.as_ref().ok_or("stale-share")?;
-        if share.job_id != job.id {
-            return Err("invalid-job-id");
-        }
+        let current = self.job.as_ref().ok_or("stale-share")?;
+        let job = if share.job_id == current.id {
+            current
+        } else {
+            self.previous
+                .iter()
+                .find(|job| job.id == share.job_id)
+                .ok_or("invalid-job-id")?
+        };
         if self.sequence.is_some_and(|last| {
             let delta = share.sequence.wrapping_sub(last);
             delta == 0 || delta >= 1 << 31
@@ -183,15 +218,17 @@ impl Channel {
         if !meets_target(&hash, &self.target) && !block {
             return Err("difficulty-too-low");
         }
-        if self.seen.contains(&hash) {
+        if self.seen.values().any(|seen| seen.contains(&hash)) {
             return Err("duplicate-share");
         }
-        if self.seen.len() >= MAX_SHARES_PER_JOB {
+        let seen = self.seen.entry(job.id).or_default();
+        if seen.len() >= MAX_SHARES_PER_JOB {
             return Err("job-share-limit");
         }
-        self.seen.insert(hash);
+        seen.insert(hash);
         Ok(ValidatedShare {
             generation: job.generation,
+            template: job.template.clone(),
             coinbase,
             header,
             block,
@@ -294,6 +331,87 @@ mod tests {
         assert!(channel.check(input, 1700000010).is_ok());
         assert!(channel.check(share(0), 1700000010).is_err());
     }
+    #[test]
+    fn same_tip_retains_inflight_work_without_resetting_duplicate_protection() {
+        for kind in [ChannelKind::Standard, ChannelKind::Extended] {
+            let mut channel = channel(1, kind);
+            let mut input = share(0);
+            if kind == ChannelKind::Extended {
+                input.extranonce = &[0; DEVICE_EXTRANONCE_SIZE];
+            }
+            let first = channel.check(input, 1700000010).unwrap();
+            for id in 2..=3 {
+                channel
+                    .install(
+                        id,
+                        u64::from(id) + 2,
+                        Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+                    )
+                    .unwrap();
+            }
+            // Reusing the very same header under a new job ID is still a duplicate.
+            let mut alias = share(1);
+            alias.job_id = 3;
+            if kind == ChannelKind::Extended {
+                alias.extranonce = &[0; DEVICE_EXTRANONCE_SIZE];
+            }
+            assert!(matches!(
+                channel.check(alias, 1700000010),
+                Err("duplicate-share")
+            ));
+            let mut delayed = share(2);
+            delayed.nonce = 1;
+            if kind == ChannelKind::Extended {
+                delayed.extranonce = &[0; DEVICE_EXTRANONCE_SIZE];
+            }
+            let retained = channel.check(delayed, 1700000010).unwrap();
+            assert_eq!(retained.generation, first.generation);
+            let decoded: Block = consensus::deserialize(
+                &retained
+                    .template
+                    .block(&retained.coinbase, retained.header)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(decoded.check_merkle_root());
+            let mut changed = rpc_template();
+            changed["previousblockhash"] = serde_json::json!("cd".repeat(32));
+            channel
+                .install(4, 6, Arc::new(BchTemplate::from_rpc(&changed).unwrap()))
+                .unwrap();
+            assert!(matches!(
+                channel.check(share(3), 1700000010),
+                Err("invalid-job-id")
+            ));
+            assert!(channel.previous.is_empty());
+        }
+    }
+
+    #[test]
+    fn job_history_is_bounded_and_revoke_clears_it() {
+        let mut channel = channel(1, ChannelKind::Standard);
+        for id in 2..=MAX_ACTIVE_JOBS as u32 + 2 {
+            channel
+                .install(
+                    id,
+                    u64::from(id),
+                    Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+                )
+                .unwrap();
+        }
+        assert_eq!(channel.previous.len(), MAX_ACTIVE_JOBS - 1);
+        assert!(matches!(
+            channel.check(share(0), 1700000010),
+            Err("invalid-job-id")
+        ));
+        let mut recent = share(1);
+        recent.job_id = MAX_ACTIVE_JOBS as u32 + 1;
+        assert!(channel.check(recent, 1700000010).is_ok());
+        channel.revoke();
+        assert!(channel.previous.is_empty());
+        assert!(channel.seen.is_empty());
+    }
+
     #[test]
     fn extended_extranonce_and_coinbase_parts_agree_with_full_block() {
         let mut channel = channel(1, ChannelKind::Extended);

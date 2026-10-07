@@ -3,7 +3,7 @@
 //! jobs and shares using SRI; it never constructs payouts or accepts a share
 //! without the upstream validator. Plain SV1 belongs on a trusted mining LAN.
 
-use super::{transport::Session, wire::encoded};
+use super::{channel::MAX_ACTIVE_JOBS, transport::Session, wire::encoded};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -177,7 +177,8 @@ struct Bridge {
     configured: bool,
     mask: Option<HexU32Be>,
     future: BTreeMap<u32, NewExtendedMiningJobOwned>,
-    current: Option<(u32, u32)>,
+    active: BTreeMap<u32, u32>,
+    previous_hash: Option<SetNewPrevHashOwned>,
     notify: Option<Value>,
     sequence: u32,
     pending: BTreeMap<u32, (u64, Instant)>,
@@ -202,7 +203,8 @@ impl Bridge {
             configured: false,
             mask: None,
             future: BTreeMap::new(),
-            current: None,
+            active: BTreeMap::new(),
+            previous_hash: None,
             notify: None,
             sequence: 0,
             pending: BTreeMap::new(),
@@ -360,9 +362,11 @@ impl Bridge {
                         Some((25, "not subscribed"))
                     } else if self.worker.as_deref() != Some(submit.user_name.as_str()) {
                         Some((24, "unauthorized worker"))
-                    } else if self
-                        .current
-                        .is_none_or(|(job, _)| submit.job_id != job.to_string())
+                    } else if submit
+                        .job_id
+                        .parse::<u32>()
+                        .ok()
+                        .is_none_or(|job| !self.active.contains_key(&job))
                     {
                         Some((21, "stale job"))
                     } else if submit.extra_nonce2.len() != self.extra_size {
@@ -381,7 +385,10 @@ impl Bridge {
                 if let Some((code, text)) = error {
                     out.push(reject(id, code, text));
                 } else {
-                    let (_, version) = self.current.ok_or("no current job")?;
+                    let version = self.active[&submit
+                        .job_id
+                        .parse::<u32>()
+                        .map_err(|_| "invalid job identifier")?];
                     // A worker may omit version_bits and use the original version.
                     let mask = submit.version_bits.as_ref().and(self.mask.clone());
                     let share = sv1_to_sv2::build_sv2_submit_shares_extended_from_sv1_submit(
@@ -412,16 +419,32 @@ impl Bridge {
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
                 let job: NewExtendedMiningJob =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid mining job")?;
-                if job.channel_id != self.channel
-                    || !job.version_rolling_allowed
-                    || !job.is_future()
-                {
+                if job.channel_id != self.channel || !job.version_rolling_allowed {
                     return Err("unexpected firmware job".into());
                 }
-                if self.future.len() >= 8 {
-                    return Err("too many future jobs".into());
+                if self.future.contains_key(&job.job_id) || self.active.contains_key(&job.job_id) {
+                    return Err("job identifier already in use".into());
                 }
-                self.future.insert(job.job_id, job.as_owned());
+                if job.is_future() {
+                    if self.future.len() >= MAX_ACTIVE_JOBS {
+                        return Err("too many future jobs".into());
+                    }
+                    self.future.insert(job.job_id, job.as_owned());
+                } else {
+                    let prev = self
+                        .previous_hash
+                        .clone()
+                        .ok_or("job before initial parent")?;
+                    if job
+                        .min_ntime
+                        .clone()
+                        .into_inner()
+                        .is_none_or(|time| time < prev.min_ntime)
+                    {
+                        return Err("job time precedes active parent".into());
+                    }
+                    out.extend(self.activate(prev, job.as_owned(), false)?);
+                }
             }
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
                 let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload())
@@ -434,11 +457,9 @@ impl Bridge {
                     .remove(&prev.job_id)
                     .ok_or("unknown job activation")?;
                 self.future.clear();
-                self.current = Some((job.job_id, job.version));
-                let notify = sv2_to_sv1::build_sv1_notify_from_sv2(prev.as_owned(), job, true)
-                    .map_err(|_| "job translation failed")?;
-                self.notify = Some(to_json(notify.into())?);
-                out.extend(self.notifications()?);
+                self.active.clear();
+                self.previous_hash = Some(prev.as_owned());
+                out.extend(self.activate(prev.as_owned(), job, true)?);
             }
             MESSAGE_TYPE_SET_TARGET => {
                 let target: SetTarget =
@@ -485,6 +506,25 @@ impl Bridge {
             _ => return Err("unexpected upstream firmware message".into()),
         }
         Ok(out)
+    }
+
+    // #### PR #38
+    // Immediate same-parent jobs preserve in-flight shares and use clean=false
+    // on SV1. Only SetNewPrevHash flushes old jobs; each share keeps its version.
+    fn activate(
+        &mut self,
+        prev: SetNewPrevHashOwned,
+        job: NewExtendedMiningJobOwned,
+        clean: bool,
+    ) -> Result<Vec<Value>, String> {
+        self.active.insert(job.job_id, job.version);
+        while self.active.len() > MAX_ACTIVE_JOBS {
+            self.active.pop_first();
+        }
+        let notify = sv2_to_sv1::build_sv1_notify_from_sv2(prev, job, clean)
+            .map_err(|_| "job translation failed")?;
+        self.notify = Some(to_json(notify.into())?);
+        self.notifications()
     }
 }
 
@@ -598,7 +638,7 @@ mod tests {
         bridge
             .request(json!({"id":2,"method":"mining.authorize","params":["worker", "unused"]}))
             .unwrap();
-        bridge.current = Some((4, 0x20000000));
+        bridge.active.insert(4, 0x20000000);
         bridge
     }
     fn submit(id: u64) -> Value {

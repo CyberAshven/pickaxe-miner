@@ -2,9 +2,11 @@
 //! Pin full-template submission to its source node. A failed refresh revokes
 //! work; a light-job payload must never be sent as a full block on failover.
 
+use super::channel::MAX_ACTIVE_JOBS;
 use super::template::{double_sha256, meets_target, BchTemplate, Coinbase};
 use crate::config::MiningNetwork;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 
 pub trait NodeRpc {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String>;
@@ -32,7 +34,7 @@ pub struct TemplateProvider<R> {
     network: MiningNetwork,
     generation: u64,
     current: Option<BchTemplate>,
-    previous: Option<(u64, BchTemplate)>,
+    previous: VecDeque<(u64, BchTemplate)>,
 }
 
 impl<R: NodeRpc> TemplateProvider<R> {
@@ -42,7 +44,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
             network,
             generation: 0,
             current: None,
-            previous: None,
+            previous: VecDeque::new(),
         }
     }
 
@@ -54,7 +56,8 @@ impl<R: NodeRpc> TemplateProvider<R> {
 
     pub fn refresh(&mut self) -> Result<(u64, &BchTemplate), String> {
         let previous = self.current.take();
-        self.previous = None;
+        // Move history out while fetching; any failed refresh revokes it.
+        let mut history = std::mem::take(&mut self.previous);
         let before = self.chain_tip()?;
         let raw = self.rpc.call(
             "getblocktemplate",
@@ -75,7 +78,11 @@ impl<R: NodeRpc> TemplateProvider<R> {
         if let Some(previous) =
             previous.filter(|previous| previous.previous_hash == template.previous_hash)
         {
-            self.previous = Some((self.generation, previous));
+            history.push_back((self.generation, previous));
+            while history.len() >= MAX_ACTIVE_JOBS {
+                history.pop_front();
+            }
+            self.previous = history;
         }
         self.generation = self
             .generation
@@ -90,7 +97,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
             Ok(tip) => tip,
             Err(error) => {
                 self.current = None;
-                self.previous = None;
+                self.previous.clear();
                 return Err(error);
             }
         };
@@ -114,8 +121,8 @@ impl<R: NodeRpc> TemplateProvider<R> {
             current
         } else {
             self.previous
-                .as_ref()
-                .filter(|(id, template)| {
+                .iter()
+                .find(|(id, template)| {
                     *id == generation && template.previous_hash == current.previous_hash
                 })
                 .map(|(_, template)| template)
@@ -130,7 +137,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
             return Err("source node rejected the block".into());
         }
         self.current = None;
-        self.previous = None;
+        self.previous.clear();
         Ok(())
     }
 

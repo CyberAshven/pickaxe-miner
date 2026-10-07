@@ -75,6 +75,10 @@ impl MiningSession {
         self.current = Some((id, generation, template.clone()));
         let mut frames = Vec::new();
         for channel in self.channels.values_mut() {
+            let immediate = channel.job().is_some_and(|job| {
+                job.template.previous_hash == template.previous_hash
+                    && job.template.bits == template.bits
+            });
             // Chipnet can have easier block work than a normal ASIC share.
             // Never ask firmware to discard headers that could win a block.
             if !meets_target(&template.target, &channel.target) {
@@ -92,7 +96,7 @@ impl MiningSession {
                 }))?);
             }
             channel.install(id, generation, template.clone())?;
-            frames.extend(job_frames(channel)?);
+            frames.extend(job_frames(channel, immediate)?);
         }
         Ok(frames)
     }
@@ -328,7 +332,7 @@ impl MiningSession {
                 },
             ))?,
         }];
-        frames.extend(job_frames(&channel)?);
+        frames.extend(job_frames(&channel, false)?);
         self.channels.insert(channel.id, channel);
         self.maximum_targets.insert(self.next_channel, maximum);
         Ok(frames)
@@ -381,20 +385,20 @@ impl MiningSession {
     }
 }
 
-fn job_frames(channel: &Channel) -> Result<Vec<SerializedFrame>, String> {
+fn job_frames(channel: &Channel, immediate: bool) -> Result<Vec<SerializedFrame>, String> {
     let job = channel.job().ok_or("channel has no job")?;
     let new = match channel.kind {
         ChannelKind::Standard => Mining::NewMiningJob(NewMiningJob {
             channel_id: channel.id,
             job_id: job.id,
-            min_ntime: Sv2Option::new(None),
+            min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
             merkle_root: (&job.standard_coinbase.merkle_root).into(),
         }),
         ChannelKind::Extended => Mining::NewExtendedMiningJob(NewExtendedMiningJob {
             channel_id: channel.id,
             job_id: job.id,
-            min_ntime: Sv2Option::new(None),
+            min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
             version_rolling_allowed: true,
             merkle_path: job
@@ -419,16 +423,17 @@ fn job_frames(channel: &Channel) -> Result<Vec<SerializedFrame>, String> {
                 .map_err(|_| "coinbase suffix too long")?,
         }),
     };
-    Ok(vec![
-        mining(new)?,
-        mining(Mining::SetNewPrevHash(SetNewPrevHash {
+    let mut frames = vec![mining(new)?];
+    if !immediate {
+        frames.push(mining(Mining::SetNewPrevHash(SetNewPrevHash {
             channel_id: channel.id,
             job_id: job.id,
             prev_hash: (&job.template.previous_hash).into(),
             min_ntime: job.template.current_time,
             nbits: job.template.bits,
-        }))?,
-    ])
+        }))?);
+    }
+    Ok(frames)
 }
 
 fn open_error(id: u32, code: &'static str) -> Result<SerializedFrame, String> {
@@ -549,15 +554,22 @@ mod tests {
             }))
             .unwrap()
         };
+        // Retain an in-flight solution through an immediate same-tip refresh.
+        let mut refresh = rpc_template();
+        refresh["curtime"] = serde_json::json!(1700000025);
+        let mut update = server
+            .set_job(10, 4, Arc::new(BchTemplate::from_rpc(&refresh).unwrap()))
+            .unwrap();
+        assert_eq!(update.len(), 1, "same-tip work must not reset the parent");
+        let next: NewMiningJob = binary_sv2::from_bytes(update[0].payload()).unwrap();
+        assert!(!next.is_future());
+        assert_eq!(next.min_ntime.into_inner(), Some(1700000025));
         let result = server.receive(submit(0), 1700000010).unwrap();
         assert_eq!(result.blocks.len(), 1);
         let solved = &result.blocks[0];
         assert_eq!(solved.header, header);
-        let block = server
-            .current
-            .as_ref()
-            .unwrap()
-            .2
+        let block = solved
+            .template
             .block(&solved.coinbase, solved.header)
             .unwrap();
         let decoded: Block = consensus::deserialize(&block).unwrap();
@@ -568,11 +580,13 @@ mod tests {
                 .msg_type(),
             MESSAGE_TYPE_SUBMIT_SHARES_ERROR
         );
+        let mut changed_tip = rpc_template();
+        changed_tip["previousblockhash"] = serde_json::json!("cd".repeat(32));
         server
             .set_job(
-                10,
-                4,
-                Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+                11,
+                5,
+                Arc::new(BchTemplate::from_rpc(&changed_tip).unwrap()),
             )
             .unwrap();
         assert!(server
