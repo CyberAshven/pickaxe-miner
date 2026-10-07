@@ -362,6 +362,12 @@ fn encrypted_cpu_devices_submit_blocks_and_receive_successor_without_reconnect()
         let mut device = Device::connect(&server, extended);
         for sequence in 0..2 {
             let hash = device.solve_and_submit(sequence);
+            // The peer has received the ACK, so its validated share must
+            // already be visible even if node submission is still in flight.
+            assert_eq!(
+                server.stats.lock().unwrap().shares_accepted,
+                u64::from(sequence) + 1
+            );
             server.wait(|stats| stats.blocks_accepted == u64::from(sequence) + 1);
             assert_eq!(server.node.lock().unwrap().tip, hash);
         }

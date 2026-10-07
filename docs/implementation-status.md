@@ -20,7 +20,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
-| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full-template fixtures pass; light/native TP and live proof pending |
+| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Real Chipnet full-template preflight and proposal validation pass; light/native TP and accepted block pending |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending; Knuth live tests deferred, BCHN is the live-test baseline |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests pass; upstream CPU device and ASIC pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle and local CPU device pass; upstream/ASIC pending |
@@ -134,3 +134,34 @@ Local SV1 checkpoint: 35 focused tests pass; the full serial host suite passes
 All-feature Clippy passes with warnings denied on both the existing host
 compiler and Rust 1.99 used by current CI. Formatting and `cargo deny check`
 also pass. Remote checks are required on the subsequent pushed commit.
+
+## Live BCHN preflight and CI ordering fix (2026-10-07)
+
+After the owner's Start9 node came online, its authenticated private RPC
+connection reported BCHN 29.1.0 on Chipnet, synced with peers. Pickaxe's
+`stratum-v2 check-node` accepted a real full template for height 326691, with
+bits `1d00ffff` and the node's 2,000,000-byte size limit.
+
+The opt-in `live_chipnet_node_validates_standard_and_extended_block_proposals`
+test then built standard and extended coinbases through the production channel
+and template code. BCHN `validateblocktemplate` returned true for both complete
+proposals at height 326712 (22 transactions including coinbase). An independent
+decoder checked each merkle root and transaction count. Corrupting the merkle
+root produced `bad-txnmrklroot` from BCHN's proposal API in both cases. No PoW was
+searched and no block was submitted: this is real-node assembly validation,
+not block acceptance, propagation or physical ASIC evidence.
+
+Run that test only with `PICKAXE_CHIPNET_CONFIG` pointing to a private saved
+Chipnet configuration, using `cargo test --locked --no-default-features
+--features stratum-v2 --lib live_chipnet_node_validates_standard_and_extended_block_proposals
+-- --ignored --nocapture`. It refuses other networks and does not use a wallet.
+Node credentials, host details and the user's payout are outside the repository.
+
+Windows CI on `101f444` exposed an acknowledgement/counter race: a peer could
+receive its share ACK and the node could accept its block before the dashboard's
+accepted-share counter was updated. The server now publishes validation counters
+before sending the ACK. The TCP regression checks the counter immediately after
+the peer receives it, without adding a sleep. All three server experiments pass
+with four test threads; the full parallel host suite passes 371 library and 16
+binary tests (17 ignored, 34 hardware-filtered). Formatting and Rust 1.99
+all-feature Clippy with warnings denied pass. Exact pushed-commit CI is separate.

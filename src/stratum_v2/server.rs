@@ -271,9 +271,6 @@ fn serve_device(
                         .try_send(block)
                         .map_err(|_| "block submission queue unavailable")?;
                 }
-                for frame in responses.frames {
-                    sender.send(frame)?;
-                }
                 let next_accepted = mining.accepted;
                 let next_rejected = mining.rejected;
                 if let Ok(mut stats) = shared.stats.lock() {
@@ -286,6 +283,14 @@ fn serve_device(
                 }
                 accepted = next_accepted;
                 rejected = next_rejected;
+                // #### PR #38
+                // Publish validation counters before the peer can observe its
+                // acknowledgement. The node worker may already have accepted
+                // the block; delayed socket scheduling must not leave the
+                // acknowledged share missing from the dashboard snapshot.
+                for frame in responses.frames {
+                    sender.send(frame)?;
+                }
             }
         }
         Ok(())

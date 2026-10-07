@@ -9,6 +9,8 @@ mod bch;
 pub mod channel;
 #[cfg(feature = "stratum-v2")]
 pub mod command;
+#[cfg(all(test, feature = "stratum-v2"))]
+mod live_tests;
 #[cfg(feature = "stratum-v2")]
 pub mod provider;
 mod reference;
