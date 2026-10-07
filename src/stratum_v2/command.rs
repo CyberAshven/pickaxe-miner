@@ -140,6 +140,8 @@ pub fn run(
         let mut device_offset = 0usize;
         let mut setting_error = None;
         let mut advanced = false;
+        // The workers table opens first; Tab switches to the overview.
+        let mut overview = false;
         while !stop.load(Ordering::Relaxed) && !worker.is_finished() {
             if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
                 break;
@@ -165,13 +167,34 @@ pub fn run(
                     sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
                     setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {authority}")),
                 );
+                let online = devices.iter().filter(|device| device.connected).count();
+                let total_rate: f64 = devices
+                    .iter()
+                    .filter(|device| device.connected)
+                    .filter_map(|device| device.hashrate_estimate)
+                    .sum();
+                let header = format!(
+                    "{} · Node {} · Height {} · Donation {}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
+                    config.network.as_str(),
+                    if snapshot.template_ready { "Ready" } else { "Waiting" },
+                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
+                    donation_summary(donation_value),
+                    devices.len(),
+                    crate::telemetry::format_hash_rate(total_rate),
+                    snapshot.shares_accepted,
+                    snapshot.shares_rejected,
+                    snapshot.blocks_accepted,
+                    snapshot.blocks_pending,
+                );
                 terminal
                     .terminal
                     .draw(|frame| {
                         if advanced {
                             render_advanced(frame, donation_value, setting_error)
-                        } else {
+                        } else if overview {
                             render_dashboard(frame, &status, &devices, device_offset)
+                        } else {
+                            render_workers(frame, &header, &devices, device_offset)
                         }
                     })
                     .map_err(|_| "cannot draw mining dashboard")?;
@@ -181,6 +204,7 @@ pub fn run(
                             match key.code {
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
                                 KeyCode::Esc => advanced = false,
+                                KeyCode::Tab if !advanced => overview = !overview,
                                 // The donation changes only in Advanced settings.
                                 KeyCode::Char('+')
                                 | KeyCode::Char('=')
@@ -365,7 +389,132 @@ fn render_dashboard(
         .block(Block::bordered().title(title)),
         areas[1],
     );
-    frame.render_widget(Paragraph::new("↑/↓ PgUp/PgDn  Devices · a  Advanced settings · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
+    frame.render_widget(Paragraph::new("Tab  Workers · ↑/↓ PgUp/PgDn  Devices · a  Advanced settings · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
+}
+
+/// Seconds since the last share, as "12s ago", "4m ago" or "2h ago".
+fn ago(seconds: Option<u64>) -> String {
+    match seconds {
+        None => "—".into(),
+        Some(s) if s < 60 => format!("{s}s ago"),
+        Some(s) if s < 3600 => format!("{}m ago", s / 60),
+        Some(s) => format!("{}h ago", s / 3600),
+    }
+}
+
+/// A share difficulty in thousands, millions and so on: "4.10K".
+fn format_difficulty(difficulty: Option<f64>) -> String {
+    let Some(mut value) = difficulty.filter(|value| value.is_finite() && *value > 0.0) else {
+        return "—".into();
+    };
+    for unit in ["", "K", "M", "G", "T"] {
+        if value < 1000.0 {
+            return if unit.is_empty() {
+                format!("{value:.0}")
+            } else {
+                format!("{value:.2}{unit}")
+            };
+        }
+        value /= 1000.0;
+    }
+    format!("{value:.2}P")
+}
+
+/// The workers table, laid out like a pool's worker list; the default page.
+fn render_workers(frame: &mut Frame<'_>, header: &str, devices: &[DeviceSnapshot], offset: usize) {
+    let areas = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(4),
+        Constraint::Length(2),
+    ])
+    .split(frame.area());
+    frame.render_widget(
+        Paragraph::new(header)
+            .block(Block::bordered().title("Pickaxe · BCH ASIC mining · Workers"))
+            .wrap(Wrap { trim: false }),
+        areas[0],
+    );
+    let rate = |value: Option<f64>| {
+        value
+            .map(crate::telemetry::format_hash_rate)
+            .unwrap_or_else(|| "Measuring".into())
+    };
+    let rows = devices.iter().skip(offset).map(|device| {
+        let total = device.accepted + device.rejected;
+        Row::new(vec![
+            device.label.clone(),
+            if device.connected {
+                "Online"
+            } else {
+                "Offline"
+            }
+            .to_owned(),
+            rate(device.hashrate_estimate),
+            rate(device.hashrate_hour),
+            device.accepted.to_string(),
+            device.rejected.to_string(),
+            if total == 0 {
+                "—".to_owned()
+            } else {
+                format!("{:.2}%", device.rejected as f64 * 100.0 / total as f64)
+            },
+            ago(device.last_share_seconds),
+            format_difficulty(device.difficulty),
+            device.protocol.to_owned(),
+            device
+                .adapter_error
+                .or(device.connection_error)
+                .or(device.last_rejection)
+                .unwrap_or("—")
+                .to_owned(),
+        ])
+    });
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(20),
+                Constraint::Length(7),
+                Constraint::Length(11),
+                Constraint::Length(11),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(4),
+                Constraint::Min(10),
+            ],
+        )
+        .header(
+            Row::new([
+                "Worker",
+                "Status",
+                "Now (5m)",
+                "1 hour",
+                "Accepted",
+                "Rejected",
+                "Reject",
+                "Last share",
+                "Difficulty",
+                "Via",
+                "Last issue",
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .block(Block::bordered().title(format!(
+            "Workers · {} · {} onward",
+            devices.len(),
+            if devices.is_empty() { 0 } else { offset + 1 }
+        ))),
+        areas[1],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · a  Advanced settings · q  Stop server\nRates come from validated shares: 30s warm-up, then up to 5 minutes and up to 1 hour.",
+        ),
+        areas[2],
+    );
 }
 
 fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), String> {
@@ -458,6 +607,56 @@ mod tests {
         fs::write(&path, b"broken config").unwrap();
         assert!(save_donation(&path, BchDonation::default()).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"broken config");
+    }
+
+    #[test]
+    fn workers_page_lists_each_worker_like_a_pool() {
+        use super::super::telemetry::{Devices, ShareEvent};
+        use ratatui::{backend::TestBackend, Terminal};
+        let start = Instant::now();
+        let mut devices = Devices::default();
+        let first = devices.connect("127.0.0.1:1000".parse().unwrap(), true, start);
+        let mut target = [0xff; 32];
+        target[26..32].fill(0);
+        for second in 1..=40 {
+            devices.share(
+                first,
+                ShareEvent::Accepted(target),
+                false,
+                start + Duration::from_secs(second),
+            );
+        }
+        devices.share(first, ShareEvent::Rejected("stale job"), true, start);
+        let rows = devices.snapshots(start + Duration::from_secs(45));
+        let mut terminal = Terminal::new(TestBackend::new(150, 20)).unwrap();
+        terminal
+            .draw(|f| render_workers(f, "Chipnet · Node Ready · 1 of 1 workers online", &rows, 0))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for column in [
+            "Worker",
+            "Now (5m)",
+            "1 hour",
+            "Reject",
+            "Last share",
+            "Difficulty",
+        ] {
+            assert!(text.contains(column), "{column}");
+        }
+        assert!(text.contains(&rows[0].label));
+        assert!(text.contains("2.44%"));
+        assert!(text.contains("5s ago"));
+        assert!(text.contains("Tab  Overview"));
+        assert_eq!(format_difficulty(Some(4096.0)), "4.10K");
+        assert_eq!(format_difficulty(Some(512.0)), "512");
+        assert_eq!(format_difficulty(None), "—");
+        assert_eq!(ago(Some(250)), "4m ago");
     }
 
     #[test]

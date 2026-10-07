@@ -13,6 +13,8 @@ use std::{
 };
 
 const WINDOW: u64 = 300;
+/// The longer window, kept in one-minute buckets.
+const HOUR: u64 = 3600;
 const WARMUP: u64 = 30;
 const RECENT_CLOSED: usize = 64;
 
@@ -38,6 +40,10 @@ pub struct DeviceSnapshot {
     pub adapter_rejected: u64,
     pub last_rejection: Option<&'static str>,
     pub hashrate_estimate: Option<f64>,
+    /// The same estimate over up to an hour.
+    pub hashrate_hour: Option<f64>,
+    /// Difficulty of the last accepted share's target.
+    pub difficulty: Option<f64>,
     pub estimate_seconds: f64,
     pub last_share_seconds: Option<u64>,
     pub connection_error: Option<&'static str>,
@@ -58,6 +64,9 @@ struct Device {
     last_share: Option<Instant>,
     // At most one aggregate per second, independent of incoming share rate.
     work: VecDeque<(u64, f64)>,
+    // At most one aggregate per minute, for the hour estimate.
+    hour: VecDeque<(u64, f64)>,
+    difficulty: Option<f64>,
     connection_error: Option<&'static str>,
     adapter_error: Option<&'static str>,
 }
@@ -117,6 +126,8 @@ impl Devices {
                 last_rejection: None,
                 last_share: None,
                 work: VecDeque::new(),
+                hour: VecDeque::new(),
+                difficulty: None,
                 connection_error: None,
                 adapter_error: None,
             },
@@ -153,6 +164,20 @@ impl Devices {
                 } else {
                     row.work.push_back((second, hashes));
                 }
+                let minute = second / 60;
+                while row
+                    .hour
+                    .front()
+                    .is_some_and(|(m, _)| (m + 1) * 60 + HOUR <= second)
+                {
+                    row.hour.pop_front();
+                }
+                if let Some((_, total)) = row.hour.back_mut().filter(|(m, _)| *m == minute) {
+                    *total += hashes;
+                } else {
+                    row.hour.push_back((minute, hashes));
+                }
+                row.difficulty = Some(hashes / 2f64.powi(32));
             }
             ShareEvent::Rejected(reason) => {
                 row.rejected = row.rejected.saturating_add(1);
@@ -207,6 +232,13 @@ impl Devices {
                     .filter(|(t, _)| t.saturating_add(WINDOW) > second)
                     .map(|(_, w)| w)
                     .sum();
+                let hour_seconds = elapsed.as_secs_f64().min(HOUR as f64);
+                let hour_work: f64 = row
+                    .hour
+                    .iter()
+                    .filter(|(m, _)| (m + 1) * 60 + HOUR > second)
+                    .map(|(_, w)| w)
+                    .sum();
                 DeviceSnapshot {
                     label: row.label.clone(),
                     protocol: row.protocol,
@@ -223,6 +255,14 @@ impl Devices {
                     } else {
                         None
                     },
+                    hashrate_hour: if row.ended.is_some() {
+                        Some(0.0)
+                    } else if elapsed >= Duration::from_secs(WARMUP) {
+                        Some(hour_work / hour_seconds)
+                    } else {
+                        None
+                    },
+                    difficulty: row.difficulty,
                     estimate_seconds: seconds,
                     last_share_seconds: row
                         .last_share
@@ -324,6 +364,40 @@ mod tests {
             devices.snapshots(start + Duration::from_secs(332))[0].hashrate_estimate,
             Some(2000.0 / 300.0)
         );
+    }
+
+    #[test]
+    fn hour_estimate_spans_an_hour_and_difficulty_follows_the_last_share() {
+        let start = Instant::now();
+        let mut devices = Devices::default();
+        let id = devices.connect("127.0.0.1:1234".parse().unwrap(), false, start);
+        // One share every minute for an hour.
+        let mut target = [0xff; 32];
+        target[28..32].fill(0);
+        for minute in 0..60 {
+            devices.share(
+                id,
+                ShareEvent::Accepted(target),
+                false,
+                start + Duration::from_secs(minute * 60 + 30),
+            );
+        }
+        let row = devices
+            .snapshots(start + Duration::from_secs(3600))
+            .remove(0);
+        let per_share = expected_hashes(&target);
+        let hour = row.hashrate_hour.unwrap();
+        assert!((hour - 60.0 * per_share / 3600.0).abs() < 1e-6 * hour);
+        // The five-minute window holds only the last five shares.
+        let five = row.hashrate_estimate.unwrap();
+        assert!((five - 5.0 * per_share / 300.0).abs() < 1e-6 * five);
+        assert!((row.difficulty.unwrap() - per_share / 2f64.powi(32)).abs() < 1e-9);
+        // Buckets older than an hour leave the hour estimate.
+        let later = devices
+            .snapshots(start + Duration::from_secs(3600 + 1800))
+            .remove(0);
+        assert!(later.hashrate_hour.unwrap() < hour);
+        assert!(devices.rows[&id].hour.len() <= 61);
     }
 
     #[test]
