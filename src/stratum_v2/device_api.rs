@@ -2,18 +2,22 @@
 //! Read-only device reports for the workers table: what the miner itself says
 //! about its hash rate, temperature and fans. Only standard read commands are
 //! sent (CGMiner API `summary` and `estats` on port 4028; Bitaxe's
-//! `/api/system/info`); nothing here changes a device setting.
+//! `/api/system/info`); nothing here changes a device setting. Only devices
+//! on the local network are asked, and each device gets one time limit for
+//! its whole report so a slow one cannot hold up the others or shutdown.
 
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{IpAddr, SocketAddr, TcpStream},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-const TIMEOUT: Duration = Duration::from_millis(1500);
-const MAX_REPLY: u64 = 256 * 1024;
+/// Time allowed for one device's whole report: connecting, asking, reading.
+const DEADLINE: Duration = Duration::from_secs(3);
+const CONNECT: Duration = Duration::from_millis(1500);
+const MAX_REPLY: usize = 256 * 1024;
 
 /// What a device reports about itself.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -32,36 +36,107 @@ impl DeviceReport {
     }
 }
 
+/// Whether a device at this address may be asked for its report: private,
+/// link-local and shared (100.64.0.0/10, used by Tailscale) IPv4 ranges, and
+/// IPv6 unique-local and link-local ranges. Loopback is the SV1 adapter's own
+/// link. Public addresses are never asked: a miner reaching the server over
+/// the internet shows its router's address, not the miner's.
+pub fn queryable(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => {
+            let [first, second, ..] = ip.octets();
+            ip.is_private() || ip.is_link_local() || (first == 100 && second & 0xc0 == 0x40)
+        }
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+
 /// Asks a device on the local network for its own report: first the CGMiner
 /// API used by Avalon and most SHA-256 miners, then Bitaxe's web API.
 pub fn poll(ip: IpAddr) -> Option<DeviceReport> {
-    cgminer(ip).or_else(|| bitaxe(ip))
+    if !queryable(ip) {
+        return None;
+    }
+    let ip = ip.to_canonical();
+    let deadline = Instant::now() + DEADLINE;
+    cgminer(ip, deadline).or_else(|| bitaxe(ip, deadline))
 }
 
-fn exchange(address: SocketAddr, request: &[u8]) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&address, TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(TIMEOUT)).ok()?;
+/// Sends one request and reads until `complete` accepts the reply, the device
+/// closes the connection, or the deadline passes.
+fn exchange(
+    address: SocketAddr,
+    request: &[u8],
+    deadline: Instant,
+    complete: fn(&[u8]) -> bool,
+) -> Option<String> {
+    let left = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+    };
+    let mut stream = TcpStream::connect_timeout(&address, left()?.min(CONNECT)).ok()?;
+    stream.set_write_timeout(Some(left()?)).ok()?;
     stream.write_all(request).ok()?;
     let mut reply = Vec::new();
-    stream.take(MAX_REPLY).read_to_end(&mut reply).ok()?;
+    let mut chunk = [0; 4096];
+    while !complete(&reply) {
+        stream.set_read_timeout(Some(left()?)).ok()?;
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                reply.extend_from_slice(&chunk[..read]);
+                if reply.len() > MAX_REPLY {
+                    return None;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => (),
+            Err(_) => return None,
+        }
+    }
     Some(String::from_utf8_lossy(&reply).into_owned())
 }
 
-fn cgminer(ip: IpAddr) -> Option<DeviceReport> {
+fn cgminer(ip: IpAddr, deadline: Instant) -> Option<DeviceReport> {
+    // Each CGMiner API reply ends in a NUL byte.
     let reply = exchange(
         SocketAddr::new(ip, 4028),
         br#"{"command":"summary+estats"}"#,
+        deadline,
+        |reply| reply.contains(&0),
     )?;
     parse_cgminer(&reply)
 }
 
-fn bitaxe(ip: IpAddr) -> Option<DeviceReport> {
+fn bitaxe(ip: IpAddr, deadline: Instant) -> Option<DeviceReport> {
+    let host = match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
     let request =
-        format!("GET /api/system/info HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n");
-    let reply = exchange(SocketAddr::new(ip, 80), request.as_bytes())?;
+        format!("GET /api/system/info HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let reply = exchange(
+        SocketAddr::new(ip, 80),
+        request.as_bytes(),
+        deadline,
+        http_complete,
+    )?;
     let body = reply.split_once("\r\n\r\n")?.1;
     parse_bitaxe(body)
+}
+
+/// An HTTP reply is whole once its headers and its `Content-Length` body
+/// arrived; without that header, the device closing the connection ends it.
+fn http_complete(reply: &[u8]) -> bool {
+    let Some(end) = reply.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    String::from_utf8_lossy(&reply[..end])
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, length)| length.trim().parse::<usize>().ok())
+        .is_some_and(|length| reply.len() >= end + 4 + length)
 }
 
 /// Reads a CGMiner API reply: hash rate from `summary`, temperatures and fans
@@ -210,5 +285,92 @@ mod tests {
         // A key is matched whole: "MaxTemp" is not "Temp".
         assert_eq!(bracket_number("MaxTemp[90] Temp[50]", "Temp"), Some(50.0));
         assert_eq!(bracket_value("FanR[42%]", "FanR"), Some("42%"));
+    }
+
+    #[test]
+    fn only_local_network_addresses_are_asked() {
+        for local in [
+            "192.168.1.20",
+            "10.0.0.2",
+            "172.16.5.4",
+            "172.31.255.1",
+            "169.254.3.3",
+            "100.64.0.7",
+            "100.127.255.1",
+            "fd12::5",
+            "fe80::1",
+            "::ffff:192.168.1.20",
+        ] {
+            assert!(queryable(local.parse().unwrap()), "{local}");
+        }
+        for other in [
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+            "192.0.2.9",
+            "127.0.0.1",
+            "0.0.0.0",
+            "::1",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(!queryable(other.parse().unwrap()), "{other}");
+        }
+        // Refused before any connection is attempted.
+        assert_eq!(poll("8.8.8.8".parse().unwrap()), None);
+    }
+
+    /// A device stand-in on loopback: writes `reply` one piece at a time,
+    /// `pause` apart, then holds the connection open.
+    fn device(reply: &'static [&'static [u8]], pause: Duration) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                for piece in reply {
+                    std::thread::sleep(pause);
+                    if stream.write_all(piece).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+        address
+    }
+
+    #[test]
+    fn whole_replies_return_without_waiting_for_the_device_to_close() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(8);
+        let cgminer = device(&[br#"{"SUMMARY":[{"MHS av":1.0}]}"#, b"\0"], Duration::ZERO);
+        let reply = exchange(cgminer, b"{}", deadline, |reply| reply.contains(&0)).unwrap();
+        assert!(parse_cgminer(&reply).is_some());
+        let http = device(
+            &[
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n",
+                br#"{"temp":51.5}"#,
+            ],
+            Duration::ZERO,
+        );
+        let reply = exchange(http, b"GET / HTTP/1.0\r\n\r\n", deadline, http_complete).unwrap();
+        let body = reply.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(parse_bitaxe(body).unwrap().temperature_c, Some(51.5));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn silent_or_trickling_devices_end_at_the_deadline() {
+        let silent = device(&[], Duration::ZERO);
+        let trickling = device(&[b" " as &[u8]; 100], Duration::from_millis(50));
+        for address in [silent, trickling] {
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(400);
+            assert_eq!(
+                exchange(address, b"{}", deadline, |reply| reply.contains(&0)),
+                None
+            );
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
     }
 }

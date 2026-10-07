@@ -146,10 +146,11 @@ impl Devices {
         id
     }
 
-    /// Records where a device can be asked for its own report. Loopback is
-    /// ignored: it is the SV1 adapter's link, not the device.
+    /// Records where a device can be asked for its own report. Only local
+    /// network addresses are kept: loopback is the SV1 adapter's link, and a
+    /// public address belongs to a router, not the device.
     pub fn set_address(&mut self, id: u64, ip: IpAddr) {
-        if !ip.is_loopback() && self.rows.contains_key(&id) {
+        if super::device_api::queryable(ip) && self.rows.contains_key(&id) {
             self.addresses.insert(id, ip);
         }
     }
@@ -498,12 +499,11 @@ mod tests {
         let id = devices.connect("127.0.0.1:5000".parse().unwrap(), true, now);
         // The adapter's loopback link is not the device.
         devices.set_address(id, "127.0.0.1".parse().unwrap());
+        // A public address is the router's, never asked.
+        devices.set_address(id, "203.0.113.5".parse().unwrap());
         assert!(devices.addresses().is_empty());
-        devices.set_address(id, "192.0.2.9".parse().unwrap());
-        assert_eq!(
-            devices.addresses(),
-            vec![(id, "192.0.2.9".parse().unwrap())]
-        );
+        devices.set_address(id, "10.9.8.7".parse().unwrap());
+        assert_eq!(devices.addresses(), vec![(id, "10.9.8.7".parse().unwrap())]);
         devices.set_report(
             id,
             Some(DeviceReport {
@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(row.temperature_c, Some(61.0));
         assert_eq!(row.fan.as_deref(), Some("40%"));
         let json = serde_json::to_string(&devices.snapshots(now)).unwrap();
-        assert!(!json.contains("192.0.2.9"));
+        assert!(!json.contains("10.9.8.7"));
         devices.close(id, true, None, now);
         assert!(devices.addresses().is_empty());
     }
