@@ -3046,8 +3046,8 @@ fn run_supervisor(
             search.snapshot().winners,
         ) {
             // Stop new launches as soon as a host-verified GPU winner is
-            // queued. Any batch already in flight is allowed to finish before
-            // the authoritative live-state check below.
+            // queued. Batches other GPUs still have in flight finish in the
+            // background; the claim does not wait for them.
             winner_refresh_pending = true;
             pending_winners = 1;
             let _ = search.apply_control(SearchCommand::Pause);
@@ -3064,15 +3064,11 @@ fn run_supervisor(
         if stop {
             break;
         }
-        let force_winner_refresh = winner_refresh_ready(
-            winner_refresh_pending,
-            search.batch_in_flight(),
-            session.is_some(),
-        );
+        let force_winner_refresh = winner_refresh_ready(winner_refresh_pending, session.is_some());
         if force_winner_refresh {
-            // The worker is now at a safe boundary. Run the existing
-            // authoritative refresh immediately rather than waiting for the
-            // next 500 ms periodic deadline.
+            // The winning GPU's batch has ended, since a winner is queued only
+            // after its batch. Run the existing authoritative refresh
+            // immediately rather than waiting for the next 500 ms deadline.
             next_state_refresh = Instant::now();
         }
         if session.is_none() {
@@ -3521,7 +3517,9 @@ fn run_supervisor(
                             );
 
                             if force_winner_refresh {
-                                for winner in search.drain_winners() {
+                                let drained = search.drain_winners();
+                                let drained_count = drained.len();
+                                for winner in drained {
                                     if winner_matches_live(&winner, cfg.generation_id, &live) {
                                         verified_winners = verified_winners.saturating_add(1);
                                         pending_winners = 1;
@@ -3577,10 +3575,8 @@ fn run_supervisor(
                                         );
                                     }
                                 }
-                                // The worker pauses after a verified winning
-                                // batch, so this snapshot acknowledges every
-                                // bounded winner queued through that boundary.
-                                observed_search_winners = search.snapshot().winners;
+                                observed_search_winners =
+                                    acknowledge_drained(observed_search_winners, drained_count);
                                 winner_refresh_pending = false;
                                 if pending_winner.is_none() && pending_submission.is_none() {
                                     pending_winners = 0;
@@ -4142,14 +4138,29 @@ fn winner_matches_live(winner: &VerifiedWinner, generation_id: u64, live: &LiveJ
         && winner.baton_vout == live.baton_vout
 }
 
+// #### PR #35: claim a winner without waiting for other GPUs ####
+// What: once a GPU queues a host-verified winner, the claim starts at once.
+// It no longer waits until every GPU has finished its current batch, and a
+// drain acknowledges exactly the winners it took from the queue.
+// Why: with several GPUs the claim waited for the slowest GPU's batch (up to
+// about 350 ms on wgpu) before it could be broadcast.
+// Safe because: a winner is queued only after its own batch ends, so the
+// winning work is complete; the shared pause stops every other GPU at its next
+// boundary. Counting drained winners, not a counter snapshot, keeps a winner
+// that another GPU queues during the claim from being acknowledged unseen: it
+// raises the counter above the acknowledged count and triggers its own check.
+// Check: `stale_winners` or a winner that is found but never claimed on a rig.
 /// Reports whether a pending winner can be reconciled with fresh state.
-fn winner_refresh_ready(
-    winner_refresh_pending: bool,
-    batch_in_flight: bool,
-    session_connected: bool,
-) -> bool {
-    winner_refresh_pending && !batch_in_flight && session_connected
+fn winner_refresh_ready(winner_refresh_pending: bool, session_connected: bool) -> bool {
+    winner_refresh_pending && session_connected
 }
+
+/// The winner count acknowledged after a drain: exactly the winners taken
+/// from the queue.
+fn acknowledge_drained(observed: u64, drained: usize) -> u64 {
+    observed.saturating_add(drained as u64)
+}
+// #### end PR #35 ####
 
 /// Checks whether winner recovery needs an immediate job refresh.
 fn should_begin_winner_refresh(
@@ -6217,11 +6228,39 @@ mod tests {
         assert!(!should_begin_winner_refresh(true, false, false, 0, 1));
         assert!(!should_begin_winner_refresh(false, true, false, 0, 1));
         assert!(!should_begin_winner_refresh(false, false, true, 0, 1));
-        assert!(!winner_refresh_ready(false, false, true));
-        assert!(!winner_refresh_ready(true, true, true));
-        assert!(!winner_refresh_ready(true, false, false));
-        assert!(winner_refresh_ready(true, false, true));
+        assert!(!winner_refresh_ready(false, true));
+        assert!(!winner_refresh_ready(true, false));
+        assert!(winner_refresh_ready(true, true));
     }
+
+    // #### PR #35 test: a claim does not wait for other GPUs ####
+    #[test]
+    fn a_winner_another_gpu_queues_during_a_claim_gets_its_own_check() {
+        // Five winners handled so far; the claim drains one, while a second
+        // GPU queues another winner, so the counter reads seven.
+        let observed = acknowledge_drained(5, 1);
+        assert_eq!(observed, 6);
+        assert!(should_begin_winner_refresh(
+            false, false, false, observed, 7
+        ));
+        // Once that winner is drained too, nothing is left to check.
+        assert!(!should_begin_winner_refresh(
+            false,
+            false,
+            false,
+            acknowledge_drained(observed, 1),
+            7
+        ));
+        // A drain can run before the counter increments; it never re-triggers.
+        assert!(!should_begin_winner_refresh(
+            false,
+            false,
+            false,
+            acknowledge_drained(0, 1),
+            0
+        ));
+    }
+    // #### end PR #35 test ####
 
     #[test]
     /// Checks that submission retry never rebroadcasts parent after it is known.
