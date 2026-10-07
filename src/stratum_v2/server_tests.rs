@@ -387,3 +387,167 @@ fn share_acknowledgement_does_not_claim_node_block_acceptance() {
     assert_eq!(server.node.lock().unwrap().height, 325908);
     device.sender.close();
 }
+
+struct FirmwareAdapter {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<Result<(), String>>>,
+    address: SocketAddr,
+}
+impl FirmwareAdapter {
+    fn new(server: &Running) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = server.stop.clone();
+        let upstream = server.address;
+        let authority = server.authority;
+        let thread = {
+            let stop = stop.clone();
+            thread::spawn(move || super::sv1::run(listener, upstream, authority, stop))
+        };
+        Self {
+            stop,
+            thread: Some(thread),
+            address,
+        }
+    }
+}
+impl Drop for FirmwareAdapter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            if !thread::panicking() {
+                assert!(matches!(result, Ok(Ok(()))));
+            }
+        }
+    }
+}
+
+struct FirmwareDevice {
+    write: TcpStream,
+    read: std::io::BufReader<TcpStream>,
+    prefix: Vec<u8>,
+}
+impl FirmwareDevice {
+    fn connect(adapter: &FirmwareAdapter, rolling: bool, authorize_first: bool) -> Self {
+        let write = TcpStream::connect(adapter.address).unwrap();
+        write
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let read = std::io::BufReader::new(write.try_clone().unwrap());
+        let mut device = Self {
+            write,
+            read,
+            prefix: Vec::new(),
+        };
+        if rolling {
+            device.send(json!({"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":2}]}));
+            let configured = device.receive();
+            assert_eq!(configured["result"]["version-rolling"], true);
+            assert_eq!(configured["result"]["version-rolling.mask"], "1fffe000");
+        }
+        let authorize = json!({"id":3,"method":"mining.authorize","params":["cpu.worker"]});
+        if authorize_first {
+            device.send(authorize.clone());
+            assert_eq!(device.receive()["result"], true);
+        }
+        device
+            .send(json!({"id":2,"method":"mining.subscribe","params":["CPU firmware experiment"]}));
+        let subscribed = device.receive();
+        assert_eq!(subscribed["result"][2], 8);
+        device.prefix = hex::decode(subscribed["result"][1].as_str().unwrap()).unwrap();
+        assert_eq!(device.prefix.len(), 16);
+        if !authorize_first {
+            device.send(authorize);
+            assert_eq!(device.receive()["result"], true);
+        }
+        device
+    }
+    fn send(&mut self, value: Value) {
+        use std::io::Write;
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        self.write.write_all(&bytes).unwrap();
+    }
+    fn receive(&mut self) -> Value {
+        use std::io::BufRead;
+        let mut line = String::new();
+        self.read.read_line(&mut line).unwrap();
+        assert!(!line.is_empty(), "firmware connection closed");
+        serde_json::from_str(&line).unwrap()
+    }
+    fn solve(&mut self, id: u32, rolling: bool) -> (String, Value) {
+        let difficulty = self.receive();
+        assert_eq!(difficulty["method"], "mining.set_difficulty");
+        assert!(difficulty["params"][0].as_f64().unwrap() > 0.0);
+        let notify = self.receive();
+        assert_eq!(notify["method"], "mining.notify");
+        let fields = notify["params"].as_array().unwrap();
+        let extra = [id as u8; 8];
+        let mut coinbase = hex::decode(fields[2].as_str().unwrap()).unwrap();
+        coinbase.extend(&self.prefix);
+        coinbase.extend(extra);
+        coinbase.extend(hex::decode(fields[3].as_str().unwrap()).unwrap());
+        let mut root = sha256d::Hash::hash(&coinbase).to_byte_array();
+        for sibling in fields[4].as_array().unwrap() {
+            let mut joined = root.to_vec();
+            joined.extend(hex::decode(sibling.as_str().unwrap()).unwrap());
+            root = sha256d::Hash::hash(&joined).to_byte_array();
+        }
+        let version = u32::from_str_radix(fields[5].as_str().unwrap(), 16).unwrap();
+        let version = if rolling { version ^ 0x2000 } else { version };
+        let mut header = version.to_le_bytes().to_vec();
+        let mut previous = hex::decode(fields[1].as_str().unwrap()).unwrap();
+        for word in previous.as_chunks_mut::<4>().0 {
+            word.reverse();
+        }
+        header.extend(previous);
+        header.extend(root);
+        let time = u32::from_str_radix(fields[7].as_str().unwrap(), 16).unwrap();
+        header.extend(time.to_le_bytes());
+        let bits = u32::from_str_radix(fields[6].as_str().unwrap(), 16).unwrap();
+        header.extend(bits.to_le_bytes());
+        header.extend(0u32.to_le_bytes());
+        let mut header: Header = consensus::deserialize(&header).unwrap();
+        let nonce = (0..10_000)
+            .find(|n| {
+                header.nonce = *n;
+                header.validate_pow(header.target()).is_ok()
+            })
+            .unwrap();
+        let mut params = vec![
+            json!("cpu.worker"),
+            fields[0].clone(),
+            json!(hex::encode(extra)),
+            json!(format!("{time:08x}")),
+            json!(format!("{nonce:08x}")),
+        ];
+        if rolling {
+            params.push(json!(format!("{:08x}", version & 0x1fffe000)));
+        }
+        let submit = json!({"id":id+10,"method":"mining.submit","params":params});
+        (header.block_hash().to_string(), submit)
+    }
+}
+
+#[test]
+fn sv1_cpu_firmware_mines_through_noise_and_receives_successor_jobs() {
+    for (rolling, authorize_first) in [(false, true), (true, false)] {
+        let server = Running::new(false);
+        let adapter = FirmwareAdapter::new(&server);
+        let mut device = FirmwareDevice::connect(&adapter, rolling, authorize_first);
+        for round in 0..2 {
+            let (hash, submit) = device.solve(round, rolling);
+            device.send(submit);
+            let ack = device.receive();
+            assert_eq!(ack["id"], round + 10);
+            assert_eq!(ack["result"], true);
+            assert!(ack["error"].is_null());
+            server.wait(|stats| stats.blocks_accepted == u64::from(round) + 1);
+            assert_eq!(server.node.lock().unwrap().tip, hash);
+        }
+        assert_eq!(server.stats.lock().unwrap().shares_rejected, 0);
+        assert_eq!(server.stats.lock().unwrap().connections, 1);
+        device.write.shutdown(std::net::Shutdown::Both).unwrap();
+    }
+}

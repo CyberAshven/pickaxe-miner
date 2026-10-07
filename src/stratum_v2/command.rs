@@ -43,7 +43,7 @@ pub fn run(
             .map_err(|_| "a valid payout for the selected network is required")?;
     }
     let (rpc, template) = preflight(config)?;
-    let StratumV2Command::Serve { listen } = action else {
+    let StratumV2Command::Serve { listen, sv1_listen } = action else {
         println!(
             "{}",
             serde_json::json!({
@@ -55,6 +55,18 @@ pub fn run(
         return Ok(());
     };
     let listener = TcpListener::bind(listen).map_err(|_| "cannot bind mining listener")?;
+    let bound = listener
+        .local_addr()
+        .map_err(|_| "cannot read mining listener")?;
+    let sv1_listener = sv1_listen
+        .map(TcpListener::bind)
+        .transpose()
+        .map_err(|_| "cannot bind SV1 listener")?;
+    let sv1_bound = sv1_listener
+        .as_ref()
+        .map(TcpListener::local_addr)
+        .transpose()
+        .map_err(|_| "cannot read SV1 listener")?;
     let authority_secret = load_authority(&config_path.with_extension("sv2-key"))?;
     let public = server::authority_public(&authority_secret)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -80,6 +92,20 @@ pub fn run(
         let stats = stats.clone();
         thread::spawn(move || server::run(listener, rpc, settings, stop, stats))
     };
+    let firmware = sv1_listener.map(|listener| {
+        let stop = stop.clone();
+        // Wildcard listeners are dialed through local loopback, never via an
+        // arbitrary network route. The SV2 authority remains pinned.
+        let mut upstream = bound;
+        if upstream.ip().is_unspecified() {
+            upstream.set_ip(if upstream.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+        }
+        thread::spawn(move || super::sv1::run(listener, upstream, public, stop))
+    });
     // SV2 reference authority public-key encoding: version 1 (little endian),
     // 32-byte x-only key, Base58Check. Only the public key is displayed.
     let mut encoded = vec![1, 0];
@@ -89,18 +115,21 @@ pub fn run(
         if terminal.is_none() {
             println!(
                 "{}",
-                serde_json::json!({"listen":listen.to_string(),"authority":authority,"network":config.network.as_str()})
+                serde_json::json!({"listen":bound.to_string(),"sv1_listen":sv1_bound.map(|address| address.to_string()),"authority":authority,"network":config.network.as_str()})
             );
         }
         while !stop.load(Ordering::Relaxed) && !worker.is_finished() {
+            if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
+                break;
+            }
             let snapshot = stats
                 .lock()
                 .map_err(|_| "mining statistics unavailable")?
                 .clone();
             if let Some(terminal) = terminal.as_mut() {
                 let status = format!(
-                    "Network       {}\nListener      {}\nNode          {}\nHeight        {}\nDevices       {}\nShares        {} accepted / {} rejected\nBlocks        {} accepted / {} unconfirmed\nConnections   {} errors\n\nAuthority public key\n{}\n\nq  Stop mining server",
-                    config.network.as_str(), listen, if snapshot.template_ready { "Ready" } else { "Waiting for a valid template" },
+                    "Network       {}\nSV2 listener  {}\nSV1 listener  {}\nNode          {}\nHeight        {}\nDevices       {}\nShares        {} accepted / {} rejected\nBlocks        {} accepted / {} unconfirmed\nConnections   {} errors\n\nAuthority public key\n{}\n\nq  Stop mining server",
+                    config.network.as_str(), bound, sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()), if snapshot.template_ready { "Ready" } else { "Waiting for a valid template" },
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), snapshot.connections,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.blocks_accepted, snapshot.blocks_unconfirmed,
                     snapshot.connection_errors, authority,
@@ -141,10 +170,18 @@ pub fn run(
         Ok(())
     })();
     stop.store(true, Ordering::Relaxed);
+    let firmware_result = firmware
+        .map(|worker| {
+            worker
+                .join()
+                .map_err(|_| "SV1 listener stopped unexpectedly".to_owned())
+                .and_then(|r| r)
+        })
+        .unwrap_or(Ok(()));
     let server_result = worker
         .join()
         .map_err(|_| "mining server stopped unexpectedly")?;
-    result.and(server_result)
+    result.and(server_result).and(firmware_result)
 }
 
 fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), String> {

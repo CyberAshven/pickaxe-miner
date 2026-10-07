@@ -28,6 +28,7 @@ pub struct MiningSession {
     setup_flags: Option<u32>,
     next_channel: u32,
     pub channels: BTreeMap<u32, Channel>,
+    maximum_targets: BTreeMap<u32, Hash>,
     current: Option<(u32, u64, Arc<BchTemplate>)>,
     pub accepted: u64,
     pub rejected: u64,
@@ -58,6 +59,7 @@ impl MiningSession {
             setup_flags: None,
             next_channel: 0,
             channels: BTreeMap::new(),
+            maximum_targets: BTreeMap::new(),
             current: None,
             accepted: 0,
             rejected: 0,
@@ -73,6 +75,22 @@ impl MiningSession {
         self.current = Some((id, generation, template.clone()));
         let mut frames = Vec::new();
         for channel in self.channels.values_mut() {
+            // Chipnet can have easier block work than a normal ASIC share.
+            // Never ask firmware to discard headers that could win a block.
+            if !meets_target(&template.target, &channel.target) {
+                let maximum = self
+                    .maximum_targets
+                    .get(&channel.id)
+                    .ok_or("channel target missing")?;
+                if !meets_target(&template.target, maximum) {
+                    return Err("device maximum target would discard valid block work".into());
+                }
+                channel.target = template.target;
+                frames.push(mining(Mining::SetTarget(SetTarget {
+                    channel_id: channel.id,
+                    maximum_target: (&channel.target).into(),
+                }))?);
+            }
             channel.install(id, generation, template.clone())?;
             frames.extend(job_frames(channel)?);
         }
@@ -215,13 +233,16 @@ impl MiningSession {
                         if !meets_target(&channel.target, &maximum) {
                             return Err("max-target-out-of-range");
                         }
-                        Ok(channel.target)
+                        Ok((channel.target, maximum))
                     });
                 frames.push(match result {
-                    Ok(target) => mining(Mining::SetTarget(SetTarget {
-                        channel_id: request.channel_id,
-                        maximum_target: (&target).into(),
-                    }))?,
+                    Ok((target, maximum)) => {
+                        self.maximum_targets.insert(request.channel_id, maximum);
+                        mining(Mining::SetTarget(SetTarget {
+                            channel_id: request.channel_id,
+                            maximum_target: (&target).into(),
+                        }))?
+                    }
                     Err(code) => mining(Mining::UpdateChannelError(UpdateChannelError {
                         channel_id: request.channel_id,
                         error_code: code.try_into().unwrap(),
@@ -230,6 +251,7 @@ impl MiningSession {
             }
             Mining::CloseChannel(request) => {
                 self.channels.remove(&request.channel_id);
+                self.maximum_targets.remove(&request.channel_id);
             }
             _ => return Err("unsupported downstream mining message".into()),
         }
@@ -260,9 +282,18 @@ impl MiningSession {
         if let Some(code) = error {
             return Ok(vec![open_error(request, code)?]);
         }
+        let (_, _, template) = self.current.as_ref().unwrap();
+        if !meets_target(&template.target, &maximum) {
+            return Ok(vec![open_error(request, "max-target-out-of-range")?]);
+        }
         self.next_channel += 1;
-        let target = if meets_target(&self.share_target, &maximum) {
+        let desired = if meets_target(&self.share_target, &template.target) {
+            template.target
+        } else {
             self.share_target
+        };
+        let target = if meets_target(&desired, &maximum) {
+            desired
         } else {
             maximum
         };
@@ -299,6 +330,7 @@ impl MiningSession {
         }];
         frames.extend(job_frames(&channel)?);
         self.channels.insert(channel.id, channel);
+        self.maximum_targets.insert(self.next_channel, maximum);
         Ok(frames)
     }
 
@@ -573,6 +605,47 @@ mod tests {
         .unwrap();
         assert_eq!(
             server.receive(extended, 1700000010).unwrap().frames[0]
+                .header()
+                .msg_type(),
+            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR
+        );
+    }
+
+    #[test]
+    fn easy_network_work_is_not_discarded_by_asic_share_difficulty() {
+        let mut server = session();
+        server.share_target = super::super::template::compact_target(0x1b0ffff0).unwrap();
+        server.receive(setup(5), 1700000010).unwrap();
+        let mut replies = server.receive(open(), 1700000010).unwrap().frames;
+        let opened: OpenStandardMiningChannelSuccess =
+            binary_sv2::from_bytes(replies[0].payload()).unwrap();
+        let initial = server.current.as_ref().unwrap().2.target;
+        assert_eq!(opened.target.as_ref(), initial);
+        let id = opened.channel_id;
+        // The next template becomes easier; notify target before publishing work.
+        let mut template = (*server.current.as_ref().unwrap().2).clone();
+        template.target = [254; 32];
+        let replies = server.set_job(11, 4, Arc::new(template.clone())).unwrap();
+        assert_eq!(replies[0].header().msg_type(), MESSAGE_TYPE_SET_TARGET);
+        assert_eq!(server.channels[&id].target, template.target);
+        // A firmware target ceiling cannot silently hide a later network win.
+        server.maximum_targets.insert(id, initial);
+        template.target = [255; 32];
+        assert!(server.set_job(12, 5, Arc::new(template)).is_err());
+
+        let mut server = session();
+        server.receive(setup(5), 1700000010).unwrap();
+        let request = mining(Mining::OpenStandardMiningChannel(
+            OpenStandardMiningChannel {
+                request_id: 2,
+                user_identity: "device".try_into().unwrap(),
+                nominal_hash_rate: 1e12,
+                max_target: (&[1; 32]).into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            server.receive(request, 1700000010).unwrap().frames[0]
                 .header()
                 .msg_type(),
             MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR

@@ -105,6 +105,9 @@ pub enum StratumV2Command {
         /// Listener address. Use a LAN address to connect an external ASIC.
         #[arg(long, default_value = "127.0.0.1:3336")]
         listen: std::net::SocketAddr,
+        /// Optional plain SV1 endpoint for ASIC firmware on a trusted LAN.
+        #[arg(long)]
+        sv1_listen: Option<std::net::SocketAddr>,
     },
 }
 

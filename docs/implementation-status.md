@@ -25,7 +25,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests pass; upstream CPU device and ASIC pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle and local CPU device pass; upstream/ASIC pending |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Fixture acceptance/rejection distinguished; live proof and durable retry pending |
-| S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Pending |
+| S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter and CPU firmware TCP experiments pass; physical firmware pending |
 | S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Aggregate dashboard added; per-device rate/vardiff and live validation pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
@@ -84,7 +84,7 @@ accepted Chipnet block or propagation result is claimed. No credentials,
 host details, payout addresses or local helper files are included here.
 
 Known limits: the CLI uses a single selected full-template source; runtime
-failover, GBT-light, native TP, block retry durability, SV1, vardiff, per-device
+failover, GBT-light, native TP, block retry durability, vardiff, per-device
 rates, distributed rigs, pool routing and BCH coinbase donation accounting are
 not complete. Existing GPU/token runtime and donation policies are preserved.
 
@@ -97,3 +97,40 @@ Local validation for this checkpoint:
 - Native SV2 debug build and `stratum-v2 serve --help` passed. A build/CLI check does not validate the terminal on an attached ASIC.
 
 Remote CI is checked on the pushed commit, independently of this local report.
+
+## SV1 firmware experiment (2026-10-07)
+
+The optional SV1 listener translates jobs and submissions through a pinned
+Noise connection to the same SV2 server. SRI supplies the JSON protocol types,
+job/difficulty conversion and extended-share conversion. The adapter retains
+the server's coinbase and configured payout. Worker authorization registers
+an identity; it is not password authentication. The plain listener is intended
+for a trusted mining LAN and is disabled unless explicitly requested.
+
+The independent CPU firmware experiment reconstructs headers from SV1 JSON,
+including the previous-hash word byte order and extranonce split. It exercises
+both subscribe/authorize orders and version rolling on/off. Each variant
+submits two solved blocks, verified independently by the node fixture, then
+receives successor work without reconnecting. This is synthetic easy-target
+testing; it is not physical ASIC or real Chipnet acceptance evidence.
+
+Boundary tests cover unauthorized/wrong workers, stale jobs, invalid extranonce
+length, version-mask negotiation, pending-request bounds, malformed/oversized
+and fragmented JSON, partial-input deadlines, and exact upstream reply mapping.
+SV1 never acknowledges a share before the shared SV2 validator does. A separate
+regression ensures share targets cannot hide easier network-valid block work,
+including when Chipnet difficulty falls between jobs.
+
+CI on `2c83810` passed the previous compiler lint failure. Its Linux dependency
+policy check exposed the `hex_lit 0.1.1` MITNFA license, pulled by reference
+Stratum dependencies. The unmodified compile-time macro's license was reviewed
+against the SPDX text and allowed for that exact crate/version only. Local
+`cargo deny check` passes advisories, bans, licenses and sources; no advisory or
+source check was disabled. The separate GitHub advanced-security review run
+failed with an account monthly-quota error, which is not a clean security result.
+
+Local SV1 checkpoint: 35 focused tests pass; the full serial host suite passes
+371 library and 16 binary tests, with 17 ignored and 34 hardware tests filtered.
+All-feature Clippy passes with warnings denied on both the existing host
+compiler and Rust 1.99 used by current CI. Formatting and `cargo deny check`
+also pass. Remote checks are required on the subsequent pushed commit.

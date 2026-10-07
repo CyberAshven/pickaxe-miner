@@ -2770,7 +2770,24 @@ dependencies = [
  "mining_sv2",
  "noise_sv2",
  "parsers_sv2",
+ "stratum_translation",
+ "sv1_api",
  "template_distribution_sv2",
+]
+
+[[package]]
+name = "stratum_translation"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98e605710f92ba5f012186a4bfe98cf4d332a4ef49dc7f549056a58bc94dc4ed"
+dependencies = [
+ "binary_sv2",
+ "bitcoin",
+ "channels_sv2",
+ "mining_sv2",
+ "serde_json",
+ "sv1_api",
+ "tracing",
 ]
 
 [[package]]
@@ -2805,6 +2822,20 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sv1_api"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "752483e742a02b5d176c5cad001e6cbcb96f32de92c1960e5d4852a6b3f4fa39"
+dependencies = [
+ "binary_sv2",
+ "bitcoin",
+ "byteorder",
+ "serde",
+ "serde_json",
+ "tracing",
+]
 
 [[package]]
 name = "syn"

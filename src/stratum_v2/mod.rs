@@ -19,6 +19,8 @@ pub mod server;
 mod server_tests;
 mod status;
 #[cfg(feature = "stratum-v2")]
+pub mod sv1;
+#[cfg(feature = "stratum-v2")]
 pub mod template;
 #[cfg(all(test, feature = "stratum-v2"))]
 mod template_tests;

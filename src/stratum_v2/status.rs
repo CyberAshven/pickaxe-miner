@@ -47,9 +47,9 @@ pub fn status_report() -> String {
          bch: CTOR={ctor} no_segwit={no_segwit} ASERT={asert} CashAddr={cashaddr} adaptive_size={adaptive}\n\
          first_network: {network}\n\
          design: {design}\n\
-         available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates)\n\
+         available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates, optional SV1 adapter)\n\
          validation: local TCP/CPU experiments; live Chipnet and ASIC validation pending\n\
-         pending: SV1 translator, vardiff/device rates, Knuth TP, distributed rigs and pool routing\n\
+         pending: physical ASIC validation, vardiff/device rates, Knuth TP, distributed rigs and pool routing\n\
          evidence: docs/implementation-status.md\n",
         feature = status.feature,
         crates = if status.reference_crates_linked {
