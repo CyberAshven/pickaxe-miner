@@ -96,7 +96,10 @@ verification, node-pinned full-block submission, and an aggregate dashboard.
 An optional SV1 listener translates older firmware through the same encrypted
 SV2 path using the reference translation library.
 The tests include a local TCP CPU miner and an independent block decoder.
-They do not establish live Chipnet, upstream CPU-device, or ASIC interoperability.
+An Avalon Nano 3 has also mined confirmed Chipnet blocks, including a header
+matched through two independent public servers. This does not establish native
+SV2 firmware compatibility or compatibility with every ASIC; see the evidence
+and remaining gates in `implementation-status.md`.
 
 Build the native application with `cargo build --locked --features stratum-v2`.
 The feature remains opt-in. No release is published by this change.
@@ -120,7 +123,8 @@ keys cause an error instead of silent identity replacement. Press `q` to stop;
 `--no-tui` provides JSON status and Ctrl+C shutdown.
 
 Use `--sv1-listen LAN-IP:3333` for SV1 firmware on your trusted mining LAN;
-configure the ASIC with `stratum+tcp://LAN-IP:3333` and a worker name. This
+configure the ASIC with `stratum+tcp://LAN-IP:3333` and a worker identity (an
+address alone is accepted; a worker suffix is optional). This
 local listener uses the server's configured payout, never an address supplied
 by the ASIC username. SV1 has no encryption or access authentication; its
 authorize method registers a worker identity, and does not validate a password.
@@ -130,7 +134,9 @@ and forwards success only after upstream share validation. Node block acceptance
 is reported separately. Jobs, pending replies, input size and setup/partial-I/O
 time are bounded. The initial adapter handles one extended channel per device
 and the server's immediate acknowledgements; it is not a general upstream pool
-translator. Physical Avalon/Antminer/Bitaxe validation is still pending.
+translator. Avalon Nano 3 has been tested; Antminer and native Bitaxe SV2
+validation remain pending. Each listener currently caps connections at 64;
+this is not a claim of 1,000-device capacity.
 
 The full-template provider checks network, synchronization, tip identity,
 CTOR, transaction bytes/IDs, header target and adaptive block size. It revokes
@@ -143,7 +149,7 @@ cannot accommodate this work is rejected. Vardiff, individual device rates, Knut
 pool routing and a durable block-submission retry journal are still pending.
 Current BCH coinbases pay the configured mining address; integrating the
 compiled BCH donation policy remains separate from existing token policies.
-Do not treat this checkpoint as a completed or live-validated ASIC product.
+The successful Chipnet experiments do not complete those remaining capabilities.
 
 The authority encoding follows the [SV2 security specification, section
 4.7](https://github.com/stratum-mining/sv2-spec/blob/main/04-Protocol-Security.md#47-url-scheme-and-pool-authority-key).

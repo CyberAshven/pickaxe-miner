@@ -20,12 +20,12 @@ Work continues on PR #38; this document does not narrow the requested scope.
 
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
-| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Real Chipnet full templates and source-node confirmed ASIC blocks pass; light/native TP and independent propagation pending |
+| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Real Chipnet full templates, confirmed ASIC blocks and independent public-server header checks pass; light/native TP pending |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending; Knuth live tests deferred, BCHN is the live-test baseline |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests pass; upstream CPU device and ASIC pending |
-| S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle and local CPU device pass; upstream/ASIC pending |
-| S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Source-node confirmed Chipnet blocks and configured payout verified; independent propagation, uncertain-outcome diagnosis and durable retry pending |
-| S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; stale-job behavior still under investigation |
+| S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local CPU device and Avalon Nano 3 pass; refresh uniqueness follow-up and upstream native SV2 device validation tracked below |
+| S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Confirmed Chipnet blocks and configured payout verified, with independent public-server header matches; uncertain-outcome diagnosis and durable retry pending |
+| S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
 | S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Aggregate dashboard added; per-device rate/vardiff and live validation pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
@@ -240,3 +240,45 @@ ignored and 34 hardware tests filtered. Rust 1.99 formatting and all-target,
 all-feature Clippy with warnings denied pass. No kernel or ASIC settings changed.
 Exact-commit CI and updated physical-firmware observations are checked separately.
 The durable block journal remains unfinished and is not included in this fix.
+
+## Physical retention validation and unique refresh work (2026-10-07)
+
+#### PR #38
+
+The Linux binary for `5972a46` (SHA256
+`3c3c9af1f4cc0d249f78f34aa6dacb03c7a94abca6f1be14baada9b83d3905f1`)
+passed real-node preflight and replaced the previous service behind the same
+ASIC endpoint. Its first 45-second passive sample saw 12 accepted responses,
+no rejects, two retained-job notifications and one clean new-parent notification.
+A later sample included a duplicate rejection; the initial clean sample is not
+a claim of zero future rejects or a controlled rejection-rate comparison.
+
+BCHN confirmed the updated service's block at height 326804 and the configured
+payout matched its coinbase. Independently fetched headers for that height from
+`chipnet.bch.ninja` and `chipnet.imaginary.cash` both hashed to the source node's
+block hash. This establishes external visibility of that block, not universal
+peer propagation. A subsequent service snapshot showed two accepted blocks,
+zero unconfirmed outcomes and zero connection errors since restart.
+
+A 120-second passive follow-up observed 29 submissions across eight same-tip
+updates: 28 accepted and one duplicate (SV1 code 22). The duplicate repeated the
+same coinbase/transaction commitment, extranonce, time, nonce and version under
+a different job ID. The server correctly rejected the repeat, but reusing the
+search space wastes work when firmware resets its nonce search on a new job.
+
+The follow-up commits four job-ID bytes into the fixed coinbase prefix before
+the session/channel and device extranonces. Standard and extended channels now
+receive distinct work even when a refreshed template and share time are identical.
+Device extranonce sizes and addresses remain unchanged. Retained old jobs still
+validate against their own coinbase; actual repeated headers remain rejected.
+This follows the SV2 [unique work requirement](https://stratumprotocol.org/specification/05-mining-protocol/).
+
+The focused protocol suite passes 39 tests, with the real-node test opt-in.
+That real-node test also passed for both standard and extended proposals at
+Chipnet height 326808 (16 transactions): BCHN accepted each assembled proposal
+and rejected a deliberately corrupted merkle root. It did not submit blocks.
+The full host suite passes 375 library and 16 binary tests (18 ignored and
+34 GPU tests filtered); formatting and Rust 1.99 all-target/all-feature Clippy
+with warnings denied also pass. Exact-commit CI and deployment of the uniqueness
+follow-up are recorded separately after completion. No raw packets, payouts or
+credentials are included in this evidence.

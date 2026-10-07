@@ -107,13 +107,20 @@ impl Channel {
         {
             return Err("job identifier already in use".into());
         }
-        let standard_coinbase =
-            template.coinbase(self.network, &self.payout, &self.extranonce_prefix)?;
-        let parts = template.coinbase_parts(
+        // #### PR #38
+        // Time rolling overlaps across same-tip refreshes. Commit the job ID
+        // before the channel/device extranonce so restarting the firmware's
+        // nonce search cannot repeat headers from a retained job. The device
+        // cannot overwrite this prefix; its extranonce size stays unchanged.
+        let mut extra = id.to_le_bytes().to_vec();
+        extra.extend(self.extranonce_prefix);
+        let standard_coinbase = template.coinbase(self.network, &self.payout, &extra)?;
+        let mut parts = template.coinbase_parts(
             self.network,
             &self.payout,
-            self.extranonce_prefix.len() + DEVICE_EXTRANONCE_SIZE,
+            extra.len() + DEVICE_EXTRANONCE_SIZE,
         )?;
+        parts.prefix.extend(id.to_le_bytes());
         // #### PR #38
         // A mempool/time refresh on the same parent does not invalidate work
         // already in an ASIC pipeline. Retain exact coinbases and tx lists;
@@ -202,7 +209,8 @@ impl Channel {
                 if share.extranonce.len() != DEVICE_EXTRANONCE_SIZE {
                     return Err("invalid-extranonce-size");
                 }
-                let mut extra = self.extranonce_prefix.to_vec();
+                let mut extra = job.id.to_le_bytes().to_vec();
+                extra.extend(self.extranonce_prefix);
                 extra.extend_from_slice(share.extranonce);
                 job.template
                     .coinbase(self.network, &self.payout, &extra)
@@ -349,17 +357,26 @@ mod tests {
                     )
                     .unwrap();
             }
-            // Reusing the very same header under a new job ID is still a duplicate.
+            // The same device nonce/time/extranonce is fresh work in a new job.
+            // This prevents firmware resets on a refresh from repeating hashes.
             let mut alias = share(1);
             alias.job_id = 3;
             if kind == ChannelKind::Extended {
                 alias.extranonce = &[0; DEVICE_EXTRANONCE_SIZE];
             }
+            let fresh = channel.check(alias, 1700000010).unwrap();
+            assert_ne!(fresh.header, first.header);
+            assert_ne!(fresh.coinbase.bytes, first.coinbase.bytes);
+            // The actual old header remains a duplicate, even after refresh.
+            let mut duplicate = share(2);
+            if kind == ChannelKind::Extended {
+                duplicate.extranonce = &[0; DEVICE_EXTRANONCE_SIZE];
+            }
             assert!(matches!(
-                channel.check(alias, 1700000010),
+                channel.check(duplicate, 1700000010),
                 Err("duplicate-share")
             ));
-            let mut delayed = share(2);
+            let mut delayed = share(3);
             delayed.nonce = 1;
             if kind == ChannelKind::Extended {
                 delayed.extranonce = &[0; DEVICE_EXTRANONCE_SIZE];
@@ -380,7 +397,7 @@ mod tests {
                 .install(4, 6, Arc::new(BchTemplate::from_rpc(&changed).unwrap()))
                 .unwrap();
             assert!(matches!(
-                channel.check(share(3), 1700000010),
+                channel.check(share(4), 1700000010),
                 Err("invalid-job-id")
             ));
             assert!(channel.previous.is_empty());
