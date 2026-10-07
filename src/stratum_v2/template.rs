@@ -2,8 +2,7 @@
 //! Validated BCH full templates. Preserve the node's complete CTOR transaction
 //! list and target; do not inherit Bitcoin witness or fixed block-size rules.
 
-use crate::config::{validate_payout_address, MiningNetwork};
-use crate::tx::cashaddr_to_p2pkh_locking;
+use crate::config::MiningNetwork;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use stratum_core::bitcoin::{consensus, Transaction};
@@ -165,8 +164,18 @@ impl BchTemplate {
         payout: &str,
         extranonce: &[u8],
     ) -> Result<Coinbase, String> {
-        let canonical = validate_payout_address(network, payout)?;
-        let locking = cashaddr_to_p2pkh_locking(&canonical)?;
+        self.coinbase_with_payout(network, payout, extranonce, Default::default())
+    }
+
+    pub fn coinbase_with_payout(
+        &self,
+        network: MiningNetwork,
+        payout: &str,
+        extranonce: &[u8],
+        policy: crate::donation::bch::BchPayout,
+    ) -> Result<Coinbase, String> {
+        let scripts = super::payout::scripts(network, payout)?;
+        let outputs = super::payout::outputs(self.coinbase_value, &scripts, policy);
         if extranonce.len() > 64 {
             return Err("extranonce exceeds coinbase budget".into());
         }
@@ -186,10 +195,12 @@ impl BchTemplate {
         compact_size(script.len(), &mut bytes);
         bytes.extend(script);
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-        bytes.push(1);
-        bytes.extend_from_slice(&self.coinbase_value.to_le_bytes());
-        compact_size(locking.len(), &mut bytes);
-        bytes.extend(locking);
+        compact_size(outputs.len(), &mut bytes);
+        for (amount, script) in outputs {
+            bytes.extend_from_slice(&amount.to_le_bytes());
+            compact_size(script.len(), &mut bytes);
+            bytes.extend(script);
+        }
         bytes.extend_from_slice(&0u32.to_le_bytes());
         self.check_block_size(bytes.len())?;
         let mut hashes = Vec::with_capacity(self.transaction_hashes.len() + 1);
@@ -207,10 +218,21 @@ impl BchTemplate {
         payout: &str,
         extranonce_len: usize,
     ) -> Result<CoinbaseParts, String> {
+        self.coinbase_parts_with_payout(network, payout, extranonce_len, Default::default())
+    }
+
+    pub fn coinbase_parts_with_payout(
+        &self,
+        network: MiningNetwork,
+        payout: &str,
+        extranonce_len: usize,
+        policy: crate::donation::bch::BchPayout,
+    ) -> Result<CoinbaseParts, String> {
         if extranonce_len > 64 {
             return Err("extranonce exceeds coinbase budget".into());
         }
-        let coinbase = self.coinbase(network, payout, &vec![0; extranonce_len])?;
+        let coinbase =
+            self.coinbase_with_payout(network, payout, &vec![0; extranonce_len], policy)?;
         // The coinbase script is at most 100 bytes, so its CompactSize is one byte.
         let offset =
             4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len();

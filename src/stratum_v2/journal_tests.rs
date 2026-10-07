@@ -9,6 +9,13 @@ use std::{fs, sync::Arc};
 use stratum_core::bitcoin::{block::Header, consensus};
 
 pub(crate) fn solved_share(salt: u8) -> ValidatedShare {
+    solved_share_with_payout(salt, Default::default())
+}
+
+fn solved_share_with_payout(
+    salt: u8,
+    payout_policy: crate::donation::bch::BchPayout,
+) -> ValidatedShare {
     let template = Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap());
     let mut channel = Channel::new(
         1,
@@ -19,7 +26,9 @@ pub(crate) fn solved_share(salt: u8) -> ValidatedShare {
         &payout(),
     )
     .unwrap();
-    let job = channel.install(1, 1, template.clone()).unwrap();
+    let job = channel
+        .install_with_payout(1, 1, template.clone(), payout_policy)
+        .unwrap();
     let nonce = (0..10_000)
         .find(|nonce| {
             let bytes = template
@@ -52,6 +61,86 @@ pub(crate) fn solved_share(salt: u8) -> ValidatedShare {
 
 fn open(dir: &TestDirectory) -> Journal {
     Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), [42; 32]).unwrap()
+}
+
+#[test]
+fn journal_recovers_each_jobs_rate_and_rejects_policy_tampering() {
+    use crate::donation::bch::BchPayout;
+    let dir = TestDirectory::new();
+    let mut journal = open(&dir);
+    for (index, policy) in [
+        BchPayout::default(),
+        BchPayout {
+            donation: "2".parse().unwrap(),
+            donation_work: false,
+        },
+        BchPayout {
+            donation: "2.01".parse().unwrap(),
+            donation_work: true,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        journal
+            .enqueue(&solved_share_with_payout(index as u8, policy))
+            .unwrap();
+    }
+    let original = fs::read(dir.journal()).unwrap();
+    drop(journal);
+    let journal = open(&dir);
+    assert_eq!(journal.counts(), (3, 0, 0));
+    assert_eq!(fs::read(dir.journal()).unwrap(), original);
+    drop(journal);
+    for replacement in [
+        serde_json::json!(null),
+        serde_json::json!({"donation":200,"donation_work":false}),
+        serde_json::json!({"donation":150,"donation_work":true}),
+        serde_json::json!({"donation":0,"donation_work":false}),
+    ] {
+        let mut state: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        state["pending"][0]["payout"] = replacement;
+        fs::write(dir.journal(), serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(
+            Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), [42; 32]).is_err()
+        );
+    }
+}
+
+#[test]
+fn pre_donation_solved_blocks_are_recovered_without_rewriting_the_coinbase() {
+    use stratum_core::bitcoin::{Amount, Block};
+    let dir = TestDirectory::new();
+    let mut journal = open(&dir);
+    journal.enqueue(&solved_share(42)).unwrap();
+    drop(journal);
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.journal()).unwrap()).unwrap();
+    let raw = hex::decode(state["pending"][0]["block"].as_str().unwrap()).unwrap();
+    let mut block: Block = consensus::deserialize(&raw).unwrap();
+    block.txdata[0].output.truncate(1);
+    block.txdata[0].output[0].value = Amount::from_sat(312_500_000);
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    block.header.nonce = (0..10_000)
+        .find(|nonce| {
+            block.header.nonce = *nonce;
+            block.header.validate_pow(block.header.target()).is_ok()
+        })
+        .unwrap();
+    let hash = block.block_hash().to_string();
+    let bytes = hex::encode(consensus::serialize(&block));
+    state["pending"][0] = serde_json::json!({"hash":hash,"block":bytes});
+    let legacy = serde_json::to_vec(&state).unwrap();
+    fs::write(dir.journal(), &legacy).unwrap();
+    let mut journal = open(&dir);
+    assert_eq!(fs::read(dir.journal()).unwrap(), legacy);
+    assert_eq!(journal.pending(&hash).unwrap().block, bytes);
+    journal.enqueue(&solved_share(43)).unwrap();
+    drop(journal);
+    let mut journal = open(&dir);
+    assert_eq!(journal.pending(&hash).unwrap().block, bytes);
+    journal.finish(&hash, true).unwrap();
+    assert_eq!(journal.counts(), (1, 1, 0));
 }
 
 #[test]

@@ -84,12 +84,21 @@ impl NodeRpc for Rpc {
                 assert_eq!(block.txdata.len(), 1);
                 let coinbase = &block.txdata[0];
                 assert!(coinbase.is_coinbase());
-                assert_eq!(coinbase.output.len(), 1);
-                assert_eq!(coinbase.output[0].value.to_sat(), 312_500_000);
                 let mut expected = vec![0x76, 0xa9, 0x14];
                 expected.extend([0x12; 20]);
                 expected.extend([0x88, 0xac]);
-                assert_eq!(coinbase.output[0].script_pubkey.as_bytes(), expected);
+                let donor =
+                    crate::tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS).unwrap();
+                if coinbase.output.len() == 1 {
+                    assert_eq!(coinbase.output[0].value.to_sat(), 312_500_000);
+                    assert!(coinbase.output[0].script_pubkey.as_bytes() == donor);
+                } else {
+                    assert_eq!(coinbase.output.len(), 2);
+                    assert_eq!(coinbase.output[0].value.to_sat(), 309_359_297);
+                    assert_eq!(coinbase.output[1].value.to_sat(), 3_140_703);
+                    assert!(coinbase.output[0].script_pubkey.as_bytes() == expected);
+                    assert!(coinbase.output[1].script_pubkey.as_bytes() == donor);
+                }
                 assert!(coinbase.input[0].witness.is_empty());
                 assert!((100..=200).contains(&consensus::serialize(coinbase).len()));
                 node.submissions += 1;
@@ -152,6 +161,8 @@ impl Running {
         let secret = [17; 32];
         let authority = server::authority_public(&secret).unwrap();
         let config = ServerConfig {
+            donation: Arc::new(std::sync::RwLock::new(Default::default())),
+            allocation_phase: Some(300_000_000_000),
             network: MiningNetwork::Chipnet,
             payout: payout(),
             authority_secret: secret,

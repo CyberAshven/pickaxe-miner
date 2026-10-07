@@ -27,6 +27,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
 | S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; vardiff pending |
+| S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | Default 1.5% policy, dashboard controls and saved configuration implemented; host/reference checks and four live-node proposals pass; updated physical ASIC payout observation pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | Pending |
@@ -502,3 +503,43 @@ PICKAXE_SV2_REFERENCE_DEVICE="$(realpath ../sv2-reference/target/debug/mining_de
 If a shared `CARGO_TARGET_DIR` is configured, use the executable in that target
 directory instead. Successful synthetic interoperability is not a live block
 propagation or hardware performance claim.
+
+## BCH donation checkpoint (2026-10-07)
+
+#### PR #38
+
+The BCH server now shows one adjustable donation percentage, starting at 1.5%.
+The internal calculation compensates for the overlap between donation work and
+personal rewards so the expected combined percentage targets the selected total.
+It does not round up a satoshi charge: fractional satoshis remain with the miner.
+The arithmetic test checks every supported setting from 1.50% through 100.00%,
+and the existing PHOTON policy is unchanged.
+
+The CLI accepts `--donation`; dashboard `+` / `-` controls save changes before
+applying them to new jobs. A separate wire job ID commits fresh search space on
+policy rotations without changing the node's template generation. Retained jobs
+keep their original payout plan. The journal validates that plan on recovery and
+replays pre-donation pending blocks byte-for-byte. The work adapter's timing and
+firmware limits are described in `stratum-v2.md`; rewards are not guaranteed to
+match the percentage over a short session.
+
+Validation of this source checkpoint:
+
+- Windows Rust 1.99 all-feature host suite: 407 library and 16 binary tests passed,
+  19 opt-in tests ignored, 34 hardware tests filtered. One earlier full run hit a
+  loopback Noise handshake timeout; the focused retry and complete suite passed
+  without changing or extending production timeouts. That transient is recorded,
+  not treated as a proven transport fix.
+- Formatting and all-target/all-feature Clippy with warnings denied passed.
+- Linux Rust 1.98.1: 66 protocol tests and three BCH arithmetic tests passed.
+- Unmodified pinned SRI reference device: authority rejection and two successor
+  blocks passed in 19.63 seconds with independently decoded payout outputs.
+- Real BCHN 29.1.0 Chipnet proposals: standard and extended personal/donation-work
+  coinbases all validated at height 326846, each with 16 transactions; all four
+  corrupted-merkle controls were rejected. No block was broadcast by this test.
+- Test-source archive SHA256:
+  `1386b6e8bd657e86af8749d69ac35c4a32c5f653b133b02eba2e2f33d09c567a`.
+
+At this checkpoint the physical ASIC service remains on `67e7774`; new physical
+payout evidence and exact pushed-commit CI must be recorded separately. This
+checkpoint does not complete the remaining requirements in the matrix above.

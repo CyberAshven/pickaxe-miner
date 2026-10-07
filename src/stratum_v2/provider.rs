@@ -258,6 +258,7 @@ mod durable_tests {
         PendingBlock {
             hash: hex::encode(hash),
             block: hex::encode(block),
+            payout: Some(share.payout),
         }
     }
     fn tip() -> Value {

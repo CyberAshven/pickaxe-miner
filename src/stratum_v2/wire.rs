@@ -8,6 +8,7 @@ use super::{
     template::{meets_target, BchTemplate, Hash},
 };
 use crate::config::MiningNetwork;
+use crate::donation::bch::BchPayout;
 use std::{collections::BTreeMap, sync::Arc};
 use stratum_core::{
     binary_sv2::{self, GetSize, Serialize, Sv2Option},
@@ -31,6 +32,7 @@ pub struct MiningSession {
     pub channels: BTreeMap<u32, Channel>,
     maximum_targets: BTreeMap<u32, Hash>,
     current: Option<(u32, u64, Arc<BchTemplate>)>,
+    payout_policy: BchPayout,
     pub accepted: u64,
     pub rejected: u64,
 }
@@ -63,6 +65,7 @@ impl MiningSession {
             channels: BTreeMap::new(),
             maximum_targets: BTreeMap::new(),
             current: None,
+            payout_policy: BchPayout::default(),
             accepted: 0,
             rejected: 0,
         })
@@ -83,7 +86,18 @@ impl MiningSession {
         generation: u64,
         template: Arc<BchTemplate>,
     ) -> Result<Vec<SerializedFrame>, String> {
+        self.set_job_with_payout(id, generation, template, BchPayout::default())
+    }
+
+    pub fn set_job_with_payout(
+        &mut self,
+        id: u32,
+        generation: u64,
+        template: Arc<BchTemplate>,
+        payout: BchPayout,
+    ) -> Result<Vec<SerializedFrame>, String> {
         self.current = Some((id, generation, template.clone()));
+        self.payout_policy = payout;
         let mut frames = Vec::new();
         for channel in self.channels.values_mut() {
             let immediate = channel.job().is_some_and(|job| {
@@ -106,7 +120,7 @@ impl MiningSession {
                     maximum_target: (&channel.target).into(),
                 }))?);
             }
-            channel.install(id, generation, template.clone())?;
+            channel.install_with_payout(id, generation, template.clone(), payout)?;
             frames.extend(job_frames(channel, immediate)?);
         }
         Ok(frames)
@@ -342,7 +356,7 @@ impl MiningSession {
             &self.payout,
         )?;
         let (id, generation, template) = self.current.as_ref().unwrap();
-        channel.install(*id, *generation, template.clone())?;
+        channel.install_with_payout(*id, *generation, template.clone(), self.payout_policy)?;
         let mut frames = vec![match kind {
             ChannelKind::Standard => mining(Mining::OpenStandardMiningChannelSuccess(
                 OpenStandardMiningChannelSuccess {

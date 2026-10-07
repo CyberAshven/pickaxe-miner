@@ -5,7 +5,7 @@
 use super::{channel::ValidatedShare, template::double_sha256};
 use crate::{
     config::{self, MiningNetwork},
-    tx::cashaddr_to_p2pkh_locking,
+    donation::bch::BchPayout,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,6 +27,10 @@ const MAX_RECEIPTS: usize = 1024;
 pub struct PendingBlock {
     pub hash: String,
     pub block: String,
+    // Missing only in pre-donation journals. Recovery submits those exact
+    // bytes; it must never silently rebuild an already solved coinbase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payout: Option<BchPayout>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -44,7 +48,7 @@ struct State {
 pub struct Journal {
     path: PathBuf,
     _lock: File,
-    script: Vec<u8>,
+    scripts: [Vec<u8>; 2],
     state: State,
 }
 
@@ -56,10 +60,10 @@ impl Journal {
         source: [u8; 32],
     ) -> Result<Self, String> {
         let payout = config::validate_payout_address(network, payout)?;
-        let script = cashaddr_to_p2pkh_locking(&payout)?;
+        let scripts = super::payout::scripts(network, &payout)?;
         let mut context = source.to_vec();
         context.extend(network.as_str().as_bytes());
-        context.extend(&script);
+        context.extend(&scripts[0]);
         let context = hex::encode(double_sha256(&context));
         let parent = path
             .parent()
@@ -110,11 +114,11 @@ impl Journal {
                 rejected: 0,
             }
         };
-        validate_state(&state, &script)?;
+        validate_state(&state, &scripts)?;
         let journal = Self {
             path: path.to_owned(),
             _lock: lock,
-            script,
+            scripts,
             state,
         };
         if !path.exists() {
@@ -142,7 +146,7 @@ impl Journal {
             return Err("cannot journal a non-block share".into());
         }
         let bytes = share.template.block(&share.coinbase, share.header)?;
-        let hash = validate_block(&bytes, &self.script)?;
+        let hash = validate_block(&bytes, &self.scripts, Some(share.payout))?;
         if self.state.completed.contains(&hash) || self.state.pending.iter().any(|b| b.hash == hash)
         {
             return Ok(false);
@@ -151,6 +155,7 @@ impl Journal {
         next.pending.push(PendingBlock {
             hash,
             block: hex::encode(bytes),
+            payout: Some(share.payout),
         });
         // Existing entries were checked at load/enqueue. Do not hash every
         // stored full block again while another device waits to journal work.
@@ -243,7 +248,7 @@ fn regular_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
-fn validate_state(state: &State, script: &[u8]) -> Result<(), String> {
+fn validate_state(state: &State, scripts: &[Vec<u8>; 2]) -> Result<(), String> {
     validate_limits(state)?;
     let mut seen = std::collections::HashSet::new();
     for hash in &state.completed {
@@ -265,7 +270,9 @@ fn validate_state(state: &State, script: &[u8]) -> Result<(), String> {
             return Err("pending blocks exceed journal storage budget".into());
         }
         let bytes = hex::decode(&pending.block).map_err(|_| "invalid journal block encoding")?;
-        if validate_block(&bytes, script)? != pending.hash || !seen.insert(pending.hash.clone()) {
+        if validate_block(&bytes, scripts, pending.payout)? != pending.hash
+            || !seen.insert(pending.hash.clone())
+        {
             return Err("invalid or duplicate journal block".into());
         }
     }
@@ -287,7 +294,11 @@ fn validate_limits(state: &State) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_block(bytes: &[u8], script: &[u8]) -> Result<String, String> {
+fn validate_block(
+    bytes: &[u8],
+    scripts: &[Vec<u8>; 2],
+    payout: Option<BchPayout>,
+) -> Result<String, String> {
     if bytes.len() > MAX_BLOCK_BYTES {
         return Err("block exceeds journal storage budget".into());
     }
@@ -300,9 +311,23 @@ fn validate_block(bytes: &[u8], script: &[u8]) -> Result<String, String> {
         .txdata
         .first()
         .ok_or("journal block has no coinbase")?;
+    let total = coinbase
+        .output
+        .iter()
+        .try_fold(0u64, |sum, output| sum.checked_add(output.value.to_sat()))
+        .filter(|sum| *sum <= 21_000_000 * 100_000_000)
+        .ok_or("invalid journal coinbase value")?;
+    let expected = match payout {
+        Some(policy) => super::payout::outputs(total, scripts, policy),
+        None => vec![(total, scripts[0].clone())],
+    };
+    let actual = coinbase
+        .output
+        .iter()
+        .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
+        .collect::<Vec<_>>();
     if !coinbase.is_coinbase()
-        || coinbase.output.len() != 1
-        || coinbase.output[0].script_pubkey.as_bytes() != script
+        || actual != expected
         || block
             .txdata
             .iter()

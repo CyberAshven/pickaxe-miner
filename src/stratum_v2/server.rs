@@ -9,8 +9,10 @@ use super::{
     template::{BchTemplate, Hash},
     transport::Session,
     wire::MiningSession,
+    work_allocation::WorkAllocation,
 };
 use crate::config::{validate_payout_address, MiningNetwork};
+use crate::donation::bch::{BchDonation, BchPayout};
 use std::{
     collections::HashMap,
     io,
@@ -37,6 +39,9 @@ pub struct ServerConfig {
     pub share_target: Hash,
     pub journal_path: PathBuf,
     pub source_identity: [u8; 32],
+    pub donation: Arc<RwLock<BchDonation>>,
+    #[cfg(test)]
+    pub allocation_phase: Option<u64>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -349,29 +354,56 @@ fn publish(shared: &Shared, job: Option<PublishedJob>) {
 // immediately, reject submissions while unavailable, then cleanly activate a
 // fresh job on the same channel. The grace is bounded; never extend a job's
 // original freshness lease just to keep a connection alive.
-#[derive(Default)]
 struct JobAvailability {
     generation: Option<u64>,
     unavailable_since: Option<Instant>,
+    payout: Option<BchPayout>,
+    next_id: u32,
+    allocation: WorkAllocation,
 }
 
 impl JobAvailability {
+    fn new(phase: u64) -> Self {
+        Self {
+            generation: None,
+            unavailable_since: None,
+            payout: None,
+            next_id: 0,
+            allocation: WorkAllocation::new(phase),
+        }
+    }
+
     fn update(
         &mut self,
         mining: &mut MiningSession,
         current: Option<PublishedJob>,
         now: Instant,
+        donation: BchDonation,
     ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
         if let Some(job) = current.filter(|job| now < job.valid_until) {
+            self.allocation.update(now, !mining.channels.is_empty());
+            let payout = BchPayout {
+                donation,
+                donation_work: self.allocation.donation_work(donation),
+            };
             self.unavailable_since = None;
-            if self.generation == Some(job.generation) {
+            if self.generation == Some(job.generation) && self.payout == Some(payout) {
                 return Ok(Vec::new());
             }
-            let id = u32::try_from(job.generation).map_err(|_| "job identifiers exhausted")?;
-            let frames = mining.set_job(id, job.generation, job.template)?;
+            // Policy rotations need unique search space even with the same
+            // template generation. The provider still receives its original
+            // generation, while the wire ID commits a distinct coinbase.
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .ok_or("job identifiers exhausted")?;
+            let frames =
+                mining.set_job_with_payout(self.next_id, job.generation, job.template, payout)?;
             self.generation = Some(job.generation);
+            self.payout = Some(payout);
             return Ok(frames);
         }
+        self.allocation.update(now, false);
         if self.generation.take().is_some() {
             mining.revoke_job();
         }
@@ -413,7 +445,10 @@ fn serve_device(
             rand::random(),
             config.share_target,
         )?;
-        let mut availability = JobAvailability::default();
+        let phase = rand::random();
+        #[cfg(test)]
+        let phase = config.allocation_phase.unwrap_or(phase);
+        let mut availability = JobAvailability::new(phase);
         let mut accepted = 0u64;
         let mut rejected = 0u64;
         while !shared.stop.load(Ordering::Relaxed) {
@@ -424,13 +459,24 @@ fn serve_device(
                     .map(|job| job.clone())
                     .map_err(|_| "template state unavailable")
             };
-            for frame in availability.update(&mut mining, current_job()?, Instant::now())? {
+            let donation = || {
+                config
+                    .donation
+                    .read()
+                    .map(|value| *value)
+                    .map_err(|_| "donation setting unavailable")
+            };
+            for frame in
+                availability.update(&mut mining, current_job()?, Instant::now(), donation()?)?
+            {
                 sender.send(frame)?;
             }
             if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
                 // A node failure or tip change may have occurred while waiting
                 // for a device frame; resample before validating that frame.
-                for update in availability.update(&mut mining, current_job()?, Instant::now())? {
+                for update in
+                    availability.update(&mut mining, current_job()?, Instant::now(), donation()?)?
+                {
                     sender.send(update)?;
                 }
                 let now = SystemTime::now()
@@ -500,6 +546,64 @@ mod retry_tests {
     use super::*;
 
     #[test]
+    fn payout_rotation_issues_unique_jobs_without_changing_template_generation() {
+        use super::super::channel::{Channel, ChannelKind};
+        let start = Instant::now();
+        let payout = super::super::template_tests::payout();
+        let mut mining =
+            MiningSession::new(MiningNetwork::Chipnet, payout.clone(), [17; 12], [255; 32])
+                .unwrap();
+        mining.channels.insert(
+            1,
+            Channel::new(
+                1,
+                ChannelKind::Standard,
+                [255; 32],
+                [17; 12],
+                MiningNetwork::Chipnet,
+                &payout,
+            )
+            .unwrap(),
+        );
+        let job = PublishedJob {
+            generation: 99,
+            template: Arc::new(
+                BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap(),
+            ),
+            valid_until: start + Duration::from_secs(30),
+        };
+        let mut availability = JobAvailability::new(0);
+        for (seconds, rate, expected_work, expected_id) in [
+            (0, "1.5", true, 1),
+            (3, "1.5", false, 2),
+            (5, "2", false, 3),
+        ] {
+            availability
+                .update(
+                    &mut mining,
+                    Some(job.clone()),
+                    start + Duration::from_secs(seconds),
+                    rate.parse().unwrap(),
+                )
+                .unwrap();
+            let current = mining.channels[&1].job().unwrap();
+            assert_eq!(current.id, expected_id);
+            assert_eq!(current.generation, 99);
+            assert_eq!(current.payout.donation_work, expected_work);
+            assert_eq!(current.payout.donation, rate.parse().unwrap());
+        }
+        assert!(availability
+            .update(
+                &mut mining,
+                Some(job),
+                start + Duration::from_secs(6),
+                "2".parse().unwrap()
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn expired_template_is_revoked_and_repeated_failures_do_not_extend_grace() {
         let start = Instant::now();
         let mut mining = MiningSession::new(
@@ -516,23 +620,39 @@ mod retry_tests {
             ),
             valid_until: start + Duration::from_secs(30),
         };
-        let mut availability = JobAvailability::default();
+        let mut availability = JobAvailability::new(300_000_000_000);
         availability
-            .update(&mut mining, Some(job.clone()), start)
+            .update(
+                &mut mining,
+                Some(job.clone()),
+                start,
+                BchDonation::default(),
+            )
             .unwrap();
         assert_eq!(availability.generation, Some(1));
         availability
-            .update(&mut mining, Some(job.clone()), job.valid_until)
+            .update(
+                &mut mining,
+                Some(job.clone()),
+                job.valid_until,
+                BchDonation::default(),
+            )
             .unwrap();
         assert_eq!(availability.generation, None);
         availability
-            .update(&mut mining, None, job.valid_until + Duration::from_secs(2))
+            .update(
+                &mut mining,
+                None,
+                job.valid_until + Duration::from_secs(2),
+                BchDonation::default(),
+            )
             .unwrap();
         assert!(availability
             .update(
                 &mut mining,
                 Some(job.clone()),
-                job.valid_until + TEMPLATE_RECOVERY_GRACE
+                job.valid_until + TEMPLATE_RECOVERY_GRACE,
+                BchDonation::default()
             )
             .is_err());
         assert_eq!(

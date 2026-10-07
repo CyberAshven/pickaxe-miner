@@ -11,6 +11,7 @@ use super::{
 use crate::{
     cli::StratumV2Command,
     config::{self, RuntimeConfig},
+    donation::bch::BchDonation,
     tui::TerminalSession,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -27,7 +28,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -49,7 +50,12 @@ pub fn run(
             .map_err(|_| "a valid payout for the selected network is required")?;
     }
     let (rpc, template) = preflight(config)?;
-    let StratumV2Command::Serve { listen, sv1_listen } = action else {
+    let StratumV2Command::Serve {
+        listen,
+        sv1_listen,
+        donation,
+    } = action
+    else {
         println!(
             "{}",
             serde_json::json!({
@@ -60,6 +66,7 @@ pub fn run(
         );
         return Ok(());
     };
+    let donation = Arc::new(RwLock::new(donation.unwrap_or(config.bch_donation)));
     let listener = TcpListener::bind(listen).map_err(|_| "cannot bind mining listener")?;
     let bound = listener
         .local_addr()
@@ -94,6 +101,9 @@ pub fn run(
         share_target: compact_target(0x1b0ffff0)?,
         journal_path: config_path.with_extension("sv2-blocks.json"),
         source_identity: rpc.source_identity()?,
+        donation: donation.clone(),
+        #[cfg(test)]
+        allocation_phase: None,
     };
     let worker = {
         let stop = stop.clone();
@@ -128,6 +138,7 @@ pub fn run(
             );
         }
         let mut device_offset = 0usize;
+        let mut setting_error = None;
         while !stop.load(Ordering::Relaxed) && !worker.is_finished() {
             if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
                 break;
@@ -138,16 +149,20 @@ pub fn run(
                 .clone();
             let devices = snapshot.device_stats.snapshots(Instant::now());
             device_offset = device_offset.min(devices.len().saturating_sub(1));
+            let donation_value = *donation
+                .read()
+                .map_err(|_| "donation setting unavailable")?;
             if let Some(terminal) = terminal.as_mut() {
                 let status = format!(
-                    "{} · Node {} · Height {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\nAuthority {}",
+                    "{} · Node {} · Height {} · Donation {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" },
-                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), snapshot.connections, snapshot.sessions_started,
+                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_value, snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
                     snapshot.connection_errors, snapshot.sv1_connection_errors,
                     snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), bound,
-                    sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()), authority,
+                    sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
+                    setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {authority}")),
                 );
                 terminal
                     .terminal
@@ -157,6 +172,19 @@ pub fn run(
                     if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
                         if key.kind == KeyEventKind::Press {
                             match key.code {
+                                KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') => {
+                                    let next =
+                                        donation_value.adjusted(key.code != KeyCode::Char('-'));
+                                    if next != donation_value {
+                                        match save_donation(config_path, next) {
+                                            Ok(()) => {
+                                                *donation.write().map_err(|_| "donation setting unavailable")? = next;
+                                                setting_error = None;
+                                            }
+                                            Err(()) => setting_error = Some("Could not save donation; previous setting retained"),
+                                        }
+                                    }
+                                }
                                 KeyCode::Char('q') => stop.store(true, Ordering::Relaxed),
                                 KeyCode::Char('c')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -178,6 +206,7 @@ pub fn run(
                 println!(
                     "{}",
                     serde_json::json!({"ready":snapshot.template_ready,"height":snapshot.height,
+                    "donation":donation_value.to_string(),
                     "devices":snapshot.connections,"shares_accepted":snapshot.shares_accepted,"shares_rejected":snapshot.shares_rejected,
                     "blocks_accepted":snapshot.blocks_accepted,"blocks_unconfirmed":snapshot.blocks_pending,
                     "blocks_pending":snapshot.blocks_pending,"blocks_rejected":snapshot.blocks_rejected,
@@ -205,6 +234,16 @@ pub fn run(
         .join()
         .map_err(|_| "mining server stopped unexpectedly")?;
     result.and(server_result).and(firmware_result)
+}
+
+fn save_donation(path: &Path, value: BchDonation) -> Result<(), ()> {
+    // Preserve unrelated saved settings. Saving must succeed before new jobs
+    // use the changed percentage; in-flight jobs retain their original policy.
+    let mut saved = config::SavedConfig::load_optional(path)
+        .map_err(|_| ())?
+        .unwrap_or_default();
+    saved.bch_donation_bps = Some(value);
+    saved.save(path).map_err(|_| ())
 }
 
 fn render_dashboard(
@@ -282,7 +321,7 @@ fn render_dashboard(
         .block(Block::bordered().title(title)),
         areas[1],
     );
-    frame.render_widget(Paragraph::new("↑/↓ PgUp/PgDn  Devices · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
+    frame.render_widget(Paragraph::new("↑/↓ PgUp/PgDn  Devices · +/- Donation · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
 }
 
 fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), String> {
@@ -352,6 +391,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn donation_control_persists_only_the_bch_setting_and_fails_closed() {
+        let dir = super::super::journal::TestDirectory::new();
+        let path = dir.0.join("settings.json");
+        let mut original = config::SavedConfig {
+            network: Some("chipnet".into()),
+            intensity: Some(70),
+            ..Default::default()
+        };
+        original.save(&path).unwrap();
+        let rate = "2.01".parse().unwrap();
+        save_donation(&path, rate).unwrap();
+        original.bch_donation_bps = Some(rate);
+        assert_eq!(config::SavedConfig::load(&path).unwrap(), original);
+        let mut runtime = RuntimeConfig::default();
+        original.apply_to_runtime(&mut runtime).unwrap();
+        assert_eq!(runtime.bch_donation, rate);
+        assert_eq!(
+            runtime.token.fee_policy(runtime.network).scheme.work(),
+            [400, 0]
+        );
+        fs::write(&path, b"broken config").unwrap();
+        assert!(save_donation(&path, BchDonation::default()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"broken config");
+    }
+
+    #[test]
     fn device_dashboard_renders_estimates_failures_and_scrolled_sessions() {
         use super::super::telemetry::{Devices, ShareEvent};
         use ratatui::{backend::TestBackend, Terminal};
@@ -367,7 +432,7 @@ mod tests {
         for width in [100, 140] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal
-                .draw(|f| render_dashboard(f, "Chipnet · Node Ready", &rows, 0))
+                .draw(|f| render_dashboard(f, "Chipnet · Node Ready · Donation 1.5%", &rows, 0))
                 .unwrap();
             let text: String = terminal
                 .backend()
@@ -381,6 +446,9 @@ mod tests {
             assert!(text.contains("Est. 5m"));
             assert!(text.contains("stale job"));
             assert!(text.contains("TH/s"));
+            assert!(text.contains("Donation 1.5%"));
+            assert!(text.contains("+/- Donation"));
+            assert!(!text.contains("2T/3"));
             terminal
                 .draw(|f| render_dashboard(f, "Chipnet · Node Ready", &rows, 1))
                 .unwrap();

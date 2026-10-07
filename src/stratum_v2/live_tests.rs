@@ -10,6 +10,7 @@ use super::{
     template_tests::payout,
 };
 use crate::config::{MiningNetwork, SavedConfig};
+use crate::donation::bch::BchPayout;
 use serde_json::json;
 use std::{path::Path, sync::Arc};
 use stratum_core::bitcoin::{consensus, Block};
@@ -26,9 +27,14 @@ fn live_chipnet_node_validates_standard_and_extended_block_proposals() {
     let mut rpc = NativeNodeRpc::new(endpoint);
     // A public synthetic test script is intentional: proposals do not publish,
     // and this test neither reads a wallet nor requests a real payout address.
-    for (index, kind) in [ChannelKind::Standard, ChannelKind::Extended]
-        .into_iter()
-        .enumerate()
+    for (index, (kind, donation_work)) in [
+        (ChannelKind::Standard, false),
+        (ChannelKind::Extended, false),
+        (ChannelKind::Standard, true),
+        (ChannelKind::Extended, true),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let (generation, template) = provider.refresh().expect("live template preflight failed");
         let template = Arc::new(template.clone());
@@ -42,7 +48,15 @@ fn live_chipnet_node_validates_standard_and_extended_block_proposals() {
         )
         .unwrap();
         let job = channel
-            .install(1, generation, template.clone())
+            .install_with_payout(
+                1,
+                generation,
+                template.clone(),
+                BchPayout {
+                    donation_work,
+                    ..Default::default()
+                },
+            )
             .unwrap()
             .clone();
         let coinbase = if kind == ChannelKind::Standard {
@@ -71,6 +85,24 @@ fn live_chipnet_node_validates_standard_and_extended_block_proposals() {
         let decoded: Block = consensus::deserialize(&block).unwrap();
         assert!(decoded.check_merkle_root());
         assert_eq!(decoded.txdata.len(), template.transaction_count());
+        let outputs = &decoded.txdata[0].output;
+        assert_eq!(
+            outputs.iter().map(|o| o.value.to_sat()).sum::<u64>(),
+            template.coinbase_value
+        );
+        let donor = crate::tx::cashaddr_to_p2pkh_locking(crate::config::DONATION_ADDRESS).unwrap();
+        if donation_work {
+            assert_eq!(outputs.len(), 1);
+            assert!(outputs[0].script_pubkey.as_bytes() == donor);
+        } else {
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(outputs[1].value.to_sat(), template.coinbase_value * 2 / 199);
+            assert!(outputs[1].script_pubkey.as_bytes() == donor);
+            assert!(
+                outputs[0].script_pubkey.as_bytes()
+                    == crate::tx::cashaddr_to_p2pkh_locking(&payout()).unwrap()
+            );
+        }
         let result = rpc
             .call("validateblocktemplate", json!([hex::encode(&block)]))
             .expect("BCHN proposal validation failed (a moved tip requires a new run)");

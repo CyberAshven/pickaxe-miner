@@ -5,6 +5,7 @@
 
 use super::template::{double_sha256, meets_target, BchTemplate, Coinbase, CoinbaseParts, Hash};
 use crate::config::{validate_payout_address, MiningNetwork};
+use crate::donation::bch::BchPayout;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -44,6 +45,7 @@ pub struct Job {
     pub standard_coinbase: Coinbase,
     pub parts: CoinbaseParts,
     pub target: Hash,
+    pub payout: BchPayout,
 }
 
 pub struct Share<'a> {
@@ -63,6 +65,7 @@ pub struct ValidatedShare {
     pub header: [u8; 80],
     pub block: bool,
     pub share_target: Hash,
+    pub payout: BchPayout,
 }
 
 impl Channel {
@@ -104,6 +107,16 @@ impl Channel {
         generation: u64,
         template: Arc<BchTemplate>,
     ) -> Result<&Job, String> {
+        self.install_with_payout(id, generation, template, BchPayout::default())
+    }
+
+    pub fn install_with_payout(
+        &mut self,
+        id: u32,
+        generation: u64,
+        template: Arc<BchTemplate>,
+        payout: BchPayout,
+    ) -> Result<&Job, String> {
         if self.job.as_ref().is_some_and(|job| job.id == id)
             || self.previous.iter().any(|job| job.id == id)
         {
@@ -116,11 +129,13 @@ impl Channel {
         // cannot overwrite this prefix; its extranonce size stays unchanged.
         let mut extra = id.to_le_bytes().to_vec();
         extra.extend(self.extranonce_prefix);
-        let standard_coinbase = template.coinbase(self.network, &self.payout, &extra)?;
-        let mut parts = template.coinbase_parts(
+        let standard_coinbase =
+            template.coinbase_with_payout(self.network, &self.payout, &extra, payout)?;
+        let mut parts = template.coinbase_parts_with_payout(
             self.network,
             &self.payout,
             extra.len() + DEVICE_EXTRANONCE_SIZE,
+            payout,
         )?;
         parts.prefix.extend(id.to_le_bytes());
         // #### PR #38
@@ -149,6 +164,7 @@ impl Channel {
             standard_coinbase,
             parts,
             target: self.target,
+            payout,
         });
         Ok(self.job.as_ref().unwrap())
     }
@@ -216,7 +232,7 @@ impl Channel {
                 extra.extend(self.extranonce_prefix);
                 extra.extend_from_slice(share.extranonce);
                 job.template
-                    .coinbase(self.network, &self.payout, &extra)
+                    .coinbase_with_payout(self.network, &self.payout, &extra, job.payout)
                     .map_err(|_| "invalid-coinbase")?
             }
         };
@@ -247,6 +263,7 @@ impl Channel {
             header,
             block,
             share_target: job.target,
+            payout: job.payout,
         })
     }
 }
@@ -298,6 +315,55 @@ mod tests {
             time: 1700000010,
             nonce: 0,
             extranonce: &[],
+        }
+    }
+    #[test]
+    fn retained_jobs_keep_exact_payouts_across_rate_and_work_rotations() {
+        use crate::donation::bch::BchDonation;
+        for kind in [ChannelKind::Standard, ChannelKind::Extended] {
+            let mut channel = channel(1, kind);
+            let template = channel.job().unwrap().template.clone();
+            let plans = [
+                BchPayout::default(),
+                BchPayout {
+                    donation: "2".parse().unwrap(),
+                    donation_work: false,
+                },
+                BchPayout {
+                    donation: BchDonation::default(),
+                    donation_work: true,
+                },
+            ];
+            for (index, payout) in plans.iter().enumerate().skip(1) {
+                channel
+                    .install_with_payout(index as u32 + 1, 3, template.clone(), *payout)
+                    .unwrap();
+            }
+            for (index, payout) in plans.iter().enumerate() {
+                let mut submission = share(index as u32);
+                submission.job_id = index as u32 + 1;
+                if kind == ChannelKind::Extended {
+                    submission.extranonce = &[7; 8];
+                }
+                let result = channel.check(submission, template.current_time).unwrap();
+                assert_eq!(result.payout, *payout);
+                let tx: stratum_core::bitcoin::Transaction =
+                    consensus::deserialize(&result.coinbase.bytes).unwrap();
+                let values = tx
+                    .output
+                    .iter()
+                    .map(|o| o.value.to_sat())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    values,
+                    [
+                        vec![309_359_297, 3_140_703],
+                        vec![308_305_370, 4_194_630],
+                        vec![312_500_000]
+                    ][index]
+                );
+                assert_eq!(values.iter().sum::<u64>(), template.coinbase_value);
+            }
         }
     }
     #[test]

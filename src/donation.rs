@@ -1,6 +1,8 @@
 //! Token-selected fee policy; a work recipient is fixed before hashing.
 use crate::config::{self, MiningNetwork};
 
+pub mod bch;
+
 /// Basis points for project and collaborator. A hybrid's reward split applies
 /// only to personal work, never to developer wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

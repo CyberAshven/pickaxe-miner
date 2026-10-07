@@ -198,8 +198,20 @@ share target through subsequent target updates. SV1 adapter rejects now count
 in the shared dashboard totals; separate adapter/native connection error fields
 can both describe the same disconnected session. Vardiff, Knuth TP,
 distributed rigs and pool routing are still pending.
-Current BCH coinbases pay the configured mining address; integrating the
-compiled BCH donation policy remains separate from existing token policies.
+BCH uses an adjustable donation, defaulting to 1.5%, shown as one percentage
+in the dashboard. `--donation 2` selects 2%; `+` / `-` changes the saved setting
+by 0.1 percentage points within 1.5%–100%. Token policies remain separate.
+The BCH policy is attached to each job; changing the setting never changes an
+in-flight job's coinbase. Saved solved blocks retain that policy across restart,
+and pre-donation journal entries replay their original bytes.
+
+The work adapter schedules eligible channel time in ten-minute cycles with
+independent random starting phases, preserving the position through template
+refreshes and excluding unavailable work. ASIC hashes cannot be counted exactly
+from Stratum messages: this is a time allocation, not a claim of exact measured
+hash allocation or guaranteed rewards. Dispatch cadence and firmware response
+can affect short intervals. Fractional satoshis stay with the miner, and the
+complete coinbase retains the node's subsidy-plus-fees budget.
 The successful Chipnet experiments do not complete those remaining capabilities.
 
 The authority encoding follows the [SV2 security specification, section
