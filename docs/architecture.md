@@ -28,11 +28,16 @@ day each fact was checked.
   BCHN node, a durable block journal, per-device vardiff, a workers table with
   each device's own report, and an adjustable donation. Tested on Chipnet with
   an Avalon Nano 3.
-- In review: a read-only `watch` view for a server running as a service,
-  calmer vardiff, starting the ASIC server from the setup screen, and device
-  controls (restart, work level) that each need a confirmation (PR #40); GPU
-  rigs on other machines that mine as one with a coordinator, with backup
-  coordinators, in the default build (PR #32).
+- In review (PR #40): a read-only `watch` view for a server running as a
+  service, calmer vardiff, starting the ASIC server from the setup screen,
+  device reports and confirmed controls for every make through asic-rs (with
+  Pickaxe's own CGMiner and Bitaxe code as the extension), and pool mode,
+  where SV1 devices mine at a remote Stratum V2 pool through the adapter with
+  no node.
+- In review (PR #32): GPU rigs on other machines that mine as one with a
+  coordinator, with backup coordinators, in the default build; the portable
+  engine on older Intel Vulkan drivers (wgpu's upstream fix), its self-test on
+  T2 engines, and throttled mining at full batch sizes.
 
 ## Product direction
 
@@ -195,10 +200,21 @@ to plug it in:
   tested yet.
 - ckpool supports Stratum V2 for pool and solo servers and for proxy
   upstreams, with a Job Declaration server; Bitcoin only. The BCH ckpool forks
-  (ASICseer pool, EloPool) had not adopted it when checked.
-- SoloFury (closed source) runs Stratum V2 for BCH solo mining: extended
-  channels only, no Job Declaration, CashAddr identities and a target per
-  block from ASERT.
+  ASICseer pool and EloPool had not adopted it when checked.
+- CashStratum (GPL-3.0, github.com/cashstratum/cashstratum; 1.2.1 on
+  2026-10-06) is skaisser's BCH ckpool fork under a new name. Its C engine
+  has its own Stratum V2 code (Noise, codec, mining and Job Declaration
+  sources); its installers serve SV1 and leave SV2 off. Its server
+  certificate uses format version 1, which the SV2 spec forbids (it must be
+  0) and SRI-based clients refuse (checked 2026-10-08; reported as
+  cashstratum/cashstratum#3).
+- SoloFury runs Stratum V2 for BCH solo mining: extended channels only, no
+  Job Declaration, CashAddr identities (`address.worker`) and a target per
+  block from ASERT. Its BCH pool credits skaisser/ckpool, now CashStratum,
+  and its BCH Stratum V2 certificate has CashStratum's version 1, so
+  Pickaxe's pool mode refuses it until that is fixed. SoloFury's Bitcoin
+  Stratum V2 runs on another stack, and Pickaxe's pool mode receives work
+  from it (read-only check, 2026-10-08).
 - The official Stratum V2 UI app for Umbrel is a setup wizard and dashboard
   for pool, solo and Job Declaration mining with the user's own node, running
   SRI's translator for SV1 miners; Bitcoin only. It is a model for Pickaxe's
@@ -259,8 +275,9 @@ What this means for Pickaxe, and what step 1 did:
   May 2026. ckpool supports Stratum V2 for pool, solo and proxy use with a
   Job Declaration server. OCEAN uses its own DATUM protocol instead: miners
   build templates and are paid in the coinbase.
-- BCH: SoloFury has served Stratum V2 for solo mining since August 2026; the
-  large BCH pools, such as ViaBTC, publish SV1 endpoints.
+- BCH: SoloFury has served Stratum V2 since August 2026, for BCH since
+  September 2026; the large BCH pools, such as ViaBTC, publish SV1
+  endpoints.
 
 ### Nodes and interfaces
 
@@ -397,7 +414,15 @@ Stratum V2 on BCH:
   https://github.com/k-nuth/kth/blob/master/docs/json-rpc.md); package:
   https://github.com/BitcoinCash1/knuth-bch-startos ; site: https://kth.cash .
 - SoloFury: https://solofury.com/blog/stratum-v2-bitcoin-cash-solo-mining/ ,
-  https://solofury.com/blog/stratum-v2-solo-mining-guide/ .
+  https://solofury.com/blog/stratum-v2-solo-mining-guide/ , public docs
+  https://github.com/solofurypool-code/solofury-public-docs (README: BCH pool
+  on skaisser/ckpool).
+- CashStratum: https://github.com/cashstratum/cashstratum (SV2 sources in
+  `src/sv2_*.c`; certificate version in `src/sv2_noise.c`), certificate
+  issue https://github.com/cashstratum/cashstratum/issues/3 ; SV2 spec on the
+  certificate version:
+  https://github.com/stratum-mining/sv2-spec/blob/main/04-Protocol-Security.md ;
+  SRI's check: https://github.com/stratum-mining/stratum/commit/15e5969c8 .
 - ViaBTC BCH (SV1 endpoints):
   https://support.viabtc.com/hc/en-us/articles/7207458561679-BCH-Mining .
 - Bitaxe ESP-Miner: https://github.com/bitaxeorg/ESP-Miner .
