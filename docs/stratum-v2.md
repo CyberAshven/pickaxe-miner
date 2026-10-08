@@ -120,13 +120,26 @@ pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json --sv1-listen 127.
 
 `check-node` is read-only and prints a redacted template summary. `serve`
 binds to `127.0.0.1:3336` unless `--listen IP:PORT` selects a LAN interface.
-The dashboard shows each session's generated label, connection state, accepted
-and rejected shares, estimated hashrate and latest diagnostic. Arrow/Page keys
-scroll the rows. An address-only worker still gets its own row and unique work;
-reconnecting creates a new session label. Rates use validated shares over up to
-five minutes with a 30-second warm-up; they are statistical estimates, not ASIC
-hardware telemetry. Up to 64 closed sessions remain visible. JSON `device_details`
-contains the same rows, including last-share age and SV1-local reject counts.
+The dashboard opens on a workers table, laid out like a pool's worker list: one
+row per session with its generated label, status, rate over 5 minutes and over
+1 hour, the device's own report, accepted and rejected shares, reject rate, last
+share, current share difficulty, protocol and latest issue. Tab switches to the
+overview, Arrow/Page keys scroll, and `a` opens Advanced settings. An
+address-only worker still gets its own row and unique work; reconnecting creates
+a new session label. Both rates come from validated shares after a 30-second
+warm-up; they are statistical estimates, so compare the 1-hour rate with the
+device's own figure. Up to 64 closed sessions remain visible. JSON
+`device_details` contains the same rows, including last-share age and SV1-local
+reject counts.
+
+"Device says", Temp and Fan are the device's own report. Every 15 seconds
+Pickaxe asks each connected device on the local network (private, link-local,
+100.64.0.0/10 and IPv6 local addresses, never a public address) with read-only
+commands: the CGMiner API's `summary` and `estats` on port 4028 (Avalon and most
+SHA-256 miners) or Bitaxe's `/api/system/info`. It shows the device's 5-minute
+rate when reported, its hottest temperature and its fan speed. Each device gets
+three seconds per report. Device addresses are used only for these queries and
+never appear in the dashboard or JSON; no device setting is changed.
 
 The dashboard also shows the public authority key that devices must pin. Its
 private key is created beside the config as `chipnet.sv2-key`, protected with
@@ -191,19 +204,29 @@ unsaved block is acknowledged. Corrupt or mismatched state is preserved and
 causes a startup error. Abrupt-exit, restart, lost-reply and failed-write tests
 use synthetic solved blocks; actual node/ASIC evidence is recorded separately.
 
-The initial share difficulty is 4096, reduced when the network has easier work
-so firmware does not discard valid Chipnet blocks. A device target limit that
-cannot accommodate this work is rejected. Active jobs retain their assigned
-share target through subsequent target updates. SV1 adapter rejects now count
-in the shared dashboard totals; separate adapter/native connection error fields
-can both describe the same disconnected session. Vardiff, Knuth TP,
-distributed rigs and pool routing are still pending.
+Each device starts at share difficulty 4096. Vardiff (SRI's reference rules)
+then moves it toward about 20 shares a minute, for 1 TH/s miners and 1 PH/s
+ones alike, with a floor equal to 1 MH/s. A new target is sent as SetTarget and
+at once as a fresh job on the same template, so SV1 firmware receives
+`set_difficulty` and a notify that keeps work in flight. When the network has
+easier work, the device's target follows it down so firmware does not discard
+valid Chipnet blocks, and returns on the next normal template (Chipnet allows
+difficulty-1 blocks after a 20-minute gap). A device target limit that cannot
+accommodate easier block work is rejected. Older jobs accept shares at the
+easier of their own target and the current one, and each share is credited at
+the target it met. Only the first solved block on each parent is saved; later
+solutions on the same parent count as shares. SV1 adapter rejects count in the
+shared dashboard totals; separate adapter/native connection error fields can
+both describe the same disconnected session. Knuth TP, distributed rigs and
+pool routing are still pending.
 BCH uses an adjustable donation, defaulting to 1.5%: one third of it is mining
 work and two thirds is the block reward (0.5% and 1% at the default). The
 dashboard shows the total and both parts, each rounded up to two decimals; the
 combined effect of the two parts is slightly below the total (1.495% at 1.5%).
 `--donation 2` selects 2%; the dashboard's Advanced settings (`a`) change the
 saved setting in 0.5% steps from 0% to 100%. Token policies remain separate.
+Mainnet and Chipnet each donate to their own built-in address
+(`src/donation/bch.rs`), checked by the same payout validation as the miner's.
 The BCH policy is attached to each job; changing the setting never changes an
 in-flight job's coinbase. Saved solved blocks retain that policy across restart,
 and pre-donation journal entries replay their original bytes.

@@ -26,7 +26,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
-| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; vardiff pending |
+| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; workers page, read-only device reports and per-device vardiff host-tested, physical observation pending |
 | S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | Default 1.5% policy, dashboard controls and saved configuration implemented; host/reference checks and four live-node proposals pass; updated physical ASIC payout observation pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
@@ -543,3 +543,35 @@ Validation of this source checkpoint:
 At this checkpoint the physical ASIC service remains on `67e7774`; new physical
 payout evidence and exact pushed-commit CI must be recorded separately. This
 checkpoint does not complete the remaining requirements in the matrix above.
+
+## Workers page, device reports and vardiff checkpoint (2026-10-08)
+
+#### PR #38
+
+This checkpoint follows the operator's review of the Avalon Nano 3 service.
+
+- Donation: the setting lives in Advanced settings (`a`), from 0% to 100% in
+  0.5% steps, default 1.5%. One third is mining work and two thirds block
+  reward, each rounded up to two decimals when shown; this replaces the earlier
+  formula that compensated for their overlap. Mainnet and Chipnet each donate
+  to their own built-in address through the shared payout validation.
+- Workers page: the default dashboard page lists each worker with 5-minute and
+  1-hour rates, rejects, last share, difficulty and the device's own report;
+  Tab switches to the overview.
+- Device reports: read-only CGMiner API (`summary`, `estats`, port 4028) and
+  Bitaxe `/api/system/info` queries every 15 seconds, to local-network
+  addresses only, three seconds per device. Addresses never reach the display
+  or JSON.
+- Vardiff: SRI's reference rules per channel, about 20 shares a minute,
+  starting at 4096 with a 1 MH/s floor; a new target applies with a fresh job.
+- Chipnet difficulty-1 windows: the device target now returns after following
+  an easier block target. It previously stayed down until reconnect, flooding
+  shares (one Avalon Nano 3 reported 260,039 accepted shares at an average
+  difficulty of 85). Only the first solved block per parent is saved, so such a
+  burst can no longer fill the 64-block journal and stop the server.
+
+Validation: Windows all-feature host suite, 426 library and 16 binary tests
+passed, 19 opt-in tests ignored, 34 hardware tests filtered; formatting and
+all-target/all-feature Clippy with warnings denied passed. Vardiff convergence
+is simulated for 1 TH/s, 4 TH/s, 90 TH/s, 200 TH/s and 1 PH/s devices. Physical
+observation on the Avalon Nano 3 and exact pushed-commit CI are separate gates.
