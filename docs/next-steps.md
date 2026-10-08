@@ -71,7 +71,8 @@ Rigs switch to each successor job as soon as the coordinator starts it. The
 coordinator's dashboard and `--json` status list each rig (name, GPUs, rate,
 winners, time connected). A rig can be given backup coordinators, tried in
 order. Rigs ship in the default build. Still to come: a live test across
-machines.
+machines. The portable engine fixes from issue #30 are in #32 too (see
+Follow-ups from #22).
 
 ## Step 3: the gaps
 
@@ -132,11 +133,14 @@ Researched on 2026-10-05.
 
 ## Follow-ups from #22
 
-- Claim latency on rigs with slow GPUs: a winner is claimed once every GPU has
-  finished its current batch (at most about 350 ms on wgpu); claiming when the
-  winning GPU's batch ends would remove that wait.
-- Hardware not yet run: Intel GPUs, discrete AMD cards on native HIP, Linux GPUs
-  and Apple Silicon.
+- Done in #35: a winner is claimed as soon as the winning GPU's batch ends,
+  without waiting for the other GPUs' batches (up to about 350 ms on wgpu).
+- Intel GPUs: an HD 520 user found three portable-engine problems (issue #30);
+  #32 fixes all three (wgpu 30's crash on older Vulkan drivers through wgpu's
+  unreleased upstream fix, the self-test on T2 engines, and throttled mining
+  stuck at its first batch size), awaiting a run on the HD 520.
+- Hardware not yet run: discrete AMD cards on native HIP, Linux GPUs and Apple
+  Silicon.
 - Telemetry for GPUs mined through wgpu on Windows when no vendor tool is
   installed.
 - A longer test of an integrated GPU beside a discrete one (it added about 2% in
