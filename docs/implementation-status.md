@@ -651,10 +651,14 @@ a changed extranonce, a closed channel or a Reconnect closes the device for a
 fresh channel. Local mode keeps its exact behavior: per-share
 acknowledgements from Pickaxe's own server before firmware gets its reply.
 The donation does not apply in pool mode, since the pool builds the blocks.
+Backup pools repeat `--upstream` and `--upstream-key` in order: each device
+takes the first pool that completes the handshake, setup and channel, and a
+device whose pools all fail keeps a row with the last pool's reason.
 
 Evidence: an end-to-end test with Pickaxe's own server as the pool, reached
-by host name over Noise, mines two blocks with SV1 firmware, and the adapter's
-separate statistics count both verdicts. Read-only against SoloFury's BTC SV2
+by host name over Noise after a first pool with the wrong key is skipped,
+mines two blocks with SV1 firmware, and the adapter's separate statistics
+count both verdicts. Read-only against SoloFury's BTC SV2
 (`eu-btc.solofury.com:3333`) with a throwaway identity, an SV1 device stand-in
 got a 4-byte extranonce prefix, an 8-byte extranonce2, difficulty 1024 and a
 first job (opt-in test `real_sv2_pool_sends_work_to_sv1_firmware`). SoloFury's
@@ -664,7 +668,7 @@ refuse other versions, as SRI's `noise_sv2` 2.0 does, so Pickaxe names that
 reason on the workers page. Reported as
 [cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3).
 
-Validation: Windows all-feature host suite, 442 library and 16 binary tests
+Validation: Windows all-feature host suite, 443 library and 16 binary tests
 passed, 21 opt-in tests ignored, 31 hardware tests filtered; formatting,
 all-target/all-feature Clippy and the server-only Clippy with warnings
 denied passed.

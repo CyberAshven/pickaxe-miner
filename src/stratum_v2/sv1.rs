@@ -12,7 +12,10 @@
 //! adapter counts the pool's verdicts on the workers page itself.
 
 use super::{
-    channel::MAX_ACTIVE_JOBS, server::ServerStats, telemetry::ShareEvent, transport::Session,
+    channel::MAX_ACTIVE_JOBS,
+    server::ServerStats,
+    telemetry::ShareEvent,
+    transport::{Receiver, Sender, Session},
     wire::encoded,
 };
 use serde_json::{json, Value};
@@ -89,12 +92,15 @@ impl Upstream {
 
 /// All validation and block submission still pass through the pinned SV2
 /// connection, including connections from older SV1-only ASIC firmware.
+/// Each device takes the first of `upstreams` that opens a channel for it:
+/// this server's own listener, or remote pools in failover order.
 pub fn run(
     listener: TcpListener,
-    upstream: Upstream,
+    upstreams: Vec<Upstream>,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
+    let upstreams: Arc<[Upstream]> = upstreams.into();
     listener
         .set_nonblocking(true)
         .map_err(|_| "cannot configure SV1 listener")?;
@@ -114,9 +120,9 @@ pub fn run(
                 Ok((stream, _)) if devices.len() < 64 => {
                     let stop = stop.clone();
                     let stats = stats.clone();
-                    let upstream = upstream.clone();
+                    let upstreams = upstreams.clone();
                     devices.push(thread::spawn(move || {
-                        let _ = serve(stream, &upstream, &stop, &stats);
+                        let _ = serve(stream, &upstreams, &stop, &stats);
                     }));
                 }
                 Ok(_) => (),
@@ -148,19 +154,54 @@ fn connect(address: &str) -> Result<TcpStream, String> {
         .ok_or_else(|| "SV2 server unavailable".into())
 }
 
+/// #### PR #40
+/// A channel opened for one device at one upstream.
+struct Opened {
+    send: Sender,
+    receive: Receiver,
+    bridge: Bridge,
+    /// The adapter's end of the link; this server's own view of the device
+    /// uses the same address, which joins the two into one row.
+    local: SocketAddr,
+}
+
 fn serve(
     stream: TcpStream,
-    upstream: &Upstream,
+    upstreams: &[Upstream],
     stop: &AtomicBool,
     stats: &Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
-    let socket = connect(&upstream.address)?;
-    let peer = socket
-        .local_addr()
-        .map_err(|_| "cannot identify adapter socket")?;
+    // Pools in failover order: the first that completes the handshake, the
+    // setup and the channel serves this device.
+    let mut failure = String::from("SV2 server unavailable");
+    let mut chosen = None;
+    for upstream in upstreams {
+        match open(upstream) {
+            Ok(opened) => {
+                chosen = Some((upstream, opened));
+                break;
+            }
+            Err(error) => failure = error,
+        }
+    }
+    let Some((upstream, opened)) = chosen else {
+        // The device still gets a row, with the last pool's reason.
+        if let Ok(mut stats) = stats.lock() {
+            if let Ok(device) = stream.peer_addr() {
+                let now = Instant::now();
+                let id = stats.device_stats.connect(device, true, now);
+                stats.device_stats.set_address(id, device.ip());
+                stats.sv1_connection_errors = stats.sv1_connection_errors.saturating_add(1);
+                stats.device_stats.close(id, true, Some(&failure), now);
+            }
+        }
+        return Err(failure);
+    };
     let id = {
         let mut stats = stats.lock().map_err(|_| "mining statistics unavailable")?;
-        let id = stats.device_stats.connect(peer, true, Instant::now());
+        let id = stats
+            .device_stats
+            .connect(opened.local, true, Instant::now());
         // The firmware's own address, for read-only device reports.
         if let Ok(device) = stream.peer_addr() {
             stats.device_stats.set_address(id, device.ip());
@@ -172,7 +213,7 @@ fn serve(
         }
         id
     };
-    let result = serve_session(stream, socket, upstream, stop, stats, id);
+    let result = serve_session(stream, opened, upstream, stop, stats, id);
     if let Ok(mut stats) = stats.lock() {
         if upstream.remote {
             stats.connections = stats.connections.saturating_sub(1);
@@ -190,14 +231,13 @@ fn serve(
     result
 }
 
-fn serve_session(
-    stream: TcpStream,
-    socket: TcpStream,
-    upstream: &Upstream,
-    stop: &AtomicBool,
-    stats: &Arc<Mutex<ServerStats>>,
-    device: u64,
-) -> Result<(), String> {
+/// Opens an extended channel for one device at `upstream`: TCP, the pinned
+/// Noise handshake, the setup and the channel.
+fn open(upstream: &Upstream) -> Result<Opened, String> {
+    let socket = connect(&upstream.address)?;
+    let local = socket
+        .local_addr()
+        .map_err(|_| "cannot identify adapter socket")?;
     let peer = socket
         .peer_addr()
         .map_err(|_| "cannot identify adapter upstream")?;
@@ -250,7 +290,28 @@ fn serve_session(
     }
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
-    let mut bridge = Bridge::new(opened, upstream.remote)?;
+    Ok(Opened {
+        bridge: Bridge::new(opened, upstream.remote)?,
+        send,
+        receive,
+        local,
+    })
+}
+
+fn serve_session(
+    stream: TcpStream,
+    opened: Opened,
+    upstream: &Upstream,
+    stop: &AtomicBool,
+    stats: &Arc<Mutex<ServerStats>>,
+    device: u64,
+) -> Result<(), String> {
+    let Opened {
+        mut send,
+        mut receive,
+        mut bridge,
+        ..
+    } = opened;
     let mut downstream = Lines::new(stream)?;
     let started = Instant::now();
     while !stop.load(Ordering::Relaxed) {

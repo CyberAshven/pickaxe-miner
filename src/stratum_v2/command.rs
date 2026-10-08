@@ -54,27 +54,25 @@ pub fn run(
     // #### PR #40
     // Pool mode: SV1 devices mine at a remote SV2 pool through the adapter,
     // and no local node or SV2 server runs.
-    let pool = match &action {
+    let pools = match &action {
         StratumV2Command::Serve {
-            upstream: Some(address),
+            upstream,
             upstream_key,
             upstream_user,
             ..
-        } => Some(pool_upstream(
-            config,
-            address,
-            upstream_key.as_deref(),
-            upstream_user.as_deref(),
-        )?),
-        _ => None,
+        } if !upstream.is_empty() => {
+            pool_upstreams(config, upstream, upstream_key, upstream_user.as_deref())?
+        }
+        _ => Vec::new(),
     };
-    if matches!(action, StratumV2Command::Serve { .. }) && pool.is_none() {
+    if matches!(action, StratumV2Command::Serve { .. }) && pools.is_empty() {
         config::validate_payout_address(config.network, &config.payout_address)
             .map_err(|_| "a valid payout for the selected network is required")?;
     }
-    let node = match pool {
-        None => Some(preflight(config)?),
-        Some(_) => None,
+    let node = if pools.is_empty() {
+        Some(preflight(config)?)
+    } else {
+        None
     };
     let StratumV2Command::Serve {
         listen,
@@ -123,12 +121,13 @@ pub fn run(
         .as_ref()
         .map(server::authority_public)
         .transpose()?;
-    // The SV1 adapter's upstream: the pool, or this server's own listener.
-    // Wildcard listeners are dialed through local loopback, never via an
-    // arbitrary network route. The SV2 authority remains pinned.
-    let upstream = match (&pool, bound, public) {
-        (Some(pool), _, _) => pool.clone(),
-        (None, Some(mut local), Some(public)) => {
+    // The SV1 adapter's upstreams: the pools in failover order, or this
+    // server's own listener. Wildcard listeners are dialed through local
+    // loopback, never via an arbitrary network route. The SV2 authority
+    // remains pinned.
+    let upstreams = match (bound, public) {
+        _ if !pools.is_empty() => pools.clone(),
+        (Some(mut local), Some(public)) => {
             if local.ip().is_unspecified() {
                 local.set_ip(if local.is_ipv4() {
                     std::net::Ipv4Addr::LOCALHOST.into()
@@ -136,11 +135,18 @@ pub fn run(
                     std::net::Ipv6Addr::LOCALHOST.into()
                 });
             }
-            super::sv1::Upstream::local(local, public)
+            vec![super::sv1::Upstream::local(local, public)]
         }
         _ => return Err("mining server unavailable".into()),
     };
-    let pool_address = pool.as_ref().map(|pool| pool.address.clone());
+    // The pools as the dashboard and status show them; never the identity.
+    let pool_address = (!pools.is_empty()).then(|| {
+        pools
+            .iter()
+            .map(|pool| pool.address.as_str())
+            .collect::<Vec<_>>()
+            .join(" → ")
+    });
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
     ctrlc::set_handler(move || stop_signal.store(true, Ordering::Relaxed))
@@ -178,8 +184,8 @@ pub fn run(
     let firmware = sv1_listener.map(|listener| {
         let stop = stop.clone();
         let stats = stats.clone();
-        let upstream = upstream.clone();
-        thread::spawn(move || super::sv1::run(listener, upstream, stop, stats))
+        let upstreams = upstreams.clone();
+        thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
     });
     // #### PR #40
     // Device reports every 15 seconds, outside the stats lock, from asic-rs
@@ -442,34 +448,21 @@ pub fn run(
 }
 
 /// #### PR #40
-/// The remote SV2 pool from `--upstream`, `--upstream-key` and
-/// `--upstream-user`. The key is the pool's authority public key as SV2
-/// pools publish it: Base58Check of version 1 and the 32-byte x-only key,
-/// the form this server prints for its own. The identity defaults to the
+/// The remote SV2 pools from `--upstream`, `--upstream-key` and
+/// `--upstream-user`, in failover order: one key per pool, in the same order.
+/// A key is the pool's authority public key as SV2 pools publish it:
+/// Base58Check of version 1 and the 32-byte x-only key, the form this server
+/// prints for its own. The identity, shared by all the pools, defaults to the
 /// payout address, which solo SV2 pools pay; it is never printed.
-fn pool_upstream(
+fn pool_upstreams(
     config: &RuntimeConfig,
-    address: &str,
-    key: Option<&str>,
+    addresses: &[String],
+    keys: &[String],
     user: Option<&str>,
-) -> Result<super::sv1::Upstream, String> {
-    let address = address.trim();
-    if address
-        .rsplit_once(':')
-        .is_none_or(|(host, port)| host.is_empty() || port.parse::<u16>().is_err())
-    {
-        return Err("--upstream must be HOST:PORT".into());
+) -> Result<Vec<super::sv1::Upstream>, String> {
+    if keys.len() != addresses.len() {
+        return Err("give one --upstream-key for each --upstream, in the same order".into());
     }
-    let invalid_key = "--upstream-key is not an SV2 authority public key";
-    let decoded = stratum_core::bitcoin::base58::decode_check(
-        key.ok_or("--upstream-key is required with --upstream")?
-            .trim(),
-    )
-    .map_err(|_| invalid_key)?;
-    let authority: [u8; 32] = match decoded.as_slice() {
-        [1, 0, key @ ..] => key.try_into().map_err(|_| invalid_key)?,
-        _ => return Err(invalid_key.into()),
-    };
     let identity = match user.map(str::trim) {
         Some(user) => {
             if user.is_empty() || user.len() > 255 || user.chars().any(char::is_control) {
@@ -484,12 +477,32 @@ fn pool_upstream(
             config.payout_address.clone()
         }
     };
-    Ok(super::sv1::Upstream {
-        address: address.to_owned(),
-        authority,
-        identity,
-        remote: true,
-    })
+    addresses
+        .iter()
+        .zip(keys)
+        .map(|(address, key)| {
+            let address = address.trim();
+            if address
+                .rsplit_once(':')
+                .is_none_or(|(host, port)| host.is_empty() || port.parse::<u16>().is_err())
+            {
+                return Err("--upstream must be HOST:PORT".into());
+            }
+            let invalid_key = "--upstream-key is not an SV2 authority public key";
+            let decoded =
+                stratum_core::bitcoin::base58::decode_check(key.trim()).map_err(|_| invalid_key)?;
+            let authority: [u8; 32] = match decoded.as_slice() {
+                [1, 0, key @ ..] => key.try_into().map_err(|_| invalid_key)?,
+                _ => return Err(invalid_key.into()),
+            };
+            Ok(super::sv1::Upstream {
+                address: address.to_owned(),
+                authority,
+                identity: identity.clone(),
+                remote: true,
+            })
+        })
+        .collect()
 }
 
 fn save_donation(path: &Path, value: BchDonation) -> Result<(), ()> {
@@ -1406,28 +1419,59 @@ mod tests {
         let mut encoded = vec![1, 0];
         encoded.extend([7u8; 32]);
         let key = stratum_core::bitcoin::base58::encode_check(&encoded);
+        let one = |address: &str, key: &str, user: Option<&str>| {
+            pool_upstreams(&config, &[address.to_owned()], &[key.to_owned()], user)
+                .map(|mut pools| pools.remove(0))
+        };
         // A worker name for an account pool.
-        let pool =
-            pool_upstream(&config, " pool.example:3336 ", Some(&key), Some("me.rig1")).unwrap();
+        let pool = one(" pool.example:3336 ", &key, Some("me.rig1")).unwrap();
         assert_eq!(pool.address, "pool.example:3336");
         assert_eq!(pool.authority, [7u8; 32]);
         assert_eq!(pool.identity, "me.rig1");
         assert!(pool.remote);
         // Without one, a solo pool's identity is the payout address, which
         // must be valid for the network.
-        assert!(pool_upstream(&config, "pool.example:3336", Some(&key), None).is_err());
+        assert!(one("pool.example:3336", &key, None).is_err());
         config.payout_address = "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp".into();
-        let pool = pool_upstream(&config, "pool.example:3336", Some(&key), None).unwrap();
-        assert_eq!(pool.identity, config.payout_address);
+        let one = |address: &str, key: &str, user: Option<&str>| {
+            pool_upstreams(&config, &[address.to_owned()], &[key.to_owned()], user)
+                .map(|mut pools| pools.remove(0))
+        };
+        assert_eq!(
+            one("pool.example:3336", &key, None).unwrap().identity,
+            config.payout_address
+        );
         // Malformed input fails before any connection.
-        assert!(pool_upstream(&config, "pool.example", Some(&key), None).is_err());
-        assert!(pool_upstream(&config, "pool.example:3336", Some("not-a-key"), None).is_err());
-        assert!(pool_upstream(&config, "pool.example:3336", None, None).is_err());
-        assert!(pool_upstream(&config, "pool.example:3336", Some(&key), Some("a\nb")).is_err());
+        assert!(one("pool.example", &key, None).is_err());
+        assert!(one("pool.example:3336", "not-a-key", None).is_err());
+        assert!(one("pool.example:3336", &key, Some("a\nb")).is_err());
         let mut wrong_version = vec![2, 0];
         wrong_version.extend([7u8; 32]);
         let wrong = stratum_core::bitcoin::base58::encode_check(&wrong_version);
-        assert!(pool_upstream(&config, "pool.example:3336", Some(&wrong), None).is_err());
+        assert!(one("pool.example:3336", &wrong, None).is_err());
+        // Backups: one key per pool, in order, sharing the identity.
+        let pools = pool_upstreams(
+            &config,
+            &["a.example:3336".into(), "b.example:3336".into()],
+            &[key.clone(), key.clone()],
+            Some("me"),
+        )
+        .unwrap();
+        assert_eq!(
+            pools
+                .iter()
+                .map(|pool| pool.address.as_str())
+                .collect::<Vec<_>>(),
+            ["a.example:3336", "b.example:3336"]
+        );
+        assert!(pools.iter().all(|pool| pool.identity == "me"));
+        assert!(pool_upstreams(
+            &config,
+            &["a.example:3336".into(), "b.example:3336".into()],
+            &[key],
+            Some("me"),
+        )
+        .is_err());
     }
 
     #[test]

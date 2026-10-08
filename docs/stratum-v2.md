@@ -212,8 +212,16 @@ address and authority key:
 
 ```text
 pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
-  --upstream POOL-HOST:PORT --upstream-key POOL-AUTHORITY-KEY [--upstream-user IDENTITY]
+  --upstream POOL-HOST:PORT --upstream-key POOL-AUTHORITY-KEY [--upstream-user IDENTITY] \
+  [--upstream BACKUP-HOST:PORT --upstream-key BACKUP-AUTHORITY-KEY ...]
 ```
+
+Repeat `--upstream` and `--upstream-key`, in the same order, for backup pools.
+Each device takes the first pool that completes the handshake, the setup and
+the channel, so a pool that is down, or one whose certificate fails, is
+skipped; a device that reconnects starts again from the first pool. All pools
+share the identity. If every pool fails, the device's row shows the last
+pool's reason.
 
 No node runs and no SV2 listener opens; SV1 devices point at
 `stratum+tcp://LAN-IP:3333` as usual. Each device gets its own encrypted SV2

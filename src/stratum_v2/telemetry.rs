@@ -373,6 +373,7 @@ pub fn connection_reason(error: &str) -> &'static str {
             "upstream asked to reconnect"
         }
         "SV2 upstream closed the channel" => "upstream closed the channel",
+        "invalid SV2 authority key" => "upstream key is not an SV2 authority key",
         "SV2 certificate version unsupported" => {
             "upstream certificate version is not SV2's; the pool must fix it"
         }

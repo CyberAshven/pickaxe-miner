@@ -117,12 +117,14 @@ pub enum StratumV2Command {
         /// #### PR #40
         /// Mine at a remote SV2 pool instead of your own node: HOST:PORT of
         /// the pool (another Pickaxe server, or a BCH SV2 pool). SV1 devices
-        /// connect to --sv1-listen; no node is needed.
+        /// connect to --sv1-listen; no node is needed. Repeat for backup
+        /// pools, tried in order.
         #[arg(long, requires_all = ["upstream_key", "sv1_listen"], conflicts_with = "donation")]
-        upstream: Option<String>,
-        /// The pool's authority public key, as the pool publishes it.
+        upstream: Vec<String>,
+        /// The pool's authority public key, as the pool publishes it; one per
+        /// --upstream, in the same order.
         #[arg(long, requires = "upstream")]
-        upstream_key: Option<String>,
+        upstream_key: Vec<String>,
         /// The identity the pool knows you by: an account or worker name, or
         /// for a solo pool your payout address. Defaults to the configured
         /// payout address.
@@ -361,7 +363,7 @@ mod tests {
         let Some(Commands::StratumV2 {
             command:
                 StratumV2Command::Serve {
-                    upstream: Some(upstream),
+                    upstream,
                     upstream_user: Some(user),
                     ..
                 },
@@ -369,10 +371,33 @@ mod tests {
         else {
             panic!("pool options missing")
         };
-        assert_eq!(
-            (upstream.as_str(), user.as_str()),
-            ("pool.example:3336", "me.rig1")
-        );
+        assert_eq!(upstream, ["pool.example:3336"]);
+        assert_eq!(user, "me.rig1");
+        // Backup pools repeat both options, in order.
+        let cli = with(&[
+            "--upstream-key",
+            "key-a",
+            "--upstream",
+            "backup.example:3336",
+            "--upstream-key",
+            "key-b",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    upstream,
+                    upstream_key,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("pool options missing")
+        };
+        assert_eq!(upstream, ["pool.example:3336", "backup.example:3336"]);
+        assert_eq!(upstream_key, ["key-a", "key-b"]);
         // The pool's key and a listener for the devices are required.
         assert!(with(&["--sv1-listen", "0.0.0.0:3333"]).is_err());
         assert!(with(&["--upstream-key", "key"]).is_err());

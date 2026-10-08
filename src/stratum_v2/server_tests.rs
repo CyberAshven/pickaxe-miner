@@ -642,7 +642,7 @@ impl FirmwareAdapter {
             thread::spawn(move || {
                 super::sv1::run(
                     listener,
-                    super::sv1::Upstream::local(upstream, authority),
+                    vec![super::sv1::Upstream::local(upstream, authority)],
                     stop,
                     stats,
                 )
@@ -925,17 +925,20 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
     let address = listener.local_addr().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(ServerStats::default()));
-    let upstream = super::sv1::Upstream {
+    // The first pool pins a key the pool does not hold, so its handshake
+    // fails and the device falls back to the second, which is correct.
+    let pool_with = |authority| super::sv1::Upstream {
         // A host name, resolved at each connection.
         address: format!("localhost:{}", pool.address.port()),
-        authority: pool.authority,
+        authority,
         identity: payout(),
         remote: true,
     };
+    let upstreams = vec![pool_with([3; 32]), pool_with(pool.authority)];
     let thread = {
         let stop = stop.clone();
         let stats = stats.clone();
-        thread::spawn(move || super::sv1::run(listener, upstream, stop, stats))
+        thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
     };
     let adapter = FirmwareAdapter {
         stop,
@@ -1011,7 +1014,7 @@ fn real_sv2_pool_sends_work_to_sv1_firmware() {
     let thread = {
         let stop = stop.clone();
         let stats = stats.clone();
-        thread::spawn(move || super::sv1::run(listener, upstream, stop, stats))
+        thread::spawn(move || super::sv1::run(listener, vec![upstream], stop, stats))
     };
     let _adapter = FirmwareAdapter {
         stop,
@@ -1072,4 +1075,53 @@ fn real_sv2_pool_sends_work_to_sv1_firmware() {
     );
     assert!(difficulty > 0.0);
     write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+#[test]
+fn a_device_whose_pools_all_fail_still_shows_the_reason() {
+    let pool = Running::new(false);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(ServerStats::default()));
+    // The only pool pins a valid key the pool does not hold, then a value
+    // that is no key at all.
+    let upstreams = vec![
+        super::sv1::Upstream {
+            address: pool.address.to_string(),
+            authority: [3; 32],
+            identity: payout(),
+            remote: true,
+        },
+        super::sv1::Upstream {
+            address: pool.address.to_string(),
+            authority: server::authority_public(&[18; 32]).unwrap(),
+            identity: payout(),
+            remote: true,
+        },
+    ];
+    let thread = {
+        let stop = stop.clone();
+        let stats = stats.clone();
+        thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
+    };
+    let _adapter = FirmwareAdapter {
+        stop,
+        thread: Some(thread),
+        address,
+    };
+    let device = TcpStream::connect(address).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = stats.lock().unwrap().device_stats.snapshots(Instant::now());
+        if let Some(row) = rows.first() {
+            assert!(!row.connected);
+            assert_eq!(row.adapter_error, Some("authentication or framing failed"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "no row for the device");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(stats.lock().unwrap().sv1_connection_errors, 1);
+    drop(device);
 }

@@ -1581,8 +1581,8 @@ fn main() {
                             listen: std::net::SocketAddr::from(([0, 0, 0, 0], 3336)),
                             sv1_listen: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3333))),
                             donation: None,
-                            upstream: None,
-                            upstream_key: None,
+                            upstream: Vec::new(),
+                            upstream_key: Vec::new(),
                             upstream_user: None,
                         };
                         #[cfg(feature = "stratum-v2")]
