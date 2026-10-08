@@ -921,6 +921,33 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
             })
         })
         .collect();
+    // Built apart from the status below, which is already near the json!
+    // macro's recursion limit.
+    let rigs = snapshot.rigs.as_ref().map(|rigs| {
+        let each: Vec<serde_json::Value> = rigs
+            .rigs
+            .iter()
+            .map(|rig| {
+                serde_json::json!({
+                    "name": rig.name,
+                    "gpus": rig.gpus,
+                    "rate": rig.rate,
+                    "winners": rig.winners,
+                    "connected_secs": rig.connected_secs,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "listen": rigs.listen,
+            "coordinator_key": rigs.key,
+            "connected": rigs.connected,
+            "gpus": rigs.gpus,
+            "rate": rigs.rate,
+            "winners": rigs.winners,
+            "rejected": rigs.rejected,
+            "rigs": each,
+        })
+    });
     serde_json::json!({
         "event": "status",
         "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
@@ -960,6 +987,7 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "gpu_telemetry": &snapshot.gpu_telemetry,
         "gpu_efficiency_candidates_per_watt": efficiency,
         "gpus": gpus,
+        "rigs": rigs,
     })
 }
 
@@ -1502,8 +1530,19 @@ fn main() {
             // #### PR #32
             // A rig mines its coordinator's jobs: no setup, payout, Fulcrum or
             // node of its own, and it never claims; the coordinator does.
-            if let Some(coordinator) = args.coordinator.as_deref() {
-                let key = args.coordinator_key.as_deref().unwrap_or_default();
+            if !args.coordinator.is_empty() {
+                if args.coordinator.len() != args.coordinator_key.len() {
+                    eprintln!(
+                        "error: give one --coordinator-key for each --coordinator, in the same order"
+                    );
+                    exit_after_error(2);
+                }
+                let coordinators: Vec<(String, String)> = args
+                    .coordinator
+                    .iter()
+                    .cloned()
+                    .zip(args.coordinator_key.iter().cloned())
+                    .collect();
                 let result = (|| {
                     let _gpu_lock = mining_lock::acquire_gpu_lock()?;
                     let stop = Arc::new(AtomicBool::new(false));
@@ -1511,8 +1550,7 @@ fn main() {
                     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
                         .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
                     rigs::run_rig(
-                        coordinator,
-                        key,
+                        &coordinators,
                         &selected_gpus,
                         cfg.intensity,
                         args.json,

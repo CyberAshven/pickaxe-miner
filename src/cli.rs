@@ -65,18 +65,21 @@ pub struct Cli {
     pub rigs_listen: Option<std::net::SocketAddr>,
 
     /// Mine as a rig of the coordinator at this address; it claims every win.
+    /// Repeat for backup coordinators, tried in order.
     #[arg(
         long,
         global = true,
         value_name = "HOST:PORT",
         requires = "coordinator_key",
-        conflicts_with = "rigs_listen"
+        conflicts_with = "rigs_listen",
+        action = clap::ArgAction::Append
     )]
-    pub coordinator: Option<String>,
+    pub coordinator: Vec<String>,
 
-    /// The key the coordinator prints at start, so a rig trusts only it.
-    #[arg(long, global = true, value_name = "KEY")]
-    pub coordinator_key: Option<String>,
+    /// The key each coordinator prints at start, so a rig trusts only it.
+    /// Give one per --coordinator, in the same order.
+    #[arg(long, global = true, value_name = "KEY", action = clap::ArgAction::Append)]
+    pub coordinator_key: Vec<String>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -303,7 +306,22 @@ mod tests {
             "key",
         ])
         .unwrap();
-        assert_eq!(cli.coordinator.as_deref(), Some("192.0.2.1:3340"));
+        assert_eq!(cli.coordinator, ["192.0.2.1:3340"]);
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--coordinator",
+            "192.0.2.1:3340",
+            "--coordinator-key",
+            "main",
+            "--coordinator",
+            "192.0.2.2:3340",
+            "--coordinator-key",
+            "backup",
+        ])
+        .unwrap();
+        assert_eq!(cli.coordinator, ["192.0.2.1:3340", "192.0.2.2:3340"]);
+        assert_eq!(cli.coordinator_key, ["main", "backup"]);
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_err()
         );

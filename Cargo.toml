@@ -9,7 +9,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 # Native builds carry the portable T2 engine so AMD and Intel GPUs mine through Vulkan.
-default = ["rust-t2", "portable-wgpu"]
+default = ["rust-t2", "portable-wgpu", "stratum-v2"]
 incremental-k = []
 tail-grind = []
 # Default Rust implementation of the complete CUDA T2 mining path.
@@ -23,8 +23,9 @@ shared-rust-t2 = []
 # #### PR #22: development-only browser export that checks the portable
 # engine against the CPU (tools/build-browser.py --check). Not in releases.
 browser-check = ["portable-wgpu"]
-# Optional native Stratum server and firmware adapter. CI checks this feature
-# with all-features; enable the server build with --features stratum-v2.
+# #### PR #32: Stratum V2 for the BCH ASIC server, its firmware adapter and
+# the encrypted link between a GPU coordinator and its rigs. In the default
+# build since #32; the browser and portable builds choose their own features.
 stratum-v2 = ["dep:stratum-core"]
 
 [dependencies]

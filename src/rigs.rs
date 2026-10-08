@@ -24,6 +24,30 @@ pub struct RigSummary {
     pub rate: f64,
     pub winners: u64,
     pub rejected: u64,
+    /// One line per connected rig, in connection order.
+    pub rigs: Vec<RigLine>,
+}
+
+/// One connected rig as the coordinator shows it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RigLine {
+    pub name: String,
+    pub gpus: usize,
+    pub rate: f64,
+    pub winners: u64,
+    pub connected_secs: u64,
+}
+
+/// A rig's name as sent, without control characters that could disturb a
+/// terminal, and at most 64 characters.
+#[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
+fn clean_name(name: &str) -> String {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+    if name.trim().is_empty() {
+        "rig".into()
+    } else {
+        name
+    }
 }
 
 /// A job on its way to a rig. Large integers travel as text.
@@ -276,10 +300,12 @@ mod net {
         rejected: u64,
     }
 
-    #[derive(Default)]
     struct RigRow {
+        name: String,
         gpus: usize,
         rate: f64,
+        winners: u64,
+        since: Instant,
     }
 
     fn lock(state: &Mutex<HubState>) -> MutexGuard<'_, HubState> {
@@ -393,6 +419,17 @@ mod net {
                 rate: state.rigs.values().map(|rig| rig.rate).sum(),
                 winners: state.received,
                 rejected: state.rejected,
+                rigs: state
+                    .rigs
+                    .values()
+                    .map(|rig| RigLine {
+                        name: rig.name.clone(),
+                        gpus: rig.gpus,
+                        rate: rig.rate,
+                        winners: rig.winners,
+                        connected_secs: rig.since.elapsed().as_secs(),
+                    })
+                    .collect(),
             }
         }
     }
@@ -421,7 +458,16 @@ mod net {
             let mut state = lock(&state);
             state.next_id = state.next_id.wrapping_add(1);
             let id = state.next_id;
-            state.rigs.insert(id, RigRow::default());
+            state.rigs.insert(
+                id,
+                RigRow {
+                    name: "rig".into(),
+                    gpus: 0,
+                    rate: 0.0,
+                    winners: 0,
+                    since: Instant::now(),
+                },
+            );
             id
         };
         let mut sent = 0u64;
@@ -451,6 +497,7 @@ mod net {
                         let hello: RigHello =
                             serde_json::from_slice(&bytes).map_err(|_| "malformed rig hello")?;
                         if let Some(row) = lock(&state).rigs.get_mut(&id) {
+                            row.name = clean_name(&hello.name);
                             row.gpus = hello.gpus.min(64);
                         }
                     }
@@ -472,6 +519,9 @@ mod net {
                         let winner = VerifiedWinner::try_from(wire)?;
                         let mut state = lock(&state);
                         state.received = state.received.saturating_add(1);
+                        if let Some(row) = state.rigs.get_mut(&id) {
+                            row.winners = row.winners.saturating_add(1);
+                        }
                         let checked = state.job.as_ref().is_some_and(|job| {
                             crate::mining_job::verify_rig_winner(&winner, job).is_ok()
                         });
@@ -491,16 +541,27 @@ mod net {
         lock(&state).rigs.remove(&id);
     }
 
-    fn connect(
-        coordinator: &str,
-        authority: [u8; 32],
-    ) -> Result<
-        (
-            crate::stratum_v2::transport::Sender,
-            crate::stratum_v2::transport::Receiver,
-        ),
-        String,
-    > {
+    type Link = (
+        crate::stratum_v2::transport::Sender,
+        crate::stratum_v2::transport::Receiver,
+    );
+
+    /// Connects to the first reachable coordinator, in the order given: the
+    /// first is the main one, the others are backups.
+    pub(super) fn connect_first(
+        coordinators: &[(String, [u8; 32])],
+    ) -> Result<(usize, Link), String> {
+        let mut last = String::from("no coordinator given");
+        for (index, (address, authority)) in coordinators.iter().enumerate() {
+            match connect(address, *authority) {
+                Ok(link) => return Ok((index, link)),
+                Err(error) => last = format!("{address}: {error}"),
+            }
+        }
+        Err(last)
+    }
+
+    fn connect(coordinator: &str, authority: [u8; 32]) -> Result<Link, String> {
         let address = coordinator
             .to_socket_addrs()
             .map_err(|_| "cannot resolve the coordinator address")?
@@ -527,14 +588,16 @@ mod net {
     /// The rig side: mines the coordinator's jobs on every local GPU and sends
     /// winners back. A rig never talks to the chain and never claims.
     pub fn run_rig(
-        coordinator: &str,
-        key: &str,
+        coordinators: &[(String, String)],
         gpus: &[GpuDevice],
         intensity: u8,
         json: bool,
         stop: Arc<AtomicBool>,
     ) -> Result<(), String> {
-        let authority = decode_key(key)?;
+        let coordinators = coordinators
+            .iter()
+            .map(|(address, key)| Ok((address.clone(), decode_key(key)?)))
+            .collect::<Result<Vec<_>, String>>()?;
         let devices: Vec<(BackendKind, usize)> = gpus
             .iter()
             .map(|gpu| (gpu.backend, gpu.index as usize))
@@ -552,13 +615,16 @@ mod net {
         let mut backoff = Duration::from_secs(1);
         let mut winners_sent = 0u64;
         while !stop.load(Ordering::Relaxed) {
-            match connect(coordinator, authority) {
-                Ok((mut sender, mut receiver)) => {
+            match connect_first(&coordinators) {
+                Ok((index, (mut sender, mut receiver))) => {
                     backoff = Duration::from_secs(1);
                     report(
                         json,
                         "connected",
-                        serde_json::json!({"coordinator": coordinator}),
+                        serde_json::json!({
+                            "coordinator": coordinators[index].0,
+                            "backup": index > 0,
+                        }),
                     );
                     let link = (|| -> Result<(), String> {
                         sender.send(frame(
@@ -715,8 +781,7 @@ mod stub {
     }
 
     pub fn run_rig(
-        _coordinator: &str,
-        _key: &str,
+        _coordinators: &[(String, String)],
         _gpus: &[crate::backend::GpuDevice],
         _intensity: u8,
         _json: bool,
@@ -818,6 +883,9 @@ mod tests {
         let summary = hub.summary();
         assert_eq!((summary.connected, summary.gpus), (1, 2));
         assert_eq!((summary.winners, summary.rejected), (2, 1));
+        assert_eq!(summary.rigs.len(), 1);
+        assert_eq!(summary.rigs[0].name, "test");
+        assert_eq!(summary.rigs[0].winners, 2);
         assert_eq!(hub.take_winners(), vec![winner]);
         assert!(!hub.has_winner());
         // A rig pinning another key does not accept this coordinator.
@@ -827,6 +895,24 @@ mod tests {
         .unwrap();
         let stranger = TcpStream::connect(hub.listen()).unwrap();
         assert!(Session::initiate(stranger, other).is_err());
+        // A rig falls back to a backup when the main coordinator is down.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let down = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        let (index, _) = net::connect_first(&[
+            (down.clone(), authority),
+            (hub.listen().to_owned(), authority),
+        ])
+        .unwrap();
+        assert_eq!(index, 1);
+        assert!(net::connect_first(&[(down, authority)]).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rig_names_cannot_disturb_the_terminal() {
+        assert_eq!(clean_name("rig\u{1b}[2Jone\n"), "rig[2Jone");
+        assert_eq!(clean_name("   "), "rig");
+        assert_eq!(clean_name(&"x".repeat(100)).len(), 64);
     }
 }

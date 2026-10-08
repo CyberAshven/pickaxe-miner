@@ -67,10 +67,11 @@ extension (type `0x5043`, JSON payloads). The coordinator checks every rig
 winner (job, Schnorr signature, digest, proof of work, a search key separate
 from the payout) before its claim path, which rebuilds the transaction from
 the coordinator's own job and payouts, so a rig cannot redirect a reward.
-Rigs switch to each successor job as soon as the coordinator starts it, and
-the dashboard shows the rigs connected, their GPUs, rate and winners. Still to
-come: rig rows in the workers table and `watch`, a backup coordinator, and a
-live test across machines.
+Rigs switch to each successor job as soon as the coordinator starts it. The
+coordinator's dashboard and `--json` status list each rig (name, GPUs, rate,
+winners, time connected). A rig can be given backup coordinators, tried in
+order. Rigs ship in the default build. Still to come: a live test across
+machines.
 
 ## Step 3: the gaps
 

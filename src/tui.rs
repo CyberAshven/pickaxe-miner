@@ -3141,6 +3141,23 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
     ];
     fields.splice(1..1, per_gpu);
     if let Some(rigs) = snapshot.rigs.as_ref() {
+        for (offset, rig) in rigs.rigs.iter().enumerate() {
+            fields.insert(
+                1 + offset,
+                RuntimeField::new(
+                    "  Rig",
+                    wrap(format!(
+                        "{} · {} GPUs · {} · winners {} · {}m",
+                        rig.name,
+                        rig.gpus,
+                        crate::telemetry::format_hash_rate(rig.rate),
+                        rig.winners,
+                        rig.connected_secs / 60
+                    )),
+                    4,
+                ),
+            );
+        }
         fields.insert(
             1,
             RuntimeField::new(

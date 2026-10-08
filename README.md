@@ -86,7 +86,7 @@ Your other machines can mine as rigs of one coordinator, so they never compete f
 | The coordinator | your usual `mine` command plus `--rigs-listen 0.0.0.0:3340` |
 | Each rig | `pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key>` |
 
-The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. For now this needs a build with `--features stratum-v2`.
+The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. Repeat `--coordinator` and `--coordinator-key` (in the same order) to give a rig backup coordinators, tried in order.
 
 ### Browser miner
 
