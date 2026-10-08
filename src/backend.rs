@@ -659,7 +659,7 @@ struct CudaInfo {
 /// Reads CUDA device details for selection and display.
 fn cuda_device_info(index: u32, ctx: &CudaContext) -> CudaInfo {
     // Best-effort via driver sys; fall back to ordinal if attrs fail.
-    let mut name_buf = [0i8; 256];
+    let mut name_buf = [0 as c_char; 256];
     let name = unsafe {
         let mut dev: sys::CUdevice = 0;
         if sys::cuDeviceGet(&mut dev, index as i32) == sys::CUresult::CUDA_SUCCESS {
@@ -681,7 +681,7 @@ fn cuda_device_info(index: u32, ctx: &CudaContext) -> CudaInfo {
     let mut major = 0i32;
     let mut minor = 0i32;
     let mut total_mem: usize = 0;
-    let mut bus_id = [0i8; 64];
+    let mut bus_id = [0 as c_char; 64];
     let mut pci = None;
     unsafe {
         let mut dev: sys::CUdevice = 0;
