@@ -33,6 +33,8 @@ pub struct MiningSession {
     maximum_targets: BTreeMap<u32, Hash>,
     current: Option<(u32, u64, Arc<BchTemplate>)>,
     payout_policy: BchPayout,
+    /// #### PR #40: a public pool, where each channel pays its user.
+    public: Option<super::payout::PublicPool>,
     pub accepted: u64,
     pub rejected: u64,
 }
@@ -50,7 +52,7 @@ impl MiningSession {
         salt: [u8; 12],
         share_target: Hash,
     ) -> Result<Self, String> {
-        crate::config::validate_payout_address(network, &payout)
+        crate::config::validate_coinbase_address(network, &payout)
             .map_err(|_| "invalid payout for selected network")?;
         if share_target == [0; 32] {
             return Err("share target cannot be zero".into());
@@ -66,6 +68,7 @@ impl MiningSession {
             maximum_targets: BTreeMap::new(),
             current: None,
             payout_policy: BchPayout::default(),
+            public: None,
             accepted: 0,
             rejected: 0,
         })
@@ -242,6 +245,7 @@ impl MiningSession {
                     request.nominal_hash_rate,
                     maximum,
                     0,
+                    request.user_identity.as_utf8_or_hex().as_str(),
                 )?);
             }
             Mining::OpenExtendedMiningChannel(request) => {
@@ -262,6 +266,7 @@ impl MiningSession {
                         request.nominal_hash_rate,
                         maximum,
                         request.min_extranonce_size,
+                        request.user_identity.as_utf8_or_hex().as_str(),
                     )?);
                 }
             }
@@ -348,6 +353,14 @@ impl MiningSession {
         })
     }
 
+    /// #### PR #40
+    /// Makes this connection a public pool's: each channel pays the address
+    /// its user connects with, and the operator's fee address is added.
+    pub fn set_public(&mut self, public: Option<super::payout::PublicPool>) {
+        self.public = public;
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn open(
         &mut self,
         request: u32,
@@ -355,6 +368,7 @@ impl MiningSession {
         rate: f32,
         maximum: Hash,
         extra: u16,
+        identity: &str,
     ) -> Result<Vec<SerializedFrame>, String> {
         let error = if !rate.is_finite() || rate < 0.0 {
             Some("invalid-nominal-hashrate")
@@ -376,6 +390,14 @@ impl MiningSession {
         if !meets_target(&template.target, &maximum) {
             return Ok(vec![open_error(request, "max-target-out-of-range")?]);
         }
+        // #### PR #40: in a public pool, the user's own address.
+        let payout = match &self.public {
+            Some(_) => match super::payout::identity_payout(self.network, identity) {
+                Ok(payout) => payout,
+                Err(_) => return Ok(vec![open_error(request, "unknown-user")?]),
+            },
+            None => self.payout.clone(),
+        };
         self.next_channel += 1;
         // Every device starts at the configured share target; vardiff moves
         // it from there.
@@ -385,8 +407,11 @@ impl MiningSession {
             self.share_target,
             self.salt,
             self.network,
-            &self.payout,
+            &payout,
         )?;
+        if let Some(public) = &self.public {
+            channel.set_operator(Some(&public.address))?;
+        }
         let (id, generation, template) = self.current.as_ref().unwrap();
         channel.settle(&template.target, &maximum);
         let target = channel.target;

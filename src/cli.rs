@@ -130,6 +130,23 @@ pub enum StratumV2Command {
         /// payout address.
         #[arg(long, requires = "upstream")]
         upstream_user: Option<String>,
+        /// #### PR #40
+        /// Run a public pool: each miner's username is their own payout
+        /// address (q or p, optionally with .worker) and the blocks they find
+        /// pay them; the Pickaxe donation comes off first, then your fee.
+        #[arg(long, conflicts_with = "upstream")]
+        public: bool,
+        /// The public pool's fee: a percentage of what the donation leaves,
+        /// 0 to 100 (default 0).
+        #[arg(long, requires = "public")]
+        pool_fee: Option<crate::donation::bch::BchDonation>,
+        /// Where the fee comes from: coinbase, work or both (default coinbase).
+        #[arg(long, requires = "public")]
+        pool_fee_mode: Option<crate::donation::bch::FeeMode>,
+        /// The fee's address, q or p (such as a multisig); defaults to the
+        /// configured payout address.
+        #[arg(long, requires = "public")]
+        pool_fee_address: Option<String>,
     },
 }
 
@@ -337,6 +354,68 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_public_pool_takes_a_fee_from_a_chosen_source_and_cannot_also_join_a_pool() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--public",
+            "--pool-fee",
+            "2",
+            "--pool-fee-mode",
+            "both",
+            "--pool-fee-address",
+            "bchtest:pqpool",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    public,
+                    pool_fee,
+                    pool_fee_mode,
+                    pool_fee_address,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("public pool options missing")
+        };
+        assert!(public);
+        assert_eq!(pool_fee, Some("2".parse().unwrap()));
+        assert_eq!(pool_fee_mode, Some(crate::donation::bch::FeeMode::Both));
+        assert_eq!(pool_fee_address.as_deref(), Some("bchtest:pqpool"));
+        // Fee options need a public pool, and a public pool is not a miner
+        // at someone else's pool.
+        assert!(
+            Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--pool-fee", "2"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--public",
+            "--upstream",
+            "pool.example:3336",
+            "--upstream-key",
+            "key",
+            "--sv1-listen",
+            "0.0.0.0:3333"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--public",
+            "--pool-fee-mode",
+            "half"
+        ])
+        .is_err());
     }
 
     #[test]

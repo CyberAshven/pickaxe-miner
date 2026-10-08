@@ -1584,6 +1584,10 @@ fn main() {
                             upstream: Vec::new(),
                             upstream_key: Vec::new(),
                             upstream_user: None,
+                            public: false,
+                            pool_fee: None,
+                            pool_fee_mode: None,
+                            pool_fee_address: None,
                         };
                         #[cfg(feature = "stratum-v2")]
                         let result = stratum_v2::command::run(

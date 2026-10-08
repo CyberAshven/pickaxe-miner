@@ -40,6 +40,8 @@ pub struct ServerConfig {
     pub journal_path: PathBuf,
     pub source_identity: [u8; 32],
     pub donation: Arc<RwLock<BchDonation>>,
+    /// #### PR #40: a public pool, where each miner's blocks pay them.
+    pub public: Option<super::payout::PublicPool>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -419,12 +421,18 @@ impl JobAvailability {
         current: Option<PublishedJob>,
         now: Instant,
         donation: BchDonation,
+        fee: Option<crate::donation::bch::PoolFee>,
     ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
         if let Some(job) = current.filter(|job| now < job.valid_until) {
             self.allocation.update(now, !mining.channels.is_empty());
+            let donation_work = self.allocation.donation_work(donation);
             let payout = BchPayout {
                 donation,
-                donation_work: self.allocation.donation_work(donation),
+                donation_work,
+                // #### PR #40: a public pool's fee, after the donation.
+                fee,
+                fee_work: !donation_work
+                    && fee.is_some_and(|fee| self.allocation.fee_work(donation, fee)),
             };
             self.unavailable_since = None;
             if self.generation == Some(job.generation) && self.payout == Some(payout) {
@@ -501,6 +509,8 @@ fn serve_device(
             rand::random(),
             config.share_target,
         )?;
+        mining.set_public(config.public.clone());
+        let fee = config.public.as_ref().and_then(|public| public.fee);
         let phase = rand::random();
         #[cfg(test)]
         let phase = config.allocation_phase.unwrap_or(phase);
@@ -522,9 +532,13 @@ fn serve_device(
                     .map(|value| *value)
                     .map_err(|_| "donation setting unavailable")
             };
-            for frame in
-                availability.update(&mut mining, current_job()?, Instant::now(), donation()?)?
-            {
+            for frame in availability.update(
+                &mut mining,
+                current_job()?,
+                Instant::now(),
+                donation()?,
+                fee,
+            )? {
                 sender.send(frame)?;
             }
             for frame in availability.retarget(&mut mining)? {
@@ -533,9 +547,13 @@ fn serve_device(
             if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
                 // A node failure or tip change may have occurred while waiting
                 // for a device frame; resample before validating that frame.
-                for update in
-                    availability.update(&mut mining, current_job()?, Instant::now(), donation()?)?
-                {
+                for update in availability.update(
+                    &mut mining,
+                    current_job()?,
+                    Instant::now(),
+                    donation()?,
+                    fee,
+                )? {
                     sender.send(update)?;
                 }
                 let now = SystemTime::now()
@@ -667,6 +685,7 @@ mod retry_tests {
                     Some(job.clone()),
                     start + Duration::from_secs(seconds),
                     rate.parse().unwrap(),
+                    None,
                 )
                 .unwrap();
             let current = mining.channels[&1].job().unwrap();
@@ -680,7 +699,8 @@ mod retry_tests {
                 &mut mining,
                 Some(job),
                 start + Duration::from_secs(6),
-                "2".parse().unwrap()
+                "2".parse().unwrap(),
+                None,
             )
             .unwrap()
             .is_empty());
@@ -710,6 +730,7 @@ mod retry_tests {
                 Some(job.clone()),
                 start,
                 BchDonation::default(),
+                None,
             )
             .unwrap();
         assert_eq!(availability.generation, Some(1));
@@ -719,6 +740,7 @@ mod retry_tests {
                 Some(job.clone()),
                 job.valid_until,
                 BchDonation::default(),
+                None,
             )
             .unwrap();
         assert_eq!(availability.generation, None);
@@ -728,6 +750,7 @@ mod retry_tests {
                 None,
                 job.valid_until + Duration::from_secs(2),
                 BchDonation::default(),
+                None,
             )
             .unwrap();
         assert!(availability
@@ -735,7 +758,8 @@ mod retry_tests {
                 &mut mining,
                 Some(job.clone()),
                 job.valid_until + TEMPLATE_RECOVERY_GRACE,
-                BchDonation::default()
+                BchDonation::default(),
+                None,
             )
             .is_err());
         assert_eq!(

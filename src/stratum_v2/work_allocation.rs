@@ -45,6 +45,14 @@ impl WorkAllocation {
     pub fn pool_donation_work(&self, rate: BchDonation) -> bool {
         self.position < rate.pool_work_units(PERIOD_NS)
     }
+
+    /// #### PR #40: a public pool operator's work share, right after the
+    /// donation's and a share of what it leaves.
+    pub fn fee_work(&self, rate: BchDonation, fee: crate::donation::bch::PoolFee) -> bool {
+        let donation = rate.work_units(PERIOD_NS);
+        let fee = fee.work_units(PERIOD_NS - donation);
+        (donation..donation + fee).contains(&self.position)
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 
 use super::telemetry::expected_hashes;
 use super::template::{double_sha256, meets_target, BchTemplate, Coinbase, CoinbaseParts, Hash};
-use crate::config::{validate_payout_address, MiningNetwork};
+use crate::config::MiningNetwork;
 use crate::donation::bch::BchPayout;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -52,6 +52,8 @@ pub struct Channel {
     pub extranonce_prefix: [u8; 16],
     network: MiningNetwork,
     payout: String,
+    /// #### PR #40: a public pool operator's fee address.
+    operator: Option<String>,
     job: Option<Job>,
     previous: VecDeque<Job>,
     sequence: Option<u32>,
@@ -96,6 +98,9 @@ pub struct ValidatedShare {
     pub block: bool,
     pub share_target: Hash,
     pub payout: BchPayout,
+    /// #### PR #40: who the block pays, which a public pool's journal records.
+    pub miner: String,
+    pub operator: Option<String>,
 }
 
 impl Channel {
@@ -110,7 +115,7 @@ impl Channel {
         if target == [0; 32] {
             return Err("max-target-out-of-range".into());
         }
-        let payout = validate_payout_address(network, payout)
+        let payout = crate::config::validate_coinbase_address(network, payout)
             .map_err(|_| "invalid payout for selected network")?;
         let mut extranonce_prefix = [0; 16];
         extranonce_prefix[..12].copy_from_slice(&session_salt);
@@ -122,6 +127,7 @@ impl Channel {
             extranonce_prefix,
             network,
             payout,
+            operator: None,
             job: None,
             previous: VecDeque::new(),
             sequence: None,
@@ -164,11 +170,17 @@ impl Channel {
         // cannot overwrite this prefix; its extranonce size stays unchanged.
         let mut extra = id.to_le_bytes().to_vec();
         extra.extend(self.extranonce_prefix);
-        let standard_coinbase =
-            template.coinbase_with_payout(self.network, &self.payout, &extra, payout)?;
+        let standard_coinbase = template.coinbase_with_payout(
+            self.network,
+            &self.payout,
+            self.operator.as_deref(),
+            &extra,
+            payout,
+        )?;
         let mut parts = template.coinbase_parts_with_payout(
             self.network,
             &self.payout,
+            self.operator.as_deref(),
             extra.len() + DEVICE_EXTRANONCE_SIZE,
             payout,
         )?;
@@ -351,7 +363,13 @@ impl Channel {
                 extra.extend(self.extranonce_prefix);
                 extra.extend_from_slice(share.extranonce);
                 job.template
-                    .coinbase_with_payout(self.network, &self.payout, &extra, job.payout)
+                    .coinbase_with_payout(
+                        self.network,
+                        &self.payout,
+                        self.operator.as_deref(),
+                        &extra,
+                        job.payout,
+                    )
                     .map_err(|_| "invalid-coinbase")?
             }
         };
@@ -396,7 +414,24 @@ impl Channel {
             block,
             share_target: accepted,
             payout: job.payout,
+            miner: self.payout.clone(),
+            operator: self.operator.clone(),
         })
+    }
+
+    /// #### PR #40
+    /// A public pool's operator fee address, set before the first job.
+    pub fn set_operator(&mut self, operator: Option<&str>) -> Result<(), String> {
+        self.operator = operator
+            .map(|operator| crate::config::validate_coinbase_address(self.network, operator))
+            .transpose()
+            .map_err(|_| "invalid pool fee address for selected network")?;
+        Ok(())
+    }
+
+    /// The address this channel's blocks pay.
+    pub fn payout(&self) -> &str {
+        &self.payout
     }
 }
 
@@ -461,10 +496,12 @@ mod tests {
                 BchPayout {
                     donation: "2".parse().unwrap(),
                     donation_work: false,
+                    ..BchPayout::default()
                 },
                 BchPayout {
                     donation: BchDonation::default(),
                     donation_work: true,
+                    ..BchPayout::default()
                 },
             ];
             for (index, payout) in plans.iter().enumerate().skip(1) {

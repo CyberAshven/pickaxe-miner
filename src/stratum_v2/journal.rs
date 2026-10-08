@@ -31,6 +31,12 @@ pub struct PendingBlock {
     // bytes; it must never silently rebuild an already solved coinbase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payout: Option<BchPayout>,
+    /// #### PR #40: in a public pool, the miner this block pays when it is
+    /// not the configured payout, and the pool's fee address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -48,7 +54,9 @@ struct State {
 pub struct Journal {
     path: PathBuf,
     _lock: File,
-    scripts: [Vec<u8>; 2],
+    network: MiningNetwork,
+    payout: String,
+    scripts: Vec<Vec<u8>>,
     state: State,
 }
 
@@ -59,8 +67,8 @@ impl Journal {
         payout: &str,
         source: [u8; 32],
     ) -> Result<Self, String> {
-        let payout = config::validate_payout_address(network, payout)?;
-        let scripts = super::payout::scripts(network, &payout)?;
+        let payout = config::validate_coinbase_address(network, payout)?;
+        let scripts = super::payout::scripts(network, &payout, None)?;
         let mut context = source.to_vec();
         context.extend(network.as_str().as_bytes());
         context.extend(&scripts[0]);
@@ -114,10 +122,12 @@ impl Journal {
                 rejected: 0,
             }
         };
-        validate_state(&state, &scripts)?;
+        validate_state(&state, network, &scripts)?;
         let journal = Self {
             path: path.to_owned(),
             _lock: lock,
+            network,
+            payout,
             scripts,
             state,
         };
@@ -146,7 +156,14 @@ impl Journal {
             return Err("cannot journal a non-block share".into());
         }
         let bytes = share.template.block(&share.coinbase, share.header)?;
-        let hash = validate_block(&bytes, &self.scripts, Some(share.payout))?;
+        let miner = (share.miner != self.payout).then(|| share.miner.clone());
+        let scripts = block_scripts(
+            self.network,
+            &self.scripts,
+            miner.as_deref(),
+            share.operator.as_deref(),
+        )?;
+        let hash = validate_block(&bytes, &scripts, Some(share.payout))?;
         if self.state.completed.contains(&hash) || self.state.pending.iter().any(|b| b.hash == hash)
         {
             return Ok(false);
@@ -156,6 +173,8 @@ impl Journal {
             hash,
             block: hex::encode(bytes),
             payout: Some(share.payout),
+            miner,
+            operator: share.operator.clone(),
         });
         // Existing entries were checked at load/enqueue. Do not hash every
         // stored full block again while another device waits to journal work.
@@ -248,7 +267,35 @@ fn regular_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
-fn validate_state(state: &State, scripts: &[Vec<u8>; 2]) -> Result<(), String> {
+/// #### PR #40
+/// The recipients a recorded block pays: the configured payout and the
+/// donation, or in a public pool the block's own miner, plus any fee address.
+fn block_scripts(
+    network: MiningNetwork,
+    configured: &[Vec<u8>],
+    miner: Option<&str>,
+    operator: Option<&str>,
+) -> Result<Vec<Vec<u8>>, String> {
+    match (miner, operator) {
+        (None, None) => Ok(configured.to_vec()),
+        (Some(miner), operator) => super::payout::scripts(network, miner, operator),
+        (None, Some(operator)) => {
+            let mut scripts = configured.to_vec();
+            scripts.extend(
+                super::payout::scripts(network, operator, None)?
+                    .into_iter()
+                    .take(1),
+            );
+            Ok(scripts)
+        }
+    }
+}
+
+fn validate_state(
+    state: &State,
+    network: MiningNetwork,
+    scripts: &[Vec<u8>],
+) -> Result<(), String> {
     validate_limits(state)?;
     let mut seen = std::collections::HashSet::new();
     for hash in &state.completed {
@@ -270,7 +317,13 @@ fn validate_state(state: &State, scripts: &[Vec<u8>; 2]) -> Result<(), String> {
             return Err("pending blocks exceed journal storage budget".into());
         }
         let bytes = hex::decode(&pending.block).map_err(|_| "invalid journal block encoding")?;
-        if validate_block(&bytes, scripts, pending.payout)? != pending.hash
+        let scripts = block_scripts(
+            network,
+            scripts,
+            pending.miner.as_deref(),
+            pending.operator.as_deref(),
+        )?;
+        if validate_block(&bytes, &scripts, pending.payout)? != pending.hash
             || !seen.insert(pending.hash.clone())
         {
             return Err("invalid or duplicate journal block".into());
@@ -296,7 +349,7 @@ fn validate_limits(state: &State) -> Result<(), String> {
 
 fn validate_block(
     bytes: &[u8],
-    scripts: &[Vec<u8>; 2],
+    scripts: &[Vec<u8>],
     payout: Option<BchPayout>,
 ) -> Result<String, String> {
     if bytes.len() > MAX_BLOCK_BYTES {

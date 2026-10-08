@@ -265,6 +265,8 @@ mod durable_tests {
             hash: hex::encode(hash),
             block: hex::encode(block),
             payout: Some(share.payout),
+            miner: None,
+            operator: None,
         }
     }
     fn tip() -> Value {

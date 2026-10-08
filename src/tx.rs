@@ -73,6 +73,103 @@ pub fn cashaddr_to_p2pkh_locking(address: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// #### PR #40
+/// The locking script a BCH coinbase output pays for a CashAddr: P2PKH (q),
+/// or P2SH (p), such as a multisig, with a 20-byte or a 32-byte hash. Token
+/// kinds of both decode to the same scripts. A coinbase can pay any of
+/// them; PHOTON payouts keep `cashaddr_to_p2pkh_locking`.
+pub fn cashaddr_to_coinbase_locking(address: &str) -> Result<Vec<u8>, String> {
+    if let Ok(script) = cashaddr_to_p2pkh_locking(address) {
+        return Ok(script);
+    }
+    let normalized = address.trim().to_ascii_lowercase();
+    let normalized = if normalized.contains(':') {
+        normalized
+    } else {
+        format!("bitcoincash:{normalized}")
+    };
+    let (prefix, payload_text) = normalized
+        .split_once(':')
+        .ok_or("CashAddr must contain exactly one prefix separator")?;
+    if payload_text.contains(':') || !matches!(prefix, "bitcoincash" | "bchtest") {
+        return Err("expected bitcoincash: or bchtest: address".into());
+    }
+    if address.chars().any(|c| c.is_ascii_lowercase())
+        && address.chars().any(|c| c.is_ascii_uppercase())
+    {
+        return Err("CashAddr must not mix upper and lower case".into());
+    }
+    let values = payload_text
+        .bytes()
+        .map(|ch| {
+            CASHADDR_CHARSET
+                .iter()
+                .position(|&c| c == ch)
+                .map(|index| index as u8)
+                .ok_or("invalid CashAddr character")
+        })
+        .collect::<Result<Vec<u8>, _>>()?;
+    if values.len() < 9 {
+        return Err("CashAddr too short".into());
+    }
+    let polymod_input: Vec<u8> = prefix
+        .bytes()
+        .map(|c| c & 31)
+        .chain(std::iter::once(0))
+        .chain(values.iter().copied())
+        .collect();
+    if cashaddr_polymod(&polymod_input) != 0 {
+        return Err("CashAddr checksum invalid".into());
+    }
+    let decoded = convert_bits(&values[..values.len() - 8], 5, 8, false)?;
+    let (version, hash) = decoded.split_first().ok_or("CashAddr too short")?;
+    let p2sh = matches!(version >> 3, 1 | 3);
+    match (p2sh, version & 7, hash.len()) {
+        (true, 0, 20) => {
+            let mut out = vec![0xa9, 0x14];
+            out.extend_from_slice(hash);
+            out.push(0x87);
+            Ok(out)
+        }
+        (true, 3, 32) => {
+            let mut out = vec![0xaa, 0x20];
+            out.extend_from_slice(hash);
+            out.push(0x87);
+            Ok(out)
+        }
+        _ => Err("a coinbase pays a P2PKH or P2SH address".into()),
+    }
+}
+
+/// #### PR #40: encodes any CashAddr version and hash, for tests of P2SH.
+#[cfg(test)]
+pub(crate) fn cashaddr_with_version(
+    version: u8,
+    hash: &[u8],
+    network: crate::config::MiningNetwork,
+) -> String {
+    let mut decoded = vec![version];
+    decoded.extend_from_slice(hash);
+    let payload = convert_bits(&decoded, 8, 5, true).unwrap();
+    let prefix = match network {
+        crate::config::MiningNetwork::Mainnet => "bitcoincash",
+        crate::config::MiningNetwork::Chipnet => "bchtest",
+    };
+    let mut checksum_input: Vec<u8> = prefix.bytes().map(|c| c & 31).collect();
+    checksum_input.push(0);
+    checksum_input.extend_from_slice(&payload);
+    checksum_input.extend_from_slice(&[0u8; 8]);
+    let checksum = cashaddr_polymod(&checksum_input);
+    let mut encoded: String = payload
+        .iter()
+        .map(|value| CASHADDR_CHARSET[*value as usize] as char)
+        .collect();
+    for shift in (0..8).rev() {
+        encoded.push(CASHADDR_CHARSET[((checksum >> (shift * 5)) & 31) as usize] as char);
+    }
+    format!("{prefix}:{encoded}")
+}
+
 /// Computes the CashAddr checksum polynomial.
 fn cashaddr_polymod(values: &[u8]) -> u64 {
     let mut c: u64 = 1;

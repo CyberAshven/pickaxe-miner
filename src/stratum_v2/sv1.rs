@@ -104,6 +104,9 @@ pub struct Upstream {
     pub remote: bool,
     /// #### PR #40: where the donation's work goes at this pool.
     pub donation: Option<DonationRoute>,
+    /// #### PR #40: this server's own listener running a public pool, where
+    /// a device's channel opens at authorize under the device's username.
+    pub public: bool,
 }
 
 impl Upstream {
@@ -115,6 +118,15 @@ impl Upstream {
             identity: "sv1-device".into(),
             remote: false,
             donation: None,
+            public: false,
+        }
+    }
+
+    /// #### PR #40: this server's own listener running a public pool.
+    pub fn local_public(address: SocketAddr, authority: [u8; 32]) -> Self {
+        Self {
+            public: true,
+            ..Self::local(address, authority)
         }
     }
 
@@ -313,6 +325,15 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     )?)?;
     let reply = receive.receive(DEADLINE)?.ok_or("SV2 setup timed out")?;
     validate_setup_reply(reply)?;
+    // #### PR #40: a public pool opens the device's channel at authorize.
+    if upstream.public {
+        return Ok(Opened {
+            bridge: Bridge::public(),
+            send,
+            receive,
+            local,
+        });
+    }
     let open = sv1_to_sv2::build_sv2_open_extended_mining_channel(
         1,
         upstream.identity.clone(),
@@ -421,8 +442,16 @@ fn serve_session(
                 downstream.write(&message)?;
             }
         }
-        // #### PR #40: at a remote pool, the donation channel and the
-        // device's switches between it and its own channel.
+        // #### PR #40: a public pool's channel under the device's username;
+        // at a remote pool, the donation channel and the device's switches
+        // between it and its own channel.
+        if let Some(open) = bridge.channel_request()? {
+            send.send(encoded(
+                open,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+                false,
+            )?)?;
+        }
         if let Some(open) = bridge.donation_request()? {
             send.send(encoded(
                 open,
@@ -565,6 +594,33 @@ struct Bridge {
     on_donation: bool,
     /// A donation problem not yet shown on the device's row.
     donation_issue: Option<&'static str>,
+    /// #### PR #40: the adapter owns the device's extranonce, at a remote
+    /// pool or in a public pool, and puts the channel's prefix into the
+    /// coinbase part the device receives.
+    owned: bool,
+    /// A public pool's channel, opened under the device's username.
+    public: Public,
+}
+
+/// #### PR #40
+/// A public pool's channel for a device: opened at authorize, under the
+/// username, which the server accepts only if it is a payout address.
+enum Public {
+    /// Not a public pool: the channel opened when the device connected.
+    Off,
+    /// Waiting for the device's username.
+    Waiting,
+    /// The channel request to send, and the authorize to answer.
+    Asking {
+        name: String,
+        authorize: u64,
+    },
+    /// Sent; the authorize is answered when the server replies.
+    Opening {
+        name: String,
+        authorize: u64,
+    },
+    Open,
 }
 
 /// A share forwarded upstream and waiting for its verdict.
@@ -610,11 +666,70 @@ impl Bridge {
             allocation: WorkAllocation::new(rand::random()),
             on_donation: false,
             donation_issue: None,
+            owned: remote,
+            public: Public::Off,
         })
     }
 
+    /// #### PR #40
+    /// A device at a public pool: no channel until it gives its username.
+    fn public() -> Self {
+        Self {
+            user: Lane {
+                channel: 0,
+                prefix: Vec::new(),
+                extra_size: POOL_EXTRANONCE1 + POOL_EXTRANONCE2,
+                target: [255; 32],
+                future: BTreeMap::new(),
+                active: BTreeMap::new(),
+                previous_hash: None,
+                notify: None,
+                sequence: 0,
+                pending: BTreeMap::new(),
+            },
+            subscribed: false,
+            worker: None,
+            configured: false,
+            mask: None,
+            local_rejection: None,
+            remote: false,
+            extranonce1: rand::random::<[u8; POOL_EXTRANONCE1]>().to_vec(),
+            extranonce2_size: POOL_EXTRANONCE2,
+            route: None,
+            donation: Donation::Off,
+            allocation: WorkAllocation::new(rand::random()),
+            on_donation: false,
+            donation_issue: None,
+            owned: true,
+            public: Public::Waiting,
+        }
+    }
+
+    /// #### PR #40: a public pool's channel request, sent once.
+    fn channel_request(&mut self) -> Result<Option<OpenExtendedMiningChannelOwned>, String> {
+        let Public::Asking { name, authorize } = &self.public else {
+            return Ok(None);
+        };
+        let (name, authorize) = (name.clone(), *authorize);
+        self.public = Public::Opening {
+            name: name.clone(),
+            authorize,
+        };
+        sv1_to_sv2::build_sv2_open_extended_mining_channel(
+            1,
+            name,
+            1.0,
+            Target::from_le_bytes([255; 32]),
+            (POOL_EXTRANONCE1 + POOL_EXTRANONCE2) as u16,
+        )
+        .map(Some)
+        .map_err(|_| "cannot open firmware channel".into())
+    }
+
     fn ready(&self) -> bool {
-        self.subscribed && self.worker.is_some()
+        self.subscribed
+            && self.worker.is_some()
+            && matches!(self.public, Public::Off | Public::Open)
     }
 
     fn lane(&self, donation: bool) -> Option<&Lane> {
@@ -847,13 +962,23 @@ impl Bridge {
                     && !auth.name.is_empty()
                     && auth.name.len() <= 128
                     && !auth.name.chars().any(char::is_control);
-                if accepted {
-                    self.worker = Some(auth.name.clone());
+                // #### PR #40: in a public pool the username is the payout,
+                // so the server decides; the answer waits for its reply.
+                if accepted && matches!(self.public, Public::Waiting) {
+                    self.public = Public::Asking {
+                        name: auth.name.clone(),
+                        authorize: id,
+                    };
+                } else {
+                    let accepted = accepted && matches!(self.public, Public::Off);
+                    if accepted {
+                        self.worker = Some(auth.name.clone());
+                    }
+                    out.push(
+                        serde_json::to_value(auth.respond(accepted))
+                            .map_err(|_| "cannot encode authorization")?,
+                    );
                 }
-                out.push(
-                    serde_json::to_value(auth.respond(accepted))
-                        .map_err(|_| "cannot encode authorization")?,
-                );
             }
             "mining.extranonce.subscribe" => out.push(json!({"id":id,"result":true,"error":null})),
             "mining.suggest_difficulty" => out.push(json!({"id":id,"result":false,"error":null})),
@@ -912,6 +1037,7 @@ impl Bridge {
                     // A worker may omit version_bits and use the original version.
                     let mask = submit.version_bits.as_ref().and(self.mask.clone());
                     let remote = self.remote;
+                    let owned = self.owned;
                     let extranonce1 = self.extranonce1.clone();
                     let lane = self.lane_mut(donation).ok_or("stale job")?;
                     let mut share = sv1_to_sv2::build_sv2_submit_shares_extended_from_sv1_submit(
@@ -923,7 +1049,7 @@ impl Bridge {
                     )
                     .map_err(|_| "share translation failed")?;
                     share.job_id &= !DONATION_JOBS;
-                    if remote {
+                    if owned {
                         // The channel's miner bytes: any padding, the
                         // adapter's four, then the device's four.
                         let mut extranonce =
@@ -976,6 +1102,46 @@ impl Bridge {
             // adapter with it.
             MESSAGE_TYPE_RECONNECT if !channel_message => {
                 return Err("SV2 upstream asked to reconnect".into())
+            }
+            // #### PR #40: a public pool's answer to the device's channel.
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
+                if matches!(self.public, Public::Opening { .. }) =>
+            {
+                let opened: OpenExtendedMiningChannelSuccess =
+                    binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid channel reply")?;
+                let Public::Opening { name, authorize } =
+                    std::mem::replace(&mut self.public, Public::Open)
+                else {
+                    return Err("unexpected SV2 channel".into());
+                };
+                if opened.request_id != 1
+                    || (opened.extranonce_size as usize) < POOL_EXTRANONCE1 + POOL_EXTRANONCE2
+                {
+                    return Err("unexpected SV2 extranonce allocation".into());
+                }
+                self.user = Lane::new(&opened)?;
+                self.worker = Some(name);
+                out.push(json!({"id":authorize,"result":true,"error":null}));
+            }
+            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR
+                if matches!(self.public, Public::Opening { .. }) =>
+            {
+                let error: OpenMiningChannelError =
+                    binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid channel error")?;
+                let Public::Opening { authorize, .. } =
+                    std::mem::replace(&mut self.public, Public::Waiting)
+                else {
+                    return Err("unexpected SV2 channel error".into());
+                };
+                if error.request_id != 1 {
+                    return Err("unexpected SV2 channel error".into());
+                }
+                self.local_rejection = Some("username is not a payout address");
+                out.push(reject(
+                    authorize,
+                    24,
+                    "the username must be your payout address on this network",
+                ));
             }
             // #### PR #40: the pool's answer to the donation channel.
             MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS if self.remote => {
@@ -1136,7 +1302,7 @@ impl Bridge {
         job: NewExtendedMiningJobOwned,
         clean: bool,
     ) -> Result<Vec<Value>, String> {
-        let remote = self.remote;
+        let owned = self.owned;
         let lane = self.lane_mut(donation).ok_or("unknown mining channel")?;
         lane.active.insert(job.job_id, job.version);
         while lane.active.len() > MAX_ACTIVE_JOBS {
@@ -1145,9 +1311,9 @@ impl Bridge {
         let number = job.job_id;
         let mut notify = sv2_to_sv1::build_sv1_notify_from_sv2(prev, job, clean)
             .map_err(|_| "job translation failed")?;
-        // #### PR #40: at a remote pool the channel's prefix (and any
-        // padding) is part of the coinbase the device receives.
-        if remote {
+        // #### PR #40: when the adapter owns the extranonce, the channel's
+        // prefix (and any padding) is part of the coinbase the device gets.
+        if owned {
             let mut coinbase: Vec<u8> = notify.coin_base1.clone().into();
             coinbase.extend(&lane.prefix);
             coinbase.resize(
@@ -1490,6 +1656,60 @@ mod tests {
         );
         assert!(bridge.tick(Instant::now()).unwrap().is_empty());
         assert!(bridge.donation_request().unwrap().is_none());
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_public_pool_opens_the_device_channel_under_its_username() {
+        let mut bridge = Bridge::public();
+        let (subscribed, _) = bridge
+            .request(json!({"id":1,"method":"mining.subscribe","params":[]}))
+            .unwrap();
+        assert_eq!(subscribed[0]["result"][2], 4);
+        // The answer waits for the server, which checks the payout.
+        let (replies, _) = bridge
+            .request(json!({"id":2,"method":"mining.authorize","params":["bchtest:qq.rig"]}))
+            .unwrap();
+        assert!(replies.is_empty());
+        assert!(!bridge.ready());
+        let open = bridge.channel_request().unwrap().expect("channel request");
+        assert_eq!(open.request_id, 1);
+        assert_eq!(open.user_identity.as_utf8_or_hex(), "bchtest:qq.rig");
+        assert!(bridge.channel_request().unwrap().is_none());
+        // Refused: the device hears why and may try again.
+        let refused = encoded(
+            OpenMiningChannelError {
+                request_id: 1,
+                error_code: "unknown-user".try_into().unwrap(),
+            },
+            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+            false,
+        )
+        .unwrap();
+        let replies = bridge.upstream(refused).unwrap().0;
+        assert_eq!(replies[0]["id"], 2);
+        assert_eq!(replies[0]["error"][0], 24);
+        bridge
+            .request(json!({"id":3,"method":"mining.authorize","params":["bchtest:qq"]}))
+            .unwrap();
+        assert!(bridge.channel_request().unwrap().is_some());
+        let opened = encoded(
+            OpenExtendedMiningChannelSuccess {
+                request_id: 1,
+                channel_id: 4,
+                group_channel_id: 0,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 8,
+                extranonce_prefix: [5u8; 16].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            false,
+        )
+        .unwrap();
+        let replies = bridge.upstream(opened).unwrap().0;
+        assert_eq!(replies, vec![json!({"id":3,"result":true,"error":null})]);
+        assert!(bridge.ready());
+        assert_eq!(bridge.user.channel, 4);
     }
 
     #[test]

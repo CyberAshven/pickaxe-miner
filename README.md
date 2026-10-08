@@ -28,6 +28,15 @@ With `--upstream`, it sends SV1 devices to a remote Stratum V2 pool instead of
 your own node, with backup pools in order; there the pool builds the blocks,
 so the donation is that share of mining time at the pool. See [docs/stratum-v2.md](docs/stratum-v2.md).
 
+### For pool operators
+
+Run a public BCH pool with Pickaxe: SV1 and SV2 miners connect with their own
+payout address, and the blocks they find pay them directly in the coinbase, so
+the pool holds no one's money. You choose your fee and where it comes from (the
+coinbase, mining work, or both) and the address it goes to, including a
+multisig; miners can see every fee in the coinbase. `stratum-v2 serve --public
+--pool-fee 2 --pool-fee-address <address>`; see [docs/pool.md](docs/pool.md).
+
 ## Supported platforms
 
 Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).

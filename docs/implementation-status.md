@@ -789,3 +789,48 @@ Validation: Windows all-feature host suite, 447 library and 16 binary tests
 passed, 22 opt-in tests ignored, 34 hardware tests filtered; formatting,
 all-target/all-feature Clippy on Rust 1.94 and 1.99 and the server-only Clippy
 with warnings denied passed.
+
+## Public pool: each miner paid at their own address (2026-10-08)
+
+#### PR #40
+
+`stratum-v2 serve --public [--pool-fee P --pool-fee-mode coinbase|work|both
+--pool-fee-address A]` runs the ASIC server as a public pool
+([pool.md](pool.md)). Each channel pays the payout its user names (an
+address, with or without its network prefix, optionally followed by
+`.worker`); a name that is not a payout on the pool's network gets the SV2
+`unknown-user` error, which SV1 firmware sees as a refused authorize. The
+coinbase pays the miner, then the Pickaxe donation (first and in full), then
+the operator's fee from what the donation leaves: from the coinbase, from
+mining work (the server's work clock gives the operator's slice right after
+the donation's), or both (a third work, two thirds coinbase). No custody:
+nothing is paid out later. The dashboard header names the public pool and
+its fee.
+
+SV1 firmware cannot give its username before its subscription is answered,
+so in a public pool the adapter answers the subscription with an extranonce
+of its own (as at a remote pool), opens the device's channel only at
+authorize under the device's username, and answers the authorize when the
+server accepts or refuses that name. The block journal records the miner and
+the fee address of a block that does not pay the configured payout and
+checks every pending block against them on restart. Coinbase payouts, the
+fee address and pool miners' addresses now accept P2SH (`p`, such as a
+multisig, with a 20-byte or 32-byte hash) as well as P2PKH; PHOTON payouts
+stay P2PKH.
+
+Evidence: end to end with this server's own node fixture, two SV2 devices
+(a standard and an extended channel, one with a bare address and a worker
+name) each mined a block that paid exactly their address, the donation's 1%
+and a 2% coinbase fee of the remainder; through the SV1 adapter, two SV1
+devices with their own addresses were each paid by their own block with a
+1% fee, and a non-address username was refused at authorize. Unit tests cover
+the fee arithmetic in each mode (the donation first), old journal records
+without a fee, usernames with and without prefixes and workers, P2SH and
+P2SH32 scripts, a journal restart with a public pool's block and a tampered
+miner failing closed, the adapter's held authorize, and the new options. Not
+yet run with real public miners.
+
+Validation: Windows all-feature host suite, 455 library and 16 binary tests
+passed, 22 opt-in tests ignored, 34 hardware tests filtered; formatting,
+all-target/all-feature Clippy on Rust 1.94 and 1.99 and the server-only Clippy
+with warnings denied passed.

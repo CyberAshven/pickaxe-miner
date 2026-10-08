@@ -65,6 +65,33 @@ pub fn run(
         }
         _ => Vec::new(),
     };
+    // #### PR #40
+    // A public pool: each miner is paid at the address they connect with,
+    // and the operator's fee comes off what the donation leaves.
+    let public = match &action {
+        StratumV2Command::Serve {
+            public: true,
+            pool_fee,
+            pool_fee_mode,
+            pool_fee_address,
+            ..
+        } => Some(super::payout::PublicPool {
+            fee: pool_fee.filter(|rate| u16::from(*rate) > 0).map(|rate| {
+                crate::donation::bch::PoolFee {
+                    rate,
+                    mode: pool_fee_mode.unwrap_or(crate::donation::bch::FeeMode::Coinbase),
+                }
+            }),
+            address: config::validate_coinbase_address(
+                config.network,
+                pool_fee_address
+                    .as_deref()
+                    .unwrap_or(config.payout_address.as_str()),
+            )
+            .map_err(|_| "the pool fee address must be a q or p address on this network")?,
+        }),
+        _ => None,
+    };
     if matches!(action, StratumV2Command::Serve { .. }) && pools.is_empty() {
         config::validate_payout_address(config.network, &config.payout_address)
             .map_err(|_| "a valid payout for the selected network is required")?;
@@ -137,7 +164,7 @@ pub fn run(
         .is_some()
         .then(|| load_authority(&config_path.with_extension("sv2-key")))
         .transpose()?;
-    let public = authority_secret
+    let public_key = authority_secret
         .as_ref()
         .map(server::authority_public)
         .transpose()?;
@@ -145,7 +172,8 @@ pub fn run(
     // server's own listener. Wildcard listeners are dialed through local
     // loopback, never via an arbitrary network route. The SV2 authority
     // remains pinned.
-    let upstreams = match (bound, public) {
+    let public_pool = public.clone();
+    let upstreams = match (bound, public_key) {
         _ if !pools.is_empty() => pools.clone(),
         (Some(mut local), Some(public)) => {
             if local.ip().is_unspecified() {
@@ -155,11 +183,19 @@ pub fn run(
                     std::net::Ipv6Addr::LOCALHOST.into()
                 });
             }
-            vec![super::sv1::Upstream::local(local, public)]
+            // #### PR #40: a public pool's devices open their channel
+            // under their own username.
+            vec![if public_pool.is_some() {
+                super::sv1::Upstream::local_public(local, public)
+            } else {
+                super::sv1::Upstream::local(local, public)
+            }]
         }
         _ => return Err("mining server unavailable".into()),
     };
     // The pools as the dashboard and status show them; never the identity.
+    // #### PR #40: a public pool says so on the dashboard, with its fee.
+    let pool_suffix = public_pool_suffix(public.as_ref());
     let pool_address = (!pools.is_empty()).then(|| {
         pools
             .iter()
@@ -189,6 +225,7 @@ pub fn run(
                 share_target: compact_target(0x1b0ffff0)?,
                 journal_path: config_path.with_extension("sv2-blocks.json"),
                 source_identity: rpc.source_identity()?,
+                public: public.clone(),
                 donation: donation.clone(),
                 #[cfg(test)]
                 allocation_phase: None,
@@ -241,9 +278,9 @@ pub fn run(
     let devices_hint = device_hint(bound, sv1_bound, lan_address());
     // SV2 reference authority public-key encoding: version 1 (little endian),
     // 32-byte x-only key, Base58Check. Only the public key is displayed.
-    let authority = public.map(|public| {
+    let authority = public_key.map(|key| {
         let mut encoded = vec![1, 0];
-        encoded.extend(public);
+        encoded.extend(key);
         stratum_core::bitcoin::base58::encode_check(&encoded)
     });
     let result = (|| {
@@ -309,9 +346,9 @@ pub fn run(
                     )
                 } else {
                     format!(
-                    "{} · Node {}{} · Height {} · Donation {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
+                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_suffix(node_client.as_deref()),
-                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), snapshot.connections, snapshot.sessions_started,
+                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
                     snapshot.connection_errors, snapshot.sv1_connection_errors,
@@ -338,12 +375,13 @@ pub fn run(
                     )
                 } else {
                     format!(
-                        "{} · Node {}{} · Height {} · Donation {}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
+                        "{} · Node {}{} · Height {} · Donation {}{}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
                         config.network.as_str(),
                         if snapshot.template_ready { "Ready" } else { "Waiting" },
                         node_suffix(node_client.as_deref()),
                         snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
                         donation_summary(donation_value),
+                        pool_suffix,
                         devices.len(),
                         crate::telemetry::format_hash_rate(total_rate),
                         snapshot.shares_accepted,
@@ -523,6 +561,7 @@ fn pool_upstreams(
                 identity: identity.clone(),
                 remote: true,
                 donation: None,
+                public: false,
             })
         })
         .collect()
@@ -1208,6 +1247,17 @@ fn watch(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// #### PR #40
+/// A public pool's note after the donation: each miner's blocks pay them,
+/// and the operator's fee comes off what the donation leaves.
+fn public_pool_suffix(public: Option<&super::payout::PublicPool>) -> String {
+    match public.map(|public| public.fee) {
+        None => String::new(),
+        Some(None) => " · Public pool, no fee".into(),
+        Some(Some(fee)) => format!(" · Public pool, fee {} from {}", fee.rate, fee.mode),
+    }
 }
 
 /// #### PR #40
