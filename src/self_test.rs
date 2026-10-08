@@ -26,6 +26,8 @@ pub struct SelfTestReport {
     pub device: u32,
     pub candidates: u32,
     pub nonce: u32,
+    /// The low 16 bits a T2 engine returns beside its signature nonce.
+    pub tail_j: Option<u16>,
     pub digest_hex: String,
     pub gpu_host_digest_equal: bool,
     pub schnorr_valid: bool,
@@ -46,6 +48,7 @@ struct ValidatedWinner {
     digest: [u8; 32],
     parent_txid: String,
     settlement_txid: String,
+    reward_token_amount: u128,
     miner_token_amount: u128,
     donation_token_amount: u128,
     settlement_fee_sats: u64,
@@ -111,6 +114,17 @@ fn build_reference_shaped_template(
         )
     })
 }
+// #### PR #32: the self-test checks T2 winners
+// What: a T2 engine (the portable wgpu engine, CUDA and HIP T2) returns the
+// signature nonce and `tail_j` separately; the candidate is
+// `(nonce << 16) | tail_j`, and `tail_j` tokens move from the reward back to
+// the baton. The host check now rebuilds that transaction, as mining's own
+// `verify_gpu_winner` does.
+// Why: `self-test --backend wgpu` failed with "winner nonce 4660 != expected
+// 305419896" and then a HASH256 mismatch on every adapter, although the GPU
+// result was correct (issue #30; reproduced on llvmpipe).
+// Check: the T2 unit test below, and `self_test_passes_on_the_portable_engine`
+// on a GPU.
 /// Checks a GPU winner and its expected reward against the reference.
 fn validate_gpu_winner_and_reward(
     template: &[u8; TX_BYTES],
@@ -118,9 +132,15 @@ fn validate_gpu_winner_and_reward(
     reward_secret: &[u8; 32],
     reward_public_key: &[u8; 33],
     nonce: u32,
+    tail_j: Option<u16>,
     gpu_digest: &[u8; 32],
 ) -> Result<ValidatedWinner, String> {
-    let context = reference_context(target);
+    let reward_amount = match tail_j {
+        Some(j) => tx::t2_reward_amount(VECTOR_TOKEN_AMOUNT, VECTOR_REWARD_RAW, j)?,
+        None => VECTOR_REWARD_RAW,
+    };
+    let mut context = reference_context(target);
+    context.reward_raw = reward_amount;
     let reward_address = reward::p2pkh_cashaddr_from_public_key(reward_public_key)?;
     let message = tx::photon_message_sha256(nonce, &context.target_le_hex)?;
     let signature = crypto::bch_schnorr_sign(reward_secret, &message)?;
@@ -146,6 +166,22 @@ fn validate_gpu_winner_and_reward(
     let mut expected = *template;
     expected[390..394].copy_from_slice(&nonce.to_le_bytes());
     expected[426..490].copy_from_slice(&signature);
+    if let Some(j) = tail_j {
+        // The baton's and the reward's 8-byte token amounts.
+        let amount = |bytes: &[u8]| -> Result<u64, String> {
+            Ok(u64::from_le_bytes(
+                bytes.try_into().map_err(|_| "T2 amount is not 8 bytes")?,
+            ))
+        };
+        let baton = amount(&expected[491..499])?
+            .checked_add(u64::from(j))
+            .ok_or("T2 baton amount overflows")?;
+        let reward = amount(&expected[578..586])?
+            .checked_sub(u64::from(j))
+            .ok_or("T2 adjustment exceeds the reward")?;
+        expected[491..499].copy_from_slice(&baton.to_le_bytes());
+        expected[578..586].copy_from_slice(&reward.to_le_bytes());
+    }
     if completed.as_slice() != expected.as_slice() {
         return Err("host reconstructed transaction differs from GPU template completion".into());
     }
@@ -169,15 +205,15 @@ fn validate_gpu_winner_and_reward(
         reward_secret,
         reward_public_key,
         &miner_payout,
-        VECTOR_REWARD_RAW,
+        reward_amount,
     )?;
 
-    let (expected_miner, expected_donation) = RuntimeConfig::split_reward(VECTOR_REWARD_RAW);
+    let (expected_miner, expected_donation) = RuntimeConfig::split_reward(reward_amount);
     if settlement.miner_token_amount != expected_miner
         || settlement.donation_token_amount != expected_donation
-        || settlement.miner_token_amount + settlement.donation_token_amount != VECTOR_REWARD_RAW
+        || settlement.miner_token_amount + settlement.donation_token_amount != reward_amount
         || settlement.donation_token_amount
-            != VECTOR_REWARD_RAW.saturating_mul(u128::from(DONATION_BPS)) / 10_000
+            != reward_amount.saturating_mul(u128::from(DONATION_BPS)) / 10_000
     {
         return Err("self-funded settlement failed exact 98/2 token conservation".into());
     }
@@ -193,6 +229,7 @@ fn validate_gpu_winner_and_reward(
         digest: host_digest,
         parent_txid,
         settlement_txid: settlement.settlement_txid,
+        reward_token_amount: reward_amount,
         miner_token_amount: settlement.miner_token_amount,
         donation_token_amount: settlement.donation_token_amount,
         settlement_fee_sats: settlement.fee_sats,
@@ -252,10 +289,11 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
         ));
     }
     let winner = &batch.winners[0];
-    if winner.nonce != CONTROLLED_NONCE {
+    let candidate = winner_candidate(winner.nonce, winner.tail_j);
+    if candidate != Some(CONTROLLED_NONCE) {
         return Err(format!(
-            "controlled {backend_name} winner nonce {} != expected {}",
-            winner.nonce, CONTROLLED_NONCE
+            "controlled {backend_name} winner nonce {} (T2 tail {:?}) != expected {}",
+            winner.nonce, winner.tail_j, CONTROLLED_NONCE
         ));
     }
 
@@ -265,6 +303,7 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
         &reward_secret,
         &reward_public_key,
         winner.nonce,
+        winner.tail_j,
         &winner.digest,
     )?;
 
@@ -273,7 +312,8 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
         backend: backend_name,
         device,
         candidates: batch.candidates,
-        nonce: winner.nonce,
+        nonce: CONTROLLED_NONCE,
+        tail_j: winner.tail_j,
         digest_hex: hex::encode(validated.digest),
         gpu_host_digest_equal: true,
         schnorr_valid: true,
@@ -282,13 +322,22 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
         settlement_txid: validated.settlement_txid,
         miner_token_amount: validated.miner_token_amount,
         donation_token_amount: validated.donation_token_amount,
-        reward_token_amount: VECTOR_REWARD_RAW,
+        reward_token_amount: validated.reward_token_amount,
         settlement_fee_sats: validated.settlement_fee_sats,
         persistent_device_bytes,
         network_access: false,
         broadcast: false,
     })
 }
+/// The 32-bit candidate a winner stands for: a T2 winner's signature nonce
+/// is the high 16 bits and `tail_j` the low 16.
+fn winner_candidate(nonce: u32, tail_j: Option<u16>) -> Option<u32> {
+    match tail_j {
+        Some(j) => (nonce <= u32::from(u16::MAX)).then(|| (nonce << 16) | u32::from(j)),
+        None => Some(nonce),
+    }
+}
+
 /// Prints the results of the offline GPU self-test.
 pub fn print_report(report: &SelfTestReport, json: bool) {
     if json {
@@ -306,8 +355,16 @@ pub fn print_report(report: &SelfTestReport, json: bool) {
         report.device
     );
     println!(
-        "GPU A->B->C: {} controlled candidate, winner nonce=0x{:08x}",
-        report.candidates, report.nonce
+        "GPU A->B->C: {} controlled candidate, winner nonce=0x{:08x}{}",
+        report.candidates,
+        report.nonce,
+        report
+            .tail_j
+            .map(|j| format!(
+                " (T2: signature nonce 0x{:04x}, tail 0x{j:04x})",
+                report.nonce >> 16
+            ))
+            .unwrap_or_default()
     );
     println!("GPU == host HASH256: {}", report.digest_hex);
     println!("BCH Schnorr: valid");
@@ -361,6 +418,7 @@ mod tests {
             &secret,
             &public,
             CONTROLLED_NONCE,
+            None,
             &digest,
         )
         .unwrap();
@@ -391,10 +449,79 @@ mod tests {
             &secret,
             &public,
             CONTROLLED_NONCE,
+            None,
             &digest,
         )
         .unwrap_err();
         assert!(error.contains("GPU/host HASH256 mismatch"));
+    }
+
+    #[test]
+    fn offline_host_validation_accepts_a_t2_winner_for_the_same_candidate() {
+        let target = [0xffu8; 32];
+        let secret = deterministic_secret(1);
+        let public = public_key(&secret).unwrap();
+        let template = build_reference_shaped_template(&target, &public).unwrap();
+        // What a T2 engine returns for candidate 0x12345678.
+        let (nonce, j) = (0x1234, 0x5678);
+        assert_eq!(winner_candidate(nonce, Some(j)), Some(CONTROLLED_NONCE));
+        assert_eq!(
+            winner_candidate(CONTROLLED_NONCE, None),
+            Some(CONTROLLED_NONCE)
+        );
+        assert_eq!(winner_candidate(0x1_0000, Some(0)), None);
+        // The host's own T2 transaction: the signature for the high bits, and
+        // j tokens moved from the reward back to the baton.
+        let reward = tx::t2_reward_amount(VECTOR_TOKEN_AMOUNT, VECTOR_REWARD_RAW, j).unwrap();
+        let mut context = reference_context(&target);
+        context.reward_raw = reward;
+        let message = tx::photon_message_sha256(nonce, &context.target_le_hex).unwrap();
+        let signature = crypto::bch_schnorr_sign(&secret, &message).unwrap();
+        let completed = tx::apply_reference_signature_for_deployment(
+            &context,
+            &reward::p2pkh_cashaddr_from_public_key(&public).unwrap(),
+            &hex::encode(public),
+            nonce,
+            &hex::encode(signature),
+            &crate::protocol::MAINNET_V0_PHOTON,
+        )
+        .unwrap();
+        let digest = search::hash256(&completed);
+
+        let validated = validate_gpu_winner_and_reward(
+            &template,
+            &target,
+            &secret,
+            &public,
+            nonce,
+            Some(j),
+            &digest,
+        )
+        .unwrap();
+        assert_eq!(validated.reward_token_amount, VECTOR_REWARD_RAW - 0x5678);
+        assert_eq!(
+            validated.miner_token_amount + validated.donation_token_amount,
+            validated.reward_token_amount
+        );
+        // The classic check of the same digest fails: the amounts differ.
+        assert!(validate_gpu_winner_and_reward(
+            &template, &target, &secret, &public, nonce, None, &digest
+        )
+        .is_err());
+    }
+
+    /// Opt-in: the whole self-test on a real adapter, chosen by name, e.g.
+    /// `PICKAXE_TEST_WGPU_ADAPTER="AMD Radeon" cargo test --release --lib
+    /// --no-default-features --features portable-wgpu
+    /// self_test_passes_on_the_portable_engine -- --ignored`.
+    #[cfg(feature = "portable-wgpu")]
+    #[test]
+    #[ignore = "needs a GPU; choose it with PICKAXE_TEST_WGPU_ADAPTER"]
+    fn self_test_passes_on_the_portable_engine() {
+        let report = run_self_test(BackendKind::Wgpu, 0).unwrap();
+        assert_eq!(report.status, "PASS");
+        assert_eq!(report.nonce, CONTROLLED_NONCE);
+        println!("tail_j={:?} digest={}", report.tail_j, report.digest_hex);
     }
 
     #[test]
