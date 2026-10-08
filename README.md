@@ -2,7 +2,28 @@
 
 ![Pickaxe Miner](docs/assets/pickaxe-miner-logo.png)
 
-Rust-first, GPU-only miner for CashTokens on Bitcoin Cash.
+Rust-first miner for Bitcoin Cash: CashTokens on GPUs and BCH on ASICs, solo,
+in farms and in pools.
+
+## What do you want to do?
+
+Run `pickaxe` for the setup, or use the command line.
+
+| You want to | In the setup | Command line | More |
+|---|---|---|---|
+| Mine PHOTON on your GPUs | GPU mining | `pickaxe mine --address <yours>` | [Quick start](#quick-start-mainnet-tui) |
+| Mine with GPUs on many machines | GPU mining; rigs: Join a GPU pool or farm | coordinator `--rigs-listen 0.0.0.0:3340`, rigs `--coordinator HOST:3340 --coordinator-key KEY` | [docs/farm.md](docs/farm.md) |
+| Join someone's GPU pool | GPU mining, Join a GPU pool or farm | `pickaxe mine --coordinator HOST:3340 --coordinator-key KEY --address <yours>` | [docs/farm.md](docs/farm.md) |
+| Run a GPU pool | Run a pool, GPU pool | `pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --rigs-public --rigs-fee 2 --address <yours>` | [docs/pool.md](docs/pool.md#a-public-gpu-pool) |
+| Mine BCH solo with your ASICs | ASIC mining, Solo | `pickaxe stratum-v2 serve` (your BCH node) | [docs/stratum-v2.md](docs/stratum-v2.md) |
+| Point your ASICs at a pool | ASIC mining, Join a pool | `pickaxe stratum-v2 serve --sv1-listen 0.0.0.0:3333 --upstream stratum2+tcp://HOST:PORT/KEY` | [docs/stratum-v2.md](docs/stratum-v2.md) |
+| Run a BCH pool for others | Run a pool, ASIC pool | `pickaxe stratum-v2 serve --public --pool-fee 2 --pool-tag /MyPool/` | [docs/pool.md](docs/pool.md) |
+
+A server or coordinator shows where devices and rigs connect on its
+dashboard (`i` or `I`, Connection info), ready to copy, for your network and,
+with [Tailscale](https://tailscale.com), from anywhere. Mining BCH needs a
+BCH node (Fulcrum cannot build blocks); PHOTON uses yours when you have one
+and public Fulcrum servers when you do not.
 
 ## Scope
 
