@@ -157,6 +157,10 @@ pub fn run(
             }
         })
     };
+    // #### PR #40
+    // Tell the user where to point devices: a wildcard listener shows this
+    // computer's address on the local network instead.
+    let devices_hint = device_hint(bound, sv1_bound, lan_address());
     // SV2 reference authority public-key encoding: version 1 (little endian),
     // 32-byte x-only key, Base58Check. Only the public key is displayed.
     let mut encoded = vec![1, 0];
@@ -218,7 +222,7 @@ pub fn run(
                     .filter_map(|device| device.hashrate_estimate)
                     .sum();
                 let header = format!(
-                    "{} · Node {} · Height {} · Donation {}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
+                    "{} · Node {} · Height {} · Donation {}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
                     config.network.as_str(),
                     if snapshot.template_ready { "Ready" } else { "Waiting" },
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
@@ -463,7 +467,7 @@ fn render_workers(
     footer: &str,
 ) {
     let areas = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Min(4),
         Constraint::Length(2),
     ])
@@ -611,6 +615,36 @@ impl From<&DeviceSnapshot> for WorkerLine {
             temperature_c: device.temperature_c,
             fan: device.fan.clone(),
         }
+    }
+}
+
+/// This computer's address on the local network. No packet is sent:
+/// connecting a UDP socket only chooses the outgoing interface.
+fn lan_address() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+/// Where devices connect, with wildcard listeners shown as this computer's
+/// local network address.
+fn device_hint(
+    sv2: std::net::SocketAddr,
+    sv1: Option<std::net::SocketAddr>,
+    lan: Option<std::net::IpAddr>,
+) -> String {
+    let shown = |address: std::net::SocketAddr| match lan {
+        Some(ip) if address.ip().is_unspecified() => std::net::SocketAddr::new(ip, address.port()),
+        _ => address,
+    };
+    match sv1 {
+        Some(sv1) => format!(
+            "Point devices at: SV1 stratum+tcp://{} · SV2 {}",
+            shown(sv1),
+            shown(sv2)
+        ),
+        None => format!("Point devices at: SV2 {}", shown(sv2)),
     }
 }
 
@@ -942,6 +976,28 @@ mod tests {
         assert_eq!(format_difficulty(Some(512.0)), "512");
         assert_eq!(format_difficulty(None), "—");
         assert_eq!(ago(Some(250)), "4m ago");
+    }
+
+    #[test]
+    fn devices_are_told_this_computers_network_address() {
+        let lan = Some("192.168.0.160".parse().unwrap());
+        assert_eq!(
+            device_hint(
+                "0.0.0.0:3336".parse().unwrap(),
+                Some("0.0.0.0:3333".parse().unwrap()),
+                lan
+            ),
+            "Point devices at: SV1 stratum+tcp://192.168.0.160:3333 · SV2 192.168.0.160:3336"
+        );
+        // Explicit listeners are shown as configured.
+        assert_eq!(
+            device_hint("127.0.0.1:3336".parse().unwrap(), None, lan),
+            "Point devices at: SV2 127.0.0.1:3336"
+        );
+        assert_eq!(
+            device_hint("0.0.0.0:3336".parse().unwrap(), None, None),
+            "Point devices at: SV2 0.0.0.0:3336"
+        );
     }
 
     #[test]

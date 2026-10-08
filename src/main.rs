@@ -1573,6 +1573,35 @@ fn main() {
                             exit_after_error(1);
                         }
                     };
+                    // #### PR #40
+                    // ASIC mode from setup runs the BCH ASIC server for devices
+                    // on the local network: SV1 on 3333 and SV2 on 3336.
+                    if setup.asic {
+                        let action = cli::StratumV2Command::Serve {
+                            listen: std::net::SocketAddr::from(([0, 0, 0, 0], 3336)),
+                            sv1_listen: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3333))),
+                            donation: None,
+                        };
+                        #[cfg(feature = "stratum-v2")]
+                        let result = stratum_v2::command::run(
+                            action,
+                            &setup.config,
+                            &config_path,
+                            false,
+                            false,
+                        );
+                        #[cfg(not(feature = "stratum-v2"))]
+                        let result: Result<(), String> = {
+                            let _ = action;
+                            Err("this build does not include Stratum V2; build with --features stratum-v2"
+                                .into())
+                        };
+                        if let Err(error) = result {
+                            eprintln!("error: {error}");
+                            exit_after_error(1);
+                        }
+                        return;
+                    }
                     (setup.config, setup.gpus, Some(setup.profile_name))
                 }
                 MineStartup::Direct => (cfg, selected_gpus, None),

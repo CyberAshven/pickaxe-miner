@@ -65,6 +65,8 @@ pub struct SetupResult {
     /// The GPUs to mine on.
     pub gpus: Vec<GpuDevice>,
     pub profile_name: String,
+    /// Start the BCH ASIC server instead of GPU mining.
+    pub asic: bool,
 }
 
 #[derive(Default)]
@@ -150,7 +152,8 @@ enum TextField {
     Connection,
 }
 
-/// What an ASIC can mine, once ASIC mining is supported.
+/// What an ASIC can mine: BCH today (merge-mined tokens as they appear);
+/// ASIC-exclusive tokens come later.
 const ASIC_TARGETS: [&str; 2] = [
     "BCH + all merge-mined tokens",
     "ASIC-exclusive token (SAFA, ...)",
@@ -757,10 +760,33 @@ impl SetupFlow {
                     self.connection_selected = 0;
                     self.step = SetupStep::Connections;
                 }
+                // #### PR #40
+                // ASIC mode starts the BCH ASIC server: blocks come from the
+                // miner's own BCH node and pay the payout address directly.
                 SettingsRow::Start if self.mode == MiningMode::Asic => {
-                    self.status_line =
-                        "ASIC mining isn't supported yet. Start becomes available when it is."
-                            .into();
+                    if self.asic_target != 0 {
+                        self.status_line =
+                            "ASIC-exclusive tokens are not available yet; choose BCH.".into();
+                    } else if self.config.payout_address.trim().is_empty() {
+                        self.status_line = "Enter a payout address first.".into();
+                        self.open_settings(SettingsRow::Address);
+                    } else if crate::config::validate_payout_address(
+                        self.config.network,
+                        &self.config.payout_address,
+                    )
+                    .is_err()
+                    {
+                        self.status_line =
+                            "Enter a BCH payout address for the selected network.".into();
+                        self.open_settings(SettingsRow::Address);
+                    } else if self.config.custom_node_endpoints().is_empty() {
+                        self.status_line =
+                            "BCH ASIC mining builds blocks from your own BCH node; add it on the BCH node row."
+                                .into();
+                        self.open_settings(SettingsRow::Node);
+                    } else {
+                        return SetupAction::Complete;
+                    }
                 }
                 SettingsRow::Start if self.config.payout_address.trim().is_empty() => {
                     self.status_line = "Enter a payout address first.".into();
@@ -1391,6 +1417,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
                             config: state.config.clone(),
                             gpus,
                             profile_name,
+                            asic: state.mode == MiningMode::Asic,
                         }));
                     }
                     Err(error) => state.status_line = error,
@@ -2350,9 +2377,16 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     Span::raw(format!("{marker} ")),
                     Span::styled("Start mining", Style::default().fg(Color::Green)),
                 ]),
+                MiningMode::Asic if state.asic_target == 0 => Line::from(vec![
+                    Span::raw(format!("{marker} ")),
+                    Span::styled(
+                        "Start the BCH ASIC server",
+                        Style::default().fg(Color::Green),
+                    ),
+                ]),
                 MiningMode::Asic => Line::from(vec![
                     Span::raw(format!("{marker} ")),
-                    dim("Start (available when ASIC mining is supported)"),
+                    dim("Start (ASIC-exclusive tokens come later)"),
                 ]),
             });
             continue;
@@ -4001,7 +4035,7 @@ mod tests {
     }
 
     #[test]
-    fn asic_path_offers_both_targets_but_cannot_start() {
+    fn asic_path_starts_bch_mining_once_payout_and_node_are_set() {
         let devices = test_devices();
         let mut setup = SetupFlow::new(
             RuntimeConfig::default(),
@@ -4027,7 +4061,30 @@ mod tests {
         assert!(!rows.contains(&SettingsRow::Intensity));
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
-        assert!(setup.status_line.contains("ASIC mining isn't supported"));
+        assert!(setup.status_line.contains("not available yet"));
+        // BCH: a payout address, then the miner's own node, are required.
+        setup.asic_target = 0;
+        assert!(setup_text(&setup).contains("Start the BCH ASIC server"));
+        setup.config.payout_address.clear();
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.status_line.contains("payout address"));
+        let public_key = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes([2; 32]).unwrap(),
+        )
+        .serialize();
+        setup.config.payout_address = crate::config::reprefix_p2pkh_payout(
+            &crate::reward::p2pkh_cashaddr_from_public_key(&public_key).unwrap(),
+            setup.config.network,
+        )
+        .unwrap();
+        setup.config.node_url = None;
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert!(setup.status_line.contains("own BCH node"));
+        setup.config.node_url = Some("http://user:pass@127.0.0.1:8332".into());
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
     }
 
     #[test]

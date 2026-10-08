@@ -141,6 +141,12 @@ rate when reported, its hottest temperature and its fan speed. Each device gets
 three seconds per report. Device addresses are used only for these queries and
 never appear in the dashboard or JSON; no device setting is changed.
 
+The setup screen starts the same server: choose ASIC, then "BCH + all
+merge-mined tokens", and set a payout address and your BCH node. It listens on
+the local network (SV1 on port 3333, SV2 on 3336) and the workers page shows
+this computer's address to point devices at. SV1 has no encryption, so use it
+on a trusted network.
+
 A server running without a screen, for example as a service with
 `--no-tui --json`, saves the same status once a second beside its config
 (`chipnet.sv2-status.json` for `chipnet.json`). On that machine,
