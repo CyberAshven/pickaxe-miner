@@ -678,8 +678,8 @@ impl OpenClPhotonEngine {
         let amount =
             |at: usize| u64::from_le_bytes(template[at..at + 8].try_into().expect("8-byte amount"));
         let mut midstate = INITIAL_STATE;
-        for block in template[..384].chunks_exact(64) {
-            compress(&mut midstate, block.try_into().expect("64-byte block"));
+        for block in template[..384].as_chunks::<64>().0 {
+            compress(&mut midstate, block);
         }
         self.kernel(shift)?;
         self.write(self.target, target)?;
@@ -919,8 +919,8 @@ fn signed_window(job: &mut Job, nonce: u32) -> Result<Window, String> {
     padded[491 + shift - 448..499 + shift - 448].fill(0);
     padded[578 + shift - 448..586 + shift - 448].fill(0);
     let mut tail = [0u32; TAIL_WORDS];
-    for (word, bytes) in tail.iter_mut().zip(padded.chunks_exact(4)) {
-        *word = u32::from_be_bytes(bytes.try_into().expect("4 bytes"));
+    for (word, bytes) in tail.iter_mut().zip(padded.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
     }
     let window = Window { state, tail };
     if job.windows.len() >= WINDOW_CACHE {
@@ -981,8 +981,8 @@ const ROUND: [u32; 64] = [
 /// One SHA-256 compression on the host, for the per-window midstate.
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for (i, bytes) in block.chunks_exact(4).enumerate() {
-        w[i] = u32::from_be_bytes(bytes.try_into().expect("4 bytes"));
+    for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
     }
     for i in 16..64 {
         let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -1045,7 +1045,7 @@ mod tests {
             );
         }
         let mut state = window.state;
-        for block in m.chunks_exact(16) {
+        for block in m.as_chunks::<16>().0 {
             let bytes: Vec<u8> = block.iter().flat_map(|word| word.to_be_bytes()).collect();
             compress(&mut state, bytes.as_slice().try_into().unwrap());
         }
@@ -1134,8 +1134,8 @@ mod tests {
                 let template = template_for(&deployment, age, &key, &target, baton, reward);
                 assert!(tx::supports_t2_window(&template).unwrap());
                 let mut midstate = INITIAL_STATE;
-                for block in template[..384].chunks_exact(64) {
-                    compress(&mut midstate, block.try_into().unwrap());
+                for block in template[..384].as_chunks::<64>().0 {
+                    compress(&mut midstate, block);
                 }
                 let shift = layout.shift();
                 let mut job = Job {

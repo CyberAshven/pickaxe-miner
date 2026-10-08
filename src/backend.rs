@@ -593,7 +593,7 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
                 return Err(hip_error(&library, device_code, "hipDeviceGet"));
             }
 
-            let mut name_buffer = [0 as c_char; 256];
+            let mut name_buffer: [c_char; 256] = [0; 256];
             let name_code =
                 hip_device_get_name(name_buffer.as_mut_ptr(), name_buffer.len() as c_int, device);
             if name_code != 0 {
@@ -621,7 +621,7 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
                 "hip ordinal={ordinal}; gfx={architecture}; runtime={runtime_version}; driver={driver_version}; vram={vram_gb}"
             );
             let pci = hip_device_get_pci_bus_id.as_ref().and_then(|get_bus_id| {
-                let mut bus_id = [0 as c_char; 64];
+                let mut bus_id: [c_char; 64] = [0; 64];
                 (get_bus_id(bus_id.as_mut_ptr(), bus_id.len() as c_int, device) == 0)
                     .then(|| PciAddress::parse(&CStr::from_ptr(bus_id.as_ptr()).to_string_lossy()))
                     .flatten()
@@ -659,7 +659,7 @@ struct CudaInfo {
 /// Reads CUDA device details for selection and display.
 fn cuda_device_info(index: u32, ctx: &CudaContext) -> CudaInfo {
     // Best-effort via driver sys; fall back to ordinal if attrs fail.
-    let mut name_buf = [0 as c_char; 256];
+    let mut name_buf: [c_char; 256] = [0; 256];
     let name = unsafe {
         let mut dev: sys::CUdevice = 0;
         if sys::cuDeviceGet(&mut dev, index as i32) == sys::CUresult::CUDA_SUCCESS {
@@ -681,7 +681,7 @@ fn cuda_device_info(index: u32, ctx: &CudaContext) -> CudaInfo {
     let mut major = 0i32;
     let mut minor = 0i32;
     let mut total_mem: usize = 0;
-    let mut bus_id = [0 as c_char; 64];
+    let mut bus_id: [c_char; 64] = [0; 64];
     let mut pci = None;
     unsafe {
         let mut dev: sys::CUdevice = 0;
