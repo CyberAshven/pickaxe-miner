@@ -244,10 +244,17 @@ impl Channel {
             )
             .ok()
             .flatten()?;
-        self.hashrate = hashrate;
-        self.desired = hash_rate_to_target(f64::from(hashrate), f64::from(SHARES_PER_MINUTE))
+        let desired = hash_rate_to_target(f64::from(hashrate), f64::from(SHARES_PER_MINUTE))
             .ok()?
             .to_le_bytes();
+        // The floor only stops the target from easing further. A device
+        // below it (or started easier than it) never gets a harder target
+        // from the floor itself.
+        if hashrate <= MIN_HASHRATE && meets_target(&desired, &self.desired) {
+            return None;
+        }
+        self.hashrate = hashrate;
+        self.desired = desired;
         self.settle(&block, maximum).then_some(self.target)
     }
 
@@ -710,6 +717,14 @@ mod tests {
             .unwrap()
             .to_le_bytes();
         assert_eq!(silent.target, floor);
+        // A device started easier than the floor, with few or no shares,
+        // is never made harder by the floor.
+        let mut easy = device_channel([255; 32]);
+        for shares in [0, 5] {
+            easy.vardiff_window(20, shares);
+            assert_eq!(easy.retarget(&[255; 32]), None);
+            assert_eq!(easy.target, [255; 32]);
+        }
     }
 
     #[test]
