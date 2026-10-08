@@ -147,6 +147,13 @@ the local network (SV1 on port 3333, SV2 on 3336) and the workers page shows
 this computer's address to point devices at. SV1 has no encryption, so use it
 on a trusted network.
 
+On the workers page, `c` opens controls for the top row's device: Restart
+(Avalon and Bitaxe) and one work level down or up (Avalon, within the
+device's own range). Each action needs a confirmation, goes only to a device
+on the local network through its own API (Canaan's CGMiner `ascset`,
+Bitaxe's restart endpoint), and shows the device's reply. The read-only
+`watch` view has no controls.
+
 A server running without a screen, for example as a service with
 `--no-tui --json`, saves the same status once a second beside its config
 (`chipnet.sv2-status.json` for `chipnet.json`). On that machine,

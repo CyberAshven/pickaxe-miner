@@ -155,6 +155,15 @@ impl Devices {
         }
     }
 
+    /// The local network address of a connected worker, for actions the user
+    /// confirms on the workers page. Never shown or written to JSON.
+    pub fn address_for_label(&self, label: &str) -> Option<IpAddr> {
+        self.rows
+            .iter()
+            .find(|(_, row)| row.label == label && row.ended.is_none())
+            .and_then(|(id, _)| self.addresses.get(id).copied())
+    }
+
     /// Connected devices with a known address.
     pub fn addresses(&self) -> Vec<(u64, IpAddr)> {
         self.addresses
@@ -503,6 +512,12 @@ mod tests {
         devices.set_address(id, "203.0.113.5".parse().unwrap());
         assert!(devices.addresses().is_empty());
         devices.set_address(id, "10.9.8.7".parse().unwrap());
+        let label = devices.snapshots(now)[0].label.clone();
+        assert_eq!(
+            devices.address_for_label(&label),
+            Some("10.9.8.7".parse().unwrap())
+        );
+        assert_eq!(devices.address_for_label("Device unknown"), None);
         assert_eq!(devices.addresses(), vec![(id, "10.9.8.7".parse().unwrap())]);
         devices.set_report(
             id,

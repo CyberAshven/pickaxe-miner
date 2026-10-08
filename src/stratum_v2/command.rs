@@ -180,6 +180,7 @@ pub fn run(
         let mut overview = false;
         let status_file = status_path(config_path);
         let mut status_saved: Option<Instant> = None;
+        let mut controls: Option<Controls> = None;
         while !stop.load(Ordering::Relaxed) && !worker.is_finished() {
             if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
                 break;
@@ -238,19 +239,43 @@ pub fn run(
                 terminal
                     .terminal
                     .draw(|frame| {
-                        if advanced {
+                        if let Some(view) = controls.as_ref() {
+                            render_controls(frame, view)
+                        } else if advanced {
                             render_advanced(frame, donation_value, setting_error)
                         } else if overview {
                             render_dashboard(frame, &overview_text, &devices, device_offset)
                         } else {
-                            render_workers(frame, &header, &lines, device_offset, SERVE_FOOTER)
+                            render_workers(
+                                frame,
+                                &header,
+                                &lines,
+                                device_offset,
+                                SERVE_FOOTER,
+                                true,
+                            )
                         }
                     })
                     .map_err(|_| "cannot draw mining dashboard")?;
                 if event::poll(Duration::from_millis(500)).map_err(|_| "cannot read terminal")? {
                     if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
                         if key.kind == KeyEventKind::Press {
+                            if let Some(view) = controls.as_mut() {
+                                if handle_controls_key(view, key.code, &stats) {
+                                    controls = None;
+                                }
+                                continue;
+                            }
                             match key.code {
+                                KeyCode::Char('c') | KeyCode::Char('C')
+                                    if !advanced && !overview =>
+                                {
+                                    if let Some(device) =
+                                        devices.get(device_offset).filter(|device| device.connected)
+                                    {
+                                        controls = Some(Controls::new(device.label.clone()));
+                                    }
+                                }
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
                                 KeyCode::Esc => advanced = false,
                                 KeyCode::Tab if !advanced => overview = !overview,
@@ -465,6 +490,7 @@ fn render_workers(
     devices: &[WorkerLine],
     offset: usize,
     footer: &str,
+    highlight: bool,
 ) {
     let areas = Layout::vertical([
         Constraint::Length(5),
@@ -483,46 +509,56 @@ fn render_workers(
             .map(crate::telemetry::format_hash_rate)
             .unwrap_or_else(|| "Measuring".into())
     };
-    let rows = devices.iter().skip(offset).map(|device| {
-        let total = device.accepted + device.rejected;
-        Row::new(vec![
-            device.label.clone(),
-            if device.connected {
-                "Online"
+    let rows = devices
+        .iter()
+        .skip(offset)
+        .enumerate()
+        .map(|(index, device)| {
+            let total = device.accepted + device.rejected;
+            let style = if highlight && index == 0 {
+                Style::default().add_modifier(Modifier::REVERSED)
             } else {
-                "Offline"
-            }
-            .to_owned(),
-            rate(device.hashrate_estimate),
-            rate(device.hashrate_hour),
-            device
-                .reported_hashrate
-                .map(crate::telemetry::format_hash_rate)
-                .unwrap_or_else(|| "—".into()),
-            device
-                .temperature_c
-                .map(|temperature| format!("{temperature:.0} °C"))
-                .unwrap_or_else(|| "—".into()),
-            device.fan.clone().unwrap_or_else(|| "—".into()),
-            device.accepted.to_string(),
-            device.rejected.to_string(),
-            if total == 0 {
-                "—".to_owned()
-            } else {
-                format!("{:.2}%", device.rejected as f64 * 100.0 / total as f64)
-            },
-            ago(device.last_share_seconds),
-            format_difficulty(device.difficulty),
-            device.protocol.clone(),
-            device
-                .adapter_error
-                .as_deref()
-                .or(device.connection_error.as_deref())
-                .or(device.last_rejection.as_deref())
-                .unwrap_or("—")
+                Style::default()
+            };
+            Row::new(vec![
+                device.label.clone(),
+                if device.connected {
+                    "Online"
+                } else {
+                    "Offline"
+                }
                 .to_owned(),
-        ])
-    });
+                rate(device.hashrate_estimate),
+                rate(device.hashrate_hour),
+                device
+                    .reported_hashrate
+                    .map(crate::telemetry::format_hash_rate)
+                    .unwrap_or_else(|| "—".into()),
+                device
+                    .temperature_c
+                    .map(|temperature| format!("{temperature:.0} °C"))
+                    .unwrap_or_else(|| "—".into()),
+                device.fan.clone().unwrap_or_else(|| "—".into()),
+                device.accepted.to_string(),
+                device.rejected.to_string(),
+                if total == 0 {
+                    "—".to_owned()
+                } else {
+                    format!("{:.2}%", device.rejected as f64 * 100.0 / total as f64)
+                },
+                ago(device.last_share_seconds),
+                format_difficulty(device.difficulty),
+                device.protocol.clone(),
+                device
+                    .adapter_error
+                    .as_deref()
+                    .or(device.connection_error.as_deref())
+                    .or(device.last_rejection.as_deref())
+                    .unwrap_or("—")
+                    .to_owned(),
+            ])
+            .style(style)
+        });
     frame.render_widget(
         Table::new(
             rows,
@@ -572,7 +608,7 @@ fn render_workers(
     frame.render_widget(Paragraph::new(footer), areas[2]);
 }
 
-const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
+const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · c  Controls (top row) · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
 const WATCH_FOOTER: &str = "↑/↓ PgUp/PgDn  Scroll · q  Quit (the server keeps running)\nRead-only view of the server's saved status; Now and 1 hour come from validated shares.";
 
 /// One row of the workers table, from the live server or its saved status.
@@ -646,6 +682,103 @@ fn device_hint(
         ),
         None => format!("Point devices at: SV2 {}", shown(sv2)),
     }
+}
+
+/// #### PR #40
+/// The controls page for one worker: choose an action, confirm it, and read
+/// the device's reply. Actions run in the background so the page stays live.
+struct Controls {
+    label: String,
+    confirming: Option<super::device_api::DeviceAction>,
+    reply: Arc<Mutex<Option<String>>>,
+}
+
+impl Controls {
+    fn new(label: String) -> Self {
+        Self {
+            label,
+            confirming: None,
+            reply: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn set_reply(&self, text: String) {
+        if let Ok(mut reply) = self.reply.lock() {
+            *reply = Some(text);
+        }
+    }
+}
+
+/// Handles one key on the controls page; true closes it.
+fn handle_controls_key(view: &mut Controls, code: KeyCode, stats: &Mutex<ServerStats>) -> bool {
+    use super::device_api::{control, DeviceAction};
+    match (view.confirming, code) {
+        (_, KeyCode::Esc) => return true,
+        (None, KeyCode::Char(choice @ '1'..='3')) => {
+            view.confirming = Some(DeviceAction::ALL[usize::from(choice as u8 - b'1')]);
+        }
+        (Some(action), KeyCode::Char('y') | KeyCode::Char('Y')) => {
+            view.confirming = None;
+            let address = stats
+                .lock()
+                .ok()
+                .and_then(|stats| stats.device_stats.address_for_label(&view.label));
+            match address {
+                None => view.set_reply(
+                    "This worker's network address is not known, so it cannot be controlled."
+                        .into(),
+                ),
+                Some(ip) => {
+                    view.set_reply(format!("Sending: {}…", action.label()));
+                    let reply = Arc::clone(&view.reply);
+                    thread::spawn(move || {
+                        let text = match control(ip, action) {
+                            Ok(message) => {
+                                format!("{}: the device replied \"{message}\"", action.label())
+                            }
+                            Err(error) => format!("{}: not done; {error}", action.label()),
+                        };
+                        if let Ok(mut reply) = reply.lock() {
+                            *reply = Some(text);
+                        }
+                    });
+                }
+            }
+        }
+        (Some(_), _) => view.confirming = None,
+        _ => {}
+    }
+    false
+}
+
+fn render_controls(frame: &mut Frame<'_>, view: &Controls) {
+    use super::device_api::DeviceAction;
+    let mut text = format!("Worker  {}\n\n", view.label);
+    match view.confirming {
+        Some(action) => text.push_str(&format!(
+            "{} {}?\n\ny  Yes · any other key  No\n",
+            action.label(),
+            view.label
+        )),
+        None => {
+            for (index, action) in DeviceAction::ALL.iter().enumerate() {
+                text.push_str(&format!("{}  {}\n", index + 1, action.label()));
+            }
+            text.push_str("\nEsc  Back to workers\n");
+        }
+    }
+    if let Some(reply) = view.reply.lock().ok().and_then(|reply| reply.clone()) {
+        text.push_str(&format!("\n{reply}\n"));
+    }
+    text.push_str(
+        "\nActions go to the device's own API on your local network and each needs your confirmation. Restart works on Avalon and Bitaxe; work levels on Avalon, within the device's own range.",
+    );
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::bordered().title("Pickaxe · Device controls"))
+            .wrap(Wrap { trim: false }),
+        frame.area(),
+    );
 }
 
 fn unix_now() -> u64 {
@@ -798,7 +931,7 @@ fn watch(path: &Path) -> Result<(), String> {
         offset = offset.min(rows.len().saturating_sub(1));
         terminal
             .terminal
-            .draw(|frame| render_workers(frame, &header, &rows, offset, WATCH_FOOTER))
+            .draw(|frame| render_workers(frame, &header, &rows, offset, WATCH_FOOTER, false))
             .map_err(|_| "cannot draw workers table")?;
         if event::poll(Duration::from_secs(1)).map_err(|_| "cannot read terminal")? {
             if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
@@ -945,6 +1078,7 @@ mod tests {
                     &rows,
                     0,
                     SERVE_FOOTER,
+                    true,
                 )
             })
             .unwrap();
@@ -976,6 +1110,42 @@ mod tests {
         assert_eq!(format_difficulty(Some(512.0)), "512");
         assert_eq!(format_difficulty(None), "—");
         assert_eq!(ago(Some(250)), "4m ago");
+    }
+
+    #[test]
+    fn controls_need_a_choice_and_a_confirmation() {
+        use super::super::device_api::DeviceAction;
+        use ratatui::{backend::TestBackend, Terminal};
+        let stats = Mutex::new(ServerStats::default());
+        let mut view = Controls::new("Device 1".into());
+        // Choosing an action only asks for confirmation.
+        assert!(!handle_controls_key(&mut view, KeyCode::Char('2'), &stats));
+        assert_eq!(view.confirming, Some(DeviceAction::LowerPower));
+        // Any key other than y cancels.
+        handle_controls_key(&mut view, KeyCode::Char('n'), &stats);
+        assert_eq!(view.confirming, None);
+        assert!(view.reply.lock().unwrap().is_none());
+        // Confirmed, but without a known address nothing is sent.
+        handle_controls_key(&mut view, KeyCode::Char('1'), &stats);
+        handle_controls_key(&mut view, KeyCode::Char('y'), &stats);
+        assert!(view
+            .reply
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("cannot be controlled"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| render_controls(f, &view)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Restart") && text.contains("Raise power"));
+        assert!(handle_controls_key(&mut view, KeyCode::Esc, &stats));
     }
 
     #[test]
@@ -1062,7 +1232,7 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(180, 20)).unwrap();
         terminal
-            .draw(|f| render_workers(f, &header, &saved.rows(updated), 0, WATCH_FOOTER))
+            .draw(|f| render_workers(f, &header, &saved.rows(updated), 0, WATCH_FOOTER, false))
             .unwrap();
         let text: String = terminal
             .backend()

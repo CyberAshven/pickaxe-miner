@@ -139,6 +139,125 @@ fn http_complete(reply: &[u8]) -> bool {
         .is_some_and(|length| reply.len() >= end + 4 + length)
 }
 
+/// #### PR #40
+/// What the user may ask a device to do from the workers page, each only
+/// after confirming it there. Commands follow Canaan's CGMiner fork
+/// (`ascset` with `reboot` and `worklevel`) and Bitaxe's restart endpoint;
+/// the device checks every value itself and replies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAction {
+    Restart,
+    LowerPower,
+    RaisePower,
+}
+
+impl DeviceAction {
+    pub const ALL: [Self; 3] = [Self::Restart, Self::LowerPower, Self::RaisePower];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Restart => "Restart",
+            Self::LowerPower => "Lower power (one work level down)",
+            Self::RaisePower => "Raise power (one work level up)",
+        }
+    }
+}
+
+/// Sends one confirmed action to a device on the local network and returns
+/// the device's own reply.
+pub fn control(ip: IpAddr, action: DeviceAction) -> Result<String, String> {
+    if !queryable(ip) {
+        return Err("only devices on the local network can be controlled".into());
+    }
+    let ip = ip.to_canonical();
+    let cgminer = SocketAddr::new(ip, 4028);
+    match action {
+        DeviceAction::Restart => ascset(cgminer, "0,reboot,0")
+            .or_else(|error| bitaxe_restart(SocketAddr::new(ip, 80)).map_err(|_| error)),
+        DeviceAction::LowerPower => adjust_level(cgminer, false),
+        DeviceAction::RaisePower => adjust_level(cgminer, true),
+    }
+}
+
+/// One CGMiner `ascset` command for the first device; `Ok` carries the
+/// device's message when it reports success or information.
+fn ascset(address: SocketAddr, parameter: &str) -> Result<String, String> {
+    let request = serde_json::json!({"command": "ascset", "parameter": parameter}).to_string();
+    let reply = exchange(
+        address,
+        request.as_bytes(),
+        Instant::now() + DEADLINE,
+        |reply| reply.contains(&0),
+    )
+    .ok_or("the device did not answer")?;
+    parse_ascset(&reply)
+}
+
+/// Reads the work level, then asks for one step lower or higher; the device
+/// rejects a level outside its own range.
+fn adjust_level(address: SocketAddr, raise: bool) -> Result<String, String> {
+    let current = ascset(address, "0,worklevel,get")?;
+    let level = parse_level(&current).ok_or("the device did not report its work level")?;
+    let next = if raise { level + 1 } else { level - 1 };
+    ascset(address, &format!("0,worklevel,set,{next}"))
+        .map(|reply| format!("{reply} (work level {level} to {next})"))
+}
+
+fn bitaxe_restart(address: SocketAddr) -> Result<String, String> {
+    let host = match address.ip() {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    let request = format!(
+        "POST /api/system/restart HTTP/1.0\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let reply = exchange(
+        address,
+        request.as_bytes(),
+        Instant::now() + DEADLINE,
+        http_complete,
+    )
+    .ok_or("the device did not answer")?;
+    let status = reply.lines().next().unwrap_or_default();
+    if status.split_whitespace().nth(1) == Some("200") {
+        Ok("restarting".into())
+    } else {
+        Err(format!("the device answered {status}"))
+    }
+}
+
+/// A CGMiner reply's status: "S" (success) and "I" (information) are kept,
+/// anything else is the device's refusal.
+pub fn parse_ascset(reply: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(reply.trim_end_matches('\0').trim())
+        .map_err(|_| "unexpected reply from the device")?;
+    let status = value
+        .get("STATUS")
+        .and_then(|status| status.get(0))
+        .ok_or("unexpected reply from the device")?;
+    let message = status
+        .get("Msg")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match status.get("STATUS").and_then(Value::as_str) {
+        Some("S") | Some("I") => Ok(message),
+        _ if message.is_empty() => Err("the device refused".into()),
+        _ => Err(message),
+    }
+}
+
+/// The level in a reply such as "ASC 0 set info: worklevel 2".
+fn parse_level(message: &str) -> Option<i32> {
+    message
+        .split("worklevel")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Reads a CGMiner API reply: hash rate from `summary`, temperatures and fans
 /// from `estats` (Avalon's `MM ID` text uses `Key[value]` pairs).
 pub fn parse_cgminer(reply: &str) -> Option<DeviceReport> {
@@ -344,6 +463,70 @@ mod tests {
         }
         // Refused before any connection is attempted.
         assert_eq!(poll("8.8.8.8".parse().unwrap()), None);
+    }
+
+    /// A device stand-in that answers one connection per reply, in order,
+    /// and hands each request it received to the test.
+    fn recording_device(
+        replies: Vec<&'static [u8]>,
+    ) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut request = vec![0; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let _ = sender.send(String::from_utf8_lossy(&request[..read]).into_owned());
+                let _ = stream.write_all(reply);
+            }
+        });
+        (address, receiver)
+    }
+
+    #[test]
+    fn controls_send_canaan_commands_and_report_the_reply() {
+        // Raise power: read the level, then set one step up.
+        let (avalon, requests) = recording_device(vec![
+            br#"{"STATUS":[{"STATUS":"I","Msg":"ASC 0 set info: worklevel 1"}],"id":1}"#,
+            br#"{"STATUS":[{"STATUS":"S","Msg":"ASC 0 set OK"}],"id":1}"#,
+        ]);
+        assert_eq!(
+            adjust_level(avalon, true).unwrap(),
+            "ASC 0 set OK (work level 1 to 2)"
+        );
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,worklevel,get"}"#
+        );
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,worklevel,set,2"}"#
+        );
+        // A refusal is reported with the device's own reason.
+        let (refusing, _) = recording_device(vec![
+            br#"{"STATUS":[{"STATUS":"E","Msg":"ASC 0 set failed: worklevel unknown argument"}]}"#,
+        ]);
+        assert_eq!(
+            ascset(refusing, "0,worklevel,set,9").unwrap_err(),
+            "ASC 0 set failed: worklevel unknown argument"
+        );
+        // Bitaxe restart.
+        let (bitaxe, requests) =
+            recording_device(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]);
+        assert_eq!(bitaxe_restart(bitaxe).unwrap(), "restarting");
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("POST /api/system/restart HTTP/1.0\r\n"));
+        assert_eq!(parse_level("ASC 0 set info: worklevel -1"), Some(-1));
+        assert_eq!(parse_level("ASC 0 set OK"), None);
+        // Public addresses are never controlled.
+        assert!(control("8.8.8.8".parse().unwrap(), DeviceAction::Restart).is_err());
     }
 
     /// A device stand-in on loopback: writes `reply` one piece at a time,
