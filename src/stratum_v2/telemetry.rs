@@ -112,6 +112,32 @@ impl Default for Devices {
     }
 }
 
+/// #### PR #40
+/// The worker name in a username, never an address: printable, at most 24
+/// characters.
+fn worker_name(username: &str) -> Option<String> {
+    let username = username.trim();
+    let name = match username.rsplit_once('.') {
+        Some((_, name)) => name,
+        None => username,
+    };
+    let name: String = name.chars().filter(char::is_ascii_graphic).collect();
+    if name.is_empty() || looks_like_address(&name) {
+        return None;
+    }
+    Some(name.chars().take(24).collect())
+}
+
+/// A CashAddr, with or without its prefix, or anything with a prefix.
+fn looks_like_address(text: &str) -> bool {
+    const CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let lower = text.to_ascii_lowercase();
+    lower.contains(':')
+        || (lower.len() >= 40
+            && (lower.starts_with('q') || lower.starts_with('p'))
+            && lower.chars().all(|c| CHARSET.contains(c)))
+}
+
 impl Devices {
     pub fn connect(&mut self, socket: SocketAddr, adapter: bool, now: Instant) -> u64 {
         if let Some(id) = self.sockets.get(&socket) {
@@ -149,6 +175,17 @@ impl Devices {
         );
         self.prune();
         id
+    }
+
+    /// #### PR #40
+    /// Names a worker by the name its owner gave it: the part after the payout
+    /// address (`bitcoincash:q....rig1` gives `rig1`), or the whole username
+    /// when it is not an address. An address alone keeps the generated label:
+    /// payout addresses are never shown. The number keeps labels unique.
+    pub fn set_worker(&mut self, id: u64, username: &str) {
+        if let (Some(name), Some(row)) = (worker_name(username), self.rows.get_mut(&id)) {
+            row.label = format!("{name} #{id}");
+        }
     }
 
     /// Records where a device can be asked for its own report. Only local
@@ -392,6 +429,39 @@ pub fn connection_reason(error: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #40
+    #[test]
+    fn workers_are_named_by_their_owners_but_never_by_an_address() {
+        let address = crate::tx::p2pkh_hash_to_cashaddr_for_network(
+            &[0x11; 20],
+            crate::config::MiningNetwork::Mainnet,
+        )
+        .unwrap();
+        let address = address.as_str();
+        let bare = address.strip_prefix("bitcoincash:").unwrap();
+        assert_eq!(
+            worker_name(&format!("{address}.rig1")).as_deref(),
+            Some("rig1")
+        );
+        assert_eq!(worker_name(&format!("{bare}.r2")).as_deref(), Some("r2"));
+        assert_eq!(worker_name("rack-7").as_deref(), Some("rack-7"));
+        assert_eq!(worker_name("account.worker1").as_deref(), Some("worker1"));
+        assert_eq!(worker_name(address), None);
+        assert_eq!(worker_name(bare), None);
+        assert_eq!(worker_name(" \u{1b} "), None);
+        let mut devices = Devices::default();
+        let id = devices.connect("127.0.0.1:4000".parse().unwrap(), true, Instant::now());
+        devices.set_worker(id, address);
+        assert!(devices.snapshots(Instant::now())[0]
+            .label
+            .starts_with("Device "));
+        devices.set_worker(id, &format!("{address}.rig1"));
+        assert_eq!(
+            devices.snapshots(Instant::now())[0].label,
+            format!("rig1 #{id}")
+        );
+    }
 
     #[test]
     fn rates_weight_validated_targets_and_decay_when_work_stops() {

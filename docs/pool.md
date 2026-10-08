@@ -43,6 +43,9 @@ JSON start line (`--no-tui`) lists the same addresses under `connect`.
   Another Pickaxe joins with that same line (Join a pool).
 - A username that is not a payout address on the pool's network is refused
   when the device authorizes, with that reason.
+- The workers page names each device by its worker name (`rig1` in
+  `bitcoincash:q….rig1`), never by its address; a device that gives only an
+  address keeps a generated label.
 
 ## Miners in other places
 
@@ -98,6 +101,5 @@ terminal, and the details, see [farm.md](farm.md#a-public-gpu-pool).
 
 - Shared rewards, where every miner gets part of every block: that is P2Pool
   v2 (coming), also without custody.
-- The workers page shows generated labels, not miners' addresses.
 - Tested end to end with simulated SV1 and SV2 devices on a test node, not
   yet with real public miners.

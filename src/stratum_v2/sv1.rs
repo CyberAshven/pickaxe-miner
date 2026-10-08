@@ -109,13 +109,17 @@ pub struct Upstream {
     pub public: bool,
 }
 
+/// #### PR #40: the identity the adapter's channels open with at this
+/// server's own listener; not a worker name.
+pub(crate) const LOCAL_IDENTITY: &str = "sv1-device";
+
 impl Upstream {
     /// This server's own SV2 listener.
     pub fn local(address: SocketAddr, authority: [u8; 32]) -> Self {
         Self {
             address: address.to_string(),
             authority,
-            identity: "sv1-device".into(),
+            identity: LOCAL_IDENTITY.into(),
             remote: false,
             donation: None,
             public: false,
@@ -373,6 +377,7 @@ fn serve_session(
     stats: &Arc<Mutex<ServerStats>>,
     device: u64,
 ) -> Result<(), String> {
+    let mut named = false;
     let Opened {
         mut send,
         mut receive,
@@ -402,6 +407,16 @@ fn serve_session(
         }
         if let Some(request) = downstream.read()? {
             let (responses, shares) = bridge.request(request)?;
+            // #### PR #40: the workers page names the device by the name its
+            // owner gave it, never by a payout address.
+            if !named {
+                if let Some(worker) = bridge.worker.as_deref() {
+                    if let Ok(mut stats) = stats.lock() {
+                        stats.device_stats.set_worker(device, worker);
+                    }
+                    named = true;
+                }
+            }
             if let Some(reason) = bridge.local_rejection.take() {
                 let mut stats = stats.lock().map_err(|_| "mining statistics unavailable")?;
                 stats.shares_rejected = stats.shares_rejected.saturating_add(1);

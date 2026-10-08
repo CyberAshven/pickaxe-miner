@@ -638,6 +638,10 @@ fn serve_device(
                         .shares_rejected
                         .saturating_add(next_rejected.saturating_sub(rejected));
                     stats.device_stats.channels(device, mining.channels.len());
+                    // #### PR #40: named by its channel's user identity.
+                    if let Some(identity) = mining.identity.take() {
+                        stats.device_stats.set_worker(device, &identity);
+                    }
                     if let Some(event) = responses.share_event {
                         stats
                             .device_stats

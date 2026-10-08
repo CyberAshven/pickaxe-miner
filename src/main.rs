@@ -1209,6 +1209,40 @@ fn persist_session_profile(
 #[cfg(not(windows))]
 const TERMINAL_RELAUNCH_ENV: &str = "PICKAXE_TERMINAL_LAUNCHED";
 
+/// #### PR #32 / #40
+/// Mines as a rig of the given coordinators (from `--coordinator`, or the
+/// setup's Join a GPU pool or farm) until stopped. A public GPU pool claims
+/// the rig's wins to its payout.
+fn run_as_rig(
+    coordinators: &[(String, String)],
+    name: Option<&str>,
+    payout: &str,
+    gpus: &[backend::GpuDevice],
+    intensity: u8,
+    json: bool,
+) {
+    let result = (|| {
+        let _gpu_lock = mining_lock::acquire_gpu_lock()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&stop);
+        ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+            .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
+        rigs::run_rig(
+            coordinators,
+            name,
+            Some(payout).filter(|payout| !payout.trim().is_empty()),
+            gpus,
+            intensity,
+            json,
+            stop,
+        )
+    })();
+    if let Err(error) = result {
+        eprintln!("error: {error}");
+        exit_after_error(1);
+    }
+}
+
 /// Exits after an error, keeping a console opened just for the miner open.
 fn exit_after_error(code: i32) -> ! {
     if console_closes_on_exit() {
@@ -1564,28 +1598,14 @@ fn main() {
                     .cloned()
                     .zip(args.coordinator_key.iter().cloned())
                     .collect();
-                let result = (|| {
-                    let _gpu_lock = mining_lock::acquire_gpu_lock()?;
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let signal = Arc::clone(&stop);
-                    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
-                        .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
-                    rigs::run_rig(
-                        &coordinators,
-                        args.rig_name.as_deref(),
-                        // #### PR #32: a public GPU pool pays the rig's own.
-                        Some(cfg.payout_address.as_str())
-                            .filter(|payout| !payout.trim().is_empty()),
-                        &selected_gpus,
-                        cfg.intensity,
-                        args.json,
-                        stop,
-                    )
-                })();
-                if let Err(error) = result {
-                    eprintln!("error: {error}");
-                    exit_after_error(1);
-                }
+                run_as_rig(
+                    &coordinators,
+                    args.rig_name.as_deref(),
+                    &cfg.payout_address,
+                    &selected_gpus,
+                    cfg.intensity,
+                    args.json,
+                );
                 return;
             }
             // #### PR #32 / #40: the rig hub's settings, from the flags or
@@ -1674,6 +1694,25 @@ fn main() {
                     // pool's rigs on every interface (port 3340) with no GPU
                     // of its own, as `--rigs-listen 0.0.0.0:3340 --rigs-only
                     // --rigs-public` would.
+                    // #### PR #40: Join a GPU pool or farm: these GPUs mine as a
+                    // rig of its coordinator, as `--coordinator` does.
+                    if let Some(tui::ServerSetup::JoinGpuPool { address, key }) =
+                        setup.server.clone()
+                    {
+                        println!(
+                            "Mining as a rig of {address} on {} GPU(s); Ctrl+C stops.",
+                            setup.gpus.len()
+                        );
+                        run_as_rig(
+                            &[(address, key)],
+                            None,
+                            &setup.config.payout_address,
+                            &setup.gpus,
+                            setup.config.intensity,
+                            false,
+                        );
+                        return;
+                    }
                     if let Some(tui::ServerSetup::GpuPool { fee, address }) = setup.server.clone() {
                         rigs_listen = Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3340)));
                         rigs_public = true;
@@ -1704,8 +1743,9 @@ fn main() {
                                 tui::ServerSetup::Public { fee, mode, address } => {
                                     (Vec::new(), Vec::new(), true, Some(fee), Some(mode), address)
                                 }
-                                // Started above, as a GPU coordinator.
-                                tui::ServerSetup::GpuPool { .. } => unreachable!(),
+                                // Started above, as a GPU coordinator or rig.
+                                tui::ServerSetup::GpuPool { .. }
+                                | tui::ServerSetup::JoinGpuPool { .. } => unreachable!(),
                             };
                             let action = cli::StratumV2Command::Serve {
                                 listen: std::net::SocketAddr::from(([0, 0, 0, 0], 3336)),

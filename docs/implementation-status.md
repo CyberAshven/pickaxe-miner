@@ -1016,3 +1016,35 @@ so mining needed Fulcrum to start and stopped after a claim without it.
 
 Evidence: host tests with a scripted node cover the RPC answers and the
 transaction lookup without an index. Not yet mined live from a node.
+
+## Worker names on the workers page (2026-10-09)
+
+#### PR #40
+
+A device is named by the worker name in its username: the part after the
+payout address (`ADDRESS.rig1` gives `rig1`), or the whole username when it
+is not an address, at most 24 printable characters, with its session number
+to keep labels unique (`rig1 #3`). An address alone keeps the generated label,
+so payout addresses are still never shown. SV1 devices are named by the
+adapter when they authorize; native SV2 devices by their channel's user
+identity (the adapter's own channel identity is not a name).
+
+Evidence: host tests cover names from addresses with and without a prefix,
+account-style usernames, bare addresses and control characters, and the label
+change.
+
+## Joining a GPU pool or farm from the setup (2026-10-09)
+
+#### PR #40
+
+GPU mining's settings have a Mining row: alone (claims to your address), or
+join a GPU pool or farm. Joining asks for the coordinator's address and key
+(the one-line `stratum2+tcp://HOST:PORT/KEY` fills both) and your payout
+address, which a public pool claims your wins to; it shows no Fulcrum or node
+rows, since a rig takes its jobs from its coordinator. Start mines as a rig
+of that coordinator on the chosen GPUs, as `--coordinator` does (both use one
+`run_as_rig` path), printing its status lines.
+
+Evidence: a host test walks the setup from the Mining row to the result,
+including the one-line address filling the key and the checks for a missing
+coordinator address.

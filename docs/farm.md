@@ -50,6 +50,10 @@ as a `rigs join` line.
 pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key> --rig-name rack1-07 --no-tui
 ```
 
+In the setup, choose GPU mining and set Mining to "Join a GPU pool or farm"
+with the coordinator's address and key (the one-line
+`stratum2+tcp://HOST:3340/KEY` fills both); Start mines as a rig.
+
 A rig needs no address, Fulcrum server or node of its own, and mines with the
 coordinator's donation setting (never below the token's minimum). It mines on
 every discrete GPU (`--device` and `--include-integrated` choose others), and

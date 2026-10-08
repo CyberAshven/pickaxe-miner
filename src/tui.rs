@@ -85,6 +85,12 @@ pub enum ServerSetup {
         /// `None` is the payout address.
         address: Option<String>,
     },
+    /// #### PR #40: this computer's GPUs join someone's GPU pool or farm as
+    /// a rig of its coordinator (`HOST:PORT` and the coordinator's key).
+    JoinGpuPool {
+        address: String,
+        key: String,
+    },
     /// A public GPU pool: this computer coordinates other people's rigs,
     /// each mining for its own address; the fee is a share of each rig's
     /// mining time, since a token claim pays one address.
@@ -232,6 +238,8 @@ struct SetupFlow {
     asic_target: usize,
     /// #### PR #40: where an ASIC mines, the pool it joins or runs.
     asic_mining: AsicMining,
+    /// #### PR #40: whether GPUs mine alone or join a GPU pool or farm.
+    gpu_join: bool,
     pool_kind: PoolKind,
     /// A pool to run is for ASICs (0) or GPUs (1, coming soon).
     pool_target: usize,
@@ -328,6 +336,7 @@ impl SetupFlow {
             mode: MiningMode::Gpu,
             asic_target: 0,
             asic_mining: AsicMining::Solo,
+            gpu_join: false,
             pool_kind: PoolKind::Normal,
             pool_target: 0,
             join_address: String::new(),
@@ -553,8 +562,20 @@ impl SetupFlow {
     /// Rows of the settings page for the chosen hardware.
     fn settings_rows(&self) -> Vec<SettingsRow> {
         match self.mode {
+            // #### PR #40: a rig takes its jobs from its coordinator.
+            MiningMode::Gpu if self.gpu_join => vec![
+                SettingsRow::Gpu,
+                SettingsRow::Mining,
+                SettingsRow::PoolAddress,
+                SettingsRow::PoolKey,
+                SettingsRow::Address,
+                SettingsRow::Intensity,
+                SettingsRow::ProfileName,
+                SettingsRow::Start,
+            ],
             MiningMode::Gpu => vec![
                 SettingsRow::Gpu,
+                SettingsRow::Mining,
                 SettingsRow::Address,
                 SettingsRow::Intensity,
                 SettingsRow::Fulcrum,
@@ -608,6 +629,10 @@ impl SetupFlow {
     /// #### PR #40: the server this setup starts, if not GPU mining.
     fn server_setup(&self) -> Option<ServerSetup> {
         match self.mode {
+            MiningMode::Gpu if self.gpu_join => Some(ServerSetup::JoinGpuPool {
+                address: self.join_address.trim().to_owned(),
+                key: self.join_key.trim().to_owned(),
+            }),
             MiningMode::Gpu => None,
             MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => {
                 Some(ServerSetup::JoinPool {
@@ -999,6 +1024,9 @@ impl SetupFlow {
                     }
                     SettingsRow::AsicTarget => self.asic_target = 1 - self.asic_target,
                     // #### PR #40
+                    SettingsRow::Mining if self.mode == MiningMode::Gpu => {
+                        self.gpu_join = !self.gpu_join;
+                    }
                     SettingsRow::Mining => {
                         self.asic_mining = match self.asic_mining {
                             AsicMining::Solo => AsicMining::JoinPool,
@@ -1061,6 +1089,35 @@ impl SetupFlow {
                     self.step = SetupStep::Connections;
                     if row == SettingsRow::Node {
                         self.check_local_node();
+                    }
+                }
+                // #### PR #40
+                // Joining a GPU pool or farm needs its coordinator and key,
+                // and the payout a public pool claims this rig's wins to.
+                SettingsRow::Start if self.mode == MiningMode::Gpu && self.gpu_join => {
+                    if !self.join_address.contains(':') {
+                        self.status_line =
+                            "Enter the coordinator's address as HOST:PORT (its Connection info shows it)."
+                                .into();
+                        self.open_settings(SettingsRow::PoolAddress);
+                    } else if self.join_key.trim().is_empty() {
+                        self.status_line = "Enter the coordinator's key.".into();
+                        self.open_settings(SettingsRow::PoolKey);
+                    } else if crate::config::validate_payout_address(
+                        self.config.network,
+                        &self.config.payout_address,
+                    )
+                    .is_err()
+                    {
+                        self.status_line =
+                            "Enter your payout address (a q address): a public pool claims your wins to it."
+                                .into();
+                        self.open_settings(SettingsRow::Address);
+                    } else if self.chosen_gpus().is_empty() {
+                        self.status_line = "Choose at least one GPU.".into();
+                        self.open_settings(SettingsRow::Gpu);
+                    } else {
+                        return SetupAction::Complete;
                     }
                 }
                 // #### PR #40
@@ -3013,9 +3070,11 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             // #### PR #40
             SettingsRow::Mining => (
                 "Mining",
-                Span::raw(match state.asic_mining {
-                    AsicMining::Solo => "Solo (your BCH node)",
-                    AsicMining::JoinPool => "Join a pool",
+                Span::raw(match (state.mode, state.gpu_join, state.asic_mining) {
+                    (MiningMode::Gpu, false, _) => "Alone (claims to your address)",
+                    (MiningMode::Gpu, true, _) => "Join a GPU pool or farm",
+                    (_, _, AsicMining::Solo) => "Solo (your BCH node)",
+                    (_, _, AsicMining::JoinPool) => "Join a pool",
                 }),
                 "< >",
             ),
@@ -4371,7 +4430,17 @@ fn render_connect(
         Line::from(""),
         dim("Run this on each rig, a computer with GPUs and Pickaxe:"),
     ];
+    let mut setup_heading = false;
     for (number, (place, command)) in lines.iter().enumerate() {
+        // #### PR #40: after the commands, the one-line addresses the
+        // setup's Join a GPU pool or farm takes.
+        if command.starts_with("stratum2+tcp://") && !setup_heading {
+            setup_heading = true;
+            text.push(Line::from(""));
+            text.push(dim(
+                "Or in the setup (GPU mining, Mining: Join a GPU pool or farm), paste:",
+            ));
+        }
         text.push(Line::from(""));
         text.push(Line::from(format!("[{}] {}", number + 1, place.label())));
         text.push(Line::from(format!("    {command}")));
@@ -4756,6 +4825,47 @@ mod tests {
         setup.handle_key(key(KeyCode::Left));
         assert!(setup.settings_rows().contains(&SettingsRow::Node));
         assert_eq!(setup.server_setup(), Some(ServerSetup::Solo));
+    }
+
+    // #### PR #40
+    #[test]
+    fn gpus_can_join_a_gpu_pool_or_farm_as_a_rig() {
+        let mut setup = setup_for(MiningMode::Gpu);
+        assert!(setup.settings_rows().contains(&SettingsRow::Fulcrum));
+        setup.open_settings(SettingsRow::Mining);
+        setup.handle_key(key(KeyCode::Right));
+        assert!(setup.gpu_join);
+        // A rig takes its jobs from its coordinator: no sources of its own.
+        let rows = setup.settings_rows();
+        assert!(rows.contains(&SettingsRow::PoolAddress) && rows.contains(&SettingsRow::PoolKey));
+        assert!(!rows.contains(&SettingsRow::Fulcrum) && !rows.contains(&SettingsRow::Node));
+        assert!(setup_text(&setup).contains("Join a GPU pool or farm"));
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("coordinator's address"),
+            "{}",
+            setup.status_line
+        );
+        // The coordinator's one-line address fills its key too.
+        setup.open_settings(SettingsRow::PoolAddress);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "stratum2+tcp://192.168.0.160:3340/KEY");
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            (setup.join_address.as_str(), setup.join_key.as_str()),
+            ("192.168.0.160:3340", "KEY")
+        );
+        setup.config.payout_address = chipnet_payout(3);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(
+            setup.server_setup(),
+            Some(ServerSetup::JoinGpuPool {
+                address: "192.168.0.160:3340".into(),
+                key: "KEY".into(),
+            })
+        );
     }
 
     #[test]

@@ -158,7 +158,9 @@ or JSON. The overview page (Tab) shows each device's model and power.
 The setup screen starts the same server: choose ASIC, then "BCH + all
 merge-mined tokens", and set a payout address and your BCH node. It listens on
 the local network (SV1 on port 3333, SV2 on 3336) and the workers page shows
-this computer's address to point devices at; `i` opens Connection info, with
+this computer's address to point devices at, and names each device by the
+worker name its owner set (`rig1`, or `rig1` in `ADDRESS.rig1`; an address
+alone is never shown); `i` opens Connection info, with
 every address (your network and Tailscale), SV1 for stock firmware and SV2
 with the authority key in the address (`stratum2+tcp://HOST:3336/KEY`), each
 ready to copy. SV1 has no encryption, so use it on a trusted network.

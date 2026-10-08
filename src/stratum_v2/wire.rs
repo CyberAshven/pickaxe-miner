@@ -35,6 +35,9 @@ pub struct MiningSession {
     payout_policy: BchPayout,
     /// #### PR #40: a public pool, where each channel pays its user.
     public: Option<super::payout::PublicPool>,
+    /// #### PR #40: the latest channel's user identity, taken by the server
+    /// to name the device on the workers page.
+    pub identity: Option<String>,
     pub accepted: u64,
     pub rejected: u64,
 }
@@ -69,6 +72,7 @@ impl MiningSession {
             current: None,
             payout_policy: BchPayout::default(),
             public: None,
+            identity: None,
             accepted: 0,
             rejected: 0,
         })
@@ -389,6 +393,9 @@ impl MiningSession {
         let (_, _, template) = self.current.as_ref().unwrap();
         if !meets_target(&template.target, &maximum) {
             return Ok(vec![open_error(request, "max-target-out-of-range")?]);
+        }
+        if identity != super::sv1::LOCAL_IDENTITY {
+            self.identity = Some(identity.to_owned());
         }
         // #### PR #40: in a public pool, the user's own address.
         let payout = match &self.public {
