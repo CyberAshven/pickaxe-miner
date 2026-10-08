@@ -248,14 +248,37 @@ jobs:
             os: ubuntu-latest
           - name: Windows x86_64
             os: windows-latest
+          # #### PR #32: native ARM64 builds on GitHub's ARM64 runners, for
+          # ARM boards and laptops (Raspberry Pi 5, Ampere, Snapdragon); the
+          # portable engine mines there. Their binaries are uploaded below.
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+          - name: Windows ARM64
+            os: windows-11-arm
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Install rustup where the ARM64 image lacks it
+        if: runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              curl -sSfL -o rustup-init.exe https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
+              ./rustup-init.exe -y --profile minimal --default-toolchain none
+              echo "${USERPROFILE}\.cargo\bin" >> "${GITHUB_PATH}"
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+              echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+            fi
+          fi
 
       - name: Install Rust stable
         run: |
@@ -268,6 +291,7 @@ jobs:
           cargo --version
 
       - name: Test release channel policy
+        if: runner.arch == 'X64'
         shell: bash
         run: python -m unittest discover -s tools -p 'test_release_channel.py' -v
 
@@ -295,7 +319,7 @@ jobs:
           cargo clippy --locked --manifest-path rust-engine/Cargo.toml --all-targets -- -D warnings
 
       - name: Rust dependency security policy
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         shell: bash
         run: bash tools/check-rust-deps.sh
 
@@ -318,3 +342,12 @@ jobs:
           printf '%s\n' "${help}" | grep -q -- '--intensity'
           printf '%s\n' "${help}" | grep -q 'mine'
           test "$(${bin} --version | tr -d '\r')" = "pickaxe ${version}"
+
+      - name: Upload ARM64 binary for testers
+        if: runner.arch == 'ARM64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pickaxe-${{ runner.os == 'Windows' && 'windows' || 'linux' }}-arm64-${{ github.sha }}
+          path: target/release/pickaxe_miner${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 14

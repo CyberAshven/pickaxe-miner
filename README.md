@@ -25,6 +25,8 @@ rewards depend on which work wins.
 
 Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).
 
+Linux and Windows ARM64 (for example Raspberry Pi 5, Ampere servers and Snapdragon laptops) build and pass the tests on GitHub's ARM64 runners; each CI run uploads the ARM64 binaries. They mine through the portable engine (Vulkan, or DirectX 12 on Windows) and have not yet been run on ARM hardware.
+
 | GPU | Engine | Tested |
 | --- | --- | --- |
 | NVIDIA GeForce RTX 50 series (`sm_120`) | CUDA | RTX 5070 Ti Laptop: about 1.48 GH/s |
