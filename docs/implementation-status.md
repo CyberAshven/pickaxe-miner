@@ -722,3 +722,25 @@ the timing-sensitive `sv1_same_tip_refresh_accepts_inflight_block_and_new_tip_re
 time out under parallel load; it passed alone three times and does not use
 the node code changed here); formatting, all-target/all-feature Clippy on Rust
 1.94 and 1.99 and the server-only Clippy with warnings denied passed.
+
+## Windows: accepted sockets block again (2026-10-08)
+
+#### PR #40
+
+The release-mode test run on GitHub's Windows runner failed in a server test
+whose simulated firmware lost its connection before its first job. Locally,
+two or three of every five or six release-mode runs of the server tests
+failed the same way, in different tests. The cause: on Windows an accepted
+socket inherits its listener's non-blocking mode (Linux does not), and both
+the SV2 server and the SV1 adapter accept on non-blocking listeners. The SV2
+server's Noise handshake then read at once, and when the client's first bytes
+came a moment after the connection it failed and dropped the client; the SV1
+adapter's reads and writes likewise failed instead of waiting out their
+timeouts. Both now set each accepted socket blocking before using it. A
+Windows-hosted server could drop SV2 devices this way; the physical ASIC runs
+against the Linux service, which is unaffected.
+
+Validation: eight release-mode runs of the server tests with 16 threads
+passed (two or three of every five or six failed before); the Windows
+all-feature host suite passed 444 library and 16 binary tests; formatting,
+all-feature Clippy and server-only Clippy with warnings denied passed.

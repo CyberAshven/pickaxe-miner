@@ -118,6 +118,14 @@ pub fn run(
             devices = active;
             match listener.accept() {
                 Ok((stream, _)) if devices.len() < 64 => {
+                    // #### PR #40
+                    // On Windows an accepted socket inherits the listener's
+                    // non-blocking mode, so reads and writes would fail at
+                    // once instead of waiting out their timeouts; Linux does
+                    // not inherit it. Blocking again here makes both alike.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
                     let stop = stop.clone();
                     let stats = stats.clone();
                     let upstreams = upstreams.clone();

@@ -250,7 +250,17 @@ pub fn run<R: NodeRpc + Send + 'static>(
         devices = remaining;
         match listener.accept() {
             Ok((stream, peer)) => {
-                if devices.len() >= MAX_CONNECTIONS {
+                // #### PR #40
+                // What: accepted sockets block again before the handshake.
+                // Why: on Windows an accepted socket inherits the listener's
+                // non-blocking mode, so the Noise handshake's first read
+                // failed at once whenever the client's first bytes came a
+                // moment after the connection (under load, or from a device
+                // on the network), and the server dropped it. Linux does not
+                // inherit the mode, which is why the live ASIC never showed it.
+                // Check: SV2 devices and the SV1 adapter connect on a Windows
+                // host under load (the release-mode server tests).
+                if devices.len() >= MAX_CONNECTIONS || stream.set_nonblocking(false).is_err() {
                     drop(stream);
                     continue;
                 }
