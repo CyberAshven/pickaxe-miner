@@ -101,6 +101,19 @@ pub fn run(
         return Ok(());
     };
     let donation = Arc::new(RwLock::new(donation.unwrap_or(config.bch_donation)));
+    // #### PR #40
+    // At a pool the donation is the setting's share of mining time under the
+    // donation address, on a second channel at the same pool.
+    let pools: Vec<super::sv1::Upstream> = pools
+        .into_iter()
+        .map(|pool| super::sv1::Upstream {
+            donation: Some(super::sv1::DonationRoute {
+                identity: crate::donation::bch::address(config.network).to_owned(),
+                rate: donation.clone(),
+            }),
+            ..pool
+        })
+        .collect();
     let listener = node
         .is_some()
         .then(|| TcpListener::bind(listen))
@@ -284,7 +297,7 @@ pub fn run(
             if let Some(terminal) = terminal.as_mut() {
                 let overview_text = if let Some(pool) = &pool_address {
                     format!(
-                        "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nThe pool builds the blocks and pays; the donation applies only to blocks Pickaxe builds from your own node.\nConnection errors: SV1 {}\nSV1 {}",
+                        "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nThe pool builds the blocks; the donation is that share of mining time under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
                         config.network.as_str(),
                         snapshot.connections,
                         snapshot.sessions_started,
@@ -509,6 +522,7 @@ fn pool_upstreams(
                 authority,
                 identity: identity.clone(),
                 remote: true,
+                donation: None,
             })
         })
         .collect()
@@ -533,17 +547,23 @@ fn donation_summary(donation: BchDonation) -> String {
 /// Advanced settings: the donation, adjustable from 0% to 100%.
 fn render_advanced(frame: &mut Frame<'_>, donation: BchDonation, error: Option<&str>, pool: bool) {
     let (work, reward) = donation.shares();
+    // #### PR #40: at a pool the whole donation is mining time.
+    let split = if pool {
+        format!(
+            "{donation} of each device's mining time mines at the pool under the Pickaxe \
+             donation address; the pool builds the blocks, so none of it is a block reward."
+        )
+    } else {
+        format!(
+            "{work} of mining work and {reward} of each block reward go to the Pickaxe donation \
+             address."
+        )
+    };
     let mut text = format!(
-        "Donation  {donation}\n\n{work} of mining work and {reward} of each block reward go to the \
-         Pickaxe donation address.\nThe default is 1.50%; any setting from 0% to 100% works, in \
-         0.5% steps. Changes apply to new jobs and are saved.\n\n←/→ or +/-  Change donation · \
-         a or Esc  Back"
+        "Donation  {donation}\n\n{split}\nThe default is 1.50%; any setting from 0% to 100% \
+         works, in 0.5% steps. Changes apply to new jobs and are saved.\n\n←/→ or +/-  Change \
+         donation · a or Esc  Back"
     );
-    if pool {
-        text.push_str(
-            "\n\nMining at a pool: the pool builds the blocks, so this setting applies when you mine on your own node.",
-        );
-    }
     if let Some(error) = error {
         text.push_str(&format!("\n\n{error}"));
     }

@@ -17,7 +17,9 @@ use super::{
     telemetry::ShareEvent,
     transport::{Receiver, Sender, Session},
     wire::encoded,
+    work_allocation::WorkAllocation,
 };
+use crate::donation::bch::BchDonation;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -25,7 +27,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -53,6 +55,39 @@ const REMOTE_VERDICT: Duration = Duration::from_secs(120);
 /// sets the pool's first difficulty: 1 TH/s, about one Bitaxe. Pools then
 /// adjust it from the shares.
 const REMOTE_NOMINAL_HASHRATE: f32 = 1e12;
+/// #### PR #40
+/// At a remote pool the adapter owns the device's extranonce: extranonce1 is
+/// four bytes it picks and extranonce2 the next four the device rolls,
+/// together the channel's eight miner bytes, while the pool's channel prefix
+/// (and zero padding, should a pool grant more) goes into the coinbase part
+/// the device receives. One device session can then mine on its own channel
+/// or the donation's channel at the same pool by job alone.
+const POOL_EXTRANONCE1: usize = 4;
+const POOL_EXTRANONCE2: usize = 4;
+/// SV1 job numbers of the donation channel's jobs: the pool's number with the
+/// top bit set, so the two channels' numbers never meet.
+const DONATION_JOBS: u32 = 0x8000_0000;
+/// The request ID that opens the donation channel.
+const DONATION_REQUEST: u32 = 2;
+
+/// #### PR #40
+/// Where the BCH donation's work goes at a remote pool: a second channel at
+/// the same pool under the donation address, for the donation's share of
+/// mining time. The rate is the Advanced setting, read live.
+#[derive(Clone, Debug)]
+pub struct DonationRoute {
+    pub identity: String,
+    pub rate: Arc<RwLock<BchDonation>>,
+}
+
+impl DonationRoute {
+    fn rate(&self) -> BchDonation {
+        *self
+            .rate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 /// #### PR #40
 /// Where the adapter takes its work from.
@@ -67,6 +102,8 @@ pub struct Upstream {
     pub identity: String,
     /// A remote pool rather than this server's own SV2 listener.
     pub remote: bool,
+    /// #### PR #40: where the donation's work goes at this pool.
+    pub donation: Option<DonationRoute>,
 }
 
 impl Upstream {
@@ -77,6 +114,7 @@ impl Upstream {
             authority,
             identity: "sv1-device".into(),
             remote: false,
+            donation: None,
         }
     }
 
@@ -299,7 +337,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
     Ok(Opened {
-        bridge: Bridge::new(opened, upstream.remote)?,
+        bridge: Bridge::new(opened, upstream.remote, upstream.donation.clone())?,
         send,
         receive,
         local,
@@ -329,10 +367,12 @@ fn serve_session(
         if upstream.remote {
             // Firmware already has its reply; a verdict that never comes is
             // simply not counted.
-            bridge
-                .pending
-                .retain(|_, pending| pending.sent.elapsed() < REMOTE_VERDICT);
+            for lane in bridge.lanes_mut() {
+                lane.pending
+                    .retain(|_, pending| pending.sent.elapsed() < REMOTE_VERDICT);
+            }
         } else if bridge
+            .user
             .pending
             .values()
             .any(|pending| pending.sent.elapsed() >= DEADLINE)
@@ -381,29 +421,150 @@ fn serve_session(
                 downstream.write(&message)?;
             }
         }
+        // #### PR #40: at a remote pool, the donation channel and the
+        // device's switches between it and its own channel.
+        if let Some(open) = bridge.donation_request()? {
+            send.send(encoded(
+                open,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+                false,
+            )?)?;
+        }
+        for message in bridge.tick(Instant::now())? {
+            downstream.write(&message)?;
+        }
+        if let Some(issue) = bridge.donation_issue.take() {
+            if let Ok(mut stats) = stats.lock() {
+                stats.device_stats.note_adapter(device, issue);
+            }
+        }
     }
     send.close();
     Ok(())
 }
 
-struct Bridge {
+/// #### PR #40
+/// One SV2 extended channel a device's work comes from: its own, or at a
+/// remote pool the donation's.
+struct Lane {
     channel: u32,
     prefix: Vec<u8>,
+    /// The channel's miner extranonce size.
     extra_size: usize,
     target: [u8; 32],
-    subscribed: bool,
-    worker: Option<String>,
-    configured: bool,
-    mask: Option<HexU32Be>,
     future: BTreeMap<u32, NewExtendedMiningJobOwned>,
     active: BTreeMap<u32, u32>,
     previous_hash: Option<SetNewPrevHashOwned>,
     notify: Option<Value>,
     sequence: u32,
     pending: BTreeMap<u32, Pending>,
+}
+
+impl Lane {
+    fn new(open: &OpenExtendedMiningChannelSuccess<'_>) -> Result<Self, String> {
+        Ok(Self {
+            channel: open.channel_id,
+            prefix: open.extranonce_prefix.as_ref().to_vec(),
+            extra_size: open.extranonce_size as usize,
+            target: open
+                .target
+                .as_ref()
+                .try_into()
+                .map_err(|_| "invalid target")?,
+            future: BTreeMap::new(),
+            active: BTreeMap::new(),
+            previous_hash: None,
+            notify: None,
+            sequence: 0,
+            pending: BTreeMap::new(),
+        })
+    }
+
+    /// A job for this channel: kept for its parent, or with the same parent
+    /// returned for activation.
+    fn job(
+        &mut self,
+        job: NewExtendedMiningJob<'_>,
+    ) -> Result<Option<(SetNewPrevHashOwned, NewExtendedMiningJobOwned)>, String> {
+        if !job.version_rolling_allowed {
+            return Err("unexpected firmware job".into());
+        }
+        if self.future.contains_key(&job.job_id) || self.active.contains_key(&job.job_id) {
+            return Err("job identifier already in use".into());
+        }
+        if job.is_future() {
+            if self.future.len() >= MAX_ACTIVE_JOBS {
+                return Err("too many future jobs".into());
+            }
+            self.future.insert(job.job_id, job.as_owned());
+            return Ok(None);
+        }
+        let prev = self
+            .previous_hash
+            .clone()
+            .ok_or("job before initial parent")?;
+        if job
+            .min_ntime
+            .clone()
+            .into_inner()
+            .is_none_or(|time| time < prev.min_ntime)
+        {
+            return Err("job time precedes active parent".into());
+        }
+        Ok(Some((prev, job.as_owned())))
+    }
+
+    /// A new parent: its future job becomes the only active one.
+    fn parent(
+        &mut self,
+        prev: SetNewPrevHash<'_>,
+    ) -> Result<(SetNewPrevHashOwned, NewExtendedMiningJobOwned), String> {
+        let job = self
+            .future
+            .remove(&prev.job_id)
+            .ok_or("unknown job activation")?;
+        self.future.clear();
+        self.active.clear();
+        self.previous_hash = Some(prev.as_owned());
+        Ok((prev.as_owned(), job))
+    }
+}
+
+/// #### PR #40
+/// The donation's channel at a remote pool.
+enum Donation {
+    /// None: this server's own listener, a 0% donation, or not asked yet.
+    Off,
+    Requested,
+    Open(Box<Lane>),
+    /// The pool refused or broke the donation channel; the device keeps
+    /// mining on its own channel and its row shows why.
+    Unavailable,
+}
+
+struct Bridge {
+    /// The device's own channel.
+    user: Lane,
+    subscribed: bool,
+    worker: Option<String>,
+    configured: bool,
+    mask: Option<HexU32Be>,
     local_rejection: Option<&'static str>,
     /// A remote pool: see `Upstream::remote`.
     remote: bool,
+    /// The device's extranonce1: this server's channel prefix, or at a
+    /// remote pool the adapter's own four bytes.
+    extranonce1: Vec<u8>,
+    /// The extranonce2 size the device rolls.
+    extranonce2_size: usize,
+    /// #### PR #40: the donation at a remote pool.
+    route: Option<DonationRoute>,
+    donation: Donation,
+    allocation: WorkAllocation,
+    /// The device mines the donation channel's jobs now.
+    on_donation: bool,
+    /// A donation problem not yet shown on the device's row.
+    donation_issue: Option<&'static str>,
 }
 
 /// A share forwarded upstream and waiting for its verdict.
@@ -416,31 +577,39 @@ struct Pending {
 }
 
 impl Bridge {
-    fn new(open: OpenExtendedMiningChannelSuccess<'_>, remote: bool) -> Result<Self, String> {
-        if open.request_id != 1 || open.extranonce_size != 8 {
+    fn new(
+        open: OpenExtendedMiningChannelSuccess<'_>,
+        remote: bool,
+        route: Option<DonationRoute>,
+    ) -> Result<Self, String> {
+        let size = open.extranonce_size as usize;
+        if open.request_id != 1 || size != 8 && !(remote && size > 8) {
             return Err("unexpected SV2 extranonce allocation".into());
         }
+        let user = Lane::new(&open)?;
+        let (extranonce1, extranonce2_size) = if remote {
+            (
+                rand::random::<[u8; POOL_EXTRANONCE1]>().to_vec(),
+                POOL_EXTRANONCE2,
+            )
+        } else {
+            (user.prefix.clone(), user.extra_size)
+        };
         Ok(Self {
-            channel: open.channel_id,
-            prefix: open.extranonce_prefix.as_ref().to_vec(),
-            extra_size: open.extranonce_size as usize,
-            target: open
-                .target
-                .as_ref()
-                .try_into()
-                .map_err(|_| "invalid target")?,
+            user,
             subscribed: false,
             worker: None,
             configured: false,
             mask: None,
-            future: BTreeMap::new(),
-            active: BTreeMap::new(),
-            previous_hash: None,
-            notify: None,
-            sequence: 0,
-            pending: BTreeMap::new(),
             local_rejection: None,
             remote,
+            extranonce1,
+            extranonce2_size,
+            route: route.filter(|_| remote),
+            donation: Donation::Off,
+            allocation: WorkAllocation::new(rand::random()),
+            on_donation: false,
+            donation_issue: None,
         })
     }
 
@@ -448,18 +617,127 @@ impl Bridge {
         self.subscribed && self.worker.is_some()
     }
 
+    fn lane(&self, donation: bool) -> Option<&Lane> {
+        match (donation, &self.donation) {
+            (false, _) => Some(&self.user),
+            (true, Donation::Open(lane)) => Some(lane.as_ref()),
+            (true, _) => None,
+        }
+    }
+
+    fn lane_mut(&mut self, donation: bool) -> Option<&mut Lane> {
+        match (donation, &mut self.donation) {
+            (false, _) => Some(&mut self.user),
+            (true, Donation::Open(lane)) => Some(lane.as_mut()),
+            (true, _) => None,
+        }
+    }
+
+    /// Both channels' shares, for expiring verdicts no longer awaited.
+    fn lanes_mut(&mut self) -> impl Iterator<Item = &mut Lane> {
+        let donation = match &mut self.donation {
+            Donation::Open(lane) => Some(lane.as_mut()),
+            _ => None,
+        };
+        std::iter::once(&mut self.user).chain(donation)
+    }
+
+    /// Whether a channel-specific message is the donation channel's; an
+    /// unknown channel is an error.
+    fn on_lane(&self, channel: u32, error: &'static str) -> Result<bool, String> {
+        if self.lane(true).is_some_and(|lane| lane.channel == channel) {
+            Ok(true)
+        } else if channel == self.user.channel {
+            Ok(false)
+        } else {
+            Err(error.into())
+        }
+    }
+
     fn notifications(&self) -> Result<Vec<Value>, String> {
         if !self.ready() {
             return Ok(Vec::new());
         }
-        let Some(notify) = &self.notify else {
+        let Some(lane) = self.lane(self.on_donation) else {
+            return Ok(Vec::new());
+        };
+        let Some(notify) = &lane.notify else {
             return Ok(Vec::new());
         };
         let difficulty = sv2_to_sv1::build_sv1_set_difficulty_from_sv2_target(
-            Target::from_le_bytes(self.target),
+            Target::from_le_bytes(lane.target),
         )
         .map_err(|_| "invalid share target")?;
         Ok(vec![to_json(difficulty)?, notify.clone()])
+    }
+
+    /// The current channel's difficulty and job, with the other channel's
+    /// work abandoned: sent when the device switches channels.
+    fn switched(&self) -> Result<Vec<Value>, String> {
+        let mut out = self.notifications()?;
+        if let Some(notify) = out.last_mut() {
+            notify["params"][8] = json!(true);
+        }
+        Ok(out)
+    }
+
+    /// #### PR #40
+    /// What: at a remote pool, the donation's share of mining time mines on
+    /// the donation channel, by a 10-minute cycle per device counted while it
+    /// has work, as the server's own donation work is. A switch sends the
+    /// channel's difficulty and a clean job; the device never reconnects.
+    /// Why: Pickaxe cannot add a coinbase output to a pool's blocks, so the
+    /// whole donation is work, in the BCH setting's own 0%..100% range.
+    /// Check: at 1.5%, a device's shares at the pool's donation identity are
+    /// about 1.5% of its shares there.
+    fn tick(&mut self, now: Instant) -> Result<Vec<Value>, String> {
+        let Some(route) = &self.route else {
+            return Ok(Vec::new());
+        };
+        let rate = route.rate();
+        self.allocation
+            .update(now, self.ready() && self.user.notify.is_some());
+        let usable = self.lane(true).is_some_and(|lane| lane.notify.is_some());
+        let donate = usable && self.allocation.pool_donation_work(rate);
+        if donate == self.on_donation {
+            return Ok(Vec::new());
+        }
+        self.on_donation = donate;
+        self.switched()
+    }
+
+    /// The donation channel to open: at a remote pool, with a donation above
+    /// 0%, once the device is ready.
+    fn donation_request(&mut self) -> Result<Option<OpenExtendedMiningChannelOwned>, String> {
+        let Some(route) = &self.route else {
+            return Ok(None);
+        };
+        if !matches!(self.donation, Donation::Off) || !self.ready() || u16::from(route.rate()) == 0
+        {
+            return Ok(None);
+        }
+        let identity = route.identity.clone();
+        self.donation = Donation::Requested;
+        sv1_to_sv2::build_sv2_open_extended_mining_channel(
+            DONATION_REQUEST,
+            identity,
+            REMOTE_NOMINAL_HASHRATE,
+            Target::from_le_bytes([255; 32]),
+            (POOL_EXTRANONCE1 + POOL_EXTRANONCE2) as u16,
+        )
+        .map(Some)
+        .map_err(|_| "cannot open the donation channel".into())
+    }
+
+    /// Stops donating at this pool: the device goes back to its own channel.
+    fn drop_donation(&mut self, reason: &'static str) -> Result<Vec<Value>, String> {
+        self.donation = Donation::Unavailable;
+        self.donation_issue = Some(reason);
+        if self.on_donation {
+            self.on_donation = false;
+            return self.switched();
+        }
+        Ok(Vec::new())
     }
 
     fn request(
@@ -543,15 +821,15 @@ impl Bridge {
                         return Err("invalid subscribe".into());
                     };
                     let prefix = self
-                        .prefix
+                        .extranonce1
                         .clone()
                         .try_into()
                         .map_err(|_| "invalid extranonce prefix")?;
                     out.push(
                         serde_json::to_value(subscribe.respond(
-                            vec![("mining.notify".into(), format!("{:08x}", self.channel))],
+                            vec![("mining.notify".into(), format!("{:08x}", self.user.channel))],
                             prefix,
-                            self.extra_size,
+                            self.extranonce2_size,
                         ))
                         .map_err(|_| "cannot encode subscription")?,
                     );
@@ -591,23 +869,33 @@ impl Bridge {
                 else {
                     return Err("invalid submission".into());
                 };
+                // #### PR #40: the donation channel's jobs carry the top bit.
+                let number = submit.job_id.parse::<u32>().ok();
+                let donation = number.is_some_and(|number| number & DONATION_JOBS != 0);
+                let version = number.and_then(|number| {
+                    self.lane(donation)?
+                        .active
+                        .get(&(number & !DONATION_JOBS))
+                        .copied()
+                });
+                let pending_full = self
+                    .lane(donation)
+                    .is_some_and(|lane| lane.pending.len() >= MAX_PENDING);
+                let duplicate = self
+                    .lane(false)
+                    .into_iter()
+                    .chain(self.lane(true))
+                    .any(|lane| lane.pending.values().any(|pending| pending.id == id));
                 let error =
                     if !self.subscribed {
                         Some((25, "not subscribed"))
                     } else if self.worker.as_deref() != Some(submit.user_name.as_str()) {
                         Some((24, "unauthorized worker"))
-                    } else if submit
-                        .job_id
-                        .parse::<u32>()
-                        .ok()
-                        .is_none_or(|job| !self.active.contains_key(&job))
-                    {
+                    } else if version.is_none() {
                         Some((21, "stale job"))
-                    } else if submit.extra_nonce2.len() != self.extra_size {
+                    } else if submit.extra_nonce2.len() != self.extranonce2_size {
                         Some((20, "invalid extranonce size"))
-                    } else if (self.pending.len() >= MAX_PENDING && !self.remote)
-                        || self.pending.values().any(|pending| pending.id == id)
-                    {
+                    } else if (pending_full && !self.remote) || duplicate {
                         Some((20, "too many pending submissions or duplicate request ID"))
                     } else if submit.version_bits.as_ref().is_some_and(|bits| {
                         self.mask.as_ref().is_none_or(|mask| bits.0 & !mask.0 != 0)
@@ -620,35 +908,47 @@ impl Bridge {
                     self.local_rejection = Some(text);
                     out.push(reject(id, code, text));
                 } else {
-                    let version = self.active[&submit
-                        .job_id
-                        .parse::<u32>()
-                        .map_err(|_| "invalid job identifier")?];
+                    let version = version.ok_or("stale job")?;
                     // A worker may omit version_bits and use the original version.
                     let mask = submit.version_bits.as_ref().and(self.mask.clone());
-                    let share = sv1_to_sv2::build_sv2_submit_shares_extended_from_sv1_submit(
+                    let remote = self.remote;
+                    let extranonce1 = self.extranonce1.clone();
+                    let lane = self.lane_mut(donation).ok_or("stale job")?;
+                    let mut share = sv1_to_sv2::build_sv2_submit_shares_extended_from_sv1_submit(
                         &submit,
-                        self.channel,
-                        self.sequence,
+                        lane.channel,
+                        lane.sequence,
                         version,
                         mask,
                     )
                     .map_err(|_| "share translation failed")?;
-                    if self.pending.len() >= MAX_PENDING {
-                        // Remote only: the oldest verdict is no longer awaited.
-                        self.pending.pop_first();
+                    share.job_id &= !DONATION_JOBS;
+                    if remote {
+                        // The channel's miner bytes: any padding, the
+                        // adapter's four, then the device's four.
+                        let mut extranonce =
+                            vec![0; lane.extra_size - POOL_EXTRANONCE1 - POOL_EXTRANONCE2];
+                        extranonce.extend(extranonce1);
+                        extranonce.extend(Vec::<u8>::from(submit.extra_nonce2.clone()));
+                        share.extranonce = extranonce
+                            .try_into()
+                            .map_err(|_| "share translation failed")?;
                     }
-                    self.pending.insert(
-                        self.sequence,
+                    if lane.pending.len() >= MAX_PENDING {
+                        // Remote only: the oldest verdict is no longer awaited.
+                        lane.pending.pop_first();
+                    }
+                    lane.pending.insert(
+                        lane.sequence,
                         Pending {
                             id,
                             sent: Instant::now(),
-                            target: self.target,
+                            target: lane.target,
                         },
                     );
-                    self.sequence = self.sequence.wrapping_add(1);
+                    lane.sequence = lane.sequence.wrapping_add(1);
                     shares.push(share);
-                    if self.remote {
+                    if remote {
                         out.push(json!({"id":id,"result":true,"error":null}));
                     }
                 }
@@ -677,58 +977,64 @@ impl Bridge {
             MESSAGE_TYPE_RECONNECT if !channel_message => {
                 return Err("SV2 upstream asked to reconnect".into())
             }
+            // #### PR #40: the pool's answer to the donation channel.
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS if self.remote => {
+                let opened: OpenExtendedMiningChannelSuccess =
+                    binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid channel reply")?;
+                if opened.request_id != DONATION_REQUEST
+                    || !matches!(self.donation, Donation::Requested)
+                {
+                    return Err("unexpected SV2 channel".into());
+                }
+                if (opened.extranonce_size as usize) < POOL_EXTRANONCE1 + POOL_EXTRANONCE2
+                    || opened.channel_id == self.user.channel
+                {
+                    out.extend(self.drop_donation("the pool's donation channel cannot be used")?);
+                } else {
+                    self.donation = Donation::Open(Box::new(Lane::new(&opened)?));
+                }
+            }
+            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR if self.remote => {
+                let error: OpenMiningChannelError =
+                    binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid channel error")?;
+                if error.request_id != DONATION_REQUEST
+                    || !matches!(self.donation, Donation::Requested)
+                {
+                    return Err("unexpected SV2 channel error".into());
+                }
+                out.extend(self.drop_donation("the pool refused the donation channel")?);
+            }
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
                 let job: NewExtendedMiningJob =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid mining job")?;
-                if job.channel_id != self.channel || !job.version_rolling_allowed {
-                    return Err("unexpected firmware job".into());
-                }
-                if self.future.contains_key(&job.job_id) || self.active.contains_key(&job.job_id) {
-                    return Err("job identifier already in use".into());
-                }
-                if job.is_future() {
-                    if self.future.len() >= MAX_ACTIVE_JOBS {
-                        return Err("too many future jobs".into());
-                    }
-                    self.future.insert(job.job_id, job.as_owned());
+                let donation = self.on_lane(job.channel_id, "unexpected firmware job")?;
+                if donation && job.job_id & DONATION_JOBS != 0 {
+                    out.extend(
+                        self.drop_donation(
+                            "the pool's job numbers do not fit the donation channel",
+                        )?,
+                    );
                 } else {
-                    let prev = self
-                        .previous_hash
-                        .clone()
-                        .ok_or("job before initial parent")?;
-                    if job
-                        .min_ntime
-                        .clone()
-                        .into_inner()
-                        .is_none_or(|time| time < prev.min_ntime)
-                    {
-                        return Err("job time precedes active parent".into());
+                    let lane = self.lane_mut(donation).ok_or("unexpected firmware job")?;
+                    if let Some((prev, job)) = lane.job(job)? {
+                        out.extend(self.activate(donation, prev, job, false)?);
                     }
-                    out.extend(self.activate(prev, job.as_owned(), false)?);
                 }
             }
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
                 let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload())
                     .map_err(|_| "invalid job activation")?;
-                if prev.channel_id != self.channel {
-                    return Err("wrong mining channel".into());
-                }
-                let job = self
-                    .future
-                    .remove(&prev.job_id)
-                    .ok_or("unknown job activation")?;
-                self.future.clear();
-                self.active.clear();
-                self.previous_hash = Some(prev.as_owned());
-                out.extend(self.activate(prev.as_owned(), job, true)?);
+                let donation = self.on_lane(prev.channel_id, "wrong mining channel")?;
+                let lane = self.lane_mut(donation).ok_or("wrong mining channel")?;
+                let (prev, job) = lane.parent(prev)?;
+                out.extend(self.activate(donation, prev, job, true)?);
             }
             MESSAGE_TYPE_SET_TARGET => {
                 let target: SetTarget =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid target")?;
-                if target.channel_id != self.channel {
-                    return Err("wrong mining channel".into());
-                }
-                self.target = target
+                let donation = self.on_lane(target.channel_id, "wrong mining channel")?;
+                let lane = self.lane_mut(donation).ok_or("wrong mining channel")?;
+                lane.target = target
                     .maximum_target
                     .as_ref()
                     .try_into()
@@ -738,12 +1044,14 @@ impl Bridge {
                 let ack: SubmitSharesSuccess = binary_sv2::from_bytes(frame.payload())
                     .map_err(|_| "invalid share response")?;
                 if self.remote {
-                    if ack.channel_id != self.channel {
-                        return Err("unexpected share acknowledgement".into());
-                    }
+                    let donation =
+                        self.on_lane(ack.channel_id, "unexpected share acknowledgement")?;
+                    let lane = self
+                        .lane_mut(donation)
+                        .ok_or("unexpected share acknowledgement")?;
                     // Pools may acknowledge a batch: every share up to the
                     // last sequence number that has no error is accepted.
-                    while let Some(entry) = self.pending.first_entry() {
+                    while let Some(entry) = lane.pending.first_entry() {
                         if *entry.key() > ack.last_sequence_number {
                             break;
                         }
@@ -751,10 +1059,11 @@ impl Bridge {
                     }
                 } else {
                     // This server acknowledges each share on its own.
-                    if ack.channel_id != self.channel || ack.new_submits_accepted_count != 1 {
+                    if ack.channel_id != self.user.channel || ack.new_submits_accepted_count != 1 {
                         return Err("unexpected share acknowledgement".into());
                     }
                     let pending = self
+                        .user
                         .pending
                         .remove(&ack.last_sequence_number)
                         .ok_or("unknown share acknowledgement")?;
@@ -764,10 +1073,10 @@ impl Bridge {
             MESSAGE_TYPE_SUBMIT_SHARES_ERROR => {
                 let error: SubmitSharesError =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid share error")?;
-                if error.channel_id != self.channel {
-                    return Err("wrong mining channel".into());
-                }
-                let pending = self.pending.remove(&error.sequence_number);
+                let donation = self.on_lane(error.channel_id, "wrong mining channel")?;
+                let pending = self
+                    .lane_mut(donation)
+                    .and_then(|lane| lane.pending.remove(&error.sequence_number));
                 let (code, reason) = match error.error_code.as_ref() {
                     b"duplicate-share" => (22, "duplicate-share"),
                     b"difficulty-too-low" => (23, "difficulty-too-low"),
@@ -787,11 +1096,29 @@ impl Bridge {
             }
             // The device's extranonce cannot change under SV1 firmware, and
             // a closed channel has no work: the device reconnects for a new
-            // channel.
+            // channel. The donation channel just stops.
             MESSAGE_TYPE_SET_EXTRANONCE_PREFIX => {
-                return Err("SV2 upstream changed the extranonce".into())
+                let changed: SetExtranoncePrefix = binary_sv2::from_bytes(frame.payload())
+                    .map_err(|_| "SV2 upstream changed the extranonce")?;
+                if self
+                    .lane(true)
+                    .is_none_or(|lane| lane.channel != changed.channel_id)
+                {
+                    return Err("SV2 upstream changed the extranonce".into());
+                }
+                out.extend(self.drop_donation("the pool changed the donation channel")?);
             }
-            MESSAGE_TYPE_CLOSE_CHANNEL => return Err("SV2 upstream closed the channel".into()),
+            MESSAGE_TYPE_CLOSE_CHANNEL => {
+                let closed: CloseChannel = binary_sv2::from_bytes(frame.payload())
+                    .map_err(|_| "SV2 upstream closed the channel")?;
+                if self
+                    .lane(true)
+                    .is_none_or(|lane| lane.channel != closed.channel_id)
+                {
+                    return Err("SV2 upstream closed the channel".into());
+                }
+                out.extend(self.drop_donation("the pool closed the donation channel")?);
+            }
             // Group channels only matter for standard channels.
             MESSAGE_TYPE_SET_GROUP_CHANNEL if self.remote => (),
             _ => return Err("unexpected upstream firmware message".into()),
@@ -804,18 +1131,40 @@ impl Bridge {
     // on SV1. Only SetNewPrevHash flushes old jobs; each share keeps its version.
     fn activate(
         &mut self,
+        donation: bool,
         prev: SetNewPrevHashOwned,
         job: NewExtendedMiningJobOwned,
         clean: bool,
     ) -> Result<Vec<Value>, String> {
-        self.active.insert(job.job_id, job.version);
-        while self.active.len() > MAX_ACTIVE_JOBS {
-            self.active.pop_first();
+        let remote = self.remote;
+        let lane = self.lane_mut(donation).ok_or("unknown mining channel")?;
+        lane.active.insert(job.job_id, job.version);
+        while lane.active.len() > MAX_ACTIVE_JOBS {
+            lane.active.pop_first();
         }
-        let notify = sv2_to_sv1::build_sv1_notify_from_sv2(prev, job, clean)
+        let number = job.job_id;
+        let mut notify = sv2_to_sv1::build_sv1_notify_from_sv2(prev, job, clean)
             .map_err(|_| "job translation failed")?;
-        self.notify = Some(to_json(notify.into())?);
-        self.notifications()
+        // #### PR #40: at a remote pool the channel's prefix (and any
+        // padding) is part of the coinbase the device receives.
+        if remote {
+            let mut coinbase: Vec<u8> = notify.coin_base1.clone().into();
+            coinbase.extend(&lane.prefix);
+            coinbase.resize(
+                coinbase.len() + lane.extra_size - POOL_EXTRANONCE1 - POOL_EXTRANONCE2,
+                0,
+            );
+            notify.coin_base1 = coinbase.into();
+        }
+        if donation {
+            notify.job_id = (number | DONATION_JOBS).to_string();
+        }
+        lane.notify = Some(to_json(notify.into())?);
+        if donation == self.on_donation {
+            self.notifications()
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -971,6 +1320,7 @@ mod tests {
                 extranonce_prefix: prefix.as_slice().try_into().unwrap(),
             },
             remote,
+            None,
         )
         .unwrap()
     }
@@ -985,7 +1335,7 @@ mod tests {
         bridge
             .request(json!({"id":2,"method":"mining.authorize","params":["worker", "unused"]}))
             .unwrap();
-        bridge.active.insert(4, 0x20000000);
+        bridge.user.active.insert(4, 0x20000000);
         bridge
     }
     fn ready() -> Bridge {
@@ -993,6 +1343,200 @@ mod tests {
     }
     fn submit(id: u64) -> Value {
         json!({"id":id,"method":"mining.submit","params":["worker","4","0000000000000000","00000001","00000002"]})
+    }
+    /// #### PR #40: at a remote pool the device rolls four extranonce2 bytes.
+    fn remote_submit(id: u64) -> Value {
+        json!({"id":id,"method":"mining.submit","params":["worker","4","00000000","00000001","00000002"]})
+    }
+
+    // #### PR #40
+    #[test]
+    fn at_a_pool_the_device_switches_to_the_donation_channel_by_job_alone() {
+        let job = |channel_id: u32, job_id: u32| {
+            encoded(
+                NewExtendedMiningJob {
+                    channel_id,
+                    job_id,
+                    min_ntime: binary_sv2::Sv2Option::new(None),
+                    version: 0x20000000,
+                    version_rolling_allowed: true,
+                    merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+                    coinbase_tx_prefix: [1u8; 32].as_slice().try_into().unwrap(),
+                    coinbase_tx_suffix: [2u8; 32].as_slice().try_into().unwrap(),
+                },
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+                true,
+            )
+            .unwrap()
+        };
+        let parent = |channel_id: u32, job_id: u32| {
+            encoded(
+                SetNewPrevHash {
+                    channel_id,
+                    job_id,
+                    prev_hash: (&[0u8; 32]).into(),
+                    min_ntime: 1700000000,
+                    nbits: 0x1d00ffff,
+                },
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+                true,
+            )
+            .unwrap()
+        };
+        let rate = Arc::new(RwLock::new("100".parse::<BchDonation>().unwrap()));
+        let mut bridge = Bridge::new(
+            OpenExtendedMiningChannelSuccess {
+                request_id: 1,
+                channel_id: 3,
+                group_channel_id: 0,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 8,
+                extranonce_prefix: [7u8; 4].as_slice().try_into().unwrap(),
+            },
+            true,
+            Some(DonationRoute {
+                identity: "donation".into(),
+                rate: rate.clone(),
+            }),
+        )
+        .unwrap();
+        // The device's extranonce is the adapter's: four bytes, four to roll.
+        let (subscribed, _) = bridge
+            .request(json!({"id":1,"method":"mining.subscribe","params":[]}))
+            .unwrap();
+        let extranonce1 = hex::decode(subscribed[0]["result"][1].as_str().unwrap()).unwrap();
+        assert_eq!(extranonce1.len(), 4);
+        assert_eq!(subscribed[0]["result"][2], 4);
+        assert!(
+            bridge.donation_request().unwrap().is_none(),
+            "not before authorize"
+        );
+        bridge
+            .request(json!({"id":2,"method":"mining.authorize","params":["worker", ""]}))
+            .unwrap();
+        // Its own channel's prefix is in the coinbase part the device gets.
+        bridge.upstream(job(3, 5)).unwrap();
+        let own = bridge.upstream(parent(3, 5)).unwrap().0;
+        assert_eq!(
+            own[1]["params"][2],
+            format!("{}{}", "01".repeat(32), "07".repeat(4))
+        );
+        // The donation channel opens once the device is ready.
+        let open = bridge
+            .donation_request()
+            .unwrap()
+            .expect("donation channel");
+        assert_eq!(open.request_id, DONATION_REQUEST);
+        assert!(bridge.donation_request().unwrap().is_none());
+        let opened = encoded(
+            OpenExtendedMiningChannelSuccess {
+                request_id: DONATION_REQUEST,
+                channel_id: 9,
+                group_channel_id: 0,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 10,
+                extranonce_prefix: [9u8; 2].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            false,
+        )
+        .unwrap();
+        assert!(bridge.upstream(opened).unwrap().0.is_empty());
+        bridge.upstream(job(9, 5)).unwrap();
+        // Its jobs are kept while the device mines its own channel.
+        assert!(bridge.upstream(parent(9, 5)).unwrap().0.is_empty());
+        // At 100% the work clock switches the device at once, with a clean
+        // job of its own number; the pool granted ten bytes, so two pad.
+        let switched = bridge.tick(Instant::now()).unwrap();
+        assert_eq!(switched[0]["method"], "mining.set_difficulty");
+        assert_eq!(switched[1]["params"][0], (5 | DONATION_JOBS).to_string());
+        assert_eq!(switched[1]["params"][8], true);
+        assert_eq!(
+            switched[1]["params"][2],
+            format!("{}{}{}", "01".repeat(32), "09".repeat(2), "00".repeat(2))
+        );
+        // A share for that job goes to the donation channel.
+        let (replies, shares) = bridge
+            .request(json!({"id":3,"method":"mining.submit","params":["worker",(5 | DONATION_JOBS).to_string(),"0a0b0c0d","00000001","00000002"]}))
+            .unwrap();
+        assert_eq!(replies, vec![json!({"id":3,"result":true,"error":null})]);
+        assert_eq!((shares[0].channel_id, shares[0].job_id), (9, 5));
+        let mut expected = vec![0, 0];
+        expected.extend(&extranonce1);
+        expected.extend([0x0a, 0x0b, 0x0c, 0x0d]);
+        assert_eq!(shares[0].extranonce.as_ref(), expected.as_slice());
+        // At 0% it goes back to its own channel.
+        *rate.write().unwrap() = "0".parse().unwrap();
+        let back = bridge.tick(Instant::now()).unwrap();
+        assert_eq!(back[1]["params"][0], "5");
+        assert_eq!(back[1]["params"][8], true);
+        // A closed donation channel stops the donation and tells the row.
+        *rate.write().unwrap() = "100".parse().unwrap();
+        assert!(!bridge.tick(Instant::now()).unwrap().is_empty());
+        let close = encoded(
+            CloseChannel {
+                channel_id: 9,
+                reason_code: "bye".try_into().unwrap(),
+            },
+            MESSAGE_TYPE_CLOSE_CHANNEL,
+            true,
+        )
+        .unwrap();
+        let after = bridge.upstream(close).unwrap().0;
+        assert_eq!(after[1]["params"][0], "5");
+        assert_eq!(
+            bridge.donation_issue,
+            Some("the pool closed the donation channel")
+        );
+        assert!(bridge.tick(Instant::now()).unwrap().is_empty());
+        assert!(bridge.donation_request().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_pool_that_refuses_the_donation_channel_keeps_the_device_mining() {
+        let rate = Arc::new(RwLock::new(BchDonation::default()));
+        let mut bridge = Bridge::new(
+            OpenExtendedMiningChannelSuccess {
+                request_id: 1,
+                channel_id: 3,
+                group_channel_id: 0,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 8,
+                extranonce_prefix: [7u8; 4].as_slice().try_into().unwrap(),
+            },
+            true,
+            Some(DonationRoute {
+                identity: "donation".into(),
+                rate,
+            }),
+        )
+        .unwrap();
+        bridge
+            .request(json!({"id":1,"method":"mining.subscribe","params":[]}))
+            .unwrap();
+        bridge
+            .request(json!({"id":2,"method":"mining.authorize","params":["worker", ""]}))
+            .unwrap();
+        assert!(bridge.donation_request().unwrap().is_some());
+        let refused = encoded(
+            OpenMiningChannelError {
+                request_id: DONATION_REQUEST,
+                error_code: "unknown-user".try_into().unwrap(),
+            },
+            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+            false,
+        )
+        .unwrap();
+        assert!(bridge.upstream(refused).unwrap().0.is_empty());
+        assert_eq!(
+            bridge.donation_issue,
+            Some("the pool refused the donation channel")
+        );
+        assert!(bridge.tick(Instant::now()).unwrap().is_empty());
+        // This server's own listener never gets a donation channel.
+        let mut local = ready();
+        assert!(local.donation_request().unwrap().is_none());
+        assert!(local.tick(Instant::now()).unwrap().is_empty());
     }
 
     #[test]
@@ -1049,7 +1593,7 @@ mod tests {
         assert_eq!(next[1]["method"], "mining.notify");
         // Work in flight is kept: no clean_jobs, and the older job still counts.
         assert_eq!(next[1]["params"][8], false);
-        assert!(bridge.active.contains_key(&5) && bridge.active.contains_key(&6));
+        assert!(bridge.user.active.contains_key(&5) && bridge.user.active.contains_key(&6));
     }
 
     #[test]
@@ -1088,7 +1632,7 @@ mod tests {
         let replies = bridge.upstream(reject).unwrap().0;
         assert_eq!(replies[0]["id"], 10);
         assert_eq!(replies[0]["error"][0], 22);
-        assert!(bridge.pending.is_empty());
+        assert!(bridge.user.pending.is_empty());
     }
 
     #[test]
@@ -1096,7 +1640,7 @@ mod tests {
         let mut bridge = ready_for(true);
         // Firmware gets its reply as soon as the share is forwarded.
         for id in 20..23 {
-            let (replies, shares) = bridge.request(submit(id)).unwrap();
+            let (replies, shares) = bridge.request(remote_submit(id)).unwrap();
             assert_eq!(replies, vec![json!({"id":id,"result":true,"error":null})]);
             assert_eq!(shares.len(), 1);
         }
@@ -1134,14 +1678,14 @@ mod tests {
         assert!(verdicts.iter().all(
             |verdict| matches!(verdict, ShareEvent::Accepted(target) if *target == [255; 32])
         ));
-        assert!(bridge.pending.is_empty());
+        assert!(bridge.user.pending.is_empty());
         // A repeated or late verdict is not an error.
         assert!(bridge.upstream(batch).unwrap().1.is_empty());
         // Pending verdicts stay bounded: the oldest is dropped, never the share.
         for id in 0..(MAX_PENDING as u64 + 5) {
-            assert_eq!(bridge.request(submit(100 + id)).unwrap().1.len(), 1);
+            assert_eq!(bridge.request(remote_submit(100 + id)).unwrap().1.len(), 1);
         }
-        assert_eq!(bridge.pending.len(), MAX_PENDING);
+        assert_eq!(bridge.user.pending.len(), MAX_PENDING);
         // The firmware cannot follow a new extranonce, so it reconnects.
         let prefix = encoded(
             SetExtranoncePrefix {
@@ -1190,7 +1734,7 @@ mod tests {
         let mut request = submit(7);
         request["params"][4] = json!(u64::MAX);
         assert!(bridge.request(request).is_err());
-        assert_eq!(bridge.pending.len(), 1);
+        assert_eq!(bridge.user.pending.len(), 1);
     }
 
     #[test]
@@ -1220,7 +1764,7 @@ mod tests {
         let (replies, shares) = bridge.request(submit(100)).unwrap();
         assert!(shares.is_empty());
         assert_eq!(replies[0]["error"][0], 20);
-        assert_eq!(bridge.pending.len(), MAX_PENDING);
+        assert_eq!(bridge.user.pending.len(), MAX_PENDING);
     }
 
     #[test]

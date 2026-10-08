@@ -114,6 +114,13 @@ impl BchDonation {
         (u128::from(units) * u128::from(self.0)).div_ceil(30_000) as u64
     }
 
+    /// #### PR #40
+    /// The work share when the whole donation is work, as at a remote pool,
+    /// where Pickaxe cannot add a coinbase output: 1.5% at the default.
+    pub fn pool_work_units(self, units: u64) -> u64 {
+        (u128::from(units) * u128::from(self.0)).div_ceil(10_000) as u64
+    }
+
     /// The block-reward share: two thirds of the total (1% of each block
     /// reward at the 1.5% default). Any fractional satoshi stays with the
     /// miner.

@@ -671,6 +671,9 @@ struct FirmwareDevice {
     write: TcpStream,
     read: std::io::BufReader<TcpStream>,
     prefix: Vec<u8>,
+    /// The extranonce2 size the adapter gave: 8 from this server's own
+    /// listener, 4 at a remote pool (#### PR #40).
+    extra_size: usize,
     clean: bool,
 }
 impl FirmwareDevice {
@@ -684,6 +687,7 @@ impl FirmwareDevice {
             write,
             read,
             prefix: Vec::new(),
+            extra_size: 0,
             clean: false,
         };
         if rolling {
@@ -700,9 +704,14 @@ impl FirmwareDevice {
         device
             .send(json!({"id":2,"method":"mining.subscribe","params":["CPU firmware experiment"]}));
         let subscribed = device.receive();
-        assert_eq!(subscribed["result"][2], 8);
+        device.extra_size = subscribed["result"][2].as_u64().unwrap() as usize;
         device.prefix = hex::decode(subscribed["result"][1].as_str().unwrap()).unwrap();
-        assert_eq!(device.prefix.len(), 16);
+        // This server's prefix and eight bytes, or at a remote pool the
+        // adapter's four and four.
+        assert!(
+            matches!((device.prefix.len(), device.extra_size), (16, 8) | (4, 4)),
+            "{subscribed}"
+        );
         if !authorize_first {
             device.send(authorize);
             assert_eq!(device.receive()["result"], true);
@@ -727,13 +736,16 @@ impl FirmwareDevice {
         assert_eq!(difficulty["method"], "mining.set_difficulty");
         assert!(difficulty["params"][0].as_f64().unwrap() > 0.0);
         let notify = self.receive();
+        self.solve_notify(id, rolling, &notify)
+    }
+    fn solve_notify(&mut self, id: u32, rolling: bool, notify: &Value) -> (String, Value) {
         assert_eq!(notify["method"], "mining.notify");
         let fields = notify["params"].as_array().unwrap();
         self.clean = fields[8].as_bool().unwrap();
-        let extra = [id as u8; 8];
+        let extra = vec![id as u8; self.extra_size];
         let mut coinbase = hex::decode(fields[2].as_str().unwrap()).unwrap();
         coinbase.extend(&self.prefix);
-        coinbase.extend(extra);
+        coinbase.extend(&extra);
         coinbase.extend(hex::decode(fields[3].as_str().unwrap()).unwrap());
         let mut root = sha256d::Hash::hash(&coinbase).to_byte_array();
         for sibling in fields[4].as_array().unwrap() {
@@ -933,6 +945,7 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         authority,
         identity: payout(),
         remote: true,
+        donation: None,
     };
     let upstreams = vec![pool_with([3; 32]), pool_with(pool.authority)];
     let thread = {
@@ -973,6 +986,74 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
+// #### PR #40
+#[test]
+fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_it() {
+    // Pickaxe's own server stands in for the pool. At 100% the device mines
+    // only the donation channel's jobs once that channel has work.
+    let pool = Running::new(false);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(ServerStats::default()));
+    let upstreams = vec![super::sv1::Upstream {
+        address: pool.address.to_string(),
+        authority: pool.authority,
+        identity: payout(),
+        remote: true,
+        donation: Some(super::sv1::DonationRoute {
+            identity: crate::donation::bch::address(crate::config::MiningNetwork::Chipnet)
+                .to_owned(),
+            rate: Arc::new(std::sync::RwLock::new("100".parse().unwrap())),
+        }),
+    }];
+    let thread = {
+        let stop = stop.clone();
+        let stats = stats.clone();
+        thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
+    };
+    let adapter = FirmwareAdapter {
+        stop,
+        thread: Some(thread),
+        address,
+    };
+    let mut device = FirmwareDevice::connect(&adapter, true, false);
+    assert_eq!(device.extra_size, 4);
+    // Wait for the switch: a clean job numbered with the donation bit.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let notify = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no donation job reached the device"
+        );
+        let message = device.receive();
+        if message["method"] == "mining.notify"
+            && message["params"][0]
+                .as_str()
+                .and_then(|id| id.parse::<u32>().ok())
+                .is_some_and(|id| id >= 0x8000_0000)
+        {
+            assert_eq!(message["params"][8], true);
+            break message;
+        }
+    };
+    let (hash, submit) = device.solve_notify(0, true, &notify);
+    device.send(submit);
+    let ack = device.receive();
+    assert_eq!(ack["result"], true);
+    // The pool validated the share on the donation channel: the coinbase the
+    // device built with the adapter's extranonce is the pool's own.
+    pool.wait(|stats| stats.blocks_accepted == 1);
+    assert_eq!(pool.node.lock().unwrap().tip, hash);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while stats.lock().unwrap().shares_accepted < 1 {
+        assert!(Instant::now() < deadline, "pool verdict not counted");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(stats.lock().unwrap().shares_rejected, 0);
+    device.write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
 /// Opt-in and read-only: SV1 firmware reaches a real SV2 pool through the
 /// adapter and receives work; no share is submitted, and the identity is the
 /// address of a random, never-funded key. For example:
@@ -1010,6 +1091,7 @@ fn real_sv2_pool_sends_work_to_sv1_firmware() {
         authority,
         identity,
         remote: true,
+        donation: None,
     };
     let thread = {
         let stop = stop.clone();
@@ -1092,12 +1174,14 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             authority: [3; 32],
             identity: payout(),
             remote: true,
+            donation: None,
         },
         super::sv1::Upstream {
             address: pool.address.to_string(),
             authority: server::authority_public(&[18; 32]).unwrap(),
             identity: payout(),
             remote: true,
+            donation: None,
         },
     ];
     let thread = {

@@ -238,6 +238,14 @@ impl Devices {
         }
     }
 
+    /// #### PR #40: a problem the adapter reports while the device mines,
+    /// such as a pool refusing the donation channel.
+    pub fn note_adapter(&mut self, id: u64, issue: &'static str) {
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.adapter_error = Some(issue);
+        }
+    }
+
     pub fn close(&mut self, id: u64, adapter: bool, error: Option<&str>, now: Instant) {
         let Some(row) = self.rows.get_mut(&id) else {
             return;

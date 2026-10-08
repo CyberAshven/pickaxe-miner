@@ -650,7 +650,8 @@ once a share is checked and forwarded and counts the pool's verdicts itself;
 a changed extranonce, a closed channel or a Reconnect closes the device for a
 fresh channel. Local mode keeps its exact behavior: per-share
 acknowledgements from Pickaxe's own server before firmware gets its reply.
-The donation does not apply in pool mode, since the pool builds the blocks.
+The donation does not apply in pool mode, since the pool builds the blocks
+(changed the same day: see "Pool mode: the donation as mining time").
 Backup pools repeat `--upstream` and `--upstream-key` in order: each device
 takes the first pool that completes the handshake, setup and channel, and a
 device whose pools all fail keeps a row with the last pool's reason.
@@ -744,3 +745,47 @@ Validation: eight release-mode runs of the server tests with 16 threads
 passed (two or three of every five or six failed before); the Windows
 all-feature host suite passed 444 library and 16 binary tests; formatting,
 all-feature Clippy and server-only Clippy with warnings denied passed.
+
+## Pool mode: the donation as mining time (2026-10-08)
+
+#### PR #40
+
+The operator decided the donation applies however Pickaxe is used, including
+at a remote pool, with the BCH setting's 0% option kept. A pool builds its own
+blocks, so the whole BCH donation is mining time there: for that share of each
+device's time (9 seconds of every 10 minutes at the 1.5% default), the device
+mines at the same pool under the network's donation address, on a second
+extended channel of the same encrypted connection. The schedule is the
+server's own per-device work clock, counted while the device has work. At 0%
+no donation channel is opened.
+
+To switch channels without reconnecting the device (which could make it fall
+back to its own backup pools), the adapter now owns a pool-mode device's
+extranonce: extranonce1 is four bytes it picks and extranonce2 the four the
+device rolls, together the channel's eight miner bytes; the pool's channel
+prefix, and zero padding if a pool grants more than eight bytes, goes into the
+coinbase part the device receives. A switch sends the channel's difficulty and
+a clean job; the donation channel's jobs carry the top bit in their SV1 job
+number, so each share returns to the channel its job came from, with its
+extranonce rebuilt. A pool that refuses or later closes or changes the
+donation channel leaves the device mining on its own channel and puts the
+reason on its workers-page row. Local mode (this server's own listener, which
+the Avalon Nano uses) is unchanged. `--donation` now works with `--upstream`.
+
+Evidence: unit tests cover the extranonce split and coinbase prefix, opening
+the donation channel only once the device is ready, the switch at 100% with a
+clean job of donation number and padding for a ten-byte grant, a donation
+share's channel, job and extranonce, the switch back at 0%, and a refused or
+closed donation channel. End to end, with Pickaxe's own server as the pool
+over Noise, SV1 firmware at a 100% donation mined a block from a donation
+channel job; the pool validated the share and the node fixture accepted the
+block, which checks the coinbase the device built from the adapter's
+extranonce. The existing pool test (two blocks, verdicts counted, fallback
+past a wrong key) passes with the new extranonce split. Not yet run against a
+real BCH SV2 pool: SoloFury's BCH endpoints still send the certificate version
+reported in cashstratum/cashstratum#3.
+
+Validation: Windows all-feature host suite, 447 library and 16 binary tests
+passed, 22 opt-in tests ignored, 34 hardware tests filtered; formatting,
+all-target/all-feature Clippy on Rust 1.94 and 1.99 and the server-only Clippy
+with warnings denied passed.

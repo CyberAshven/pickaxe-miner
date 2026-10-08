@@ -119,7 +119,7 @@ pub enum StratumV2Command {
         /// the pool (another Pickaxe server, or a BCH SV2 pool). SV1 devices
         /// connect to --sv1-listen; no node is needed. Repeat for backup
         /// pools, tried in order.
-        #[arg(long, requires_all = ["upstream_key", "sv1_listen"], conflicts_with = "donation")]
+        #[arg(long, requires_all = ["upstream_key", "sv1_listen"])]
         upstream: Vec<String>,
         /// The pool's authority public key, as the pool publishes it; one per
         /// --upstream, in the same order.
@@ -340,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_mode_needs_the_pool_key_and_an_sv1_listener_and_has_no_donation() {
+    fn pool_mode_needs_the_pool_key_and_an_sv1_listener_and_keeps_the_donation() {
         let base = [
             "pickaxe",
             "stratum-v2",
@@ -401,7 +401,7 @@ mod tests {
         // The pool's key and a listener for the devices are required.
         assert!(with(&["--sv1-listen", "0.0.0.0:3333"]).is_err());
         assert!(with(&["--upstream-key", "key"]).is_err());
-        // The pool builds the blocks, so the donation setting does not apply.
+        // #### PR #40: at a pool the donation is mining time, set as anywhere.
         assert!(with(&[
             "--upstream-key",
             "key",
@@ -410,7 +410,7 @@ mod tests {
             "--donation",
             "2"
         ])
-        .is_err());
+        .is_ok());
         // Pool identity options need a pool.
         assert!(
             Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--upstream-user", "me"])

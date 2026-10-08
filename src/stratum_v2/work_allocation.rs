@@ -40,6 +40,11 @@ impl WorkAllocation {
     pub fn donation_work(&self, rate: BchDonation) -> bool {
         self.position < rate.work_units(PERIOD_NS)
     }
+
+    /// #### PR #40: at a remote pool the whole donation is work.
+    pub fn pool_donation_work(&self, rate: BchDonation) -> bool {
+        self.position < rate.pool_work_units(PERIOD_NS)
+    }
 }
 
 #[cfg(test)]

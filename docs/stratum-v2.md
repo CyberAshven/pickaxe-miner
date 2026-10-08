@@ -251,11 +251,23 @@ Pools may acknowledge shares in batches, so in pool mode a device gets its
 reply once the adapter has checked and forwarded the share, and the workers
 page counts the pool's own verdicts as they arrive. A pool that changes a
 channel's extranonce or asks for a reconnect closes that device's connection,
-and the device reconnects for a new channel. SV1 firmware needs an 8-byte
-extranonce2; a pool that allocates another size is refused with a clear reason.
-The donation does not apply in pool mode, since the pool builds the blocks and
-pays (`--donation` is refused with `--upstream`). Native SV2 devices such as
-Bitaxe can connect to SV2 pools themselves.
+and the device reconnects for a new channel. A pool must allocate at least
+eight miner extranonce bytes per channel; the adapter gives each device four
+bytes of its own as extranonce1 and lets it roll four as extranonce2, and puts
+the pool's channel prefix into the coinbase part the device receives.
+
+The donation applies in pool mode too, as mining time: since the pool builds
+the blocks, Pickaxe cannot add a coinbase output, so the whole BCH donation
+setting (1.5% by default, 0% to 100% in Advanced settings or `--donation`) is
+that share of each device's mining time, mined at the same pool under the
+donation address on a second channel. A 10-minute cycle per device decides
+which channel feeds it (9 seconds at 1.5%); a switch sends the channel's
+difficulty and a clean job, so the device never reconnects or falls back to
+its own backup pools. At 0% no donation channel is opened. A pool that refuses
+the second channel, for example one whose usernames are accounts rather than
+addresses, keeps the device mining on its own channel, and the workers page
+shows why. Native SV2 devices such as Bitaxe can connect to SV2 pools
+themselves.
 
 Evidence, 2026-10-08: Pickaxe's own server as the pool, over TCP with Noise
 and a host name (two blocks mined, both counted by the adapter), and SoloFury's

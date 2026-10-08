@@ -26,7 +26,7 @@ confirmed controls (restart, pause, resume, blink its light to find it, Avalon
 work levels) for most makes, through [asic-rs](https://github.com/256foundation/asic-rs).
 With `--upstream`, it sends SV1 devices to a remote Stratum V2 pool instead of
 your own node, with backup pools in order; there the pool builds the blocks,
-so the donation does not apply. See [docs/stratum-v2.md](docs/stratum-v2.md).
+so the donation is that share of mining time at the pool. See [docs/stratum-v2.md](docs/stratum-v2.md).
 
 ## Supported platforms
 
