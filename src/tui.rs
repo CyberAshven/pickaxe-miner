@@ -246,7 +246,7 @@ struct SetupFlow {
     /// #### PR #40: whether GPUs mine alone or join a GPU pool or farm.
     gpu_join: bool,
     pool_kind: PoolKind,
-    /// A pool to run is for ASICs (0) or GPUs (1, coming soon).
+    /// A pool to run is for ASICs (0) or GPUs (1).
     pool_target: usize,
     join_address: String,
     join_key: String,
@@ -2958,14 +2958,13 @@ fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
         ]
     } else if state.mode == MiningMode::Asic {
         vec![
-            Line::from(vec![
-                Span::raw(format!(
-                    "{} {:<34}",
-                    selection_marker(state.asic_target == 0),
-                    ASIC_TARGETS[0]
-                )),
-                Span::styled("coming soon", soon),
-            ]),
+            // #### PR #40: BCH mining works today; only P2Pool v2 is "coming
+            // soon", and ASIC-exclusive tokens are not supported yet.
+            Line::from(Span::raw(format!(
+                "{} {}",
+                selection_marker(state.asic_target == 0),
+                ASIC_TARGETS[0]
+            ))),
             Line::from(dim(
                 "    Mines BCH and adds every merge-mined token automatically as each is supported.",
             )),
@@ -2975,7 +2974,7 @@ fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     selection_marker(state.asic_target == 1),
                     ASIC_TARGETS[1]
                 )),
-                Span::styled("coming soon", soon),
+                Span::styled("not supported yet", soon),
             ]),
             Line::from(dim(
                 "    Tokens only ASICs mine. Choose one from this list once supported.",
@@ -3081,10 +3080,11 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             }
             SettingsRow::AsicTarget => (
                 "ASIC target",
-                Span::raw(format!(
-                    "{}  (coming soon)",
-                    ASIC_TARGETS[state.asic_target]
-                )),
+                Span::raw(if state.asic_target == 0 {
+                    ASIC_TARGETS[0].to_owned()
+                } else {
+                    format!("{}  (not supported yet)", ASIC_TARGETS[1])
+                }),
                 "< >",
             ),
             // #### PR #40
@@ -4925,6 +4925,19 @@ mod tests {
         // A GPU pool's claims have no coinbase of their own to name.
         setup.pool_target = 1;
         assert!(!setup.settings_rows().contains(&SettingsRow::PoolName));
+    }
+
+    // #### PR #40
+    #[test]
+    fn only_p2pool_v2_is_coming_soon_and_bch_asic_mining_is_offered() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.step = SetupStep::Token;
+        let screen = setup_text(&setup);
+        assert!(screen.contains("BCH + all merge-mined tokens"), "{screen}");
+        assert!(!screen.contains("coming soon"), "{screen}");
+        assert!(screen.contains("not supported yet"), "{screen}");
+        setup.open_settings(SettingsRow::AsicTarget);
+        assert!(!setup_text(&setup).contains("coming soon"));
     }
 
     #[test]
