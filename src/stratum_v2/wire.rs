@@ -718,8 +718,8 @@ mod tests {
         server.receive(open(), 1700000010).unwrap();
         let id = *server.channels.keys().next().unwrap();
         assert_eq!(server.channels[&id].target, server.share_target);
-        // A silent device: twenty seconds without shares eases its target.
-        server.channels.get_mut(&id).unwrap().vardiff_window(20, 0);
+        // A silent device: a minute without shares eases its target.
+        server.channels.get_mut(&id).unwrap().vardiff_window(60, 0);
         let mut next_id = 10;
         let mut frames = server.retarget(&mut next_id).unwrap();
         assert_eq!(frames.len(), 2);

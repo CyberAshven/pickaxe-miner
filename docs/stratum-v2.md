@@ -141,6 +141,16 @@ rate when reported, its hottest temperature and its fan speed. Each device gets
 three seconds per report. Device addresses are used only for these queries and
 never appear in the dashboard or JSON; no device setting is changed.
 
+A server running without a screen, for example as a service with
+`--no-tui --json`, saves the same status once a second beside its config
+(`chipnet.sv2-status.json` for `chipnet.json`). On that machine,
+`stratum-v2 watch` with the same network flag and `--config` shows the
+server's workers table, read-only: it never connects to the server or changes
+anything, and `q` leaves the server running. The status file holds no payout
+addresses or credentials; reading a service's state directory may need
+`sudo`. The header shows "Server not updating" when the saved status is older
+than five seconds.
+
 The dashboard also shows the public authority key that devices must pin. Its
 private key is created beside the config as `chipnet.sv2-key`, protected with
 the same owner-only file mechanism as saved RPC credentials. Invalid existing
@@ -206,7 +216,10 @@ use synthetic solved blocks; actual node/ASIC evidence is recorded separately.
 
 Each device starts at share difficulty 4096. Vardiff (SRI's reference rules)
 then moves it toward about 20 shares a minute, for 1 TH/s miners and 1 PH/s
-ones alike, with a floor equal to 1 MH/s. A new target is sent as SetTarget and
+ones alike, with a floor equal to 1 MH/s. Like ckpool and P2Poolv2, it acts
+only on enough evidence (72 shares, four minutes, or a silent minute) and
+ignores changes under 25%, which are share luck, so the difficulty does not
+jump on a short run of lucky shares. A new target is sent as SetTarget and
 at once as a fresh job on the same template, so SV1 firmware receives
 `set_difficulty` and a notify that keeps work in flight. When the network has
 easier work, the device's target follows it down so firmware does not discard

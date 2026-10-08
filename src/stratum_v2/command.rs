@@ -21,17 +21,18 @@ use ratatui::{
     widgets::{Block, Paragraph, Row, Table, Wrap},
     Frame,
 };
+use serde::Deserialize;
 use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, RwLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub fn run(
@@ -44,6 +45,9 @@ pub fn run(
     if let StratumV2Command::Status = action {
         print!("{}", super::status_report());
         return Ok(());
+    }
+    if let StratumV2Command::Watch = action {
+        return watch(&status_path(config_path));
     }
     if matches!(action, StratumV2Command::Serve { .. }) {
         config::validate_payout_address(config.network, &config.payout_address)
@@ -170,6 +174,8 @@ pub fn run(
         let mut advanced = false;
         // The workers table opens first; Tab switches to the overview.
         let mut overview = false;
+        let status_file = status_path(config_path);
+        let mut status_saved: Option<Instant> = None;
         while !stop.load(Ordering::Relaxed) && !worker.is_finished() {
             if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
                 break;
@@ -183,8 +189,18 @@ pub fn run(
             let donation_value = *donation
                 .read()
                 .map_err(|_| "donation setting unavailable")?;
+            // #### PR #40
+            // The status the JSON mode prints is also saved once a second
+            // beside the config, so `stratum-v2 watch` can show the workers
+            // table of a server running as a service. It never holds payouts
+            // or credentials, and a failed save never stops mining.
+            let status = status_json(config.network.as_str(), &snapshot, donation_value, &devices);
+            if status_saved.is_none_or(|saved| saved.elapsed() >= Duration::from_secs(1)) {
+                let _ = write_status(&status_file, &status);
+                status_saved = Some(Instant::now());
+            }
             if let Some(terminal) = terminal.as_mut() {
-                let status = format!(
+                let overview_text = format!(
                     "{} · Node {} · Height {} · Donation {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" },
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), snapshot.connections, snapshot.sessions_started,
@@ -214,15 +230,16 @@ pub fn run(
                     snapshot.blocks_accepted,
                     snapshot.blocks_pending,
                 );
+                let lines: Vec<WorkerLine> = devices.iter().map(WorkerLine::from).collect();
                 terminal
                     .terminal
                     .draw(|frame| {
                         if advanced {
                             render_advanced(frame, donation_value, setting_error)
                         } else if overview {
-                            render_dashboard(frame, &status, &devices, device_offset)
+                            render_dashboard(frame, &overview_text, &devices, device_offset)
                         } else {
-                            render_workers(frame, &header, &devices, device_offset)
+                            render_workers(frame, &header, &lines, device_offset, SERVE_FOOTER)
                         }
                     })
                     .map_err(|_| "cannot draw mining dashboard")?;
@@ -273,19 +290,7 @@ pub fn run(
                     }
                 }
             } else {
-                println!(
-                    "{}",
-                    serde_json::json!({"ready":snapshot.template_ready,"height":snapshot.height,
-                    "donation":donation_value.to_string(),
-                    "devices":snapshot.connections,"shares_accepted":snapshot.shares_accepted,"shares_rejected":snapshot.shares_rejected,
-                    "blocks_accepted":snapshot.blocks_accepted,"blocks_unconfirmed":snapshot.blocks_pending,
-                    "blocks_pending":snapshot.blocks_pending,"blocks_rejected":snapshot.blocks_rejected,
-                    "block_retries":snapshot.block_retries,"last_block_result":snapshot.last_block_result,
-                    "connection_errors":snapshot.connection_errors,"sv1_connection_errors":snapshot.sv1_connection_errors,
-                    "template_failures":snapshot.template_failures,"last_template_error":snapshot.last_template_error,
-                    "sv1_local_rejected":snapshot.sv1_local_rejected,"sessions_started":snapshot.sessions_started,
-                    "device_details":devices})
-                );
+                println!("{status}");
                 thread::sleep(Duration::from_secs(1));
             }
         }
@@ -450,7 +455,13 @@ fn format_difficulty(difficulty: Option<f64>) -> String {
 }
 
 /// The workers table, laid out like a pool's worker list; the default page.
-fn render_workers(frame: &mut Frame<'_>, header: &str, devices: &[DeviceSnapshot], offset: usize) {
+fn render_workers(
+    frame: &mut Frame<'_>,
+    header: &str,
+    devices: &[WorkerLine],
+    offset: usize,
+    footer: &str,
+) {
     let areas = Layout::vertical([
         Constraint::Length(4),
         Constraint::Min(4),
@@ -498,11 +509,12 @@ fn render_workers(frame: &mut Frame<'_>, header: &str, devices: &[DeviceSnapshot
             },
             ago(device.last_share_seconds),
             format_difficulty(device.difficulty),
-            device.protocol.to_owned(),
+            device.protocol.clone(),
             device
                 .adapter_error
-                .or(device.connection_error)
-                .or(device.last_rejection)
+                .as_deref()
+                .or(device.connection_error.as_deref())
+                .or(device.last_rejection.as_deref())
                 .unwrap_or("—")
                 .to_owned(),
         ])
@@ -553,12 +565,226 @@ fn render_workers(frame: &mut Frame<'_>, header: &str, devices: &[DeviceSnapshot
         ))),
         areas[1],
     );
-    frame.render_widget(
-        Paragraph::new(
-            "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.",
-        ),
-        areas[2],
-    );
+    frame.render_widget(Paragraph::new(footer), areas[2]);
+}
+
+const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
+const WATCH_FOOTER: &str = "↑/↓ PgUp/PgDn  Scroll · q  Quit (the server keeps running)\nRead-only view of the server's saved status; Now and 1 hour come from validated shares.";
+
+/// One row of the workers table, from the live server or its saved status.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+struct WorkerLine {
+    label: String,
+    protocol: String,
+    connected: bool,
+    accepted: u64,
+    rejected: u64,
+    last_rejection: Option<String>,
+    hashrate_estimate: Option<f64>,
+    hashrate_hour: Option<f64>,
+    difficulty: Option<f64>,
+    last_share_seconds: Option<u64>,
+    connection_error: Option<String>,
+    adapter_error: Option<String>,
+    reported_hashrate: Option<f64>,
+    temperature_c: Option<f64>,
+    fan: Option<String>,
+}
+
+impl From<&DeviceSnapshot> for WorkerLine {
+    fn from(device: &DeviceSnapshot) -> Self {
+        Self {
+            label: device.label.clone(),
+            protocol: device.protocol.to_owned(),
+            connected: device.connected,
+            accepted: device.accepted,
+            rejected: device.rejected,
+            last_rejection: device.last_rejection.map(str::to_owned),
+            hashrate_estimate: device.hashrate_estimate,
+            hashrate_hour: device.hashrate_hour,
+            difficulty: device.difficulty,
+            last_share_seconds: device.last_share_seconds,
+            connection_error: device.connection_error.map(str::to_owned),
+            adapter_error: device.adapter_error.map(str::to_owned),
+            reported_hashrate: device.reported_hashrate,
+            temperature_c: device.temperature_c,
+            fan: device.fan.clone(),
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Where the server saves its status for `stratum-v2 watch`: beside the
+/// config, like the authority key and the block journal.
+fn status_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("sv2-status.json")
+}
+
+/// The status published each second: printed in JSON mode and saved for
+/// `stratum-v2 watch`. It never contains payouts or credentials.
+fn status_json(
+    network: &str,
+    snapshot: &ServerStats,
+    donation: BchDonation,
+    devices: &[DeviceSnapshot],
+) -> serde_json::Value {
+    serde_json::json!({
+        "network": network,
+        "updated": unix_now(),
+        "ready": snapshot.template_ready,
+        "height": snapshot.height,
+        "donation": donation.to_string(),
+        "donation_summary": donation_summary(donation),
+        "devices": snapshot.connections,
+        "shares_accepted": snapshot.shares_accepted,
+        "shares_rejected": snapshot.shares_rejected,
+        "blocks_accepted": snapshot.blocks_accepted,
+        "blocks_unconfirmed": snapshot.blocks_pending,
+        "blocks_pending": snapshot.blocks_pending,
+        "blocks_rejected": snapshot.blocks_rejected,
+        "block_retries": snapshot.block_retries,
+        "last_block_result": snapshot.last_block_result,
+        "connection_errors": snapshot.connection_errors,
+        "sv1_connection_errors": snapshot.sv1_connection_errors,
+        "template_failures": snapshot.template_failures,
+        "last_template_error": snapshot.last_template_error,
+        "sv1_local_rejected": snapshot.sv1_local_rejected,
+        "sessions_started": snapshot.sessions_started,
+        "device_details": devices,
+    })
+}
+
+/// Replaces the status file whole, so a reader never sees half of it.
+fn write_status(path: &Path, status: &serde_json::Value) -> std::io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".tmp-{:016x}", rand::random::<u64>()));
+    let temp = PathBuf::from(temp);
+    fs::write(&temp, status.to_string())?;
+    fs::rename(&temp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
+}
+
+/// The saved status as `stratum-v2 watch` reads it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WatchStatus {
+    network: String,
+    updated: u64,
+    ready: bool,
+    height: Option<u32>,
+    donation: String,
+    donation_summary: Option<String>,
+    shares_accepted: u64,
+    shares_rejected: u64,
+    blocks_accepted: u64,
+    blocks_pending: usize,
+    device_details: Vec<WorkerLine>,
+}
+
+impl WatchStatus {
+    /// The workers page header, with how old the saved status is.
+    fn header(&self, now: u64) -> String {
+        let age = now.saturating_sub(self.updated);
+        let online = self
+            .device_details
+            .iter()
+            .filter(|row| row.connected)
+            .count();
+        let rate: f64 = self
+            .device_details
+            .iter()
+            .filter(|row| row.connected)
+            .filter_map(|row| row.hashrate_estimate)
+            .sum();
+        let freshness = if age > 5 {
+            format!("Server not updating; last status {}", ago(Some(age)))
+        } else {
+            "Live".to_owned()
+        };
+        format!(
+            "{} · Node {} · Height {} · Donation {} · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
+            self.network,
+            if self.ready { "Ready" } else { "Waiting" },
+            self.height
+                .map(|height| height.to_string())
+                .unwrap_or_else(|| "Waiting".into()),
+            self.donation_summary.as_deref().unwrap_or(&self.donation),
+            self.device_details.len(),
+            crate::telemetry::format_hash_rate(rate),
+            self.shares_accepted,
+            self.shares_rejected,
+            self.blocks_accepted,
+            self.blocks_pending,
+        )
+    }
+
+    /// The rows, with share ages counted to now rather than to the save.
+    fn rows(&self, now: u64) -> Vec<WorkerLine> {
+        let age = now.saturating_sub(self.updated);
+        self.device_details
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.last_share_seconds = row.last_share_seconds.map(|s| s.saturating_add(age));
+                row
+            })
+            .collect()
+    }
+}
+
+/// #### PR #40
+/// `stratum-v2 watch`: the workers table of a server running elsewhere on
+/// this machine, such as a service started with --no-tui. Read-only: it reads
+/// the status the server saves each second and never touches the server.
+fn watch(path: &Path) -> Result<(), String> {
+    let mut terminal = TerminalSession::enter()?;
+    let mut offset = 0usize;
+    loop {
+        let now = unix_now();
+        let status = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<WatchStatus>(&text).ok());
+        let (header, rows) = match &status {
+            Some(status) => (status.header(now), status.rows(now)),
+            None => (
+                format!(
+                    "Waiting for the server's status at {}\nStart the server, or pass the same --config it uses.",
+                    path.display()
+                ),
+                Vec::new(),
+            ),
+        };
+        offset = offset.min(rows.len().saturating_sub(1));
+        terminal
+            .terminal
+            .draw(|frame| render_workers(frame, &header, &rows, offset, WATCH_FOOTER))
+            .map_err(|_| "cannot draw workers table")?;
+        if event::poll(Duration::from_secs(1)).map_err(|_| "cannot read terminal")? {
+            if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break
+                        }
+                        KeyCode::Up => offset = offset.saturating_sub(1),
+                        KeyCode::Down => offset = offset.saturating_add(1),
+                        KeyCode::PageUp => offset = offset.saturating_sub(10),
+                        KeyCode::PageDown => offset = offset.saturating_add(10),
+                        _ => (),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), String> {
@@ -671,10 +897,22 @@ mod tests {
             );
         }
         devices.share(first, ShareEvent::Rejected("stale job"), true, start);
-        let rows = devices.snapshots(start + Duration::from_secs(45));
+        let rows: Vec<WorkerLine> = devices
+            .snapshots(start + Duration::from_secs(45))
+            .iter()
+            .map(WorkerLine::from)
+            .collect();
         let mut terminal = Terminal::new(TestBackend::new(180, 20)).unwrap();
         terminal
-            .draw(|f| render_workers(f, "Chipnet · Node Ready · 1 of 1 workers online", &rows, 0))
+            .draw(|f| {
+                render_workers(
+                    f,
+                    "Chipnet · Node Ready · 1 of 1 workers online",
+                    &rows,
+                    0,
+                    SERVE_FOOTER,
+                )
+            })
             .unwrap();
         let text: String = terminal
             .backend()
@@ -704,6 +942,83 @@ mod tests {
         assert_eq!(format_difficulty(Some(512.0)), "512");
         assert_eq!(format_difficulty(None), "—");
         assert_eq!(ago(Some(250)), "4m ago");
+    }
+
+    #[test]
+    fn saved_status_shows_the_same_workers_read_only() {
+        use super::super::{device_api::DeviceReport, telemetry::ShareEvent};
+        use ratatui::{backend::TestBackend, Terminal};
+        let start = Instant::now();
+        let mut stats = ServerStats::default();
+        let id = stats
+            .device_stats
+            .connect("127.0.0.1:1000".parse().unwrap(), true, start);
+        let mut target = [0xff; 32];
+        target[26..32].fill(0);
+        stats.device_stats.share(
+            id,
+            ShareEvent::Accepted(target),
+            false,
+            start + Duration::from_secs(1),
+        );
+        stats.device_stats.set_report(
+            id,
+            Some(DeviceReport {
+                hashrate: Some(4.0e12),
+                temperature_c: Some(61.0),
+                fan: Some("40%".into()),
+            }),
+        );
+        stats.template_ready = true;
+        stats.height = Some(326930);
+        stats.shares_accepted = 1;
+        let devices = stats
+            .device_stats
+            .snapshots(start + Duration::from_secs(40));
+        let status = status_json("chipnet", &stats, BchDonation::default(), &devices);
+        let dir = super::super::journal::TestDirectory::new();
+        let path = status_path(&dir.0.join("chipnet.json"));
+        write_status(&path, &status).unwrap();
+        write_status(&path, &status).unwrap();
+        // Replaced whole each time, with no temporary file left behind.
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+        let saved: WatchStatus = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let updated = saved.updated;
+        assert_eq!(
+            saved.rows(updated),
+            devices.iter().map(WorkerLine::from).collect::<Vec<_>>()
+        );
+        let header = saved.header(updated);
+        for part in [
+            "chipnet",
+            "Height 326930",
+            "0.50% of work",
+            "Live",
+            "1 of 1 workers",
+        ] {
+            assert!(header.contains(part), "{part}");
+        }
+        assert!(saved.header(updated + 60).contains("Server not updating"));
+        // Share ages count on from the save.
+        assert_eq!(
+            saved.rows(updated + 10)[0].last_share_seconds,
+            devices[0].last_share_seconds.map(|s| s + 10)
+        );
+        let mut terminal = Terminal::new(TestBackend::new(180, 20)).unwrap();
+        terminal
+            .draw(|f| render_workers(f, &header, &saved.rows(updated), 0, WATCH_FOOTER))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains(&devices[0].label));
+        assert!(text.contains("61 °C"));
+        assert!(text.contains("q  Quit"));
+        assert!(!text.contains("Stop server"));
     }
 
     #[test]

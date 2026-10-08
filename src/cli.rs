@@ -100,6 +100,9 @@ pub enum StratumV2Command {
     Status,
     /// Check the configured BCH node and full block template without mining.
     CheckNode,
+    /// Show a running server's workers table, read-only (for example a
+    /// service started with --no-tui). Use the same --config as the server.
+    Watch,
     /// Serve encrypted BCH mining jobs to SV2 devices.
     Serve {
         /// Listener address. Use a LAN address to connect an external ASIC.
@@ -280,6 +283,17 @@ mod tests {
             cli.command,
             Some(Commands::StratumV2 {
                 command: StratumV2Command::Status
+            })
+        ));
+    }
+
+    #[test]
+    fn clap_parses_stratum_v2_watch_without_server_options() {
+        let cli = Cli::try_parse_from(["pickaxe", "--chipnet", "stratum-v2", "watch"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Watch
             })
         ));
     }

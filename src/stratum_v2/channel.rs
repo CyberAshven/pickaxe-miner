@@ -3,6 +3,7 @@
 //! Version rolling is restricted to BIP320's general-purpose bits. Devices
 //! receive disjoint coinbases and cannot alter payouts or template tx order.
 
+use super::telemetry::expected_hashes;
 use super::template::{double_sha256, meets_target, BchTemplate, Coinbase, CoinbaseParts, Hash};
 use crate::config::{validate_payout_address, MiningNetwork};
 use crate::donation::bch::BchPayout;
@@ -29,6 +30,14 @@ pub const MAX_ACTIVE_JOBS: usize = 8;
 // misreported device from asking for a near-zero difficulty.
 pub const SHARES_PER_MINUTE: f32 = 20.0;
 const MIN_HASHRATE: f32 = 1.0e6;
+// #### PR #40
+// Calmer than SRI's rules alone, as ckpool and P2Poolv2 are: decide only on
+// enough evidence (72 shares, four minutes, or a silent minute), and ignore
+// changes under a quarter, which are share luck rather than a different device.
+const VARDIFF_SHARES: u32 = 72;
+const VARDIFF_SECONDS: u64 = 240;
+const VARDIFF_SILENT_SECONDS: u64 = 60;
+const VARDIFF_HYSTERESIS: f64 = 1.25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -235,6 +244,17 @@ impl Channel {
     /// new target when the device must be told.
     pub fn retarget(&mut self, maximum: &Hash) -> Option<Hash> {
         let block = self.job.as_ref()?.template.target;
+        let shares = self.vardiff.shares_since_last_update;
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |now| now.as_secs())
+            .saturating_sub(self.vardiff.timestamp_of_last_update);
+        if shares < VARDIFF_SHARES
+            && elapsed < VARDIFF_SECONDS
+            && !(shares == 0 && elapsed >= VARDIFF_SILENT_SECONDS)
+        {
+            return None;
+        }
         let hashrate = self
             .vardiff
             .try_vardiff(
@@ -250,8 +270,16 @@ impl Channel {
         // The floor only stops the target from easing further. A device
         // below it (or started easier than it) never gets a harder target
         // from the floor itself.
-        if hashrate <= MIN_HASHRATE && meets_target(&desired, &self.desired) {
-            return None;
+        if hashrate <= MIN_HASHRATE {
+            if meets_target(&desired, &self.desired) {
+                return None;
+            }
+        } else {
+            // Small changes are share luck; at the floor, easing always applies.
+            let change = expected_hashes(&desired) / expected_hashes(&self.desired);
+            if (1.0 / VARDIFF_HYSTERESIS..=VARDIFF_HYSTERESIS).contains(&change) {
+                return None;
+            }
         }
         self.hashrate = hashrate;
         self.desired = desired;
@@ -388,8 +416,8 @@ pub fn share_work(target: &Hash) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::template::compact_target;
     use super::super::template_tests::{payout, rpc_template};
-    use super::super::{telemetry::expected_hashes, template::compact_target};
     use super::*;
     use stratum_core::bitcoin::{consensus, Block};
     fn channel(id: u32, kind: ChannelKind) -> Channel {
@@ -721,10 +749,35 @@ mod tests {
         // is never made harder by the floor.
         let mut easy = device_channel([255; 32]);
         for shares in [0, 5] {
-            easy.vardiff_window(20, shares);
+            easy.vardiff_window(240, shares);
             assert_eq!(easy.retarget(&[255; 32]), None);
             assert_eq!(easy.target, [255; 32]);
         }
+    }
+
+    #[test]
+    fn vardiff_waits_for_evidence_and_ignores_share_luck() {
+        let rate = 4.0e12;
+        let ideal = hash_rate_to_target(rate, f64::from(SHARES_PER_MINUTE))
+            .unwrap()
+            .to_le_bytes();
+        let mut channel = device_channel(ideal);
+        let per_share = expected_hashes(&ideal);
+        let shares =
+            |seconds: f64, factor: f64| (factor * seconds * rate / per_share).round() as u32;
+        // A lucky burst, three times the aim for 16 seconds: too little
+        // evidence to act on.
+        channel.vardiff_window(16, shares(16.0, 3.0));
+        assert_eq!(channel.retarget(&[255; 32]), None);
+        // Five minutes 15% above the aim: share luck, not a different device.
+        channel.vardiff_window(300, shares(300.0, 1.15));
+        assert_eq!(channel.retarget(&[255; 32]), None);
+        assert_eq!(channel.target, ideal);
+        // 60% more hash rate is a real change.
+        channel.vardiff_window(300, shares(300.0, 1.6));
+        assert!(channel.retarget(&[255; 32]).is_some());
+        assert!(meets_target(&channel.target, &ideal));
+        assert_ne!(channel.target, ideal);
     }
 
     #[test]

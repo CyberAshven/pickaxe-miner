@@ -26,7 +26,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
-| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; workers page, read-only device reports and per-device vardiff host-tested, physical observation pending |
+| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; workers page, read-only device reports and per-device vardiff observed on the Avalon Nano 3 on 2026-10-08; the read-only `watch` view and calmer vardiff host-tested |
 | S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | Default 1.5% policy, dashboard controls and saved configuration implemented; host/reference checks and four live-node proposals pass; updated physical ASIC payout observation pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
@@ -575,3 +575,29 @@ passed, 19 opt-in tests ignored, 34 hardware tests filtered; formatting and
 all-target/all-feature Clippy with warnings denied passed. Vardiff convergence
 is simulated for 1 TH/s, 4 TH/s, 90 TH/s, 200 TH/s and 1 PH/s devices. Physical
 observation on the Avalon Nano 3 and exact pushed-commit CI are separate gates.
+
+## Workers view and calmer vardiff checkpoint (2026-10-08)
+
+#### PR #40
+
+Live evidence before this change, from the Avalon Nano 3 on the Chipnet
+service running PR #38's head (`03135d3`), about ten minutes after the
+restart: the device's own report (3.92 TH/s five-minute rate, 94 °C hottest,
+fan 73%) beside Pickaxe's measured 4.47 TH/s over five minutes and 4.31 TH/s
+since the restart; 93 accepted shares and one stale; the donation at 1.50%;
+three brief node RPC failures recovered without dropping the device. Vardiff
+had moved the difficulty from 4096 to about 5,297, above the expected 2,800 to
+3,100: SRI's rules alone can act on a short run of lucky shares, the likely
+cause of that overshoot.
+
+This change adds `stratum-v2 watch`, a read-only workers table for a server
+running without a screen, fed by a status file the server saves each second
+beside its config, and makes vardiff calmer: it acts only on 72 shares, four
+minutes or a silent minute, and ignores changes under 25%, as ckpool and
+P2Poolv2 do.
+
+Validation: Windows all-feature host suite, 429 library and 16 binary tests
+passed, 19 opt-in tests ignored, 34 hardware tests filtered; formatting and
+all-target/all-feature Clippy with warnings denied passed. Physical
+observation of the calmer vardiff and the `watch` view on the Avalon's service
+is a separate gate.
