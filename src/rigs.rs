@@ -363,7 +363,14 @@ mod net {
                         while !stop.load(Ordering::Relaxed) {
                             match listener.accept() {
                                 Ok((stream, _)) => {
-                                    if lock(&state).rigs.len() >= MAX_RIGS {
+                                    // #### PR #32: on Windows an accepted
+                                    // socket inherits the listener's
+                                    // non-blocking mode, and the handshake's
+                                    // first read would fail at once whenever
+                                    // the rig's bytes came a moment later.
+                                    if lock(&state).rigs.len() >= MAX_RIGS
+                                        || stream.set_nonblocking(false).is_err()
+                                    {
                                         continue;
                                     }
                                     let state = Arc::clone(&state);
