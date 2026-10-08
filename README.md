@@ -138,10 +138,10 @@ Headless, from the same directory:
 Without `--no-tui`, the miner opens a short setup:
 
 1. **Profiles**: your saved profiles. Enter on one opens its settings with Start selected, so a second Enter mines. `R` renames and `D` deletes (with a confirmation).
-2. **Hardware**: GPU or ASIC.
+2. **What to do**: GPU mining, ASIC mining, or run a pool for other miners.
 3. **Network**: Mainnet or Chipnet.
 4. **Token**: the GPU tokens for that network, or for ASIC, "BCH + all merge-mined tokens" or an ASIC-exclusive token. Choosing BCH starts the BCH ASIC server, which builds blocks from your own BCH node (see [docs/stratum-v2.md](docs/stratum-v2.md)); the BCH node list finds Bitcoin Cash Node on the same computer, which needs no password. ASIC-exclusive tokens come later.
-5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page.
+5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. ASIC mining adds a Mining row: solo on your node, or join a pool (a normal pool's address and key; P2Pool v2 is coming). Running a pool asks for the pool type, your node, the pool fee, where it comes from (coinbase, mining work or both) and its address, then starts a public pool ([docs/pool.md](docs/pool.md)).
 
 Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session.
 

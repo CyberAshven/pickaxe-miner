@@ -1575,19 +1575,39 @@ fn main() {
                     };
                     // #### PR #40
                     // ASIC mode from setup runs the BCH ASIC server for devices
-                    // on the local network: SV1 on 3333 and SV2 on 3336.
-                    if setup.asic {
+                    // on the local network (SV1 on 3333, SV2 on 3336): solo
+                    // on the miner's node, at someone's pool, or as a public
+                    // pool for other miners.
+                    if let Some(server) = setup.server.clone() {
+                        let (
+                            upstream,
+                            upstream_key,
+                            public,
+                            pool_fee,
+                            pool_fee_mode,
+                            pool_fee_address,
+                        ) = match server {
+                            tui::ServerSetup::Solo => {
+                                (Vec::new(), Vec::new(), false, None, None, None)
+                            }
+                            tui::ServerSetup::JoinPool { address, key } => {
+                                (vec![address], vec![key], false, None, None, None)
+                            }
+                            tui::ServerSetup::Public { fee, mode, address } => {
+                                (Vec::new(), Vec::new(), true, Some(fee), Some(mode), address)
+                            }
+                        };
                         let action = cli::StratumV2Command::Serve {
                             listen: std::net::SocketAddr::from(([0, 0, 0, 0], 3336)),
                             sv1_listen: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3333))),
                             donation: None,
-                            upstream: Vec::new(),
-                            upstream_key: Vec::new(),
+                            upstream,
+                            upstream_key,
                             upstream_user: None,
-                            public: false,
-                            pool_fee: None,
-                            pool_fee_mode: None,
-                            pool_fee_address: None,
+                            public,
+                            pool_fee,
+                            pool_fee_mode,
+                            pool_fee_address,
                         };
                         #[cfg(feature = "stratum-v2")]
                         let result = stratum_v2::command::run(

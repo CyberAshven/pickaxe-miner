@@ -834,3 +834,19 @@ Validation: Windows all-feature host suite, 455 library and 16 binary tests
 passed, 22 opt-in tests ignored, 34 hardware tests filtered; formatting,
 all-target/all-feature Clippy on Rust 1.94 and 1.99 and the server-only Clippy
 with warnings denied passed.
+
+## Setup: solo, join a pool, or run one (2026-10-08)
+
+#### PR #40
+
+The setup's first screen now offers GPU mining, ASIC mining and Run a pool.
+ASIC mining's settings page has a Mining row: solo on your node, or join a
+pool, which asks for the pool type (a normal pool; P2Pool v2 is listed as
+coming), the pool's `HOST:PORT` and its authority key, and starts pool mode.
+Run a pool asks what miners mine (an ASIC pool; a GPU pool needs the GPU farm
+of PR #32 in the same build), the pool type, the payout address and node, the
+pool fee in 0.5% steps, where it comes from (coinbase, mining work, or both)
+and its address (q or p, checked for the network), and starts the public pool.
+Host tests walk each path, including the refusals for P2Pool v2, a GPU pool
+in this build, a missing pool address or key, a bad fee address and a missing
+node. Pool settings last for the session, as the hardware choice does.
