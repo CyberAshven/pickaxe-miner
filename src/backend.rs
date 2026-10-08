@@ -665,12 +665,13 @@ fn cuda_device_info(index: u32, ctx: &CudaContext) -> CudaInfo {
         if sys::cuDeviceGet(&mut dev, index as i32) == sys::CUresult::CUDA_SUCCESS {
             let _ = sys::cuDeviceGetName(name_buf.as_mut_ptr(), name_buf.len() as i32, dev);
         }
-        let bytes: Vec<u8> = name_buf
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        let s = String::from_utf8_lossy(&bytes).trim().to_string();
+        // c_char is signed on x86_64 and unsigned on ARM64 Linux; reading the
+        // buffer as a C string needs no cast on either.
+        name_buf[name_buf.len() - 1] = 0;
+        let s = CStr::from_ptr(name_buf.as_ptr())
+            .to_string_lossy()
+            .trim()
+            .to_string();
         if s.is_empty() {
             format!("NVIDIA GPU {index}")
         } else {
