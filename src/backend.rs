@@ -73,6 +73,7 @@ pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
         BackendKind::Cuda => list_cuda_devices(),
         BackendKind::Hip => list_hip_devices(),
         BackendKind::Wgpu => list_wgpu_devices(),
+        BackendKind::OpenCl => list_opencl_devices(),
         BackendKind::Auto => {
             let cuda = list_cuda_devices();
             let hip = list_hip_devices();
@@ -91,6 +92,13 @@ pub fn list_devices(prefer: BackendKind) -> Result<Vec<GpuDevice>, String> {
             match wgpu {
                 Ok(mut found) => devices.append(&mut found),
                 Err(error) => errors.push(error),
+            }
+            // OpenCL only when no other engine found a GPU (see mining_gpus).
+            if devices.is_empty() {
+                match list_opencl_devices() {
+                    Ok(mut found) => devices.append(&mut found),
+                    Err(error) => errors.push(error),
+                }
             }
 
             if devices.is_empty() {
@@ -126,16 +134,31 @@ pub fn resolve_mining_devices(
         BackendKind::Cuda => select_gpus(list_cuda_devices()?, selection, prefer),
         BackendKind::Hip => select_gpus(list_hip_devices()?, selection, prefer),
         BackendKind::Wgpu => select_gpus(list_wgpu_devices()?, selection, prefer),
+        BackendKind::OpenCl => select_gpus(list_opencl_devices()?, selection, prefer),
         BackendKind::Auto => select_gpus(mining_gpus(), selection, prefer),
     }
 }
 
 /// Every GPU automatic selection can mine on: one entry per physical GPU.
 pub fn mining_gpus() -> Vec<GpuDevice> {
-    physical_gpus(
+    let gpus = physical_gpus(
         list_cuda_devices().unwrap_or_default(),
         list_hip_devices().unwrap_or_default(),
         list_wgpu_devices().unwrap_or_default(),
+    );
+    if !gpus.is_empty() {
+        return gpus;
+    }
+    // #### PR #32: OpenCL is loaded only when no other engine found a GPU,
+    // such as an older integrated GPU without Vulkan or DirectX 12, or an
+    // ARM GPU without Vulkan. A machine whose GPUs another engine drives
+    // never loads an OpenCL driver, so a broken one cannot affect it;
+    // `--backend opencl` chooses OpenCL explicitly.
+    physical_gpus_with_opencl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        list_opencl_devices().unwrap_or_default(),
     )
 }
 
@@ -206,13 +229,28 @@ fn select_gpus(
 // Why: one miner drives all of a machine's GPUs, so they share one job and
 // never compete for the same reward, and no card may mine twice.
 // Check: `pickaxe devices` lists each physical GPU once with its engine.
+//
+// #### PR #32: OpenCL comes last for every GPU, so a GPU another engine can
+// drive keeps that engine, and one only OpenCL sees (an older integrated GPU
+// without Vulkan or DirectX 12, an ARM GPU) still mines. Two integrated GPUs
+// of one vendor are one GPU when no PCI address tells them apart, because
+// OpenCL may name a GPU differently from the other engines.
 fn physical_gpus(
     cuda: Vec<GpuDevice>,
     hip: Vec<GpuDevice>,
     wgpu: Vec<GpuDevice>,
 ) -> Vec<GpuDevice> {
+    physical_gpus_with_opencl(cuda, hip, wgpu, Vec::new())
+}
+
+fn physical_gpus_with_opencl(
+    cuda: Vec<GpuDevice>,
+    hip: Vec<GpuDevice>,
+    wgpu: Vec<GpuDevice>,
+    opencl: Vec<GpuDevice>,
+) -> Vec<GpuDevice> {
     let mut groups: Vec<Vec<GpuDevice>> = Vec::new();
-    for device in cuda.into_iter().chain(hip).chain(wgpu) {
+    for device in cuda.into_iter().chain(hip).chain(wgpu).chain(opencl) {
         match groups
             .iter_mut()
             .find(|group| same_physical_gpu(group, &device))
@@ -227,9 +265,19 @@ fn physical_gpus(
             let integrated = group.iter().any(|device| device.integrated);
             let pci = group.iter().find_map(|device| device.pci);
             let priority = if integrated {
-                [BackendKind::Wgpu, BackendKind::Hip, BackendKind::Cuda]
+                [
+                    BackendKind::Wgpu,
+                    BackendKind::Hip,
+                    BackendKind::Cuda,
+                    BackendKind::OpenCl,
+                ]
             } else {
-                [BackendKind::Cuda, BackendKind::Hip, BackendKind::Wgpu]
+                [
+                    BackendKind::Cuda,
+                    BackendKind::Hip,
+                    BackendKind::Wgpu,
+                    BackendKind::OpenCl,
+                ]
             };
             priority
                 .iter()
@@ -259,7 +307,8 @@ fn same_physical_gpu(group: &[GpuDevice], device: &GpuDevice) -> bool {
         }
     }
     group.iter().any(|member| {
-        member.vendor.eq_ignore_ascii_case(&device.vendor) && same_name(&member.name, &device.name)
+        member.vendor.eq_ignore_ascii_case(&device.vendor)
+            && (same_name(&member.name, &device.name) || (member.integrated && device.integrated))
     })
 }
 
@@ -282,10 +331,27 @@ pub fn require_production_mining_backend(backend: BackendKind) -> Result<(), Str
                 Err("wgpu fallback is not compiled; rebuild with --features portable-wgpu".into())
             }
         }
+        BackendKind::OpenCl => {
+            if cfg!(feature = "opencl") {
+                Ok(())
+            } else {
+                Err("OpenCL is not compiled; rebuild with --features opencl".into())
+            }
+        }
         BackendKind::Auto => {
             Err("auto backend must be resolved before production mining starts".into())
         }
     }
+}
+
+#[cfg(feature = "opencl")]
+fn list_opencl_devices() -> Result<Vec<GpuDevice>, String> {
+    crate::opencl_photon::list_opencl_devices()
+}
+
+#[cfg(not(feature = "opencl"))]
+fn list_opencl_devices() -> Result<Vec<GpuDevice>, String> {
+    Err("OpenCL is not compiled; rebuild with --features opencl".into())
 }
 
 #[cfg(feature = "portable-wgpu")]
@@ -527,7 +593,7 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
                 return Err(hip_error(&library, device_code, "hipDeviceGet"));
             }
 
-            let mut name_buffer = [0 as c_char; 256];
+            let mut name_buffer: [c_char; 256] = [0; 256];
             let name_code =
                 hip_device_get_name(name_buffer.as_mut_ptr(), name_buffer.len() as c_int, device);
             if name_code != 0 {
@@ -555,7 +621,7 @@ fn list_hip_devices() -> Result<Vec<GpuDevice>, String> {
                 "hip ordinal={ordinal}; gfx={architecture}; runtime={runtime_version}; driver={driver_version}; vram={vram_gb}"
             );
             let pci = hip_device_get_pci_bus_id.as_ref().and_then(|get_bus_id| {
-                let mut bus_id = [0 as c_char; 64];
+                let mut bus_id: [c_char; 64] = [0; 64];
                 (get_bus_id(bus_id.as_mut_ptr(), bus_id.len() as c_int, device) == 0)
                     .then(|| PciAddress::parse(&CStr::from_ptr(bus_id.as_ptr()).to_string_lossy()))
                     .flatten()
@@ -593,18 +659,19 @@ struct CudaInfo {
 /// Reads CUDA device details for selection and display.
 fn cuda_device_info(index: u32, ctx: &CudaContext) -> CudaInfo {
     // Best-effort via driver sys; fall back to ordinal if attrs fail.
-    let mut name_buf = [0i8; 256];
+    let mut name_buf: [c_char; 256] = [0; 256];
     let name = unsafe {
         let mut dev: sys::CUdevice = 0;
         if sys::cuDeviceGet(&mut dev, index as i32) == sys::CUresult::CUDA_SUCCESS {
             let _ = sys::cuDeviceGetName(name_buf.as_mut_ptr(), name_buf.len() as i32, dev);
         }
-        let bytes: Vec<u8> = name_buf
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        let s = String::from_utf8_lossy(&bytes).trim().to_string();
+        // c_char is signed on x86_64 and unsigned on ARM64 Linux; reading the
+        // buffer as a C string needs no cast on either.
+        name_buf[name_buf.len() - 1] = 0;
+        let s = CStr::from_ptr(name_buf.as_ptr())
+            .to_string_lossy()
+            .trim()
+            .to_string();
         if s.is_empty() {
             format!("NVIDIA GPU {index}")
         } else {
@@ -615,7 +682,7 @@ fn cuda_device_info(index: u32, ctx: &CudaContext) -> CudaInfo {
     let mut major = 0i32;
     let mut minor = 0i32;
     let mut total_mem: usize = 0;
-    let mut bus_id = [0i8; 64];
+    let mut bus_id: [c_char; 64] = [0; 64];
     let mut pci = None;
     unsafe {
         let mut dev: sys::CUdevice = 0;
@@ -823,6 +890,42 @@ mod tests {
             }),
             ..device
         }
+    }
+
+    #[test]
+    fn opencl_is_the_last_engine_and_mines_only_what_no_other_engine_sees() {
+        // The same integrated GPU through wgpu and OpenCL, under different
+        // names and without PCI addresses: one GPU, mined through wgpu.
+        let mut opencl_view = integrated_fixture(0, "AMD", BackendKind::OpenCl);
+        opencl_view.name = "gfx1036".into();
+        let gpus = physical_gpus_with_opencl(
+            Vec::new(),
+            Vec::new(),
+            vec![integrated_fixture(0, "AMD", BackendKind::Wgpu)],
+            vec![opencl_view],
+        );
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].backend, BackendKind::Wgpu);
+        // A discrete card the other engines drive keeps its engine.
+        let gpus = physical_gpus_with_opencl(
+            vec![at_bus(fixture_device(0, "NVIDIA", BackendKind::Cuda), 1)],
+            Vec::new(),
+            Vec::new(),
+            vec![at_bus(fixture_device(0, "NVIDIA", BackendKind::OpenCl), 1)],
+        );
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].backend, BackendKind::Cuda);
+        // A GPU only OpenCL sees, such as an old integrated GPU, mines on it.
+        let gpus = physical_gpus_with_opencl(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![integrated_fixture(0, "Intel", BackendKind::OpenCl)],
+        );
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].backend, BackendKind::OpenCl);
+        assert_eq!(BackendKind::parse("opencl").unwrap(), BackendKind::OpenCl);
+        assert_eq!(BackendKind::OpenCl.as_str(), "opencl");
     }
 
     /// The first GPU automatic selection mines on, or the GPU numbered `wanted`.

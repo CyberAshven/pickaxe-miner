@@ -11,6 +11,7 @@ use crate::backend::{BackendKind, GpuDevice};
 use crate::config::{JobSource, MiningNetwork, RuntimeConfig};
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::reward;
+use crate::rigs::{RigHub, RigSummary};
 use crate::search::VerifiedWinner;
 use crate::search::{
     MiningState, RuntimeCommand as SearchCommand, SearchHandle, SearchPauseHandle, SearchStats,
@@ -34,6 +35,10 @@ mod source_pool;
 use self::source_pool::{
     SourceCapability, SourceCatalog, SourceKind, AUTO_PROBE_LIMIT, DEFAULT_CAPABILITY_TTL_MS,
 };
+
+/// #### PR #32
+/// The backend name a coordinator with no GPU of its own shows: its rigs mine.
+pub const RIGS_ONLY: &str = "rigs only";
 
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
@@ -2050,9 +2055,12 @@ fn prepare_submission_for_network(
         return Err("verified winner is stale before direct reward preparation".into());
     }
     settlement.ensure_current(cfg.generation_id, live)?;
-    let policy = cfg.token.fee_policy(cfg.network);
+    let policy = cfg.fee_policy();
     require_direct_reward_policy(policy.scheme)?;
-    let payouts = policy.payouts(cfg.network, &cfg.payout_address)?;
+    // #### PR #32: a public GPU pool's winner pays the rig it came from (or
+    // the operator in a fee window); the coordinator checked that address.
+    let miner = winner.payout.as_deref().unwrap_or(&cfg.payout_address);
+    let payouts = policy.payouts(cfg.network, miner)?;
     let deployment = cfg.token.photon_deployment(cfg.network);
     let mut accepted = None;
     for (recipient, payout) in crate::donation::Recipient::ALL.into_iter().zip(payouts) {
@@ -2302,7 +2310,7 @@ fn preflight_live_job(
     }
     tx::cashaddr_to_p2pkh_locking(&cfg.payout_address)
         .map_err(|error| format!("production payout validation failed: {error}"))?;
-    let policy = cfg.token.fee_policy(cfg.network);
+    let policy = cfg.fee_policy();
     require_direct_reward_policy(policy.scheme)?;
     for payout in policy.payouts(cfg.network, &cfg.payout_address)? {
         tx::cashaddr_to_p2pkh_locking(&payout)?;
@@ -2468,6 +2476,10 @@ pub struct RuntimeSnapshot {
     pub state: SupervisorState,
     pub network: MiningNetwork,
     pub fee_scheme: crate::donation::Scheme,
+    /// #### PR #32: the token donation in effect and its minimum, for
+    /// Advanced settings.
+    pub token_donation: crate::donation::TokenDonation,
+    pub donation_minimum: crate::donation::TokenDonation,
     /// The first mining GPU; `gpus` lists every one.
     pub gpu_backend: String,
     pub gpu_device: u32,
@@ -2496,6 +2508,8 @@ pub struct RuntimeSnapshot {
     pub search: SearchStats,
     /// Telemetry of all mining GPUs together; each GPU's is in `gpus`.
     pub gpu_telemetry: GpuTelemetry,
+    /// The rigs this miner coordinates, when it runs with --rigs-listen.
+    pub rigs: Option<RigSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -2535,6 +2549,10 @@ pub enum RuntimeEvent {
 #[allow(dead_code)]
 enum SupervisorCommand {
     SetIntensity(u8, SyncSender<Result<(), String>>),
+    SetDonation(
+        crate::donation::TokenDonation,
+        SyncSender<Result<(), String>>,
+    ),
     Pause(SyncSender<Result<(), String>>),
     Resume(SyncSender<Result<(), String>>),
     SetPayout(String, SyncSender<Result<(), String>>),
@@ -2583,9 +2601,26 @@ impl RuntimeSupervisor {
     /// Starts supervised GPU search on every selected GPU after runtime
     /// preflight. The GPUs share one job, pause together on a winner and
     /// claim through this one supervisor.
-    pub fn start_on_gpus(mut cfg: RuntimeConfig, gpus: &[GpuDevice]) -> Result<Self, String> {
+    pub fn start_on_gpus(cfg: RuntimeConfig, gpus: &[GpuDevice]) -> Result<Self, String> {
+        Self::start_on_gpus_with_rigs(cfg, gpus, None)
+    }
+
+    /// #### PR #32
+    /// As `start_on_gpus`, also coordinating GPU rigs: every job this miner
+    /// mines is shared with them, and their checked winners join its own at
+    /// the claim path. With no GPUs, the rigs do all the mining.
+    pub fn start_on_gpus_with_rigs(
+        mut cfg: RuntimeConfig,
+        gpus: &[GpuDevice],
+        rigs: Option<RigHub>,
+    ) -> Result<Self, String> {
         cfg.ensure_mining_supported()?;
-        let first = gpus.first().ok_or("no GPU selected for mining")?;
+        // #### PR #32
+        // With no GPU here, a coordinator mines through its rigs only
+        // (`--rigs-only`); without rigs there is nothing to mine with.
+        if gpus.is_empty() && rigs.is_none() {
+            return Err("no GPU selected for mining".into());
+        }
         for gpu in gpus {
             crate::backend::require_production_mining_backend(gpu.backend)?;
         }
@@ -2629,25 +2664,36 @@ impl RuntimeSupervisor {
 
         let initial_job =
             initial.to_mining_job_for_network(cfg.generation_id, &cfg.payout_address, cfg.network);
+        if let Some(rigs) = rigs.as_ref() {
+            rigs.set_donation(cfg.token_donation());
+            rigs.publish(initial_job.clone());
+        }
         let devices: Vec<(BackendKind, usize)> = gpus
             .iter()
             .map(|gpu| (gpu.backend, gpu.index as usize))
             .collect();
-        let search = SearchHandle::start_devices_with_work_fee(
-            &devices,
-            cfg.intensity,
-            initial_job,
-            cfg.token.fee_policy(cfg.network),
-        )?;
+        let search = if devices.is_empty() {
+            SearchHandle::start_without_gpus(cfg.intensity, initial_job, cfg.fee_policy())?
+        } else {
+            SearchHandle::start_devices_with_work_fee(
+                &devices,
+                cfg.intensity,
+                initial_job,
+                cfg.fee_policy(),
+            )?
+        };
         let initial_search = search.snapshot();
         let telemetry = LiveTelemetrySampler::start(crate::telemetry::telemetry_sources(gpus));
         let shutdown = ShutdownSignal::new(search.pause_handle());
         let initial_snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,
             network: cfg.network,
-            fee_scheme: cfg.token.fee_policy(cfg.network).scheme,
-            gpu_backend: first.backend.as_str().into(),
-            gpu_device: first.index,
+            fee_scheme: cfg.fee_policy().scheme,
+            gpu_backend: gpus
+                .first()
+                .map_or(RIGS_ONLY, |gpu| gpu.backend.as_str())
+                .into(),
+            gpu_device: gpus.first().map_or(0, |gpu| gpu.index),
             gpus: gpus
                 .iter()
                 .map(|gpu| RuntimeGpu {
@@ -2678,6 +2724,9 @@ impl RuntimeSupervisor {
             last_error: None,
             search: initial_search,
             gpu_telemetry: telemetry.snapshot(),
+            rigs: rigs.as_ref().map(RigHub::summary),
+            token_donation: cfg.token_donation(),
+            donation_minimum: cfg.token.donation_minimum(),
         };
 
         let snapshot = Arc::new(Mutex::new(initial_snapshot));
@@ -2705,6 +2754,7 @@ impl RuntimeSupervisor {
                     event_tx,
                     worker_snapshot,
                     worker_shutdown,
+                    rigs,
                 )
             })
             .map_err(|error| format!("start live PHOTON supervisor: {error}"))?;
@@ -2743,6 +2793,13 @@ impl RuntimeSupervisor {
     /// Requests an updated GPU work intensity.
     pub fn set_intensity(&self, value: u8) -> Result<(), String> {
         self.request(|reply| SupervisorCommand::SetIntensity(value, reply))
+    }
+
+    /// #### PR #32
+    /// Changes the token donation from Advanced settings; it is never lower
+    /// than the token's minimum and reaches every GPU and rig at once.
+    pub fn set_donation(&self, value: crate::donation::TokenDonation) -> Result<(), String> {
+        self.request(|reply| SupervisorCommand::SetDonation(value, reply))
     }
 
     #[allow(dead_code)]
@@ -2838,6 +2895,7 @@ fn run_supervisor(
     event_tx: SyncSender<RuntimeEvent>,
     shared_snapshot: Arc<Mutex<RuntimeSnapshot>>,
     shutdown: ShutdownSignal,
+    rigs: Option<RigHub>,
 ) {
     let mut active_fulcrum_endpoint = initial_session.url.clone();
     let mut session = Some(initial_session);
@@ -2897,6 +2955,17 @@ fn run_supervisor(
                     let result = cfg
                         .set_intensity(value)
                         .and_then(|()| search.set_intensity(value));
+                    let _ = reply.send(result);
+                }
+                Ok(SupervisorCommand::SetDonation(value, reply)) => {
+                    let mut next = cfg.clone();
+                    next.token_donation = Some(value.at_least(next.token.donation_minimum()));
+                    let result = search.set_work_fee(next.fee_policy()).map(|()| {
+                        cfg.token_donation = next.token_donation;
+                        if let Some(rigs) = rigs.as_ref() {
+                            rigs.set_donation(cfg.token_donation());
+                        }
+                    });
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Pause(reply)) => {
@@ -3038,13 +3107,20 @@ fn run_supervisor(
                 Err(TryRecvError::Empty) => break,
             }
         }
+        // #### PR #32
+        // A checked winner from a rig starts the same claim as a local one.
+        let rig_winner = rigs.as_ref().is_some_and(RigHub::has_winner);
         if should_begin_winner_refresh(
             winner_refresh_pending,
             pending_winner.is_some(),
             pending_submission.is_some(),
             observed_search_winners,
             search.snapshot().winners,
-        ) {
+        ) || (rig_winner
+            && !winner_refresh_pending
+            && pending_winner.is_none()
+            && pending_submission.is_none())
+        {
             // Stop new launches as soon as a host-verified GPU winner is
             // queued. Batches other GPUs still have in flight finish in the
             // background; the claim does not wait for them.
@@ -3519,7 +3595,9 @@ fn run_supervisor(
                             if force_winner_refresh {
                                 let drained = search.drain_winners();
                                 let drained_count = drained.len();
-                                for winner in drained {
+                                let from_rigs =
+                                    rigs.as_ref().map(RigHub::take_winners).unwrap_or_default();
+                                for winner in drained.into_iter().chain(from_rigs) {
                                     if winner_matches_live(&winner, cfg.generation_id, &live) {
                                         verified_winners = verified_winners.saturating_add(1);
                                         pending_winners = 1;
@@ -3676,6 +3754,17 @@ fn run_supervisor(
             }
         }
 
+        // #### PR #32
+        // Rigs mine whatever this miner mines: share each new generation.
+        if let Some(rigs) = rigs.as_ref() {
+            if rigs.published_generation() != Some(cfg.generation_id) {
+                rigs.publish(live.to_mining_job_for_network(
+                    cfg.generation_id,
+                    &cfg.payout_address,
+                    cfg.network,
+                ));
+            }
+        }
         write_snapshot(
             &shared_snapshot,
             state,
@@ -3693,6 +3782,12 @@ fn run_supervisor(
             last_error.clone(),
             &mut throughput,
         );
+        if let Some(rigs) = rigs.as_ref() {
+            shared_snapshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .rigs = Some(rigs.summary());
+        }
         thread::sleep(SUPERVISOR_POLL);
     }
 
@@ -4349,7 +4444,8 @@ fn write_snapshot(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     snapshot.state = state;
     snapshot.network = cfg.network;
-    snapshot.fee_scheme = cfg.token.fee_policy(cfg.network).scheme;
+    snapshot.fee_scheme = cfg.fee_policy().scheme;
+    snapshot.token_donation = cfg.token_donation();
     snapshot.generation_id = cfg.generation_id;
     snapshot.payout_address.clone_from(&cfg.payout_address);
     snapshot.endpoint.clone_from(&live.url);
@@ -4669,6 +4765,7 @@ mod tests {
             public_key: [0u8; 33],
             signature: [0u8; 64],
             transaction: Vec::new(),
+            payout: None,
         }
     }
 
@@ -4715,6 +4812,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         }
     }
 
@@ -4835,6 +4933,7 @@ mod tests {
                                         signature,
                                         digest: crate::search::hash256(&transaction),
                                         transaction,
+                                        payout: None,
                                     }
                                 })
                             })
@@ -4845,6 +4944,39 @@ mod tests {
                     let winner = sign_winner(&job, cfg.generation_id);
                     let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
                     production_preflight_local(&cfg, &job, &journal, 1_000).unwrap();
+                    // #### PR #32: a public GPU pool's winner for a rig's own
+                    // payout is claimed only when the hub vouches for it.
+                    if recipient == Recipient::Miner {
+                        let mut rig_cfg = cfg.clone();
+                        rig_cfg.payout_address = crate::config::reprefix_p2pkh_payout(
+                            crate::config::DONATION_ADDRESS,
+                            network,
+                        )
+                        .unwrap();
+                        let rig_winner = winner.clone();
+                        assert!(prepare_submission_for_network(
+                            &rig_winner,
+                            &rig_cfg,
+                            &job,
+                            &settlement,
+                            &journal
+                        )
+                        .is_err());
+                        let vouched = VerifiedWinner {
+                            payout: Some(cfg.payout_address.clone()),
+                            ..rig_winner
+                        };
+                        let pending = prepare_submission_for_network(
+                            &vouched,
+                            &rig_cfg,
+                            &job,
+                            &settlement,
+                            &journal,
+                        )
+                        .unwrap();
+                        assert_eq!(pending.miner_token_amount, job.reward_raw);
+                        let _ = std::fs::remove_file(&journal);
+                    }
                     let pending =
                         prepare_submission_for_network(&winner, &cfg, &job, &settlement, &journal)
                             .unwrap();
@@ -5676,6 +5808,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         };
 
         validate_verified_parent(&winner, &job, &reward_public).unwrap();
@@ -5736,6 +5869,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         };
 
         let first = prepare_pending_submission(
@@ -5825,6 +5959,7 @@ mod tests {
                     public_key: search_public,
                     signature,
                     transaction,
+                    payout: None,
                 });
                 break;
             }

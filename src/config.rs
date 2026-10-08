@@ -64,8 +64,36 @@ pub enum MiningToken {
 impl MiningToken {
     pub const GPU_SUPPORTED: &[Self] = &[Self::Photon];
 
+    /// #### PR #32
+    /// The least a miner donates to mine this token: PHOTON's 4% work share.
+    /// Every token added later uses `donation::NEW_TOKEN_DONATION` (1.5%).
+    pub fn donation_minimum(self) -> crate::donation::TokenDonation {
+        match self {
+            Self::Photon => crate::donation::TokenDonation::from_bps(400),
+        }
+    }
+
+    /// The token's policy at a donation the miner chose: anything above the
+    /// minimum goes to the project's donation address, as more of the work.
+    pub fn fee_policy_at(
+        self,
+        network: MiningNetwork,
+        donation: crate::donation::TokenDonation,
+    ) -> crate::donation::Policy {
+        let mut policy = self.fee_policy(network);
+        let extra = donation
+            .at_least(self.donation_minimum())
+            .bps()
+            .saturating_sub(self.donation_minimum().bps());
+        if let crate::donation::Scheme::Work([project, _]) = &mut policy.scheme {
+            *project = project.saturating_add(extra);
+        }
+        policy
+    }
+
     /// Maintainer-editable mode, shares and recipients. The protocol must support
-    /// its selected payout scheme before mining starts.
+    /// its selected payout scheme before mining starts. This is the minimum;
+    /// `fee_policy_at` adds what a miner chose above it.
     pub fn fee_policy(self, network: MiningNetwork) -> crate::donation::Policy {
         use crate::donation::{Policy, Scheme};
         match self {
@@ -161,6 +189,9 @@ impl JobSource {
 pub struct RuntimeConfig {
     /// BCH ASIC policy only. Token policies are selected separately.
     pub bch_donation: crate::donation::bch::BchDonation,
+    /// #### PR #32: the token donation a miner chose in Advanced settings;
+    /// `None` mines at the token's minimum.
+    pub token_donation: Option<crate::donation::TokenDonation>,
     /// Mining chain; mainnet is the safe default.
     pub network: MiningNetwork,
     /// Selected token. PHOTON is currently the only supported GPU token.
@@ -190,6 +221,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             bch_donation: Default::default(),
+            token_donation: None,
             network: MiningNetwork::Mainnet,
             token: MiningToken::Photon,
             intensity: 100,
@@ -204,6 +236,18 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// #### PR #32: the token donation in effect, never below the minimum.
+    pub fn token_donation(&self) -> crate::donation::TokenDonation {
+        let minimum = self.token.donation_minimum();
+        self.token_donation.unwrap_or(minimum).at_least(minimum)
+    }
+
+    /// The selected token's policy at the donation in effect.
+    pub fn fee_policy(&self) -> crate::donation::Policy {
+        self.token
+            .fee_policy_at(self.network, self.token_donation())
+    }
+
     pub fn set_network(&mut self, network: MiningNetwork) {
         if self.network != network {
             // Keep the entered address intact; validation requires an address for the new chain.
@@ -522,6 +566,9 @@ impl SavedDevices {
 pub struct SavedConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bch_donation_bps: Option<crate::donation::bch::BchDonation>,
+    /// #### PR #32: a token donation raised above its minimum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_donation_bps: Option<crate::donation::TokenDonation>,
     pub network: Option<String>,
     pub token: Option<String>,
     pub backend: Option<String>,
@@ -541,6 +588,9 @@ impl SavedConfig {
     pub fn apply_to_runtime(&self, cfg: &mut RuntimeConfig) -> Result<(), String> {
         if let Some(donation) = self.bch_donation_bps {
             cfg.bch_donation = donation;
+        }
+        if let Some(donation) = self.token_donation_bps {
+            cfg.token_donation = Some(donation);
         }
         if let Some(value) = &self.network {
             cfg.set_network(MiningNetwork::parse(value)?);
@@ -647,6 +697,8 @@ impl SavedConfig {
             network: Some(runtime.network.as_str().to_string()),
             bch_donation_bps: (runtime.bch_donation != Default::default())
                 .then_some(runtime.bch_donation),
+            token_donation_bps: (runtime.token_donation() != runtime.token.donation_minimum())
+                .then(|| runtime.token_donation()),
             token: Some(runtime.token.as_str().to_string()),
             backend: Some(backend.to_string()),
             device: SavedDevices::from_selection(devices),
@@ -1144,6 +1196,39 @@ mod tests {
     use super::*;
 
     const PAYOUT: &str = "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh";
+
+    // #### PR #32
+    #[test]
+    fn a_raised_photon_donation_adds_only_to_the_project_share() {
+        use crate::donation::TokenDonation;
+        let six = TokenDonation::from_bps(600);
+        let mainnet = MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, six);
+        assert_eq!(mainnet.scheme.work(), [400, 200]);
+        assert_eq!(mainnet.scheme.description(), "Donation: 6%");
+        let chipnet = MiningToken::Photon.fee_policy_at(MiningNetwork::Chipnet, six);
+        assert_eq!(chipnet.scheme.work(), [600, 0]);
+        // Below the minimum, the minimum applies.
+        let low =
+            MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, TokenDonation::from_bps(100));
+        assert_eq!(low.scheme.work(), [200, 200]);
+        let mut cfg = RuntimeConfig::default();
+        assert_eq!(cfg.token_donation().bps(), 400);
+        cfg.token_donation = Some(TokenDonation::from_bps(150));
+        assert_eq!(cfg.token_donation().bps(), 400);
+        assert_eq!(cfg.fee_policy().scheme.work(), [200, 200]);
+        // The saved setting only holds a raised value.
+        cfg.set_payout(PAYOUT.into()).unwrap();
+        let saved = SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &cfg);
+        assert_eq!(saved.token_donation_bps, None);
+        cfg.token_donation = Some(six);
+        let saved = SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &cfg);
+        assert_eq!(saved.token_donation_bps, Some(six));
+        assert_eq!(
+            MiningToken::Photon.donation_minimum(),
+            TokenDonation::from_bps(400)
+        );
+        assert_eq!(crate::donation::NEW_TOKEN_DONATION.bps(), 150);
+    }
 
     #[test]
     fn photon_donation_routes_by_network() {
