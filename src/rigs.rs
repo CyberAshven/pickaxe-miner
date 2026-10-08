@@ -81,6 +81,10 @@ struct WireJob {
     payout_address: String,
     source_identity: String,
     generation_id: u64,
+    /// #### PR #32: the coordinator's token donation; a rig never mines
+    /// below the token's minimum, whatever it is sent.
+    #[serde(default)]
+    donation: Option<crate::donation::TokenDonation>,
 }
 
 impl From<&MiningJob> for WireJob {
@@ -100,6 +104,7 @@ impl From<&MiningJob> for WireJob {
             payout_address: job.payout_address.clone(),
             source_identity: job.source_identity.clone(),
             generation_id: job.generation_id,
+            donation: None,
         }
     }
 }
@@ -307,6 +312,8 @@ mod net {
     #[derive(Default)]
     struct HubState {
         job: Option<MiningJob>,
+        /// The coordinator's token donation, sent with every job.
+        donation: Option<crate::donation::TokenDonation>,
         version: u64,
         winners: VecDeque<VerifiedWinner>,
         rigs: BTreeMap<u64, RigRow>,
@@ -412,6 +419,17 @@ mod net {
             lock(&self.state).job.as_ref().map(|job| job.generation_id)
         }
 
+        /// #### PR #32
+        /// The token donation rigs mine with; a change is sent to every rig
+        /// at once, with the current job.
+        pub fn set_donation(&self, donation: crate::donation::TokenDonation) {
+            let mut state = lock(&self.state);
+            if state.donation != Some(donation) {
+                state.donation = Some(donation);
+                state.version = state.version.wrapping_add(1);
+            }
+        }
+
         /// Shares a job with every rig; a generation already shared is not
         /// sent again.
         pub fn publish(&self, job: MiningJob) {
@@ -498,11 +516,16 @@ mod net {
             while !stop.load(Ordering::Relaxed) {
                 let pending = {
                     let state = lock(&state);
-                    (state.version != sent).then(|| (state.version, state.job.clone()))
+                    (state.version != sent)
+                        .then(|| (state.version, state.job.clone(), state.donation))
                 };
-                if let Some((version, job)) = pending {
+                if let Some((version, job, donation)) = pending {
                     if let Some(job) = job {
-                        sender.send(frame(JOB, &WireJob::from(&job))?)?;
+                        let wire = WireJob {
+                            donation,
+                            ..WireJob::from(&job)
+                        };
+                        sender.send(frame(JOB, &wire)?)?;
                     }
                     sent = version;
                 }
@@ -692,16 +715,27 @@ mod net {
                                 }
                                 let wire: WireJob = serde_json::from_slice(&bytes)
                                     .map_err(|_| "malformed job from the coordinator")?;
+                                let donation = wire
+                                    .donation
+                                    .unwrap_or_else(|| MiningToken::Photon.donation_minimum());
                                 let job = MiningJob::try_from(wire)?;
                                 let (height, generation) = (job.height, job.generation_id);
+                                // #### PR #32: the coordinator's donation,
+                                // never below the token's minimum.
+                                let policy =
+                                    MiningToken::Photon.fee_policy_at(job.network, donation);
                                 match search.as_ref() {
                                     None => {
-                                        let policy = MiningToken::Photon.fee_policy(job.network);
                                         search = Some(SearchHandle::start_devices_with_work_fee(
                                             &devices, intensity, job, policy,
                                         )?);
                                     }
                                     Some(handle) => {
+                                        if handle.work_fee().map(|current| current.scheme)
+                                            != Some(policy.scheme)
+                                        {
+                                            handle.set_work_fee(policy)?;
+                                        }
                                         handle.replace_job(job)?;
                                         let _ = handle.apply_control(SearchCommand::Resume);
                                     }
@@ -815,6 +849,7 @@ mod stub {
             None
         }
         pub fn publish(&self, _job: MiningJob) {}
+        pub fn set_donation(&self, _donation: crate::donation::TokenDonation) {}
         pub fn has_winner(&self) -> bool {
             false
         }
@@ -912,6 +947,18 @@ mod tests {
         assert_eq!(kind, 2);
         let wire: WireJob = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(wire, WireJob::from(&job));
+        // #### PR #32: a raised donation reaches the rig with the same job.
+        let raised = crate::donation::TokenDonation::from_bps(600);
+        hub.set_donation(raised);
+        let resent = loop {
+            if let Some(message) = receiver.receive(Duration::from_secs(5)).unwrap() {
+                break message;
+            }
+        };
+        let (_, bytes) = net::read(resent).unwrap();
+        let wire: WireJob = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire.donation, Some(raised));
+        assert_eq!(wire.generation_id, job.generation_id);
         // A real winner for the shared job is queued for the claim path.
         let winner = crate::mining_job::tests::solved_winner(&job, [3; 32]);
         sender

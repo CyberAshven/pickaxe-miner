@@ -1,7 +1,106 @@
 //! Token-selected fee policy; a work recipient is fixed before hashing.
 use crate::config::{self, MiningNetwork};
+use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 
 pub mod bch;
+
+/// #### PR #32
+/// What: a token's donation, as a share of the mining work itself in
+/// hundredths of a percent. Each token has a minimum a miner can raise in
+/// Advanced settings but not lower: 4% for PHOTON, and 1.5% (also the default)
+/// for every token added later. BCH and its merge-mined tokens keep their own
+/// policy (`bch::BchDonation`), which can go down to 0%.
+/// Why: the operator's rule for using the software (2026-10-08).
+/// Check: a saved or typed value below the token's minimum mines at the
+/// minimum; raising it moves only the operator's share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "u16", into = "u16")]
+pub struct TokenDonation(u16);
+
+/// The minimum and default of every token added after PHOTON.
+pub const NEW_TOKEN_DONATION: TokenDonation = TokenDonation(150);
+/// The most a miner can donate: the miner keeps a share of the work.
+const MAX_TOKEN_DONATION_BPS: u16 = 9_950;
+/// Steps of the Advanced setting: 0.5%.
+const TOKEN_DONATION_STEP_BPS: u16 = 50;
+
+impl TokenDonation {
+    pub const fn from_bps(bps: u16) -> Self {
+        Self(if bps > MAX_TOKEN_DONATION_BPS {
+            MAX_TOKEN_DONATION_BPS
+        } else {
+            bps
+        })
+    }
+
+    pub const fn bps(self) -> u16 {
+        self.0
+    }
+
+    /// This value, or `minimum` when it is lower.
+    pub fn at_least(self, minimum: Self) -> Self {
+        self.max(minimum)
+    }
+
+    /// The next 0.5% step up or down, never below `minimum`.
+    pub fn adjusted(self, increase: bool, minimum: Self) -> Self {
+        let next = if increase {
+            (self.0 / TOKEN_DONATION_STEP_BPS + 1).saturating_mul(TOKEN_DONATION_STEP_BPS)
+        } else {
+            self.0.div_ceil(TOKEN_DONATION_STEP_BPS).saturating_sub(1) * TOKEN_DONATION_STEP_BPS
+        };
+        Self::from_bps(next).at_least(minimum)
+    }
+}
+
+impl TryFrom<u16> for TokenDonation {
+    type Error = String;
+    fn try_from(bps: u16) -> Result<Self, String> {
+        if bps > MAX_TOKEN_DONATION_BPS {
+            return Err("a token donation must be below 100%".into());
+        }
+        Ok(Self(bps))
+    }
+}
+
+impl From<TokenDonation> for u16 {
+    fn from(value: TokenDonation) -> Self {
+        value.0
+    }
+}
+
+impl FromStr for TokenDonation {
+    type Err = String;
+    /// A percentage such as "4", "4.5" or "6.25".
+    fn from_str(value: &str) -> Result<Self, String> {
+        let invalid = || "use a donation percentage with at most two decimal places".to_owned();
+        let (whole, fraction) = value.trim().split_once('.').unwrap_or((value.trim(), ""));
+        if whole.is_empty()
+            || whole.len() > 3
+            || fraction.len() > 2
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit())
+        {
+            return Err(invalid());
+        }
+        let whole: u16 = whole.parse().map_err(|_| invalid())?;
+        let fraction: u16 = format!("{fraction:0<2}").parse().map_err(|_| invalid())?;
+        let bps = whole
+            .checked_mul(100)
+            .and_then(|bps| bps.checked_add(fraction))
+            .ok_or_else(invalid)?;
+        Self::try_from(bps)
+    }
+}
+
+impl fmt::Display for TokenDonation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{:02}%", self.0 / 100, self.0 % 100)
+    }
+}
 
 /// Basis points for project and collaborator. A hybrid's reward split applies
 /// only to personal work, never to developer wins.
@@ -166,6 +265,38 @@ pub(crate) fn require_direct_reward_policy(scheme: crate::donation::Scheme) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #32
+    #[test]
+    fn a_token_donation_moves_in_half_percent_steps_above_its_minimum() {
+        let photon = TokenDonation::from_bps(400);
+        assert_eq!("4".parse::<TokenDonation>().unwrap(), photon);
+        assert_eq!("4.5".parse::<TokenDonation>().unwrap().bps(), 450);
+        assert_eq!("6.25".parse::<TokenDonation>().unwrap().bps(), 625);
+        for bad in ["", "-1", "4.555", "100", "1e2", "4,5", "1000"] {
+            assert!(bad.parse::<TokenDonation>().is_err(), "{bad}");
+        }
+        assert_eq!(photon.to_string(), "4.00%");
+        assert_eq!(photon.adjusted(true, photon).bps(), 450);
+        assert_eq!(photon.adjusted(false, photon), photon);
+        assert_eq!(
+            TokenDonation::from_bps(475).adjusted(false, photon).bps(),
+            450
+        );
+        assert_eq!(TokenDonation::from_bps(100).at_least(photon), photon);
+        assert_eq!(
+            TokenDonation::from_bps(9_950).adjusted(true, photon).bps(),
+            9_950
+        );
+        assert_eq!(NEW_TOKEN_DONATION.to_string(), "1.50%");
+        assert_eq!(
+            NEW_TOKEN_DONATION.adjusted(false, NEW_TOKEN_DONATION),
+            NEW_TOKEN_DONATION
+        );
+        assert!(serde_json::from_str::<TokenDonation>("10000").is_err());
+        assert_eq!(serde_json::to_string(&photon).unwrap(), "400");
+    }
+
     #[test]
     fn fee_description_reports_only_totals() {
         assert_eq!(Scheme::Work([200, 200]).description(), "Donation: 4%");

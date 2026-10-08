@@ -81,6 +81,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "KEY", action = clap::ArgAction::Append)]
     pub coordinator_key: Vec<String>,
 
+    /// Token donation percentage, at least the token's minimum (4 for PHOTON);
+    /// Advanced settings (`a`) changes it while mining.
+    #[arg(long, global = true, value_name = "PERCENT")]
+    pub token_donation: Option<crate::donation::TokenDonation>,
+
     /// With --rigs-listen: mine with the rigs only and use no GPU on this
     /// computer, so the coordinator can run on any machine. Needs --address.
     #[arg(long, global = true, requires_all = ["rigs_listen", "address"])]

@@ -43,12 +43,13 @@ lines carry the same under `rigs`.
 pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key> --rig-name rack1-07 --no-tui
 ```
 
-A rig needs no address, Fulcrum server or node of its own. It mines on every
-discrete GPU (`--device` and `--include-integrated` choose others), and prints
-one line per event: its GPUs at start, `connected`, each `job` and `winner`,
-and a `status` line with its rate every 10 seconds; `--json` prints them as
-JSON. Repeat `--coordinator` and `--coordinator-key`, in the same order, for
-backup coordinators. The name defaults to the computer's name.
+A rig needs no address, Fulcrum server or node of its own, and mines with the
+coordinator's donation setting (never below the token's minimum). It mines on
+every discrete GPU (`--device` and `--include-integrated` choose others), and
+prints one line per event: its GPUs at start, `connected`, each `job` and
+`winner`, and a `status` line with its rate every 10 seconds; `--json` prints
+them as JSON. Repeat `--coordinator` and `--coordinator-key`, in the same
+order, for backup coordinators. The name defaults to the computer's name.
 
 ## Running rigs as a service
 

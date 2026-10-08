@@ -2055,7 +2055,7 @@ fn prepare_submission_for_network(
         return Err("verified winner is stale before direct reward preparation".into());
     }
     settlement.ensure_current(cfg.generation_id, live)?;
-    let policy = cfg.token.fee_policy(cfg.network);
+    let policy = cfg.fee_policy();
     require_direct_reward_policy(policy.scheme)?;
     let payouts = policy.payouts(cfg.network, &cfg.payout_address)?;
     let deployment = cfg.token.photon_deployment(cfg.network);
@@ -2307,7 +2307,7 @@ fn preflight_live_job(
     }
     tx::cashaddr_to_p2pkh_locking(&cfg.payout_address)
         .map_err(|error| format!("production payout validation failed: {error}"))?;
-    let policy = cfg.token.fee_policy(cfg.network);
+    let policy = cfg.fee_policy();
     require_direct_reward_policy(policy.scheme)?;
     for payout in policy.payouts(cfg.network, &cfg.payout_address)? {
         tx::cashaddr_to_p2pkh_locking(&payout)?;
@@ -2473,6 +2473,10 @@ pub struct RuntimeSnapshot {
     pub state: SupervisorState,
     pub network: MiningNetwork,
     pub fee_scheme: crate::donation::Scheme,
+    /// #### PR #32: the token donation in effect and its minimum, for
+    /// Advanced settings.
+    pub token_donation: crate::donation::TokenDonation,
+    pub donation_minimum: crate::donation::TokenDonation,
     /// The first mining GPU; `gpus` lists every one.
     pub gpu_backend: String,
     pub gpu_device: u32,
@@ -2542,6 +2546,10 @@ pub enum RuntimeEvent {
 #[allow(dead_code)]
 enum SupervisorCommand {
     SetIntensity(u8, SyncSender<Result<(), String>>),
+    SetDonation(
+        crate::donation::TokenDonation,
+        SyncSender<Result<(), String>>,
+    ),
     Pause(SyncSender<Result<(), String>>),
     Resume(SyncSender<Result<(), String>>),
     SetPayout(String, SyncSender<Result<(), String>>),
@@ -2654,6 +2662,7 @@ impl RuntimeSupervisor {
         let initial_job =
             initial.to_mining_job_for_network(cfg.generation_id, &cfg.payout_address, cfg.network);
         if let Some(rigs) = rigs.as_ref() {
+            rigs.set_donation(cfg.token_donation());
             rigs.publish(initial_job.clone());
         }
         let devices: Vec<(BackendKind, usize)> = gpus
@@ -2661,17 +2670,13 @@ impl RuntimeSupervisor {
             .map(|gpu| (gpu.backend, gpu.index as usize))
             .collect();
         let search = if devices.is_empty() {
-            SearchHandle::start_without_gpus(
-                cfg.intensity,
-                initial_job,
-                cfg.token.fee_policy(cfg.network),
-            )?
+            SearchHandle::start_without_gpus(cfg.intensity, initial_job, cfg.fee_policy())?
         } else {
             SearchHandle::start_devices_with_work_fee(
                 &devices,
                 cfg.intensity,
                 initial_job,
-                cfg.token.fee_policy(cfg.network),
+                cfg.fee_policy(),
             )?
         };
         let initial_search = search.snapshot();
@@ -2680,7 +2685,7 @@ impl RuntimeSupervisor {
         let initial_snapshot = RuntimeSnapshot {
             state: SupervisorState::Mining,
             network: cfg.network,
-            fee_scheme: cfg.token.fee_policy(cfg.network).scheme,
+            fee_scheme: cfg.fee_policy().scheme,
             gpu_backend: gpus
                 .first()
                 .map_or(RIGS_ONLY, |gpu| gpu.backend.as_str())
@@ -2717,6 +2722,8 @@ impl RuntimeSupervisor {
             search: initial_search,
             gpu_telemetry: telemetry.snapshot(),
             rigs: rigs.as_ref().map(RigHub::summary),
+            token_donation: cfg.token_donation(),
+            donation_minimum: cfg.token.donation_minimum(),
         };
 
         let snapshot = Arc::new(Mutex::new(initial_snapshot));
@@ -2783,6 +2790,13 @@ impl RuntimeSupervisor {
     /// Requests an updated GPU work intensity.
     pub fn set_intensity(&self, value: u8) -> Result<(), String> {
         self.request(|reply| SupervisorCommand::SetIntensity(value, reply))
+    }
+
+    /// #### PR #32
+    /// Changes the token donation from Advanced settings; it is never lower
+    /// than the token's minimum and reaches every GPU and rig at once.
+    pub fn set_donation(&self, value: crate::donation::TokenDonation) -> Result<(), String> {
+        self.request(|reply| SupervisorCommand::SetDonation(value, reply))
     }
 
     #[allow(dead_code)]
@@ -2938,6 +2952,17 @@ fn run_supervisor(
                     let result = cfg
                         .set_intensity(value)
                         .and_then(|()| search.set_intensity(value));
+                    let _ = reply.send(result);
+                }
+                Ok(SupervisorCommand::SetDonation(value, reply)) => {
+                    let mut next = cfg.clone();
+                    next.token_donation = Some(value.at_least(next.token.donation_minimum()));
+                    let result = search.set_work_fee(next.fee_policy()).map(|()| {
+                        cfg.token_donation = next.token_donation;
+                        if let Some(rigs) = rigs.as_ref() {
+                            rigs.set_donation(cfg.token_donation());
+                        }
+                    });
                     let _ = reply.send(result);
                 }
                 Ok(SupervisorCommand::Pause(reply)) => {
@@ -4416,7 +4441,8 @@ fn write_snapshot(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     snapshot.state = state;
     snapshot.network = cfg.network;
-    snapshot.fee_scheme = cfg.token.fee_policy(cfg.network).scheme;
+    snapshot.fee_scheme = cfg.fee_policy().scheme;
+    snapshot.token_donation = cfg.token_donation();
     snapshot.generation_id = cfg.generation_id;
     snapshot.payout_address.clone_from(&cfg.payout_address);
     snapshot.endpoint.clone_from(&live.url);

@@ -583,6 +583,10 @@ struct SharedControl {
     paused: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
     generation_id: Arc<AtomicU64>,
+    /// #### PR #32: the donation's share of the work, changed while mining
+    /// from Advanced settings; each GPU applies it at its next batch.
+    work_fee: Arc<Mutex<Option<crate::donation::Policy>>>,
+    work_fee_version: Arc<AtomicU64>,
 }
 
 /// One GPU worker's own state.
@@ -768,7 +772,16 @@ fn run_worker(
         paused,
         intensity,
         generation_id,
+        work_fee: shared_work_fee,
+        work_fee_version,
     } = shared;
+    // The donation in effect now, which may have changed since the search
+    // started; read the version first so a change in between is not missed.
+    let mut seen_work_fee = work_fee_version.load(Ordering::Acquire);
+    let work_fee = (*shared_work_fee
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    .or(work_fee);
     let GpuCounters {
         stop,
         batch_in_flight,
@@ -884,6 +897,26 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
+        // #### PR #32: a donation changed in Advanced settings rebuilds the
+        // work schedule at this batch; the recipients' addresses stay the same.
+        let version = work_fee_version.load(Ordering::Acquire);
+        if version != seen_work_fee {
+            seen_work_fee = version;
+            let next = *shared_work_fee
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let (Some((schedule, _, policy)), Some(next)) = (&mut allocation, next) {
+                match crate::donation::Schedule::new(next.scheme, quantum, rng.random()) {
+                    Ok(rebuilt) => {
+                        *schedule = rebuilt;
+                        *policy = next;
+                    }
+                    Err(error) => {
+                        diagnostics.record_batch_error(format!("donation change failed: {error}"))
+                    }
+                }
+            }
+        }
         if let Some((schedule, payouts, _)) = &allocation {
             let address = &payouts[schedule.recipient() as usize];
             let next = (|| {
@@ -1185,6 +1218,8 @@ impl SearchHandle {
                 paused: Arc::new(AtomicBool::new(false)),
                 intensity: Arc::new(AtomicU8::new(intensity)),
                 generation_id: Arc::new(AtomicU64::new(job.generation_id)),
+                work_fee: Arc::new(Mutex::new(Some(policy))),
+                work_fee_version: Arc::new(AtomicU64::new(0)),
             },
             workers: Vec::new(),
             winner_rx,
@@ -1248,6 +1283,8 @@ impl SearchHandle {
             paused: Arc::new(AtomicBool::new(initially_paused)),
             intensity: Arc::new(AtomicU8::new(intensity)),
             generation_id: Arc::new(AtomicU64::new(job.generation_id)),
+            work_fee: Arc::new(Mutex::new(work_fee)),
+            work_fee_version: Arc::new(AtomicU64::new(0)),
         };
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
         let mut handle = Self {
@@ -1376,6 +1413,32 @@ impl SearchHandle {
     /// Returns the current search generation identifier.
     pub fn generation_id(&self) -> u64 {
         self.shared.generation_id.load(Ordering::Acquire)
+    }
+
+    /// #### PR #32
+    /// Changes the donation's share of the work: each GPU applies it at its
+    /// next batch, and a GPU that restarts later starts with it.
+    pub fn set_work_fee(&self, policy: crate::donation::Policy) -> Result<(), String> {
+        policy.scheme.validate()?;
+        *self
+            .shared
+            .work_fee
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(policy);
+        self.shared.work_fee_version.fetch_add(1, Ordering::AcqRel);
+        for worker in &self.workers {
+            worker.unpark();
+        }
+        Ok(())
+    }
+
+    /// The donation's share of the work in effect.
+    pub fn work_fee(&self) -> Option<crate::donation::Policy> {
+        *self
+            .shared
+            .work_fee
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Drains host-verified GPU winners for settlement.
@@ -1573,6 +1636,11 @@ mod tests {
         search.apply_control(RuntimeCommand::Pause).unwrap();
         assert_eq!(search.snapshot().state, MiningState::Paused);
         search.apply_control(RuntimeCommand::Resume).unwrap();
+        // A raised donation is kept for the rigs' next jobs.
+        let raised = crate::config::MiningToken::Photon
+            .fee_policy_at(next.network, crate::donation::TokenDonation::from_bps(600));
+        search.set_work_fee(raised).unwrap();
+        assert_eq!(search.work_fee().unwrap().scheme, raised.scheme);
         assert!(search.drain_winners().is_empty());
         assert!(!search.batch_in_flight());
         let stats = search.stop();
@@ -1927,6 +1995,8 @@ mod tests {
                 paused: Arc::new(AtomicBool::new(false)),
                 intensity: Arc::new(AtomicU8::new(10)),
                 generation_id,
+                work_fee: Arc::new(Mutex::new(None)),
+                work_fee_version: Arc::new(AtomicU64::new(0)),
             },
             workers: workers
                 .into_iter()
@@ -2110,6 +2180,8 @@ mod tests {
             paused: Arc::new(AtomicBool::new(false)),
             intensity: Arc::new(AtomicU8::new(100)),
             generation_id: Arc::new(AtomicU64::new(1)),
+            work_fee: Arc::new(Mutex::new(None)),
+            work_fee_version: Arc::new(AtomicU64::new(0)),
         };
         let gpu = GpuCounters::new();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);

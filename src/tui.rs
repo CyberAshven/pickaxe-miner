@@ -1093,6 +1093,8 @@ struct TuiState {
     command_draft: String,
     show_help: bool,
     settings_mode: bool,
+    /// #### PR #32: Advanced settings (`a`), where the donation is set.
+    advanced_mode: bool,
     logs_mode: bool,
     status_line: String,
     events: VecDeque<String>,
@@ -1120,6 +1122,7 @@ impl TuiState {
             command_draft: String::new(),
             show_help: false,
             settings_mode: false,
+            advanced_mode: false,
             logs_mode: false,
             status_line: String::new(),
             events,
@@ -1264,6 +1267,7 @@ impl TuiState {
         self.command_draft.clear();
         self.show_help = false;
         self.settings_mode = false;
+        self.advanced_mode = false;
         self.logs_mode = false;
     }
 
@@ -1614,6 +1618,8 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         search: Default::default(),
         gpu_telemetry: Default::default(),
         rigs: None,
+        token_donation: crate::donation::TokenDonation::from_bps(400),
+        donation_minimum: crate::donation::TokenDonation::from_bps(400),
     };
     snapshot.search.intensity = 100;
     snapshot.search.rate = 500_000.0;
@@ -1714,6 +1720,38 @@ fn handle_key(
         return Ok(false);
     }
 
+    // #### PR #32
+    // Advanced settings: Left/Right move the token donation in 0.5% steps,
+    // never below the token's minimum. It applies to every GPU and rig at
+    // once and is saved to the profile when mining stops.
+    if state.advanced_mode {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => state.advanced_mode = false,
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('-') | KeyCode::Char('+') => {
+                let raise = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
+                let next = snapshot
+                    .token_donation
+                    .adjusted(raise, snapshot.donation_minimum);
+                if next == snapshot.token_donation {
+                    state.status_line = if raise {
+                        "The donation is at its highest.".into()
+                    } else {
+                        format!("{} is this token's minimum.", snapshot.donation_minimum)
+                    };
+                } else {
+                    apply_result(
+                        supervisor.set_donation(next),
+                        &format!("Donation {next}"),
+                        state,
+                    );
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     if state.settings_mode {
         match key.code {
             KeyCode::Esc => {
@@ -1749,6 +1787,11 @@ fn handle_key(
         }
         KeyCode::Char('s') | KeyCode::Char('S') => {
             state.settings_mode = !state.settings_mode;
+            Ok(false)
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            state.advanced_mode = true;
+            state.settings_mode = false;
             Ok(false)
         }
         KeyCode::Char('/') | KeyCode::Char(':') | KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -2630,6 +2673,9 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     }
     if state.settings_mode {
         render_settings(frame, area, snapshot);
+    }
+    if state.advanced_mode {
+        render_advanced(frame, area, snapshot);
     }
     if state.logs_mode {
         render_logs(frame, area, state);
@@ -3553,6 +3599,43 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
     frame.render_widget(settings, popup);
 }
 
+/// #### PR #32
+/// Advanced settings: the token donation, a share of the mining work.
+fn render_advanced(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
+    let popup = centered_rect(82, 50, area);
+    frame.render_widget(Clear, popup);
+    let dim = |text: String| Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
+    let lines = vec![
+        Line::from(Span::styled(
+            "Advanced settings",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(format!("Donation   {}   ", snapshot.token_donation)),
+            Span::styled("[←/→] change", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        dim(format!(
+            "A share of the mining work itself mines for the Pickaxe donation address. This token's minimum is {}; raise it in 0.5% steps.",
+            snapshot.donation_minimum
+        )),
+        dim("It applies to every GPU and rig at once and is saved to your profile when you stop.".into()),
+        Line::from(""),
+        Line::from("[A/Esc] close"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Advanced settings ")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 /// Renders the interactive keyboard help panel.
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(76, 72, area);
@@ -3569,6 +3652,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Space / P    pause or resume"),
         Line::from("R            reconnect the current source"),
         Line::from("S            settings"),
+        Line::from("A            advanced settings"),
         Line::from("G            show or hide charts (hash rate and temperature at first)"),
         Line::from("O            chart options: pick which charts to show"),
         Line::from("/ (: or C)   command bar"),
@@ -3782,6 +3866,8 @@ mod tests {
             search: Default::default(),
             gpu_telemetry: Default::default(),
             rigs: None,
+            token_donation: crate::donation::TokenDonation::from_bps(400),
+            donation_minimum: crate::donation::TokenDonation::from_bps(400),
         }
     }
 
@@ -4672,6 +4758,41 @@ mod tests {
 
     // #### PR #32
     #[test]
+    fn advanced_settings_show_the_donation_and_its_minimum() {
+        let mut snapshot = test_snapshot();
+        snapshot.token_donation = crate::donation::TokenDonation::from_bps(550);
+        let mut state = TuiState::new(&snapshot);
+        state.advanced_mode = true;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &snapshot, &state))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Advanced settings"), "{text}");
+        assert!(text.contains("Donation   5.50%"), "{text}");
+        assert!(text.contains("minimum is 4.00%"), "{text}");
+        // The main dashboard does not show the slider.
+        state.advanced_mode = false;
+        terminal
+            .draw(|frame| render(frame, &snapshot, &state))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!text.contains("Donation   5.50%"), "{text}");
+    }
+
+    #[test]
     fn a_coordinator_without_gpus_says_its_rigs_mine() {
         let mut snapshot = test_snapshot();
         snapshot.gpus.clear();
@@ -5076,6 +5197,8 @@ mod tests {
             search: Default::default(),
             gpu_telemetry: Default::default(),
             rigs: None,
+            token_donation: crate::donation::TokenDonation::from_bps(400),
+            donation_minimum: crate::donation::TokenDonation::from_bps(400),
         };
         let mut state = TuiState::new(&snapshot);
         for i in 0..(EVENT_HISTORY_CAP + 20) {

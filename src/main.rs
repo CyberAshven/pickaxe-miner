@@ -318,9 +318,9 @@ fn process_gpu_winners(
     }
 }
 
-/// Prints the compiled miner donation policy.
+/// Prints the miner donation policy in effect.
 fn print_donation(cfg: &RuntimeConfig) {
-    println!("{}", cfg.token.fee_policy(cfg.network).scheme.description());
+    println!("{}", cfg.fee_policy().scheme.description());
 }
 
 /// Parses and executes one interactive command.
@@ -732,6 +732,9 @@ fn runtime_config_from_cli_with_base(
     if let Some(intensity) = args.intensity {
         cfg.set_intensity(intensity)?;
     }
+    if let Some(donation) = args.token_donation {
+        cfg.token_donation = Some(donation);
+    }
     if let Some(address) = &args.address {
         cfg.set_payout(address.clone())?;
     }
@@ -1103,7 +1106,7 @@ fn run_headless_mining(
     json: bool,
     use_tui: bool,
     rigs: Option<rigs::RigHub>,
-) -> Result<Option<(u8, String)>, String> {
+) -> Result<Option<SessionSettings>, String> {
     cfg.ensure_mining_supported()?;
     let _gpu_lock = mining_lock::acquire_gpu_lock()?;
     // Cache device information before the live miner starts so `/devices` never
@@ -1118,10 +1121,14 @@ fn run_headless_mining(
     if use_tui {
         let final_snapshot = tui::run(supervisor, tui_devices)?;
         print_runtime_snapshot(&final_snapshot, false);
-        return Ok(Some((
-            final_snapshot.search.intensity,
-            final_snapshot.payout_address,
-        )));
+        return Ok(Some(SessionSettings {
+            intensity: final_snapshot.search.intensity,
+            // #### PR #32: a donation raised in Advanced settings is saved;
+            // the token's minimum is not, so a later minimum applies.
+            token_donation: (final_snapshot.token_donation != final_snapshot.donation_minimum)
+                .then_some(final_snapshot.token_donation),
+            address: final_snapshot.payout_address,
+        }));
     }
     let intensity_rx = spawn_intensity_commands();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1164,11 +1171,17 @@ fn run_headless_mining(
     Ok(None)
 }
 
+/// What a mining session saves back to its profile when it stops.
+struct SessionSettings {
+    intensity: u8,
+    address: String,
+    token_donation: Option<pickaxe_miner::donation::TokenDonation>,
+}
+
 fn persist_session_profile(
     path: &std::path::Path,
     name: &str,
-    intensity: u8,
-    address: &str,
+    session: &SessionSettings,
 ) -> Result<(), String> {
     let mut profiles = config::MiningProfiles::load_optional(path)?;
     let profile = profiles
@@ -1176,8 +1189,9 @@ fn persist_session_profile(
         .iter_mut()
         .find(|profile| profile.name.eq_ignore_ascii_case(name))
         .ok_or("mining profile was renamed or removed during this session")?;
-    profile.settings.intensity = Some(intensity);
-    profile.settings.address = Some(address.to_string());
+    profile.settings.intensity = Some(session.intensity);
+    profile.settings.address = Some(session.address.clone());
+    profile.settings.token_donation_bps = session.token_donation;
     profiles.save(path)
 }
 
@@ -1676,10 +1690,9 @@ fn main() {
                 }
             };
             match run_headless_mining(cfg, &gpus, args.json, use_tui, rig_hub) {
-                Ok(Some((intensity, address))) => {
+                Ok(Some(session)) => {
                     if let Some(name) = profile_name {
-                        if let Err(error) =
-                            persist_session_profile(&profiles_path, &name, intensity, &address)
+                        if let Err(error) = persist_session_profile(&profiles_path, &name, &session)
                         {
                             eprintln!("error: save mining profile: {error}");
                             exit_after_error(1);
@@ -1764,9 +1777,31 @@ mod tests {
             .unwrap();
         profiles.save(&path).unwrap();
 
-        persist_session_profile(&path, "Rig A", 40, config::DONATION_ADDRESS).unwrap();
+        let mut session = SessionSettings {
+            intensity: 40,
+            address: config::DONATION_ADDRESS.into(),
+            token_donation: Some(pickaxe_miner::donation::TokenDonation::from_bps(550)),
+        };
+        persist_session_profile(&path, "Rig A", &session).unwrap();
         let saved = config::MiningProfiles::load_optional(&path).unwrap();
         assert_eq!(saved.profiles[0].settings.intensity, Some(40));
+        // #### PR #32: a raised donation is saved and applies at the next start.
+        assert_eq!(
+            saved.profiles[0].settings.token_donation_bps,
+            session.token_donation
+        );
+        let mut next = RuntimeConfig::default();
+        saved.profiles[0]
+            .settings
+            .apply_to_runtime(&mut next)
+            .unwrap();
+        assert_eq!(next.token_donation().bps(), 550);
+        assert_eq!(next.fee_policy().scheme.work(), [350, 200]);
+        // Back at the minimum, nothing is saved.
+        session.token_donation = None;
+        persist_session_profile(&path, "Rig A", &session).unwrap();
+        let saved = config::MiningProfiles::load_optional(&path).unwrap();
+        assert_eq!(saved.profiles[0].settings.token_donation_bps, None);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1983,6 +2018,8 @@ mod tests {
                 fan_percent: None,
             },
             rigs: None,
+            token_donation: pickaxe_miner::donation::TokenDonation::from_bps(400),
+            donation_minimum: pickaxe_miner::donation::TokenDonation::from_bps(400),
         };
 
         let status = runtime_snapshot_json(&snapshot);
