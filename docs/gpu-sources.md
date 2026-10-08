@@ -51,10 +51,11 @@ GPUs keep the portable engine, which is faster.
   boundaries (opt-in; choose the GPU with `PICKAXE_TEST_OPENCL_DEVICE`).
   `self-test --backend opencl` and `benchmark --backend opencl` work as for
   the other engines.
-- **Measured** on the integrated Radeon of the test laptop: about 13.2 MH/s at
-  100% intensity, scaling with intensity (benchmark validation passes); the
-  portable engine reaches about 29 MH/s on the same GPU. No Intel or ARM GPU
-  has run it yet.
+- **Measured** on the integrated Radeon of the test laptop: about 30.6 MH/s at
+  100% intensity, scaling with intensity (benchmark validation passes), level
+  with the portable engine's 29 MH/s on the same GPU. The kernel's loops are
+  unrolled so the SHA-256 schedule stays in registers; without that it ran
+  13.2 MH/s. No Intel or ARM GPU has run it yet.
 
 ## Which GPUs mine
 

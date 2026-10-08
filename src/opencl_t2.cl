@@ -45,6 +45,7 @@ __constant uint K[64] = {
 void compress(uint state[8], uint w[16]) {
     uint a = state[0], b = state[1], c = state[2], d = state[3];
     uint e = state[4], f = state[5], g = state[6], h = state[7];
+#pragma unroll
     for (int i = 0; i < 64; i++) {
         uint wi;
         if (i < 16) {
@@ -122,22 +123,27 @@ __kernel void photon_t2(__global const uint *states, __global const uint *tails,
     uint j = position & 0xffffu;
 
     uint m[48];
+#pragma unroll
     for (int i = 0; i < 48; i++) {
         m[i] = tails[window * 48 + i];
     }
     ulong b = baton + (ulong)j;
     ulong r = reward - (ulong)j;
+#pragma unroll
     for (int i = 0; i < 8; i++) {
         PUT(m, BATON_OFFSET + i, b >> (8 * i));
         PUT(m, REWARD_OFFSET + i, r >> (8 * i));
     }
 
     uint state[8];
+#pragma unroll
     for (int i = 0; i < 8; i++) {
         state[i] = states[window * 8 + i];
     }
+#pragma unroll
     for (int block = 0; block < 3; block++) {
         uint w[16];
+#pragma unroll
         for (int i = 0; i < 16; i++) {
             w[i] = m[block * 16 + i];
         }
