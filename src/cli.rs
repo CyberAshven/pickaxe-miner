@@ -59,6 +59,25 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
+    /// Coordinate GPU rigs: share this miner's job with rigs that connect to
+    /// this address (for example 0.0.0.0:3340). Only this miner claims.
+    #[arg(long, global = true, value_name = "ADDR:PORT")]
+    pub rigs_listen: Option<std::net::SocketAddr>,
+
+    /// Mine as a rig of the coordinator at this address; it claims every win.
+    #[arg(
+        long,
+        global = true,
+        value_name = "HOST:PORT",
+        requires = "coordinator_key",
+        conflicts_with = "rigs_listen"
+    )]
+    pub coordinator: Option<String>,
+
+    /// The key the coordinator prints at start, so a rig trusts only it.
+    #[arg(long, global = true, value_name = "KEY")]
+    pub coordinator_key: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -271,6 +290,37 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--chipnet", "--network", "mainnet"]).is_err()
         );
+    }
+
+    #[test]
+    fn rig_flags_parse_and_a_rig_needs_the_coordinator_key() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--coordinator",
+            "192.0.2.1:3340",
+            "--coordinator-key",
+            "key",
+        ])
+        .unwrap();
+        assert_eq!(cli.coordinator.as_deref(), Some("192.0.2.1:3340"));
+        assert!(
+            Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_err()
+        );
+        let cli =
+            Cli::try_parse_from(["pickaxe", "mine", "--rigs-listen", "0.0.0.0:3340"]).unwrap();
+        assert_eq!(cli.rigs_listen, Some("0.0.0.0:3340".parse().unwrap()));
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--rigs-listen",
+            "0.0.0.0:3340",
+            "--coordinator",
+            "192.0.2.1:3340",
+            "--coordinator-key",
+            "key",
+        ])
+        .is_err());
     }
 
     #[test]

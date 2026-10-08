@@ -60,6 +60,18 @@ that work in the existing PR; implementation and evidence are tracked in
 - Rigs connect over the same Stratum V2 transport as step 1; one dashboard
   shows every rig and GPU; rigs fail over to a backup coordinator.
 
+Status, first slice in #32: `mine --rigs-listen ADDR` makes the normal miner
+the coordinator, and `mine --coordinator ADDR --coordinator-key KEY` runs a
+rig. Jobs and winners travel over the Stratum V2 Noise transport as a Pickaxe
+extension (type `0x5043`, JSON payloads). The coordinator checks every rig
+winner (job, Schnorr signature, digest, proof of work, a search key separate
+from the payout) before its claim path, which rebuilds the transaction from
+the coordinator's own job and payouts, so a rig cannot redirect a reward.
+Rigs switch to each successor job as soon as the coordinator starts it, and
+the dashboard shows the rigs connected, their GPUs, rate and winners. Still to
+come: rig rows in the workers table and `watch`, a backup coordinator, and a
+live test across machines.
+
 ## Step 3: the gaps
 
 - ASIC-exclusive tokens: SAFA-style tokens hash an 80-byte commitment laid out

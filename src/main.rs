@@ -5,7 +5,7 @@
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 use pickaxe_miner::{
-    backend, benchmark, cli, config, electrum, mining_lock, node, runtime, search, self_test,
+    backend, benchmark, cli, config, electrum, mining_lock, node, rigs, runtime, search, self_test,
     stratum_v2, telemetry, tui, tx,
 };
 
@@ -1074,6 +1074,7 @@ fn run_headless_mining(
     gpus: &[backend::GpuDevice],
     json: bool,
     use_tui: bool,
+    rigs: Option<rigs::RigHub>,
 ) -> Result<Option<(u8, String)>, String> {
     cfg.ensure_mining_supported()?;
     let _gpu_lock = mining_lock::acquire_gpu_lock()?;
@@ -1084,7 +1085,7 @@ fn run_headless_mining(
     } else {
         Vec::new()
     };
-    let supervisor = runtime::RuntimeSupervisor::start_on_gpus(cfg, gpus)?;
+    let supervisor = runtime::RuntimeSupervisor::start_on_gpus_with_rigs(cfg, gpus, rigs)?;
     if use_tui {
         let final_snapshot = tui::run(supervisor, tui_devices)?;
         print_runtime_snapshot(&final_snapshot, false);
@@ -1498,6 +1499,32 @@ fn main() {
                         exit_after_error(2);
                     }
                 };
+            // #### PR #32
+            // A rig mines its coordinator's jobs: no setup, payout, Fulcrum or
+            // node of its own, and it never claims; the coordinator does.
+            if let Some(coordinator) = args.coordinator.as_deref() {
+                let key = args.coordinator_key.as_deref().unwrap_or_default();
+                let result = (|| {
+                    let _gpu_lock = mining_lock::acquire_gpu_lock()?;
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let signal = Arc::clone(&stop);
+                    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+                        .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
+                    rigs::run_rig(
+                        coordinator,
+                        key,
+                        &selected_gpus,
+                        cfg.intensity,
+                        args.json,
+                        stop,
+                    )
+                })();
+                if let Err(error) = result {
+                    eprintln!("error: {error}");
+                    exit_after_error(1);
+                }
+                return;
+            }
             let (cfg, gpus, profile_name) = match startup {
                 MineStartup::InteractiveSetup => {
                     // Setup lists each physical GPU once, numbered as
@@ -1578,7 +1605,31 @@ fn main() {
                 MineStartup::Direct => (cfg, selected_gpus, None),
             };
             let use_tui = !(args.no_tui || args.json);
-            match run_headless_mining(cfg, &gpus, args.json, use_tui) {
+            // #### PR #32
+            // --rigs-listen makes this miner the coordinator its rigs follow.
+            let rig_hub = match args.rigs_listen {
+                None => None,
+                Some(listen) => {
+                    match rigs::RigHub::start(listen, &config_path.with_extension("rigs-key")) {
+                        Ok(hub) => {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "event": "rigs",
+                                    "listen": hub.listen(),
+                                    "coordinator_key": hub.key(),
+                                })
+                            );
+                            Some(hub)
+                        }
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            exit_after_error(2);
+                        }
+                    }
+                }
+            };
+            match run_headless_mining(cfg, &gpus, args.json, use_tui, rig_hub) {
                 Ok(Some((intensity, address))) => {
                     if let Some(name) = profile_name {
                         if let Err(error) =
@@ -1880,6 +1931,7 @@ mod tests {
                 memory_clock_mhz: Some(8_000.0),
                 fan_percent: None,
             },
+            rigs: None,
         };
 
         let status = runtime_snapshot_json(&snapshot);

@@ -11,6 +11,7 @@ use crate::backend::{BackendKind, GpuDevice};
 use crate::config::{JobSource, MiningNetwork, RuntimeConfig};
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::reward;
+use crate::rigs::{RigHub, RigSummary};
 use crate::search::VerifiedWinner;
 use crate::search::{
     MiningState, RuntimeCommand as SearchCommand, SearchHandle, SearchPauseHandle, SearchStats,
@@ -2496,6 +2497,8 @@ pub struct RuntimeSnapshot {
     pub search: SearchStats,
     /// Telemetry of all mining GPUs together; each GPU's is in `gpus`.
     pub gpu_telemetry: GpuTelemetry,
+    /// The rigs this miner coordinates, when it runs with --rigs-listen.
+    pub rigs: Option<RigSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -2583,7 +2586,19 @@ impl RuntimeSupervisor {
     /// Starts supervised GPU search on every selected GPU after runtime
     /// preflight. The GPUs share one job, pause together on a winner and
     /// claim through this one supervisor.
-    pub fn start_on_gpus(mut cfg: RuntimeConfig, gpus: &[GpuDevice]) -> Result<Self, String> {
+    pub fn start_on_gpus(cfg: RuntimeConfig, gpus: &[GpuDevice]) -> Result<Self, String> {
+        Self::start_on_gpus_with_rigs(cfg, gpus, None)
+    }
+
+    /// #### PR #32
+    /// As `start_on_gpus`, also coordinating GPU rigs: every job this miner
+    /// mines is shared with them, and their checked winners join its own at
+    /// the claim path.
+    pub fn start_on_gpus_with_rigs(
+        mut cfg: RuntimeConfig,
+        gpus: &[GpuDevice],
+        rigs: Option<RigHub>,
+    ) -> Result<Self, String> {
         cfg.ensure_mining_supported()?;
         let first = gpus.first().ok_or("no GPU selected for mining")?;
         for gpu in gpus {
@@ -2629,6 +2644,9 @@ impl RuntimeSupervisor {
 
         let initial_job =
             initial.to_mining_job_for_network(cfg.generation_id, &cfg.payout_address, cfg.network);
+        if let Some(rigs) = rigs.as_ref() {
+            rigs.publish(initial_job.clone());
+        }
         let devices: Vec<(BackendKind, usize)> = gpus
             .iter()
             .map(|gpu| (gpu.backend, gpu.index as usize))
@@ -2678,6 +2696,7 @@ impl RuntimeSupervisor {
             last_error: None,
             search: initial_search,
             gpu_telemetry: telemetry.snapshot(),
+            rigs: rigs.as_ref().map(RigHub::summary),
         };
 
         let snapshot = Arc::new(Mutex::new(initial_snapshot));
@@ -2705,6 +2724,7 @@ impl RuntimeSupervisor {
                     event_tx,
                     worker_snapshot,
                     worker_shutdown,
+                    rigs,
                 )
             })
             .map_err(|error| format!("start live PHOTON supervisor: {error}"))?;
@@ -2838,6 +2858,7 @@ fn run_supervisor(
     event_tx: SyncSender<RuntimeEvent>,
     shared_snapshot: Arc<Mutex<RuntimeSnapshot>>,
     shutdown: ShutdownSignal,
+    rigs: Option<RigHub>,
 ) {
     let mut active_fulcrum_endpoint = initial_session.url.clone();
     let mut session = Some(initial_session);
@@ -3038,13 +3059,20 @@ fn run_supervisor(
                 Err(TryRecvError::Empty) => break,
             }
         }
+        // #### PR #32
+        // A checked winner from a rig starts the same claim as a local one.
+        let rig_winner = rigs.as_ref().is_some_and(RigHub::has_winner);
         if should_begin_winner_refresh(
             winner_refresh_pending,
             pending_winner.is_some(),
             pending_submission.is_some(),
             observed_search_winners,
             search.snapshot().winners,
-        ) {
+        ) || (rig_winner
+            && !winner_refresh_pending
+            && pending_winner.is_none()
+            && pending_submission.is_none())
+        {
             // Stop new launches as soon as a host-verified GPU winner is
             // queued. Batches other GPUs still have in flight finish in the
             // background; the claim does not wait for them.
@@ -3519,7 +3547,9 @@ fn run_supervisor(
                             if force_winner_refresh {
                                 let drained = search.drain_winners();
                                 let drained_count = drained.len();
-                                for winner in drained {
+                                let from_rigs =
+                                    rigs.as_ref().map(RigHub::take_winners).unwrap_or_default();
+                                for winner in drained.into_iter().chain(from_rigs) {
                                     if winner_matches_live(&winner, cfg.generation_id, &live) {
                                         verified_winners = verified_winners.saturating_add(1);
                                         pending_winners = 1;
@@ -3676,6 +3706,17 @@ fn run_supervisor(
             }
         }
 
+        // #### PR #32
+        // Rigs mine whatever this miner mines: share each new generation.
+        if let Some(rigs) = rigs.as_ref() {
+            if rigs.published_generation() != Some(cfg.generation_id) {
+                rigs.publish(live.to_mining_job_for_network(
+                    cfg.generation_id,
+                    &cfg.payout_address,
+                    cfg.network,
+                ));
+            }
+        }
         write_snapshot(
             &shared_snapshot,
             state,
@@ -3693,6 +3734,12 @@ fn run_supervisor(
             last_error.clone(),
             &mut throughput,
         );
+        if let Some(rigs) = rigs.as_ref() {
+            shared_snapshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .rigs = Some(rigs.summary());
+        }
         thread::sleep(SUPERVISOR_POLL);
     }
 

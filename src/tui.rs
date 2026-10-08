@@ -1611,6 +1611,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         last_error: None,
         search: Default::default(),
         gpu_telemetry: Default::default(),
+        rigs: None,
     };
     snapshot.search.intensity = 100;
     snapshot.search.rate = 500_000.0;
@@ -3139,6 +3140,25 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
         ),
     ];
     fields.splice(1..1, per_gpu);
+    if let Some(rigs) = snapshot.rigs.as_ref() {
+        fields.insert(
+            1,
+            RuntimeField::new(
+                "Rigs",
+                wrap(format!(
+                    "{} connected · {} GPUs · {} · winners {} (rejected {}) · {} · key {}",
+                    rigs.connected,
+                    rigs.gpus,
+                    crate::telemetry::format_hash_rate(rigs.rate),
+                    rigs.winners,
+                    rigs.rejected,
+                    rigs.listen,
+                    rigs.key
+                )),
+                3,
+            ),
+        );
+    }
     fields
 }
 
@@ -3720,6 +3740,7 @@ mod tests {
             last_error: None,
             search: Default::default(),
             gpu_telemetry: Default::default(),
+            rigs: None,
         }
     }
 
@@ -4983,6 +5004,7 @@ mod tests {
             last_error: None,
             search: Default::default(),
             gpu_telemetry: Default::default(),
+            rigs: None,
         };
         let mut state = TuiState::new(&snapshot);
         for i in 0..(EVENT_HISTORY_CAP + 20) {

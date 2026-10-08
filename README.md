@@ -77,6 +77,17 @@ One miner drives all of a machine's GPUs: they mine the same job for your addres
 
 In setup, Enter on the GPU row lists the GPUs with a checkbox each, and a profile remembers the choice. The dashboard shows each GPU's rate and temperature. A GPU that fails restarts by itself while the others keep mining.
 
+### Several machines
+
+Your other machines can mine as rigs of one coordinator, so they never compete for the same reward either. The coordinator is your normal miner with one more option: only it talks to the chain and claims, and every rig signs with its own key. The link is encrypted, and a rig trusts only the coordinator whose key it was given.
+
+| Machine | Command |
+| --- | --- |
+| The coordinator | your usual `mine` command plus `--rigs-listen 0.0.0.0:3340` |
+| Each rig | `pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key>` |
+
+The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. For now this needs a build with `--features stratum-v2`.
+
 ### Browser miner
 
 The browser miner is the same portable engine compiled to WebAssembly, mining on browser WebGPU in Chrome, Edge, Firefox or Safari. In the extracted `-browser.tar.gz` download, run this one command (Python required), then open `http://127.0.0.1:8080`, enter your payout address and press **Start mining**:

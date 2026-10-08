@@ -198,3 +198,151 @@ pub(crate) fn verify_gpu_winner(
         transaction,
     })
 }
+
+/// #### PR #32
+/// A winner from a rig must stand on its own before it reaches the claim
+/// path: it answers the job it names, carries a valid Schnorr signature, its
+/// digest matches its transaction, the digest meets the target under this
+/// deployment's rule, and its search identity is separate from the payout.
+/// The claim path then rebuilds the transaction from this miner's own job and
+/// payouts, so a rig cannot redirect a reward.
+#[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
+pub(crate) fn verify_rig_winner(winner: &VerifiedWinner, job: &MiningJob) -> Result<(), String> {
+    if winner.generation_id != job.generation_id
+        || winner.height != job.height
+        || winner.baton_txid != job.baton_txid
+        || winner.baton_vout != job.baton_vout
+        || winner.job_reward_raw != job.reward_raw
+    {
+        return Err("rig winner answers another job".into());
+    }
+    let target = validate_job(job)?;
+    let message = tx::photon_message_sha256(winner.nonce, &job.target_le_hex)?;
+    if !crypto::bch_schnorr_verify(&winner.public_key, &message, &winner.signature)? {
+        return Err("rig winner failed BCH Schnorr verification".into());
+    }
+    if hash256(&winner.transaction) != winner.digest {
+        return Err("rig winner digest does not match its transaction".into());
+    }
+    if !meets_target_le_for_rule(
+        &winner.digest,
+        &target,
+        MiningToken::Photon
+            .photon_deployment(job.network)
+            .proof_rule,
+    ) {
+        return Err("rig winner does not meet the PHOTON target".into());
+    }
+    if tx::cashaddr_to_p2pkh_locking(&job.payout_address)?
+        == crate::reward::p2pkh_locking_from_public_key(&winner.public_key)
+    {
+        return Err("rig search identity must be separate from the payout".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A job with an easy target, so real winners turn up within a few nonces.
+    pub(crate) fn easy_job() -> MiningJob {
+        MiningJob {
+            network: MiningNetwork::Mainnet,
+            height: 1_000,
+            baton_txid: "11".repeat(32),
+            baton_vout: 0,
+            baton_height: 999,
+            baton_value_sats: 15_971_500,
+            relay_fee_sats_per_kb: 1_000,
+            age: 1,
+            target_le_hex: format!("{}7f", "ff".repeat(31)),
+            token_amount: 2_099_905_002_035_715,
+            reward_raw: 4_999_773_813,
+            payout_address: "bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh".into(),
+            source_identity: "coordinator".into(),
+            generation_id: 7,
+        }
+    }
+
+    /// A real, signed winner for `job` that meets its target.
+    pub(crate) fn solved_winner(job: &MiningJob, secret: [u8; 32]) -> VerifiedWinner {
+        let public_key = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes(secret).unwrap(),
+        )
+        .serialize();
+        let target = validate_job(job).unwrap();
+        let deployment = MiningToken::Photon.photon_deployment(job.network);
+        let context = tx::ReferenceJobContext {
+            prev_txid: job.baton_txid.clone(),
+            prev_vout: job.baton_vout,
+            age: job.age,
+            target_le_hex: job.target_le_hex.clone(),
+            contract_value_sats: job.baton_value_sats,
+            relay_fee_sats_per_kb: job.relay_fee_sats_per_kb,
+            contract_token_amount: job.token_amount,
+            reward_raw: job.reward_raw,
+        };
+        for nonce in 0..10_000 {
+            let message = tx::photon_message_sha256(nonce, &job.target_le_hex).unwrap();
+            let signature = crypto::bch_schnorr_sign(&secret, &message).unwrap();
+            // Building the transaction refuses a candidate below the target.
+            let Ok(transaction) = tx::apply_reference_signature_for_deployment(
+                &context,
+                &job.payout_address,
+                &hex::encode(public_key),
+                nonce,
+                &hex::encode(signature),
+                deployment,
+            ) else {
+                continue;
+            };
+            let digest = hash256(&transaction);
+            if meets_target_le_for_rule(&digest, &target, deployment.proof_rule) {
+                return VerifiedWinner {
+                    generation_id: job.generation_id,
+                    height: job.height,
+                    baton_txid: job.baton_txid.clone(),
+                    baton_vout: job.baton_vout,
+                    job_reward_raw: job.reward_raw,
+                    nonce,
+                    digest,
+                    public_key,
+                    signature,
+                    transaction,
+                };
+            }
+        }
+        panic!("no winner within 10,000 nonces");
+    }
+
+    #[test]
+    fn rig_winners_must_carry_their_own_proof() {
+        let job = easy_job();
+        let winner = solved_winner(&job, [1; 32]);
+        assert!(verify_rig_winner(&winner, &job).is_ok());
+        let mut bad_signature = winner.clone();
+        bad_signature.signature[5] ^= 1;
+        assert!(verify_rig_winner(&bad_signature, &job).is_err());
+        let mut bad_digest = winner.clone();
+        bad_digest.digest[0] ^= 1;
+        assert!(verify_rig_winner(&bad_digest, &job).is_err());
+        let mut other_job = winner.clone();
+        other_job.generation_id += 1;
+        assert!(verify_rig_winner(&other_job, &job).is_err());
+        // The same winner does not meet a much harder target.
+        let hard = MiningJob {
+            target_le_hex: format!("01{}", "00".repeat(31)),
+            ..job.clone()
+        };
+        assert!(verify_rig_winner(&winner, &hard).is_err());
+        // A rig's search key may not be the payout key.
+        let public_key = winner.public_key;
+        let own = MiningJob {
+            payout_address: crate::reward::p2pkh_cashaddr_from_public_key(&public_key).unwrap(),
+            ..job
+        };
+        let same_key = solved_winner(&own, [1; 32]);
+        assert!(verify_rig_winner(&same_key, &own).is_err());
+    }
+}
