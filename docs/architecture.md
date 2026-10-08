@@ -28,16 +28,26 @@ day each fact was checked.
   BCHN node, a durable block journal, per-device vardiff, a workers table with
   each device's own report, and an adjustable donation. Tested on Chipnet with
   an Avalon Nano 3.
+- GPU farms (PR #32): rigs on other machines mine as one with a coordinator,
+  with backup coordinators and `--rigs-only` for a coordinator without GPUs,
+  in the default build; live on Chipnet with two rigs on one PC, 349 claims in
+  10 minutes. A public GPU pool, where each rig mines for its own address and
+  the operator's fee is a share of mining time; the token donation in Advanced
+  settings; the OpenCL engine for GPUs the other engines cannot drive; the
+  portable engine on older Intel Vulkan drivers (wgpu's upstream fix), its
+  self-test on T2 engines, and throttled mining at full batch sizes.
 - In review (PR #40): a read-only `watch` view for a server running as a
-  service, calmer vardiff, starting the ASIC server from the setup screen,
-  device reports and confirmed controls for every make through asic-rs (with
-  Pickaxe's own CGMiner and Bitaxe code as the extension), and pool mode,
-  where SV1 devices mine at a remote Stratum V2 pool through the adapter with
-  no node.
-- In review (PR #32): GPU rigs on other machines that mine as one with a
-  coordinator, with backup coordinators, in the default build; the portable
-  engine on older Intel Vulkan drivers (wgpu's upstream fix), its self-test on
-  T2 engines, and throttled mining at full batch sizes.
+  service, calmer vardiff, a setup that starts with GPU mining, ASIC mining or
+  Run a pool, device reports and confirmed controls for every make through
+  asic-rs (with Pickaxe's own CGMiner and Bitaxe code as the extension), and:
+  - pool mode, where SV1 devices mine at a remote Stratum V2 pool through the
+    adapter with no node, and the donation is mining time on a second channel;
+  - a public ASIC pool that pays each miner at their own address in the
+    coinbase, with an operator fee from the coinbase, the mining work or both,
+    to a q or p (multisig) address;
+  - finding a BCH node on the same computer (its cookie login);
+  - Connection info: the stratum addresses devices and rigs use, for the local
+    network and Tailscale, ready to copy.
 
 ## Product direction
 
@@ -354,10 +364,11 @@ What this means for Pickaxe, and what step 1 did:
    device. Remaining items are tracked in
    [implementation-status.md](implementation-status.md).
 2. GPU scaling: a coordinator and rigs on many machines, one job pushed to
-   every rig, one claim path and one dashboard. First slices in PR #32: the
+   every rig, one claim path and one dashboard. Merged in PR #32: the
    coordinator is the normal miner with `--rigs-listen`, rigs follow it over
    the Stratum V2 Noise transport, and every rig winner is checked before the
-   claim path rebuilds its transaction; a live test across machines remains.
+   claim path rebuilds its transaction; live on Chipnet with two rigs on one
+   PC. Rigs on separate machines remain to be tested.
 3. The gaps, in an order to agree later: ASIC-exclusive tokens, the
    merge-minable token standard and the BCH-plus-tokens mode, the guided
    own-node setup, and the Stratum V2 pool and P2Pool connectors with Job
