@@ -58,6 +58,8 @@ pub mod self_test;
 #[cfg(test)]
 mod stage_b;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod stratum_v2;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod telemetry;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]

@@ -896,13 +896,13 @@ fn network_label(network: MiningNetwork) -> &'static str {
     }
 }
 
-struct TerminalSession {
-    terminal: PickaxeTerminal,
+pub(crate) struct TerminalSession {
+    pub(crate) terminal: PickaxeTerminal,
 }
 
 impl TerminalSession {
     /// Enters raw terminal mode and switches to the alternate screen.
-    fn enter() -> Result<Self, String> {
+    pub(crate) fn enter() -> Result<Self, String> {
         enable_raw_mode().map_err(|error| format!("enable terminal raw mode: {error}"))?;
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen) {

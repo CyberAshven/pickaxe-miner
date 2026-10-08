@@ -14,6 +14,13 @@ Mainnet and Chipnet run the PHOTON v3.2 contract (mainnet category `53bd86e3f123
 
 PHOTON uses a **4% mining-work donation**: 96% of completed candidate hashes mine for your wallet. Each win pays directly. There is no additional reward split, minimum withdrawal, or deposit required. The donation is based on work, not guaranteed rewards: short sessions can have different outcomes because wins are random.
 
+The BCH ASIC server has its own **1.5% donation** by default: 0.5% of mining
+work and 1% of each block reward. Set it anywhere from 0% to 100%, in 0.5%
+steps, with `stratum-v2 serve --donation <percent>` or in the dashboard's
+**Advanced settings** (`a`); changes are saved. Shown percentages are rounded
+up to two decimals. Other assets keep their own donation policies. Actual
+rewards depend on which work wins.
+
 ## Supported platforms
 
 Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).
