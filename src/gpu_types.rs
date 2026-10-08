@@ -8,6 +8,10 @@ pub(crate) const PORTABLE_MAX_BATCH_CANDIDATES: u32 = 33_554_432;
 /// fine duty pacing, large enough to keep the GPU busy during a burst.
 pub(crate) const THROTTLED_BATCH_DIVISOR: u32 = 4;
 
+/// The OpenCL engine's largest batch: 256 T2 windows.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) const OPENCL_MAX_BATCH_CANDIDATES: u32 = 1 << 24;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotonCudaWinner {
     pub nonce: u32,

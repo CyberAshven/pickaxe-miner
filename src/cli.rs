@@ -17,7 +17,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub token: Option<String>,
 
-    #[arg(long, global = true, value_parser = ["auto", "cuda", "hip", "wgpu"])]
+    #[arg(long, global = true, value_parser = ["auto", "cuda", "hip", "wgpu", "opencl"])]
     pub backend: Option<String>,
 
     /// GPUs to mine on: all, one number from `pickaxe devices`, or a list like 0,2.
@@ -217,6 +217,8 @@ mod tests {
         let cli = Cli::try_parse_from(["pickaxe", "devices", "--backend", "wgpu"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Devices)));
         assert_eq!(cli.backend.as_deref(), Some("wgpu"));
+        let cli = Cli::try_parse_from(["pickaxe", "devices", "--backend", "opencl"]).unwrap();
+        assert_eq!(cli.backend.as_deref(), Some("opencl"));
     }
 
     #[test]

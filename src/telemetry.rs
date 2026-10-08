@@ -220,7 +220,7 @@ pub(crate) fn sample_gpu_telemetry(backend: BackendKind, device: u32) -> Option<
     match backend {
         BackendKind::Cuda => sample_nvidia_telemetry(&device.to_string()),
         BackendKind::Hip => sample_amd_telemetry(&device.to_string()),
-        BackendKind::Auto | BackendKind::Wgpu => None,
+        BackendKind::Auto | BackendKind::Wgpu | BackendKind::OpenCl => None,
     }
 }
 

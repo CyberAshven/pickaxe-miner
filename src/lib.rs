@@ -43,6 +43,8 @@ pub mod mining_lock;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod node;
+#[cfg(all(feature = "opencl", not(target_arch = "wasm32")))]
+pub mod opencl_photon;
 pub mod proof;
 #[allow(dead_code)]
 pub mod protocol;

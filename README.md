@@ -35,6 +35,7 @@ Linux and Windows ARM64 (for example Raspberry Pi 5, Ampere servers and Snapdrag
 | Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails | Not yet |
 | Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) | Not yet |
 | Apple Silicon (M1 and later) | Portable engine on Metal | Built by CI; not yet run on a Mac |
+| GPUs no other engine finds: older integrated GPUs without Vulkan or DirectX 12, ARM GPUs (Mali, Adreno) with only an OpenCL driver | OpenCL engine, used only when no other engine finds a GPU, or with `--backend opencl` | Integrated Radeon over OpenCL: about 13 MH/s (the portable engine reaches about 29 MH/s on the same GPU) |
 | Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU | Chrome, on the integrated Radeon and the RTX 5070 Ti |
 
 The engine is selected automatically, and one miner mines on every discrete GPU of the machine, each on its best engine ([several GPUs](#several-gpus)). An integrated GPU mines automatically only when no discrete GPU is present. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).

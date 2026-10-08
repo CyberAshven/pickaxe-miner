@@ -48,6 +48,8 @@ pub(crate) enum PhotonEngine {
     Hip(Box<HipPhotonEngine>),
     #[cfg(feature = "portable-wgpu")]
     Wgpu(Box<WgpuPhotonEngine>),
+    #[cfg(feature = "opencl")]
+    OpenCl(Box<crate::opencl_photon::OpenClPhotonEngine>),
 }
 
 impl PhotonEngine {
@@ -85,6 +87,23 @@ impl PhotonEngine {
                         "wgpu fallback is not compiled; rebuild with --features portable-wgpu"
                             .into(),
                     )
+                }
+            }
+            BackendKind::OpenCl => {
+                #[cfg(feature = "opencl")]
+                {
+                    Ok(Self::OpenCl(Box::new(
+                        crate::opencl_photon::OpenClPhotonEngine::new(
+                            device_ordinal,
+                            max_batch_candidates,
+                            winner_buffer_cap,
+                        )?,
+                    )))
+                }
+                #[cfg(not(feature = "opencl"))]
+                {
+                    let _ = (device_ordinal, max_batch_candidates, winner_buffer_cap);
+                    Err("OpenCL is not compiled; rebuild with --features opencl".into())
                 }
             }
             BackendKind::Auto => {
@@ -130,6 +149,11 @@ impl PhotonEngine {
                 engine.set_proof_rule(MiningToken::Photon.photon_deployment(network).proof_rule);
                 engine.set_job(template, target, private_key)
             }
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => {
+                engine.set_proof_rule(MiningToken::Photon.photon_deployment(network).proof_rule);
+                engine.set_job(template, target, private_key)
+            }
         }
     }
 
@@ -144,6 +168,8 @@ impl PhotonEngine {
             Self::Hip(engine) => engine.search_batch(nonce_base, candidate_count),
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.search_batch(nonce_base, candidate_count),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => engine.search_batch(nonce_base, candidate_count),
         }
     }
 
@@ -154,6 +180,8 @@ impl PhotonEngine {
             Self::Hip(engine) => engine.persistent_device_bytes(),
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.persistent_device_bytes(),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => engine.persistent_device_bytes(),
         }
     }
 
@@ -164,6 +192,8 @@ impl PhotonEngine {
             Self::Hip(engine) => format!("{:?}", engine.table_source()),
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => format!("{:?}", engine.table_source()),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => engine.table_source().to_owned(),
         }
     }
 
@@ -188,6 +218,8 @@ impl PhotonEngine {
             }
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.recommended_batch_candidates(),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => engine.recommended_batch_candidates(),
         };
         intensity_batch_candidates(capacity, intensity)
     }
@@ -197,6 +229,7 @@ impl PhotonEngine {
 pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32 {
     match backend {
         BackendKind::Wgpu => PORTABLE_WGPU_MAX_BATCH_CANDIDATES,
+        BackendKind::OpenCl => crate::gpu_types::OPENCL_MAX_BATCH_CANDIDATES,
         BackendKind::Cuda => CUDA_MAX_BATCH_CANDIDATES,
         BackendKind::Auto | BackendKind::Hip => MAX_BATCH_CANDIDATES,
     }
@@ -762,6 +795,8 @@ fn run_worker(
         PhotonEngine::Hip(_) => BackendKind::Hip,
         #[cfg(feature = "portable-wgpu")]
         PhotonEngine::Wgpu(_) => BackendKind::Wgpu,
+        #[cfg(feature = "opencl")]
+        PhotonEngine::OpenCl(_) => BackendKind::OpenCl,
     };
     let quantum = crate::mining_control::work_allocation_quantum(
         backend,

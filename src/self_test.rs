@@ -273,6 +273,22 @@ pub fn run_self_test(backend: BackendKind, device: u32) -> Result<SelfTestReport
                 );
             }
         }
+        BackendKind::OpenCl => {
+            #[cfg(feature = "opencl")]
+            {
+                let mut engine =
+                    crate::opencl_photon::OpenClPhotonEngine::new(device as usize, 1, 1)?;
+                engine.set_proof_rule(crate::protocol::MAINNET_V0_PHOTON.proof_rule);
+                let bytes = engine.persistent_device_bytes();
+                engine.set_job(&template, &target, &reward_secret)?;
+                let batch = engine.search_batch(CONTROLLED_NONCE, 1)?;
+                ("opencl", bytes, batch)
+            }
+            #[cfg(not(feature = "opencl"))]
+            {
+                return Err("OpenCL is not compiled; rebuild with --features opencl".into());
+            }
+        }
         BackendKind::Auto => return Err("self-test requires a resolved native backend".into()),
     };
     if batch.candidates != 1

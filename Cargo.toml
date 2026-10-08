@@ -9,7 +9,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 # Native builds carry the portable T2 engine so AMD and Intel GPUs mine through Vulkan.
-default = ["rust-t2", "portable-wgpu", "stratum-v2"]
+default = ["rust-t2", "portable-wgpu", "stratum-v2", "opencl"]
 incremental-k = []
 tail-grind = []
 # Default Rust implementation of the complete CUDA T2 mining path.
@@ -27,6 +27,10 @@ browser-check = ["portable-wgpu"]
 # the encrypted link between a GPU coordinator and its rigs. In the default
 # build since #32; the browser and portable builds choose their own features.
 stratum-v2 = ["dep:stratum-core"]
+# #### PR #32: the OpenCL engine for GPUs the other engines cannot drive
+# (older integrated GPUs, older cards, ARM GPUs). The OpenCL library is loaded
+# at runtime, so builds with it run on machines without one.
+opencl = []
 
 [dependencies]
 sha2 = "0.11"
