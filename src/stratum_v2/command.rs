@@ -3,6 +3,8 @@
 //! keep authority secrets private, and never print node credentials or payouts.
 
 use super::{
+    device_api::DeviceAction,
+    fleet::Fleet,
     provider::{NativeNodeRpc, TemplateProvider},
     server::{self, ServerConfig, ServerStats},
     telemetry::DeviceSnapshot,
@@ -129,21 +131,21 @@ pub fn run(
         }
         thread::spawn(move || super::sv1::run(listener, upstream, public, stop, stats))
     });
-    // Read-only device reports every 15 seconds, outside the stats lock.
+    // #### PR #40
+    // Device reports every 15 seconds, outside the stats lock, from asic-rs
+    // mixed with Pickaxe's own reader; all devices are asked in parallel.
+    let fleet = Arc::new(Fleet::new());
     let reports = {
         let stop = stop.clone();
         let stats = stats.clone();
+        let fleet = fleet.clone();
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let addresses = stats
                     .lock()
                     .map(|stats| stats.device_stats.addresses())
                     .unwrap_or_default();
-                for (id, ip) in addresses {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let report = super::device_api::poll(ip);
+                for (id, report) in fleet.poll(&addresses, &stop) {
                     if let Ok(mut stats) = stats.lock() {
                         stats.device_stats.set_report(id, report);
                     }
@@ -261,7 +263,7 @@ pub fn run(
                     if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
                         if key.kind == KeyEventKind::Press {
                             if let Some(view) = controls.as_mut() {
-                                if handle_controls_key(view, key.code, &stats) {
+                                if handle_controls_key(view, key.code, &fleet) {
                                     controls = None;
                                 }
                                 continue;
@@ -273,7 +275,10 @@ pub fn run(
                                     if let Some(device) =
                                         devices.get(device_offset).filter(|device| device.connected)
                                     {
-                                        controls = Some(Controls::new(device.label.clone()));
+                                        let address = stats.lock().ok().and_then(|stats| {
+                                            stats.device_stats.address_for_label(&device.label)
+                                        });
+                                        controls = Some(Controls::new(device, address, &fleet));
                                     }
                                 }
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
@@ -405,10 +410,12 @@ fn render_dashboard(
                 "Offline"
             }
             .to_owned(),
+            device.model.clone().unwrap_or_else(|| "—".into()),
             device
                 .hashrate_estimate
                 .map(crate::telemetry::format_hash_rate)
                 .unwrap_or_else(|| "Measuring".into()),
+            power(device.power_w),
             device.accepted.to_string(),
             device.rejected.to_string(),
             device
@@ -431,7 +438,9 @@ fn render_dashboard(
                 Constraint::Length(20),
                 Constraint::Length(3),
                 Constraint::Length(7),
+                Constraint::Length(24),
                 Constraint::Length(12),
+                Constraint::Length(7),
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Min(10),
@@ -442,7 +451,9 @@ fn render_dashboard(
                 "Device",
                 "Via",
                 "State",
+                "Model",
                 "Est. 5m",
+                "Power",
                 "Accepted",
                 "Rejected",
                 "Last issue",
@@ -453,6 +464,14 @@ fn render_dashboard(
         areas[1],
     );
     frame.render_widget(Paragraph::new("Tab  Workers · ↑/↓ PgUp/PgDn  Devices · a  Advanced settings · q  Stop server\nRate uses validated shares; 30s warm-up, up to 5m window."), areas[2]);
+}
+
+/// A device's reported power draw: "140 W".
+fn power(watts: Option<f64>) -> String {
+    watts
+        .filter(|watts| watts.is_finite() && *watts > 0.0)
+        .map(|watts| format!("{watts:.0} W"))
+        .unwrap_or_else(|| "—".into())
 }
 
 /// Seconds since the last share, as "12s ago", "4m ago" or "2h ago".
@@ -630,6 +649,9 @@ struct WorkerLine {
     reported_hashrate: Option<f64>,
     temperature_c: Option<f64>,
     fan: Option<String>,
+    model: Option<String>,
+    firmware: Option<String>,
+    power_w: Option<f64>,
 }
 
 impl From<&DeviceSnapshot> for WorkerLine {
@@ -650,6 +672,9 @@ impl From<&DeviceSnapshot> for WorkerLine {
             reported_hashrate: device.reported_hashrate,
             temperature_c: device.temperature_c,
             fan: device.fan.clone(),
+            model: device.model.clone(),
+            firmware: device.firmware.clone(),
+            power_w: device.power_w,
         }
     }
 }
@@ -686,17 +711,37 @@ fn device_hint(
 
 /// #### PR #40
 /// The controls page for one worker: choose an action, confirm it, and read
-/// the device's reply. Actions run in the background so the page stays live.
+/// the device's reply. The actions are the ones this device offers (see
+/// `Fleet::actions`); they run in the background so the page stays live.
 struct Controls {
     label: String,
-    confirming: Option<super::device_api::DeviceAction>,
+    /// Model, firmware and power, as the device reports them.
+    details: String,
+    address: Option<std::net::IpAddr>,
+    actions: Vec<DeviceAction>,
+    confirming: Option<DeviceAction>,
     reply: Arc<Mutex<Option<String>>>,
 }
 
 impl Controls {
-    fn new(label: String) -> Self {
+    fn new(device: &DeviceSnapshot, address: Option<std::net::IpAddr>, fleet: &Fleet) -> Self {
+        let details = [
+            device.model.clone(),
+            device
+                .firmware
+                .as_ref()
+                .map(|firmware| format!("firmware {firmware}")),
+            device.power_w.map(|watts| power(Some(watts))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
         Self {
-            label,
+            label: device.label.clone(),
+            details,
+            address,
+            actions: address.map_or_else(|| DeviceAction::OWN.to_vec(), |ip| fleet.actions(ip)),
             confirming: None,
             reply: Arc::new(Mutex::new(None)),
         }
@@ -710,20 +755,15 @@ impl Controls {
 }
 
 /// Handles one key on the controls page; true closes it.
-fn handle_controls_key(view: &mut Controls, code: KeyCode, stats: &Mutex<ServerStats>) -> bool {
-    use super::device_api::{control, DeviceAction};
+fn handle_controls_key(view: &mut Controls, code: KeyCode, fleet: &Arc<Fleet>) -> bool {
     match (view.confirming, code) {
         (_, KeyCode::Esc) => return true,
-        (None, KeyCode::Char(choice @ '1'..='3')) => {
-            view.confirming = Some(DeviceAction::ALL[usize::from(choice as u8 - b'1')]);
+        (None, KeyCode::Char(choice @ '1'..='9')) => {
+            view.confirming = view.actions.get(usize::from(choice as u8 - b'1')).copied();
         }
         (Some(action), KeyCode::Char('y') | KeyCode::Char('Y')) => {
             view.confirming = None;
-            let address = stats
-                .lock()
-                .ok()
-                .and_then(|stats| stats.device_stats.address_for_label(&view.label));
-            match address {
+            match view.address {
                 None => view.set_reply(
                     "This worker's network address is not known, so it cannot be controlled."
                         .into(),
@@ -731,11 +771,10 @@ fn handle_controls_key(view: &mut Controls, code: KeyCode, stats: &Mutex<ServerS
                 Some(ip) => {
                     view.set_reply(format!("Sending: {}…", action.label()));
                     let reply = Arc::clone(&view.reply);
+                    let fleet = Arc::clone(fleet);
                     thread::spawn(move || {
-                        let text = match control(ip, action) {
-                            Ok(message) => {
-                                format!("{}: the device replied \"{message}\"", action.label())
-                            }
+                        let text = match fleet.control(ip, action) {
+                            Ok(message) => format!("{}: {message}", action.label()),
                             Err(error) => format!("{}: not done; {error}", action.label()),
                         };
                         if let Ok(mut reply) = reply.lock() {
@@ -752,8 +791,11 @@ fn handle_controls_key(view: &mut Controls, code: KeyCode, stats: &Mutex<ServerS
 }
 
 fn render_controls(frame: &mut Frame<'_>, view: &Controls) {
-    use super::device_api::DeviceAction;
-    let mut text = format!("Worker  {}\n\n", view.label);
+    let mut text = format!("Worker  {}\n", view.label);
+    if !view.details.is_empty() {
+        text.push_str(&format!("{}\n", view.details));
+    }
+    text.push('\n');
     match view.confirming {
         Some(action) => text.push_str(&format!(
             "{} {}?\n\ny  Yes · any other key  No\n",
@@ -761,7 +803,7 @@ fn render_controls(frame: &mut Frame<'_>, view: &Controls) {
             view.label
         )),
         None => {
-            for (index, action) in DeviceAction::ALL.iter().enumerate() {
+            for (index, action) in view.actions.iter().enumerate() {
                 text.push_str(&format!("{}  {}\n", index + 1, action.label()));
             }
             text.push_str("\nEsc  Back to workers\n");
@@ -771,7 +813,7 @@ fn render_controls(frame: &mut Frame<'_>, view: &Controls) {
         text.push_str(&format!("\n{reply}\n"));
     }
     text.push_str(
-        "\nActions go to the device's own API on your local network and each needs your confirmation. Restart works on Avalon and Bitaxe; work levels on Avalon, within the device's own range.",
+        "\nActions go to the device's own API on your local network and each needs your confirmation. The list is what this device's make and firmware support through asic-rs, plus Avalon work levels; a device not yet identified offers Restart and work levels.",
     );
     frame.render_widget(
         Paragraph::new(text)
@@ -1114,20 +1156,32 @@ mod tests {
 
     #[test]
     fn controls_need_a_choice_and_a_confirmation() {
-        use super::super::device_api::DeviceAction;
         use ratatui::{backend::TestBackend, Terminal};
-        let stats = Mutex::new(ServerStats::default());
-        let mut view = Controls::new("Device 1".into());
-        // Choosing an action only asks for confirmation.
-        assert!(!handle_controls_key(&mut view, KeyCode::Char('2'), &stats));
+        let fleet = Arc::new(Fleet::new());
+        let mut stats = ServerStats::default();
+        stats
+            .device_stats
+            .connect("127.0.0.1:1000".parse().unwrap(), true, Instant::now());
+        let mut device = stats.device_stats.snapshots(Instant::now()).remove(0);
+        device.model = Some("Avalonminer AvalonNano3s".into());
+        device.power_w = Some(140.0);
+        let mut view = Controls::new(&device, None, &fleet);
+        // A device not identified by asic-rs offers Pickaxe's own actions.
+        assert_eq!(view.actions, DeviceAction::OWN.to_vec());
+        assert_eq!(view.details, "Avalonminer AvalonNano3s · 140 W");
+        // Choosing an action only asks for confirmation; a number past the
+        // list chooses nothing.
+        assert!(!handle_controls_key(&mut view, KeyCode::Char('9'), &fleet));
+        assert_eq!(view.confirming, None);
+        assert!(!handle_controls_key(&mut view, KeyCode::Char('2'), &fleet));
         assert_eq!(view.confirming, Some(DeviceAction::LowerPower));
         // Any key other than y cancels.
-        handle_controls_key(&mut view, KeyCode::Char('n'), &stats);
+        handle_controls_key(&mut view, KeyCode::Char('n'), &fleet);
         assert_eq!(view.confirming, None);
         assert!(view.reply.lock().unwrap().is_none());
         // Confirmed, but without a known address nothing is sent.
-        handle_controls_key(&mut view, KeyCode::Char('1'), &stats);
-        handle_controls_key(&mut view, KeyCode::Char('y'), &stats);
+        handle_controls_key(&mut view, KeyCode::Char('1'), &fleet);
+        handle_controls_key(&mut view, KeyCode::Char('y'), &fleet);
         assert!(view
             .reply
             .lock()
@@ -1145,7 +1199,8 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(text.contains("Restart") && text.contains("Raise power"));
-        assert!(handle_controls_key(&mut view, KeyCode::Esc, &stats));
+        assert!(text.contains("AvalonNano3s"));
+        assert!(handle_controls_key(&mut view, KeyCode::Esc, &fleet));
     }
 
     #[test]
@@ -1193,6 +1248,8 @@ mod tests {
                 hashrate: Some(4.0e12),
                 temperature_c: Some(61.0),
                 fan: Some("40%".into()),
+                model: Some("Avalonminer AvalonNano3s".into()),
+                ..DeviceReport::default()
             }),
         );
         stats.template_ready = true;

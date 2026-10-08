@@ -5,6 +5,11 @@
 //! `/api/system/info`); nothing here changes a device setting. Only devices
 //! on the local network are asked, and each device gets one time limit for
 //! its whole report so a slow one cannot hold up the others or shutdown.
+//!
+//! #### PR #40
+//! This is now the extension to asic-rs (see `fleet`): it answers for devices
+//! asic-rs cannot identify, supplies the windowed CGMiner rate and Avalon's
+//! hottest reading, and sends Canaan's work-level commands.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -28,11 +33,22 @@ pub struct DeviceReport {
     pub temperature_c: Option<f64>,
     /// Fan speed as the device gives it: "3200 rpm" or "45%".
     pub fan: Option<String>,
+    /// Make and model, as asic-rs identifies them.
+    pub model: Option<String>,
+    /// Firmware version the device reports.
+    pub firmware: Option<String>,
+    /// Power draw the device reports, in watts.
+    pub power_w: Option<f64>,
 }
 
 impl DeviceReport {
-    fn is_empty(&self) -> bool {
-        self.hashrate.is_none() && self.temperature_c.is_none() && self.fan.is_none()
+    pub fn is_empty(&self) -> bool {
+        self.hashrate.is_none()
+            && self.temperature_c.is_none()
+            && self.fan.is_none()
+            && self.model.is_none()
+            && self.firmware.is_none()
+            && self.power_w.is_none()
     }
 }
 
@@ -141,30 +157,41 @@ fn http_complete(reply: &[u8]) -> bool {
 
 /// #### PR #40
 /// What the user may ask a device to do from the workers page, each only
-/// after confirming it there. Commands follow Canaan's CGMiner fork
-/// (`ascset` with `reboot` and `worklevel`) and Bitaxe's restart endpoint;
-/// the device checks every value itself and replies.
+/// after confirming it there. asic-rs sends what it supports for the device's
+/// make and firmware (see `fleet`); Pickaxe's own commands follow Canaan's
+/// CGMiner fork (`ascset` with `reboot` and `worklevel`) and Bitaxe's restart
+/// endpoint. The device checks every value itself and replies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceAction {
     Restart,
+    Pause,
+    Resume,
+    LocateOn,
+    LocateOff,
     LowerPower,
     RaisePower,
 }
 
 impl DeviceAction {
-    pub const ALL: [Self; 3] = [Self::Restart, Self::LowerPower, Self::RaisePower];
+    /// The actions Pickaxe's own code can send, for devices asic-rs has not
+    /// identified.
+    pub const OWN: [Self; 3] = [Self::Restart, Self::LowerPower, Self::RaisePower];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Restart => "Restart",
+            Self::Pause => "Pause mining",
+            Self::Resume => "Resume mining",
+            Self::LocateOn => "Blink its light (to find it)",
+            Self::LocateOff => "Stop blinking its light",
             Self::LowerPower => "Lower power (one work level down)",
             Self::RaisePower => "Raise power (one work level up)",
         }
     }
 }
 
-/// Sends one confirmed action to a device on the local network and returns
-/// the device's own reply.
+/// Sends one of Pickaxe's own confirmed actions to a device on the local
+/// network and returns the device's own reply.
 pub fn control(ip: IpAddr, action: DeviceAction) -> Result<String, String> {
     if !queryable(ip) {
         return Err("only devices on the local network can be controlled".into());
@@ -176,6 +203,10 @@ pub fn control(ip: IpAddr, action: DeviceAction) -> Result<String, String> {
             .or_else(|error| bitaxe_restart(SocketAddr::new(ip, 80)).map_err(|_| error)),
         DeviceAction::LowerPower => adjust_level(cgminer, false),
         DeviceAction::RaisePower => adjust_level(cgminer, true),
+        DeviceAction::Pause
+        | DeviceAction::Resume
+        | DeviceAction::LocateOn
+        | DeviceAction::LocateOff => Err("this device does not offer that action".into()),
     }
 }
 
@@ -313,6 +344,18 @@ pub fn parse_cgminer(reply: &str) -> Option<DeviceReport> {
                     .map(str::to_owned)
                     .or_else(|| bracket_number(text, "Fan1").map(|rpm| format!("{rpm:.0} rpm")));
             }
+            // #### PR #40
+            // Avalon Nano power: `PS[0 0 0 4 2756 126 330]` holds the input
+            // voltage (27.56 V) fifth and the watts sixth. Larger Avalons put
+            // watts fifth, which is what asic-rs reads for every model.
+            if report.power_w.is_none()
+                && bracket_value(text, "Ver")
+                    .is_some_and(|version| version.to_ascii_lowercase().starts_with("nano"))
+            {
+                report.power_w = bracket_value(text, "PS")
+                    .and_then(|values| values.split_whitespace().nth(5)?.parse().ok())
+                    .filter(|watts: &f64| watts.is_finite() && *watts > 0.0);
+            }
         }
     }
     (!report.is_empty()).then_some(report)
@@ -337,6 +380,7 @@ pub fn parse_bitaxe(body: &str) -> Option<DeviceReport> {
                     .and_then(Value::as_f64)
                     .map(|percent| format!("{percent:.0}%"))
             }),
+        ..DeviceReport::default()
     };
     (!report.is_empty()).then_some(report)
 }
@@ -391,7 +435,8 @@ mod tests {
             r#""estats":[{"STATUS":[{"STATUS":"S"}],"STATS":[{"STATS":0,"ID":"AVANANO0","#,
             r#""MM ID0":"HashStatus[1] Ver[nano3-25103101_0736b2e] Elapsed[40600] "#,
             r#"DH[1.849%] Temp[54] OTemp[46] TMax[95] TAvg[91] TarT[90] Fan1[5280] "#,
-            r#"FanR[75%] GHSspd[4115.12] WORKLEVEL[2]","MM Count":1}],"id":1}],"id":1}"#,
+            r#"FanR[75%] GHSspd[4115.12] PS[0 0 0 4 2756 126 330] WORKLEVEL[2]","#,
+            r#""MM Count":1}],"id":1}],"id":1}"#,
             "\0"
         );
         let report = parse_cgminer(reply).unwrap();
@@ -399,6 +444,8 @@ mod tests {
         assert!((report.hashrate.unwrap() - 4.17616911e12).abs() < 1.0);
         assert_eq!(report.temperature_c, Some(95.0));
         assert_eq!(report.fan.as_deref(), Some("75%"));
+        // Watts, not the 27.56 V input voltage before them.
+        assert_eq!(report.power_w, Some(126.0));
     }
 
     #[test]

@@ -25,7 +25,7 @@ shared-rust-t2 = []
 browser-check = ["portable-wgpu"]
 # Optional native Stratum server and firmware adapter. CI checks this feature
 # with all-features; enable the server build with --features stratum-v2.
-stratum-v2 = ["dep:stratum-core"]
+stratum-v2 = ["dep:stratum-core", "dep:asic-rs", "dep:tokio"]
 
 [dependencies]
 sha2 = "0.11"
@@ -54,6 +54,11 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 crossterm = "0.29"
 libloading = "0.9"
 pollster = { version = "1.0", optional = true }
+# #### PR #40: device reports and controls for the ASIC server's workers.
+# asic-rs (256 Foundation, Apache-2.0) knows most SHA-256 makes and firmwares;
+# Pickaxe's own CGMiner and Bitaxe code extends it (src/stratum_v2/fleet.rs).
+asic-rs = { version = "0.8.5", optional = true }
+tokio = { version = "1.50", optional = true, features = ["rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
@@ -64,6 +69,8 @@ js-sys = "0.3"
 
 [dev-dependencies]
 naga = { version = "30.0.0", features = ["wgsl-in"] }
+# Builds asic-rs test data (temperatures, fan speeds) in fleet tests.
+measurements = "0.11"
 
 [build-dependencies]
 sha2 = "0.11"

@@ -134,12 +134,27 @@ reject counts.
 
 "Device says", Temp and Fan are the device's own report. Every 15 seconds
 Pickaxe asks each connected device on the local network (private, link-local,
-100.64.0.0/10 and IPv6 local addresses, never a public address) with read-only
-commands: the CGMiner API's `summary` and `estats` on port 4028 (Avalon and most
-SHA-256 miners) or Bitaxe's `/api/system/info`. It shows the device's 5-minute
-rate when reported, its hottest temperature and its fan speed. Each device gets
-three seconds per report. Device addresses are used only for these queries and
-never appear in the dashboard or JSON; no device setting is changed.
+100.64.0.0/10 and IPv6 local addresses, never a public address), all devices
+in parallel, from two sources:
+
+- [asic-rs](https://github.com/256foundation/asic-rs) (256 Foundation,
+  Apache-2.0) identifies the make, model and firmware once and reads each
+  device's own API: Antminer, Whatsminer, Avalon, Bitaxe, NerdAxe, Braiins OS,
+  Vnish, LuxOS, ePIC, Auradine and more. It supplies the model, firmware and
+  power draw, and the rate, temperature and fans for makes Pickaxe's own reader
+  does not know.
+- Pickaxe's own read-only reader (the CGMiner API's `summary` and `estats` on
+  port 4028, or Bitaxe's `/api/system/info`, three seconds per device) leads
+  where it is closer to the device's own app: the 5-minute rate (asic-rs reads
+  Avalon's 1-minute rate), the hottest temperature, the fan as the device
+  states it, and Avalon Nano power (asic-rs reads the Nano's input voltage,
+  27.56 V, as 2,756 W). It also answers alone for a device asic-rs cannot
+  identify, which is asked again after five minutes.
+
+Pool settings (their worker names are often payout addresses), MAC
+addresses, serial numbers and host names are never collected. Device
+addresses are used only for these queries and never appear in the dashboard
+or JSON. The overview page (Tab) shows each device's model and power.
 
 The setup screen starts the same server: choose ASIC, then "BCH + all
 merge-mined tokens", and set a payout address and your BCH node. It listens on
@@ -147,12 +162,16 @@ the local network (SV1 on port 3333, SV2 on 3336) and the workers page shows
 this computer's address to point devices at. SV1 has no encryption, so use it
 on a trusted network.
 
-On the workers page, `c` opens controls for the top row's device: Restart
-(Avalon and Bitaxe) and one work level down or up (Avalon, within the
-device's own range). Each action needs a confirmation, goes only to a device
-on the local network through its own API (Canaan's CGMiner `ascset`,
-Bitaxe's restart endpoint), and shows the device's reply. The read-only
-`watch` view has no controls.
+On the workers page, `c` opens controls for the top row's device, with its
+model, firmware and power. It lists what that make and firmware support
+through asic-rs (Restart, Pause and Resume mining, blink or stop blinking its
+light to find it) plus one work level down or up on Avalon (Pickaxe's own
+Canaan `ascset worklevel` commands, within the device's own range; asic-rs's
+power limit is in watts, which Avalon work levels are not). A device asic-rs
+has not identified offers Pickaxe's own Restart (Canaan's `ascset` reboot or
+Bitaxe's restart endpoint) and work levels. Each action needs a confirmation,
+goes only to a device on the local network, and shows the device's reply. The
+read-only `watch` view has no controls.
 
 A server running without a screen, for example as a service with
 `--no-tui --json`, saves the same status once a second beside its config

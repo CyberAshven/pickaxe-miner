@@ -21,6 +21,16 @@ name = "hex_lit"
 version = "=0.1.1"
 allow = ["MITNFA"]
 
+# PR #40: asic-rs (device reports and controls for the ASIC server) uses
+# reqwest with rustls, whose platform verifier ships Mozilla's root
+# certificates as data under CDLA-Permissive-2.0, a permissive data license
+# that sets no conditions on software using the data. Reviewed text:
+# https://spdx.org/licenses/CDLA-Permissive-2.0.html. Scope to this crate.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
+version = "=1.0.9"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 # Different compatible dependency trees may need different crate major versions.
 multiple-versions = "allow"

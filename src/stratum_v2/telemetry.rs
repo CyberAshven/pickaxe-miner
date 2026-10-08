@@ -52,6 +52,11 @@ pub struct DeviceSnapshot {
     pub reported_hashrate: Option<f64>,
     pub temperature_c: Option<f64>,
     pub fan: Option<String>,
+    /// #### PR #40
+    /// Make and model, firmware and power draw, from asic-rs's report.
+    pub model: Option<String>,
+    pub firmware: Option<String>,
+    pub power_w: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -317,6 +322,9 @@ impl Devices {
                     reported_hashrate: row.report.as_ref().and_then(|r| r.hashrate),
                     temperature_c: row.report.as_ref().and_then(|r| r.temperature_c),
                     fan: row.report.as_ref().and_then(|r| r.fan.clone()),
+                    model: row.report.as_ref().and_then(|r| r.model.clone()),
+                    firmware: row.report.as_ref().and_then(|r| r.firmware.clone()),
+                    power_w: row.report.as_ref().and_then(|r| r.power_w),
                 }
             })
             .collect();
@@ -525,12 +533,17 @@ mod tests {
                 hashrate: Some(4.0e12),
                 temperature_c: Some(61.0),
                 fan: Some("40%".into()),
+                model: Some("Avalonminer AvalonNano3s".into()),
+                power_w: Some(140.0),
+                ..DeviceReport::default()
             }),
         );
         let row = devices.snapshots(now).remove(0);
         assert_eq!(row.reported_hashrate, Some(4.0e12));
         assert_eq!(row.temperature_c, Some(61.0));
         assert_eq!(row.fan.as_deref(), Some("40%"));
+        assert_eq!(row.model.as_deref(), Some("Avalonminer AvalonNano3s"));
+        assert_eq!(row.power_w, Some(140.0));
         let json = serde_json::to_string(&devices.snapshots(now)).unwrap();
         assert!(!json.contains("10.9.8.7"));
         devices.close(id, true, None, now);

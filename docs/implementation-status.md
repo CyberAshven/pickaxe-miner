@@ -601,3 +601,38 @@ passed, 19 opt-in tests ignored, 34 hardware tests filtered; formatting and
 all-target/all-feature Clippy with warnings denied passed. Physical
 observation of the calmer vardiff and the `watch` view on the Avalon's service
 is a separate gate.
+
+## Device reports and controls through asic-rs (2026-10-08)
+
+#### PR #40
+
+Device reports and controls now come from asic-rs 0.8.5 (256 Foundation,
+Apache-2.0), which identifies most SHA-256 makes and firmwares, mixed with
+Pickaxe's own CGMiner and Bitaxe code as the extension (`fleet.rs`). asic-rs
+supplies model, firmware, power and the reports of makes Pickaxe did not read;
+Pickaxe's reader keeps the 5-minute rate, the hottest reading and the fan
+where a device gives them, reads Avalon Nano power, answers for unidentified
+devices, and sends Avalon work levels. Controls list what asic-rs supports
+for the device (Restart, Pause, Resume, blink the light) plus Avalon work
+levels. Pool settings, MAC addresses, serial numbers and host names are never
+collected. All connected devices are asked in parallel (up to 32 at once).
+
+Live, read-only check against the operator's Avalon Nano 3 on the local
+network (opt-in test `real_device_is_identified_and_reported`): asic-rs
+identified "AvalonNano3", firmware 25103101_0736b2e, and offered Restart,
+Pause, Resume and both light actions; the mixed report showed 3.42 TH/s
+(five-minute), 95 °C hottest, fan 74% and 127 W. asic-rs alone read the
+Nano's power as 2,756 W: the Nano's `PS[0 0 0 4 2756 126 330]` holds its
+27.56 V input fifth and watts sixth, while asic-rs reads the fifth value as
+watts for every Avalon. Pickaxe reads Nano power itself; this is worth
+reporting to asic-rs.
+
+Dependencies: asic-rs brings tokio, reqwest with rustls and the makes and
+firmwares crates; it builds on Windows and Linux. cargo-deny (advisories,
+bans, licenses, sources) passes with one scoped exception: webpki-root-certs
+1.0.9, Mozilla's root certificates as data under CDLA-Permissive-2.0.
+
+Validation: Windows all-feature host suite, 438 library and 16 binary tests
+passed, 20 opt-in tests ignored, 31 hardware tests filtered; formatting,
+all-target/all-feature Clippy and the server-only (`stratum-v2`) Clippy with
+warnings denied passed. A device control action was not sent in this check.

@@ -12,6 +12,8 @@ pub mod command;
 #[cfg(feature = "stratum-v2")]
 pub mod device_api;
 #[cfg(feature = "stratum-v2")]
+pub mod fleet;
+#[cfg(feature = "stratum-v2")]
 pub mod journal;
 #[cfg(all(test, feature = "stratum-v2"))]
 mod journal_tests;
