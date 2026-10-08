@@ -5,7 +5,7 @@
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 use pickaxe_miner::{
-    backend, benchmark, cli, config, electrum, mining_lock, node, runtime, search, self_test,
+    backend, benchmark, cli, config, electrum, mining_lock, node, rigs, runtime, search, self_test,
     stratum_v2, telemetry, tui, tx,
 };
 
@@ -318,9 +318,9 @@ fn process_gpu_winners(
     }
 }
 
-/// Prints the compiled miner donation policy.
+/// Prints the miner donation policy in effect.
 fn print_donation(cfg: &RuntimeConfig) {
-    println!("{}", cfg.token.fee_policy(cfg.network).scheme.description());
+    println!("{}", cfg.fee_policy().scheme.description());
 }
 
 /// Parses and executes one interactive command.
@@ -732,6 +732,9 @@ fn runtime_config_from_cli_with_base(
     if let Some(intensity) = args.intensity {
         cfg.set_intensity(intensity)?;
     }
+    if let Some(donation) = args.token_donation {
+        cfg.token_donation = Some(donation);
+    }
     if let Some(address) = &args.address {
         cfg.set_payout(address.clone())?;
     }
@@ -921,6 +924,33 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
             })
         })
         .collect();
+    // Built apart from the status below, which is already near the json!
+    // macro's recursion limit.
+    let rigs = snapshot.rigs.as_ref().map(|rigs| {
+        let each: Vec<serde_json::Value> = rigs
+            .rigs
+            .iter()
+            .map(|rig| {
+                serde_json::json!({
+                    "name": rig.name,
+                    "gpus": rig.gpus,
+                    "rate": rig.rate,
+                    "winners": rig.winners,
+                    "connected_secs": rig.connected_secs,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "listen": rigs.listen,
+            "coordinator_key": rigs.key,
+            "connected": rigs.connected,
+            "gpus": rigs.gpus,
+            "rate": rigs.rate,
+            "winners": rigs.winners,
+            "rejected": rigs.rejected,
+            "rigs": each,
+        })
+    });
     serde_json::json!({
         "event": "status",
         "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
@@ -960,6 +990,7 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "gpu_telemetry": &snapshot.gpu_telemetry,
         "gpu_efficiency_candidates_per_watt": efficiency,
         "gpus": gpus,
+        "rigs": rigs,
     })
 }
 
@@ -1074,24 +1105,30 @@ fn run_headless_mining(
     gpus: &[backend::GpuDevice],
     json: bool,
     use_tui: bool,
-) -> Result<Option<(u8, String)>, String> {
+    rigs: Option<rigs::RigHub>,
+) -> Result<Option<SessionSettings>, String> {
     cfg.ensure_mining_supported()?;
     let _gpu_lock = mining_lock::acquire_gpu_lock()?;
     // Cache device information before the live miner starts so `/devices` never
     // probes drivers or creates temporary GPU contexts in the mining hot path.
-    let tui_devices = if use_tui {
+    // A coordinator with no GPU (`--rigs-only`) never loads a GPU driver.
+    let tui_devices = if use_tui && !gpus.is_empty() {
         backend::list_devices(backend::BackendKind::Auto).unwrap_or_default()
     } else {
         Vec::new()
     };
-    let supervisor = runtime::RuntimeSupervisor::start_on_gpus(cfg, gpus)?;
+    let supervisor = runtime::RuntimeSupervisor::start_on_gpus_with_rigs(cfg, gpus, rigs)?;
     if use_tui {
         let final_snapshot = tui::run(supervisor, tui_devices)?;
         print_runtime_snapshot(&final_snapshot, false);
-        return Ok(Some((
-            final_snapshot.search.intensity,
-            final_snapshot.payout_address,
-        )));
+        return Ok(Some(SessionSettings {
+            intensity: final_snapshot.search.intensity,
+            // #### PR #32: a donation raised in Advanced settings is saved;
+            // the token's minimum is not, so a later minimum applies.
+            token_donation: (final_snapshot.token_donation != final_snapshot.donation_minimum)
+                .then_some(final_snapshot.token_donation),
+            address: final_snapshot.payout_address,
+        }));
     }
     let intensity_rx = spawn_intensity_commands();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1134,11 +1171,17 @@ fn run_headless_mining(
     Ok(None)
 }
 
+/// What a mining session saves back to its profile when it stops.
+struct SessionSettings {
+    intensity: u8,
+    address: String,
+    token_donation: Option<pickaxe_miner::donation::TokenDonation>,
+}
+
 fn persist_session_profile(
     path: &std::path::Path,
     name: &str,
-    intensity: u8,
-    address: &str,
+    session: &SessionSettings,
 ) -> Result<(), String> {
     let mut profiles = config::MiningProfiles::load_optional(path)?;
     let profile = profiles
@@ -1146,8 +1189,9 @@ fn persist_session_profile(
         .iter_mut()
         .find(|profile| profile.name.eq_ignore_ascii_case(name))
         .ok_or("mining profile was renamed or removed during this session")?;
-    profile.settings.intensity = Some(intensity);
-    profile.settings.address = Some(address.to_string());
+    profile.settings.intensity = Some(session.intensity);
+    profile.settings.address = Some(session.address.clone());
+    profile.settings.token_donation_bps = session.token_donation;
     profiles.save(path)
 }
 
@@ -1477,8 +1521,10 @@ fn main() {
                     exit_after_error(2);
                 }
             }
+            // #### PR #32: a rig claims nothing, so it needs no address.
             if matches!(startup, MineStartup::Direct)
                 && (args.no_tui || args.json)
+                && args.coordinator.is_empty()
                 && cfg.payout_address.trim().is_empty()
             {
                 eprintln!("error: --address is required with --no-tui or --json");
@@ -1490,14 +1536,58 @@ fn main() {
                     exit_after_error(2);
                 }
             }
-            let selected_gpus =
+            // #### PR #32: `--rigs-only` uses no GPU on this computer.
+            let selected_gpus = if args.rigs_only {
+                Vec::new()
+            } else {
                 match backend::resolve_mining_devices(backend_kind, &effective_device) {
                     Ok(gpus) => gpus,
                     Err(error) => {
                         eprintln!("error: {error}");
                         exit_after_error(2);
                     }
-                };
+                }
+            };
+            // #### PR #32
+            // A rig mines its coordinator's jobs: no setup, payout, Fulcrum or
+            // node of its own, and it never claims; the coordinator does.
+            if !args.coordinator.is_empty() {
+                if args.coordinator.len() != args.coordinator_key.len() {
+                    eprintln!(
+                        "error: give one --coordinator-key for each --coordinator, in the same order"
+                    );
+                    exit_after_error(2);
+                }
+                let coordinators: Vec<(String, String)> = args
+                    .coordinator
+                    .iter()
+                    .cloned()
+                    .zip(args.coordinator_key.iter().cloned())
+                    .collect();
+                let result = (|| {
+                    let _gpu_lock = mining_lock::acquire_gpu_lock()?;
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let signal = Arc::clone(&stop);
+                    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+                        .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
+                    rigs::run_rig(
+                        &coordinators,
+                        args.rig_name.as_deref(),
+                        // #### PR #32: a public GPU pool pays the rig's own.
+                        Some(cfg.payout_address.as_str())
+                            .filter(|payout| !payout.trim().is_empty()),
+                        &selected_gpus,
+                        cfg.intensity,
+                        args.json,
+                        stop,
+                    )
+                })();
+                if let Err(error) = result {
+                    eprintln!("error: {error}");
+                    exit_after_error(1);
+                }
+                return;
+            }
             let (cfg, gpus, profile_name) = match startup {
                 MineStartup::InteractiveSetup => {
                     // Setup lists each physical GPU once, numbered as
@@ -1578,11 +1668,53 @@ fn main() {
                 MineStartup::Direct => (cfg, selected_gpus, None),
             };
             let use_tui = !(args.no_tui || args.json);
-            match run_headless_mining(cfg, &gpus, args.json, use_tui) {
-                Ok(Some((intensity, address))) => {
+            // #### PR #32
+            // --rigs-listen makes this miner the coordinator its rigs follow.
+            let rig_hub = match args.rigs_listen {
+                None => None,
+                Some(listen) => {
+                    match rigs::RigHub::start(listen, &config_path.with_extension("rigs-key")) {
+                        Ok(hub) => {
+                            // #### PR #32: a public GPU pool.
+                            if args.rigs_public {
+                                let address = match config::validate_payout_address(
+                                    cfg.network,
+                                    args.rigs_fee_address
+                                        .as_deref()
+                                        .unwrap_or(cfg.payout_address.as_str()),
+                                ) {
+                                    Ok(address) => address,
+                                    Err(error) => {
+                                        eprintln!("error: pool fee address: {error}");
+                                        exit_after_error(2);
+                                    }
+                                };
+                                hub.set_public(Some(rigs::PublicRigs {
+                                    fee_bps: args.rigs_fee.map_or(0, u16::from),
+                                    address,
+                                }));
+                            }
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "event": "rigs",
+                                    "listen": hub.listen(),
+                                    "coordinator_key": hub.key(),
+                                })
+                            );
+                            Some(hub)
+                        }
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            exit_after_error(2);
+                        }
+                    }
+                }
+            };
+            match run_headless_mining(cfg, &gpus, args.json, use_tui, rig_hub) {
+                Ok(Some(session)) => {
                     if let Some(name) = profile_name {
-                        if let Err(error) =
-                            persist_session_profile(&profiles_path, &name, intensity, &address)
+                        if let Err(error) = persist_session_profile(&profiles_path, &name, &session)
                         {
                             eprintln!("error: save mining profile: {error}");
                             exit_after_error(1);
@@ -1667,9 +1799,31 @@ mod tests {
             .unwrap();
         profiles.save(&path).unwrap();
 
-        persist_session_profile(&path, "Rig A", 40, config::DONATION_ADDRESS).unwrap();
+        let mut session = SessionSettings {
+            intensity: 40,
+            address: config::DONATION_ADDRESS.into(),
+            token_donation: Some(pickaxe_miner::donation::TokenDonation::from_bps(550)),
+        };
+        persist_session_profile(&path, "Rig A", &session).unwrap();
         let saved = config::MiningProfiles::load_optional(&path).unwrap();
         assert_eq!(saved.profiles[0].settings.intensity, Some(40));
+        // #### PR #32: a raised donation is saved and applies at the next start.
+        assert_eq!(
+            saved.profiles[0].settings.token_donation_bps,
+            session.token_donation
+        );
+        let mut next = RuntimeConfig::default();
+        saved.profiles[0]
+            .settings
+            .apply_to_runtime(&mut next)
+            .unwrap();
+        assert_eq!(next.token_donation().bps(), 550);
+        assert_eq!(next.fee_policy().scheme.work(), [350, 200]);
+        // Back at the minimum, nothing is saved.
+        session.token_donation = None;
+        persist_session_profile(&path, "Rig A", &session).unwrap();
+        let saved = config::MiningProfiles::load_optional(&path).unwrap();
+        assert_eq!(saved.profiles[0].settings.token_donation_bps, None);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1746,8 +1900,12 @@ mod tests {
         let title = format!("Pickaxe Miner v{version}");
         assert_eq!(title, "Pickaxe Miner v0.0.3");
 
-        assert!(workflow.contains("pickaxe-miner-v${version}-linux-x86_64"));
-        assert!(workflow.contains("pickaxe-miner-v$version-windows-x86_64"));
+        // #### PR #32: Linux and Windows packages are named by the matrix's
+        // arch, x86_64 and arm64.
+        assert!(workflow.contains("pickaxe-miner-v${version}-linux-${ARCH}"));
+        assert!(workflow.contains("pickaxe-miner-v$version-windows-$env:ARCH"));
+        assert!(workflow.contains("arch: x86_64"));
+        assert!(workflow.contains("arch: arm64"));
         assert!(workflow.contains("\"${TAG}-linux-x86_64.tar.gz\""));
         assert!(workflow.contains("\"${TAG}-windows-x86_64.zip\""));
         assert!(!workflow.contains("pickaxe-${TAG}"));
@@ -1763,13 +1921,14 @@ mod tests {
             windows.trim_end_matches("-windows-x86_64")
         );
 
-        // #### PR #22: ARM64 is supported by the shared macOS package. Keep
-        // excluding unsupported Windows/Linux ARM packages from this release.
+        // #### PR #22: macOS ARM64 comes from the shared portable package.
+        // #### PR #32: Linux and Windows ARM64 packages join it, built on
+        // native ARM64 runners.
         assert!(workflow.contains("\"${TAG}-macos-arm64.tar.gz\""));
         assert!(workflow.contains("\"${TAG}-browser.tar.gz\""));
         assert!(workflow.contains("name: Verify portable package provenance"));
-        assert!(!workflow.contains("-linux-arm64"));
-        assert!(!workflow.contains("-windows-arm64"));
+        assert!(workflow.contains("\"${TAG}-linux-arm64.tar.gz\""));
+        assert!(workflow.contains("\"${TAG}-windows-arm64.zip\""));
         assert!(workflow.contains("GH_REPO: ${{ github.repository }}"));
         assert!(workflow.contains("--repo \"${GH_REPO}\""));
     }
@@ -1880,6 +2039,9 @@ mod tests {
                 memory_clock_mhz: Some(8_000.0),
                 fan_percent: None,
             },
+            rigs: None,
+            token_donation: pickaxe_miner::donation::TokenDonation::from_bps(400),
+            donation_minimum: pickaxe_miner::donation::TokenDonation::from_bps(400),
         };
 
         let status = runtime_snapshot_json(&snapshot);
@@ -2070,6 +2232,7 @@ mod tests {
             public_key: [0u8; 33],
             signature: [0u8; 64],
             transaction: Vec::new(),
+            payout: None,
         };
         assert!(validate_verified_winner_current(&winner, &cfg, live.as_ref()).is_ok());
 

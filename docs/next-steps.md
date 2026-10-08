@@ -60,6 +60,23 @@ that work in the existing PR; implementation and evidence are tracked in
 - Rigs connect over the same Stratum V2 transport as step 1; one dashboard
   shows every rig and GPU; rigs fail over to a backup coordinator.
 
+Status, first slice in #32: `mine --rigs-listen ADDR` makes the normal miner
+the coordinator, and `mine --coordinator ADDR --coordinator-key KEY` runs a
+rig. Jobs and winners travel over the Stratum V2 Noise transport as a Pickaxe
+extension (type `0x5043`, JSON payloads). The coordinator checks every rig
+winner (job, Schnorr signature, digest, proof of work, a search key separate
+from the payout) before its claim path, which rebuilds the transaction from
+the coordinator's own job and payouts, so a rig cannot redirect a reward.
+Rigs switch to each successor job as soon as the coordinator starts it. The
+coordinator's dashboard and `--json` status list each rig (name, GPUs, rate,
+winners, time connected). A rig can be given backup coordinators, tried in
+order. Rigs ship in the default build. A coordinator can run with no GPU
+(`--rigs-only`), and a live test on one PC (a coordinator with no GPU and a
+CUDA rig and a wgpu rig on Chipnet) claimed 349 rig winners in 10 minutes;
+see [farm.md](farm.md). Still to come: a live test across
+machines. The portable engine fixes from issue #30 are in #32 too (see
+Follow-ups from #22).
+
 ## Step 3: the gaps
 
 - ASIC-exclusive tokens: SAFA-style tokens hash an 80-byte commitment laid out
@@ -119,11 +136,14 @@ Researched on 2026-10-05.
 
 ## Follow-ups from #22
 
-- Claim latency on rigs with slow GPUs: a winner is claimed once every GPU has
-  finished its current batch (at most about 350 ms on wgpu); claiming when the
-  winning GPU's batch ends would remove that wait.
-- Hardware not yet run: Intel GPUs, discrete AMD cards on native HIP, Linux GPUs
-  and Apple Silicon.
+- Done in #35: a winner is claimed as soon as the winning GPU's batch ends,
+  without waiting for the other GPUs' batches (up to about 350 ms on wgpu).
+- Intel GPUs: an HD 520 user found three portable-engine problems (issue #30);
+  #32 fixes all three (wgpu 30's crash on older Vulkan drivers through wgpu's
+  unreleased upstream fix, the self-test on T2 engines, and throttled mining
+  stuck at its first batch size), awaiting a run on the HD 520.
+- Hardware not yet run: discrete AMD cards on native HIP, Linux GPUs and Apple
+  Silicon.
 - Telemetry for GPUs mined through wgpu on Windows when no vendor tool is
   installed.
 - A longer test of an integrated GPU beside a discrete one (it added about 2% in

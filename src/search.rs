@@ -38,9 +38,7 @@ pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 565_248;
 #[cfg(feature = "tail-grind")]
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 65_536;
 const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES;
-/// Throttled batches are a quarter of the full batch: small enough for
-/// fine duty pacing, large enough to keep the GPU busy during a burst.
-const THROTTLED_BATCH_DIVISOR: u32 = 4;
+use crate::gpu_types::THROTTLED_BATCH_DIVISOR;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const PAUSE_POLL: Duration = Duration::from_millis(25);
@@ -50,6 +48,8 @@ pub(crate) enum PhotonEngine {
     Hip(Box<HipPhotonEngine>),
     #[cfg(feature = "portable-wgpu")]
     Wgpu(Box<WgpuPhotonEngine>),
+    #[cfg(feature = "opencl")]
+    OpenCl(Box<crate::opencl_photon::OpenClPhotonEngine>),
 }
 
 impl PhotonEngine {
@@ -87,6 +87,23 @@ impl PhotonEngine {
                         "wgpu fallback is not compiled; rebuild with --features portable-wgpu"
                             .into(),
                     )
+                }
+            }
+            BackendKind::OpenCl => {
+                #[cfg(feature = "opencl")]
+                {
+                    Ok(Self::OpenCl(Box::new(
+                        crate::opencl_photon::OpenClPhotonEngine::new(
+                            device_ordinal,
+                            max_batch_candidates,
+                            winner_buffer_cap,
+                        )?,
+                    )))
+                }
+                #[cfg(not(feature = "opencl"))]
+                {
+                    let _ = (device_ordinal, max_batch_candidates, winner_buffer_cap);
+                    Err("OpenCL is not compiled; rebuild with --features opencl".into())
                 }
             }
             BackendKind::Auto => {
@@ -132,6 +149,11 @@ impl PhotonEngine {
                 engine.set_proof_rule(MiningToken::Photon.photon_deployment(network).proof_rule);
                 engine.set_job(template, target, private_key)
             }
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => {
+                engine.set_proof_rule(MiningToken::Photon.photon_deployment(network).proof_rule);
+                engine.set_job(template, target, private_key)
+            }
         }
     }
 
@@ -146,6 +168,8 @@ impl PhotonEngine {
             Self::Hip(engine) => engine.search_batch(nonce_base, candidate_count),
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.search_batch(nonce_base, candidate_count),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => engine.search_batch(nonce_base, candidate_count),
         }
     }
 
@@ -156,6 +180,8 @@ impl PhotonEngine {
             Self::Hip(engine) => engine.persistent_device_bytes(),
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.persistent_device_bytes(),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => engine.persistent_device_bytes(),
         }
     }
 
@@ -166,6 +192,8 @@ impl PhotonEngine {
             Self::Hip(engine) => format!("{:?}", engine.table_source()),
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => format!("{:?}", engine.table_source()),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => engine.table_source().to_owned(),
         }
     }
 
@@ -190,6 +218,8 @@ impl PhotonEngine {
             }
             #[cfg(feature = "portable-wgpu")]
             Self::Wgpu(engine) => engine.recommended_batch_candidates(),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(engine) => engine.recommended_batch_candidates(),
         };
         intensity_batch_candidates(capacity, intensity)
     }
@@ -199,6 +229,7 @@ impl PhotonEngine {
 pub(crate) const fn production_max_batch_candidates(backend: BackendKind) -> u32 {
     match backend {
         BackendKind::Wgpu => PORTABLE_WGPU_MAX_BATCH_CANDIDATES,
+        BackendKind::OpenCl => crate::gpu_types::OPENCL_MAX_BATCH_CANDIDATES,
         BackendKind::Cuda => CUDA_MAX_BATCH_CANDIDATES,
         BackendKind::Auto | BackendKind::Hip => MAX_BATCH_CANDIDATES,
     }
@@ -552,6 +583,10 @@ struct SharedControl {
     paused: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
     generation_id: Arc<AtomicU64>,
+    /// #### PR #32: the donation's share of the work, changed while mining
+    /// from Advanced settings; each GPU applies it at its next batch.
+    work_fee: Arc<Mutex<Option<crate::donation::Policy>>>,
+    work_fee_version: Arc<AtomicU64>,
 }
 
 /// One GPU worker's own state.
@@ -737,7 +772,16 @@ fn run_worker(
         paused,
         intensity,
         generation_id,
+        work_fee: shared_work_fee,
+        work_fee_version,
     } = shared;
+    // The donation in effect now, which may have changed since the search
+    // started; read the version first so a change in between is not missed.
+    let mut seen_work_fee = work_fee_version.load(Ordering::Acquire);
+    let work_fee = (*shared_work_fee
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    .or(work_fee);
     let GpuCounters {
         stop,
         batch_in_flight,
@@ -764,6 +808,8 @@ fn run_worker(
         PhotonEngine::Hip(_) => BackendKind::Hip,
         #[cfg(feature = "portable-wgpu")]
         PhotonEngine::Wgpu(_) => BackendKind::Wgpu,
+        #[cfg(feature = "opencl")]
+        PhotonEngine::OpenCl(_) => BackendKind::OpenCl,
     };
     let quantum = crate::mining_control::work_allocation_quantum(
         backend,
@@ -851,6 +897,26 @@ fn run_worker(
         }
 
         let active_intensity = intensity.load(Ordering::Relaxed).clamp(10, 100);
+        // #### PR #32: a donation changed in Advanced settings rebuilds the
+        // work schedule at this batch; the recipients' addresses stay the same.
+        let version = work_fee_version.load(Ordering::Acquire);
+        if version != seen_work_fee {
+            seen_work_fee = version;
+            let next = *shared_work_fee
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let (Some((schedule, _, policy)), Some(next)) = (&mut allocation, next) {
+                match crate::donation::Schedule::new(next.scheme, quantum, rng.random()) {
+                    Ok(rebuilt) => {
+                        *schedule = rebuilt;
+                        *policy = next;
+                    }
+                    Err(error) => {
+                        diagnostics.record_batch_error(format!("donation change failed: {error}"))
+                    }
+                }
+            }
+        }
         if let Some((schedule, payouts, _)) = &allocation {
             let address = &payouts[schedule.recipient() as usize];
             let next = (|| {
@@ -1132,6 +1198,35 @@ impl SearchHandle {
         Self::start_inner(devices, intensity, job, false, Some(policy))
     }
 
+    /// #### PR #32
+    /// A search with no GPU on this computer, for a coordinator whose rigs do
+    /// all the mining (`--rigs-only`): it checks each job and follows its
+    /// generation and pause state like a GPU search, and finds nothing.
+    pub fn start_without_gpus(
+        intensity: u8,
+        job: MiningJob,
+        policy: crate::donation::Policy,
+    ) -> Result<Self, String> {
+        if !(10..=100).contains(&intensity) {
+            return Err("intensity must be 10..=100".into());
+        }
+        policy.payouts(job.network, &job.payout_address)?;
+        validate_job(&job)?;
+        let (_, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
+        Ok(Self {
+            shared: SharedControl {
+                paused: Arc::new(AtomicBool::new(false)),
+                intensity: Arc::new(AtomicU8::new(intensity)),
+                generation_id: Arc::new(AtomicU64::new(job.generation_id)),
+                work_fee: Arc::new(Mutex::new(Some(policy))),
+                work_fee_version: Arc::new(AtomicU64::new(0)),
+            },
+            workers: Vec::new(),
+            winner_rx,
+            started: Instant::now(),
+        })
+    }
+
     /// Creates one worker per GPU and their control channels.
     fn start_inner(
         devices: &[(BackendKind, usize)],
@@ -1188,6 +1283,8 @@ impl SearchHandle {
             paused: Arc::new(AtomicBool::new(initially_paused)),
             intensity: Arc::new(AtomicU8::new(intensity)),
             generation_id: Arc::new(AtomicU64::new(job.generation_id)),
+            work_fee: Arc::new(Mutex::new(work_fee)),
+            work_fee_version: Arc::new(AtomicU64::new(0)),
         };
         let (winner_tx, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
         let mut handle = Self {
@@ -1259,6 +1356,13 @@ impl SearchHandle {
         if job.generation_id == self.generation_id() {
             return Ok(());
         }
+        if self.workers.is_empty() {
+            // No GPU here: the rigs mine the job; only its generation moves.
+            self.shared
+                .generation_id
+                .store(job.generation_id, Ordering::Release);
+            return Ok(());
+        }
         let (reply_tx, reply_rx) = mpsc::sync_channel(self.workers.len());
         let mut sent = 0;
         for worker in self.workers.iter().filter(|worker| worker.alive()) {
@@ -1311,6 +1415,32 @@ impl SearchHandle {
         self.shared.generation_id.load(Ordering::Acquire)
     }
 
+    /// #### PR #32
+    /// Changes the donation's share of the work: each GPU applies it at its
+    /// next batch, and a GPU that restarts later starts with it.
+    pub fn set_work_fee(&self, policy: crate::donation::Policy) -> Result<(), String> {
+        policy.scheme.validate()?;
+        *self
+            .shared
+            .work_fee
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(policy);
+        self.shared.work_fee_version.fetch_add(1, Ordering::AcqRel);
+        for worker in &self.workers {
+            worker.unpark();
+        }
+        Ok(())
+    }
+
+    /// The donation's share of the work in effect.
+    pub fn work_fee(&self) -> Option<crate::donation::Policy> {
+        *self
+            .shared
+            .work_fee
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Drains host-verified GPU winners for settlement.
     pub fn drain_winners(&self) -> Vec<VerifiedWinner> {
         self.winner_rx.try_iter().collect()
@@ -1348,9 +1478,16 @@ impl SearchHandle {
         Ok(self.snapshot())
     }
 
-    /// Returns the search state: Stopped while no GPU is mining.
+    /// Returns the search state: Stopped while no GPU is mining. A search
+    /// with no GPU on this computer mines through its rigs.
     fn state(&self) -> MiningState {
-        if !self.workers.iter().any(GpuWorker::mining) {
+        if self.workers.is_empty() {
+            if self.shared.paused.load(Ordering::Relaxed) {
+                MiningState::Paused
+            } else {
+                MiningState::Mining
+            }
+        } else if !self.workers.iter().any(GpuWorker::mining) {
             MiningState::Stopped
         } else if self.shared.paused.load(Ordering::Relaxed) {
             MiningState::Paused
@@ -1483,6 +1620,34 @@ mod tests {
     use super::*;
     use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
     use secp256k1::SecretKey;
+
+    // #### PR #32
+    #[test]
+    fn a_search_without_gpus_follows_jobs_and_finds_nothing() {
+        let job = crate::mining_job::tests::easy_job();
+        let policy = crate::config::MiningToken::Photon.fee_policy(job.network);
+        assert!(SearchHandle::start_without_gpus(5, job.clone(), policy).is_err());
+        let search = SearchHandle::start_without_gpus(100, job.clone(), policy).unwrap();
+        assert_eq!(search.snapshot().state, MiningState::Mining);
+        let mut next = job;
+        next.generation_id += 1;
+        search.replace_job(next.clone()).unwrap();
+        assert_eq!(search.generation_id(), next.generation_id);
+        search.apply_control(RuntimeCommand::Pause).unwrap();
+        assert_eq!(search.snapshot().state, MiningState::Paused);
+        search.apply_control(RuntimeCommand::Resume).unwrap();
+        // A raised donation is kept for the rigs' next jobs.
+        let raised = crate::config::MiningToken::Photon
+            .fee_policy_at(next.network, crate::donation::TokenDonation::from_bps(600));
+        search.set_work_fee(raised).unwrap();
+        assert_eq!(search.work_fee().unwrap().scheme, raised.scheme);
+        assert!(search.drain_winners().is_empty());
+        assert!(!search.batch_in_flight());
+        let stats = search.stop();
+        assert!(stats.gpus.is_empty());
+        assert_eq!(stats.candidates, 0);
+        assert!(!stats.waiting_for_job);
+    }
 
     #[test]
     fn search_batch_error_is_retained_and_stops_the_worker() {
@@ -1791,6 +1956,7 @@ mod tests {
                 public_key: [2u8; 33],
                 signature: [0u8; 64],
                 transaction: vec![0x02],
+                payout: None,
             })
             .collect();
 
@@ -1830,6 +1996,8 @@ mod tests {
                 paused: Arc::new(AtomicBool::new(false)),
                 intensity: Arc::new(AtomicU8::new(10)),
                 generation_id,
+                work_fee: Arc::new(Mutex::new(None)),
+                work_fee_version: Arc::new(AtomicU64::new(0)),
             },
             workers: workers
                 .into_iter()
@@ -2013,6 +2181,8 @@ mod tests {
             paused: Arc::new(AtomicBool::new(false)),
             intensity: Arc::new(AtomicU8::new(100)),
             generation_id: Arc::new(AtomicU64::new(1)),
+            work_fee: Arc::new(Mutex::new(None)),
+            work_fee_version: Arc::new(AtomicU64::new(0)),
         };
         let gpu = GpuCounters::new();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
