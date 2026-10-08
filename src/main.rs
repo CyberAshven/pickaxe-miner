@@ -1796,7 +1796,8 @@ fn main() {
                                 })
                             );
                             if !args.json && !use_tui {
-                                for (place, command) in rigs::join_lines(&hub.summary(), interfaces)
+                                for (place, command) in
+                                    rigs::join_lines(&hub.summary(), cfg.network, interfaces)
                                 {
                                     println!("rigs join ({}): {command}", place.label());
                                 }

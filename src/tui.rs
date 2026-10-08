@@ -2301,6 +2301,7 @@ fn handle_key(
                 Some(rigs) => {
                     state.connect = Some(crate::rigs::join_lines(
                         rigs,
+                        snapshot.network,
                         crate::reach::Interfaces::detect(),
                     ));
                     state.settings_mode = false;
@@ -3109,12 +3110,19 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 Span::raw(format!("{builtin} built-in + {fulcrum} yours ({label})")),
                 "[Enter]",
             ),
+            // #### PR #40: GPU mining takes its PHOTON jobs from a saved
+            // node first, and from the Fulcrum servers without one.
             SettingsRow::Node => (
                 "BCH node",
-                Span::raw(if nodes == 0 {
-                    format!("none saved for {label}")
-                } else {
-                    format!("{nodes} saved for {label}")
+                Span::raw(match (nodes, state.mode) {
+                    (0, MiningMode::Gpu) => {
+                        format!("none saved for {label}; jobs come from the Fulcrum servers")
+                    }
+                    (0, _) => format!("none saved for {label}"),
+                    (_, MiningMode::Gpu) => {
+                        format!("{nodes} saved for {label}; jobs come from your node first")
+                    }
+                    _ => format!("{nodes} saved for {label}"),
                 }),
                 "[Enter]",
             ),
@@ -5920,6 +5928,7 @@ mod tests {
             let mut state = TuiState::new(&snapshot);
             state.connect = Some(crate::rigs::join_lines(
                 snapshot.rigs.as_ref().unwrap(),
+                snapshot.network,
                 interfaces,
             ));
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();

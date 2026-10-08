@@ -178,6 +178,16 @@ node on another computer needs its RPC login in the address
 node's client and version, and a node that cannot be used is named with its
 reason, such as a refused login or a node still synchronizing.
 
+Several nodes: add more to the node list (node1, node2, …). The server starts
+on the first that gives a synchronized template and moves to the next, in
+order, whenever its node gives none; it tries the new node at once, and the
+failed one waits at the back of the list. The dashboard and `watch` show
+"node 2 of 3" and the status counts the moves. Found blocks are saved whole,
+so a block waiting for a reply goes to whichever node is in use. The block
+journal belongs to the network and payout, not to one node, so the server
+also starts when its first node is down; a journal written by an older
+build opens while its node is still configured.
+
 On the workers page, `c` opens controls for the top row's device, with its
 model, firmware and power. It lists what that make and firmware support
 through asic-rs (Restart, Pause and Resume mining, blink or stop blinking its

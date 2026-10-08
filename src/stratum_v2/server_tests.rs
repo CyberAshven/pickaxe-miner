@@ -185,6 +185,17 @@ impl Running {
         state_directory: Arc<TestDirectory>,
         public: Option<super::payout::PublicPool>,
     ) -> Self {
+        Self::start_nodes(vec![node], state_directory, public)
+    }
+
+    /// #### PR #40: a server with its nodes in failover order; `node` is the
+    /// first.
+    fn start_nodes(
+        nodes: Vec<Arc<Mutex<Node>>>,
+        state_directory: Arc<TestDirectory>,
+        public: Option<super::payout::PublicPool>,
+    ) -> Self {
+        let node = nodes[0].clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -200,13 +211,13 @@ impl Running {
             authority_secret: secret,
             share_target: [255; 32],
             journal_path: state_directory.journal(),
-            source_identity: [42; 32],
+            legacy_sources: vec![[42; 32]],
         };
         let thread = {
             let stop = stop.clone();
             let stats = stats.clone();
-            let rpc = Rpc(node.clone());
-            thread::spawn(move || server::run(listener, rpc, config, stop, stats))
+            let rpcs: Vec<Rpc> = nodes.into_iter().map(Rpc).collect();
+            thread::spawn(move || server::run(listener, rpcs, config, stop, stats))
         };
         let running = Self {
             stop,
@@ -947,6 +958,45 @@ fn sv1_transient_node_failure_revokes_work_and_recovers_without_reconnect() {
         (0, 0)
     );
     assert_eq!(stats.last_template_error, Some("node RPC unavailable"));
+}
+
+// #### PR #40
+#[test]
+fn the_server_moves_to_its_next_node_when_its_node_stops_answering() {
+    let node = || {
+        Arc::new(Mutex::new(Node {
+            height: 325908,
+            tip: "ab".repeat(32),
+            reject: false,
+            submissions: 0,
+            lose_replies: false,
+            submitted: Vec::new(),
+            known: std::collections::HashSet::new(),
+            unavailable: false,
+            public: false,
+        }))
+    };
+    let (first, second) = (node(), node());
+    let server = Running::start_nodes(
+        vec![first.clone(), second.clone()],
+        Arc::new(TestDirectory::new()),
+        None,
+    );
+    let stats = server.stats.lock().unwrap().clone();
+    assert_eq!((stats.nodes, stats.active_node), (2, 0));
+    first.lock().unwrap().unavailable = true;
+    server.wait(|stats| stats.node_switches >= 1 && stats.active_node == 1 && stats.template_ready);
+    // A block found now goes to the second node.
+    let mut device = Device::connect(&server, false);
+    device.solve_and_submit(0);
+    server.wait(|stats| stats.blocks_accepted == 1);
+    assert_eq!(second.lock().unwrap().submissions, 1);
+    assert_eq!(first.lock().unwrap().submissions, 0);
+    device.sender.close();
+    // When the second fails too, the first (back again) takes over.
+    first.lock().unwrap().unavailable = false;
+    second.lock().unwrap().unavailable = true;
+    server.wait(|stats| stats.node_switches >= 2 && stats.active_node == 0 && stats.template_ready);
 }
 
 #[test]

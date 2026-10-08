@@ -33,9 +33,12 @@ pub struct RigSummary {
 /// #### PR #40
 /// The command each rig runs to join, once per address other computers can
 /// reach this coordinator at (its local network and Tailscale addresses for
-/// a wildcard listener). A public pool's rigs add their own payout.
+/// a wildcard listener). A public pool's rigs add their own payout, which a
+/// rig checks against its network, so a Chipnet coordinator's command says
+/// `--chipnet`.
 pub fn join_lines(
     summary: &RigSummary,
+    network: crate::config::MiningNetwork,
     interfaces: crate::reach::Interfaces,
 ) -> Vec<(crate::reach::Place, String)> {
     let Ok(listen) = summary.listen.parse() else {
@@ -44,8 +47,12 @@ pub fn join_lines(
     crate::reach::addresses(listen, interfaces)
         .into_iter()
         .map(|(place, address)| {
+            let network = match network {
+                crate::config::MiningNetwork::Mainnet => "",
+                crate::config::MiningNetwork::Chipnet => " --chipnet",
+            };
             let mut command = format!(
-                "pickaxe mine --coordinator {address} --coordinator-key {}",
+                "pickaxe mine{network} --coordinator {address} --coordinator-key {}",
                 summary.key
             );
             if summary.public {
@@ -1328,8 +1335,9 @@ mod tests {
             key: "KEY".into(),
             ..RigSummary::default()
         };
+        let mainnet = crate::config::MiningNetwork::Mainnet;
         assert_eq!(
-            join_lines(&summary, interfaces),
+            join_lines(&summary, mainnet, interfaces),
             [
                 (
                     Place::LocalNetwork,
@@ -1341,15 +1349,15 @@ mod tests {
                 ),
             ]
         );
-        // A public pool's rigs name their own payout; a loopback coordinator
-        // takes rigs on this computer only.
+        // A public pool's rigs name their own payout, checked against the
+        // network; a loopback coordinator takes rigs on this computer only.
         summary.public = true;
         summary.listen = "127.0.0.1:3340".into();
         assert_eq!(
-            join_lines(&summary, interfaces),
+            join_lines(&summary, crate::config::MiningNetwork::Chipnet, interfaces),
             [(
                 Place::ThisComputer,
-                "pickaxe mine --coordinator 127.0.0.1:3340 --coordinator-key KEY --address YOUR_BCH_ADDRESS".into()
+                "pickaxe mine --chipnet --coordinator 127.0.0.1:3340 --coordinator-key KEY --address YOUR_BCH_ADDRESS".into()
             )]
         );
     }

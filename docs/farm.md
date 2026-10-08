@@ -143,5 +143,17 @@ other 3 in its mempool. Neither rig reconnected, and the coordinator's process
 showed no GPU activity. That build reported each rig's rate as 0; rigs now
 measure their own rate (fixed after the test, host-tested).
 
+A public GPU pool, live on Chipnet on 2026-10-08 with PR #40's build: the
+coordinator with `--rigs-public --rigs-fee 20` (20% only so fee windows show
+in a 10-minute test) and the same two GPUs as two rigs, each with its own
+payout: rig A joined at the coordinator's local-network address and rig B at
+its Tailscale address, both from the coordinator's `connect` list. The rigs
+sent 95 winners (rig A 94, rig B 1) and the coordinator claimed all 95. On
+Chipnet, by the output carrying the tokens, 75 claims paid rig A's address,
+1 paid rig B's, 16 the operator's fee address (17% of the rigs' claims,
+against a 20% fee window) and 3 the donation; none paid anyone else, and all
+95 confirmed. Chipnet's PHOTON target was about six times harder than in the
+first test.
+
 Not yet tested live: rigs on separate machines, a backup coordinator taking
 over, and more than two rigs.

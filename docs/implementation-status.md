@@ -936,7 +936,10 @@ prints each command as a `rigs join` line.
 
 Evidence: host tests cover the Tailscale range, interface sorting (including
 a Tailscale exit node), the listener expansion, the commands for private and
-public pools, and the rendered page with and without Tailscale.
+public pools (with `--chipnet` on Chipnet, which a rig needs to accept a
+Chipnet `--address`), and the rendered page with and without Tailscale. Live:
+the public GPU pool test in [farm.md](farm.md#tested) joined one rig at the
+local-network address and one at the Tailscale address from `connect`.
 
 ## Connection info for devices, joining by one line, and the GPU pool from setup (2026-10-08)
 
@@ -967,3 +970,49 @@ Evidence: host tests cover the address lines for every listener kind, the
 page for each mode, the JSON lines, the one-line pool address (with and
 without a key, IPv6, SV1 refused) through to the pool list, and the setup's
 GPU pool rows, validation and result.
+
+## Node failover for the ASIC server (2026-10-08)
+
+#### PR #40
+
+The server keeps every configured BCH node, in failover order starting with
+the first that gave a synchronized template at start. When its node gives no
+template (down, refusing the login, or still synchronizing), it moves to the
+next one at once; the failed node waits at the back, so a later failure moves
+on again. Work on the old node's templates is revoked and devices take a new
+job; template generations keep counting, so no job identifier repeats. Saved
+blocks are whole blocks, so a block waiting for a node's reply goes to
+whichever node is in use. The dashboard and the status show "node N of M"
+and the number of moves.
+
+The block journal is now bound to its network and payout script instead of
+also the node it was first written with (PR #38's binding), which refused to
+open when the server started on its second node. A journal written under the
+old binding opens while its node is still configured and is rebound.
+
+Evidence: host tests cover moving to the second node when the first stops
+answering (a block found then goes to the second node only) and back when the
+second fails, the rebinding of a journal written under the old binding (and
+its refusal without that node or with another payout), and the dashboard
+label. Not yet run against two live nodes.
+
+## PHOTON from the miner's own node (2026-10-08)
+
+#### PR #40
+
+With a BCH node configured, the PHOTON job source is the node: the session
+(`ElectrumSession` with a node link) finds the baton with `scantxoutset` on
+the covenant script, follows it with `gettxout` and the mempool's successor,
+rescans when it loses it, and answers the other calls the miner makes with
+standard RPCs: `getmempoolinfo` and `getnetworkinfo` for the relay fee,
+`sendrawtransaction` for claims, and `getrawtransaction` for a transaction by
+id, which without a transaction index looks in the mempool, then in the block
+holding one of its unspent outputs, then in the last 24 blocks. The runtime
+connects to the node first, at start and on every reconnect, and to the
+Fulcrum servers when no node is configured or none can give the PHOTON state;
+on the node, each refresh is the node's state, with no Fulcrum proof. Before,
+the node was a fallback route trusted only within a proof lease from Fulcrum,
+so mining needed Fulcrum to start and stopped after a claim without it.
+
+Evidence: host tests with a scripted node cover the RPC answers and the
+transaction lookup without an index. Not yet mined live from a node.

@@ -8,7 +8,7 @@ Rust-first, GPU-only miner for CashTokens on Bitcoin Cash.
 
 Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken baton it is the first minable CashToken in the BCH network: the baton outpoint, NFT commitment, token amount, and PHOTON target. BCH `getblocktemplate` and `getblocktemplatelight` are not a mining job source.
 
-Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
+With a BCH node in your settings, PHOTON jobs come from your own node: it finds the baton in its UTXO set (a one-time scan, a minute or two on mainnet), follows it through its mempool and blocks, and sends your claims; no transaction index is needed and a pruned node works. Without a node, or when it cannot give the PHOTON state, the public Fulcrum servers do the same. BCH (ASIC) mining always needs a node: Fulcrum cannot build or submit blocks.
 
 Mainnet and Chipnet run the PHOTON v3.2 contract (mainnet category `53bd86e3f123918d2d7040449f88f7ed1bbddc309b66f2ac67cd429278f5ea58`). The retired PHOTON v0 is no longer mined; releases before v0.0.3 mine only v0.
 

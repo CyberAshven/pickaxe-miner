@@ -60,19 +60,45 @@ pub struct Journal {
     state: State,
 }
 
+/// #### PR #40
+/// What a journal belongs to: its network and payout script, and before
+/// PR #40 also the node it was written with (`source`).
+fn binding(source: Option<&[u8; 32]>, network: MiningNetwork, script: &[u8]) -> String {
+    let mut context = match source {
+        Some(source) => source.to_vec(),
+        None => b"pickaxe block journal: network and payout".to_vec(),
+    };
+    context.extend(network.as_str().as_bytes());
+    context.extend(script);
+    hex::encode(double_sha256(&context))
+}
+
+#[cfg(test)]
+pub(super) fn legacy_binding(source: &[u8; 32], network: MiningNetwork, script: &[u8]) -> String {
+    binding(Some(source), network, script)
+}
+
 impl Journal {
     pub fn open(
         path: &Path,
         network: MiningNetwork,
         payout: &str,
-        source: [u8; 32],
+        legacy_sources: &[[u8; 32]],
     ) -> Result<Self, String> {
         let payout = config::validate_coinbase_address(network, payout)?;
         let scripts = super::payout::scripts(network, &payout, None)?;
-        let mut context = source.to_vec();
-        context.extend(network.as_str().as_bytes());
-        context.extend(&scripts[0]);
-        let context = hex::encode(double_sha256(&context));
+        // #### PR #40
+        // What: the journal belongs to its network and payout, no longer to
+        // the one node it was first written with.
+        // Why: with several nodes the server moves to the next when one stops
+        // answering, and it may start on its second node when the first is
+        // down; a journal bound to the first node refused to open then. Its
+        // blocks are whole blocks, valid at any node of the same network.
+        // A journal written under the old binding opens when its node is
+        // still configured (`legacy_sources`), and is rebound.
+        // Look here if: a journal is refused as another network's or
+        // payout's, or "a node that is no longer configured".
+        let context = binding(None, network, &scripts[0]);
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -95,6 +121,7 @@ impl Journal {
         config::restrict_private_config(&lock_path)
             .map_err(|_| "cannot protect block journal lock")?;
         regular_if_present(path)?;
+        let mut rebound = false;
         let state = if path.exists() {
             config::restrict_private_config(path).map_err(|_| "cannot protect block journal")?;
             let mut bytes = Vec::new();
@@ -106,11 +133,20 @@ impl Journal {
             if bytes.len() as u64 > MAX_FILE_BYTES {
                 return Err("block journal exceeds storage budget".into());
             }
-            let state: State = serde_json::from_slice(&bytes)
+            let mut state: State = serde_json::from_slice(&bytes)
                 .map_err(|_| "invalid block journal; refusing to replace it")?;
-            if state.version != 1 || state.context != context {
-                return Err("block journal belongs to another node, network or payout".into());
+            let legacy = legacy_sources
+                .iter()
+                .any(|source| state.context == binding(Some(source), network, &scripts[0]));
+            if state.version != 1 || (state.context != context && !legacy) {
+                return Err(
+                    "block journal belongs to another network or payout, or to a node that is \
+                     no longer configured"
+                        .into(),
+                );
             }
+            rebound = state.context != context;
+            state.context = context.clone();
             state
         } else {
             State {
@@ -131,7 +167,7 @@ impl Journal {
             scripts,
             state,
         };
-        if !path.exists() {
+        if !path.exists() || rebound {
             journal.persist(&journal.state)?;
         }
         Ok(journal)

@@ -133,11 +133,11 @@ pub struct NativePhotonSession {
 
 /// Reconstruct the PHOTON live state from BCHN's native UTXO/token RPCs.
 ///
-/// This provider is intentionally not advertised to the runtime source router
-/// yet. `scantxoutset` bootstraps the confirmed baton, then the mempool is used
+/// `scantxoutset` bootstraps the confirmed baton, then the mempool is used
 /// only when that baton has already been spent by an unconfirmed successor.
-/// Runtime capability remains fail-closed until the normalized state is proven
-/// equivalent to the canonical Fulcrum path.
+/// #### PR #40: with a node configured, this is the miner's job source
+/// (`ElectrumSession::connect_node_failover`); the Fulcrum path is the
+/// fallback, and proves a node it routes to as before.
 impl NativePhotonSession {
     pub fn endpoint(&self) -> &str {
         &self.url
@@ -174,6 +174,40 @@ impl NativePhotonSession {
 
         Err(format!(
             "All native node PHOTON-state RPCs failed (sequential, ban-safe):\n{}",
+            failures.join("\n")
+        ))
+    }
+
+    /// #### PR #40
+    /// Connects from a baton already known (the job being mined, or a
+    /// Fulcrum server's answer at start, which the node checks), so the UTXO
+    /// set is scanned only when that baton and its successor are both lost.
+    pub fn resume(
+        endpoints: &[String],
+        deployment: &PhotonDeployment,
+        job: &LiveJob,
+    ) -> Result<Self, String> {
+        if endpoints.is_empty() {
+            return Err("no native node endpoints configured for PHOTON state".into());
+        }
+        let mut failures = Vec::new();
+        for url in endpoints {
+            let mut session = Self {
+                url: url.clone(),
+                deployment: *deployment,
+                baton: baton_from_live_job(job),
+                snapshot: LiveStateSnapshot {
+                    tip_hash: job.tip_hash.clone(),
+                    job: job.clone(),
+                },
+            };
+            match session.refresh() {
+                Ok(_) => return Ok(session),
+                Err(error) => failures.push(format!("{}: {error}", redact_url(url))),
+            }
+        }
+        Err(format!(
+            "All native node PHOTON-state RPCs failed:\n{}",
             failures.join("\n")
         ))
     }

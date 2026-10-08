@@ -38,7 +38,9 @@ pub struct ServerConfig {
     pub authority_secret: [u8; 32],
     pub share_target: Hash,
     pub journal_path: PathBuf,
-    pub source_identity: [u8; 32],
+    /// #### PR #40: the configured nodes' identities, so a journal written
+    /// when journals were bound to one node still opens (and is rebound).
+    pub legacy_sources: Vec<[u8; 32]>,
     pub donation: Arc<RwLock<BchDonation>>,
     /// #### PR #40: a public pool, where each miner's blocks pay them.
     pub public: Option<super::payout::PublicPool>,
@@ -65,6 +67,11 @@ pub struct ServerStats {
     pub template_failures: u64,
     pub last_template_error: Option<&'static str>,
     pub height: Option<u32>,
+    /// #### PR #40: the node templates come from (0 is the first in failover
+    /// order), how many nodes there are, and how often the server moved on.
+    pub active_node: usize,
+    pub nodes: usize,
+    pub node_switches: u64,
 }
 
 #[derive(Clone)]
@@ -112,13 +119,17 @@ impl SolvedParents {
 
 /// Bind the listener before calling this function. The caller owns the stop
 /// flag and display, so native TUI and CPU tests use the same server lifecycle.
+/// `nodes` are the BCH nodes in failover order, the one to start with first.
 pub fn run<R: NodeRpc + Send + 'static>(
     listener: TcpListener,
-    rpc: R,
+    nodes: Vec<R>,
     config: ServerConfig,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
+    let total = nodes.len();
+    let mut standby = VecDeque::from(nodes);
+    let rpc = standby.pop_front().ok_or("no BCH node configured")?;
     validate_payout_address(config.network, &config.payout)
         .map_err(|_| "invalid payout for selected network")?;
     if config.share_target == [0; 32] {
@@ -132,8 +143,12 @@ pub fn run<R: NodeRpc + Send + 'static>(
         &config.journal_path,
         config.network,
         &config.payout,
-        config.source_identity,
+        &config.legacy_sources,
     )?;
+    if let Ok(mut stats) = stats.lock() {
+        stats.nodes = total;
+        stats.active_node = 0;
+    }
     let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
     let shared = Arc::new(Shared {
         job: RwLock::new(None),
@@ -149,6 +164,7 @@ pub fn run<R: NodeRpc + Send + 'static>(
     let network = config.network;
     let node = thread::spawn(move || -> Result<(), String> {
         let mut provider = TemplateProvider::new(rpc, network);
+        let mut active = 0;
         let mut refreshed = Instant::now() - Duration::from_secs(60);
         let mut retries = RetrySchedule::default();
         while !node_shared.stop.load(Ordering::Relaxed) {
@@ -224,6 +240,25 @@ pub fn run<R: NodeRpc + Send + 'static>(
                             stats.last_template_error = Some(template_reason(&error));
                         }
                         publish(&node_shared, None);
+                        // #### PR #40
+                        // What: with more than one node, move to the next in
+                        // failover order when this one gives no template, and
+                        // try it at once; the failed node waits at the back.
+                        // Why: one node down stopped the whole server while
+                        // its other nodes were fine. Saved blocks are whole
+                        // blocks, so they go to the next node too.
+                        // Look here if: the node number on the dashboard keeps
+                        // changing, which means every node is failing.
+                        if let Some(mut next) = standby.pop_front() {
+                            provider.replace_node(&mut next);
+                            standby.push_back(next);
+                            active = (active + 1) % total;
+                            if let Ok(mut stats) = node_shared.stats.lock() {
+                                stats.active_node = active;
+                                stats.node_switches = stats.node_switches.saturating_add(1);
+                            }
+                            refreshed = Instant::now() - Duration::from_secs(60);
+                        }
                     }
                 }
             }

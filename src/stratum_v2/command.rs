@@ -106,7 +106,8 @@ pub fn run(
     // for check-node, the dashboard and the saved status.
     let node_client = node
         .as_ref()
-        .and_then(|(rpc, _)| rpc.info().ok())
+        .and_then(|(nodes, _)| nodes.first())
+        .and_then(|rpc| rpc.info().ok())
         .map(|info| info.client);
     let StratumV2Command::Serve {
         listen,
@@ -214,7 +215,7 @@ pub fn run(
     };
     let stats = Arc::new(Mutex::new(ServerStats::default()));
     let worker = match (node, listener, authority_secret) {
-        (Some((rpc, _)), Some(listener), Some(authority_secret)) => {
+        (Some((nodes, _)), Some(listener), Some(authority_secret)) => {
             // Difficulty 4096 is each device's starting target; vardiff then
             // moves it toward 20 shares a minute. No nominal device rate is
             // shown as measured.
@@ -224,7 +225,10 @@ pub fn run(
                 authority_secret,
                 share_target: compact_target(0x1b0ffff0)?,
                 journal_path: config_path.with_extension("sv2-blocks.json"),
-                source_identity: rpc.source_identity()?,
+                legacy_sources: nodes
+                    .iter()
+                    .map(NativeNodeRpc::source_identity)
+                    .collect::<Result<_, _>>()?,
                 public: public.clone(),
                 donation: donation.clone(),
                 #[cfg(test)]
@@ -233,7 +237,7 @@ pub fn run(
             let stop = stop.clone();
             let stats = stats.clone();
             Some(thread::spawn(move || {
-                server::run(listener, rpc, settings, stop, stats)
+                server::run(listener, nodes, settings, stop, stats)
             }))
         }
         _ => None,
@@ -332,7 +336,7 @@ pub fn run(
             let status = status_json(
                 config.network.as_str(),
                 pool_address.as_deref(),
-                node_client.as_deref(),
+                node_client.as_deref().filter(|_| snapshot.active_node == 0),
                 &snapshot,
                 donation_value,
                 &devices,
@@ -357,7 +361,7 @@ pub fn run(
                 } else {
                     format!(
                     "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
-                    config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_suffix(node_client.as_deref()),
+                    config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
@@ -388,7 +392,7 @@ pub fn run(
                         "{} · Node {}{} · Height {} · Donation {}{}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
                         config.network.as_str(),
                         if snapshot.template_ready { "Ready" } else { "Waiting" },
-                        node_suffix(node_client.as_deref()),
+                        node_label(node_client.as_deref(), &snapshot),
                         snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
                         donation_summary(donation_value),
                         pool_suffix,
@@ -1322,6 +1326,9 @@ fn status_json(
         "sv1_connection_errors": snapshot.sv1_connection_errors,
         "template_failures": snapshot.template_failures,
         "last_template_error": snapshot.last_template_error,
+        "node_active": snapshot.active_node + 1,
+        "nodes": snapshot.nodes,
+        "node_switches": snapshot.node_switches,
         "sv1_local_rejected": snapshot.sv1_local_rejected,
         "sessions_started": snapshot.sessions_started,
         "device_details": devices,
@@ -1348,6 +1355,9 @@ struct WatchStatus {
     upstream: Option<String>,
     /// The node's client and version in local mode.
     node: Option<String>,
+    /// #### PR #40: which node of several templates come from (1-based).
+    node_active: usize,
+    nodes: usize,
     updated: u64,
     ready: bool,
     height: Option<u32>,
@@ -1394,7 +1404,12 @@ impl WatchStatus {
             "{} · Node {}{} · Height {} · Donation {} · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
             self.network,
             if self.ready { "Ready" } else { "Waiting" },
-            node_suffix(self.node.as_deref()),
+            node_suffix(self.node.as_deref())
+                + &if self.nodes > 1 {
+                    format!(" · node {} of {}", self.node_active, self.nodes)
+                } else {
+                    String::new()
+                },
             self.height
                 .map(|height| height.to_string())
                 .unwrap_or_else(|| "Waiting".into()),
@@ -1482,6 +1497,22 @@ fn public_pool_suffix(public: Option<&super::payout::PublicPool>) -> String {
 }
 
 /// #### PR #40
+/// After "Node Ready": the node's client while templates come from the node
+/// it was read from (the first in failover order), and which node of
+/// several, such as " (Bitcoin Cash Node 29.1.0) · node 1 of 2".
+fn node_label(client: Option<&str>, stats: &ServerStats) -> String {
+    let mut label = node_suffix(client.filter(|_| stats.active_node == 0));
+    if stats.nodes > 1 {
+        label.push_str(&format!(
+            " · node {} of {}",
+            stats.active_node + 1,
+            stats.nodes
+        ));
+    }
+    label
+}
+
+/// #### PR #40
 /// The node's client after "Node Ready", such as " (Bitcoin Cash Node 29.1.0)".
 fn node_suffix(client: Option<&str>) -> String {
     client
@@ -1489,18 +1520,27 @@ fn node_suffix(client: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), String> {
+/// The configured nodes in failover order, starting with the first one that
+/// gives a synchronized template, and that template.
+fn preflight(config: &RuntimeConfig) -> Result<(Vec<NativeNodeRpc>, BchTemplate), String> {
     let endpoints = config.custom_node_endpoints();
     if endpoints.is_empty() {
         return Err("configure your BCHN RPC connection before starting BCH ASIC mining".into());
     }
     let mut reason = "node RPC unavailable";
-    for endpoint in endpoints {
+    for (index, endpoint) in endpoints.iter().enumerate() {
         let mut provider =
-            TemplateProvider::new(NativeNodeRpc::new(endpoint.to_owned()), config.network);
+            TemplateProvider::new(NativeNodeRpc::new((*endpoint).to_owned()), config.network);
         match provider.refresh() {
+            // #### PR #40: the others follow in their order, as the server's
+            // failover list.
             Ok((_, template)) => {
-                return Ok((NativeNodeRpc::new(endpoint.to_owned()), template.clone()))
+                let nodes = endpoints[index..]
+                    .iter()
+                    .chain(&endpoints[..index])
+                    .map(|endpoint| NativeNodeRpc::new((*endpoint).to_owned()))
+                    .collect();
+                return Ok((nodes, template.clone()));
             }
             // #### PR #40
             // The last node's reason, such as a refused login or a node on
