@@ -81,6 +81,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "KEY", action = clap::ArgAction::Append)]
     pub coordinator_key: Vec<String>,
 
+    /// With --rigs-listen: mine with the rigs only and use no GPU on this
+    /// computer, so the coordinator can run on any machine. Needs --address.
+    #[arg(long, global = true, requires_all = ["rigs_listen", "address"])]
+    pub rigs_only: bool,
+
+    /// This rig's name on the coordinator's dashboard (default: the
+    /// computer's name).
+    #[arg(long, global = true, value_name = "NAME", requires = "coordinator")]
+    pub rig_name: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -324,6 +334,44 @@ mod tests {
         .unwrap();
         assert_eq!(cli.coordinator, ["192.0.2.1:3340", "192.0.2.2:3340"]);
         assert_eq!(cli.coordinator_key, ["main", "backup"]);
+        // #### PR #32
+        // A rig may be named; a coordinator may mine with its rigs only, given
+        // where it pays.
+        let named = Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--coordinator",
+            "192.0.2.1:3340",
+            "--coordinator-key",
+            "main",
+            "--rig-name",
+            "rack-1",
+        ])
+        .unwrap();
+        assert_eq!(named.rig_name.as_deref(), Some("rack-1"));
+        assert!(Cli::try_parse_from(["pickaxe", "mine", "--rig-name", "rack-1"]).is_err());
+        let only = Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--rigs-listen",
+            "0.0.0.0:3340",
+            "--rigs-only",
+            "--address",
+            "payout",
+        ])
+        .unwrap();
+        assert!(only.rigs_only);
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--rigs-listen",
+            "0.0.0.0:3340",
+            "--rigs-only"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["pickaxe", "mine", "--rigs-only", "--address", "payout"]).is_err()
+        );
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_err()
         );

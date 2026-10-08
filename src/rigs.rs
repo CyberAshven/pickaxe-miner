@@ -38,6 +38,20 @@ pub struct RigLine {
     pub connected_secs: u64,
 }
 
+/// #### PR #32
+/// A rig's rate since its previous report, from the candidates its GPUs have
+/// tried in all: only the main miner's runtime fills `current_rate`, so a rig
+/// measures its own. The first report has no window and says 0.
+#[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
+fn window_rate(previous: &mut Option<(std::time::Instant, u64)>, candidates: u64) -> f64 {
+    let now = std::time::Instant::now();
+    let rate = previous.map_or(0.0, |(at, before)| {
+        candidates.saturating_sub(before) as f64 / now.duration_since(at).as_secs_f64().max(0.001)
+    });
+    *previous = Some((now, candidates));
+    rate
+}
+
 /// A rig's name as sent, without control characters that could disturb a
 /// terminal, and at most 64 characters.
 #[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
@@ -235,7 +249,8 @@ mod net {
     const JOB: u8 = 2;
     const WINNER: u8 = 3;
     const STATS: u8 = 4;
-    const MAX_RIGS: usize = 64;
+    /// #### PR #32: room for a farm; each rig is one coordinator thread.
+    const MAX_RIGS: usize = 1024;
     const MAX_QUEUED_WINNERS: usize = 16;
     /// A rig reports every few seconds; this long without a word closes it.
     const QUIET: Duration = Duration::from_secs(30);
@@ -589,6 +604,7 @@ mod net {
     /// winners back. A rig never talks to the chain and never claims.
     pub fn run_rig(
         coordinators: &[(String, String)],
+        name: Option<&str>,
         gpus: &[GpuDevice],
         intensity: u8,
         json: bool,
@@ -605,12 +621,34 @@ mod net {
         if devices.is_empty() {
             return Err("no GPU selected for mining".into());
         }
-        let name = std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "rig".into())
+        // #### PR #32: `--rig-name`, or the computer's name (a Linux
+        // service has no HOSTNAME variable, so /etc/hostname too).
+        let name = name
+            .map(str::to_owned)
+            .or_else(|| std::env::var("COMPUTERNAME").ok())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .or_else(|| {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|name| name.trim().to_owned())
+                    .filter(|name| !name.is_empty())
+            })
+            .unwrap_or_else(|| "rig".into())
             .chars()
             .take(64)
             .collect::<String>();
+        // The GPUs this rig mines on, so its operator can check them.
+        report(
+            json,
+            "gpus",
+            serde_json::json!({
+                "name": name,
+                "gpus": gpus
+                    .iter()
+                    .map(|gpu| format!("{} ({}:{})", gpu.name, gpu.backend.as_str(), gpu.index))
+                    .collect::<Vec<_>>(),
+            }),
+        );
         let mut search: Option<SearchHandle> = None;
         let mut backoff = Duration::from_secs(1);
         let mut winners_sent = 0u64;
@@ -636,6 +674,8 @@ mod net {
                         )?)?;
                         let mut last_stats = Instant::now() - STATS_EVERY;
                         let mut last_status = Instant::now();
+                        let mut rate_window = None;
+                        let mut rate = 0.0;
                         let mut paused_since: Option<Instant> = None;
                         while !stop.load(Ordering::Relaxed) {
                             if let Some(message) = receiver.receive(Duration::from_millis(200))? {
@@ -686,11 +726,11 @@ mod net {
                                 paused_since = None;
                             }
                             if last_stats.elapsed() >= STATS_EVERY {
-                                let stats = handle.snapshot();
+                                rate = window_rate(&mut rate_window, handle.snapshot().candidates);
                                 sender.send(frame(
                                     STATS,
                                     &RigStats {
-                                        rate: stats.current_rate,
+                                        rate,
                                         gpus: devices.len(),
                                         winners: winners_sent,
                                     },
@@ -698,12 +738,11 @@ mod net {
                                 last_stats = Instant::now();
                             }
                             if last_status.elapsed() >= Duration::from_secs(10) {
-                                let stats = handle.snapshot();
                                 report(
                                     json,
                                     "status",
                                     serde_json::json!({
-                                        "rate": crate::telemetry::format_hash_rate(stats.current_rate),
+                                        "rate": crate::telemetry::format_hash_rate(rate),
                                         "gpus": devices.len(),
                                         "winners_sent": winners_sent,
                                     }),
@@ -782,6 +821,7 @@ mod stub {
 
     pub fn run_rig(
         _coordinators: &[(String, String)],
+        _name: Option<&str>,
         _gpus: &[crate::backend::GpuDevice],
         _intensity: u8,
         _json: bool,
@@ -907,6 +947,20 @@ mod tests {
         assert_eq!(index, 1);
         assert!(net::connect_first(&[(down, authority)]).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // #### PR #32
+    #[test]
+    fn a_rig_measures_its_rate_between_reports() {
+        let mut window = None;
+        assert_eq!(window_rate(&mut window, 1_000), 0.0);
+        let (at, _) = window.unwrap();
+        // Pretend the previous report was two seconds ago.
+        window = Some((at - std::time::Duration::from_secs(2), 1_000));
+        let rate = window_rate(&mut window, 9_000);
+        assert!((3_900.0..=4_000.0).contains(&rate), "{rate}");
+        // A search restarted with fewer candidates never reads negative.
+        assert_eq!(window_rate(&mut window, 10), 0.0);
     }
 
     #[test]

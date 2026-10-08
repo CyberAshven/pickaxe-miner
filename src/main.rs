@@ -1108,7 +1108,8 @@ fn run_headless_mining(
     let _gpu_lock = mining_lock::acquire_gpu_lock()?;
     // Cache device information before the live miner starts so `/devices` never
     // probes drivers or creates temporary GPU contexts in the mining hot path.
-    let tui_devices = if use_tui {
+    // A coordinator with no GPU (`--rigs-only`) never loads a GPU driver.
+    let tui_devices = if use_tui && !gpus.is_empty() {
         backend::list_devices(backend::BackendKind::Auto).unwrap_or_default()
     } else {
         Vec::new()
@@ -1506,8 +1507,10 @@ fn main() {
                     exit_after_error(2);
                 }
             }
+            // #### PR #32: a rig claims nothing, so it needs no address.
             if matches!(startup, MineStartup::Direct)
                 && (args.no_tui || args.json)
+                && args.coordinator.is_empty()
                 && cfg.payout_address.trim().is_empty()
             {
                 eprintln!("error: --address is required with --no-tui or --json");
@@ -1519,14 +1522,18 @@ fn main() {
                     exit_after_error(2);
                 }
             }
-            let selected_gpus =
+            // #### PR #32: `--rigs-only` uses no GPU on this computer.
+            let selected_gpus = if args.rigs_only {
+                Vec::new()
+            } else {
                 match backend::resolve_mining_devices(backend_kind, &effective_device) {
                     Ok(gpus) => gpus,
                     Err(error) => {
                         eprintln!("error: {error}");
                         exit_after_error(2);
                     }
-                };
+                }
+            };
             // #### PR #32
             // A rig mines its coordinator's jobs: no setup, payout, Fulcrum or
             // node of its own, and it never claims; the coordinator does.
@@ -1551,6 +1558,7 @@ fn main() {
                         .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
                     rigs::run_rig(
                         &coordinators,
+                        args.rig_name.as_deref(),
                         &selected_gpus,
                         cfg.intensity,
                         args.json,

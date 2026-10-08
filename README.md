@@ -86,10 +86,10 @@ Your other machines can mine as rigs of one coordinator, so they never compete f
 
 | Machine | Command |
 | --- | --- |
-| The coordinator | your usual `mine` command plus `--rigs-listen 0.0.0.0:3340` |
-| Each rig | `pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key>` |
+| The coordinator | your usual `mine` command plus `--rigs-listen 0.0.0.0:3340`; add `--rigs-only` for a coordinator that uses no GPU, on any computer |
+| Each rig | `pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key>`, optionally `--rig-name <name>` |
 
-The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. Repeat `--coordinator` and `--coordinator-key` (in the same order) to give a rig backup coordinators, tried in order.
+The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. Repeat `--coordinator` and `--coordinator-key` (in the same order) to give a rig backup coordinators, tried in order. For farms (rigs as services, ports, the live test) see [docs/farm.md](docs/farm.md).
 
 ### Browser miner
 

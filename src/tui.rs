@@ -1144,7 +1144,9 @@ impl TuiState {
         if self.history.len() == HISTORY_CAP {
             self.history.pop_front();
         }
-        let rate = snapshot.search.current_rate;
+        // A coordinator charts its whole farm: its own rate and its rigs'.
+        let rate =
+            snapshot.search.current_rate + snapshot.rigs.as_ref().map_or(0.0, |rigs| rigs.rate);
         self.history.push_back(HistorySample {
             rate: if rate.is_finite() { rate.max(0.0) } else { 0.0 },
             gpu: snapshot.gpu_telemetry.clone(),
@@ -1929,7 +1931,9 @@ fn apply_palette_command(
             state.status_line = "GPU device catalog added to runtime log".into();
         }
         PaletteCommand::Backend => {
-            let backend = if snapshot.gpus.len() > 1 {
+            let backend = if snapshot.gpus.len() > 1
+                || (snapshot.gpus.is_empty() && snapshot.rigs.is_some())
+            {
                 format!("GPUs: {}", gpu_list(snapshot))
             } else {
                 format!(
@@ -2702,6 +2706,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) 
     }
     let gpus = if snapshot.gpus.len() > 1 {
         format!("{} GPUs", snapshot.gpus.len())
+    } else if snapshot.gpus.is_empty() && snapshot.rigs.is_some() {
+        // #### PR #32: `--rigs-only`.
+        "no GPU here · rigs mine".to_owned()
     } else {
         format!(
             "{} device {}",
@@ -3019,17 +3026,31 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
         })
         .collect::<Vec<_>>();
 
+    // #### PR #32
+    // A coordinator shows its rigs' rate too; with no GPU of its own, only
+    // theirs.
+    let rigs_rate = snapshot.rigs.as_ref().map(|rigs| rigs.rate);
     let mut fields = vec![
         RuntimeField::new(
             "Hashrate",
-            wrap(match snapshot.network {
-                MiningNetwork::Chipnet => format!(
+            wrap(match (snapshot.network, rigs_rate) {
+                (_, Some(rigs)) if snapshot.gpus.is_empty() => {
+                    format!("{} from the rigs", hash_rate(rigs))
+                }
+                (_, Some(rigs)) => format!(
+                    "{} here + {} rigs = {} · avg here {}",
+                    hash_rate(search.current_rate),
+                    hash_rate(rigs),
+                    hash_rate(search.current_rate + rigs),
+                    hash_rate(search.rate),
+                ),
+                (MiningNetwork::Chipnet, None) => format!(
                     "now {} · active GPU {} · wall avg {}",
                     hash_rate(search.current_rate),
                     hash_rate(search.active_rate),
                     hash_rate(search.rate),
                 ),
-                MiningNetwork::Mainnet => format!(
+                (MiningNetwork::Mainnet, None) => format!(
                     "{} · avg {} · peak {}",
                     hash_rate(search.current_rate),
                     hash_rate(search.rate),
@@ -3181,6 +3202,9 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
 
 /// The mining GPUs as `CUDA:0 + WGPU:1`.
 fn gpu_list(snapshot: &RuntimeSnapshot) -> String {
+    if snapshot.gpus.is_empty() && snapshot.rigs.is_some() {
+        return "none here; the rigs mine".to_owned();
+    }
     if snapshot.gpus.is_empty() {
         return format!(
             "{}:{}",
@@ -4644,6 +4668,36 @@ mod tests {
                 .any(|row| row.contains("switch ") && row.contains("->")),
             "peer switch must be visible on one events row: {rows:?}"
         );
+    }
+
+    // #### PR #32
+    #[test]
+    fn a_coordinator_without_gpus_says_its_rigs_mine() {
+        let mut snapshot = test_snapshot();
+        snapshot.gpus.clear();
+        snapshot.gpu_backend = crate::runtime::RIGS_ONLY.into();
+        snapshot.rigs = Some(crate::rigs::RigSummary {
+            listen: "0.0.0.0:3340".into(),
+            key: "key".into(),
+            connected: 1,
+            gpus: 2,
+            rate: 2.0e9,
+            winners: 3,
+            rejected: 0,
+            rigs: vec![crate::rigs::RigLine {
+                name: "rack-1".into(),
+                gpus: 2,
+                rate: 2.0e9,
+                winners: 3,
+                connected_secs: 120,
+            }],
+        });
+        let rows = rendered_rows(&snapshot, 140, 40).join("\n");
+        assert!(rows.contains("no GPU here · rigs mine"), "{rows}");
+        assert!(rows.contains("2.00 GH/s from the rigs"), "{rows}");
+        assert!(rows.contains("rack-1 · 2 GPUs"), "{rows}");
+        assert!(!rows.contains("RIGS ONLY device"), "{rows}");
+        assert_eq!(gpu_list(&snapshot), "none here; the rigs mine");
     }
 
     /// Renders the dashboard at `width` x `height` and returns its rows.

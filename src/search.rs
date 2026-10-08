@@ -1165,6 +1165,33 @@ impl SearchHandle {
         Self::start_inner(devices, intensity, job, false, Some(policy))
     }
 
+    /// #### PR #32
+    /// A search with no GPU on this computer, for a coordinator whose rigs do
+    /// all the mining (`--rigs-only`): it checks each job and follows its
+    /// generation and pause state like a GPU search, and finds nothing.
+    pub fn start_without_gpus(
+        intensity: u8,
+        job: MiningJob,
+        policy: crate::donation::Policy,
+    ) -> Result<Self, String> {
+        if !(10..=100).contains(&intensity) {
+            return Err("intensity must be 10..=100".into());
+        }
+        policy.payouts(job.network, &job.payout_address)?;
+        validate_job(&job)?;
+        let (_, winner_rx) = mpsc::sync_channel(WINNER_CHANNEL_CAP);
+        Ok(Self {
+            shared: SharedControl {
+                paused: Arc::new(AtomicBool::new(false)),
+                intensity: Arc::new(AtomicU8::new(intensity)),
+                generation_id: Arc::new(AtomicU64::new(job.generation_id)),
+            },
+            workers: Vec::new(),
+            winner_rx,
+            started: Instant::now(),
+        })
+    }
+
     /// Creates one worker per GPU and their control channels.
     fn start_inner(
         devices: &[(BackendKind, usize)],
@@ -1292,6 +1319,13 @@ impl SearchHandle {
         if job.generation_id == self.generation_id() {
             return Ok(());
         }
+        if self.workers.is_empty() {
+            // No GPU here: the rigs mine the job; only its generation moves.
+            self.shared
+                .generation_id
+                .store(job.generation_id, Ordering::Release);
+            return Ok(());
+        }
         let (reply_tx, reply_rx) = mpsc::sync_channel(self.workers.len());
         let mut sent = 0;
         for worker in self.workers.iter().filter(|worker| worker.alive()) {
@@ -1381,9 +1415,16 @@ impl SearchHandle {
         Ok(self.snapshot())
     }
 
-    /// Returns the search state: Stopped while no GPU is mining.
+    /// Returns the search state: Stopped while no GPU is mining. A search
+    /// with no GPU on this computer mines through its rigs.
     fn state(&self) -> MiningState {
-        if !self.workers.iter().any(GpuWorker::mining) {
+        if self.workers.is_empty() {
+            if self.shared.paused.load(Ordering::Relaxed) {
+                MiningState::Paused
+            } else {
+                MiningState::Mining
+            }
+        } else if !self.workers.iter().any(GpuWorker::mining) {
             MiningState::Stopped
         } else if self.shared.paused.load(Ordering::Relaxed) {
             MiningState::Paused
@@ -1516,6 +1557,29 @@ mod tests {
     use super::*;
     use crate::cuda_photon::{PhotonCudaBatchResult, PhotonCudaWinner};
     use secp256k1::SecretKey;
+
+    // #### PR #32
+    #[test]
+    fn a_search_without_gpus_follows_jobs_and_finds_nothing() {
+        let job = crate::mining_job::tests::easy_job();
+        let policy = crate::config::MiningToken::Photon.fee_policy(job.network);
+        assert!(SearchHandle::start_without_gpus(5, job.clone(), policy).is_err());
+        let search = SearchHandle::start_without_gpus(100, job.clone(), policy).unwrap();
+        assert_eq!(search.snapshot().state, MiningState::Mining);
+        let mut next = job;
+        next.generation_id += 1;
+        search.replace_job(next.clone()).unwrap();
+        assert_eq!(search.generation_id(), next.generation_id);
+        search.apply_control(RuntimeCommand::Pause).unwrap();
+        assert_eq!(search.snapshot().state, MiningState::Paused);
+        search.apply_control(RuntimeCommand::Resume).unwrap();
+        assert!(search.drain_winners().is_empty());
+        assert!(!search.batch_in_flight());
+        let stats = search.stop();
+        assert!(stats.gpus.is_empty());
+        assert_eq!(stats.candidates, 0);
+        assert!(!stats.waiting_for_job);
+    }
 
     #[test]
     fn search_batch_error_is_retained_and_stops_the_worker() {

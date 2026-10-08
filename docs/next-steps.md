@@ -70,7 +70,10 @@ the coordinator's own job and payouts, so a rig cannot redirect a reward.
 Rigs switch to each successor job as soon as the coordinator starts it. The
 coordinator's dashboard and `--json` status list each rig (name, GPUs, rate,
 winners, time connected). A rig can be given backup coordinators, tried in
-order. Rigs ship in the default build. Still to come: a live test across
+order. Rigs ship in the default build. A coordinator can run with no GPU
+(`--rigs-only`), and a live test on one PC (a coordinator with no GPU and a
+CUDA rig and a wgpu rig on Chipnet) claimed 349 rig winners in 10 minutes;
+see [farm.md](farm.md). Still to come: a live test across
 machines. The portable engine fixes from issue #30 are in #32 too (see
 Follow-ups from #22).
 

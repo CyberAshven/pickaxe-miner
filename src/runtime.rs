@@ -36,6 +36,10 @@ use self::source_pool::{
     SourceCapability, SourceCatalog, SourceKind, AUTO_PROBE_LIMIT, DEFAULT_CAPABILITY_TTL_MS,
 };
 
+/// #### PR #32
+/// The backend name a coordinator with no GPU of its own shows: its rigs mine.
+pub const RIGS_ONLY: &str = "rigs only";
+
 const COMMAND_CAP: usize = 16;
 const EVENT_CAP: usize = 32;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
@@ -2593,14 +2597,19 @@ impl RuntimeSupervisor {
     /// #### PR #32
     /// As `start_on_gpus`, also coordinating GPU rigs: every job this miner
     /// mines is shared with them, and their checked winners join its own at
-    /// the claim path.
+    /// the claim path. With no GPUs, the rigs do all the mining.
     pub fn start_on_gpus_with_rigs(
         mut cfg: RuntimeConfig,
         gpus: &[GpuDevice],
         rigs: Option<RigHub>,
     ) -> Result<Self, String> {
         cfg.ensure_mining_supported()?;
-        let first = gpus.first().ok_or("no GPU selected for mining")?;
+        // #### PR #32
+        // With no GPU here, a coordinator mines through its rigs only
+        // (`--rigs-only`); without rigs there is nothing to mine with.
+        if gpus.is_empty() && rigs.is_none() {
+            return Err("no GPU selected for mining".into());
+        }
         for gpu in gpus {
             crate::backend::require_production_mining_backend(gpu.backend)?;
         }
@@ -2651,12 +2660,20 @@ impl RuntimeSupervisor {
             .iter()
             .map(|gpu| (gpu.backend, gpu.index as usize))
             .collect();
-        let search = SearchHandle::start_devices_with_work_fee(
-            &devices,
-            cfg.intensity,
-            initial_job,
-            cfg.token.fee_policy(cfg.network),
-        )?;
+        let search = if devices.is_empty() {
+            SearchHandle::start_without_gpus(
+                cfg.intensity,
+                initial_job,
+                cfg.token.fee_policy(cfg.network),
+            )?
+        } else {
+            SearchHandle::start_devices_with_work_fee(
+                &devices,
+                cfg.intensity,
+                initial_job,
+                cfg.token.fee_policy(cfg.network),
+            )?
+        };
         let initial_search = search.snapshot();
         let telemetry = LiveTelemetrySampler::start(crate::telemetry::telemetry_sources(gpus));
         let shutdown = ShutdownSignal::new(search.pause_handle());
@@ -2664,8 +2681,11 @@ impl RuntimeSupervisor {
             state: SupervisorState::Mining,
             network: cfg.network,
             fee_scheme: cfg.token.fee_policy(cfg.network).scheme,
-            gpu_backend: first.backend.as_str().into(),
-            gpu_device: first.index,
+            gpu_backend: gpus
+                .first()
+                .map_or(RIGS_ONLY, |gpu| gpu.backend.as_str())
+                .into(),
+            gpu_device: gpus.first().map_or(0, |gpu| gpu.index),
             gpus: gpus
                 .iter()
                 .map(|gpu| RuntimeGpu {
