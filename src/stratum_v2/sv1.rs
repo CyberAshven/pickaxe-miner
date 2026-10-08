@@ -748,6 +748,63 @@ mod tests {
     }
 
     #[test]
+    fn a_new_target_reaches_firmware_with_the_next_job_without_flushing_work() {
+        let job = |job_id: u32, min_ntime: Option<u32>| {
+            encoded(
+                NewExtendedMiningJob {
+                    channel_id: 3,
+                    job_id,
+                    min_ntime: binary_sv2::Sv2Option::new(min_ntime),
+                    version: 0x20000000,
+                    version_rolling_allowed: true,
+                    merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+                    coinbase_tx_prefix: [1u8; 32].as_slice().try_into().unwrap(),
+                    coinbase_tx_suffix: [2u8; 32].as_slice().try_into().unwrap(),
+                },
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+                true,
+            )
+            .unwrap()
+        };
+        let mut bridge = ready();
+        assert!(bridge.upstream(job(5, None)).unwrap().is_empty());
+        let parent = encoded(
+            SetNewPrevHash {
+                channel_id: 3,
+                job_id: 5,
+                prev_hash: (&[0u8; 32]).into(),
+                min_ntime: 1700000000,
+                nbits: 0x1d00ffff,
+            },
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            true,
+        )
+        .unwrap();
+        let first = bridge.upstream(parent).unwrap();
+        assert_eq!(first[0]["method"], "mining.set_difficulty");
+        assert_eq!(first[1]["params"][8], true);
+        // Vardiff: a new target, then an immediate job on the same block.
+        let target = super::super::template::compact_target(0x1b0ffff0).unwrap();
+        let set = encoded(
+            SetTarget {
+                channel_id: 3,
+                maximum_target: (&target).into(),
+            },
+            MESSAGE_TYPE_SET_TARGET,
+            true,
+        )
+        .unwrap();
+        assert!(bridge.upstream(set).unwrap().is_empty());
+        let next = bridge.upstream(job(6, Some(1700000000))).unwrap();
+        assert_eq!(next[0]["method"], "mining.set_difficulty");
+        assert!((next[0]["params"][0].as_f64().unwrap() - 4096.0).abs() < 0.01);
+        assert_eq!(next[1]["method"], "mining.notify");
+        // Work in flight is kept: no clean_jobs, and the older job still counts.
+        assert_eq!(next[1]["params"][8], false);
+        assert!(bridge.active.contains_key(&5) && bridge.active.contains_key(&6));
+    }
+
+    #[test]
     fn acknowledgement_requires_upstream_validation_and_maps_exact_request() {
         let mut bridge = ready();
         let (replies, shares) = bridge.request(submit(9)).unwrap();

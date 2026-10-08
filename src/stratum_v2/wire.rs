@@ -71,6 +71,13 @@ impl MiningSession {
         })
     }
 
+    /// Test hook: adds a channel together with its device maximum target.
+    #[cfg(test)]
+    pub fn insert_channel(&mut self, channel: Channel, maximum: Hash) {
+        self.maximum_targets.insert(channel.id, maximum);
+        self.channels.insert(channel.id, channel);
+    }
+
     /// Revoke validation immediately without destroying the authenticated
     /// transport. Recovery must send a clean activation even on the same tip.
     pub fn revoke_job(&mut self) {
@@ -106,15 +113,18 @@ impl MiningSession {
             });
             // Chipnet can have easier block work than a normal ASIC share.
             // Never ask firmware to discard headers that could win a block.
-            if !meets_target(&template.target, &channel.target) {
-                let maximum = self
-                    .maximum_targets
-                    .get(&channel.id)
-                    .ok_or("channel target missing")?;
-                if !meets_target(&template.target, maximum) {
-                    return Err("device maximum target would discard valid block work".into());
-                }
-                channel.target = template.target;
+            let maximum = self
+                .maximum_targets
+                .get(&channel.id)
+                .ok_or("channel target missing")?;
+            if !meets_target(&template.target, maximum) {
+                return Err("device maximum target would discard valid block work".into());
+            }
+            // #### PR #38
+            // Follow an easier block target down and, on the next normal
+            // template, back up to the share difficulty. SetTarget precedes
+            // the job so the job carries the new target.
+            if channel.settle(&template.target, maximum) {
                 frames.push(mining(Mining::SetTarget(SetTarget {
                     channel_id: channel.id,
                     maximum_target: (&channel.target).into(),
@@ -122,6 +132,36 @@ impl MiningSession {
             }
             channel.install_with_payout(id, generation, template.clone(), payout)?;
             frames.extend(job_frames(channel, immediate)?);
+        }
+        Ok(frames)
+    }
+
+    /// #### PR #38
+    /// Vardiff for every channel. A changed target goes out as SetTarget and
+    /// at once as a fresh job on the same template, because SetTarget only
+    /// applies to jobs sent after it. Job IDs come from the session's
+    /// counter; the previous job stays valid for work in flight.
+    pub fn retarget(&mut self, next_id: &mut u32) -> Result<Vec<SerializedFrame>, String> {
+        let mut frames = Vec::new();
+        for channel in self.channels.values_mut() {
+            let maximum = self
+                .maximum_targets
+                .get(&channel.id)
+                .ok_or("channel target missing")?;
+            let Some(target) = channel.retarget(maximum) else {
+                continue;
+            };
+            let (generation, template, payout) = {
+                let job = channel.job().ok_or("channel has no job")?;
+                (job.generation, job.template.clone(), job.payout)
+            };
+            *next_id = next_id.checked_add(1).ok_or("job identifiers exhausted")?;
+            frames.push(mining(Mining::SetTarget(SetTarget {
+                channel_id: channel.id,
+                maximum_target: (&target).into(),
+            }))?);
+            channel.install_with_payout(*next_id, generation, template, payout)?;
+            frames.extend(job_frames(channel, true)?);
         }
         Ok(frames)
     }
@@ -337,25 +377,19 @@ impl MiningSession {
             return Ok(vec![open_error(request, "max-target-out-of-range")?]);
         }
         self.next_channel += 1;
-        let desired = if meets_target(&self.share_target, &template.target) {
-            template.target
-        } else {
-            self.share_target
-        };
-        let target = if meets_target(&desired, &maximum) {
-            desired
-        } else {
-            maximum
-        };
+        // Every device starts at the configured share target; vardiff moves
+        // it from there.
         let mut channel = Channel::new(
             self.next_channel,
             kind,
-            target,
+            self.share_target,
             self.salt,
             self.network,
             &self.payout,
         )?;
         let (id, generation, template) = self.current.as_ref().unwrap();
+        channel.settle(&template.target, &maximum);
+        let target = channel.target;
         channel.install_with_payout(*id, *generation, template.clone(), self.payout_policy)?;
         let mut frames = vec![match kind {
             ChannelKind::Standard => mining(Mining::OpenStandardMiningChannelSuccess(
@@ -674,6 +708,37 @@ mod tests {
     }
 
     #[test]
+    fn retarget_sends_the_target_then_a_fresh_job_on_the_same_block() {
+        let mut server = session();
+        server.share_target = super::super::template::compact_target(0x1b0ffff0).unwrap();
+        let mut template = (*server.current.as_ref().unwrap().2).clone();
+        template.target = super::super::template::compact_target(0x1a00ffff).unwrap();
+        server.set_job(10, 4, Arc::new(template)).unwrap();
+        server.receive(setup(5), 1700000010).unwrap();
+        server.receive(open(), 1700000010).unwrap();
+        let id = *server.channels.keys().next().unwrap();
+        assert_eq!(server.channels[&id].target, server.share_target);
+        // A silent device: twenty seconds without shares eases its target.
+        server.channels.get_mut(&id).unwrap().vardiff_window(20, 0);
+        let mut next_id = 10;
+        let mut frames = server.retarget(&mut next_id).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].header().msg_type(), MESSAGE_TYPE_SET_TARGET);
+        assert_eq!(frames[1].header().msg_type(), MESSAGE_TYPE_NEW_MINING_JOB);
+        let job: NewMiningJob = binary_sv2::from_bytes(frames[1].payload()).unwrap();
+        // Same block: an immediate job, with no SetNewPrevHash.
+        assert!(!job.is_future());
+        assert_eq!(job.job_id, 11);
+        assert_eq!(next_id, 11);
+        let channel = &server.channels[&id];
+        assert_eq!(channel.job().unwrap().id, 11);
+        assert!(meets_target(&server.share_target, &channel.target));
+        assert_ne!(channel.target, server.share_target);
+        // Nothing more until the next window.
+        assert!(server.retarget(&mut next_id).unwrap().is_empty());
+    }
+
+    #[test]
     fn easy_network_work_is_not_discarded_by_asic_share_difficulty() {
         let mut server = session();
         server.share_target = super::super::template::compact_target(0x1b0ffff0).unwrap();
@@ -690,10 +755,16 @@ mod tests {
         let replies = server.set_job(11, 4, Arc::new(template.clone())).unwrap();
         assert_eq!(replies[0].header().msg_type(), MESSAGE_TYPE_SET_TARGET);
         assert_eq!(server.channels[&id].target, template.target);
+        // Back on normal block work, the share difficulty returns too.
+        let mut normal = template.clone();
+        normal.target = super::super::template::compact_target(0x1a00ffff).unwrap();
+        let replies = server.set_job(12, 5, Arc::new(normal)).unwrap();
+        assert_eq!(replies[0].header().msg_type(), MESSAGE_TYPE_SET_TARGET);
+        assert_eq!(server.channels[&id].target, server.share_target);
         // A firmware target ceiling cannot silently hide a later network win.
         server.maximum_targets.insert(id, initial);
         template.target = [255; 32];
-        assert!(server.set_job(12, 5, Arc::new(template)).is_err());
+        assert!(server.set_job(13, 6, Arc::new(template)).is_err());
 
         let mut server = session();
         server.receive(setup(5), 1700000010).unwrap();

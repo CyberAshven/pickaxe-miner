@@ -445,6 +445,21 @@ impl JobAvailability {
     }
 }
 
+impl JobAvailability {
+    /// #### PR #38
+    /// Vardiff runs only while a job is live. A new target reuses this
+    /// session's job counter, so a re-issued job never repeats an ID.
+    fn retarget(
+        &mut self,
+        mining: &mut MiningSession,
+    ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
+        if self.generation.is_none() {
+            return Ok(Vec::new());
+        }
+        mining.retarget(&mut self.next_id)
+    }
+}
+
 fn template_reason(error: &str) -> &'static str {
     match error {
         "node tip changed while fetching the template" => "tip changed during refresh",
@@ -499,6 +514,9 @@ fn serve_device(
             for frame in
                 availability.update(&mut mining, current_job()?, Instant::now(), donation()?)?
             {
+                sender.send(frame)?;
+            }
+            for frame in availability.retarget(&mut mining)? {
                 sender.send(frame)?;
             }
             if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
@@ -607,8 +625,7 @@ mod retry_tests {
         let mut mining =
             MiningSession::new(MiningNetwork::Chipnet, payout.clone(), [17; 12], [255; 32])
                 .unwrap();
-        mining.channels.insert(
-            1,
+        mining.insert_channel(
             Channel::new(
                 1,
                 ChannelKind::Standard,
@@ -618,6 +635,7 @@ mod retry_tests {
                 &payout,
             )
             .unwrap(),
+            [255; 32],
         );
         let job = PublishedJob {
             generation: 99,

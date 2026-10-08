@@ -10,11 +10,25 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
+use stratum_core::{
+    bitcoin::Target,
+    channels_sv2::{
+        target::{hash_rate_from_target, hash_rate_to_target},
+        Vardiff, VardiffState,
+    },
+};
 
 pub const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
 const MAX_SHARES_PER_JOB: usize = 16_384;
 pub const DEVICE_EXTRANONCE_SIZE: usize = 8;
 pub const MAX_ACTIVE_JOBS: usize = 8;
+// #### PR #38
+// Vardiff (SRI's reference rules) aims every device at about 20 shares a
+// minute, one every three seconds, from a 1 TH/s miner to a 1 PH/s one:
+// steady rate estimates for little LAN traffic. The floor keeps a silent or
+// misreported device from asking for a near-zero difficulty.
+pub const SHARES_PER_MINUTE: f32 = 20.0;
+const MIN_HASHRATE: f32 = 1.0e6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -35,6 +49,13 @@ pub struct Channel {
     seen: HashMap<u32, HashSet<Hash>>,
     pub accepted: u64,
     pub rejected: u64,
+    /// The share target vardiff wants. `target` is what the device was last
+    /// told: this one, made easier while the block target is easier, and
+    /// never easier than the device's maximum.
+    desired: Hash,
+    vardiff: VardiffState,
+    /// Vardiff's latest hash rate estimate, the baseline for its next check.
+    hashrate: f32,
 }
 
 #[derive(Clone)]
@@ -98,6 +119,11 @@ impl Channel {
             seen: HashMap::new(),
             accepted: 0,
             rejected: 0,
+            desired: target,
+            vardiff: VardiffState::new_with_min(MIN_HASHRATE)
+                .map_err(|_| "invalid system clock")?,
+            hashrate: hash_rate_from_target(target.into(), f64::from(SHARES_PER_MINUTE))
+                .map_or(MIN_HASHRATE, |rate| rate as f32),
         })
     }
 
@@ -178,6 +204,64 @@ impl Channel {
         self.job.as_ref()
     }
 
+    /// #### PR #38
+    /// Recomputes the target the device mines at: the desired one, made
+    /// easier while the block target is easier (a share that wins a block
+    /// must reach the server), never easier than the device's maximum. On
+    /// Chipnet's difficulty-1 windows this follows the block target down and,
+    /// on the next normal template, back up; before, the device stayed on
+    /// the easy target and flooded shares until it reconnected. Returns
+    /// whether the target changed; vardiff then counts afresh.
+    pub fn settle(&mut self, block: &Hash, maximum: &Hash) -> bool {
+        let mut target = if meets_target(&self.desired, block) {
+            *block
+        } else {
+            self.desired
+        };
+        if !meets_target(&target, maximum) {
+            target = *maximum;
+        }
+        if target == self.target {
+            return false;
+        }
+        self.target = target;
+        let _ = self.vardiff.reset_counter();
+        true
+    }
+
+    /// #### PR #38
+    /// Vardiff: once SRI's reference rules see the share rate drift from the
+    /// aim, the desired target follows the measured hash rate. Returns the
+    /// new target when the device must be told.
+    pub fn retarget(&mut self, maximum: &Hash) -> Option<Hash> {
+        let block = self.job.as_ref()?.template.target;
+        let hashrate = self
+            .vardiff
+            .try_vardiff(
+                self.hashrate,
+                &Target::from_le_bytes(self.target),
+                SHARES_PER_MINUTE,
+            )
+            .ok()
+            .flatten()?;
+        self.hashrate = hashrate;
+        self.desired = hash_rate_to_target(f64::from(hashrate), f64::from(SHARES_PER_MINUTE))
+            .ok()?
+            .to_le_bytes();
+        self.settle(&block, maximum).then_some(self.target)
+    }
+
+    /// Test hook: pretend `seconds` passed with `shares` counted.
+    #[cfg(test)]
+    pub fn vardiff_window(&mut self, seconds: u64, shares: u32) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.vardiff.timestamp_of_last_update = now - seconds;
+        self.vardiff.set_shares_since_last_update(shares);
+    }
+
     pub fn check(&mut self, share: Share<'_>, now: u32) -> Result<ValidatedShare, &'static str> {
         let result = self.check_inner(share, now);
         if result.is_ok() {
@@ -243,9 +327,17 @@ impl Channel {
         let hash = double_sha256(&header);
         let block = meets_target(&hash, &job.template.target);
         // #### PR #38
-        // SetTarget applies to subsequent jobs; retained active jobs keep the
-        // difficulty they advertised. Validate and account against that target.
-        if !meets_target(&hash, &job.target) && !block {
+        // A job keeps the target it was issued with. After vardiff lowers the
+        // difficulty, firmware may apply the new one to work it already holds
+        // (cgminer does for new work on the current job), so an older job also
+        // accepts the current target when that is easier. Each share is
+        // credited at the target it was accepted under.
+        let accepted = if meets_target(&self.target, &job.target) {
+            job.target
+        } else {
+            self.target
+        };
+        if !meets_target(&hash, &accepted) && !block {
             return Err("difficulty-too-low");
         }
         if self.seen.values().any(|seen| seen.contains(&hash)) {
@@ -256,13 +348,18 @@ impl Channel {
             return Err("job-share-limit");
         }
         seen.insert(hash);
+        // Vardiff counts shares at the current target only, so work still
+        // arriving at an older, easier target cannot inflate its estimate.
+        if meets_target(&hash, &self.target) {
+            self.vardiff.increment_shares_since_last_update();
+        }
         Ok(ValidatedShare {
             generation: job.generation,
             template: job.template.clone(),
             coinbase,
             header,
             block,
-            share_target: job.target,
+            share_target: accepted,
             payout: job.payout,
         })
     }
@@ -285,6 +382,7 @@ pub fn share_work(target: &Hash) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::template_tests::{payout, rpc_template};
+    use super::super::{telemetry::expected_hashes, template::compact_target};
     use super::*;
     use stratum_core::bitcoin::{consensus, Block};
     fn channel(id: u32, kind: ChannelKind) -> Channel {
@@ -503,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn active_jobs_keep_their_difficulty_across_target_updates() {
+    fn older_jobs_keep_an_easier_difficulty_and_accept_a_lowered_one() {
         let mut channel = channel(1, ChannelKind::Standard);
         let non_block_nonce = |job: &Job| {
             (0..1000)
@@ -544,11 +642,134 @@ mod tests {
                 Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
             )
             .unwrap();
+        // After the difficulty is lowered, firmware may already apply it to
+        // the older job's work: accepted, and credited at the lowered target.
         let mut old_strict = share(1);
         old_strict.job_id = 2;
         old_strict.nonce = strict_nonce;
+        let lowered = channel.check(old_strict, 1700000010).unwrap();
+        assert!(!lowered.block);
+        assert_eq!(lowered.share_target, [255; 32]);
+    }
+
+    fn hard_template() -> Arc<BchTemplate> {
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        // Mainnet-like block difficulty, so test shares are never blocks.
+        template.target = compact_target(0x1a00ffff).unwrap();
+        Arc::new(template)
+    }
+
+    fn device_channel(target: Hash) -> Channel {
+        let mut channel = Channel::new(
+            1,
+            ChannelKind::Extended,
+            target,
+            [9; 12],
+            MiningNetwork::Chipnet,
+            &payout(),
+        )
+        .unwrap();
+        channel.install(1, 3, hard_template()).unwrap();
+        channel
+    }
+
+    /// Runs vardiff for `minutes` against a device of `hashrate`, in ten
+    /// second steps, feeding the share count it would produce at each
+    /// moment's target.
+    fn simulate(channel: &mut Channel, hashrate: f64, minutes: u64) {
+        let mut elapsed = 0;
+        for _ in 0..minutes * 6 {
+            elapsed += 10;
+            let shares = elapsed as f64 * hashrate / expected_hashes(&channel.target);
+            channel.vardiff_window(elapsed, shares.round() as u32);
+            let window = channel.vardiff.timestamp_of_last_update;
+            channel.retarget(&[255; 32]);
+            if channel.vardiff.timestamp_of_last_update != window {
+                elapsed = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn vardiff_settles_every_device_size_near_twenty_shares_a_minute() {
+        let start = compact_target(0x1b0ffff0).unwrap();
+        for hashrate in [1.0e12, 4.0e12, 9.0e13, 2.0e14, 1.0e15] {
+            let mut channel = device_channel(start);
+            simulate(&mut channel, hashrate, 10);
+            // SRI's rules leave a deviation under 15% alone.
+            let per_minute = 60.0 * hashrate / expected_hashes(&channel.target);
+            assert!(
+                (15.0..=25.0).contains(&per_minute),
+                "{hashrate}: {per_minute} shares a minute"
+            );
+        }
+        // A silent device steps down to the floor and stays there.
+        let mut silent = device_channel(start);
+        simulate(&mut silent, 0.0, 30);
+        let floor = hash_rate_to_target(f64::from(MIN_HASHRATE), f64::from(SHARES_PER_MINUTE))
+            .unwrap()
+            .to_le_bytes();
+        assert_eq!(silent.target, floor);
+    }
+
+    #[test]
+    fn device_target_follows_an_easier_block_target_and_returns_after() {
+        let start = compact_target(0x1b0ffff0).unwrap();
+        let mut channel = device_channel(start);
+        // Chipnet's difficulty-1 window: follow the block target down...
+        let easy = compact_target(0x1d00ffff).unwrap();
+        assert!(channel.settle(&easy, &[255; 32]));
+        assert_eq!(channel.target, easy);
+        // ...and return to the share difficulty on the next normal template.
+        assert!(channel.settle(&compact_target(0x1a00ffff).unwrap(), &[255; 32]));
+        assert_eq!(channel.target, start);
+        // A device maximum caps how easy the target gets.
+        assert!(!channel.settle(&easy, &start));
+        assert_eq!(channel.target, start);
+    }
+
+    #[test]
+    fn difficulty_changes_never_reject_work_in_flight() {
+        let hard = compact_target(0x1b0ffff0).unwrap();
+        let mut channel = device_channel(hard);
+        let block = channel.job().unwrap().template.target;
+        let mut first = share(0);
+        first.extranonce = &[0; DEVICE_EXTRANONCE_SIZE];
         assert!(matches!(
-            channel.check(old_strict, 1700000010),
+            channel.check(first, 1700000010),
+            Err("difficulty-too-low")
+        ));
+        // Lowered: the next job carries the easier target, and the older job
+        // accepts it too, credited at it and counted by vardiff.
+        channel.desired = [255; 32];
+        assert!(channel.settle(&block, &[255; 32]));
+        assert_eq!(channel.vardiff.shares_since_last_update, 0);
+        channel.install(2, 4, hard_template()).unwrap();
+        let mut retry = share(1);
+        retry.extranonce = &[0; DEVICE_EXTRANONCE_SIZE];
+        assert_eq!(
+            channel.check(retry, 1700000010).unwrap().share_target,
+            [255; 32]
+        );
+        assert_eq!(channel.vardiff.shares_since_last_update, 1);
+        // Raised: the older job keeps its own easier target, but vardiff does
+        // not count that work; the new job needs the new target.
+        channel.desired = hard;
+        assert!(channel.settle(&block, &[255; 32]));
+        channel.install(3, 5, hard_template()).unwrap();
+        let mut older = share(2);
+        older.job_id = 2;
+        older.extranonce = &[1; DEVICE_EXTRANONCE_SIZE];
+        assert_eq!(
+            channel.check(older, 1700000010).unwrap().share_target,
+            [255; 32]
+        );
+        assert_eq!(channel.vardiff.shares_since_last_update, 0);
+        let mut newer = share(3);
+        newer.job_id = 3;
+        newer.extranonce = &[2; DEVICE_EXTRANONCE_SIZE];
+        assert!(matches!(
+            channel.check(newer, 1700000010),
             Err("difficulty-too-low")
         ));
     }

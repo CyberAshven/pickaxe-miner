@@ -92,8 +92,8 @@ pub fn run(
         Some(TerminalSession::enter()?)
     };
     let stats = Arc::new(Mutex::new(ServerStats::default()));
-    // Difficulty 4096 is a starting target. Device vardiff remains a separate
-    // capability; no nominal device rate is reported as measured hashrate.
+    // Difficulty 4096 is each device's starting target; vardiff then moves it
+    // toward 20 shares a minute. No nominal device rate is shown as measured.
     let settings = ServerConfig {
         network: config.network,
         payout: config.payout_address.clone(),
