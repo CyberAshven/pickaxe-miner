@@ -84,6 +84,8 @@ pub enum ServerSetup {
         mode: crate::donation::bch::FeeMode,
         /// `None` is the payout address.
         address: Option<String>,
+        /// The pool's name in its blocks' coinbase; `None` writes none.
+        tag: Option<String>,
     },
     /// #### PR #40: this computer's GPUs join someone's GPU pool or farm as
     /// a rig of its coordinator (`HOST:PORT` and the coordinator's key).
@@ -192,6 +194,8 @@ enum SettingsRow {
     PoolFee,
     FeeFrom,
     FeeAddress,
+    /// #### PR #40: the pool's name in its blocks.
+    PoolName,
     Address,
     Intensity,
     Fulcrum,
@@ -210,6 +214,7 @@ enum TextField {
     PoolAddress,
     PoolKey,
     FeeAddress,
+    PoolName,
 }
 
 /// What an ASIC can mine: BCH today (merge-mined tokens as they appear);
@@ -249,6 +254,7 @@ struct SetupFlow {
     pool_fee_mode: crate::donation::bch::FeeMode,
     /// Empty: the payout address.
     pool_fee_address: String,
+    pool_tag: String,
     token_input: String,
     token_selected: usize,
     settings_row: usize,
@@ -344,6 +350,7 @@ impl SetupFlow {
             pool_fee: "1".parse().expect("fee"),
             pool_fee_mode: crate::donation::bch::FeeMode::Coinbase,
             pool_fee_address: String::new(),
+            pool_tag: String::new(),
             token_input: String::new(),
             token_selected: 0,
             settings_row: 0,
@@ -620,6 +627,7 @@ impl SetupFlow {
                 SettingsRow::PoolFee,
                 SettingsRow::FeeFrom,
                 SettingsRow::FeeAddress,
+                SettingsRow::PoolName,
                 SettingsRow::ProfileName,
                 SettingsRow::Start,
             ],
@@ -649,6 +657,7 @@ impl SetupFlow {
                 fee: self.pool_fee,
                 mode: self.pool_fee_mode,
                 address: Some(self.pool_fee_address.trim().to_owned()).filter(|a| !a.is_empty()),
+                tag: Some(self.pool_tag.trim().to_owned()).filter(|t| !t.is_empty()),
             }),
         }
     }
@@ -1069,6 +1078,10 @@ impl SetupFlow {
                     let value = self.pool_fee_address.clone();
                     self.begin_edit(TextField::FeeAddress, value);
                 }
+                SettingsRow::PoolName => {
+                    let value = self.pool_tag.clone();
+                    self.begin_edit(TextField::PoolName, value);
+                }
                 SettingsRow::Mining
                 | SettingsRow::PoolKind
                 | SettingsRow::PoolFee
@@ -1389,6 +1402,13 @@ impl SetupFlow {
                         .map_err(|_| "enter a q or p address on this network")?;
                 }
                 self.pool_fee_address = value;
+                Ok(String::new())
+            }
+            TextField::PoolName => {
+                if value.len() > 20 || !value.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                    return Err("use up to 20 printable characters".into());
+                }
+                self.pool_tag = value;
                 Ok(String::new())
             }
             TextField::Connection => {
@@ -3126,6 +3146,16 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     crate::donation::bch::FeeMode::Both => "Both (1/3 work, 2/3 coinbase)",
                 }),
                 "< >",
+            ),
+            SettingsRow::PoolName => (
+                "Pool name",
+                edit_value(
+                    state,
+                    TextField::PoolName,
+                    &state.pool_tag,
+                    "written into your blocks, such as /MyPool/",
+                ),
+                "[Enter]",
             ),
             SettingsRow::FeeAddress => (
                 "Fee address",
@@ -4868,6 +4898,35 @@ mod tests {
         );
     }
 
+    // #### PR #40
+    #[test]
+    fn an_asic_pool_can_name_its_blocks() {
+        let mut setup = setup_for(MiningMode::Pool);
+        assert!(setup.settings_rows().contains(&SettingsRow::PoolName));
+        setup.open_settings(SettingsRow::PoolName);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, &"x".repeat(21));
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("20 printable"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Esc));
+        setup.open_settings(SettingsRow::PoolName);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "/MyPool/");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup_text(&setup).contains("/MyPool/"));
+        let Some(ServerSetup::Public { tag, .. }) = setup.server_setup() else {
+            panic!("an ASIC pool setup")
+        };
+        assert_eq!(tag.as_deref(), Some("/MyPool/"));
+        // A GPU pool's claims have no coinbase of their own to name.
+        setup.pool_target = 1;
+        assert!(!setup.settings_rows().contains(&SettingsRow::PoolName));
+    }
+
     #[test]
     fn running_a_pool_sets_its_fee_and_starts_a_public_pool() {
         use crate::donation::bch::FeeMode;
@@ -4956,6 +5015,7 @@ mod tests {
                 fee: "1.5".parse().unwrap(),
                 mode: FeeMode::Work,
                 address: None,
+                tag: None,
             })
         );
     }

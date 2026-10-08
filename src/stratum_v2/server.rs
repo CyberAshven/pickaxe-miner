@@ -44,6 +44,9 @@ pub struct ServerConfig {
     pub donation: Arc<RwLock<BchDonation>>,
     /// #### PR #40: a public pool, where each miner's blocks pay them.
     pub public: Option<super::payout::PublicPool>,
+    /// #### PR #40: the pool's name, written into every block's coinbase
+    /// (empty for none).
+    pub pool_tag: Vec<u8>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -162,6 +165,7 @@ pub fn run<R: NodeRpc + Send + 'static>(
     update_journal_stats(&shared)?;
     let node_shared = shared.clone();
     let network = config.network;
+    let tag = config.pool_tag.clone();
     let node = thread::spawn(move || -> Result<(), String> {
         let mut provider = TemplateProvider::new(rpc, network);
         let mut active = 0;
@@ -228,7 +232,11 @@ pub fn run<R: NodeRpc + Send + 'static>(
                             &node_shared,
                             Some(PublishedJob {
                                 generation,
-                                template: Arc::new(template.clone()),
+                                template: Arc::new({
+                                    let mut template = template.clone();
+                                    template.tag(&tag);
+                                    template
+                                }),
                                 valid_until: Instant::now() + Duration::from_secs(30),
                             }),
                         );

@@ -212,6 +212,7 @@ impl Running {
             share_target: [255; 32],
             journal_path: state_directory.journal(),
             legacy_sources: vec![[42; 32]],
+            pool_tag: Vec::new(),
         };
         let thread = {
             let stop = stop.clone();

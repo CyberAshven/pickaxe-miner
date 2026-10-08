@@ -1738,6 +1738,7 @@ fn main() {
                         // on the miner's node, at someone's pool, or as a public
                         // pool for other miners.
                         if let Some(server) = setup.server.clone() {
+                            let mut pool_tag = None;
                             let (
                                 upstream,
                                 upstream_key,
@@ -1752,7 +1753,13 @@ fn main() {
                                 tui::ServerSetup::JoinPool { address, key } => {
                                     (vec![address], vec![key], false, None, None, None)
                                 }
-                                tui::ServerSetup::Public { fee, mode, address } => {
+                                tui::ServerSetup::Public {
+                                    fee,
+                                    mode,
+                                    address,
+                                    tag,
+                                } => {
+                                    pool_tag = tag;
                                     (Vec::new(), Vec::new(), true, Some(fee), Some(mode), address)
                                 }
                                 // Started above, as a GPU coordinator or rig.
@@ -1770,6 +1777,7 @@ fn main() {
                                 pool_fee,
                                 pool_fee_mode,
                                 pool_fee_address,
+                                pool_tag,
                             };
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(

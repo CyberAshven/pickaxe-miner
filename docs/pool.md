@@ -16,8 +16,14 @@ settings page; or from a terminal:
 ```text
 pickaxe_miner stratum-v2 serve --config pool.json \
   --listen 0.0.0.0:3336 --sv1-listen 0.0.0.0:3333 \
-  --public --pool-fee 2 --pool-fee-mode coinbase --pool-fee-address <q or p address>
+  --public --pool-fee 2 --pool-fee-mode coinbase --pool-fee-address <q or p address> \
+  --pool-tag "/MyPool/"
 ```
+
+`--pool-tag` (the setup's Pool name row) writes your pool's name into the
+coinbase of every block the pool finds, as pools such as ViaBTC do, so block
+explorers show it: at most 20 printable characters. Without it no name is
+written.
 
 Add `--chipnet` to test on Chipnet first. Open ports 3333 (SV1) and 3336 (SV2)
 to the internet, through your router's port forwarding or on a server. SV1

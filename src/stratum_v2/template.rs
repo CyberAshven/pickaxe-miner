@@ -156,6 +156,15 @@ impl BchTemplate {
         })
     }
 
+    /// #### PR #40
+    /// Writes the pool's name (`--pool-tag`) into the coinbase script of every
+    /// block built from this template, after the node's flags and before the
+    /// extranonce; the coinbase script stays within 100 bytes, which
+    /// `coinbase_with_payout` checks.
+    pub fn tag(&mut self, tag: &[u8]) {
+        self.coinbase_flags.extend_from_slice(tag);
+    }
+
     /// Build one channel's coinbase. The caller assigns a unique extranonce;
     /// devices never control the payout or the transaction ordering.
     pub fn coinbase(

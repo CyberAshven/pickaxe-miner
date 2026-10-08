@@ -113,6 +113,7 @@ pub fn run(
         listen,
         sv1_listen,
         donation,
+        pool_tag,
         ..
     } = action
     else {
@@ -127,6 +128,14 @@ pub fn run(
             );
         }
         return Ok(());
+    };
+    // #### PR #40: the pool's name, at most 20 printable characters.
+    let pool_tag: Vec<u8> = match pool_tag.as_deref().map(str::trim) {
+        None | Some("") => Vec::new(),
+        Some(tag) if tag.len() <= 20 && tag.chars().all(|c| c.is_ascii_graphic() || c == ' ') => {
+            tag.as_bytes().to_vec()
+        }
+        Some(_) => return Err("--pool-tag must be 1 to 20 printable characters".into()),
     };
     let donation = Arc::new(RwLock::new(donation.unwrap_or(config.bch_donation)));
     // #### PR #40
@@ -225,6 +234,7 @@ pub fn run(
                 authority_secret,
                 share_target: compact_target(0x1b0ffff0)?,
                 journal_path: config_path.with_extension("sv2-blocks.json"),
+                pool_tag: pool_tag.clone(),
                 legacy_sources: nodes
                     .iter()
                     .map(NativeNodeRpc::source_identity)

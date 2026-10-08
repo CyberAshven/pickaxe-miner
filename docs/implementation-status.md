@@ -1071,3 +1071,18 @@ GPUs: it uses none, and the lock stopped a farm's coordinator from running on
 a PC that also mines. Any process with GPUs still takes it.
 
 Evidence: the live run above, beside a running GPU miner.
+
+## A pool's name in its blocks (2026-10-09)
+
+#### PR #40
+
+`stratum-v2 serve --pool-tag TEXT` (the setup's Pool name row for an ASIC
+pool) writes the name into the coinbase script of every block the server
+builds, after the node's coinbase flags and before the extranonce, as
+ckpool's and ASICseer's pool identifiers are; at most 20 printable
+characters, refused with `--upstream`, where the pool builds the blocks.
+Nothing is written by default.
+
+Evidence: host tests cover the name in the coinbase with the coinbase parts
+still fitting around the extranonce, a name too long for the 100-byte script
+refused, the flag, and the setup row.

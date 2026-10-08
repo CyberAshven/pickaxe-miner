@@ -203,6 +203,12 @@ pub enum StratumV2Command {
         /// configured payout address.
         #[arg(long, requires = "public")]
         pool_fee_address: Option<String>,
+        /// #### PR #40
+        /// The pool's name, written into the coinbase of every block this
+        /// server builds (at most 20 printable characters), such as /MyPool/.
+        /// Not with --upstream: the pool there builds the blocks.
+        #[arg(long, value_name = "TEXT", conflicts_with = "upstream")]
+        pool_tag: Option<String>,
     },
 }
 
@@ -556,6 +562,36 @@ mod tests {
             "--public",
             "--pool-fee-mode",
             "half"
+        ])
+        .is_err());
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_server_names_its_blocks_but_a_pool_member_cannot() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["pickaxe", "stratum-v2", "serve"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        let Some(Commands::StratumV2 {
+            command: StratumV2Command::Serve { pool_tag, .. },
+        }) = parse(&["--public", "--pool-tag", "/MyPool/"])
+            .unwrap()
+            .command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(pool_tag.as_deref(), Some("/MyPool/"));
+        assert!(parse(&[
+            "--pool-tag",
+            "/MyPool/",
+            "--upstream",
+            "pool.example:3336",
+            "--upstream-key",
+            "key",
+            "--sv1-listen",
+            "0.0.0.0:3333"
         ])
         .is_err());
     }
