@@ -14,7 +14,7 @@ use super::{
 use crate::config::{validate_payout_address, MiningNetwork};
 use crate::donation::bch::{BchDonation, BchPayout};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     net::{TcpListener, TcpStream},
     path::PathBuf,
@@ -79,6 +79,33 @@ struct Shared {
     journal: Mutex<Journal>,
     fatal: Mutex<Option<&'static str>>,
     stop: Arc<AtomicBool>,
+    solved: Mutex<SolvedParents>,
+}
+
+// #### PR #38
+// Only the first solved block on a parent can win; later solutions on the same
+// parent would only compete with it. Chipnet allows difficulty-1 blocks after
+// a 20-minute gap, and then every share is a solution: an Avalon Nano sends
+// about 930 a second. Saving each one filled the 64-block journal within a
+// fraction of a second, and a refused save stops the server. Keep one per
+// parent, for the most recent parents only.
+#[derive(Default)]
+struct SolvedParents(VecDeque<Hash>);
+
+impl SolvedParents {
+    const RECENT: usize = 64;
+
+    /// Records `parent`; false when a block on it was already saved.
+    fn first(&mut self, parent: &Hash) -> bool {
+        if self.0.contains(parent) {
+            return false;
+        }
+        if self.0.len() >= Self::RECENT {
+            self.0.pop_front();
+        }
+        self.0.push_back(*parent);
+        true
+    }
 }
 
 /// Bind the listener before calling this function. The caller owns the stop
@@ -113,6 +140,7 @@ pub fn run<R: NodeRpc + Send + 'static>(
         journal: Mutex::new(journal),
         fatal: Mutex::new(None),
         stop: stop.clone(),
+        solved: Mutex::new(SolvedParents::default()),
     });
     update_journal_stats(&shared)?;
     let node_shared = shared.clone();
@@ -491,6 +519,16 @@ fn serve_device(
                 // Storage failure stops the service rather than acknowledging
                 // work which would disappear on a restart.
                 for block in responses.blocks {
+                    // The share is still acknowledged and counted; only a
+                    // repeat solution on an already solved parent is not saved.
+                    let first = shared
+                        .solved
+                        .lock()
+                        .map_err(|_| "block state unavailable")?
+                        .first(&block.template.previous_hash);
+                    if !first {
+                        continue;
+                    }
                     let saved = shared
                         .journal
                         .lock()
@@ -546,6 +584,20 @@ fn serve_device(
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[test]
+    fn only_the_first_solution_on_a_parent_is_saved() {
+        let mut solved = SolvedParents::default();
+        assert!(solved.first(&[1; 32]));
+        assert!(!solved.first(&[1; 32]));
+        assert!(solved.first(&[2; 32]));
+        for parent in 3..=70u8 {
+            assert!(solved.first(&[parent; 32]));
+        }
+        // Old parents age out, so the record stays small.
+        assert_eq!(solved.0.len(), SolvedParents::RECENT);
+        assert!(solved.first(&[1; 32]));
+    }
 
     #[test]
     fn payout_rotation_issues_unique_jobs_without_changing_template_generation() {
