@@ -51,6 +51,27 @@ prints one line per event: its GPUs at start, `connected`, each `job` and
 them as JSON. Repeat `--coordinator` and `--coordinator-key`, in the same
 order, for backup coordinators. The name defaults to the computer's name.
 
+## A public GPU pool
+
+A coordinator can also be a public pool for other people's rigs. Each rig
+mines for its own address and its winners are claimed to it; nothing is held
+or paid out later. PHOTON's claim cannot split a reward, so the operator's
+fee is a share of each rig's mining time, after the donation, like the
+donation itself.
+
+```text
+pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --address <your payout> \
+  --rigs-public --rigs-fee 2 --rigs-fee-address <fee address> --no-tui
+```
+
+Rigs add `--address <their payout>`; a rig without one is turned away. For
+the fee's share of each rig's time (a 10-minute clock per rig), the rig gets
+the same job paying the fee address, marked by the top bit of its job number,
+and its winners are checked against exactly the job it was given. Because
+anyone can broadcast a PHOTON claim, a modified rig could keep its fee time
+for itself; the fee, like the donation, relies on rigs running Pickaxe as
+published.
+
 ## Running rigs as a service
 
 These are examples; the live test below ran rigs as plain processes.

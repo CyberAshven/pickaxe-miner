@@ -2057,7 +2057,10 @@ fn prepare_submission_for_network(
     settlement.ensure_current(cfg.generation_id, live)?;
     let policy = cfg.fee_policy();
     require_direct_reward_policy(policy.scheme)?;
-    let payouts = policy.payouts(cfg.network, &cfg.payout_address)?;
+    // #### PR #32: a public GPU pool's winner pays the rig it came from (or
+    // the operator in a fee window); the coordinator checked that address.
+    let miner = winner.payout.as_deref().unwrap_or(&cfg.payout_address);
+    let payouts = policy.payouts(cfg.network, miner)?;
     let deployment = cfg.token.photon_deployment(cfg.network);
     let mut accepted = None;
     for (recipient, payout) in crate::donation::Recipient::ALL.into_iter().zip(payouts) {
@@ -4762,6 +4765,7 @@ mod tests {
             public_key: [0u8; 33],
             signature: [0u8; 64],
             transaction: Vec::new(),
+            payout: None,
         }
     }
 
@@ -4808,6 +4812,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         }
     }
 
@@ -4928,6 +4933,7 @@ mod tests {
                                         signature,
                                         digest: crate::search::hash256(&transaction),
                                         transaction,
+                                        payout: None,
                                     }
                                 })
                             })
@@ -4938,6 +4944,39 @@ mod tests {
                     let winner = sign_winner(&job, cfg.generation_id);
                     let settlement = SettlementState::new(cfg.generation_id, &job).unwrap();
                     production_preflight_local(&cfg, &job, &journal, 1_000).unwrap();
+                    // #### PR #32: a public GPU pool's winner for a rig's own
+                    // payout is claimed only when the hub vouches for it.
+                    if recipient == Recipient::Miner {
+                        let mut rig_cfg = cfg.clone();
+                        rig_cfg.payout_address = crate::config::reprefix_p2pkh_payout(
+                            crate::config::DONATION_ADDRESS,
+                            network,
+                        )
+                        .unwrap();
+                        let rig_winner = winner.clone();
+                        assert!(prepare_submission_for_network(
+                            &rig_winner,
+                            &rig_cfg,
+                            &job,
+                            &settlement,
+                            &journal
+                        )
+                        .is_err());
+                        let vouched = VerifiedWinner {
+                            payout: Some(cfg.payout_address.clone()),
+                            ..rig_winner
+                        };
+                        let pending = prepare_submission_for_network(
+                            &vouched,
+                            &rig_cfg,
+                            &job,
+                            &settlement,
+                            &journal,
+                        )
+                        .unwrap();
+                        assert_eq!(pending.miner_token_amount, job.reward_raw);
+                        let _ = std::fs::remove_file(&journal);
+                    }
                     let pending =
                         prepare_submission_for_network(&winner, &cfg, &job, &settlement, &journal)
                             .unwrap();
@@ -5769,6 +5808,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         };
 
         validate_verified_parent(&winner, &job, &reward_public).unwrap();
@@ -5829,6 +5869,7 @@ mod tests {
             public_key: mining_public,
             signature,
             transaction,
+            payout: None,
         };
 
         let first = prepare_pending_submission(
@@ -5918,6 +5959,7 @@ mod tests {
                     public_key: search_public,
                     signature,
                     transaction,
+                    payout: None,
                 });
                 break;
             }

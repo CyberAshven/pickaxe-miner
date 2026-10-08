@@ -1573,6 +1573,9 @@ fn main() {
                     rigs::run_rig(
                         &coordinators,
                         args.rig_name.as_deref(),
+                        // #### PR #32: a public GPU pool pays the rig's own.
+                        Some(cfg.payout_address.as_str())
+                            .filter(|payout| !payout.trim().is_empty()),
                         &selected_gpus,
                         cfg.intensity,
                         args.json,
@@ -1672,6 +1675,25 @@ fn main() {
                 Some(listen) => {
                     match rigs::RigHub::start(listen, &config_path.with_extension("rigs-key")) {
                         Ok(hub) => {
+                            // #### PR #32: a public GPU pool.
+                            if args.rigs_public {
+                                let address = match config::validate_payout_address(
+                                    cfg.network,
+                                    args.rigs_fee_address
+                                        .as_deref()
+                                        .unwrap_or(cfg.payout_address.as_str()),
+                                ) {
+                                    Ok(address) => address,
+                                    Err(error) => {
+                                        eprintln!("error: pool fee address: {error}");
+                                        exit_after_error(2);
+                                    }
+                                };
+                                hub.set_public(Some(rigs::PublicRigs {
+                                    fee_bps: args.rigs_fee.map_or(0, u16::from),
+                                    address,
+                                }));
+                            }
                             println!(
                                 "{}",
                                 serde_json::json!({
@@ -2210,6 +2232,7 @@ mod tests {
             public_key: [0u8; 33],
             signature: [0u8; 64],
             transaction: Vec::new(),
+            payout: None,
         };
         assert!(validate_verified_winner_current(&winner, &cfg, live.as_ref()).is_ok());
 

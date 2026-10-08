@@ -91,6 +91,22 @@ pub struct Cli {
     #[arg(long, global = true, requires_all = ["rigs_listen", "address"])]
     pub rigs_only: bool,
 
+    /// #### PR #32
+    /// With --rigs-listen: run a public GPU pool, where each rig mines for
+    /// the --address it gives and is claimed to it; your fee is a share of
+    /// each rig's mining time.
+    #[arg(long, global = true, requires = "rigs_listen")]
+    pub rigs_public: bool,
+
+    /// The public GPU pool's fee: a percentage of each rig's mining time,
+    /// after the donation (default 0).
+    #[arg(long, global = true, value_name = "PERCENT", requires = "rigs_public")]
+    pub rigs_fee: Option<crate::donation::bch::BchDonation>,
+
+    /// Where the public GPU pool's fee goes (default: your --address).
+    #[arg(long, global = true, value_name = "ADDRESS", requires = "rigs_public")]
+    pub rigs_fee_address: Option<String>,
+
     /// This rig's name on the coordinator's dashboard (default: the
     /// computer's name).
     #[arg(long, global = true, value_name = "NAME", requires = "coordinator")]

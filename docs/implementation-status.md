@@ -612,3 +612,30 @@ the search with no GPU, the rig's rate window, the coordinator's dashboard with
 no GPU and the CLI options. Formatting and Clippy with warnings denied passed
 for the all-feature, default and portable builds, and the all-feature Clippy
 on Rust 1.99 (Linux, in Docker).
+
+## Public GPU pool (2026-10-08)
+
+#### PR #32
+
+`mine --rigs-listen ADDR --rigs-public [--rigs-fee P --rigs-fee-address A]`
+makes the coordinator a public GPU pool. A rig sends its payout with its
+hello (`--address`); a public coordinator turns away a rig without a valid
+one and gives each rig the shared job paying its own payout. For the
+operator's fee, a 10-minute clock per rig gives that share of its time to the
+same job paying the fee address, marked by the top bit of the job's
+generation, so the rig takes it as a new job; the rig's donation still
+applies inside every job, so the fee comes off what the donation leaves.
+Each winner is checked against exactly the job its rig was given, then
+queued under the shared generation with that job's payout, and the claim
+path authorizes that payout (`VerifiedWinner::payout`) instead of the
+coordinator's own; a winner with no payout is checked against the
+coordinator's payout as before.
+
+Evidence: host tests cover the job variants and the fee clock; a loopback
+coordinator over the encrypted link turns away a rig that names no payout,
+sends a rig its fee-window job, queues that job's winner under the shared
+generation for the fee address, and sends the rig's own job outside the
+window; the direct-reward lifecycle refuses a winner paying another address
+unless the coordinator vouches for it. Not yet run with rigs on other
+machines. A PHOTON claim can be broadcast by anyone, so the fee is
+voluntary for a modified rig, as the donation is.

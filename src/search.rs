@@ -1956,6 +1956,7 @@ mod tests {
                 public_key: [2u8; 33],
                 signature: [0u8; 64],
                 transaction: vec![0x02],
+                payout: None,
             })
             .collect();
 

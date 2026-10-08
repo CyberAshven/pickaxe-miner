@@ -39,6 +39,10 @@ pub struct VerifiedWinner {
     pub public_key: [u8; 33],
     pub signature: [u8; 64],
     pub transaction: Vec<u8>,
+    /// #### PR #32: in a public GPU pool, the address the rig mined for (its
+    /// own, or the operator's in a fee window); `None` is the coordinator's
+    /// own payout.
+    pub payout: Option<String>,
 }
 
 pub(crate) struct PreparedJob {
@@ -196,6 +200,7 @@ pub(crate) fn verify_gpu_winner(
         public_key: *public_key,
         signature,
         transaction,
+        payout: None,
     })
 }
 
@@ -310,6 +315,7 @@ pub(crate) mod tests {
                     public_key,
                     signature,
                     transaction,
+                    payout: None,
                 };
             }
         }

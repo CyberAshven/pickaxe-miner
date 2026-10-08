@@ -196,6 +196,8 @@ impl TryFrom<WireWinner> for VerifiedWinner {
             signature: fixed_hex(&wire.signature, "signature")?,
             transaction: hex::decode(&wire.transaction)
                 .map_err(|_| "rig winner has an invalid transaction")?,
+            // The coordinator sets it from the job it gave the rig.
+            payout: None,
         })
     }
 }
@@ -207,6 +209,68 @@ impl TryFrom<WireWinner> for VerifiedWinner {
 struct RigHello {
     name: String,
     gpus: usize,
+    /// #### PR #32: the rig's own payout, which a public GPU pool pays.
+    #[serde(default)]
+    payout: Option<String>,
+}
+
+/// #### PR #32
+/// A public GPU pool: each rig mines for the payout it sends, and the
+/// operator's fee is that share of each rig's mining time (after the
+/// donation, which every rig applies itself), paying the fee address. A
+/// PHOTON claim cannot split its reward, so the fee is work; nothing is held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicRigs {
+    /// The fee in hundredths of a percent of each rig's time; 0 for none.
+    pub fee_bps: u16,
+    pub address: String,
+}
+
+/// The top bit of a job's generation marks the operator's fee window, so the
+/// rig takes it as a new job and its winners say which job they solved.
+#[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
+const FEE_JOBS: u64 = 1 << 63;
+
+/// A rig's share of time for the operator, on a 10-minute clock counted
+/// while it is connected.
+#[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
+struct FeeClock {
+    position: u64,
+    last: std::time::Instant,
+}
+
+#[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
+impl FeeClock {
+    const PERIOD_NS: u64 = 600_000_000_000;
+
+    fn new(phase: u64) -> Self {
+        Self {
+            position: phase % Self::PERIOD_NS,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Advances the clock and says whether this is the fee window.
+    fn window(&mut self, now: std::time::Instant, fee_bps: u16) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_nanos() as u64;
+        self.last = now;
+        self.position = (self.position + elapsed % Self::PERIOD_NS) % Self::PERIOD_NS;
+        self.position < (u128::from(Self::PERIOD_NS) * u128::from(fee_bps) / 10_000) as u64
+    }
+}
+
+/// The job a rig of a public pool mines: paying its own payout, or in the fee
+/// window the operator's, marked in its generation.
+#[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
+fn rig_job(job: &MiningJob, payout: &str, public: &PublicRigs, window: bool) -> MiningJob {
+    let mut job = job.clone();
+    if window {
+        job.payout_address = public.address.clone();
+        job.generation_id |= FEE_JOBS;
+    } else {
+        job.payout_address = payout.to_owned();
+    }
+    job
 }
 
 /// A rig's regular report.
@@ -314,6 +378,8 @@ mod net {
         job: Option<MiningJob>,
         /// The coordinator's token donation, sent with every job.
         donation: Option<crate::donation::TokenDonation>,
+        /// #### PR #32: a public GPU pool.
+        public: Option<PublicRigs>,
         version: u64,
         winners: VecDeque<VerifiedWinner>,
         rigs: BTreeMap<u64, RigRow>,
@@ -420,6 +486,15 @@ mod net {
         }
 
         /// #### PR #32
+        /// Makes this coordinator a public GPU pool: each rig mines for the
+        /// payout it sends, and the operator's fee is that share of its time.
+        pub fn set_public(&self, public: Option<PublicRigs>) {
+            let mut state = lock(&self.state);
+            state.public = public;
+            state.version = state.version.wrapping_add(1);
+        }
+
+        /// #### PR #32
         /// The token donation rigs mine with; a change is sent to every rig
         /// at once, with the current job.
         pub fn set_donation(&self, donation: crate::donation::TokenDonation) {
@@ -512,14 +587,32 @@ mod net {
         };
         let mut sent = 0u64;
         let mut heard = Instant::now();
+        // #### PR #32: a public pool's rig, its payout and its fee clock.
+        let mut payout: Option<String> = None;
+        let mut clock = FeeClock::new(rand::random());
+        let mut sent_window = false;
         let _ = (|| -> Result<(), String> {
             while !stop.load(Ordering::Relaxed) {
                 let pending = {
                     let state = lock(&state);
-                    (state.version != sent)
-                        .then(|| (state.version, state.job.clone(), state.donation))
+                    let window = match (&state.public, &payout) {
+                        (Some(public), Some(_)) => clock.window(Instant::now(), public.fee_bps),
+                        _ => false,
+                    };
+                    // A public pool sends work only once the rig names its
+                    // payout, and again when the fee window opens or closes.
+                    let ready = state.public.is_none() || payout.is_some();
+                    (ready && (state.version != sent || window != sent_window)).then(|| {
+                        let job = match (&state.public, &payout, &state.job) {
+                            (Some(public), Some(payout), Some(job)) => {
+                                Some(rig_job(job, payout, public, window))
+                            }
+                            (_, _, job) => job.clone(),
+                        };
+                        (state.version, job, state.donation, window)
+                    })
                 };
-                if let Some((version, job, donation)) = pending {
+                if let Some((version, job, donation, window)) = pending {
                     if let Some(job) = job {
                         let wire = WireJob {
                             donation,
@@ -528,6 +621,7 @@ mod net {
                         sender.send(frame(JOB, &wire)?)?;
                     }
                     sent = version;
+                    sent_window = window;
                 }
                 let Some(message) = receiver.receive(Duration::from_millis(200))? else {
                     if heard.elapsed() > QUIET {
@@ -541,7 +635,28 @@ mod net {
                     HELLO => {
                         let hello: RigHello =
                             serde_json::from_slice(&bytes).map_err(|_| "malformed rig hello")?;
-                        if let Some(row) = lock(&state).rigs.get_mut(&id) {
+                        let mut state = lock(&state);
+                        // #### PR #32: a public pool pays the rig's own
+                        // payout, so a rig without a valid one is turned away.
+                        if state.public.is_some() {
+                            let network = state
+                                .job
+                                .as_ref()
+                                .map(|job| job.network)
+                                .ok_or("the pool has no job yet")?;
+                            let named = hello
+                                .payout
+                                .as_deref()
+                                .map(|address| {
+                                    crate::config::validate_payout_address(network, address)
+                                })
+                                .transpose()
+                                .ok()
+                                .flatten()
+                                .ok_or("a public pool's rig needs --address")?;
+                            payout = Some(named);
+                        }
+                        if let Some(row) = state.rigs.get_mut(&id) {
                             row.name = clean_name(&hello.name);
                             row.gpus = hello.gpus.min(64);
                         }
@@ -561,15 +676,32 @@ mod net {
                     WINNER => {
                         let wire: WireWinner =
                             serde_json::from_slice(&bytes).map_err(|_| "malformed rig winner")?;
-                        let winner = VerifiedWinner::try_from(wire)?;
+                        let mut winner = VerifiedWinner::try_from(wire)?;
                         let mut state = lock(&state);
                         state.received = state.received.saturating_add(1);
                         if let Some(row) = state.rigs.get_mut(&id) {
                             row.winners = row.winners.saturating_add(1);
                         }
-                        let checked = state.job.as_ref().is_some_and(|job| {
+                        // #### PR #32: a public pool checks a winner against
+                        // the exact job this rig was given, then claims it for
+                        // that job's payout, under the shared generation.
+                        let job = match (&state.public, &payout, &state.job) {
+                            (Some(public), Some(payout), Some(job)) => Some(rig_job(
+                                job,
+                                payout,
+                                public,
+                                winner.generation_id & FEE_JOBS != 0,
+                            )),
+                            (None, _, job) => job.clone(),
+                            _ => None,
+                        };
+                        let checked = job.as_ref().is_some_and(|job| {
                             crate::mining_job::verify_rig_winner(&winner, job).is_ok()
                         });
+                        if checked && state.public.is_some() {
+                            winner.generation_id &= !FEE_JOBS;
+                            winner.payout = job.map(|job| job.payout_address);
+                        }
                         if checked && state.winners.len() < MAX_QUEUED_WINNERS {
                             state.winners.push_back(winner);
                         } else {
@@ -635,6 +767,7 @@ mod net {
     pub fn run_rig(
         coordinators: &[(String, String)],
         name: Option<&str>,
+        payout: Option<&str>,
         gpus: &[GpuDevice],
         intensity: u8,
         json: bool,
@@ -700,6 +833,7 @@ mod net {
                             &RigHello {
                                 name: name.clone(),
                                 gpus: devices.len(),
+                                payout: payout.map(str::to_owned),
                             },
                         )?)?;
                         let mut last_stats = Instant::now() - STATS_EVERY;
@@ -850,6 +984,7 @@ mod stub {
         }
         pub fn publish(&self, _job: MiningJob) {}
         pub fn set_donation(&self, _donation: crate::donation::TokenDonation) {}
+        pub fn set_public(&self, _public: Option<PublicRigs>) {}
         pub fn has_winner(&self) -> bool {
             false
         }
@@ -864,6 +999,7 @@ mod stub {
     pub fn run_rig(
         _coordinators: &[(String, String)],
         _name: Option<&str>,
+        _payout: Option<&str>,
         _gpus: &[crate::backend::GpuDevice],
         _intensity: u8,
         _json: bool,
@@ -899,6 +1035,7 @@ mod tests {
             public_key: [2; 33],
             signature: [4; 64],
             transaction: vec![5; 300],
+            payout: None,
         };
         let wire: WireWinner =
             serde_json::from_slice(&serde_json::to_vec(&WireWinner::from(&winner)).unwrap())
@@ -933,6 +1070,7 @@ mod tests {
                     &RigHello {
                         name: "test".into(),
                         gpus: 2,
+                        payout: None,
                     },
                 )
                 .unwrap(),
@@ -1015,6 +1153,137 @@ mod tests {
         assert!((3_900.0..=4_000.0).contains(&rate), "{rate}");
         // A search restarted with fewer candidates never reads negative.
         assert_eq!(window_rate(&mut window, 10), 0.0);
+    }
+
+    // #### PR #32
+    #[test]
+    fn a_public_pool_rig_mines_for_itself_and_the_operator_in_its_fee_window() {
+        let job = sample_job();
+        let public = PublicRigs {
+            fee_bps: 200,
+            address: "operator".into(),
+        };
+        let own = rig_job(&job, "rig", &public, false);
+        assert_eq!(
+            (own.payout_address.as_str(), own.generation_id),
+            ("rig", job.generation_id)
+        );
+        let fee = rig_job(&job, "rig", &public, true);
+        assert_eq!(fee.payout_address, "operator");
+        assert_eq!(fee.generation_id, job.generation_id | FEE_JOBS);
+        // 2% of a 10-minute clock: 12 seconds.
+        let start = std::time::Instant::now();
+        let mut clock = FeeClock {
+            position: 0,
+            last: start,
+        };
+        assert!(clock.window(start, 200));
+        assert!(clock.window(start + std::time::Duration::from_secs(11), 200));
+        assert!(!clock.window(start + std::time::Duration::from_secs(13), 200));
+        assert!(!clock.window(start + std::time::Duration::from_secs(14), 0));
+    }
+
+    #[cfg(feature = "stratum-v2")]
+    #[test]
+    fn a_public_pool_claims_each_rigs_winners_to_the_job_it_was_given() {
+        use crate::stratum_v2::transport::Session;
+        use std::{net::TcpStream, time::Duration};
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-rigs-public-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = RigHub::start("127.0.0.1:0".parse().unwrap(), &dir.join("rigs-key")).unwrap();
+        let authority = net::decode_key(hub.key()).unwrap();
+        let job = sample_job();
+        let operator = job.payout_address.clone();
+        let rig_payout = crate::config::reprefix_p2pkh_payout(
+            &crate::reward::p2pkh_cashaddr_from_public_key(
+                &secp256k1::PublicKey::from_secret_key(
+                    &secp256k1::SecretKey::from_secret_bytes([9; 32]).unwrap(),
+                )
+                .serialize(),
+            )
+            .unwrap(),
+            job.network,
+        )
+        .unwrap();
+        hub.publish(job.clone());
+        // The whole clock is the fee window, so the rig mines for the operator.
+        hub.set_public(Some(PublicRigs {
+            fee_bps: 10_000,
+            address: operator.clone(),
+        }));
+        let connect = |payout: Option<String>| {
+            let stream = TcpStream::connect(hub.listen()).unwrap();
+            let (mut sender, receiver) = Session::initiate(stream, authority).unwrap().split();
+            sender
+                .send(
+                    net::frame(
+                        1,
+                        &RigHello {
+                            name: "public".into(),
+                            gpus: 1,
+                            payout,
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            (sender, receiver)
+        };
+        // A rig that names no payout gets no work and is turned away.
+        let (_, mut nameless) = connect(None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match nameless.receive(Duration::from_millis(100)) {
+                Ok(Some(_)) => panic!("a nameless rig got a job"),
+                Ok(None) => assert!(std::time::Instant::now() < deadline, "not turned away"),
+                Err(_) => break,
+            }
+        }
+        let (mut sender, mut receiver) = connect(Some(rig_payout.clone()));
+        let received = loop {
+            if let Some(message) = receiver.receive(Duration::from_secs(5)).unwrap() {
+                break message;
+            }
+        };
+        let (_, bytes) = net::read(received).unwrap();
+        let wire: WireJob = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire.payout_address, operator);
+        assert_eq!(wire.generation_id, job.generation_id | FEE_JOBS);
+        // A winner for that job is queued for the claim path under the shared
+        // generation and the operator's payout.
+        let rig_job = MiningJob::try_from(wire).unwrap();
+        let winner = crate::mining_job::tests::solved_winner(&rig_job, [3; 32]);
+        sender
+            .send(net::frame(3, &WireWinner::from(&winner)).unwrap())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !hub.has_winner() {
+            assert!(std::time::Instant::now() < deadline, "winner not queued");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let queued = hub.take_winners();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].generation_id, job.generation_id);
+        assert_eq!(queued[0].payout.as_deref(), Some(operator.as_str()));
+        // Out of the fee window, the rig's work pays the rig.
+        hub.set_public(Some(PublicRigs {
+            fee_bps: 0,
+            address: operator.clone(),
+        }));
+        let resent = loop {
+            if let Some(message) = receiver.receive(Duration::from_secs(5)).unwrap() {
+                break message;
+            }
+        };
+        let (_, bytes) = net::read(resent).unwrap();
+        let wire: WireJob = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire.payout_address, rig_payout);
+        assert_eq!(wire.generation_id, job.generation_id);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
