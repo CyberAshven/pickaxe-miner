@@ -11,6 +11,16 @@ ignore = []
 # CC0-1.0: the secp256k1 crates (libsecp256k1 bindings) used for signing.
 allow = ["AGPL-3.0-only", "Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "CC0-1.0"]
 
+# PR #38: bitcoin 0.32 via the reference Stratum crates uses this unmodified
+# compile-time hex macro. MITNFA retains MIT notice requirements and adds a
+# condition about bug-report attribution for substantially modified copies.
+# Reviewed text: https://spdx.org/licenses/MITNFA.html. Scope to this crate;
+# advisory, source and all other license gates remain in force.
+[[licenses.exceptions]]
+name = "hex_lit"
+version = "=0.1.1"
+allow = ["MITNFA"]
+
 [bans]
 # Different compatible dependency trees may need different crate major versions.
 multiple-versions = "allow"

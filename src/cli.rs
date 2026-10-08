@@ -78,6 +78,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// BCH Stratum V2 (ASIC-facing; see docs/stratum-v2.md).
+    StratumV2 {
+        #[command(subcommand)]
+        command: StratumV2Command,
+    },
     #[command(hide = true)]
     Repl,
 }
@@ -87,6 +92,26 @@ pub enum ConfigCommand {
     Show,
     Validate,
     Save,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StratumV2Command {
+    /// Print implementation and validation status.
+    Status,
+    /// Check the configured BCH node and full block template without mining.
+    CheckNode,
+    /// Serve encrypted BCH mining jobs to SV2 devices.
+    Serve {
+        /// Listener address. Use a LAN address to connect an external ASIC.
+        #[arg(long, default_value = "127.0.0.1:3336")]
+        listen: std::net::SocketAddr,
+        /// Optional plain SV1 endpoint for ASIC firmware on a trusted LAN.
+        #[arg(long)]
+        sv1_listen: Option<std::net::SocketAddr>,
+        /// BCH donation percentage, 0 to 100 (default 1.5). Defaults to the saved setting.
+        #[arg(long)]
+        donation: Option<crate::donation::bch::BchDonation>,
+    },
 }
 
 /// Parses command-line arguments into the supported miner commands.
@@ -246,5 +271,70 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--chipnet", "--network", "mainnet"]).is_err()
         );
+    }
+
+    #[test]
+    fn clap_parses_stratum_v2_status() {
+        let cli = Cli::try_parse_from(["pickaxe", "stratum-v2", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Status
+            })
+        ));
+    }
+
+    #[test]
+    fn bch_donation_flag_accepts_percentages_from_zero_to_one_hundred() {
+        for (text, expected) in [("0", 0), ("1.5", 150), ("2.01", 201), ("100", 10_000)] {
+            let cli = Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--donation", text])
+                .unwrap();
+            let Some(Commands::StratumV2 {
+                command:
+                    StratumV2Command::Serve {
+                        donation: Some(rate),
+                        ..
+                    },
+            }) = cli.command
+            else {
+                panic!("donation missing")
+            };
+            assert_eq!(u16::from(rate), expected);
+        }
+        for text in ["-1", "100.01", "2.001", "NaN"] {
+            assert!(
+                Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--donation", text])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn stratum_server_requires_a_valid_listener_and_preserves_global_network() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--chipnet",
+            "--listen",
+            "127.0.0.1:3336",
+        ])
+        .unwrap();
+        assert!(cli.chipnet);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--listen",
+            "not-a-listener"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["pickaxe", "stratum-v2", "check-node", "--chipnet"]).is_ok());
     }
 }

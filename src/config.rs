@@ -159,6 +159,8 @@ impl JobSource {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    /// BCH ASIC policy only. Token policies are selected separately.
+    pub bch_donation: crate::donation::bch::BchDonation,
     /// Mining chain; mainnet is the safe default.
     pub network: MiningNetwork,
     /// Selected token. PHOTON is currently the only supported GPU token.
@@ -187,6 +189,7 @@ impl Default for RuntimeConfig {
     /// Creates the default runtime configuration.
     fn default() -> Self {
         Self {
+            bch_donation: Default::default(),
             network: MiningNetwork::Mainnet,
             token: MiningToken::Photon,
             intensity: 100,
@@ -517,6 +520,8 @@ impl SavedDevices {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SavedConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bch_donation_bps: Option<crate::donation::bch::BchDonation>,
     pub network: Option<String>,
     pub token: Option<String>,
     pub backend: Option<String>,
@@ -534,6 +539,9 @@ pub struct SavedConfig {
 impl SavedConfig {
     /// Applies saved configuration values to a running miner.
     pub fn apply_to_runtime(&self, cfg: &mut RuntimeConfig) -> Result<(), String> {
+        if let Some(donation) = self.bch_donation_bps {
+            cfg.bch_donation = donation;
+        }
         if let Some(value) = &self.network {
             cfg.set_network(MiningNetwork::parse(value)?);
         }
@@ -637,6 +645,8 @@ impl SavedConfig {
         };
         Self {
             network: Some(runtime.network.as_str().to_string()),
+            bch_donation_bps: (runtime.bch_donation != Default::default())
+                .then_some(runtime.bch_donation),
             token: Some(runtime.token.as_str().to_string()),
             backend: Some(backend.to_string()),
             device: SavedDevices::from_selection(devices),
@@ -1046,7 +1056,7 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn restrict_private_config(path: &Path) -> Result<(), String> {
+pub(crate) fn restrict_private_config(path: &Path) -> Result<(), String> {
     #[cfg(not(any(unix, windows)))]
     let _ = path;
     #[cfg(unix)]
