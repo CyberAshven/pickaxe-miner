@@ -1835,8 +1835,12 @@ mod tests {
         let title = format!("Pickaxe Miner v{version}");
         assert_eq!(title, "Pickaxe Miner v0.0.3");
 
-        assert!(workflow.contains("pickaxe-miner-v${version}-linux-x86_64"));
-        assert!(workflow.contains("pickaxe-miner-v$version-windows-x86_64"));
+        // #### PR #32: Linux and Windows packages are named by the matrix's
+        // arch, x86_64 and arm64.
+        assert!(workflow.contains("pickaxe-miner-v${version}-linux-${ARCH}"));
+        assert!(workflow.contains("pickaxe-miner-v$version-windows-$env:ARCH"));
+        assert!(workflow.contains("arch: x86_64"));
+        assert!(workflow.contains("arch: arm64"));
         assert!(workflow.contains("\"${TAG}-linux-x86_64.tar.gz\""));
         assert!(workflow.contains("\"${TAG}-windows-x86_64.zip\""));
         assert!(!workflow.contains("pickaxe-${TAG}"));
@@ -1852,13 +1856,14 @@ mod tests {
             windows.trim_end_matches("-windows-x86_64")
         );
 
-        // #### PR #22: ARM64 is supported by the shared macOS package. Keep
-        // excluding unsupported Windows/Linux ARM packages from this release.
+        // #### PR #22: macOS ARM64 comes from the shared portable package.
+        // #### PR #32: Linux and Windows ARM64 packages join it, built on
+        // native ARM64 runners.
         assert!(workflow.contains("\"${TAG}-macos-arm64.tar.gz\""));
         assert!(workflow.contains("\"${TAG}-browser.tar.gz\""));
         assert!(workflow.contains("name: Verify portable package provenance"));
-        assert!(!workflow.contains("-linux-arm64"));
-        assert!(!workflow.contains("-windows-arm64"));
+        assert!(workflow.contains("\"${TAG}-linux-arm64.tar.gz\""));
+        assert!(workflow.contains("\"${TAG}-windows-arm64.zip\""));
         assert!(workflow.contains("GH_REPO: ${{ github.repository }}"));
         assert!(workflow.contains("--repo \"${GH_REPO}\""));
     }
