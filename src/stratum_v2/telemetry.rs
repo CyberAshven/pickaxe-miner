@@ -364,6 +364,18 @@ pub fn connection_reason(error: &str) -> &'static str {
         | "SV2 handshake failed"
         | "SV2 authority authentication failed" => "authentication or framing failed",
         "device worker panicked" => "device worker stopped unexpectedly",
+        // #### PR #40: a remote pool's answers, in pool mode.
+        "SV2 server unavailable" => "upstream unavailable",
+        "SV2 setup rejected" | "SV2 setup incompatible" => "upstream refused the connection",
+        "SV2 channel rejected" => "upstream refused the channel; check the pool identity",
+        "unexpected SV2 extranonce allocation" => "upstream extranonce size does not fit SV1",
+        "SV2 upstream asked to reconnect" | "SV2 upstream changed the extranonce" => {
+            "upstream asked to reconnect"
+        }
+        "SV2 upstream closed the channel" => "upstream closed the channel",
+        "SV2 certificate version unsupported" => {
+            "upstream certificate version is not SV2's; the pool must fix it"
+        }
         _ => "protocol or connection failure",
     }
 }

@@ -2,6 +2,14 @@
 //! SV1 firmware adapter over the same authenticated SV2 server. It translates
 //! jobs and shares using SRI; it never constructs payouts or accepts a share
 //! without the upstream validator. Plain SV1 belongs on a trusted mining LAN.
+//!
+//! #### PR #40
+//! The upstream can also be a remote SV2 pool (`Upstream::remote`): another
+//! Pickaxe server, or a BCH SV2 pool such as SoloFury or LoneStrike's stack,
+//! so SV1 firmware mines there over an encrypted, pinned link with no local
+//! node. A pool may acknowledge shares in batches, so in that mode firmware
+//! gets its reply once the adapter has checked and forwarded a share, and the
+//! adapter counts the pool's verdicts on the workers page itself.
 
 use super::{
     channel::MAX_ACTIVE_JOBS, server::ServerStats, telemetry::ShareEvent, transport::Session,
@@ -11,7 +19,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -23,7 +31,9 @@ use stratum_core::{
     binary_sv2,
     bitcoin::Target,
     codec_sv2::SerializedFrame,
-    common_messages_sv2::{Protocol, SetupConnection, SetupConnectionSuccess},
+    common_messages_sv2::{
+        Protocol, SetupConnection, SetupConnectionSuccess, MESSAGE_TYPE_RECONNECT,
+    },
     mining_sv2::*,
     stratum_translation::{sv1_to_sv2, sv2_to_sv1},
     sv1_api::{self as v1, json_rpc::Message, utils::HexU32Be},
@@ -33,13 +43,55 @@ const VERSION_MASK: u32 = 0x1fffe000;
 const MAX_LINE: usize = 64 * 1024;
 const MAX_PENDING: usize = 64;
 const DEADLINE: Duration = Duration::from_secs(10);
+/// A remote pool's verdict on a share is counted if it arrives within this
+/// time; later or missing verdicts are dropped without closing the device.
+const REMOTE_VERDICT: Duration = Duration::from_secs(120);
+/// The rate a device declares when its channel opens at a remote pool, which
+/// sets the pool's first difficulty: 1 TH/s, about one Bitaxe. Pools then
+/// adjust it from the shares.
+const REMOTE_NOMINAL_HASHRATE: f32 = 1e12;
+
+/// #### PR #40
+/// Where the adapter takes its work from.
+#[derive(Clone, Debug)]
+pub struct Upstream {
+    /// `host:port`, resolved at each connection.
+    pub address: String,
+    /// The upstream's authority public key; the Noise handshake pins it.
+    pub authority: [u8; 32],
+    /// The identity each channel opens with: the pool account or payout
+    /// address at a remote pool. Never printed.
+    pub identity: String,
+    /// A remote pool rather than this server's own SV2 listener.
+    pub remote: bool,
+}
+
+impl Upstream {
+    /// This server's own SV2 listener.
+    pub fn local(address: SocketAddr, authority: [u8; 32]) -> Self {
+        Self {
+            address: address.to_string(),
+            authority,
+            identity: "sv1-device".into(),
+            remote: false,
+        }
+    }
+
+    /// The host part of `address`, for the SV2 setup message.
+    fn host(&self) -> &str {
+        self.address
+            .rsplit_once(':')
+            .map_or(self.address.as_str(), |(host, _)| host)
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+    }
+}
 
 /// All validation and block submission still pass through the pinned SV2
 /// connection, including connections from older SV1-only ASIC firmware.
 pub fn run(
     listener: TcpListener,
-    upstream: SocketAddr,
-    authority: [u8; 32],
+    upstream: Upstream,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
@@ -62,8 +114,9 @@ pub fn run(
                 Ok((stream, _)) if devices.len() < 64 => {
                     let stop = stop.clone();
                     let stats = stats.clone();
+                    let upstream = upstream.clone();
                     devices.push(thread::spawn(move || {
-                        let _ = serve(stream, upstream, authority, &stop, &stats);
+                        let _ = serve(stream, &upstream, &stop, &stats);
                     }));
                 }
                 Ok(_) => (),
@@ -84,15 +137,24 @@ pub fn run(
     result
 }
 
+/// Connects to the first reachable address `address` resolves to.
+fn connect(address: &str) -> Result<TcpStream, String> {
+    let addresses = address
+        .to_socket_addrs()
+        .map_err(|_| "SV2 server unavailable")?;
+    addresses
+        .into_iter()
+        .find_map(|address| TcpStream::connect_timeout(&address, DEADLINE).ok())
+        .ok_or_else(|| "SV2 server unavailable".into())
+}
+
 fn serve(
     stream: TcpStream,
-    upstream: SocketAddr,
-    authority: [u8; 32],
+    upstream: &Upstream,
     stop: &AtomicBool,
     stats: &Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
-    let socket =
-        TcpStream::connect_timeout(&upstream, DEADLINE).map_err(|_| "SV2 server unavailable")?;
+    let socket = connect(&upstream.address)?;
     let peer = socket
         .local_addr()
         .map_err(|_| "cannot identify adapter socket")?;
@@ -103,10 +165,18 @@ fn serve(
         if let Ok(device) = stream.peer_addr() {
             stats.device_stats.set_address(id, device.ip());
         }
+        // With a remote pool no local server counts the session.
+        if upstream.remote {
+            stats.connections = stats.connections.saturating_add(1);
+            stats.sessions_started = stats.sessions_started.saturating_add(1);
+        }
         id
     };
-    let result = serve_session(stream, socket, authority, stop, stats, id);
+    let result = serve_session(stream, socket, upstream, stop, stats, id);
     if let Ok(mut stats) = stats.lock() {
+        if upstream.remote {
+            stats.connections = stats.connections.saturating_sub(1);
+        }
         let error = result
             .as_ref()
             .err()
@@ -123,23 +193,28 @@ fn serve(
 fn serve_session(
     stream: TcpStream,
     socket: TcpStream,
-    authority: [u8; 32],
+    upstream: &Upstream,
     stop: &AtomicBool,
     stats: &Arc<Mutex<ServerStats>>,
     device: u64,
 ) -> Result<(), String> {
-    let upstream = socket
+    let peer = socket
         .peer_addr()
         .map_err(|_| "cannot identify adapter upstream")?;
-    let (mut send, mut receive) = Session::initiate(socket, authority)?.split();
+    let (mut send, mut receive) = Session::initiate(socket, upstream.authority)?.split();
+    let host = if upstream.remote {
+        upstream.host()
+    } else {
+        "localhost"
+    };
     send.send(encoded(
         SetupConnection {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
             flags: 4,
-            endpoint_host: "localhost".try_into().map_err(|_| "invalid host")?,
-            endpoint_port: upstream.port(),
+            endpoint_host: host.try_into().map_err(|_| "invalid host")?,
+            endpoint_port: peer.port(),
             vendor: "Pickaxe SV1 adapter"
                 .try_into()
                 .map_err(|_| "invalid vendor")?,
@@ -154,8 +229,12 @@ fn serve_session(
     validate_setup_reply(reply)?;
     let open = sv1_to_sv2::build_sv2_open_extended_mining_channel(
         1,
-        "sv1-device".into(),
-        1.0,
+        upstream.identity.clone(),
+        if upstream.remote {
+            REMOTE_NOMINAL_HASHRATE
+        } else {
+            1.0
+        },
         Target::from_le_bytes([255; 32]),
         8,
     )
@@ -171,17 +250,23 @@ fn serve_session(
     }
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
-    let mut bridge = Bridge::new(opened)?;
+    let mut bridge = Bridge::new(opened, upstream.remote)?;
     let mut downstream = Lines::new(stream)?;
     let started = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         if !bridge.ready() && started.elapsed() >= DEADLINE {
             return Err("SV1 setup timed out".into());
         }
-        if bridge
+        if upstream.remote {
+            // Firmware already has its reply; a verdict that never comes is
+            // simply not counted.
+            bridge
+                .pending
+                .retain(|_, pending| pending.sent.elapsed() < REMOTE_VERDICT);
+        } else if bridge
             .pending
             .values()
-            .any(|(_, sent)| sent.elapsed() >= DEADLINE)
+            .any(|pending| pending.sent.elapsed() >= DEADLINE)
         {
             return Err("SV2 share response timed out".into());
         }
@@ -206,7 +291,24 @@ fn serve_session(
             }
         }
         if let Some(frame) = receive.receive(Duration::from_millis(1))? {
-            for message in bridge.upstream(frame)? {
+            let (messages, verdicts) = bridge.upstream(frame)?;
+            if !verdicts.is_empty() {
+                let mut stats = stats.lock().map_err(|_| "mining statistics unavailable")?;
+                for verdict in verdicts {
+                    match verdict {
+                        ShareEvent::Accepted(_) => {
+                            stats.shares_accepted = stats.shares_accepted.saturating_add(1)
+                        }
+                        ShareEvent::Rejected(_) => {
+                            stats.shares_rejected = stats.shares_rejected.saturating_add(1)
+                        }
+                    }
+                    stats
+                        .device_stats
+                        .share(device, verdict, true, Instant::now());
+                }
+            }
+            for message in messages {
                 downstream.write(&message)?;
             }
         }
@@ -229,12 +331,23 @@ struct Bridge {
     previous_hash: Option<SetNewPrevHashOwned>,
     notify: Option<Value>,
     sequence: u32,
-    pending: BTreeMap<u32, (u64, Instant)>,
+    pending: BTreeMap<u32, Pending>,
     local_rejection: Option<&'static str>,
+    /// A remote pool: see `Upstream::remote`.
+    remote: bool,
+}
+
+/// A share forwarded upstream and waiting for its verdict.
+struct Pending {
+    /// The firmware's request ID.
+    id: u64,
+    sent: Instant,
+    /// The share target the firmware was mining to, for the rate estimate.
+    target: [u8; 32],
 }
 
 impl Bridge {
-    fn new(open: OpenExtendedMiningChannelSuccess<'_>) -> Result<Self, String> {
+    fn new(open: OpenExtendedMiningChannelSuccess<'_>, remote: bool) -> Result<Self, String> {
         if open.request_id != 1 || open.extranonce_size != 8 {
             return Err("unexpected SV2 extranonce allocation".into());
         }
@@ -258,6 +371,7 @@ impl Bridge {
             sequence: 0,
             pending: BTreeMap::new(),
             local_rejection: None,
+            remote,
         })
     }
 
@@ -422,8 +536,8 @@ impl Bridge {
                         Some((21, "stale job"))
                     } else if submit.extra_nonce2.len() != self.extra_size {
                         Some((20, "invalid extranonce size"))
-                    } else if self.pending.len() >= MAX_PENDING
-                        || self.pending.values().any(|(pending, _)| *pending == id)
+                    } else if (self.pending.len() >= MAX_PENDING && !self.remote)
+                        || self.pending.values().any(|pending| pending.id == id)
                     {
                         Some((20, "too many pending submissions or duplicate request ID"))
                     } else if submit.version_bits.as_ref().is_some_and(|bits| {
@@ -451,9 +565,23 @@ impl Bridge {
                         mask,
                     )
                     .map_err(|_| "share translation failed")?;
-                    self.pending.insert(self.sequence, (id, Instant::now()));
+                    if self.pending.len() >= MAX_PENDING {
+                        // Remote only: the oldest verdict is no longer awaited.
+                        self.pending.pop_first();
+                    }
+                    self.pending.insert(
+                        self.sequence,
+                        Pending {
+                            id,
+                            sent: Instant::now(),
+                            target: self.target,
+                        },
+                    );
                     self.sequence = self.sequence.wrapping_add(1);
                     shares.push(share);
+                    if self.remote {
+                        out.push(json!({"id":id,"result":true,"error":null}));
+                    }
                 }
             }
             _ => out.push(reject(id, 20, "unsupported method")),
@@ -464,10 +592,22 @@ impl Bridge {
         Ok((out, shares))
     }
 
-    fn upstream(&mut self, mut frame: SerializedFrame) -> Result<Vec<Value>, String> {
+    /// Handles one upstream message: the SV1 messages it produces, and with
+    /// a remote pool the pool's verdicts on shares, for the workers page.
+    fn upstream(
+        &mut self,
+        mut frame: SerializedFrame,
+    ) -> Result<(Vec<Value>, Vec<ShareEvent>), String> {
         let kind = frame.header().msg_type();
+        let channel_message = frame.header().channel_msg();
         let mut out = Vec::new();
+        let mut verdicts = Vec::new();
         match kind {
+            // A common-protocol Reconnect: the device reconnects, and the
+            // adapter with it.
+            MESSAGE_TYPE_RECONNECT if !channel_message => {
+                return Err("SV2 upstream asked to reconnect".into())
+            }
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
                 let job: NewExtendedMiningJob =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid mining job")?;
@@ -528,14 +668,29 @@ impl Bridge {
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS => {
                 let ack: SubmitSharesSuccess = binary_sv2::from_bytes(frame.payload())
                     .map_err(|_| "invalid share response")?;
-                if ack.channel_id != self.channel || ack.new_submits_accepted_count != 1 {
-                    return Err("unexpected share acknowledgement".into());
+                if self.remote {
+                    if ack.channel_id != self.channel {
+                        return Err("unexpected share acknowledgement".into());
+                    }
+                    // Pools may acknowledge a batch: every share up to the
+                    // last sequence number that has no error is accepted.
+                    while let Some(entry) = self.pending.first_entry() {
+                        if *entry.key() > ack.last_sequence_number {
+                            break;
+                        }
+                        verdicts.push(ShareEvent::Accepted(entry.remove().target));
+                    }
+                } else {
+                    // This server acknowledges each share on its own.
+                    if ack.channel_id != self.channel || ack.new_submits_accepted_count != 1 {
+                        return Err("unexpected share acknowledgement".into());
+                    }
+                    let pending = self
+                        .pending
+                        .remove(&ack.last_sequence_number)
+                        .ok_or("unknown share acknowledgement")?;
+                    out.push(json!({"id":pending.id,"result":true,"error":null}));
                 }
-                let (id, _) = self
-                    .pending
-                    .remove(&ack.last_sequence_number)
-                    .ok_or("unknown share acknowledgement")?;
-                out.push(json!({"id":id,"result":true,"error":null}));
             }
             MESSAGE_TYPE_SUBMIT_SHARES_ERROR => {
                 let error: SubmitSharesError =
@@ -543,21 +698,36 @@ impl Bridge {
                 if error.channel_id != self.channel {
                     return Err("wrong mining channel".into());
                 }
-                let (id, _) = self
-                    .pending
-                    .remove(&error.sequence_number)
-                    .ok_or("unknown share error")?;
-                let code = match error.error_code.as_ref() {
-                    b"duplicate-share" => 22,
-                    b"difficulty-too-low" => 23,
-                    b"stale-share" | b"invalid-job-id" => 21,
-                    _ => 20,
+                let pending = self.pending.remove(&error.sequence_number);
+                let (code, reason) = match error.error_code.as_ref() {
+                    b"duplicate-share" => (22, "duplicate-share"),
+                    b"difficulty-too-low" => (23, "difficulty-too-low"),
+                    b"stale-share" => (21, "stale-share"),
+                    b"invalid-job-id" => (21, "invalid-job-id"),
+                    _ => (20, "rejected-by-pool"),
                 };
-                out.push(reject(id, code, "share rejected by validator"));
+                match (pending, self.remote) {
+                    (Some(_), true) => verdicts.push(ShareEvent::Rejected(reason)),
+                    // A verdict no longer awaited.
+                    (None, true) => (),
+                    (Some(pending), false) => {
+                        out.push(reject(pending.id, code, "share rejected by validator"))
+                    }
+                    (None, false) => return Err("unknown share error".into()),
+                }
             }
+            // The device's extranonce cannot change under SV1 firmware, and
+            // a closed channel has no work: the device reconnects for a new
+            // channel.
+            MESSAGE_TYPE_SET_EXTRANONCE_PREFIX => {
+                return Err("SV2 upstream changed the extranonce".into())
+            }
+            MESSAGE_TYPE_CLOSE_CHANNEL => return Err("SV2 upstream closed the channel".into()),
+            // Group channels only matter for standard channels.
+            MESSAGE_TYPE_SET_GROUP_CHANNEL if self.remote => (),
             _ => return Err("unexpected upstream firmware message".into()),
         }
-        Ok(out)
+        Ok((out, verdicts))
     }
 
     // #### PR #38
@@ -719,21 +889,27 @@ mod tests {
         }
     }
 
-    fn bridge() -> Bridge {
+    fn bridge_for(remote: bool) -> Bridge {
         let target = [255; 32];
         let prefix = [7; 16];
-        Bridge::new(OpenExtendedMiningChannelSuccess {
-            request_id: 1,
-            channel_id: 3,
-            group_channel_id: 0,
-            target: (&target).into(),
-            extranonce_size: 8,
-            extranonce_prefix: prefix.as_slice().try_into().unwrap(),
-        })
+        Bridge::new(
+            OpenExtendedMiningChannelSuccess {
+                request_id: 1,
+                channel_id: 3,
+                group_channel_id: 0,
+                target: (&target).into(),
+                extranonce_size: 8,
+                extranonce_prefix: prefix.as_slice().try_into().unwrap(),
+            },
+            remote,
+        )
         .unwrap()
     }
-    fn ready() -> Bridge {
-        let mut bridge = bridge();
+    fn bridge() -> Bridge {
+        bridge_for(false)
+    }
+    fn ready_for(remote: bool) -> Bridge {
+        let mut bridge = bridge_for(remote);
         bridge
             .request(json!({"id":1,"method":"mining.subscribe","params":[]}))
             .unwrap();
@@ -742,6 +918,9 @@ mod tests {
             .unwrap();
         bridge.active.insert(4, 0x20000000);
         bridge
+    }
+    fn ready() -> Bridge {
+        ready_for(false)
     }
     fn submit(id: u64) -> Value {
         json!({"id":id,"method":"mining.submit","params":["worker","4","0000000000000000","00000001","00000002"]})
@@ -767,7 +946,7 @@ mod tests {
             .unwrap()
         };
         let mut bridge = ready();
-        assert!(bridge.upstream(job(5, None)).unwrap().is_empty());
+        assert!(bridge.upstream(job(5, None)).unwrap().0.is_empty());
         let parent = encoded(
             SetNewPrevHash {
                 channel_id: 3,
@@ -780,7 +959,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let first = bridge.upstream(parent).unwrap();
+        let first = bridge.upstream(parent).unwrap().0;
         assert_eq!(first[0]["method"], "mining.set_difficulty");
         assert_eq!(first[1]["params"][8], true);
         // Vardiff: a new target, then an immediate job on the same block.
@@ -794,8 +973,8 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(bridge.upstream(set).unwrap().is_empty());
-        let next = bridge.upstream(job(6, Some(1700000000))).unwrap();
+        assert!(bridge.upstream(set).unwrap().0.is_empty());
+        let next = bridge.upstream(job(6, Some(1700000000))).unwrap().0;
         assert_eq!(next[0]["method"], "mining.set_difficulty");
         assert!((next[0]["params"][0].as_f64().unwrap() - 4096.0).abs() < 0.01);
         assert_eq!(next[1]["method"], "mining.notify");
@@ -821,8 +1000,10 @@ mod tests {
             true,
         )
         .unwrap();
-        let replies = bridge.upstream(ack.clone()).unwrap();
+        let (replies, verdicts) = bridge.upstream(ack.clone()).unwrap();
         assert_eq!(replies, vec![json!({"id":9,"result":true,"error":null})]);
+        // This server counts its own verdicts.
+        assert!(verdicts.is_empty());
         assert!(bridge.upstream(ack).is_err());
         bridge.request(submit(10)).unwrap();
         let reject = encoded(
@@ -835,10 +1016,74 @@ mod tests {
             true,
         )
         .unwrap();
-        let replies = bridge.upstream(reject).unwrap();
+        let replies = bridge.upstream(reject).unwrap().0;
         assert_eq!(replies[0]["id"], 10);
         assert_eq!(replies[0]["error"][0], 22);
         assert!(bridge.pending.is_empty());
+    }
+
+    #[test]
+    fn a_remote_pool_gets_replies_at_once_and_its_batched_verdicts_are_counted() {
+        let mut bridge = ready_for(true);
+        // Firmware gets its reply as soon as the share is forwarded.
+        for id in 20..23 {
+            let (replies, shares) = bridge.request(submit(id)).unwrap();
+            assert_eq!(replies, vec![json!({"id":id,"result":true,"error":null})]);
+            assert_eq!(shares.len(), 1);
+        }
+        // The pool rejects the second and acknowledges the batch.
+        let error = encoded(
+            SubmitSharesError {
+                channel_id: 3,
+                sequence_number: 1,
+                error_code: "stale-share".try_into().unwrap(),
+            },
+            MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
+            true,
+        )
+        .unwrap();
+        let (replies, verdicts) = bridge.upstream(error).unwrap();
+        assert!(replies.is_empty());
+        assert!(matches!(
+            verdicts[..],
+            [ShareEvent::Rejected("stale-share")]
+        ));
+        let batch = encoded(
+            SubmitSharesSuccess {
+                channel_id: 3,
+                last_sequence_number: 2,
+                new_submits_accepted_count: 2,
+                new_shares_sum: 0,
+            },
+            MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+            true,
+        )
+        .unwrap();
+        let (replies, verdicts) = bridge.upstream(batch.clone()).unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(verdicts.len(), 2);
+        assert!(verdicts.iter().all(
+            |verdict| matches!(verdict, ShareEvent::Accepted(target) if *target == [255; 32])
+        ));
+        assert!(bridge.pending.is_empty());
+        // A repeated or late verdict is not an error.
+        assert!(bridge.upstream(batch).unwrap().1.is_empty());
+        // Pending verdicts stay bounded: the oldest is dropped, never the share.
+        for id in 0..(MAX_PENDING as u64 + 5) {
+            assert_eq!(bridge.request(submit(100 + id)).unwrap().1.len(), 1);
+        }
+        assert_eq!(bridge.pending.len(), MAX_PENDING);
+        // The firmware cannot follow a new extranonce, so it reconnects.
+        let prefix = encoded(
+            SetExtranoncePrefix {
+                channel_id: 3,
+                extranonce_prefix: [1u8; 16].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_SET_EXTRANONCE_PREFIX,
+            true,
+        )
+        .unwrap();
+        assert!(bridge.upstream(prefix).is_err());
     }
 
     #[test]

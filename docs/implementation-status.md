@@ -636,3 +636,35 @@ Validation: Windows all-feature host suite, 438 library and 16 binary tests
 passed, 20 opt-in tests ignored, 31 hardware tests filtered; formatting,
 all-target/all-feature Clippy and the server-only (`stratum-v2`) Clippy with
 warnings denied passed. A device control action was not sent in this check.
+
+## Pool mode: SV1 devices at a remote SV2 pool (2026-10-08)
+
+#### PR #40
+
+`stratum-v2 serve --upstream HOST:PORT --upstream-key KEY [--upstream-user ID]`
+runs only the SV1 adapter, pointed at a remote SV2 pool: no node and no local
+SV2 server. Each device gets an encrypted, key-pinned SV2 connection and an
+extended channel under the identity (default: the payout address, never
+printed). Pools may batch acknowledgements, so the adapter answers firmware
+once a share is checked and forwarded and counts the pool's verdicts itself;
+a changed extranonce, a closed channel or a Reconnect closes the device for a
+fresh channel. Local mode keeps its exact behavior: per-share
+acknowledgements from Pickaxe's own server before firmware gets its reply.
+The donation does not apply in pool mode, since the pool builds the blocks.
+
+Evidence: an end-to-end test with Pickaxe's own server as the pool, reached
+by host name over Noise, mines two blocks with SV1 firmware, and the adapter's
+separate statistics count both verdicts. Read-only against SoloFury's BTC SV2
+(`eu-btc.solofury.com:3333`) with a throwaway identity, an SV1 device stand-in
+got a 4-byte extranonce prefix, an 8-byte extranonce2, difficulty 1024 and a
+first job (opt-in test `real_sv2_pool_sends_work_to_sv1_firmware`). SoloFury's
+BCH SV2 endpoints send a Noise certificate with format version 1 (CashStratum
+`src/sv2_noise.c` sets it); the SV2 spec requires 0 and requires clients to
+refuse other versions, as SRI's `noise_sv2` 2.0 does, so Pickaxe names that
+reason on the workers page. Reported as
+[cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3).
+
+Validation: Windows all-feature host suite, 442 library and 16 binary tests
+passed, 21 opt-in tests ignored, 31 hardware tests filtered; formatting,
+all-target/all-feature Clippy and the server-only Clippy with warnings
+denied passed.

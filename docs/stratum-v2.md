@@ -199,11 +199,51 @@ The adapter's connection to the local SV2 server is encrypted and pins its key.
 It supports version-mask negotiation, subscribe/authorize in either order,
 and forwards success only after upstream share validation. Node block acceptance
 is reported separately. Jobs, pending replies, input size and setup/partial-I/O
-time are bounded. The initial adapter handles one extended channel per device
-and the server's immediate acknowledgements; it is not a general upstream pool
-translator. Avalon Nano 3 has been tested; Antminer and native Bitaxe SV2
-validation remain pending. Each listener currently caps connections at 64;
-this is not a claim of 1,000-device capacity.
+time are bounded. The adapter handles one extended channel per device. Avalon
+Nano 3 has been tested; Antminer and native Bitaxe SV2 validation remain
+pending. Each listener currently caps connections at 64; this is not a claim
+of 1,000-device capacity.
+
+### Pool mode: SV1 devices at a remote SV2 pool
+
+Solo mining on your own node stays the default. To mine at a Stratum V2 pool
+instead, such as another Pickaxe server or a BCH SV2 pool, give the pool's
+address and authority key:
+
+```text
+pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
+  --upstream POOL-HOST:PORT --upstream-key POOL-AUTHORITY-KEY [--upstream-user IDENTITY]
+```
+
+No node runs and no SV2 listener opens; SV1 devices point at
+`stratum+tcp://LAN-IP:3333` as usual. Each device gets its own encrypted SV2
+connection to the pool, pinned to the pool's key, and an extended channel opened
+with `--upstream-user`: an account or worker name, or for a solo pool your
+payout address with an optional `.worker` suffix. Without `--upstream-user` it
+is the configured payout address. The identity is never printed or saved in
+the status file. The channel declares 1 TH/s, and pools set their first
+difficulty from that.
+
+Pools may acknowledge shares in batches, so in pool mode a device gets its
+reply once the adapter has checked and forwarded the share, and the workers
+page counts the pool's own verdicts as they arrive. A pool that changes a
+channel's extranonce or asks for a reconnect closes that device's connection,
+and the device reconnects for a new channel. SV1 firmware needs an 8-byte
+extranonce2; a pool that allocates another size is refused with a clear reason.
+The donation does not apply in pool mode, since the pool builds the blocks and
+pays (`--donation` is refused with `--upstream`). Native SV2 devices such as
+Bitaxe can connect to SV2 pools themselves.
+
+Evidence, 2026-10-08: Pickaxe's own server as the pool, over TCP with Noise
+and a host name (two blocks mined, both counted by the adapter), and SoloFury's
+BTC SV2 endpoint, read-only with a throwaway identity: setup accepted, extended
+channel opened with a 4-byte extranonce prefix and 8-byte extranonce2,
+difficulty 1024, and a first job delivered to an SV1 device stand-in.
+SoloFury's BCH SV2 endpoints run CashStratum, which signs its certificate with
+format version 1; the SV2 spec requires 0 and requires clients to refuse other
+versions, so Pickaxe reports "upstream certificate version is not SV2's" there
+until CashStratum fixes it
+([cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3)).
 
 The full-template provider checks network, synchronization, tip identity,
 CTOR, transaction bytes/IDs, header target and adaptive block size. It revokes

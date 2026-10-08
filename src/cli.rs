@@ -63,7 +63,7 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
-#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     Mine,
     Devices,
@@ -94,7 +94,7 @@ pub enum ConfigCommand {
     Save,
 }
 
-#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum StratumV2Command {
     /// Print implementation and validation status.
     Status,
@@ -114,6 +114,20 @@ pub enum StratumV2Command {
         /// BCH donation percentage, 0 to 100 (default 1.5). Defaults to the saved setting.
         #[arg(long)]
         donation: Option<crate::donation::bch::BchDonation>,
+        /// #### PR #40
+        /// Mine at a remote SV2 pool instead of your own node: HOST:PORT of
+        /// the pool (another Pickaxe server, or a BCH SV2 pool). SV1 devices
+        /// connect to --sv1-listen; no node is needed.
+        #[arg(long, requires_all = ["upstream_key", "sv1_listen"], conflicts_with = "donation")]
+        upstream: Option<String>,
+        /// The pool's authority public key, as the pool publishes it.
+        #[arg(long, requires = "upstream")]
+        upstream_key: Option<String>,
+        /// The identity the pool knows you by: an account or worker name, or
+        /// for a solo pool your payout address. Defaults to the configured
+        /// payout address.
+        #[arg(long, requires = "upstream")]
+        upstream_user: Option<String>,
     },
 }
 
@@ -321,6 +335,62 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn pool_mode_needs_the_pool_key_and_an_sv1_listener_and_has_no_donation() {
+        let base = [
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--upstream",
+            "pool.example:3336",
+        ];
+        let with = |extra: &[&'static str]| {
+            Cli::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        let cli = with(&[
+            "--upstream-key",
+            "9auqWEzQDVyLAAnYFbEqV2LDhYMyMEcuBJdJzkWW4GEk2Ss4Dnf",
+            "--upstream-user",
+            "me.rig1",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    upstream: Some(upstream),
+                    upstream_user: Some(user),
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("pool options missing")
+        };
+        assert_eq!(
+            (upstream.as_str(), user.as_str()),
+            ("pool.example:3336", "me.rig1")
+        );
+        // The pool's key and a listener for the devices are required.
+        assert!(with(&["--sv1-listen", "0.0.0.0:3333"]).is_err());
+        assert!(with(&["--upstream-key", "key"]).is_err());
+        // The pool builds the blocks, so the donation setting does not apply.
+        assert!(with(&[
+            "--upstream-key",
+            "key",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--donation",
+            "2"
+        ])
+        .is_err());
+        // Pool identity options need a pool.
+        assert!(
+            Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--upstream-user", "me"])
+                .is_err()
+        );
     }
 
     #[test]

@@ -639,7 +639,14 @@ impl FirmwareAdapter {
         let thread = {
             let stop = stop.clone();
             let stats = server.stats.clone();
-            thread::spawn(move || super::sv1::run(listener, upstream, authority, stop, stats))
+            thread::spawn(move || {
+                super::sv1::run(
+                    listener,
+                    super::sv1::Upstream::local(upstream, authority),
+                    stop,
+                    stats,
+                )
+            })
         };
         Self {
             stop,
@@ -907,4 +914,162 @@ fn sv1_cpu_firmware_mines_through_noise_and_receives_successor_jobs() {
         assert_eq!(devices[0].rejected, 0);
         device.write.shutdown(std::net::Shutdown::Both).unwrap();
     }
+}
+
+#[test]
+fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts() {
+    // Pickaxe's own server stands in for the remote pool; the adapter keeps
+    // its own statistics, as a separate process would.
+    let pool = Running::new(false);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(ServerStats::default()));
+    let upstream = super::sv1::Upstream {
+        // A host name, resolved at each connection.
+        address: format!("localhost:{}", pool.address.port()),
+        authority: pool.authority,
+        identity: payout(),
+        remote: true,
+    };
+    let thread = {
+        let stop = stop.clone();
+        let stats = stats.clone();
+        thread::spawn(move || super::sv1::run(listener, upstream, stop, stats))
+    };
+    let adapter = FirmwareAdapter {
+        stop,
+        thread: Some(thread),
+        address,
+    };
+    let mut device = FirmwareDevice::connect(&adapter, true, false);
+    for round in 0..2 {
+        let (hash, submit) = device.solve(round, true);
+        device.send(submit);
+        let ack = device.receive();
+        assert_eq!(ack["id"], round + 10);
+        assert_eq!(ack["result"], true);
+        pool.wait(|stats| stats.blocks_accepted == u64::from(round) + 1);
+        assert_eq!(pool.node.lock().unwrap().tip, hash);
+    }
+    // The pool's verdicts reach the adapter's own workers page.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while stats.lock().unwrap().shares_accepted < 2 {
+        assert!(Instant::now() < deadline, "pool verdicts not counted");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let counted = stats.lock().unwrap().clone();
+    assert_eq!((counted.connections, counted.sessions_started), (1, 1));
+    assert_eq!(counted.shares_rejected, 0);
+    let rows = counted.device_stats.snapshots(Instant::now());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].accepted, rows[0].rejected, rows[0].protocol),
+        (2, 0, "SV1")
+    );
+    device.write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+/// Opt-in and read-only: SV1 firmware reaches a real SV2 pool through the
+/// adapter and receives work; no share is submitted, and the identity is the
+/// address of a random, never-funded key. For example:
+/// `PICKAXE_TEST_SV2_POOL=HOST:PORT PICKAXE_TEST_SV2_POOL_KEY=KEY cargo test
+/// --features stratum-v2 --lib real_sv2_pool_sends_work -- --ignored --nocapture`.
+/// On 2026-10-08 SoloFury's BCH SV2 endpoints (`eu-bch.solofury.com:7333`,
+/// key `9c5s3n4RzRrDhzMBr3iSJsUfreSLPGiHkQyyzJjYAVWK9YWaZf7`) sent a Noise
+/// certificate with version 1, which the SV2 spec requires refusing (it must
+/// be 0), so this test reports "upstream certificate version is not SV2's"
+/// there; their BTC endpoint's handshake succeeds.
+#[test]
+#[ignore = "needs a real SV2 pool"]
+fn real_sv2_pool_sends_work_to_sv1_firmware() {
+    use std::io::{BufRead, Write};
+    let address = std::env::var("PICKAXE_TEST_SV2_POOL").expect("set PICKAXE_TEST_SV2_POOL");
+    let key = std::env::var("PICKAXE_TEST_SV2_POOL_KEY").expect("set PICKAXE_TEST_SV2_POOL_KEY");
+    let decoded = stratum_core::bitcoin::base58::decode_check(key.trim()).unwrap();
+    assert_eq!(&decoded[..2], &[1, 0], "SV2 authority key version");
+    let authority: [u8; 32] = decoded[2..].try_into().unwrap();
+    let secret = secp256k1::SecretKey::from_secret_bytes(rand::random()).unwrap();
+    let public = secp256k1::PublicKey::from_secret_key(&secret).serialize();
+    // PICKAXE_TEST_SV2_POOL_USER overrides it, for a pool of another chain.
+    let identity = std::env::var("PICKAXE_TEST_SV2_POOL_USER").unwrap_or_else(|_| {
+        format!(
+            "{}.pickaxe-test",
+            crate::reward::p2pkh_cashaddr_from_public_key(&public).unwrap()
+        )
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(ServerStats::default()));
+    let upstream = super::sv1::Upstream {
+        address,
+        authority,
+        identity,
+        remote: true,
+    };
+    let thread = {
+        let stop = stop.clone();
+        let stats = stats.clone();
+        thread::spawn(move || super::sv1::run(listener, upstream, stop, stats))
+    };
+    let _adapter = FirmwareAdapter {
+        stop,
+        thread: Some(thread),
+        address: local,
+    };
+    let mut write = TcpStream::connect(local).unwrap();
+    write
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut read = std::io::BufReader::new(write.try_clone().unwrap());
+    for request in [
+        json!({"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":2}]}),
+        json!({"id":2,"method":"mining.subscribe","params":["Pickaxe test firmware"]}),
+        json!({"id":3,"method":"mining.authorize","params":["pickaxe-test", "x"]}),
+    ] {
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        bytes.push(b'\n');
+        write.write_all(&bytes).unwrap();
+    }
+    let (mut subscribed, mut authorized, mut difficulty, mut notify) = (None, None, None, None);
+    while notify.is_none() {
+        let mut line = String::new();
+        let closed = read.read_line(&mut line).map_or(true, |read| read == 0);
+        if closed {
+            thread::sleep(Duration::from_millis(200));
+            let reasons: Vec<_> = stats
+                .lock()
+                .unwrap()
+                .device_stats
+                .snapshots(Instant::now())
+                .iter()
+                .map(|row| (row.adapter_error, row.connection_error))
+                .collect();
+            panic!("the adapter closed the device: {reasons:?}");
+        }
+        let message: Value = serde_json::from_str(&line).unwrap();
+        match (message["id"].as_u64(), message["method"].as_str()) {
+            (Some(2), _) => subscribed = Some(message),
+            (Some(3), _) => authorized = Some(message),
+            (_, Some("mining.set_difficulty")) => difficulty = Some(message),
+            (_, Some("mining.notify")) => notify = Some(message),
+            _ => (),
+        }
+    }
+    let subscribed = subscribed.expect("subscribe answered");
+    assert_eq!(authorized.expect("authorize answered")["result"], true);
+    let difficulty = difficulty.expect("difficulty before work")["params"][0]
+        .as_f64()
+        .unwrap();
+    let notify = notify.unwrap();
+    println!(
+        "extranonce1 {} bytes, extranonce2 {} bytes, difficulty {difficulty}, job {}, clean {}",
+        subscribed["result"][1].as_str().unwrap().len() / 2,
+        subscribed["result"][2],
+        notify["params"][0],
+        notify["params"][8]
+    );
+    assert!(difficulty > 0.0);
+    write.shutdown(std::net::Shutdown::Both).unwrap();
 }

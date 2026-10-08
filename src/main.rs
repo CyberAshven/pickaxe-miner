@@ -1296,7 +1296,7 @@ fn main() {
         }
     };
 
-    match args.command.unwrap_or(cli::Commands::Mine) {
+    match args.command.clone().unwrap_or(cli::Commands::Mine) {
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {
                 eprintln!("error: {error}");
@@ -1581,6 +1581,9 @@ fn main() {
                             listen: std::net::SocketAddr::from(([0, 0, 0, 0], 3336)),
                             sv1_listen: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3333))),
                             donation: None,
+                            upstream: None,
+                            upstream_key: None,
+                            upstream_user: None,
                         };
                         #[cfg(feature = "stratum-v2")]
                         let result = stratum_v2::command::run(

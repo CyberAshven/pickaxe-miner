@@ -51,31 +51,60 @@ pub fn run(
     if let StratumV2Command::Watch = action {
         return watch(&status_path(config_path));
     }
-    if matches!(action, StratumV2Command::Serve { .. }) {
+    // #### PR #40
+    // Pool mode: SV1 devices mine at a remote SV2 pool through the adapter,
+    // and no local node or SV2 server runs.
+    let pool = match &action {
+        StratumV2Command::Serve {
+            upstream: Some(address),
+            upstream_key,
+            upstream_user,
+            ..
+        } => Some(pool_upstream(
+            config,
+            address,
+            upstream_key.as_deref(),
+            upstream_user.as_deref(),
+        )?),
+        _ => None,
+    };
+    if matches!(action, StratumV2Command::Serve { .. }) && pool.is_none() {
         config::validate_payout_address(config.network, &config.payout_address)
             .map_err(|_| "a valid payout for the selected network is required")?;
     }
-    let (rpc, template) = preflight(config)?;
+    let node = match pool {
+        None => Some(preflight(config)?),
+        Some(_) => None,
+    };
     let StratumV2Command::Serve {
         listen,
         sv1_listen,
         donation,
+        ..
     } = action
     else {
-        println!(
-            "{}",
-            serde_json::json!({
-                "network":config.network.as_str(),"template_height":template.height,
-                "transactions":template.transaction_count(),"bits":format!("{:08x}", template.bits),
-                "size_limit":template.size_limit,"ready":true,"mining":false,
-            })
-        );
+        if let Some((_, template)) = &node {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "network":config.network.as_str(),"template_height":template.height,
+                    "transactions":template.transaction_count(),"bits":format!("{:08x}", template.bits),
+                    "size_limit":template.size_limit,"ready":true,"mining":false,
+                })
+            );
+        }
         return Ok(());
     };
     let donation = Arc::new(RwLock::new(donation.unwrap_or(config.bch_donation)));
-    let listener = TcpListener::bind(listen).map_err(|_| "cannot bind mining listener")?;
+    let listener = node
+        .is_some()
+        .then(|| TcpListener::bind(listen))
+        .transpose()
+        .map_err(|_| "cannot bind mining listener")?;
     let bound = listener
-        .local_addr()
+        .as_ref()
+        .map(TcpListener::local_addr)
+        .transpose()
         .map_err(|_| "cannot read mining listener")?;
     let sv1_listener = sv1_listen
         .map(TcpListener::bind)
@@ -86,8 +115,32 @@ pub fn run(
         .map(TcpListener::local_addr)
         .transpose()
         .map_err(|_| "cannot read SV1 listener")?;
-    let authority_secret = load_authority(&config_path.with_extension("sv2-key"))?;
-    let public = server::authority_public(&authority_secret)?;
+    let authority_secret = node
+        .is_some()
+        .then(|| load_authority(&config_path.with_extension("sv2-key")))
+        .transpose()?;
+    let public = authority_secret
+        .as_ref()
+        .map(server::authority_public)
+        .transpose()?;
+    // The SV1 adapter's upstream: the pool, or this server's own listener.
+    // Wildcard listeners are dialed through local loopback, never via an
+    // arbitrary network route. The SV2 authority remains pinned.
+    let upstream = match (&pool, bound, public) {
+        (Some(pool), _, _) => pool.clone(),
+        (None, Some(mut local), Some(public)) => {
+            if local.ip().is_unspecified() {
+                local.set_ip(if local.is_ipv4() {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                });
+            }
+            super::sv1::Upstream::local(local, public)
+        }
+        _ => return Err("mining server unavailable".into()),
+    };
+    let pool_address = pool.as_ref().map(|pool| pool.address.clone());
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
     ctrlc::set_handler(move || stop_signal.store(true, Ordering::Relaxed))
@@ -98,38 +151,35 @@ pub fn run(
         Some(TerminalSession::enter()?)
     };
     let stats = Arc::new(Mutex::new(ServerStats::default()));
-    // Difficulty 4096 is each device's starting target; vardiff then moves it
-    // toward 20 shares a minute. No nominal device rate is shown as measured.
-    let settings = ServerConfig {
-        network: config.network,
-        payout: config.payout_address.clone(),
-        authority_secret,
-        share_target: compact_target(0x1b0ffff0)?,
-        journal_path: config_path.with_extension("sv2-blocks.json"),
-        source_identity: rpc.source_identity()?,
-        donation: donation.clone(),
-        #[cfg(test)]
-        allocation_phase: None,
-    };
-    let worker = {
-        let stop = stop.clone();
-        let stats = stats.clone();
-        thread::spawn(move || server::run(listener, rpc, settings, stop, stats))
+    let worker = match (node, listener, authority_secret) {
+        (Some((rpc, _)), Some(listener), Some(authority_secret)) => {
+            // Difficulty 4096 is each device's starting target; vardiff then
+            // moves it toward 20 shares a minute. No nominal device rate is
+            // shown as measured.
+            let settings = ServerConfig {
+                network: config.network,
+                payout: config.payout_address.clone(),
+                authority_secret,
+                share_target: compact_target(0x1b0ffff0)?,
+                journal_path: config_path.with_extension("sv2-blocks.json"),
+                source_identity: rpc.source_identity()?,
+                donation: donation.clone(),
+                #[cfg(test)]
+                allocation_phase: None,
+            };
+            let stop = stop.clone();
+            let stats = stats.clone();
+            Some(thread::spawn(move || {
+                server::run(listener, rpc, settings, stop, stats)
+            }))
+        }
+        _ => None,
     };
     let firmware = sv1_listener.map(|listener| {
         let stop = stop.clone();
         let stats = stats.clone();
-        // Wildcard listeners are dialed through local loopback, never via an
-        // arbitrary network route. The SV2 authority remains pinned.
-        let mut upstream = bound;
-        if upstream.ip().is_unspecified() {
-            upstream.set_ip(if upstream.is_ipv4() {
-                std::net::Ipv4Addr::LOCALHOST.into()
-            } else {
-                std::net::Ipv6Addr::LOCALHOST.into()
-            });
-        }
-        thread::spawn(move || super::sv1::run(listener, upstream, public, stop, stats))
+        let upstream = upstream.clone();
+        thread::spawn(move || super::sv1::run(listener, upstream, stop, stats))
     });
     // #### PR #40
     // Device reports every 15 seconds, outside the stats lock, from asic-rs
@@ -165,14 +215,17 @@ pub fn run(
     let devices_hint = device_hint(bound, sv1_bound, lan_address());
     // SV2 reference authority public-key encoding: version 1 (little endian),
     // 32-byte x-only key, Base58Check. Only the public key is displayed.
-    let mut encoded = vec![1, 0];
-    encoded.extend(public);
-    let authority = stratum_core::bitcoin::base58::encode_check(&encoded);
+    let authority = public.map(|public| {
+        let mut encoded = vec![1, 0];
+        encoded.extend(public);
+        stratum_core::bitcoin::base58::encode_check(&encoded)
+    });
     let result = (|| {
         if terminal.is_none() {
+            // The pool's identity may be a payout address: never printed.
             println!(
                 "{}",
-                serde_json::json!({"listen":bound.to_string(),"sv1_listen":sv1_bound.map(|address| address.to_string()),"authority":authority,"network":config.network.as_str()})
+                serde_json::json!({"listen":bound.map(|address| address.to_string()),"sv1_listen":sv1_bound.map(|address| address.to_string()),"authority":authority,"upstream":pool_address,"network":config.network.as_str()})
             );
         }
         let mut device_offset = 0usize;
@@ -183,7 +236,9 @@ pub fn run(
         let status_file = status_path(config_path);
         let mut status_saved: Option<Instant> = None;
         let mut controls: Option<Controls> = None;
-        while !stop.load(Ordering::Relaxed) && !worker.is_finished() {
+        while !stop.load(Ordering::Relaxed)
+            && worker.as_ref().is_none_or(|worker| !worker.is_finished())
+        {
             if firmware.as_ref().is_some_and(|worker| worker.is_finished()) {
                 break;
             }
@@ -201,42 +256,74 @@ pub fn run(
             // beside the config, so `stratum-v2 watch` can show the workers
             // table of a server running as a service. It never holds payouts
             // or credentials, and a failed save never stops mining.
-            let status = status_json(config.network.as_str(), &snapshot, donation_value, &devices);
+            let status = status_json(
+                config.network.as_str(),
+                pool_address.as_deref(),
+                &snapshot,
+                donation_value,
+                &devices,
+            );
             if status_saved.is_none_or(|saved| saved.elapsed() >= Duration::from_secs(1)) {
                 let _ = write_status(&status_file, &status);
                 status_saved = Some(Instant::now());
             }
             if let Some(terminal) = terminal.as_mut() {
-                let overview_text = format!(
+                let overview_text = if let Some(pool) = &pool_address {
+                    format!(
+                        "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nThe pool builds the blocks and pays; the donation applies only to blocks Pickaxe builds from your own node.\nConnection errors: SV1 {}\nSV1 {}",
+                        config.network.as_str(),
+                        snapshot.connections,
+                        snapshot.sessions_started,
+                        snapshot.shares_accepted,
+                        snapshot.shares_rejected,
+                        snapshot.sv1_local_rejected,
+                        snapshot.sv1_connection_errors,
+                        sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
+                    )
+                } else {
+                    format!(
                     "{} · Node {} · Height {} · Donation {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" },
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
                     snapshot.connection_errors, snapshot.sv1_connection_errors,
-                    snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), bound,
+                    snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"),
+                    bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
                     sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
-                    setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {authority}")),
-                );
+                    setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", authority.as_deref().unwrap_or("—"))),
+                    )
+                };
                 let online = devices.iter().filter(|device| device.connected).count();
                 let total_rate: f64 = devices
                     .iter()
                     .filter(|device| device.connected)
                     .filter_map(|device| device.hashrate_estimate)
                     .sum();
-                let header = format!(
-                    "{} · Node {} · Height {} · Donation {}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
-                    config.network.as_str(),
-                    if snapshot.template_ready { "Ready" } else { "Waiting" },
-                    snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
-                    donation_summary(donation_value),
-                    devices.len(),
-                    crate::telemetry::format_hash_rate(total_rate),
-                    snapshot.shares_accepted,
-                    snapshot.shares_rejected,
-                    snapshot.blocks_accepted,
-                    snapshot.blocks_pending,
-                );
+                let header = if let Some(pool) = &pool_address {
+                    format!(
+                        "{} · Pool {pool} (SV2, encrypted) · the pool builds blocks and pays\n{online} of {} workers online · {} · Shares {} accepted / {} rejected\n{devices_hint}",
+                        config.network.as_str(),
+                        devices.len(),
+                        crate::telemetry::format_hash_rate(total_rate),
+                        snapshot.shares_accepted,
+                        snapshot.shares_rejected,
+                    )
+                } else {
+                    format!(
+                        "{} · Node {} · Height {} · Donation {}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
+                        config.network.as_str(),
+                        if snapshot.template_ready { "Ready" } else { "Waiting" },
+                        snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
+                        donation_summary(donation_value),
+                        devices.len(),
+                        crate::telemetry::format_hash_rate(total_rate),
+                        snapshot.shares_accepted,
+                        snapshot.shares_rejected,
+                        snapshot.blocks_accepted,
+                        snapshot.blocks_pending,
+                    )
+                };
                 let lines: Vec<WorkerLine> = devices.iter().map(WorkerLine::from).collect();
                 terminal
                     .terminal
@@ -244,7 +331,12 @@ pub fn run(
                         if let Some(view) = controls.as_ref() {
                             render_controls(frame, view)
                         } else if advanced {
-                            render_advanced(frame, donation_value, setting_error)
+                            render_advanced(
+                                frame,
+                                donation_value,
+                                setting_error,
+                                pool_address.is_some(),
+                            )
                         } else if overview {
                             render_dashboard(frame, &overview_text, &devices, device_offset)
                         } else {
@@ -340,10 +432,64 @@ pub fn run(
                 .and_then(|r| r)
         })
         .unwrap_or(Ok(()));
-    let server_result = worker
-        .join()
-        .map_err(|_| "mining server stopped unexpectedly")?;
+    let server_result = match worker {
+        Some(worker) => worker
+            .join()
+            .map_err(|_| "mining server stopped unexpectedly")?,
+        None => Ok(()),
+    };
     result.and(server_result).and(firmware_result)
+}
+
+/// #### PR #40
+/// The remote SV2 pool from `--upstream`, `--upstream-key` and
+/// `--upstream-user`. The key is the pool's authority public key as SV2
+/// pools publish it: Base58Check of version 1 and the 32-byte x-only key,
+/// the form this server prints for its own. The identity defaults to the
+/// payout address, which solo SV2 pools pay; it is never printed.
+fn pool_upstream(
+    config: &RuntimeConfig,
+    address: &str,
+    key: Option<&str>,
+    user: Option<&str>,
+) -> Result<super::sv1::Upstream, String> {
+    let address = address.trim();
+    if address
+        .rsplit_once(':')
+        .is_none_or(|(host, port)| host.is_empty() || port.parse::<u16>().is_err())
+    {
+        return Err("--upstream must be HOST:PORT".into());
+    }
+    let invalid_key = "--upstream-key is not an SV2 authority public key";
+    let decoded = stratum_core::bitcoin::base58::decode_check(
+        key.ok_or("--upstream-key is required with --upstream")?
+            .trim(),
+    )
+    .map_err(|_| invalid_key)?;
+    let authority: [u8; 32] = match decoded.as_slice() {
+        [1, 0, key @ ..] => key.try_into().map_err(|_| invalid_key)?,
+        _ => return Err(invalid_key.into()),
+    };
+    let identity = match user.map(str::trim) {
+        Some(user) => {
+            if user.is_empty() || user.len() > 255 || user.chars().any(char::is_control) {
+                return Err("--upstream-user must be 1 to 255 printable characters".into());
+            }
+            user.to_owned()
+        }
+        None => {
+            config::validate_payout_address(config.network, &config.payout_address).map_err(
+                |_| "--upstream-user, or a valid payout address for the selected network, is required",
+            )?;
+            config.payout_address.clone()
+        }
+    };
+    Ok(super::sv1::Upstream {
+        address: address.to_owned(),
+        authority,
+        identity,
+        remote: true,
+    })
 }
 
 fn save_donation(path: &Path, value: BchDonation) -> Result<(), ()> {
@@ -363,7 +509,7 @@ fn donation_summary(donation: BchDonation) -> String {
 }
 
 /// Advanced settings: the donation, adjustable from 0% to 100%.
-fn render_advanced(frame: &mut Frame<'_>, donation: BchDonation, error: Option<&str>) {
+fn render_advanced(frame: &mut Frame<'_>, donation: BchDonation, error: Option<&str>, pool: bool) {
     let (work, reward) = donation.shares();
     let mut text = format!(
         "Donation  {donation}\n\n{work} of mining work and {reward} of each block reward go to the \
@@ -371,6 +517,11 @@ fn render_advanced(frame: &mut Frame<'_>, donation: BchDonation, error: Option<&
          0.5% steps. Changes apply to new jobs and are saved.\n\n←/→ or +/-  Change donation · \
          a or Esc  Back"
     );
+    if pool {
+        text.push_str(
+            "\n\nMining at a pool: the pool builds the blocks, so this setting applies when you mine on your own node.",
+        );
+    }
     if let Some(error) = error {
         text.push_str(&format!("\n\n{error}"));
     }
@@ -691,7 +842,7 @@ fn lan_address() -> Option<std::net::IpAddr> {
 /// Where devices connect, with wildcard listeners shown as this computer's
 /// local network address.
 fn device_hint(
-    sv2: std::net::SocketAddr,
+    sv2: Option<std::net::SocketAddr>,
     sv1: Option<std::net::SocketAddr>,
     lan: Option<std::net::IpAddr>,
 ) -> String {
@@ -699,13 +850,15 @@ fn device_hint(
         Some(ip) if address.ip().is_unspecified() => std::net::SocketAddr::new(ip, address.port()),
         _ => address,
     };
-    match sv1 {
-        Some(sv1) => format!(
+    match (sv1, sv2) {
+        (Some(sv1), Some(sv2)) => format!(
             "Point devices at: SV1 stratum+tcp://{} · SV2 {}",
             shown(sv1),
             shown(sv2)
         ),
-        None => format!("Point devices at: SV2 {}", shown(sv2)),
+        (Some(sv1), None) => format!("Point devices at: SV1 stratum+tcp://{}", shown(sv1)),
+        (None, Some(sv2)) => format!("Point devices at: SV2 {}", shown(sv2)),
+        (None, None) => String::new(),
     }
 }
 
@@ -839,12 +992,14 @@ fn status_path(config_path: &Path) -> PathBuf {
 /// `stratum-v2 watch`. It never contains payouts or credentials.
 fn status_json(
     network: &str,
+    upstream: Option<&str>,
     snapshot: &ServerStats,
     donation: BchDonation,
     devices: &[DeviceSnapshot],
 ) -> serde_json::Value {
     serde_json::json!({
         "network": network,
+        "upstream": upstream,
         "updated": unix_now(),
         "ready": snapshot.template_ready,
         "height": snapshot.height,
@@ -885,6 +1040,8 @@ fn write_status(path: &Path, status: &serde_json::Value) -> std::io::Result<()> 
 #[serde(default)]
 struct WatchStatus {
     network: String,
+    /// The pool in pool mode.
+    upstream: Option<String>,
     updated: u64,
     ready: bool,
     height: Option<u32>,
@@ -917,6 +1074,16 @@ impl WatchStatus {
         } else {
             "Live".to_owned()
         };
+        if let Some(pool) = &self.upstream {
+            return format!(
+                "{} · Pool {pool} (SV2, encrypted) · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected",
+                self.network,
+                self.device_details.len(),
+                crate::telemetry::format_hash_rate(rate),
+                self.shares_accepted,
+                self.shares_rejected,
+            );
+        }
         format!(
             "{} · Node {} · Height {} · Donation {} · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
             self.network,
@@ -1208,7 +1375,7 @@ mod tests {
         let lan = Some("192.168.0.160".parse().unwrap());
         assert_eq!(
             device_hint(
-                "0.0.0.0:3336".parse().unwrap(),
+                Some("0.0.0.0:3336".parse().unwrap()),
                 Some("0.0.0.0:3333".parse().unwrap()),
                 lan
             ),
@@ -1216,13 +1383,51 @@ mod tests {
         );
         // Explicit listeners are shown as configured.
         assert_eq!(
-            device_hint("127.0.0.1:3336".parse().unwrap(), None, lan),
+            device_hint(Some("127.0.0.1:3336".parse().unwrap()), None, lan),
             "Point devices at: SV2 127.0.0.1:3336"
         );
         assert_eq!(
-            device_hint("0.0.0.0:3336".parse().unwrap(), None, None),
+            device_hint(Some("0.0.0.0:3336".parse().unwrap()), None, None),
             "Point devices at: SV2 0.0.0.0:3336"
         );
+        // Pool mode has no SV2 listener of its own.
+        assert_eq!(
+            device_hint(None, Some("0.0.0.0:3333".parse().unwrap()), lan),
+            "Point devices at: SV1 stratum+tcp://192.168.0.160:3333"
+        );
+    }
+
+    #[test]
+    fn pool_mode_reads_the_pool_key_and_defaults_its_identity_to_the_payout() {
+        let mut config = RuntimeConfig {
+            network: crate::config::MiningNetwork::Chipnet,
+            ..RuntimeConfig::default()
+        };
+        let mut encoded = vec![1, 0];
+        encoded.extend([7u8; 32]);
+        let key = stratum_core::bitcoin::base58::encode_check(&encoded);
+        // A worker name for an account pool.
+        let pool =
+            pool_upstream(&config, " pool.example:3336 ", Some(&key), Some("me.rig1")).unwrap();
+        assert_eq!(pool.address, "pool.example:3336");
+        assert_eq!(pool.authority, [7u8; 32]);
+        assert_eq!(pool.identity, "me.rig1");
+        assert!(pool.remote);
+        // Without one, a solo pool's identity is the payout address, which
+        // must be valid for the network.
+        assert!(pool_upstream(&config, "pool.example:3336", Some(&key), None).is_err());
+        config.payout_address = "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp".into();
+        let pool = pool_upstream(&config, "pool.example:3336", Some(&key), None).unwrap();
+        assert_eq!(pool.identity, config.payout_address);
+        // Malformed input fails before any connection.
+        assert!(pool_upstream(&config, "pool.example", Some(&key), None).is_err());
+        assert!(pool_upstream(&config, "pool.example:3336", Some("not-a-key"), None).is_err());
+        assert!(pool_upstream(&config, "pool.example:3336", None, None).is_err());
+        assert!(pool_upstream(&config, "pool.example:3336", Some(&key), Some("a\nb")).is_err());
+        let mut wrong_version = vec![2, 0];
+        wrong_version.extend([7u8; 32]);
+        let wrong = stratum_core::bitcoin::base58::encode_check(&wrong_version);
+        assert!(pool_upstream(&config, "pool.example:3336", Some(&wrong), None).is_err());
     }
 
     #[test]
@@ -1258,7 +1463,7 @@ mod tests {
         let devices = stats
             .device_stats
             .snapshots(start + Duration::from_secs(40));
-        let status = status_json("chipnet", &stats, BchDonation::default(), &devices);
+        let status = status_json("chipnet", None, &stats, BchDonation::default(), &devices);
         let dir = super::super::journal::TestDirectory::new();
         let path = status_path(&dir.0.join("chipnet.json"));
         write_status(&path, &status).unwrap();
@@ -1318,7 +1523,14 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal
-            .draw(|f| render_advanced(f, BchDonation::default(), Some("Could not save donation")))
+            .draw(|f| {
+                render_advanced(
+                    f,
+                    BchDonation::default(),
+                    Some("Could not save donation"),
+                    false,
+                )
+            })
             .unwrap();
         let text: String = terminal
             .backend()
