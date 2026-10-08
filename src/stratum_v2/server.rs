@@ -460,8 +460,9 @@ impl JobAvailability {
     }
 }
 
-fn template_reason(error: &str) -> &'static str {
+pub(super) fn template_reason(error: &str) -> &'static str {
     match error {
+        crate::node::NODE_RPC_LOGIN_REFUSED => "node refused the RPC login",
         "node tip changed while fetching the template" => "tip changed during refresh",
         "node is on the wrong network" => "wrong network",
         "node is not fully synchronized" => "node not synchronized",

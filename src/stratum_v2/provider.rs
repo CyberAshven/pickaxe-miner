@@ -26,6 +26,12 @@ impl NativeNodeRpc {
     pub fn source_identity(&self) -> Result<[u8; 32], String> {
         crate::node::rpc_source_identity(&self.endpoint)
     }
+
+    /// #### PR #40
+    /// The node's client, chain and sync state.
+    pub fn info(&self) -> Result<crate::node::NodeInfo, String> {
+        crate::node::node_info(&self.endpoint)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

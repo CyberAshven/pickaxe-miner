@@ -162,6 +162,21 @@ the local network (SV1 on port 3333, SV2 on 3336) and the workers page shows
 this computer's address to point devices at. SV1 has no encryption, so use it
 on a trusted network.
 
+Your BCH node: the setup's BCH node list looks for Bitcoin Cash Node on this
+computer (`127.0.0.1:8332` on mainnet, `127.0.0.1:48332` on Chipnet) and offers
+it with its version and sync height; Enter saves it. BCHN answers once its
+`bitcoin.conf` has `server=1` (and `chipnet=1` for Chipnet). With no
+`rpcpassword` set, BCHN writes a login cookie at every start and Pickaxe reads
+it from BCHN's default folder (`%APPDATA%\Bitcoin` on Windows, `~/.bitcoin` or
+the service's `/var/lib/bitcoind` on Linux, `~/Library/Application
+Support/Bitcoin` on macOS, with `chipnet` inside it for Chipnet), so no
+password is needed; `PICKAXE_NODE_RPC_COOKIE` names a cookie file elsewhere. A
+node on another computer needs its RPC login in the address
+(`http://USER:PASSWORD@HOST:PORT`) or in `PICKAXE_NODE_RPC_USER` and
+`PICKAXE_NODE_RPC_PASSWORD`. `check-node`, the dashboard and `watch` show the
+node's client and version, and a node that cannot be used is named with its
+reason, such as a refused login or a node still synchronizing.
+
 On the workers page, `c` opens controls for the top row's device, with its
 model, firmware and power. It lists what that make and firmware support
 through asic-rs (Restart, Pause and Resume mining, blink or stop blinking its

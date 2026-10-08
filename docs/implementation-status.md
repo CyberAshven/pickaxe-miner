@@ -33,8 +33,8 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | Pending |
 | G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Pending |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | Pending |
-| D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pending |
-| D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Pending |
+| D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | SV1 devices at SV2 pools with backup pools in order implemented and tested (pool mode below); Job Declaration and coinbase payouts pending |
+| D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Setup finds a BCHN on this computer and offers it with client, version and sync height; cookie login; unusable nodes named with their reason; live-checked against a throwaway Chipnet BCHN (below). GPU broadcasts already fall back to Fulcrum; ASIC mode has no fallback, since only a node supplies full templates |
 | T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | Pending protocol/deployment evidence |
 | T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Pending author covenant design |
 | F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Needs audit |
@@ -672,3 +672,53 @@ Validation: Windows all-feature host suite, 443 library and 16 binary tests
 passed, 21 opt-in tests ignored, 31 hardware tests filtered; formatting,
 all-target/all-feature Clippy and the server-only Clippy with warnings
 denied passed.
+
+## Own BCH node: found on this computer, cookie login (2026-10-08)
+
+#### PR #40
+
+The guided own-node step (D3). The BCH node list in setup looks for Bitcoin
+Cash Node on this computer in the background, at BCHN's default RPC address
+(`127.0.0.1:8332` on mainnet, `127.0.0.1:48332` on Chipnet, from its
+`chainparamsbase.cpp`), and offers it with its client, version and sync
+height; Enter saves it for every profile on that network. A node that wants
+a login, a node on the other network and no node at all are each explained,
+with what makes BCHN answer (`server=1`, plus `chipnet=1` for Chipnet).
+Start in ASIC mode without a node opens this list directly.
+
+With no `rpcpassword` set, BCHN writes `__cookie__:<hex>` to `.cookie` in its
+network's data folder at every start (`rpc/protocol.cpp`). Pickaxe reads it
+for every call, only for a loopback host on those default ports, from BCHN's
+default data folder (`util/system.cpp`) and on Linux also its service folder
+`/var/lib/bitcoind` (`contrib/init/bitcoind.service`);
+`PICKAXE_NODE_RPC_COOKIE` names another file. A login in the URL or the
+environment still comes first. The cookie is never printed or saved.
+
+A node's HTTP 401 is now named ("the node refused the RPC login") instead of
+a JSON parse error, and `check-node` and `serve` say why no configured node
+could be used (a refused login, the wrong network, not synchronized).
+`check-node`, the dashboard header and the status `watch` reads show the
+node's client and version, such as "Node Ready (Bitcoin Cash Node 29.1.0)".
+
+Fallback: GPU broadcasts already fall back from a node to Fulcrum servers.
+ASIC mode has none, since only a node supplies full block templates; saved
+nodes are tried in order at start.
+
+Evidence: host tests cover the cookie paths per network and host (other hosts
+and ports get none), login precedence, the 401 mapping, the node report and
+its summary, user agents with control characters, saved forms of the local
+address, and the setup flow (the offer, Enter saving it, the saved state, the
+other network, a login wanted, no node). Live, against a throwaway BCHN 29.1.0
+Chipnet container with no peers and no password, reachable from this computer
+only: the opt-in `real_local_node_is_found_and_reported` read
+"Bitcoin Cash Node 29.1.0 · syncing, height 0 of 0 (0%)" with its cookie and
+`NeedsLogin` without it, and `check-node` named "node not synchronized" and
+"node refused the RPC login" respectively. No synchronized node on this
+computer was available, so a synced node in the offer is host-tested only.
+
+Validation: Windows all-feature host suite, 444 library and 16 binary tests
+passed, 22 opt-in tests ignored, 34 hardware tests filtered (one run also saw
+the timing-sensitive `sv1_same_tip_refresh_accepts_inflight_block_and_new_tip_rejects_it`
+time out under parallel load; it passed alone three times and does not use
+the node code changed here); formatting, all-target/all-feature Clippy on Rust
+1.94 and 1.99 and the server-only Clippy with warnings denied passed.

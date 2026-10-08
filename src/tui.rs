@@ -31,7 +31,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -191,6 +191,22 @@ struct SetupFlow {
     selected: usize,
     config: RuntimeConfig,
     status_line: String,
+    /// #### PR #40
+    /// The check for a BCH node on this computer, started when the BCH node
+    /// list opens.
+    local_node: LocalNodeCheck,
+    /// How the check looks; tests replace it.
+    probe_local_node: fn(MiningNetwork) -> crate::node::LocalNode,
+}
+
+/// #### PR #40
+/// The check for a BCH node on this computer runs in the background, so the
+/// BCH node list never waits on it (a refused connection takes about two
+/// seconds on Windows).
+enum LocalNodeCheck {
+    Idle,
+    Running(MiningNetwork, mpsc::Receiver<crate::node::LocalNode>),
+    Done(MiningNetwork, crate::node::LocalNode),
 }
 
 /// The GPUs that mine unless chosen otherwise: every discrete GPU, or every
@@ -256,7 +272,101 @@ impl SetupFlow {
             selected,
             config,
             status_line: String::new(),
+            local_node: LocalNodeCheck::Idle,
+            #[cfg(not(test))]
+            probe_local_node: crate::node::probe_local_node,
+            #[cfg(test)]
+            probe_local_node: |_| crate::node::LocalNode::Missing,
         })
+    }
+
+    /// #### PR #40
+    /// Starts looking for a BCH node on this computer.
+    fn check_local_node(&mut self) {
+        let (send, receive) = mpsc::channel();
+        let network = self.config.network;
+        let probe = self.probe_local_node;
+        thread::spawn(move || {
+            let _ = send.send(probe(network));
+        });
+        self.local_node = LocalNodeCheck::Running(network, receive);
+    }
+
+    fn checking_local_node(&self) -> bool {
+        matches!(self.local_node, LocalNodeCheck::Running(..))
+    }
+
+    /// Takes the check's result once it is in. The cursor moves to the
+    /// offered node if it still rests on "+ add node", so Enter adds it.
+    fn poll_local_node(&mut self) {
+        let LocalNodeCheck::Running(network, receive) = &self.local_node else {
+            return;
+        };
+        let network = *network;
+        let result = match receive.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => crate::node::LocalNode::Missing,
+        };
+        self.local_node = LocalNodeCheck::Done(network, result);
+        let count = self
+            .sources
+            .list(self.config.network, ConnectionKind::Node)
+            .len();
+        if self.step == SetupStep::Connections
+            && self.editing.is_none()
+            && self.connection_selected == count
+            && self.local_node_offer().is_some()
+        {
+            self.connection_selected = count + 1;
+        }
+    }
+
+    /// The node on this computer when it can be added: found on the
+    /// selected network and not saved yet.
+    fn local_node_offer(&self) -> Option<&crate::node::NodeInfo> {
+        let network = self.config.network;
+        match &self.local_node {
+            LocalNodeCheck::Done(checked, crate::node::LocalNode::Found(info))
+                if *checked == network
+                    && self.connection_kind == ConnectionKind::Node
+                    && info.network() == Some(network)
+                    && !self
+                        .sources
+                        .list(network, ConnectionKind::Node)
+                        .iter()
+                        .any(|url| crate::node::is_local_node_url(url, network)) =>
+            {
+                Some(info)
+            }
+            _ => None,
+        }
+    }
+
+    /// Saves the node on this computer for every profile on the network.
+    fn add_local_node(&mut self) {
+        let network = self.config.network;
+        let count = self.sources.list(network, ConnectionKind::Node).len();
+        let mut updated = self.sources.clone();
+        match updated.put(
+            network,
+            ConnectionKind::Node,
+            None,
+            crate::node::local_node_url(network),
+        ) {
+            Ok(()) => {
+                self.sources = updated;
+                self.status_line = match self.save_sources() {
+                    Ok(()) => format!(
+                        "Added the BCH node on this PC for every profile on {}.",
+                        network_label(network)
+                    ),
+                    Err(error) => error,
+                };
+                self.connection_selected = count;
+            }
+            Err(error) => self.status_line = error,
+        }
     }
 
     /// The GPUs ticked in the setup wizard, in list order.
@@ -759,6 +869,9 @@ impl SetupFlow {
                     };
                     self.connection_selected = 0;
                     self.step = SetupStep::Connections;
+                    if row == SettingsRow::Node {
+                        self.check_local_node();
+                    }
                 }
                 // #### PR #40
                 // ASIC mode starts the BCH ASIC server: blocks come from the
@@ -780,10 +893,19 @@ impl SetupFlow {
                             "Enter a BCH payout address for the selected network.".into();
                         self.open_settings(SettingsRow::Address);
                     } else if self.config.custom_node_endpoints().is_empty() {
+                        // #### PR #40
+                        // Straight to the BCH node list, which looks for a
+                        // node on this computer.
+                        self.connection_kind = ConnectionKind::Node;
+                        self.connection_selected = self
+                            .sources
+                            .list(self.config.network, ConnectionKind::Node)
+                            .len();
+                        self.step = SetupStep::Connections;
+                        self.check_local_node();
                         self.status_line =
-                            "BCH ASIC mining builds blocks from your own BCH node; add it on the BCH node row."
+                            "BCH ASIC mining builds blocks from your own BCH node: add it here."
                                 .into();
-                        self.open_settings(SettingsRow::Node);
                     } else {
                         return SetupAction::Complete;
                     }
@@ -809,6 +931,11 @@ impl SetupFlow {
     fn handle_connections_key(&mut self, key: KeyEvent) -> SetupAction {
         let network = self.config.network;
         let count = self.sources.list(network, self.connection_kind).len();
+        // #### PR #40
+        // The node found on this computer is one more row, after "+ add".
+        let offer = self.local_node_offer().is_some();
+        let rows = count + 1 + usize::from(offer);
+        self.connection_selected = self.connection_selected.min(rows - 1);
         self.status_line.clear();
         match key.code {
             KeyCode::Esc => {
@@ -818,11 +945,10 @@ impl SetupFlow {
                 };
                 self.open_settings(row);
             }
-            KeyCode::Up => {
-                self.connection_selected = (self.connection_selected + count) % (count + 1)
-            }
-            KeyCode::Down => {
-                self.connection_selected = (self.connection_selected + 1) % (count + 1)
+            KeyCode::Up => self.connection_selected = (self.connection_selected + rows - 1) % rows,
+            KeyCode::Down => self.connection_selected = (self.connection_selected + 1) % rows,
+            KeyCode::Enter if offer && self.connection_selected == count + 1 => {
+                self.add_local_node()
             }
             KeyCode::Enter => {
                 let value = self
@@ -1377,11 +1503,21 @@ pub fn run_setup(
 fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, String> {
     let mut terminal = TerminalSession::enter()?;
     loop {
+        state.poll_local_node();
         terminal
             .terminal
             .draw(|frame| render_setup(frame, &state))
             .map_err(|error| format!("draw mining setup: {error}"))?;
 
+        // #### PR #40
+        // While the check for a node on this computer runs, wake up to show
+        // its result as soon as it is in.
+        if state.checking_local_node()
+            && !event::poll(EVENT_POLL_INTERVAL)
+                .map_err(|error| format!("read mining setup input: {error}"))?
+        {
+            continue;
+        }
         let input = event::read().map_err(|error| format!("read mining setup input: {error}"))?;
         let Event::Key(key) = input else {
             continue;
@@ -2567,6 +2703,13 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
             add_label.to_string()
         }
     )));
+    if let Some(info) = state.local_node_offer() {
+        lines.push(Line::from(format!(
+            "{} Use the node on this PC: {}",
+            selection_marker(state.connection_selected == saved.len() + 1),
+            info.summary()
+        )));
+    }
     lines.push(Line::from(""));
     match state.connection_kind {
         ConnectionKind::Fulcrum => {
@@ -2582,12 +2725,58 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
                 lines.push(Line::from(dim(format!("  {endpoint}"))));
             }
         }
+        // #### PR #40
+        // What the check for a node on this computer found, then how to make
+        // one answer: BCHN answers RPC with server=1, and with no rpcpassword
+        // set Pickaxe logs in with its cookie.
         ConnectionKind::Node => {
+            let local = crate::node::local_node_url(network).trim_start_matches("http://");
+            match &state.local_node {
+                LocalNodeCheck::Running(checked, _) if *checked == network => {
+                    lines.push(Line::from(dim(format!(
+                        "Looking for a BCH node on this PC ({local})..."
+                    ))))
+                }
+                LocalNodeCheck::Done(checked, result) if *checked == network => match result {
+                    crate::node::LocalNode::Found(info) if info.network() == Some(network) => {
+                        if state.local_node_offer().is_none() {
+                            lines.push(Line::from(dim(format!(
+                                "On this PC: {} (saved)",
+                                info.summary()
+                            ))));
+                        }
+                    }
+                    crate::node::LocalNode::Found(_) => lines.push(Line::from(dim(format!(
+                        "The node on this PC ({local}) is not on {}.",
+                        network_label(network)
+                    )))),
+                    crate::node::LocalNode::NeedsLogin => {
+                        lines.push(Line::from(dim(format!(
+                            "A BCH node answers on this PC ({local}) but wants its RPC login:"
+                        ))));
+                        lines.push(Line::from(dim(format!(
+                            "add it as http://USER:PASSWORD@{local}"
+                        ))));
+                    }
+                    crate::node::LocalNode::Missing => lines.push(Line::from(dim(format!(
+                        "No BCH node answers on this PC ({local})."
+                    )))),
+                },
+                _ => {}
+            }
             lines.push(Line::from(dim(
-                "There are no public nodes: node RPC is private and needs a password.",
+                "There are no public nodes: node RPC is private.",
             )));
+            lines.push(Line::from(dim(match network {
+                MiningNetwork::Mainnet => {
+                    "Bitcoin Cash Node on this PC answers with server=1 in bitcoin.conf; Pickaxe reads its cookie, so no password is needed."
+                }
+                MiningNetwork::Chipnet => {
+                    "Bitcoin Cash Node on this PC answers with server=1 and chipnet=1 in bitcoin.conf; Pickaxe reads its cookie, so no password is needed."
+                }
+            })));
             lines.push(Line::from(dim(
-                "Add your own node, for example http://127.0.0.1:8332 on this PC.",
+                "A node on another computer needs its RPC login: http://USER:PASSWORD@HOST:PORT.",
             )));
         }
     }
@@ -4082,9 +4271,117 @@ mod tests {
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
         assert!(setup.status_line.contains("own BCH node"));
+        // #### PR #40
+        // Straight to the BCH node list, which looks for a node on this PC.
+        assert_eq!(setup.step, SetupStep::Connections);
+        assert_eq!(setup.connection_kind, ConnectionKind::Node);
+        assert!(!matches!(setup.local_node, LocalNodeCheck::Idle));
         setup.config.node_url = Some("http://user:pass@127.0.0.1:8332".into());
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+    }
+
+    // #### PR #40
+    /// Waits for the background check for a node on this computer.
+    fn finish_local_node_check(setup: &mut SetupFlow) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while setup.checking_local_node() {
+            assert!(Instant::now() < deadline, "local node check never finished");
+            thread::sleep(Duration::from_millis(2));
+            setup.poll_local_node();
+        }
+    }
+
+    #[test]
+    fn the_node_list_offers_a_node_found_on_this_computer() {
+        let devices = test_devices();
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            devices.clone(),
+            BackendKind::Auto,
+            &devices[..1],
+        )
+        .unwrap();
+        setup.config.set_network(MiningNetwork::Chipnet);
+        setup.probe_local_node = |network| {
+            assert_eq!(network, MiningNetwork::Chipnet);
+            crate::node::LocalNode::Found(crate::node::NodeInfo {
+                client: "Bitcoin Cash Node 29.1.0".into(),
+                chain: "chip".into(),
+                blocks: 326900,
+                headers: 326900,
+                syncing: false,
+                progress: 1.0,
+            })
+        };
+        setup.open_settings(SettingsRow::Node);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Connections);
+        finish_local_node_check(&mut setup);
+
+        // The cursor moved from "+ add node" to the node found, so Enter
+        // saves it for every profile on Chipnet.
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains(
+                "> Use the node on this PC: Bitcoin Cash Node 29.1.0 · synced at height 326900"
+            ),
+            "{screen}"
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.status_line.contains("Added the BCH node on this PC"));
+        assert_eq!(
+            setup
+                .sources
+                .list(MiningNetwork::Chipnet, ConnectionKind::Node),
+            ["http://127.0.0.1:48332"]
+        );
+        assert_eq!(
+            setup.config.custom_node_endpoints(),
+            ["http://127.0.0.1:48332"]
+        );
+        let screen = setup_text(&setup);
+        assert!(!screen.contains("Use the node on this PC"));
+        assert!(screen
+            .contains("On this PC: Bitcoin Cash Node 29.1.0 · synced at height 326900 (saved)"));
+
+        // A node on the other network is not offered.
+        setup
+            .sources
+            .remove(MiningNetwork::Chipnet, ConnectionKind::Node, 0);
+        setup.probe_local_node = |_| {
+            crate::node::LocalNode::Found(crate::node::NodeInfo {
+                client: "Bitcoin Cash Node 29.1.0".into(),
+                chain: "main".into(),
+                blocks: 900000,
+                headers: 900000,
+                syncing: false,
+                progress: 1.0,
+            })
+        };
+        setup.open_settings(SettingsRow::Node);
+        setup.handle_key(key(KeyCode::Enter));
+        finish_local_node_check(&mut setup);
+        assert!(setup.local_node_offer().is_none());
+        assert!(setup_text(&setup).contains("is not on Chipnet"));
+
+        // A node that wants its login, and no node at all, are explained.
+        setup.probe_local_node = |_| crate::node::LocalNode::NeedsLogin;
+        setup.open_settings(SettingsRow::Node);
+        setup.handle_key(key(KeyCode::Enter));
+        finish_local_node_check(&mut setup);
+        let screen = setup_text(&setup);
+        assert!(screen.contains("wants its RPC login"), "{screen}");
+        assert!(screen.contains("http://USER:PASSWORD@127.0.0.1:48332"));
+        setup.probe_local_node = |_| crate::node::LocalNode::Missing;
+        setup.open_settings(SettingsRow::Node);
+        setup.handle_key(key(KeyCode::Enter));
+        finish_local_node_check(&mut setup);
+        let screen = setup_text(&setup);
+        assert!(screen.contains("No BCH node answers on this PC (127.0.0.1:48332)."));
+        assert!(screen.contains("server=1 and chipnet=1"));
+        assert_eq!(setup.handle_key(key(KeyCode::Down)), SetupAction::Continue);
+        assert_eq!(setup.connection_selected, 0);
     }
 
     #[test]

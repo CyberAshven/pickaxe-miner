@@ -74,6 +74,13 @@ pub fn run(
     } else {
         None
     };
+    // #### PR #40
+    // The node's client and version, such as "Bitcoin Cash Node 29.1.0",
+    // for check-node, the dashboard and the saved status.
+    let node_client = node
+        .as_ref()
+        .and_then(|(rpc, _)| rpc.info().ok())
+        .map(|info| info.client);
     let StratumV2Command::Serve {
         listen,
         sv1_listen,
@@ -85,7 +92,7 @@ pub fn run(
             println!(
                 "{}",
                 serde_json::json!({
-                    "network":config.network.as_str(),"template_height":template.height,
+                    "network":config.network.as_str(),"node":node_client,"template_height":template.height,
                     "transactions":template.transaction_count(),"bits":format!("{:08x}", template.bits),
                     "size_limit":template.size_limit,"ready":true,"mining":false,
                 })
@@ -265,6 +272,7 @@ pub fn run(
             let status = status_json(
                 config.network.as_str(),
                 pool_address.as_deref(),
+                node_client.as_deref(),
                 &snapshot,
                 donation_value,
                 &devices,
@@ -288,8 +296,8 @@ pub fn run(
                     )
                 } else {
                     format!(
-                    "{} · Node {} · Height {} · Donation {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
-                    config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" },
+                    "{} · Node {}{} · Height {} · Donation {}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
+                    config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_suffix(node_client.as_deref()),
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
@@ -317,9 +325,10 @@ pub fn run(
                     )
                 } else {
                     format!(
-                        "{} · Node {} · Height {} · Donation {}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
+                        "{} · Node {}{} · Height {} · Donation {}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending\n{devices_hint}",
                         config.network.as_str(),
                         if snapshot.template_ready { "Ready" } else { "Waiting" },
+                        node_suffix(node_client.as_deref()),
                         snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()),
                         donation_summary(donation_value),
                         devices.len(),
@@ -1006,6 +1015,7 @@ fn status_path(config_path: &Path) -> PathBuf {
 fn status_json(
     network: &str,
     upstream: Option<&str>,
+    node: Option<&str>,
     snapshot: &ServerStats,
     donation: BchDonation,
     devices: &[DeviceSnapshot],
@@ -1013,6 +1023,7 @@ fn status_json(
     serde_json::json!({
         "network": network,
         "upstream": upstream,
+        "node": node,
         "updated": unix_now(),
         "ready": snapshot.template_ready,
         "height": snapshot.height,
@@ -1055,6 +1066,8 @@ struct WatchStatus {
     network: String,
     /// The pool in pool mode.
     upstream: Option<String>,
+    /// The node's client and version in local mode.
+    node: Option<String>,
     updated: u64,
     ready: bool,
     height: Option<u32>,
@@ -1098,9 +1111,10 @@ impl WatchStatus {
             );
         }
         format!(
-            "{} · Node {} · Height {} · Donation {} · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
+            "{} · Node {}{} · Height {} · Donation {} · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
             self.network,
             if self.ready { "Ready" } else { "Waiting" },
+            node_suffix(self.node.as_deref()),
             self.height
                 .map(|height| height.to_string())
                 .unwrap_or_else(|| "Waiting".into()),
@@ -1176,19 +1190,36 @@ fn watch(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// #### PR #40
+/// The node's client after "Node Ready", such as " (Bitcoin Cash Node 29.1.0)".
+fn node_suffix(client: Option<&str>) -> String {
+    client
+        .map(|client| format!(" ({client})"))
+        .unwrap_or_default()
+}
+
 fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), String> {
     let endpoints = config.custom_node_endpoints();
     if endpoints.is_empty() {
         return Err("configure your BCHN RPC connection before starting BCH ASIC mining".into());
     }
+    let mut reason = "node RPC unavailable";
     for endpoint in endpoints {
         let mut provider =
             TemplateProvider::new(NativeNodeRpc::new(endpoint.to_owned()), config.network);
-        if let Ok((_, template)) = provider.refresh() {
-            return Ok((NativeNodeRpc::new(endpoint.to_owned()), template.clone()));
+        match provider.refresh() {
+            Ok((_, template)) => {
+                return Ok((NativeNodeRpc::new(endpoint.to_owned()), template.clone()))
+            }
+            // #### PR #40
+            // The last node's reason, such as a refused login or a node on
+            // another network, instead of a bare failure.
+            Err(error) => reason = server::template_reason(&error),
         }
     }
-    Err("no configured BCH node supplied a synchronized template for the selected network".into())
+    Err(format!(
+        "no configured BCH node supplied a synchronized template for the selected network ({reason})"
+    ))
 }
 
 fn load_authority(path: &Path) -> Result<[u8; 32], String> {
@@ -1507,7 +1538,14 @@ mod tests {
         let devices = stats
             .device_stats
             .snapshots(start + Duration::from_secs(40));
-        let status = status_json("chipnet", None, &stats, BchDonation::default(), &devices);
+        let status = status_json(
+            "chipnet",
+            None,
+            Some("Bitcoin Cash Node 29.1.0"),
+            &stats,
+            BchDonation::default(),
+            &devices,
+        );
         let dir = super::super::journal::TestDirectory::new();
         let path = status_path(&dir.0.join("chipnet.json"));
         write_status(&path, &status).unwrap();
@@ -1523,6 +1561,7 @@ mod tests {
         let header = saved.header(updated);
         for part in [
             "chipnet",
+            "Node Ready (Bitcoin Cash Node 29.1.0)",
             "Height 326930",
             "0.50% of work",
             "Live",
