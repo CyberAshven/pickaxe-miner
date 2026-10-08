@@ -17,7 +17,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub token: Option<String>,
 
-    #[arg(long, global = true, value_parser = ["auto", "cuda", "hip", "wgpu"])]
+    #[arg(long, global = true, value_parser = ["auto", "cuda", "hip", "wgpu", "opencl"])]
     pub backend: Option<String>,
 
     /// GPUs to mine on: all, one number from `pickaxe devices`, or a list like 0,2.
@@ -58,6 +58,59 @@ pub struct Cli {
 
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// Coordinate GPU rigs: share this miner's job with rigs that connect to
+    /// this address (for example 0.0.0.0:3340). Only this miner claims.
+    #[arg(long, global = true, value_name = "ADDR:PORT")]
+    pub rigs_listen: Option<std::net::SocketAddr>,
+
+    /// Mine as a rig of the coordinator at this address; it claims every win.
+    /// Repeat for backup coordinators, tried in order.
+    #[arg(
+        long,
+        global = true,
+        value_name = "HOST:PORT",
+        requires = "coordinator_key",
+        conflicts_with = "rigs_listen",
+        action = clap::ArgAction::Append
+    )]
+    pub coordinator: Vec<String>,
+
+    /// The key each coordinator prints at start, so a rig trusts only it.
+    /// Give one per --coordinator, in the same order.
+    #[arg(long, global = true, value_name = "KEY", action = clap::ArgAction::Append)]
+    pub coordinator_key: Vec<String>,
+
+    /// Token donation percentage, at least the token's minimum (4 for PHOTON);
+    /// Advanced settings (`a`) changes it while mining.
+    #[arg(long, global = true, value_name = "PERCENT")]
+    pub token_donation: Option<crate::donation::TokenDonation>,
+
+    /// With --rigs-listen: mine with the rigs only and use no GPU on this
+    /// computer, so the coordinator can run on any machine. Needs --address.
+    #[arg(long, global = true, requires_all = ["rigs_listen", "address"])]
+    pub rigs_only: bool,
+
+    /// #### PR #32
+    /// With --rigs-listen: run a public GPU pool, where each rig mines for
+    /// the --address it gives and is claimed to it; your fee is a share of
+    /// each rig's mining time.
+    #[arg(long, global = true, requires = "rigs_listen")]
+    pub rigs_public: bool,
+
+    /// The public GPU pool's fee: a percentage of each rig's mining time,
+    /// after the donation (default 0).
+    #[arg(long, global = true, value_name = "PERCENT", requires = "rigs_public")]
+    pub rigs_fee: Option<crate::donation::bch::BchDonation>,
+
+    /// Where the public GPU pool's fee goes (default: your --address).
+    #[arg(long, global = true, value_name = "ADDRESS", requires = "rigs_public")]
+    pub rigs_fee_address: Option<String>,
+
+    /// This rig's name on the coordinator's dashboard (default: the
+    /// computer's name).
+    #[arg(long, global = true, value_name = "NAME", requires = "coordinator")]
+    pub rig_name: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -231,6 +284,8 @@ mod tests {
         let cli = Cli::try_parse_from(["pickaxe", "devices", "--backend", "wgpu"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Devices)));
         assert_eq!(cli.backend.as_deref(), Some("wgpu"));
+        let cli = Cli::try_parse_from(["pickaxe", "devices", "--backend", "opencl"]).unwrap();
+        assert_eq!(cli.backend.as_deref(), Some("opencl"));
     }
 
     #[test]
@@ -307,6 +362,90 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--chipnet", "--network", "mainnet"]).is_err()
         );
+    }
+
+    #[test]
+    fn rig_flags_parse_and_a_rig_needs_the_coordinator_key() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--coordinator",
+            "192.0.2.1:3340",
+            "--coordinator-key",
+            "key",
+        ])
+        .unwrap();
+        assert_eq!(cli.coordinator, ["192.0.2.1:3340"]);
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--coordinator",
+            "192.0.2.1:3340",
+            "--coordinator-key",
+            "main",
+            "--coordinator",
+            "192.0.2.2:3340",
+            "--coordinator-key",
+            "backup",
+        ])
+        .unwrap();
+        assert_eq!(cli.coordinator, ["192.0.2.1:3340", "192.0.2.2:3340"]);
+        assert_eq!(cli.coordinator_key, ["main", "backup"]);
+        // #### PR #32
+        // A rig may be named; a coordinator may mine with its rigs only, given
+        // where it pays.
+        let named = Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--coordinator",
+            "192.0.2.1:3340",
+            "--coordinator-key",
+            "main",
+            "--rig-name",
+            "rack-1",
+        ])
+        .unwrap();
+        assert_eq!(named.rig_name.as_deref(), Some("rack-1"));
+        assert!(Cli::try_parse_from(["pickaxe", "mine", "--rig-name", "rack-1"]).is_err());
+        let only = Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--rigs-listen",
+            "0.0.0.0:3340",
+            "--rigs-only",
+            "--address",
+            "payout",
+        ])
+        .unwrap();
+        assert!(only.rigs_only);
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--rigs-listen",
+            "0.0.0.0:3340",
+            "--rigs-only"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["pickaxe", "mine", "--rigs-only", "--address", "payout"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_err()
+        );
+        let cli =
+            Cli::try_parse_from(["pickaxe", "mine", "--rigs-listen", "0.0.0.0:3340"]).unwrap();
+        assert_eq!(cli.rigs_listen, Some("0.0.0.0:3340".parse().unwrap()));
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "mine",
+            "--rigs-listen",
+            "0.0.0.0:3340",
+            "--coordinator",
+            "192.0.2.1:3340",
+            "--coordinator-key",
+            "key",
+        ])
+        .is_err());
     }
 
     #[test]

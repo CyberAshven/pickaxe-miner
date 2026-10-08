@@ -1292,7 +1292,7 @@ fn preflight(config: &RuntimeConfig) -> Result<(NativeNodeRpc, BchTemplate), Str
     ))
 }
 
-fn load_authority(path: &Path) -> Result<[u8; 32], String> {
+pub(crate) fn load_authority(path: &Path) -> Result<[u8; 32], String> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

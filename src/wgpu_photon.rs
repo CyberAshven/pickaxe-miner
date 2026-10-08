@@ -11,7 +11,7 @@
 //! bounded number of winner nonce/HASH256 records. Names (wgpu, WebGPU, WGSL,
 //! naga): docs/gpu-sources.md.
 
-use crate::gpu_types::{PhotonCudaBatchResult, PhotonCudaWinner};
+use crate::gpu_types::{PhotonCudaBatchResult, PhotonCudaWinner, THROTTLED_BATCH_DIVISOR};
 use crate::m29_table::{self, M29TableSource};
 use crate::{protocol::ProofRule, tx::PhotonLayout};
 use secp256k1::SecretKey;
@@ -1358,7 +1358,24 @@ impl WgpuPhotonEngine {
         nonce_base
             .checked_add(candidate_count - 1)
             .ok_or("PHOTON WGPU candidate range crosses the key-rotation boundary")?;
-        let adapt_batch = candidate_count == self.recommended_candidates;
+        // #### PR #32: throttled batches grow the batch ladder too
+        // What: below 100% intensity the search runs a quarter of the
+        // recommended batch; that batch's time, scaled to the full batch, now
+        // adapts the ladder as a full batch's time does.
+        // Why: the ladder adapted only on full batches, so throttled mining
+        // stayed at its starting size: on an AMD iGPU 180,000 candidates/s at
+        // 75% against 29 million at 100%, and on an Intel HD 520 15,000
+        // against 7 to 10 million (issue #30).
+        // Check: `portable_engine_scales_with_intensity` (benchmark.rs) and
+        // `benchmark --backend wgpu` pass intensity validation.
+        let full = self.recommended_candidates;
+        let adapt_scale = if candidate_count == full {
+            Some(1)
+        } else if candidate_count.checked_mul(THROTTLED_BATCH_DIVISOR) == Some(full) {
+            Some(THROTTLED_BATCH_DIVISOR)
+        } else {
+            None
+        };
         #[cfg(not(target_arch = "wasm32"))]
         let batch_started = Instant::now();
         #[cfg(target_arch = "wasm32")]
@@ -1610,9 +1627,9 @@ impl WgpuPhotonEngine {
         #[cfg(target_arch = "wasm32")]
         let elapsed =
             Duration::from_secs_f64(((js_sys::Date::now() - batch_started) / 1000.0).max(0.0));
-        if adapt_batch {
+        if let Some(scale) = adapt_scale {
             self.recommended_candidates =
-                next_wgpu_batch_size(candidate_count, elapsed, self.active_capacity());
+                next_wgpu_batch_size(full, elapsed.saturating_mul(scale), self.active_capacity());
         }
 
         Ok(PhotonCudaBatchResult {

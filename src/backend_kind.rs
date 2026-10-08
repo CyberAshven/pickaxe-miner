@@ -8,6 +8,9 @@ pub enum BackendKind {
     Cuda,
     Hip,
     Wgpu,
+    /// #### PR #32: GPUs the other engines cannot drive, through their
+    /// OpenCL driver: older integrated GPUs and cards, and ARM GPUs.
+    OpenCl,
 }
 
 impl BackendKind {
@@ -18,7 +21,10 @@ impl BackendKind {
             "cuda" => Ok(Self::Cuda),
             "hip" | "rocm" => Ok(Self::Hip),
             "wgpu" => Ok(Self::Wgpu),
-            other => Err(format!("unknown backend `{other}` (auto|cuda|hip|wgpu)")),
+            "opencl" | "cl" => Ok(Self::OpenCl),
+            other => Err(format!(
+                "unknown backend `{other}` (auto|cuda|hip|wgpu|opencl)"
+            )),
         }
     }
 
@@ -29,6 +35,7 @@ impl BackendKind {
             Self::Cuda => "cuda",
             Self::Hip => "hip",
             Self::Wgpu => "wgpu",
+            Self::OpenCl => "opencl",
         }
     }
 }

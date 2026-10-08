@@ -683,6 +683,37 @@ pub fn print_report(report: &BenchmarkReport, json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opt-in and release-only: the whole intensity matrix on the portable
+    /// engine, on an adapter chosen by name, e.g. `PICKAXE_TEST_WGPU_ADAPTER=
+    /// "AMD Radeon" cargo test --release --lib --no-default-features --features
+    /// portable-wgpu portable_engine_scales_with_intensity -- --ignored`.
+    #[cfg(feature = "portable-wgpu")]
+    #[test]
+    #[ignore = "needs a GPU and a release build; choose it with PICKAXE_TEST_WGPU_ADAPTER"]
+    fn portable_engine_scales_with_intensity() {
+        let device = GpuDevice {
+            index: 0,
+            name: "named test adapter".into(),
+            vendor: String::new(),
+            vram_bytes: None,
+            backend: BackendKind::Wgpu,
+            detail: String::new(),
+            integrated: true,
+            ready: true,
+            pci: None,
+        };
+        let report = run_gpu_benchmark(&device, 4, None, false).unwrap();
+        for sample in &report.samples {
+            println!(
+                "intensity {:>3}%: {:>14.0} candidates/s in {} batches",
+                sample.intensity, sample.candidates_per_second, sample.batches
+            );
+        }
+        let validation = report.matrix_validation.as_ref().unwrap();
+        println!("{validation:?}");
+        assert!(report.passed(), "{validation:?}");
+    }
     use crate::telemetry::parse_nvidia_smi_line;
 
     /// Creates a synthetic one-second sample for throughput assertions.

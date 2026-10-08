@@ -28,10 +28,10 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
 | S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; workers page, read-only device reports and per-device vardiff observed on the Avalon Nano 3 on 2026-10-08; the read-only `watch` view and calmer vardiff host-tested |
 | S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | Default 1.5% policy, dashboard controls and saved configuration implemented; host/reference checks and four live-node proposals pass; updated physical ASIC payout observation pending |
-| G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | Pending |
-| G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | Pending |
-| G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | Pending |
-| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Pending |
+| G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
+| G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
+| G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check; a coordinator crash during a claim is not exercised live |
+| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live; backup coordinators host-tested; live failover and rigs on separate machines pending |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | Pending |
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | SV1 devices at SV2 pools with backup pools in order implemented and tested (pool mode below); Job Declaration and coinbase payouts pending |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Setup finds a BCHN on this computer and offers it with client, version and sync height; cookie login; unusable nodes named with their reason; live-checked against a throwaway Chipnet BCHN (below). GPU broadcasts already fall back to Fulcrum; ASIC mode has no fallback, since only a node supplies full templates |
@@ -850,3 +850,67 @@ and its address (q or p, checked for the network), and starts the public pool.
 Host tests walk each path, including the refusals for P2Pool v2, a GPU pool
 in this build, a missing pool address or key, a bad fee address and a missing
 node. Pool settings last for the session, as the hardware choice does.
+
+## GPU farm: a coordinator with no GPU and two live rigs (2026-10-08)
+
+#### PR #32
+
+`mine --rigs-listen ADDR --rigs-only --address PAYOUT` runs a coordinator
+that uses no GPU on its computer: a search with no GPU follows each job's
+generation and pause state and finds nothing, the rigs mine, and the claim
+path is the normal miner's. `--rig-name` names a rig (default: the computer's
+name, with `/etc/hostname` for a Linux service), a rig prints its GPUs at
+start, a headless rig (`--no-tui`, `--json`) no longer asks for `--address`,
+rigs measure their own rate (the rate they sent was a field only the main
+miner's runtime fills, so it read 0), a coordinator takes up to 1,024 rigs,
+and the coordinator's Hashrate row and chart add the rigs' rate.
+`docs/farm.md` is the operator guide.
+
+Live on Chipnet, on one PC, with this branch's release build: the coordinator
+(`--rigs-only`) and two rigs, rig A on the RTX 5070 Ti Laptop GPU through CUDA
+and rig B on the AMD Radeon integrated GPU through wgpu (per-process GPU
+counters showed them on different adapters), each process with its own session
+folder; the operator's mainnet miner was paused between claims for the 10
+minutes and restarted afterwards. In 10 minutes the rigs sent 357 winners (rig
+A 347, rig B 10). The coordinator checked and claimed 349 of them, each
+followed by the next job on both rigs; 3 were stale (found after their job had
+moved on), none was rejected, and the last few were not claimed before the
+test stopped. A Chipnet Fulcrum server then had 346 of the 349 claims in two
+blocks and the other 3 in its mempool. Neither rig reconnected, and the
+coordinator's process showed no GPU activity. That build reported each rig's
+rate as 0; rigs now measure their own rate (fixed after the test,
+host-tested).
+
+Validation: Windows all-feature host suite, 438 library and 16 binary tests
+passed, 22 opt-in tests ignored, 34 hardware tests filtered; new tests cover
+the search with no GPU, the rig's rate window, the coordinator's dashboard with
+no GPU and the CLI options. Formatting and Clippy with warnings denied passed
+for the all-feature, default and portable builds, and the all-feature Clippy
+on Rust 1.99 (Linux, in Docker).
+
+## Public GPU pool (2026-10-08)
+
+#### PR #32
+
+`mine --rigs-listen ADDR --rigs-public [--rigs-fee P --rigs-fee-address A]`
+makes the coordinator a public GPU pool. A rig sends its payout with its
+hello (`--address`); a public coordinator turns away a rig without a valid
+one and gives each rig the shared job paying its own payout. For the
+operator's fee, a 10-minute clock per rig gives that share of its time to the
+same job paying the fee address, marked by the top bit of the job's
+generation, so the rig takes it as a new job; the rig's donation still
+applies inside every job, so the fee comes off what the donation leaves.
+Each winner is checked against exactly the job its rig was given, then
+queued under the shared generation with that job's payout, and the claim
+path authorizes that payout (`VerifiedWinner::payout`) instead of the
+coordinator's own; a winner with no payout is checked against the
+coordinator's payout as before.
+
+Evidence: host tests cover the job variants and the fee clock; a loopback
+coordinator over the encrypted link turns away a rig that names no payout,
+sends a rig its fee-window job, queues that job's winner under the shared
+generation for the fee address, and sends the rig's own job outside the
+window; the direct-reward lifecycle refuses a winner paying another address
+unless the coordinator vouches for it. Not yet run with rigs on other
+machines. A PHOTON claim can be broadcast by anyone, so the fee is
+voluntary for a modified rig, as the donation is.

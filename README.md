@@ -41,6 +41,8 @@ multisig; miners can see every fee in the coinbase. `stratum-v2 serve --public
 
 Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).
 
+Linux and Windows ARM64 (for example Raspberry Pi 5, Ampere servers and Snapdragon laptops) build and pass the tests on GitHub's ARM64 runners; each CI run uploads the ARM64 binaries. They mine through the portable engine (Vulkan, or DirectX 12 on Windows) and have not yet been run on ARM hardware.
+
 | GPU | Engine | Tested |
 | --- | --- | --- |
 | NVIDIA GeForce RTX 50 series (`sm_120`) | CUDA | RTX 5070 Ti Laptop: about 1.48 GH/s |
@@ -49,6 +51,7 @@ Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebA
 | Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails | Not yet |
 | Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) | Not yet |
 | Apple Silicon (M1 and later) | Portable engine on Metal | Built by CI; not yet run on a Mac |
+| GPUs no other engine finds: older integrated GPUs without Vulkan or DirectX 12, ARM GPUs (Mali, Adreno) with only an OpenCL driver | OpenCL engine, used only when no other engine finds a GPU, or with `--backend opencl` | Integrated Radeon over OpenCL: about 30 MH/s, level with the portable engine on the same GPU |
 | Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU | Chrome, on the integrated Radeon and the RTX 5070 Ti |
 
 The engine is selected automatically, and one miner mines on every discrete GPU of the machine, each on its best engine ([several GPUs](#several-gpus)). An integrated GPU mines automatically only when no discrete GPU is present. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
@@ -92,6 +95,17 @@ One miner drives all of a machine's GPUs: they mine the same job for your addres
 | Chosen GPUs | `--device 0,2`, with the numbers `devices` prints |
 
 In setup, Enter on the GPU row lists the GPUs with a checkbox each, and a profile remembers the choice. The dashboard shows each GPU's rate and temperature. A GPU that fails restarts by itself while the others keep mining.
+
+### Several machines
+
+Your other machines can mine as rigs of one coordinator, so they never compete for the same reward either. The coordinator is your normal miner with one more option: only it talks to the chain and claims, and every rig signs with its own key. The link is encrypted, and a rig trusts only the coordinator whose key it was given.
+
+| Machine | Command |
+| --- | --- |
+| The coordinator | your usual `mine` command plus `--rigs-listen 0.0.0.0:3340`; add `--rigs-only` for a coordinator that uses no GPU, on any computer |
+| Each rig | `pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key>`, optionally `--rig-name <name>` |
+
+The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. Repeat `--coordinator` and `--coordinator-key` (in the same order) to give a rig backup coordinators, tried in order. For farms (rigs as services, ports, the live test) see [docs/farm.md](docs/farm.md); with `--rigs-public` a coordinator runs a public GPU pool, where each rig mines for its own `--address` and the operator's fee is a share of mining time.
 
 ### Browser miner
 
@@ -143,7 +157,7 @@ Without `--no-tui`, the miner opens a short setup:
 4. **Token**: the GPU tokens for that network, or for ASIC, "BCH + all merge-mined tokens" or an ASIC-exclusive token. Choosing BCH starts the BCH ASIC server, which builds blocks from your own BCH node (see [docs/stratum-v2.md](docs/stratum-v2.md)); the BCH node list finds Bitcoin Cash Node on the same computer, which needs no password. ASIC-exclusive tokens come later.
 5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. ASIC mining adds a Mining row: solo on your node, or join a pool (a normal pool's address and key; P2Pool v2 is coming). Running a pool asks for the pool type, your node, the pool fee, where it comes from (coinbase, mining work or both) and its address, then starts a public pool ([docs/pool.md](docs/pool.md)).
 
-Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session.
+Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session; `A` opens Advanced settings.
 
 ## Chipnet PHOTON test
 

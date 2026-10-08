@@ -21,6 +21,10 @@ pub(crate) const fn work_allocation_quantum(
         crate::backend_kind::BackendKind::Wgpu => {
             crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES as u64
         }
+        // #### PR #32: the OpenCL engine also adapts its batch size.
+        crate::backend_kind::BackendKind::OpenCl => {
+            crate::gpu_types::OPENCL_MAX_BATCH_CANDIDATES as u64
+        }
         _ => initial_batch as u64 * 64,
     }
 }

@@ -25,10 +25,10 @@ crates, not a from-scratch protocol:
   `template_distribution_sv2`, and siblings.
 - Focused crates remain an option if a thinner set is needed later.
 
-Gate those deps behind Cargo feature **`stratum-v2`** (not in default features).
-This branch wires optional `stratum-core` behind that feature so default CI
-stays green; enable with `cargo check --features stratum-v2` / `cargo test
---features stratum-v2 --lib stratum_v2`.
+These dependencies sit behind the Cargo feature **`stratum-v2`**, part of the
+default build since #32 (which also uses it for the encrypted link between a
+GPU coordinator and its rigs). The browser and portable builds choose their
+own features and leave it out.
 
 License note: Pickaxe is **AGPL-3.0-only**. Reference SV2 crates are compatible
 in principle; any AGPL bridge dependency is recorded as an open decision below.
@@ -105,8 +105,7 @@ matched through two independent public servers. This does not establish native
 SV2 firmware compatibility or compatibility with every ASIC; see the evidence
 and remaining gates in `implementation-status.md`.
 
-Build the native application with `cargo build --locked --features stratum-v2`.
-The feature remains opt-in. No release is published by this change.
+The default native build includes the server (`cargo build --locked`).
 
 Commands (using a local Pickaxe config with the selected network, a valid
 payout address, and the operator's node RPC connection):
