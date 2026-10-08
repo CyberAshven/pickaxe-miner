@@ -272,10 +272,6 @@ pub fn run(
             }
         })
     };
-    // #### PR #40
-    // Tell the user where to point devices: a wildcard listener shows this
-    // computer's address on the local network instead.
-    let devices_hint = device_hint(bound, sv1_bound, lan_address());
     // SV2 reference authority public-key encoding: version 1 (little endian),
     // 32-byte x-only key, Base58Check. Only the public key is displayed.
     let authority = public_key.map(|key| {
@@ -283,12 +279,25 @@ pub fn run(
         encoded.extend(key);
         stratum_core::bitcoin::base58::encode_check(&encoded)
     });
+    // #### PR #40
+    // Tell the user where to point devices: a wildcard listener shows this
+    // computer's address on the local network instead, and the Connection
+    // info page (`i`) every address, Tailscale's included, ready to copy.
+    let interfaces = crate::reach::Interfaces::detect();
+    let devices_hint = device_hint(bound, sv1_bound, interfaces);
+    let serve_mode = if !pools.is_empty() {
+        ServeMode::JoinPool
+    } else if public_pool.is_some() {
+        ServeMode::Public
+    } else {
+        ServeMode::Solo
+    };
     let result = (|| {
         if terminal.is_none() {
             // The pool's identity may be a payout address: never printed.
             println!(
                 "{}",
-                serde_json::json!({"listen":bound.map(|address| address.to_string()),"sv1_listen":sv1_bound.map(|address| address.to_string()),"authority":authority,"upstream":pool_address,"network":config.network.as_str()})
+                serde_json::json!({"listen":bound.map(|address| address.to_string()),"sv1_listen":sv1_bound.map(|address| address.to_string()),"authority":authority,"upstream":pool_address,"network":config.network.as_str(),"connect":connect_json(&connect_lines(bound, sv1_bound, authority.as_deref(), interfaces))})
             );
         }
         let mut device_offset = 0usize;
@@ -299,6 +308,7 @@ pub fn run(
         let status_file = status_path(config_path);
         let mut status_saved: Option<Instant> = None;
         let mut controls: Option<Controls> = None;
+        let mut connect: Option<ConnectPage> = None;
         while !stop.load(Ordering::Relaxed)
             && worker.as_ref().is_none_or(|worker| !worker.is_finished())
         {
@@ -394,7 +404,9 @@ pub fn run(
                 terminal
                     .terminal
                     .draw(|frame| {
-                        if let Some(view) = controls.as_ref() {
+                        if let Some(page) = connect.as_ref() {
+                            render_connect(frame, page)
+                        } else if let Some(view) = controls.as_ref() {
                             render_controls(frame, view)
                         } else if advanced {
                             render_advanced(
@@ -420,6 +432,35 @@ pub fn run(
                 if event::poll(Duration::from_millis(500)).map_err(|_| "cannot read terminal")? {
                     if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
                         if key.kind == KeyEventKind::Press {
+                            // #### PR #40: on Connection info, a number copies
+                            // that line.
+                            if let Some(page) = connect.as_mut() {
+                                match key.code {
+                                    KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Esc => {
+                                        connect = None
+                                    }
+                                    KeyCode::Char(digit @ '1'..='9') => {
+                                        if let Some(line) =
+                                            page.lines.get(digit as usize - '1' as usize)
+                                        {
+                                            page.note = Some(if crate::reach::copy(&line.url) {
+                                                format!("Copied {}", line.url)
+                                            } else {
+                                                "Could not copy; select the line with the mouse."
+                                                    .into()
+                                            });
+                                        }
+                                    }
+                                    KeyCode::Char('q') => stop.store(true, Ordering::Relaxed),
+                                    KeyCode::Char('c')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        stop.store(true, Ordering::Relaxed)
+                                    }
+                                    _ => (),
+                                }
+                                continue;
+                            }
                             if let Some(view) = controls.as_mut() {
                                 if handle_controls_key(view, key.code, &fleet) {
                                     controls = None;
@@ -440,6 +481,18 @@ pub fn run(
                                     }
                                 }
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
+                                KeyCode::Char('i') | KeyCode::Char('I') if !advanced => {
+                                    connect = Some(ConnectPage {
+                                        lines: connect_lines(
+                                            bound,
+                                            sv1_bound,
+                                            authority.as_deref(),
+                                            crate::reach::Interfaces::detect(),
+                                        ),
+                                        mode: serve_mode,
+                                        note: None,
+                                    });
+                                }
                                 KeyCode::Esc => advanced = false,
                                 KeyCode::Tab if !advanced => overview = !overview,
                                 // The donation changes only in Advanced settings.
@@ -520,8 +573,12 @@ fn pool_upstreams(
     keys: &[String],
     user: Option<&str>,
 ) -> Result<Vec<super::sv1::Upstream>, String> {
-    if keys.len() != addresses.len() {
-        return Err("give one --upstream-key for each --upstream, in the same order".into());
+    if !keys.is_empty() && keys.len() != addresses.len() {
+        return Err(
+            "give one --upstream-key for each --upstream, in the same order, or put each key \
+             in its address (stratum2+tcp://HOST:PORT/KEY)"
+                .into(),
+        );
     }
     let identity = match user.map(str::trim) {
         Some(user) => {
@@ -539,24 +596,35 @@ fn pool_upstreams(
     };
     addresses
         .iter()
-        .zip(keys)
-        .map(|(address, key)| {
-            let address = address.trim();
-            if address
-                .rsplit_once(':')
-                .is_none_or(|(host, port)| host.is_empty() || port.parse::<u16>().is_err())
-            {
-                return Err("--upstream must be HOST:PORT".into());
-            }
+        .enumerate()
+        .map(|(index, address)| {
+            // #### PR #40: the key may come in the address, as pools publish
+            // it; given in both places, the two must agree.
+            let (address, embedded) = super::split_pool_address(address)
+                .map_err(|error| format!("--upstream: {error}"))?;
+            let key = match (keys.get(index).map(|key| key.trim()), embedded) {
+                (Some(given), Some(embedded)) if given != embedded => {
+                    return Err("--upstream-key differs from the key in --upstream".into())
+                }
+                (Some(given), _) => given.to_owned(),
+                (None, Some(embedded)) => embedded,
+                (None, None) => {
+                    return Err(
+                        "give the pool's key with --upstream-key, or in its address as \
+                                stratum2+tcp://HOST:PORT/KEY"
+                            .into(),
+                    )
+                }
+            };
             let invalid_key = "--upstream-key is not an SV2 authority public key";
             let decoded =
-                stratum_core::bitcoin::base58::decode_check(key.trim()).map_err(|_| invalid_key)?;
+                stratum_core::bitcoin::base58::decode_check(&key).map_err(|_| invalid_key)?;
             let authority: [u8; 32] = match decoded.as_slice() {
                 [1, 0, key @ ..] => key.try_into().map_err(|_| invalid_key)?,
                 _ => return Err(invalid_key.into()),
             };
             Ok(super::sv1::Upstream {
-                address: address.to_owned(),
+                address,
                 authority,
                 identity: identity.clone(),
                 remote: true,
@@ -859,7 +927,7 @@ fn render_workers(
     frame.render_widget(Paragraph::new(footer), areas[2]);
 }
 
-const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · c  Controls (top row) · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
+const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · c  Controls (top row) · i  Connection info · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
 const WATCH_FOOTER: &str = "↑/↓ PgUp/PgDn  Scroll · q  Quit (the server keeps running)\nRead-only view of the server's saved status; Now and 1 hour come from validated shares.";
 
 /// One row of the workers table, from the live server or its saved status.
@@ -911,36 +979,189 @@ impl From<&DeviceSnapshot> for WorkerLine {
     }
 }
 
-/// This computer's address on the local network. No packet is sent:
-/// connecting a UDP socket only chooses the outgoing interface.
-fn lan_address() -> Option<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("192.0.2.1:9").ok()?;
-    let ip = socket.local_addr().ok()?.ip();
-    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
-}
-
-/// Where devices connect, with wildcard listeners shown as this computer's
-/// local network address.
+/// Where devices connect, with wildcard listeners shown at this computer's
+/// address on the local network; Connection info (`i`) has every address.
 fn device_hint(
     sv2: Option<std::net::SocketAddr>,
     sv1: Option<std::net::SocketAddr>,
-    lan: Option<std::net::IpAddr>,
+    interfaces: crate::reach::Interfaces,
 ) -> String {
-    let shown = |address: std::net::SocketAddr| match lan {
-        Some(ip) if address.ip().is_unspecified() => std::net::SocketAddr::new(ip, address.port()),
-        _ => address,
+    let shown = |address: std::net::SocketAddr| {
+        crate::reach::addresses(address, interfaces)
+            .into_iter()
+            .next()
+            .map_or(address, |(_, shown)| shown)
     };
     match (sv1, sv2) {
         (Some(sv1), Some(sv2)) => format!(
-            "Point devices at: SV1 stratum+tcp://{} · SV2 {}",
+            "Point devices at: SV1 stratum+tcp://{} · SV2 {} · i  Connection info",
             shown(sv1),
             shown(sv2)
         ),
-        (Some(sv1), None) => format!("Point devices at: SV1 stratum+tcp://{}", shown(sv1)),
-        (None, Some(sv2)) => format!("Point devices at: SV2 {}", shown(sv2)),
+        (Some(sv1), None) => format!(
+            "Point devices at: SV1 stratum+tcp://{} · i  Connection info",
+            shown(sv1)
+        ),
+        (None, Some(sv2)) => format!("Point devices at: SV2 {} · i  Connection info", shown(sv2)),
         (None, None) => String::new(),
     }
+}
+
+/// #### PR #40
+/// What this server is, for what a device's username means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeMode {
+    /// Blocks pay this server's payout address.
+    Solo,
+    /// Each miner's username is their payout address.
+    Public,
+    /// Devices mine at a remote pool through this computer.
+    JoinPool,
+}
+
+/// #### PR #40
+/// One address devices connect to: where it works from and the line to
+/// paste into a device (or, for SV2, into another Pickaxe's Join a pool).
+struct ConnectLine {
+    place: crate::reach::Place,
+    sv2: bool,
+    url: String,
+}
+
+/// #### PR #40
+/// The Connection info page (`i`), like ASICseer's: every address devices
+/// connect to, numbered for copying, and what to put as the username.
+struct ConnectPage {
+    lines: Vec<ConnectLine>,
+    mode: ServeMode,
+    /// The last copy's result.
+    note: Option<String>,
+}
+
+/// #### PR #40
+/// The addresses devices use: SV1 first, as most firmware speaks only SV1,
+/// then SV2 with the authority key in the address, the form ckpool and
+/// Braiins publish (stratum2+tcp://HOST:PORT/KEY). Each listener appears at
+/// every address this computer is reached at (local network, Tailscale).
+fn connect_lines(
+    sv2: Option<std::net::SocketAddr>,
+    sv1: Option<std::net::SocketAddr>,
+    authority: Option<&str>,
+    interfaces: crate::reach::Interfaces,
+) -> Vec<ConnectLine> {
+    let mut lines = Vec::new();
+    for (listen, sv2) in [(sv1, false), (sv2, true)] {
+        let Some(listen) = listen else {
+            continue;
+        };
+        for (place, address) in crate::reach::addresses(listen, interfaces) {
+            let url = match (sv2, authority) {
+                (false, _) => format!("stratum+tcp://{address}"),
+                (true, Some(key)) => format!("stratum2+tcp://{address}/{key}"),
+                (true, None) => format!("stratum2+tcp://{address}"),
+            };
+            lines.push(ConnectLine { place, sv2, url });
+        }
+    }
+    lines
+}
+
+/// #### PR #40: the addresses in the JSON start line; never a payout.
+fn connect_json(lines: &[ConnectLine]) -> serde_json::Value {
+    lines
+        .iter()
+        .map(|line| {
+            serde_json::json!({
+                "place": line.place.label(),
+                "protocol": if line.sv2 { "SV2" } else { "SV1" },
+                "url": line.url,
+            })
+        })
+        .collect()
+}
+
+/// #### PR #40: the Connection info page's text.
+fn connect_text(page: &ConnectPage) -> String {
+    use crate::reach::Place;
+    let mut text = String::from("How devices connect\n");
+    let mut group = None;
+    for (index, line) in page.lines.iter().enumerate() {
+        if group != Some(line.sv2) {
+            group = Some(line.sv2);
+            text.push_str(if line.sv2 {
+                "\nSV2 firmware (Braiins OS, Bitaxe), or another Pickaxe's Join a pool:\n"
+            } else {
+                "\nMost ASICs speak SV1 (stock Antminer, Avalon and Whatsminer firmware):\n"
+            });
+        }
+        text.push_str(&format!(
+            "  {}  {:<14} {}\n",
+            index + 1,
+            line.place.label(),
+            line.url
+        ));
+    }
+    if page.lines.is_empty() {
+        text.push_str("\nNo listener is open.\n");
+    }
+    text.push_str(match page.mode {
+        ServeMode::Solo => {
+            "\nUsername: any name for the device; it names the device on the workers page. \
+             Every block pays this server's payout address.\n"
+        }
+        ServeMode::Public => {
+            "\nUsername: the miner's own BCH address (q or p; the prefix may be left out), \
+             optionally followed by .name; the blocks they find pay it. SV2 devices give it \
+             as their user identity.\n"
+        }
+        ServeMode::JoinPool => {
+            "\nUsername: any name for the device; it names the device on the workers page. \
+             This computer mines at the pool for you.\n"
+        }
+    });
+    text.push_str("Password: anything; it is not checked.\n");
+    let reachable = page
+        .lines
+        .iter()
+        .any(|line| line.place != Place::ThisComputer);
+    if !reachable && !page.lines.is_empty() {
+        text.push_str(
+            "\nOnly programs on this computer can connect. For devices on your network, \
+             listen on every interface (such as --sv1-listen 0.0.0.0:3333).\n",
+        );
+    } else if !page.lines.iter().any(|line| line.place == Place::Tailscale) {
+        text.push_str(
+            "\nTailscale puts computers in other places on one private network without \
+             opening router ports; once it runs here, this computer's Tailscale address \
+             appears above.\n",
+        );
+    }
+    if page.mode != ServeMode::JoinPool {
+        text.push_str(
+            "ASICs in another place connect to a computer there running Pickaxe with Join a \
+             pool, pointed at an SV2 line above; only encrypted SV2 crosses the internet.\n",
+        );
+    }
+    text.push_str(&format!(
+        "\n{}  Copy a line · i or Esc  Back · q  Stop server",
+        match page.lines.len() {
+            0 | 1 => "1".to_owned(),
+            count => format!("1-{count}"),
+        }
+    ));
+    if let Some(note) = &page.note {
+        text.push_str(&format!("\n\n{note}"));
+    }
+    text
+}
+
+fn render_connect(frame: &mut Frame<'_>, page: &ConnectPage) {
+    frame.render_widget(
+        Paragraph::new(connect_text(page))
+            .block(Block::bordered().title("Pickaxe · Connection info"))
+            .wrap(Wrap { trim: false }),
+        frame.area(),
+    );
 }
 
 /// #### PR #40
@@ -1486,29 +1707,146 @@ mod tests {
 
     #[test]
     fn devices_are_told_this_computers_network_address() {
-        let lan = Some("192.168.0.160".parse().unwrap());
+        let lan = crate::reach::Interfaces {
+            local: Some("192.168.0.160".parse().unwrap()),
+            tailscale: None,
+        };
         assert_eq!(
             device_hint(
                 Some("0.0.0.0:3336".parse().unwrap()),
                 Some("0.0.0.0:3333".parse().unwrap()),
                 lan
             ),
-            "Point devices at: SV1 stratum+tcp://192.168.0.160:3333 · SV2 192.168.0.160:3336"
+            "Point devices at: SV1 stratum+tcp://192.168.0.160:3333 · SV2 192.168.0.160:3336 · i  Connection info"
         );
         // Explicit listeners are shown as configured.
         assert_eq!(
             device_hint(Some("127.0.0.1:3336".parse().unwrap()), None, lan),
-            "Point devices at: SV2 127.0.0.1:3336"
+            "Point devices at: SV2 127.0.0.1:3336 · i  Connection info"
         );
+        // With no network, only this computer can connect.
         assert_eq!(
-            device_hint(Some("0.0.0.0:3336".parse().unwrap()), None, None),
-            "Point devices at: SV2 0.0.0.0:3336"
+            device_hint(
+                Some("0.0.0.0:3336".parse().unwrap()),
+                None,
+                crate::reach::Interfaces::default()
+            ),
+            "Point devices at: SV2 127.0.0.1:3336 · i  Connection info"
         );
         // Pool mode has no SV2 listener of its own.
         assert_eq!(
             device_hint(None, Some("0.0.0.0:3333".parse().unwrap()), lan),
-            "Point devices at: SV1 stratum+tcp://192.168.0.160:3333"
+            "Point devices at: SV1 stratum+tcp://192.168.0.160:3333 · i  Connection info"
         );
+    }
+
+    // #### PR #40
+    #[test]
+    fn connection_info_lists_sv1_and_sv2_lines_and_what_to_type() {
+        use crate::reach::{Interfaces, Place};
+        let local = Some("192.168.0.160".parse().unwrap());
+        let both = Interfaces {
+            local,
+            tailscale: Some("100.101.102.103".parse().unwrap()),
+        };
+        let lines = connect_lines(
+            Some("0.0.0.0:3336".parse().unwrap()),
+            Some("0.0.0.0:3333".parse().unwrap()),
+            Some("KEY"),
+            both,
+        );
+        let urls: Vec<_> = lines
+            .iter()
+            .map(|line| (line.place, line.url.as_str()))
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                (Place::LocalNetwork, "stratum+tcp://192.168.0.160:3333"),
+                (Place::Tailscale, "stratum+tcp://100.101.102.103:3333"),
+                (Place::LocalNetwork, "stratum2+tcp://192.168.0.160:3336/KEY"),
+                (Place::Tailscale, "stratum2+tcp://100.101.102.103:3336/KEY"),
+            ]
+        );
+        assert_eq!(
+            connect_json(&lines)[3],
+            serde_json::json!({"place": "Tailscale", "protocol": "SV2", "url": "stratum2+tcp://100.101.102.103:3336/KEY"})
+        );
+        // What another Pickaxe pastes into Join a pool is understood there.
+        assert_eq!(
+            super::super::split_pool_address(&lines[2].url).unwrap(),
+            ("192.168.0.160:3336".into(), Some("KEY".into()))
+        );
+        let public = ConnectPage {
+            lines,
+            mode: ServeMode::Public,
+            note: None,
+        };
+        let text = connect_text(&public);
+        assert!(text.contains("Most ASICs speak SV1"), "{text}");
+        assert!(
+            text.contains("  1  your network   stratum+tcp://192.168.0.160:3333"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  4  Tailscale      stratum2+tcp://100.101.102.103:3336/KEY"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Username: the miner's own BCH address"),
+            "{text}"
+        );
+        assert!(text.contains("1-4  Copy a line"), "{text}");
+        assert!(!text.contains("Tailscale puts computers"), "{text}");
+        // Solo on the local network only: any name, and Tailscale is offered.
+        let solo = ConnectPage {
+            lines: connect_lines(
+                None,
+                Some("0.0.0.0:3333".parse().unwrap()),
+                None,
+                Interfaces {
+                    local,
+                    tailscale: None,
+                },
+            ),
+            mode: ServeMode::Solo,
+            note: Some("Copied stratum+tcp://192.168.0.160:3333".into()),
+        };
+        let text = connect_text(&solo);
+        assert!(text.contains("Username: any name for the device"), "{text}");
+        assert!(text.contains("Tailscale puts computers"), "{text}");
+        assert!(text.contains("with Join a"), "{text}");
+        assert!(text.contains("1  Copy a line"), "{text}");
+        assert!(
+            text.ends_with("Copied stratum+tcp://192.168.0.160:3333"),
+            "{text}"
+        );
+        // Joining a pool: this computer is the device side.
+        let join = ConnectPage {
+            mode: ServeMode::JoinPool,
+            note: None,
+            ..solo
+        };
+        let text = connect_text(&join);
+        assert!(text.contains("mines at the pool for you"), "{text}");
+        assert!(!text.contains("with Join a"), "{text}");
+        // A loopback listener: only this computer.
+        let local_only = ConnectPage {
+            lines: connect_lines(
+                Some("127.0.0.1:3336".parse().unwrap()),
+                None,
+                Some("KEY"),
+                both,
+            ),
+            mode: ServeMode::Solo,
+            note: None,
+        };
+        let text = connect_text(&local_only);
+        assert!(
+            text.contains("this computer  stratum2+tcp://127.0.0.1:3336/KEY"),
+            "{text}"
+        );
+        assert!(text.contains("Only programs on this computer"), "{text}");
     }
 
     #[test]
@@ -1550,6 +1888,27 @@ mod tests {
         wrong_version.extend([7u8; 32]);
         let wrong = stratum_core::bitcoin::base58::encode_check(&wrong_version);
         assert!(one("pool.example:3336", &wrong, None).is_err());
+        // #### PR #40: the key may come in the address, as pools publish it.
+        let embedded = pool_upstreams(
+            &config,
+            &[format!("stratum2+tcp://pool.example:3336/{key}")],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(embedded[0].address, "pool.example:3336");
+        assert_eq!(embedded[0].authority, [7u8; 32]);
+        // Given in both places, the keys must agree; given nowhere, it is
+        // missing; an SV1 pool is refused.
+        assert!(pool_upstreams(
+            &config,
+            &[format!("pool.example:3336/{key}")],
+            std::slice::from_ref(&wrong),
+            None
+        )
+        .is_err());
+        assert!(pool_upstreams(&config, &["pool.example:3336".into()], &[], None).is_err());
+        assert!(one("stratum+tcp://pool.example:3333", &key, None).is_err());
         // Backups: one key per pool, in order, sharing the identity.
         let pools = pool_upstreams(
             &config,

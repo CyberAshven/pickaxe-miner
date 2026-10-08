@@ -32,10 +32,17 @@ keeps it in `config.rigs-key` beside its configuration, so the key stays the
 same across restarts. Keep that file private: it is the coordinator's identity.
 
 Without `--no-tui`, the dashboard shows a Rigs row (rigs connected, their GPUs,
-the farm's rate, winners and rejected winners, the listen address and the key)
-and one row per rig (name, GPUs, rate, winners, minutes connected). Its
-Hashrate row adds the rigs' rate to the coordinator's own. `--json` status
-lines carry the same under `rigs`.
+the farm's rate, winners and rejected winners, the listen address) and one row
+per rig (name, GPUs, rate, winners, minutes connected). Its Hashrate row adds
+the rigs' rate to the coordinator's own. `--json` status lines carry the same
+under `rigs`.
+
+Press `I` for Connection info: the exact command a rig runs, once for each
+address other computers reach the coordinator at (its address on your network
+and, when Tailscale is running, its Tailscale address), with a number key to
+copy each. The `rigs` start line lists the same addresses under `connect`;
+with `--no-tui` and without `--json`, the coordinator also prints each command
+as a `rigs join` line.
 
 ## Rigs
 
@@ -108,6 +115,19 @@ schtasks /Create /TN "Pickaxe rig" /SC ONLOGON /TR "\"C:\Pickaxe\pickaxe.exe\" m
 - Any machine that reaches the port can connect as a rig, but it can only mine
   for your payout, and every winner is checked before it is claimed.
 - Up to 1,024 rigs can be connected at once.
+
+### Rigs in other places
+
+- Easiest: install [Tailscale](https://tailscale.com) on the coordinator and
+  on every rig, signed in to the same account. Rigs then reach the coordinator
+  at its Tailscale address wherever they are, with no router port opened, and
+  Connection info shows that address. [Headscale](https://github.com/juanfont/headscale)
+  runs the same network on your own server; any VPN that puts the machines on
+  one network works too.
+- Without a VPN, forward TCP 3340 on the coordinator's router to it and give
+  rigs your public IP address or domain; a public pool publishes that address.
+- Pickaxe never opens router ports by itself, and the link to every rig is
+  encrypted and pinned to the coordinator's key either way.
 
 ## Tested
 

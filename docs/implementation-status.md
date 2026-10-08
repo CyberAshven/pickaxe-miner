@@ -914,3 +914,56 @@ window; the direct-reward lifecycle refuses a winner paying another address
 unless the coordinator vouches for it. Not yet run with rigs on other
 machines. A PHOTON claim can be broadcast by anyone, so the fee is
 voluntary for a modified rig, as the donation is.
+
+## Connection info for rigs (2026-10-08)
+
+#### PR #40
+
+The coordinator's dashboard has a Connection info page (`I`): the exact
+`pickaxe mine --coordinator ADDRESS --coordinator-key KEY` command a rig runs
+(a public pool adds `--address YOUR_BCH_ADDRESS`), once per address other
+computers can use, with a number key to copy each. `src/reach.rs` finds the
+addresses: a wildcard listener is shown at this computer's address on the
+local network and, when Tailscale is up, its Tailscale address (100.64.0.0/10),
+found by asking the system which interface it would send from (a connected UDP
+socket; nothing is sent and no outside service is asked). A loopback listener
+is shown as reachable from this computer only. Copying uses the terminal's
+OSC 52 (which also reaches an SSH client's clipboard) and the system's own
+tool where there is one (`clip` on Windows, `pbcopy` on macOS). Without a
+Tailscale address the page suggests Tailscale for rigs in other places. The
+`rigs` start line lists the addresses under `connect`; headless text mode
+prints each command as a `rigs join` line.
+
+Evidence: host tests cover the Tailscale range, interface sorting (including
+a Tailscale exit node), the listener expansion, the commands for private and
+public pools, and the rendered page with and without Tailscale.
+
+## Connection info for devices, joining by one line, and the GPU pool from setup (2026-10-08)
+
+#### PR #40
+
+- **Connection info** (`i` on the server dashboard), modeled on ASICseer's:
+  every address devices use, SV1 lines first (stock Antminer, Avalon and
+  Whatsminer firmware speak only SV1) and SV2 lines with the authority key in
+  the address, `stratum2+tcp://HOST:PORT/KEY` (the form ckpool and Braiins
+  publish), each at this computer's local-network address and, when
+  Tailscale is up, its Tailscale address (`src/reach.rs`; nothing is sent).
+  The page says what the username means for a solo server, a public pool and
+  a pool member, that the password is not checked, suggests Tailscale when it
+  is not running, and, for ASICs elsewhere, a Pickaxe at their site joining
+  this server over SV2. Number keys copy a line (OSC 52, plus `clip` or
+  `pbcopy`). The header's "Point devices at" line names `i`, and the JSON
+  start line lists the addresses under `connect`.
+- **Joining by one line**: `--upstream` and the setup's Pool row accept the
+  pool's `stratum2+tcp://HOST:PORT/KEY`; the key may then be left out, must
+  match when given twice, and an SV1 pool address is refused with the reason.
+- **Run a pool → GPU pool** starts the public GPU pool (as `mine --rigs-listen
+  0.0.0.0:3340 --rigs-only --rigs-public`): the token's servers instead of a
+  node, the fee as a share of each rig's mining time, and a `q` fee address,
+  since token claims pay P2PKH. P2Pool v2 is now the only option marked
+  coming soon.
+
+Evidence: host tests cover the address lines for every listener kind, the
+page for each mode, the JSON lines, the one-line pool address (with and
+without a key, IPv6, SV1 refused) through to the pool list, and the setup's
+GPU pool rows, validation and result.

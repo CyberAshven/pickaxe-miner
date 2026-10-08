@@ -70,8 +70,8 @@ pub struct SetupResult {
 }
 
 /// #### PR #40
-/// The ASIC server setup starts: solo on the miner's own node, SV1 devices
-/// at someone's pool, or a public pool for other miners.
+/// The server setup starts: the ASIC server solo on the miner's own node,
+/// SV1 devices at someone's pool, a public ASIC pool, or a public GPU pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerSetup {
     Solo,
@@ -82,6 +82,14 @@ pub enum ServerSetup {
     Public {
         fee: crate::donation::bch::BchDonation,
         mode: crate::donation::bch::FeeMode,
+        /// `None` is the payout address.
+        address: Option<String>,
+    },
+    /// A public GPU pool: this computer coordinates other people's rigs,
+    /// each mining for its own address; the fee is a share of each rig's
+    /// mining time, since a token claim pays one address.
+    GpuPool {
+        fee: crate::donation::bch::BchDonation,
         /// `None` is the payout address.
         address: Option<String>,
     },
@@ -573,6 +581,17 @@ impl SetupFlow {
                 SettingsRow::ProfileName,
                 SettingsRow::Start,
             ],
+            // #### PR #40: a GPU pool's fee is always mining time.
+            MiningMode::Pool if self.pool_target == 1 => vec![
+                SettingsRow::PoolKind,
+                SettingsRow::Address,
+                SettingsRow::Fulcrum,
+                SettingsRow::Node,
+                SettingsRow::PoolFee,
+                SettingsRow::FeeAddress,
+                SettingsRow::ProfileName,
+                SettingsRow::Start,
+            ],
             MiningMode::Pool => vec![
                 SettingsRow::PoolKind,
                 SettingsRow::Address,
@@ -597,6 +616,10 @@ impl SetupFlow {
                 })
             }
             MiningMode::Asic => Some(ServerSetup::Solo),
+            MiningMode::Pool if self.pool_target == 1 => Some(ServerSetup::GpuPool {
+                fee: self.pool_fee,
+                address: Some(self.pool_fee_address.trim().to_owned()).filter(|a| !a.is_empty()),
+            }),
             MiningMode::Pool => Some(ServerSetup::Public {
                 fee: self.pool_fee,
                 mode: self.pool_fee_mode,
@@ -1067,15 +1090,36 @@ impl SetupFlow {
                         return SetupAction::Complete;
                     }
                 }
-                // Running a pool needs a payout, the miner's own node and a
-                // valid fee address; a GPU pool and P2Pool v2 are coming.
+                // Running a pool needs a payout and a valid fee address, and
+                // an ASIC pool the miner's own node; P2Pool v2 is coming.
                 SettingsRow::Start if self.mode == MiningMode::Pool => {
-                    if self.pool_target != 0 {
-                        // #### PR #40: GPU pools are built on the GPU farm
-                        // in PR #32; this option starts one once both merge.
-                        self.status_line =
-                            "GPU pools need the GPU farm (PR #32) in this build; run an ASIC pool here for now."
-                                .into();
+                    if self.pool_target != 0 && self.pool_kind == PoolKind::Normal {
+                        // #### PR #40: a GPU pool pays token claims, which
+                        // go to q addresses only.
+                        if crate::config::validate_payout_address(
+                            self.config.network,
+                            &self.config.payout_address,
+                        )
+                        .is_err()
+                        {
+                            self.status_line =
+                                "Enter your payout address (a q address) for the selected network."
+                                    .into();
+                            self.open_settings(SettingsRow::Address);
+                        } else if !self.pool_fee_address.trim().is_empty()
+                            && crate::config::validate_payout_address(
+                                self.config.network,
+                                &self.pool_fee_address,
+                            )
+                            .is_err()
+                        {
+                            self.status_line =
+                                "A GPU pool's fee address must be a q address on this network: token claims pay q addresses."
+                                    .into();
+                            self.open_settings(SettingsRow::FeeAddress);
+                        } else {
+                            return SetupAction::Complete;
+                        }
                     } else if self.pool_kind == PoolKind::P2PoolV2 {
                         self.status_line =
                             "P2Pool v2 is coming soon; run a normal pool for now.".into();
@@ -1261,12 +1305,22 @@ impl SetupFlow {
                 Ok(String::new())
             }
             // #### PR #40
+            // The pool's address, or the one line SV2 pools publish with
+            // their key (stratum2+tcp://HOST:PORT/KEY), which fills the key.
             TextField::PoolAddress => {
-                if !value.is_empty() && !value.contains(':') {
-                    return Err("enter the pool as HOST:PORT".into());
+                if value.is_empty() {
+                    self.join_address = value;
+                    return Ok(String::new());
                 }
-                self.join_address = value;
-                Ok(String::new())
+                let (address, key) = crate::stratum_v2::split_pool_address(&value)?;
+                self.join_address = address;
+                Ok(match key {
+                    Some(key) => {
+                        self.join_key = key;
+                        "The pool's key came with its address.".into()
+                    }
+                    None => String::new(),
+                })
             }
             TextField::PoolKey => {
                 self.join_key = value;
@@ -1507,6 +1561,9 @@ struct TuiState {
     /// #### PR #32: Advanced settings (`a`), where the donation is set.
     advanced_mode: bool,
     logs_mode: bool,
+    /// #### PR #40: Connection info (`i`): the command each rig runs, one per
+    /// address, found when the page opens.
+    connect: Option<Vec<(crate::reach::Place, String)>>,
     status_line: String,
     events: VecDeque<String>,
     devices: Vec<GpuDevice>,
@@ -1535,6 +1592,7 @@ impl TuiState {
             settings_mode: false,
             advanced_mode: false,
             logs_mode: false,
+            connect: None,
             status_line: String::new(),
             events,
             devices: Vec::new(),
@@ -1680,6 +1738,7 @@ impl TuiState {
         self.settings_mode = false;
         self.advanced_mode = false;
         self.logs_mode = false;
+        self.connect = None;
     }
 
     /// Closes the command palette without applying its draft.
@@ -2174,6 +2233,26 @@ fn handle_key(
         return Ok(false);
     }
 
+    // #### PR #40
+    // Connection info: a number copies that address's rig command.
+    if let Some(lines) = state.connect.as_ref() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('I') => state.connect = None,
+            KeyCode::Char(digit @ '1'..='9') => {
+                if let Some((place, command)) = lines.get(digit as usize - '1' as usize) {
+                    state.status_line = if crate::reach::copy(command) {
+                        format!("Copied the rig command for {}.", place.label())
+                    } else {
+                        "Could not copy; select the command with the mouse.".into()
+                    };
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     if state.settings_mode {
         match key.code {
             KeyCode::Esc => {
@@ -2214,6 +2293,23 @@ fn handle_key(
         KeyCode::Char('a') | KeyCode::Char('A') => {
             state.advanced_mode = true;
             state.settings_mode = false;
+            Ok(false)
+        }
+        // #### PR #40: Connection info, on a coordinator.
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            match snapshot.rigs.as_ref() {
+                Some(rigs) => {
+                    state.connect = Some(crate::rigs::join_lines(
+                        rigs,
+                        crate::reach::Interfaces::detect(),
+                    ));
+                    state.settings_mode = false;
+                }
+                None => {
+                    state.status_line =
+                        "Connection info is for a coordinator (--rigs-listen).".into()
+                }
+            }
             Ok(false)
         }
         KeyCode::Char('/') | KeyCode::Char(':') | KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -2936,7 +3032,7 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     state,
                     TextField::PoolAddress,
                     &state.join_address,
-                    "HOST:PORT",
+                    "HOST:PORT, or paste stratum2+tcp://HOST:PORT/KEY",
                 ),
                 "[Enter]",
             ),
@@ -2952,7 +3048,14 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             ),
             SettingsRow::PoolFee => (
                 "Pool fee",
-                Span::raw(format!("{} after the donation", state.pool_fee)),
+                Span::raw(if state.pool_target == 1 {
+                    format!(
+                        "{} of each rig's mining time, after the donation",
+                        state.pool_fee
+                    )
+                } else {
+                    format!("{} after the donation", state.pool_fee)
+                }),
                 "< >",
             ),
             SettingsRow::FeeFrom => (
@@ -2970,7 +3073,11 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     state,
                     TextField::FeeAddress,
                     &state.pool_fee_address,
-                    "your payout address; q or p (multisig)",
+                    if state.pool_target == 1 {
+                        "your payout address; a q address"
+                    } else {
+                        "your payout address; q or p (multisig)"
+                    },
                 ),
                 "[Enter]",
             ),
@@ -3271,6 +3378,9 @@ fn render(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, state: &TuiState) {
     }
     if state.logs_mode {
         render_logs(frame, area, state);
+    }
+    if let Some(lines) = state.connect.as_ref() {
+        render_connect(frame, area, lines, snapshot);
     }
     if let Some(cursor) = state.chart_options {
         render_chart_options(frame, area, state, cursor);
@@ -3822,14 +3932,13 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
             RuntimeField::new(
                 "Rigs",
                 wrap(format!(
-                    "{} connected · {} GPUs · {} · winners {} (rejected {}) · {} · key {}",
+                    "{} connected · {} GPUs · {} · winners {} (rejected {}) · {} · [I] how rigs join",
                     rigs.connected,
                     rigs.gpus,
                     crate::telemetry::format_hash_rate(rigs.rate),
                     rigs.winners,
                     rigs.rejected,
                     rigs.listen,
-                    rigs.key
                 )),
                 3,
             ),
@@ -4228,6 +4337,67 @@ fn render_advanced(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
     );
 }
 
+/// #### PR #40
+/// Connection info: the command each rig runs to join this coordinator, one
+/// per address and numbered for copying, with Tailscale for rigs elsewhere.
+fn render_connect(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: &[(crate::reach::Place, String)],
+    snapshot: &RuntimeSnapshot,
+) {
+    use crate::reach::Place;
+    let popup = centered_rect(90, 70, area);
+    frame.render_widget(Clear, popup);
+    let dim = |text: &str| {
+        Line::from(Span::styled(
+            text.to_owned(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    let mut text = vec![
+        Line::from(Span::styled(
+            "How rigs join",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        dim("Run this on each rig, a computer with GPUs and Pickaxe:"),
+    ];
+    for (number, (place, command)) in lines.iter().enumerate() {
+        text.push(Line::from(""));
+        text.push(Line::from(format!("[{}] {}", number + 1, place.label())));
+        text.push(Line::from(format!("    {command}")));
+    }
+    text.push(Line::from(""));
+    if snapshot.rigs.as_ref().is_some_and(|rigs| rigs.public) {
+        text.push(dim(
+            "Public pool: each rig puts its own payout address in place of YOUR_BCH_ADDRESS, and its wins are claimed to it.",
+        ));
+    }
+    if lines.iter().all(|(place, _)| *place == Place::ThisComputer) {
+        text.push(dim(
+            "Only rigs on this computer can join. For rigs on other computers, listen on every interface: --rigs-listen 0.0.0.0:3340.",
+        ));
+    } else if !lines.iter().any(|(place, _)| *place == Place::Tailscale) {
+        text.push(dim(crate::reach::TAILSCALE_HINT));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from(format!(
+        "[1-{}] copy   [I/Esc] close",
+        lines.len().max(1)
+    )));
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .title(" Connection info ")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 /// Renders the interactive keyboard help panel.
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(76, 72, area);
@@ -4245,6 +4415,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("R            reconnect the current source"),
         Line::from("S            settings"),
         Line::from("A            advanced settings"),
+        Line::from("I            connection info: the command rigs run to join"),
         Line::from("G            show or hide charts (hash rate and temperature at first)"),
         Line::from("O            chart options: pick which charts to show"),
         Line::from("/ (: or C)   command bar"),
@@ -4612,12 +4783,41 @@ mod tests {
         assert!(screen.contains("1.50% after the donation"), "{screen}");
         assert!(screen.contains("Mining work"));
         assert!(screen.contains("Start the pool"));
-        // A GPU pool and P2Pool v2 are coming.
+        // #### PR #40: a GPU pool starts with the token's sources (no node
+        // of its own), its fee is mining time, and it pays q addresses.
         setup.config.payout_address = chipnet_payout(3);
         setup.pool_target = 1;
+        assert!(!setup.settings_rows().contains(&SettingsRow::FeeFrom));
+        assert!(setup.settings_rows().contains(&SettingsRow::Fulcrum));
+        let screen = setup_text(&setup);
+        assert!(screen.contains("of each rig's mining time"), "{screen}");
+        setup.pool_fee_address = crate::tx::cashaddr_with_version(
+            1 << 3,
+            &[0x33; 20],
+            crate::config::MiningNetwork::Chipnet,
+        );
         setup.open_settings(SettingsRow::Start);
         setup.handle_key(key(KeyCode::Enter));
-        assert!(setup.status_line.contains("GPU farm (PR #32)"));
+        assert!(
+            setup.status_line.contains("must be a q address"),
+            "{}",
+            setup.status_line
+        );
+        setup.pool_fee_address.clear();
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(
+            setup.server_setup(),
+            Some(ServerSetup::GpuPool {
+                fee: "1.5".parse().unwrap(),
+                address: None,
+            })
+        );
+        // P2Pool v2 is the one thing coming.
+        setup.pool_kind = PoolKind::P2PoolV2;
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.status_line.contains("P2Pool v2 is coming soon"));
         setup.pool_target = 0;
         setup.pool_kind = PoolKind::P2PoolV2;
         setup.open_settings(SettingsRow::Start);
@@ -5695,6 +5895,7 @@ mod tests {
                 winners: 3,
                 connected_secs: 120,
             }],
+            public: false,
         });
         let rows = rendered_rows(&snapshot, 140, 40).join("\n");
         assert!(rows.contains("no GPU here · rigs mine"), "{rows}");
@@ -5702,6 +5903,66 @@ mod tests {
         assert!(rows.contains("rack-1 · 2 GPUs"), "{rows}");
         assert!(!rows.contains("RIGS ONLY device"), "{rows}");
         assert_eq!(gpu_list(&snapshot), "none here; the rigs mine");
+    }
+
+    // #### PR #40
+    #[test]
+    fn connection_info_shows_each_rig_command_and_suggests_tailscale() {
+        use crate::reach::Interfaces;
+        let mut snapshot = test_snapshot();
+        snapshot.rigs = Some(crate::rigs::RigSummary {
+            listen: "0.0.0.0:3340".into(),
+            key: "KEY".into(),
+            public: true,
+            ..Default::default()
+        });
+        let page = |interfaces: Interfaces| {
+            let mut state = TuiState::new(&snapshot);
+            state.connect = Some(crate::rigs::join_lines(
+                snapshot.rigs.as_ref().unwrap(),
+                interfaces,
+            ));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &snapshot, &state))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(160)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                )
+        };
+        let local = Some("192.168.0.160".parse().unwrap());
+        let lan = page(Interfaces {
+            local,
+            tailscale: None,
+        });
+        assert!(lan.contains("How rigs join"), "{lan}");
+        assert!(lan.contains("[1] your network"), "{lan}");
+        assert!(
+            lan.contains(
+                "pickaxe mine --coordinator 192.168.0.160:3340 --coordinator-key KEY --address YOUR_BCH_ADDRESS"
+            ),
+            "{lan}"
+        );
+        assert!(lan.contains("in place of YOUR_BCH_ADDRESS"), "{lan}");
+        assert!(lan.contains("Install Tailscale"), "{lan}");
+        let tailnet = page(Interfaces {
+            local,
+            tailscale: Some("100.101.102.103".parse().unwrap()),
+        });
+        assert!(tailnet.contains("[2] Tailscale"), "{tailnet}");
+        assert!(
+            tailnet.contains("--coordinator 100.101.102.103:3340"),
+            "{tailnet}"
+        );
+        assert!(!tailnet.contains("Install Tailscale"), "{tailnet}");
     }
 
     /// Renders the dashboard at `width` x `height` and returns its rows.

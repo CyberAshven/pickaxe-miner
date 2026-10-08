@@ -36,6 +36,10 @@ the pool holds no one's money. You choose your fee and where it comes from (the
 coinbase, mining work, or both) and the address it goes to, including a
 multisig; miners can see every fee in the coinbase. `stratum-v2 serve --public
 --pool-fee 2 --pool-fee-address <address>`; see [docs/pool.md](docs/pool.md).
+Run a pool also starts a GPU pool, where each rig mines for its own address and
+your fee is a share of mining time. Press `i` on the dashboard for Connection
+info: the addresses (and, for rigs, the command) miners copy, for your network
+and, with [Tailscale](https://tailscale.com), from anywhere.
 
 ## Supported platforms
 
@@ -105,7 +109,7 @@ Your other machines can mine as rigs of one coordinator, so they never compete f
 | The coordinator | your usual `mine` command plus `--rigs-listen 0.0.0.0:3340`; add `--rigs-only` for a coordinator that uses no GPU, on any computer |
 | Each rig | `pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key>`, optionally `--rig-name <name>` |
 
-The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. Repeat `--coordinator` and `--coordinator-key` (in the same order) to give a rig backup coordinators, tried in order. For farms (rigs as services, ports, the live test) see [docs/farm.md](docs/farm.md); with `--rigs-public` a coordinator runs a public GPU pool, where each rig mines for its own `--address` and the operator's fee is a share of mining time.
+The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. Repeat `--coordinator` and `--coordinator-key` (in the same order) to give a rig backup coordinators, tried in order. Press `I` on the coordinator's dashboard for the exact command each rig runs, for your network and, with Tailscale, from anywhere. For farms (rigs as services, ports, rigs in other places, the live test) see [docs/farm.md](docs/farm.md); with `--rigs-public` a coordinator runs a public GPU pool, where each rig mines for its own `--address` and the operator's fee is a share of mining time.
 
 ### Browser miner
 
@@ -155,7 +159,7 @@ Without `--no-tui`, the miner opens a short setup:
 2. **What to do**: GPU mining, ASIC mining, or run a pool for other miners.
 3. **Network**: Mainnet or Chipnet.
 4. **Token**: the GPU tokens for that network, or for ASIC, "BCH + all merge-mined tokens" or an ASIC-exclusive token. Choosing BCH starts the BCH ASIC server, which builds blocks from your own BCH node (see [docs/stratum-v2.md](docs/stratum-v2.md)); the BCH node list finds Bitcoin Cash Node on the same computer, which needs no password. ASIC-exclusive tokens come later.
-5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. ASIC mining adds a Mining row: solo on your node, or join a pool (a normal pool's address and key; P2Pool v2 is coming). Running a pool asks for the pool type, your node, the pool fee, where it comes from (coinbase, mining work or both) and its address, then starts a public pool ([docs/pool.md](docs/pool.md)).
+5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. ASIC mining adds a Mining row: solo on your node, or join a pool (a normal pool's address and key; P2Pool v2 is coming). Running a pool asks what miners will mine: an ASIC pool asks for the pool type, your node, the pool fee, where it comes from (coinbase, mining work or both) and its address, then starts a public pool; a GPU pool asks for the pool type, the token's servers, the fee (a share of each rig's mining time) and its address, then coordinates the pool's rigs ([docs/pool.md](docs/pool.md)). The Pool row of Join a pool takes the pool's address or its one-line `stratum2+tcp://HOST:PORT/KEY`, which fills the key.
 
 Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session; `A` opens Advanced settings.
 

@@ -141,9 +141,9 @@ pub fn cashaddr_to_coinbase_locking(address: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// #### PR #40: encodes any CashAddr version and hash, for the server's tests
-/// of P2SH payouts (builds without the server have no such tests).
-#[cfg(all(test, feature = "stratum-v2"))]
+/// #### PR #40: encodes any CashAddr version and hash, for tests of P2SH
+/// payouts and of where P2SH is refused.
+#[cfg(test)]
 pub(crate) fn cashaddr_with_version(
     version: u8,
     hash: &[u8],

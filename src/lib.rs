@@ -48,6 +48,8 @@ pub mod opencl_photon;
 pub mod proof;
 #[allow(dead_code)]
 pub mod protocol;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod reach;
 pub mod reward;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rigs;

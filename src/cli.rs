@@ -172,10 +172,13 @@ pub enum StratumV2Command {
         /// the pool (another Pickaxe server, or a BCH SV2 pool). SV1 devices
         /// connect to --sv1-listen; no node is needed. Repeat for backup
         /// pools, tried in order.
-        #[arg(long, requires_all = ["upstream_key", "sv1_listen"])]
+        /// #### PR #40: HOST:PORT, or the pool's one-line SV2 address with
+        /// its key, stratum2+tcp://HOST:PORT/KEY.
+        #[arg(long, requires = "sv1_listen")]
         upstream: Vec<String>,
         /// The pool's authority public key, as the pool publishes it; one per
-        /// --upstream, in the same order.
+        /// --upstream, in the same order. Not needed when each --upstream
+        /// carries its key.
         #[arg(long, requires = "upstream")]
         upstream_key: Vec<String>,
         /// The identity the pool knows you by: an account or worker name, or
@@ -616,8 +619,9 @@ mod tests {
         };
         assert_eq!(upstream, ["pool.example:3336", "backup.example:3336"]);
         assert_eq!(upstream_key, ["key-a", "key-b"]);
-        // The pool's key and a listener for the devices are required.
-        assert!(with(&["--sv1-listen", "0.0.0.0:3333"]).is_err());
+        // A listener for the devices is required; the pool's key may come in
+        // its address, so a missing key is found when the server starts.
+        assert!(with(&["--sv1-listen", "0.0.0.0:3333"]).is_ok());
         assert!(with(&["--upstream-key", "key"]).is_err());
         // #### PR #40: at a pool the donation is mining time, set as anywhere.
         assert!(with(&[

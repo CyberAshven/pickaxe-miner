@@ -158,8 +158,10 @@ or JSON. The overview page (Tab) shows each device's model and power.
 The setup screen starts the same server: choose ASIC, then "BCH + all
 merge-mined tokens", and set a payout address and your BCH node. It listens on
 the local network (SV1 on port 3333, SV2 on 3336) and the workers page shows
-this computer's address to point devices at. SV1 has no encryption, so use it
-on a trusted network.
+this computer's address to point devices at; `i` opens Connection info, with
+every address (your network and Tailscale), SV1 for stock firmware and SV2
+with the authority key in the address (`stratum2+tcp://HOST:3336/KEY`), each
+ready to copy. SV1 has no encryption, so use it on a trusted network.
 
 Your BCH node: the setup's BCH node list looks for Bitcoin Cash Node on this
 computer (`127.0.0.1:8332` on mainnet, `127.0.0.1:48332` on Chipnet) and offers
@@ -231,6 +233,11 @@ pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
 ```
 
 Repeat `--upstream` and `--upstream-key`, in the same order, for backup pools.
+A pool's one-line SV2 address carries its key, so `--upstream
+stratum2+tcp://HOST:PORT/KEY` needs no `--upstream-key`; the setup's Pool row
+takes the same line and fills the key. An SV1 pool address
+(`stratum+tcp://…`) is refused: Pickaxe joins SV2 pools only and translates
+SV1 for the devices on this side.
 Each device takes the first pool that completes the handshake, the setup and
 the channel, so a pool that is down, or one whose certificate fails, is
 skipped; a device that reconnects starts again from the first pool. All pools

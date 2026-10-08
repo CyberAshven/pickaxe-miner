@@ -26,6 +26,34 @@ pub struct RigSummary {
     pub rejected: u64,
     /// One line per connected rig, in connection order.
     pub rigs: Vec<RigLine>,
+    /// #### PR #40: a public GPU pool, where each rig names its payout.
+    pub public: bool,
+}
+
+/// #### PR #40
+/// The command each rig runs to join, once per address other computers can
+/// reach this coordinator at (its local network and Tailscale addresses for
+/// a wildcard listener). A public pool's rigs add their own payout.
+pub fn join_lines(
+    summary: &RigSummary,
+    interfaces: crate::reach::Interfaces,
+) -> Vec<(crate::reach::Place, String)> {
+    let Ok(listen) = summary.listen.parse() else {
+        return Vec::new();
+    };
+    crate::reach::addresses(listen, interfaces)
+        .into_iter()
+        .map(|(place, address)| {
+            let mut command = format!(
+                "pickaxe mine --coordinator {address} --coordinator-key {}",
+                summary.key
+            );
+            if summary.public {
+                command.push_str(" --address YOUR_BCH_ADDRESS");
+            }
+            (place, command)
+        })
+        .collect()
 }
 
 /// One connected rig as the coordinator shows it.
@@ -545,6 +573,7 @@ mod net {
                         connected_secs: rig.since.elapsed().as_secs(),
                     })
                     .collect(),
+                public: state.public.is_some(),
             }
         }
     }
@@ -1284,6 +1313,45 @@ mod tests {
         assert_eq!(wire.payout_address, rig_payout);
         assert_eq!(wire.generation_id, job.generation_id);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // #### PR #40
+    #[test]
+    fn the_coordinator_shows_the_command_each_rig_runs() {
+        use crate::reach::{Interfaces, Place};
+        let interfaces = Interfaces {
+            local: Some("192.168.0.160".parse().unwrap()),
+            tailscale: Some("100.101.102.103".parse().unwrap()),
+        };
+        let mut summary = RigSummary {
+            listen: "0.0.0.0:3340".into(),
+            key: "KEY".into(),
+            ..RigSummary::default()
+        };
+        assert_eq!(
+            join_lines(&summary, interfaces),
+            [
+                (
+                    Place::LocalNetwork,
+                    "pickaxe mine --coordinator 192.168.0.160:3340 --coordinator-key KEY".into()
+                ),
+                (
+                    Place::Tailscale,
+                    "pickaxe mine --coordinator 100.101.102.103:3340 --coordinator-key KEY".into()
+                ),
+            ]
+        );
+        // A public pool's rigs name their own payout; a loopback coordinator
+        // takes rigs on this computer only.
+        summary.public = true;
+        summary.listen = "127.0.0.1:3340".into();
+        assert_eq!(
+            join_lines(&summary, interfaces),
+            [(
+                Place::ThisComputer,
+                "pickaxe mine --coordinator 127.0.0.1:3340 --coordinator-key KEY --address YOUR_BCH_ADDRESS".into()
+            )]
+        );
     }
 
     #[test]
