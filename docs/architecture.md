@@ -28,6 +28,11 @@ day each fact was checked.
   BCHN node, a durable block journal, per-device vardiff, a workers table with
   each device's own report, and an adjustable donation. Tested on Chipnet with
   an Avalon Nano 3.
+- In review: a read-only `watch` view for a server running as a service,
+  calmer vardiff, starting the ASIC server from the setup screen, and device
+  controls (restart, work level) that each need a confirmation (PR #40); GPU
+  rigs on other machines that mine as one with a coordinator, with backup
+  coordinators, in the default build (PR #32).
 
 ## Product direction
 
@@ -332,7 +337,10 @@ What this means for Pickaxe, and what step 1 did:
    device. Remaining items are tracked in
    [implementation-status.md](implementation-status.md).
 2. GPU scaling: a coordinator and rigs on many machines, one job pushed to
-   every rig, one claim path and one dashboard (PR #32).
+   every rig, one claim path and one dashboard. First slices in PR #32: the
+   coordinator is the normal miner with `--rigs-listen`, rigs follow it over
+   the Stratum V2 Noise transport, and every rig winner is checked before the
+   claim path rebuilds its transaction; a live test across machines remains.
 3. The gaps, in an order to agree later: ASIC-exclusive tokens, the
    merge-minable token standard and the BCH-plus-tokens mode, the guided
    own-node setup, and the Stratum V2 pool and P2Pool connectors with Job
