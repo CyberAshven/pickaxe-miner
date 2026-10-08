@@ -38,9 +38,7 @@ pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 565_248;
 #[cfg(feature = "tail-grind")]
 pub(crate) const CUDA_MAX_BATCH_CANDIDATES: u32 = 65_536;
 const PORTABLE_WGPU_MAX_BATCH_CANDIDATES: u32 = crate::gpu_types::PORTABLE_MAX_BATCH_CANDIDATES;
-/// Throttled batches are a quarter of the full batch: small enough for
-/// fine duty pacing, large enough to keep the GPU busy during a burst.
-const THROTTLED_BATCH_DIVISOR: u32 = 4;
+use crate::gpu_types::THROTTLED_BATCH_DIVISOR;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const PAUSE_POLL: Duration = Duration::from_millis(25);

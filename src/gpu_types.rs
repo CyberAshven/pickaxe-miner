@@ -4,6 +4,10 @@
 // Adaptive dispatches start small; work allocation must allow their full size.
 pub(crate) const PORTABLE_MAX_BATCH_CANDIDATES: u32 = 33_554_432;
 
+/// Throttled batches are a quarter of the full batch: small enough for
+/// fine duty pacing, large enough to keep the GPU busy during a burst.
+pub(crate) const THROTTLED_BATCH_DIVISOR: u32 = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotonCudaWinner {
     pub nonce: u32,
