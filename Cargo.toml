@@ -68,3 +68,16 @@ naga = { version = "30.0.0", features = ["wgsl-in"] }
 
 [build-dependencies]
 sha2 = "0.11"
+
+# #### PR #32: wgpu 30 crashes older Vulkan drivers
+# What: third_party/wgpu-hal is the published wgpu-hal 30.0.1 plus upstream's
+# 11-line fix (gfx-rs/wgpu#10124, merged for wgpu's next release): a
+# descriptor pool never has zero pool sizes.
+# Why: wgpu 30 creates an empty bind group layout, and with it a descriptor
+# pool without pool sizes, inside `request_device`. Vulkan allowed that only
+# from 1.3.215; Intel's driver for HD 520 and UHD 630 (igvk64.dll) crashes
+# with an access violation, so the portable engine stopped before printing
+# anything (issue #30, gfx-rs/wgpu#9845).
+# Check: drop this patch once a wgpu-hal release contains #10124.
+[patch.crates-io]
+wgpu-hal = { path = "third_party/wgpu-hal" }

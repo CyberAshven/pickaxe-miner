@@ -25,7 +25,7 @@ selectable until its replacement is proven on hardware.
 | NVIDIA RTX 50 series (compute capability 12.0 and newer) | CUDA | Shared Rust engine: `cuda/build/photon_rust.ptx` | CUDA C++ kernels: build with `--no-default-features --features tail-grind` |
 | AMD Radeon RX 6000, 7000, 9000 | HIP | CUDA C++ kernels compiled for HIP: `hip/build/<arch>/*.hsaco` | Shared Rust engine: set `PICKAXE_HIP_KERNELS=rust` to load `hip/build/<arch>/photon_rust.hsaco` |
 | Older NVIDIA GPUs, other AMD GPUs, Intel GPUs, integrated GPUs | wgpu on Vulkan | Shared Rust stages (`reference/shared-stages/`) and T2 filter (`reference/shared-t2/`) | Original hand-written WGSL stages: set `PICKAXE_WGPU_STAGES=wgsl` |
-| Windows GPUs whose Vulkan driver fails | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
+| Windows GPUs whose Vulkan driver fails (older Intel drivers now work on Vulkan; see [portable builds](portable.md)) | wgpu on DirectX 12: set `PICKAXE_WGPU_API=dx12` and add Microsoft's DXC ([portable builds](portable.md)) | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
 | Apple Silicon | wgpu on Metal | Same as Vulkan, with the shared stages' DirectX 12/Metal copy | Same as Vulkan |
 | Browser miner | wgpu on browser WebGPU | Same as Vulkan; browsers other than Chromium use the DirectX 12/Metal copy | Development builds only (`verify_portable_engine`) |
 

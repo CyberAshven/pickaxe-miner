@@ -22,8 +22,13 @@ promise CUDA T2 performance.
 
 ## DirectX 12 on Windows (optional)
 
-On Windows the portable engine uses Vulkan. For a GPU whose Vulkan driver fails
-but whose DirectX 12 driver works, set `PICKAXE_WGPU_API=dx12`:
+On Windows the portable engine uses Vulkan. Older Vulkan drivers, such as
+Intel's for HD 520 and UHD 630, used to crash with an access violation in
+`igvk64.dll` before printing anything: wgpu 30 created a descriptor pool with
+no pool sizes, which Vulkan allowed only from 1.3.215. Pickaxe builds with
+wgpu's upstream fix for this (`third_party/wgpu-hal`, gfx-rs/wgpu#10124), so
+those GPUs run on Vulkan again. For a GPU whose Vulkan driver still fails but
+whose DirectX 12 driver works, set `PICKAXE_WGPU_API=dx12`:
 
 ```powershell
 $env:PICKAXE_WGPU_API = 'dx12'
