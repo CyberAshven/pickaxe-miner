@@ -1108,7 +1108,19 @@ fn run_headless_mining(
     rigs: Option<rigs::RigHub>,
 ) -> Result<Option<SessionSettings>, String> {
     cfg.ensure_mining_supported()?;
-    let _gpu_lock = mining_lock::acquire_gpu_lock()?;
+    // #### PR #40
+    // What: a coordinator with no GPU of its own (`--rigs-only`, or Run a
+    // pool, GPU pool) does not take the GPU lock.
+    // Why: the lock keeps two miners off the same GPUs; such a coordinator uses
+    // none, and taking it stopped a farm's coordinator from running on a PC
+    // that also mines.
+    // Look here if: two processes mine the same GPU (only a process with GPUs
+    // takes the lock).
+    let _gpu_lock = if gpus.is_empty() && rigs.is_some() {
+        None
+    } else {
+        Some(mining_lock::acquire_gpu_lock()?)
+    };
     // Cache device information before the live miner starts so `/devices` never
     // probes drivers or creates temporary GPU contexts in the mining hot path.
     // A coordinator with no GPU (`--rigs-only`) never loads a GPU driver.

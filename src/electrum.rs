@@ -139,11 +139,18 @@ fn node_raw_transaction(endpoint: &str, txid: &str) -> Result<Option<String>, St
         Err(error) if error.to_ascii_lowercase().contains("no such") => {}
         Err(error) => return Err(error),
     }
+    // A pruned node no longer has old blocks' data: not found there either.
     let in_block = |hash: &Value| -> Result<Option<String>, String> {
         match rpc_call(endpoint, "getrawtransaction", json!([txid, false, hash])) {
             Ok(Value::String(raw)) => Ok(Some(raw)),
             Ok(_) => Err("the node returned non-hex transaction data".into()),
-            Err(error) if error.to_ascii_lowercase().contains("no such") => Ok(None),
+            Err(error)
+                if ["no such", "pruned", "not available"]
+                    .iter()
+                    .any(|gone| error.to_ascii_lowercase().contains(gone)) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(error),
         }
     };
@@ -803,5 +810,80 @@ mod tests {
         )]);
         assert!(node_raw_transaction(&node, &txid).is_err());
         server.join().unwrap();
+    }
+
+    // #### PR #40
+    /// Opt-in, with a synced node: `PICKAXE_TEST_NODE_URL=http://USER:PASS@HOST:PORT`
+    /// (Chipnet) starts PHOTON from the node alone, by its UTXO-set scan, reads
+    /// the job and the baton's transaction back through the miner's session,
+    /// and resumes from that baton without a scan.
+    #[test]
+    #[ignore = "needs a synced Chipnet BCHN in PICKAXE_TEST_NODE_URL"]
+    fn real_node_gives_the_photon_job_alone() {
+        let Ok(url) = std::env::var("PICKAXE_TEST_NODE_URL") else {
+            return;
+        };
+        let deployment = crate::config::MiningToken::Photon
+            .photon_deployment(crate::config::MiningNetwork::Chipnet);
+        let started = std::time::Instant::now();
+        let mut session =
+            ElectrumSession::connect_node_failover(std::slice::from_ref(&url), deployment, None)
+                .unwrap();
+        let scan = started.elapsed();
+        assert!(session.is_node());
+        if let Some((login, _)) = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('@'))
+        {
+            assert!(!session.url.contains(login), "the login is never shown");
+        }
+        let job = session.fetch_live_job().unwrap();
+        assert_eq!(job.baton_txid.len(), 64);
+        assert!(session.transaction_known(&job.baton_txid).unwrap());
+        let fee = session.rpc("mempool.get_info", json!([])).unwrap();
+        assert!(fee.get("mempoolminfee").is_some());
+        let started = std::time::Instant::now();
+        let mut resumed =
+            ElectrumSession::connect_node_failover(&[url], deployment, Some(&job)).unwrap();
+        let resume = started.elapsed();
+        let again = resumed.fetch_live_job().unwrap();
+        assert_eq!(
+            (again.baton_txid.as_str(), again.baton_vout),
+            (job.baton_txid.as_str(), job.baton_vout)
+        );
+        println!(
+            "node job: height {}, baton {}:{}, reward {}, scan {:?}, resume {:?}",
+            job.height, job.baton_txid, job.baton_vout, job.reward_raw, scan, resume
+        );
+        // The same state as a public Chipnet Fulcrum's, when one answers at
+        // the same tip.
+        let fulcrum: Vec<String> = crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+            .iter()
+            .map(|url| url.to_string())
+            .collect();
+        if let Ok(mut public) =
+            ElectrumSession::connect_failover_for_deployment(&fulcrum, deployment)
+        {
+            let theirs = public.fetch_live_job().unwrap();
+            if theirs.tip_hash == job.tip_hash {
+                assert_eq!(
+                    (
+                        theirs.baton_txid.as_str(),
+                        theirs.baton_vout,
+                        theirs.reward_raw,
+                        theirs.target_le_hex.as_str()
+                    ),
+                    (
+                        job.baton_txid.as_str(),
+                        job.baton_vout,
+                        job.reward_raw,
+                        job.target_le_hex.as_str()
+                    )
+                );
+                println!("matches {} at the same tip", public.url);
+            } else {
+                println!("{} is at another tip; not compared", public.url);
+            }
+        }
     }
 }

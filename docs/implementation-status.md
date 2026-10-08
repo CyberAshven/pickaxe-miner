@@ -1015,7 +1015,19 @@ the node was a fallback route trusted only within a proof lease from Fulcrum,
 so mining needed Fulcrum to start and stopped after a claim without it.
 
 Evidence: host tests with a scripted node cover the RPC answers and the
-transaction lookup without an index. Not yet mined live from a node.
+transaction lookup without an index (and a pruned block's data counting as
+not found). Live on 2026-10-09 against a pruned Chipnet Bitcoin Cash Node
+29.1.0 with no transaction index (`real_node_gives_the_photon_job_alone`,
+opt-in): the PHOTON job came from the node alone by its UTXO-set scan (0.4 s
+on Chipnet), the baton's transaction was found by id, resuming from the
+known baton took 18 ms, and the job matched a public Chipnet Fulcrum's
+(baton, reward and target) at the same tip. That test found that BCHN's
+`scantxoutset` reports no `height` or `bestblock` (Bitcoin Core's fields),
+so the node route had never started against BCHN; the tip read right after
+the scan now stands in, checked by every later read. A coordinator with no
+GPU then mined from the node for three minutes beside a running GPU miner,
+its job and refreshes from the node, with no reconnect. Not yet live: a claim
+sent through the node.
 
 ## Worker names on the workers page (2026-10-09)
 
@@ -1048,3 +1060,14 @@ of that coordinator on the chosen GPUs, as `--coordinator` does (both use one
 Evidence: a host test walks the setup from the Mining row to the result,
 including the one-line address filling the key and the checks for a missing
 coordinator address.
+
+## A coordinator with no GPU takes no GPU lock (2026-10-09)
+
+#### PR #40
+
+A coordinator that mines with its rigs only (`--rigs-only`, or Run a pool,
+GPU pool) no longer takes the GPU lock, which keeps two miners off the same
+GPUs: it uses none, and the lock stopped a farm's coordinator from running on
+a PC that also mines. Any process with GPUs still takes it.
+
+Evidence: the live run above, beside a running GPU miner.

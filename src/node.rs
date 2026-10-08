@@ -291,16 +291,29 @@ fn bootstrap_native_photon(
         return Err("scantxoutset did not complete successfully".into());
     }
 
-    let height = scan
+    let reported_height = scan
         .get("height")
         .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or("scantxoutset omitted a valid tip height")?;
-    let bestblock = scan
+        .and_then(|value| u32::try_from(value).ok());
+    let reported_bestblock = scan
         .get("bestblock")
         .and_then(Value::as_str)
         .filter(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
-        .ok_or("scantxoutset omitted a valid bestblock")?;
+        .map(str::to_owned);
+    // #### PR #40
+    // What: when the scan does not say which tip it saw, the tip read right
+    // after it stands in.
+    // Why: Bitcoin Cash Node (29.1) answers scantxoutset without `height` and
+    // `bestblock` (Bitcoin Core's fields), so mining from a BCHN node never
+    // started. Every later read checks this tip (gettxout's `bestblock`, then
+    // getbestblockhash), so a block found during the scan is caught there and
+    // the start retried.
+    // Look here if: a node start fails with a tip or baton mismatch.
+    let (height, bestblock) = match (reported_height, reported_bestblock) {
+        (Some(height), Some(bestblock)) => (height, bestblock),
+        _ => fetch_native_chain_tip(url)?,
+    };
+    let bestblock = bestblock.as_str();
     let unspents = scan
         .get("unspents")
         .and_then(Value::as_array)

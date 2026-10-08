@@ -25,7 +25,8 @@ On any computer, with or without a GPU:
 pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --address <payout> --no-tui
 ```
 
-`--rigs-only` uses no GPU on that computer and never loads a GPU driver.
+`--rigs-only` uses no GPU on that computer and never loads a GPU driver, so
+it also runs beside a miner on the same computer.
 Without it, the coordinator also mines on its own GPUs, as a normal miner does.
 It prints its key when it starts (the `rigs` line's `coordinator_key`) and
 keeps it in `config.rigs-key` beside its configuration, so the key stays the
