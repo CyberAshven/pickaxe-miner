@@ -1461,3 +1461,26 @@ donation row's text and its 0%, the start difficulty's steps and typed value,
 the port checks, backup pools needing their key, a profile keeping and
 restoring every value, saved values refused as the setup refuses them, and
 Start opening the section at a wrong fee address.
+
+## The server's Advanced page shows its start values (2026-10-09)
+
+#### PR #42
+
+The running server's Advanced page (`a`) now lists what it started with,
+read-only, with a note that they are changed in the setup's Advanced section
+or on the command line and apply after a restart: its listening addresses,
+the start difficulty and the vardiff rule (20 shares a minute per device), the
+pool's name, a public pool's fee and where it comes from (to "your payout
+address" or "another address", never the address itself), and for Join a pool
+the pools in failover order and whether the pool knows it by the payout
+address or another username.
+
+A donation changed on that page is now also saved into the setup profile the
+server started from. Before, starting from the profile again restored the
+profile's own donation and the change was lost. The save fails closed if the
+profile was renamed or removed meanwhile.
+
+Evidence: host tests render the page with a public pool's start values (both
+ports, 65,536, the pool's name, the fee "to another address") and a joined
+server's pools and username, and save a changed donation to the config and to
+its profile, refusing a profile that is gone.

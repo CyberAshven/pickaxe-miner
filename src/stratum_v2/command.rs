@@ -37,12 +37,16 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Runs a `stratum-v2` command. `profile` names the setup profile a server
+/// started from (#### PR #42: a donation changed on its Advanced page is
+/// saved there too).
 pub fn run(
     action: StratumV2Command,
     config: &RuntimeConfig,
     config_path: &Path,
     no_tui: bool,
     json: bool,
+    profile: Option<&str>,
 ) -> Result<(), String> {
     if let StratumV2Command::Status = action {
         print!("{}", super::status_report());
@@ -109,6 +113,15 @@ pub fn run(
         .and_then(|(nodes, _)| nodes.first())
         .and_then(|rpc| rpc.info().ok())
         .map(|info| info.client);
+    // #### PR #42: whether the pool knows this server by another name than
+    // the payout address, for the Advanced page.
+    let custom_user = matches!(
+        &action,
+        StratumV2Command::Serve {
+            upstream_user: Some(_),
+            ..
+        }
+    );
     let StratumV2Command::Serve {
         listen,
         sv1_listen,
@@ -218,6 +231,23 @@ pub fn run(
             .map(|pool| pool.address.as_str())
             .collect::<Vec<_>>()
             .join(" → ")
+    });
+    // #### PR #42: what the server started with, for its Advanced page.
+    let started = started_text(&Started {
+        sv2: bound,
+        sv1: sv1_bound,
+        start_difficulty: start_difficulty.unwrap_or(4096),
+        pool_tag: String::from_utf8_lossy(&pool_tag).into_owned(),
+        pools: pool_address.clone(),
+        custom_user,
+        fee: public.as_ref().and_then(|public| {
+            public.fee.map(|fee| {
+                (
+                    fee,
+                    public.address.eq_ignore_ascii_case(&config.payout_address),
+                )
+            })
+        }),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
@@ -469,6 +499,7 @@ pub fn run(
                                 donation_value,
                                 setting_error,
                                 pool_address.is_some(),
+                                &started,
                             )
                         } else if overview {
                             render_dashboard(frame, &overview_text, &devices, device_offset)
@@ -590,7 +621,7 @@ pub fn run(
                                         KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right
                                     ));
                                     if next != donation_value {
-                                        match save_donation(config_path, next) {
+                                        match save_donation(config_path, profile, next) {
                                             Ok(()) => {
                                                 *donation.write().map_err(|_| "donation setting unavailable")? = next;
                                                 setting_error = None;
@@ -735,14 +766,112 @@ fn pool_upstreams(
         .collect()
 }
 
-fn save_donation(path: &Path, value: BchDonation) -> Result<(), ()> {
+fn save_donation(path: &Path, profile: Option<&str>, value: BchDonation) -> Result<(), ()> {
     // Preserve unrelated saved settings. Saving must succeed before new jobs
     // use the changed percentage; in-flight jobs retain their original policy.
     let mut saved = config::SavedConfig::load_optional(path)
         .map_err(|_| ())?
         .unwrap_or_default();
     saved.bch_donation_bps = Some(value);
-    saved.save(path).map_err(|_| ())
+    saved.save(path).map_err(|_| ())?;
+    // #### PR #42
+    // What: a server started from a setup profile saves the donation into
+    // that profile too.
+    // Why: starting from a profile takes the profile's settings, so a change
+    // made here was lost at the next start.
+    // Look here if: a donation changed on the server's Advanced page comes
+    // back changed after a restart from a profile.
+    if let Some(name) = profile {
+        let profiles_path = config::profiles_path(path);
+        let mut profiles = config::MiningProfiles::load_optional(&profiles_path).map_err(|_| ())?;
+        let entry = profiles
+            .profiles
+            .iter_mut()
+            .find(|entry| entry.name.eq_ignore_ascii_case(name))
+            .ok_or(())?;
+        entry.settings.bch_donation_bps = Some(value);
+        profiles.save(&profiles_path).map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+/// #### PR #42: what the server started with.
+struct Started {
+    sv2: Option<std::net::SocketAddr>,
+    sv1: Option<std::net::SocketAddr>,
+    start_difficulty: u64,
+    pool_tag: String,
+    /// The pools in failover order, when joining.
+    pools: Option<String>,
+    /// The pool knows this server by another name than the payout address.
+    custom_user: bool,
+    /// A public pool's fee, and whether it goes to the payout address.
+    fee: Option<(crate::donation::bch::PoolFee, bool)>,
+}
+
+/// #### PR #42
+/// What: the server's start values for its Advanced page: listening
+/// addresses, the start difficulty and the vardiff rule, the pool's name, a
+/// public pool's fee, and the pools joined. It never shows an address or key:
+/// the fee says "your payout address" or "another address".
+/// Why: these are set in the setup or on the command line, and apply after a
+/// restart; the operator could not see them on a running server.
+/// Look here if: the Advanced page shows a wrong start value or an address.
+fn started_text(started: &Started) -> String {
+    let mut text = String::from(
+        "Set when the server started (change them in the setup's Advanced section or on the \
+         command line; they apply after a restart):\n",
+    );
+    let listen = |name: &str, address: Option<std::net::SocketAddr>| {
+        address.map(|address| format!("{name} {address}"))
+    };
+    let listeners: Vec<String> = [listen("SV2", started.sv2), listen("SV1", started.sv1)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !listeners.is_empty() {
+        text.push_str(&format!("Listening  {}\n", listeners.join(" · ")));
+    }
+    match &started.pools {
+        Some(pools) => text.push_str(&format!(
+            "Pools  {pools} (in failover order), username: {}\n",
+            if started.custom_user {
+                "your own"
+            } else {
+                "your payout address"
+            }
+        )),
+        None => {
+            let digits = started.start_difficulty.to_string();
+            let mut grouped = String::new();
+            for (index, digit) in digits.chars().enumerate() {
+                if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                    grouped.push(',');
+                }
+                grouped.push(digit);
+            }
+            text.push_str(&format!(
+                "Start difficulty  {grouped}; vardiff then moves each device toward 20 shares a \
+                 minute\n"
+            ));
+        }
+    }
+    if !started.pool_tag.is_empty() {
+        text.push_str(&format!("Pool name  {}\n", started.pool_tag));
+    }
+    if let Some((fee, to_payout)) = &started.fee {
+        text.push_str(&format!(
+            "Pool fee  {} from {}, to {}\n",
+            fee.rate,
+            fee.mode,
+            if *to_payout {
+                "your payout address"
+            } else {
+                "another address"
+            }
+        ));
+    }
+    text
 }
 
 /// The donation as the dashboard shows it, with its two parts.
@@ -752,7 +881,13 @@ fn donation_summary(donation: BchDonation) -> String {
 }
 
 /// Advanced settings: the donation, adjustable from 0% to 100%.
-fn render_advanced(frame: &mut Frame<'_>, donation: BchDonation, error: Option<&str>, pool: bool) {
+fn render_advanced(
+    frame: &mut Frame<'_>,
+    donation: BchDonation,
+    error: Option<&str>,
+    pool: bool,
+    started: &str,
+) {
     let (work, reward) = donation.shares();
     // #### PR #40: at a pool the whole donation is mining time.
     let split = if pool {
@@ -768,8 +903,8 @@ fn render_advanced(frame: &mut Frame<'_>, donation: BchDonation, error: Option<&
     };
     let mut text = format!(
         "Donation  {donation}\n\n{split}\nThe default is 1.50%; any setting from 0% to 100% \
-         works, in 0.5% steps. Changes apply to new jobs and are saved.\n\n←/→ or +/-  Change \
-         donation · a or Esc  Back"
+         works, in 0.5% steps. Changes apply to new jobs and are saved.\n\n{started}\n←/→ or \
+         +/-  Change donation · a or Esc  Back"
     );
     if let Some(error) = error {
         text.push_str(&format!("\n\n{error}"));
@@ -1953,7 +2088,7 @@ mod tests {
         };
         original.save(&path).unwrap();
         let rate = "2.01".parse().unwrap();
-        save_donation(&path, rate).unwrap();
+        save_donation(&path, None, rate).unwrap();
         original.bch_donation_bps = Some(rate);
         assert_eq!(config::SavedConfig::load(&path).unwrap(), original);
         let mut runtime = RuntimeConfig::default();
@@ -1964,7 +2099,7 @@ mod tests {
             [400, 0]
         );
         fs::write(&path, b"broken config").unwrap();
-        assert!(save_donation(&path, BchDonation::default()).is_err());
+        assert!(save_donation(&path, None, BchDonation::default()).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"broken config");
     }
 
@@ -2453,6 +2588,21 @@ mod tests {
                     BchDonation::default(),
                     Some("Could not save donation"),
                     false,
+                    &started_text(&Started {
+                        sv2: Some("0.0.0.0:3336".parse().unwrap()),
+                        sv1: Some("0.0.0.0:3338".parse().unwrap()),
+                        start_difficulty: 65_536,
+                        pool_tag: "/MyPool/".into(),
+                        pools: None,
+                        custom_user: false,
+                        fee: Some((
+                            crate::donation::bch::PoolFee {
+                                rate: "1.5".parse().unwrap(),
+                                mode: crate::donation::bch::FeeMode::Coinbase,
+                            },
+                            false,
+                        )),
+                    }),
                 )
             })
             .unwrap();
@@ -2468,6 +2618,67 @@ mod tests {
         assert!(text.contains("0.50% of mining work and 1.00% of each block reward"));
         assert!(text.contains("from 0% to 100%"));
         assert!(text.contains("Could not save donation"));
+        // #### PR #42: the start values, read-only, never an address.
+        for expected in [
+            "apply after a restart",
+            "SV1 0.0.0.0:3338",
+            "65,536",
+            "/MyPool/",
+            "1.50% from",
+            "to another address",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        let joined = started_text(&Started {
+            sv2: None,
+            sv1: Some("0.0.0.0:3333".parse().unwrap()),
+            start_difficulty: 4096,
+            pool_tag: String::new(),
+            pools: Some("pool.example:3336 → b1.example:3336".into()),
+            custom_user: true,
+            fee: None,
+        });
+        assert!(joined.contains("pool.example:3336 → b1.example:3336 (in failover order)"));
+        assert!(joined.contains("username: your own"));
+        assert!(!joined.contains("Start difficulty"));
+    }
+
+    // #### PR #42
+    // What: a donation changed on the server's Advanced page is saved into
+    // the profile the server started from, and fails closed when that
+    // profile is gone.
+    // Look here if: save_donation changes.
+    #[test]
+    fn a_servers_donation_is_saved_to_its_profile() {
+        let dir = super::super::journal::TestDirectory::new();
+        let path = dir.0.join("chipnet.json");
+        config::SavedConfig {
+            network: Some("chipnet".into()),
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let mut profiles = config::MiningProfiles::default();
+        profiles
+            .upsert(
+                None,
+                "Pool",
+                config::SavedConfig {
+                    network: Some("chipnet".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        profiles.save(&config::profiles_path(&path)).unwrap();
+        let rate: BchDonation = "0.5".parse().unwrap();
+        save_donation(&path, Some("pool"), rate).unwrap();
+        let saved = config::MiningProfiles::load_optional(&config::profiles_path(&path)).unwrap();
+        assert_eq!(saved.profiles[0].settings.bch_donation_bps, Some(rate));
+        assert_eq!(
+            config::SavedConfig::load(&path).unwrap().bch_donation_bps,
+            Some(rate)
+        );
+        assert!(save_donation(&path, Some("Gone"), rate).is_err());
     }
 
     #[test]

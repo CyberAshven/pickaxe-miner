@@ -1520,8 +1520,14 @@ fn main() {
             }
             action => {
                 #[cfg(feature = "stratum-v2")]
-                let result =
-                    stratum_v2::command::run(action, &cfg, &config_path, args.no_tui, args.json);
+                let result = stratum_v2::command::run(
+                    action,
+                    &cfg,
+                    &config_path,
+                    args.no_tui,
+                    args.json,
+                    None,
+                );
                 #[cfg(not(feature = "stratum-v2"))]
                 let result: Result<(), String> = {
                     let _ = action;
@@ -1819,6 +1825,7 @@ fn main() {
                                 &config_path,
                                 false,
                                 false,
+                                Some(&setup.profile_name),
                             );
                             #[cfg(not(feature = "stratum-v2"))]
                             let result: Result<(), String> = {
