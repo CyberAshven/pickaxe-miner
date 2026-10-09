@@ -73,7 +73,7 @@ pub struct DeviceSnapshot {
 struct Device {
     label: String,
     protocol: &'static str,
-    /// #### PR #41: the device's local network address, kept after it
+    /// #### PR #42: the device's local network address, kept after it
     /// disconnects so a reconnect replaces its row.
     ip: Option<IpAddr>,
     started: Instant,
@@ -226,7 +226,7 @@ impl Devices {
     pub fn set_address(&mut self, id: u64, ip: IpAddr) {
         if super::device_api::queryable(ip) && self.rows.contains_key(&id) {
             self.addresses.insert(id, ip);
-            // #### PR #41
+            // #### PR #42
             // What: one row per device on the local network. A device that
             // connects again replaces its own offline row.
             // Why: every connection was a row of its own, so a reconnect left
@@ -341,7 +341,7 @@ impl Devices {
         let ip = row.ip;
         self.sockets.retain(|_, existing| *existing != id);
         self.addresses.remove(&id);
-        // #### PR #41: a short extra connection from a device that is still
+        // #### PR #42: a short extra connection from a device that is still
         // online leaves no row behind.
         if ip.is_some()
             && self
@@ -487,7 +487,7 @@ pub fn connection_reason(error: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    // #### PR #41
+    // #### PR #42
     #[test]
     fn a_device_keeps_one_row_through_reconnects_and_extra_connections() {
         let now = Instant::now();
