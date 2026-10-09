@@ -480,6 +480,13 @@ BCH uses an adjustable donation, defaulting to 1.5%: one third of it is mining
 work and two thirds is the block reward (0.5% and 1% at the default). The
 dashboard shows the total and both parts, each rounded up to two decimals; the
 combined effect of the two parts is slightly below the total (1.495% at 1.5%).
+In the setup, ASIC mining and Join a pool keep their server options under
+**Advanced** on the settings page (Enter on its header opens it): the
+donation, the start difficulty, the SV1 and SV2 ports, and for Join a pool the
+backup pools (each `stratum2+tcp://HOST:PORT/KEY`, used in order when the pool
+fails) and the username at the pool (your payout address by default). A
+saved profile keeps them.
+
 `--donation 2` selects 2%; the dashboard's Advanced settings (`a`) change the
 saved setting in 0.5% steps from 0% to 100%. Token policies remain separate.
 Mainnet and Chipnet each donate to their own built-in address

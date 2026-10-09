@@ -10,8 +10,11 @@ same way for GPU rigs; see [A public GPU pool](#a-public-gpu-pool).
 
 The pool builds blocks from your own BCH node, as solo mining does (see
 [stratum-v2.md](stratum-v2.md)). In the setup choose **Run a pool**, then
-**ASIC pool**, and set the pool fee, where it comes from and its address on the
-settings page; or from a terminal:
+**ASIC pool**, and set the pool fee on the settings page. The rest is under
+**Advanced** on the same page (Enter opens it): where the fee comes from and
+its address, the pool's name, the start difficulty, the SV1 and SV2 ports and
+the donation. A saved profile keeps them all and reopens as a pool. From a
+terminal:
 
 ```text
 pickaxe_miner stratum-v2 serve --config pool.json \

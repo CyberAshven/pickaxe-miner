@@ -675,6 +675,19 @@ pub struct SavedServer {
     /// An ASIC pool's name in its blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_tag: Option<String>,
+    /// #### PR #42: an ASIC server's Advanced values; left out at their
+    /// defaults (3333, 3336, the server's start difficulty, no backup pools,
+    /// the payout address at the pool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sv1_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sv2_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_difficulty: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_user: Option<String>,
 }
 
 impl SavedServer {
@@ -709,6 +722,52 @@ impl SavedServer {
                 _ => validate_coinbase_address(network, address),
             }
             .map_err(|error| format!("pool fee address: {error}"))?;
+        }
+        // #### PR #42: the Advanced values, checked as the setup checks them.
+        let asic = matches!(
+            self.mode,
+            SavedMode::AsicSolo | SavedMode::AsicJoin | SavedMode::AsicPool
+        );
+        let advanced = self.sv1_port.is_some()
+            || self.sv2_port.is_some()
+            || self.start_difficulty.is_some()
+            || !self.backups.is_empty()
+            || self.pool_user.is_some();
+        if advanced && !asic {
+            return Err(
+                "only an ASIC server saves ports, a start difficulty or backup pools".into(),
+            );
+        }
+        if self.sv1_port == Some(0) || self.sv2_port == Some(0) {
+            return Err("a port is 1 to 65535".into());
+        }
+        if self.sv1_port.unwrap_or(3333) == self.sv2_port.unwrap_or(3336) {
+            return Err("the SV1 and SV2 ports must differ".into());
+        }
+        if self
+            .start_difficulty
+            .is_some_and(|difficulty| difficulty == 0 || difficulty > 1 << 48)
+        {
+            return Err("a start difficulty is 1 to 2^48".into());
+        }
+        if self.mode != SavedMode::AsicJoin
+            && (!self.backups.is_empty() || self.pool_user.is_some())
+        {
+            return Err(
+                "only a profile that joins a pool saves backup pools or a pool username".into(),
+            );
+        }
+        if self.backups.len() > 8
+            || self.backups.iter().any(|pool| {
+                pool.is_empty() || pool.chars().any(|c| c.is_whitespace() || c.is_control())
+            })
+        {
+            return Err("at most 8 backup pools, each without spaces".into());
+        }
+        if self.pool_user.as_deref().is_some_and(|user| {
+            user.is_empty() || user.len() > 255 || user.chars().any(char::is_control)
+        }) {
+            return Err("a pool username is 1 to 255 printable characters".into());
         }
         if let Some(tag) = &self.pool_tag {
             let tag = tag.trim();
@@ -1855,6 +1914,11 @@ mod tests {
             fee_mode: Some(crate::donation::bch::FeeMode::Both),
             fee_address: None,
             pool_tag: Some("/MyPool/".into()),
+            sv1_port: Some(3338),
+            sv2_port: None,
+            start_difficulty: Some(65_536),
+            backups: Vec::new(),
+            pool_user: None,
         };
         with(pool.clone()).validate().unwrap();
         let text = serde_json::to_string(&with(pool.clone())).unwrap();
@@ -1869,6 +1933,11 @@ mod tests {
             fee_mode: None,
             fee_address: None,
             pool_tag: None,
+            sv1_port: None,
+            sv2_port: None,
+            start_difficulty: None,
+            backups: vec!["stratum2+tcp://backup.example:3336/KEY".into()],
+            pool_user: Some("rig-owner".into()),
         };
         with(joining.clone()).validate().unwrap();
         for (bad, why) in [
@@ -1913,6 +1982,34 @@ mod tests {
                     ..pool.clone()
                 },
                 "a GPU pool with an ASIC pool's name and fee source",
+            ),
+            (
+                SavedServer {
+                    sv1_port: Some(3336),
+                    ..pool.clone()
+                },
+                "the SV1 port on the SV2 port",
+            ),
+            (
+                SavedServer {
+                    start_difficulty: Some(0),
+                    ..pool.clone()
+                },
+                "a start difficulty of 0",
+            ),
+            (
+                SavedServer {
+                    backups: vec!["a b".into()],
+                    ..joining.clone()
+                },
+                "a backup pool with a space",
+            ),
+            (
+                SavedServer {
+                    pool_user: Some("rig".into()),
+                    ..pool.clone()
+                },
+                "a pool username on an ASIC pool",
             ),
         ] {
             assert!(with(bad).validate().is_err(), "{why}");

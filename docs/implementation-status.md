@@ -1428,3 +1428,36 @@ Evidence: host tests write and read the devices file, take a worker's address
 from it, refuse a shared or unknown one, refuse an edited public address, read
 the server's own addresses back, and show the "run watch as the server's
 user" explanation when the file cannot be read.
+
+## The Advanced section in setup (2026-10-09)
+
+#### PR #42
+
+The setup's settings page now has an **Advanced** section for the ASIC modes,
+closed by default and opened with Enter (or Left/Right) on its header. It holds
+what was missing from the setup or hard to find:
+- ASIC solo: the donation, the start difficulty, the SV1 and SV2 ports, and
+  the Fulcrum list.
+- Join a pool: backup pools (one-line SV2 addresses with their keys, at most
+  8, used in order), the username at the pool (the payout address by
+  default), the donation and the SV1 port.
+- An ASIC pool: where the fee comes from, the fee address and the pool's name
+  (moved here), the start difficulty, both ports and the donation.
+
+The donation row reads "1.50% of BCH and merge-mined tokens (1.00% of rewards ·
+0.50% of work)" and goes from 0% to 100% in 0.5% steps. The start difficulty
+halves or doubles with Left/Right or takes a typed number (1 to 2^48; 4096 is
+the server's default). Ports are checked (1 to 65535, the two different).
+When Start finds a wrong value inside the section, it opens the section at
+that row. A saved profile keeps every value, and the server starts with them
+(before, setup always used ports 3333 and 3336, the default start difficulty,
+one pool and the payout address as the pool username).
+
+Not yet: the GPU modes' rows in the section, and the server's own Advanced
+page showing these start values.
+
+Evidence: host tests check that the section hides its rows until opened, the
+donation row's text and its 0%, the start difficulty's steps and typed value,
+the port checks, backup pools needing their key, a profile keeping and
+restoring every value, saved values refused as the setup refuses them, and
+Start opening the section at a wrong fee address.

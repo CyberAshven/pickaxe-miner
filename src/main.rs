@@ -1762,8 +1762,18 @@ fn main() {
                                 tui::ServerSetup::Solo => {
                                     (Vec::new(), Vec::new(), false, None, None, None)
                                 }
+                                // #### PR #42: the pool, then the backup
+                                // pools from the Advanced section, each with
+                                // its key in its address.
                                 tui::ServerSetup::JoinPool { address, key } => {
-                                    (vec![address], vec![key], false, None, None, None)
+                                    let main = if address.contains("://") || key.is_empty() {
+                                        address
+                                    } else {
+                                        format!("stratum2+tcp://{address}/{key}")
+                                    };
+                                    let mut upstream = vec![main];
+                                    upstream.extend(setup.options.backups.iter().cloned());
+                                    (upstream, Vec::new(), false, None, None, None)
                                 }
                                 tui::ServerSetup::Public {
                                     fee,
@@ -1778,19 +1788,29 @@ fn main() {
                                 tui::ServerSetup::GpuPool { .. }
                                 | tui::ServerSetup::JoinGpuPool { .. } => unreachable!(),
                             };
+                            // #### PR #42: the ports, start difficulty
+                            // and pool username from the Advanced section.
+                            let options = &setup.options;
+                            let joining = !upstream.is_empty();
                             let action = cli::StratumV2Command::Serve {
-                                listen: std::net::SocketAddr::from(([0, 0, 0, 0], 3336)),
-                                sv1_listen: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3333))),
+                                listen: std::net::SocketAddr::from((
+                                    [0, 0, 0, 0],
+                                    options.sv2_port,
+                                )),
+                                sv1_listen: Some(std::net::SocketAddr::from((
+                                    [0, 0, 0, 0],
+                                    options.sv1_port,
+                                ))),
                                 donation: None,
                                 upstream,
                                 upstream_key,
-                                upstream_user: None,
+                                upstream_user: options.pool_user.clone().filter(|_| joining),
                                 public,
                                 pool_fee,
                                 pool_fee_mode,
                                 pool_fee_address,
                                 pool_tag,
-                                start_difficulty: None,
+                                start_difficulty: options.start_difficulty.filter(|_| !joining),
                             };
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(

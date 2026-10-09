@@ -67,6 +67,55 @@ pub struct SetupResult {
     pub profile_name: String,
     /// #### PR #40: the BCH ASIC server to start instead of GPU mining.
     pub server: Option<ServerSetup>,
+    /// #### PR #42: the ASIC server's options from the Advanced section.
+    pub options: ServerOptions,
+}
+
+/// #### PR #42: the ASIC server's options the setup's Advanced section
+/// sets: listening ports, the start difficulty, backup pools and the pool
+/// username.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerOptions {
+    pub sv1_port: u16,
+    pub sv2_port: u16,
+    /// `None` is the server's default.
+    pub start_difficulty: Option<u64>,
+    /// Backup pools for Join a pool, each a one-line SV2 address with its
+    /// key, in failover order.
+    pub backups: Vec<String>,
+    /// The username at the pool; `None` is the payout address.
+    pub pool_user: Option<String>,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            sv1_port: DEFAULT_SV1_PORT,
+            sv2_port: DEFAULT_SV2_PORT,
+            start_difficulty: None,
+            backups: Vec::new(),
+            pool_user: None,
+        }
+    }
+}
+
+/// #### PR #42: the ASIC server's defaults, as its command line has them.
+const DEFAULT_SV1_PORT: u16 = 3333;
+const DEFAULT_SV2_PORT: u16 = 3336;
+const DEFAULT_START_DIFFICULTY: u64 = 4096;
+const MAX_START_DIFFICULTY: u64 = 1 << 48;
+const MAX_BACKUPS: usize = 8;
+
+/// #### PR #42: the start difficulty one step down (half) or up (double),
+/// within 1 to 2^48; the default reads as `None`.
+fn step_difficulty(current: Option<u64>, up: bool) -> Option<u64> {
+    let now = current.unwrap_or(DEFAULT_START_DIFFICULTY);
+    let next = if up {
+        now.saturating_mul(2).min(MAX_START_DIFFICULTY)
+    } else {
+        (now / 2).max(1)
+    };
+    Some(next).filter(|difficulty| *difficulty != DEFAULT_START_DIFFICULTY)
 }
 
 /// #### PR #40
@@ -196,6 +245,18 @@ enum SettingsRow {
     FeeAddress,
     /// #### PR #40: the pool's name in its blocks.
     PoolName,
+    /// #### PR #42: the Advanced section's header; Enter or Left/Right opens
+    /// and closes it. Its rows follow it while it is open.
+    Advanced,
+    /// The BCH donation, shared by merge-mined tokens.
+    Donation,
+    StartDifficulty,
+    Sv1Port,
+    Sv2Port,
+    /// Backup pools for Join a pool, in failover order.
+    Backups,
+    /// The username at the pool (the payout address by default).
+    PoolUser,
     Address,
     Intensity,
     Fulcrum,
@@ -215,6 +276,12 @@ enum TextField {
     PoolKey,
     FeeAddress,
     PoolName,
+    /// #### PR #42: the Advanced section's text rows.
+    StartDifficulty,
+    Sv1Port,
+    Sv2Port,
+    Backups,
+    PoolUser,
 }
 
 /// What an ASIC can mine: BCH today (merge-mined tokens as they appear);
@@ -255,6 +322,16 @@ struct SetupFlow {
     /// Empty: the payout address.
     pool_fee_address: String,
     pool_tag: String,
+    /// #### PR #42: the Advanced section and its values.
+    advanced_open: bool,
+    /// `None` is the server's default start difficulty (4096).
+    start_difficulty: Option<u64>,
+    sv1_port: u16,
+    sv2_port: u16,
+    /// Backup pools, each a one-line SV2 address with its key.
+    backups: Vec<String>,
+    /// Empty: the payout address.
+    pool_user: String,
     token_input: String,
     token_selected: usize,
     settings_row: usize,
@@ -351,6 +428,12 @@ impl SetupFlow {
             pool_fee_mode: SetupFlow::server_defaults().1,
             pool_fee_address: String::new(),
             pool_tag: String::new(),
+            advanced_open: false,
+            start_difficulty: None,
+            sv1_port: DEFAULT_SV1_PORT,
+            sv2_port: DEFAULT_SV2_PORT,
+            backups: Vec::new(),
+            pool_user: String::new(),
             token_input: String::new(),
             token_selected: 0,
             settings_row: 0,
@@ -590,25 +673,38 @@ impl SetupFlow {
                 SettingsRow::ProfileName,
                 SettingsRow::Start,
             ],
-            MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => vec![
-                SettingsRow::AsicTarget,
-                SettingsRow::Mining,
-                SettingsRow::PoolKind,
-                SettingsRow::PoolAddress,
-                SettingsRow::PoolKey,
-                SettingsRow::Address,
-                SettingsRow::ProfileName,
-                SettingsRow::Start,
-            ],
-            MiningMode::Asic => vec![
-                SettingsRow::AsicTarget,
-                SettingsRow::Mining,
-                SettingsRow::Address,
-                SettingsRow::Fulcrum,
-                SettingsRow::Node,
-                SettingsRow::ProfileName,
-                SettingsRow::Start,
-            ],
+            // #### PR #42: server options in the Advanced section.
+            MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => self.with_advanced(
+                vec![
+                    SettingsRow::AsicTarget,
+                    SettingsRow::Mining,
+                    SettingsRow::PoolKind,
+                    SettingsRow::PoolAddress,
+                    SettingsRow::PoolKey,
+                    SettingsRow::Address,
+                ],
+                vec![
+                    SettingsRow::Backups,
+                    SettingsRow::PoolUser,
+                    SettingsRow::Donation,
+                    SettingsRow::Sv1Port,
+                ],
+            ),
+            MiningMode::Asic => self.with_advanced(
+                vec![
+                    SettingsRow::AsicTarget,
+                    SettingsRow::Mining,
+                    SettingsRow::Address,
+                    SettingsRow::Node,
+                ],
+                vec![
+                    SettingsRow::Donation,
+                    SettingsRow::StartDifficulty,
+                    SettingsRow::Sv1Port,
+                    SettingsRow::Sv2Port,
+                    SettingsRow::Fulcrum,
+                ],
+            ),
             // #### PR #40: a GPU pool's fee is always mining time.
             MiningMode::Pool if self.pool_target == 1 => vec![
                 SettingsRow::PoolKind,
@@ -620,19 +716,76 @@ impl SetupFlow {
                 SettingsRow::ProfileName,
                 SettingsRow::Start,
             ],
-            MiningMode::Pool => vec![
-                SettingsRow::PoolKind,
-                SettingsRow::Address,
-                SettingsRow::Node,
-                SettingsRow::PoolFee,
-                SettingsRow::FeeFrom,
-                SettingsRow::FeeAddress,
-                SettingsRow::PoolName,
-                SettingsRow::ProfileName,
-                SettingsRow::Start,
-            ],
+            MiningMode::Pool => self.with_advanced(
+                vec![
+                    SettingsRow::PoolKind,
+                    SettingsRow::Address,
+                    SettingsRow::Node,
+                    SettingsRow::PoolFee,
+                ],
+                vec![
+                    SettingsRow::FeeFrom,
+                    SettingsRow::FeeAddress,
+                    SettingsRow::PoolName,
+                    SettingsRow::StartDifficulty,
+                    SettingsRow::Sv1Port,
+                    SettingsRow::Sv2Port,
+                    SettingsRow::Donation,
+                ],
+            ),
         }
     }
+
+    // #### PR #42: the Advanced section
+    // What: the ASIC modes' server options sit in an Advanced section under
+    // the main rows: ports, start difficulty, the donation, backup pools and
+    // the pool username, and an ASIC pool's fee source, fee address and name.
+    // It opens with Enter or Left/Right on its header, and by itself when a
+    // check sends the cursor to one of its rows.
+    // Why: the operator could not find the pool settings; several existed
+    // only as command-line flags.
+    // Look here if: a row is missing from a mode, or Start points at a row
+    // that is not shown.
+    /// The mode's rows, then the Advanced header and, while it is open, its
+    /// rows, then the profile name and Start.
+    fn with_advanced(
+        &self,
+        basic: Vec<SettingsRow>,
+        advanced: Vec<SettingsRow>,
+    ) -> Vec<SettingsRow> {
+        let mut rows = basic;
+        rows.push(SettingsRow::Advanced);
+        if self.advanced_open {
+            rows.extend(advanced);
+        }
+        rows.extend([SettingsRow::ProfileName, SettingsRow::Start]);
+        rows
+    }
+
+    /// Opens or closes the Advanced section, keeping the cursor on its
+    /// header.
+    fn toggle_advanced(&mut self) {
+        self.advanced_open = !self.advanced_open;
+        if let Some(index) = self
+            .settings_rows()
+            .iter()
+            .position(|row| *row == SettingsRow::Advanced)
+        {
+            self.settings_row = index;
+        }
+    }
+
+    /// The server options the setup starts the ASIC server with.
+    fn server_options(&self) -> ServerOptions {
+        ServerOptions {
+            sv1_port: self.sv1_port,
+            sv2_port: self.sv2_port,
+            start_difficulty: self.start_difficulty,
+            backups: self.backups.clone(),
+            pool_user: Some(self.pool_user.trim().to_owned()).filter(|user| !user.is_empty()),
+        }
+    }
+    // #### end PR #42 ####
 
     /// #### PR #40: the server this setup starts, if not GPU mining.
     fn server_setup(&self) -> Option<ServerSetup> {
@@ -671,6 +824,11 @@ impl SetupFlow {
     /// The mode and pool values a profile saves; `None` for plain GPU mining.
     fn saved_server(&self) -> Option<SavedServer> {
         let text = |value: &str| Some(value.trim().to_owned()).filter(|v| !v.is_empty());
+        // #### PR #42: an ASIC server's Advanced values are saved too.
+        let asic = matches!(self.mode, MiningMode::Asic | MiningMode::Pool)
+            && !(self.mode == MiningMode::Pool && self.pool_target == 1);
+        let options = self.server_options();
+        let ports = |port: u16, default: u16| Some(port).filter(|port| asic && *port != default);
         let joining = |mode| SavedServer {
             mode,
             join: text(&self.join_address),
@@ -679,6 +837,15 @@ impl SetupFlow {
             fee_mode: None,
             fee_address: None,
             pool_tag: None,
+            sv1_port: ports(options.sv1_port, DEFAULT_SV1_PORT),
+            sv2_port: ports(options.sv2_port, DEFAULT_SV2_PORT),
+            start_difficulty: options.start_difficulty.filter(|_| asic),
+            backups: if asic {
+                options.backups.clone()
+            } else {
+                Vec::new()
+            },
+            pool_user: options.pool_user.clone().filter(|_| asic),
         };
         Some(match self.server_setup()? {
             ServerSetup::JoinGpuPool { .. } => joining(SavedMode::GpuRig),
@@ -686,6 +853,8 @@ impl SetupFlow {
             ServerSetup::Solo => SavedServer {
                 join: None,
                 join_key: None,
+                backups: Vec::new(),
+                pool_user: None,
                 ..joining(SavedMode::AsicSolo)
             },
             ServerSetup::GpuPool { fee, address } => SavedServer {
@@ -696,6 +865,7 @@ impl SetupFlow {
                 fee_mode: None,
                 fee_address: address,
                 pool_tag: None,
+                ..joining(SavedMode::GpuPool)
             },
             ServerSetup::Public {
                 fee,
@@ -710,6 +880,9 @@ impl SetupFlow {
                 fee_mode: Some(mode),
                 fee_address: address,
                 pool_tag: tag,
+                backups: Vec::new(),
+                pool_user: None,
+                ..joining(SavedMode::AsicPool)
             },
         })
     }
@@ -727,6 +900,12 @@ impl SetupFlow {
         self.pool_fee_mode = defaults.1;
         self.pool_fee_address.clear();
         self.pool_tag.clear();
+        self.advanced_open = false;
+        self.start_difficulty = None;
+        self.sv1_port = DEFAULT_SV1_PORT;
+        self.sv2_port = DEFAULT_SV2_PORT;
+        self.backups.clear();
+        self.pool_user.clear();
         let Some(server) = server else {
             self.mode = MiningMode::Gpu;
             return;
@@ -753,6 +932,11 @@ impl SetupFlow {
         self.pool_fee_mode = server.fee_mode.unwrap_or(defaults.1);
         self.pool_fee_address = server.fee_address.clone().unwrap_or_default();
         self.pool_tag = server.pool_tag.clone().unwrap_or_default();
+        self.start_difficulty = server.start_difficulty;
+        self.sv1_port = server.sv1_port.unwrap_or(DEFAULT_SV1_PORT);
+        self.sv2_port = server.sv2_port.unwrap_or(DEFAULT_SV2_PORT);
+        self.backups = server.backups.clone();
+        self.pool_user = server.pool_user.clone().unwrap_or_default();
     }
 
     /// A new pool's fee and where it comes from, before anyone changes them.
@@ -774,6 +958,10 @@ impl SetupFlow {
 
     fn open_settings(&mut self, row: SettingsRow) {
         self.step = SetupStep::Settings;
+        // #### PR #42: a row inside the closed Advanced section opens it.
+        if !self.settings_rows().contains(&row) {
+            self.advanced_open = true;
+        }
         self.settings_row = self
             .settings_rows()
             .iter()
@@ -1164,10 +1352,43 @@ impl SetupFlow {
                             (FeeMode::Both, true) | (FeeMode::Work, false) => FeeMode::Coinbase,
                         };
                     }
+                    // #### PR #42: the Advanced section.
+                    SettingsRow::Advanced => self.toggle_advanced(),
+                    SettingsRow::Donation => {
+                        self.config.bch_donation = self.config.bch_donation.adjusted(forward)
+                    }
+                    SettingsRow::StartDifficulty => {
+                        self.start_difficulty = step_difficulty(self.start_difficulty, forward)
+                    }
                     _ => {}
                 }
             }
             KeyCode::Enter => match row {
+                // #### PR #42: the Advanced section.
+                SettingsRow::Advanced => self.toggle_advanced(),
+                SettingsRow::StartDifficulty => {
+                    let value = self
+                        .start_difficulty
+                        .map(|difficulty| difficulty.to_string())
+                        .unwrap_or_default();
+                    self.begin_edit(TextField::StartDifficulty, value);
+                }
+                SettingsRow::Sv1Port => {
+                    let value = self.sv1_port.to_string();
+                    self.begin_edit(TextField::Sv1Port, value);
+                }
+                SettingsRow::Sv2Port => {
+                    let value = self.sv2_port.to_string();
+                    self.begin_edit(TextField::Sv2Port, value);
+                }
+                SettingsRow::Backups => {
+                    let value = self.backups.join(" ");
+                    self.begin_edit(TextField::Backups, value);
+                }
+                SettingsRow::PoolUser => {
+                    let value = self.pool_user.clone();
+                    self.begin_edit(TextField::PoolUser, value);
+                }
                 SettingsRow::Address => {
                     let value = self.config.payout_address.clone();
                     self.begin_edit(TextField::Address, value);
@@ -1192,7 +1413,8 @@ impl SetupFlow {
                 SettingsRow::Mining
                 | SettingsRow::PoolKind
                 | SettingsRow::PoolFee
-                | SettingsRow::FeeFrom => {
+                | SettingsRow::FeeFrom
+                | SettingsRow::Donation => {
                     self.status_line = "Use Left/Right to change this row.".into();
                 }
                 SettingsRow::ProfileName => {
@@ -1516,6 +1738,71 @@ impl SetupFlow {
                     return Err("use up to 20 printable characters".into());
                 }
                 self.pool_tag = value;
+                Ok(String::new())
+            }
+            // #### PR #42: the Advanced section's text rows.
+            TextField::StartDifficulty => {
+                let digits: String = value.chars().filter(|c| *c != ',' && *c != '_').collect();
+                self.start_difficulty = if digits.is_empty() {
+                    None
+                } else {
+                    match digits.parse::<u64>() {
+                        Ok(difficulty) if (1..=MAX_START_DIFFICULTY).contains(&difficulty) => {
+                            Some(difficulty).filter(|d| *d != DEFAULT_START_DIFFICULTY)
+                        }
+                        _ => return Err("use a start difficulty from 1 to 2^48".into()),
+                    }
+                };
+                Ok(String::new())
+            }
+            TextField::Sv1Port | TextField::Sv2Port => {
+                let port = value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .ok_or("use a port from 1 to 65535")?;
+                let other = if field == TextField::Sv1Port {
+                    self.sv2_port
+                } else {
+                    self.sv1_port
+                };
+                if port == other {
+                    return Err("the SV1 and SV2 ports must differ".into());
+                }
+                if field == TextField::Sv1Port {
+                    self.sv1_port = port;
+                } else {
+                    self.sv2_port = port;
+                }
+                Ok(String::new())
+            }
+            TextField::Backups => {
+                let backups: Vec<String> = value
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if backups.len() > MAX_BACKUPS {
+                    return Err(format!("use at most {MAX_BACKUPS} backup pools"));
+                }
+                for backup in &backups {
+                    match crate::stratum_v2::split_pool_address(backup)? {
+                        (_, Some(_)) => (),
+                        (_, None) => {
+                            return Err(
+                                "give each backup pool as stratum2+tcp://HOST:PORT/KEY".into()
+                            )
+                        }
+                    }
+                }
+                self.backups = backups;
+                Ok(String::new())
+            }
+            TextField::PoolUser => {
+                if value.len() > 255 || value.chars().any(char::is_control) {
+                    return Err("use up to 255 printable characters".into());
+                }
+                self.pool_user = value;
                 Ok(String::new())
             }
             TextField::Connection => {
@@ -2064,6 +2351,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
                             gpus,
                             profile_name,
                             server: state.server_setup(),
+                            options: state.server_options(),
                         }));
                     }
                     Err(error) => state.status_line = error,
@@ -3339,6 +3627,72 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     }
                     _ => format!("{nodes} saved for {label}"),
                 }),
+                "[Enter]",
+            ),
+            // #### PR #42: the Advanced section.
+            SettingsRow::Advanced => (
+                "Advanced",
+                Span::raw(if state.advanced_open {
+                    "▾ open: server options below".to_owned()
+                } else {
+                    "▸ closed: ports, start difficulty, donation and more".to_owned()
+                }),
+                "[Enter] < >",
+            ),
+            SettingsRow::Donation => {
+                let (work, reward) = state.config.bch_donation.shares();
+                (
+                    "Donation",
+                    Span::raw(format!(
+                        "{} of BCH and merge-mined tokens ({reward} of rewards · {work} of work)",
+                        state.config.bch_donation
+                    )),
+                    "< >  0% to 100%",
+                )
+            }
+            SettingsRow::StartDifficulty => (
+                "Start diff.",
+                match state.start_difficulty {
+                    _ if state.editing == Some(TextField::StartDifficulty) => {
+                        Span::raw(format!("{}_", state.text_input))
+                    }
+                    None => Span::raw(format!(
+                        "{} (default; vardiff adjusts each device)",
+                        group_digits(DEFAULT_START_DIFFICULTY)
+                    )),
+                    Some(difficulty) => Span::raw(group_digits(difficulty)),
+                },
+                "< > halves or doubles  [Enter]",
+            ),
+            SettingsRow::Sv1Port => (
+                "SV1 port",
+                edit_value(state, TextField::Sv1Port, &state.sv1_port.to_string(), ""),
+                "[Enter]  most ASIC firmware",
+            ),
+            SettingsRow::Sv2Port => (
+                "SV2 port",
+                edit_value(state, TextField::Sv2Port, &state.sv2_port.to_string(), ""),
+                "[Enter]",
+            ),
+            SettingsRow::Backups => (
+                "Backup pools",
+                match state.backups.len() {
+                    _ if state.editing == Some(TextField::Backups) => {
+                        Span::raw(format!("{}_", state.text_input))
+                    }
+                    0 => dim("none; paste stratum2+tcp://HOST:PORT/KEY lines".to_owned()),
+                    count => Span::raw(format!("{count}, used in order when the pool fails")),
+                },
+                "[Enter]",
+            ),
+            SettingsRow::PoolUser => (
+                "Pool username",
+                edit_value(
+                    state,
+                    TextField::PoolUser,
+                    &state.pool_user,
+                    "your payout address (default)",
+                ),
                 "[Enter]",
             ),
             SettingsRow::ProfileName => (
@@ -5024,12 +5378,160 @@ mod tests {
         );
     }
 
+    // #### PR #42
+    // What: the ASIC modes' server options live in an Advanced section that
+    // opens with Enter on its header; the donation row names BCH and
+    // merge-mined tokens with its 2:1 split and reaches 0%; the start
+    // difficulty halves, doubles and takes a typed value; ports are checked;
+    // backup pools need their key; profiles keep every value; and Start lands
+    // on a row inside the section when that row is wrong.
+    // Look here if: with_advanced, toggle_advanced, open_settings or the
+    // Advanced rows change.
+    #[test]
+    fn the_advanced_section_holds_the_server_options() {
+        let mut setup = setup_for(MiningMode::Asic);
+        let rows = setup.settings_rows();
+        assert!(rows.contains(&SettingsRow::Advanced));
+        assert!(!rows.contains(&SettingsRow::Sv1Port));
+        setup.open_settings(SettingsRow::Advanced);
+        assert!(setup_text(&setup).contains("ports, start difficulty, donation"));
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.advanced_open);
+        assert_eq!(setup.current_row(), SettingsRow::Advanced);
+        for row in [
+            SettingsRow::Donation,
+            SettingsRow::StartDifficulty,
+            SettingsRow::Sv1Port,
+            SettingsRow::Sv2Port,
+            SettingsRow::Fulcrum,
+        ] {
+            assert!(setup.settings_rows().contains(&row), "{row:?}");
+        }
+        let screen = setup_text(&setup);
+        assert!(
+            screen
+                .contains("1.50% of BCH and merge-mined tokens (1.00% of rewards · 0.50% of work)"),
+            "{screen}"
+        );
+        assert!(screen.contains("4,096 (default"), "{screen}");
+        // The donation reaches 0%.
+        setup.open_settings(SettingsRow::Donation);
+        for _ in 0..3 {
+            setup.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(setup.config.bch_donation.to_string(), "0.00%");
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.config.bch_donation.to_string(), "0.50%");
+        // The start difficulty halves, doubles and is typed.
+        setup.open_settings(SettingsRow::StartDifficulty);
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.start_difficulty, Some(8192));
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.start_difficulty, None, "4096 is the default");
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.start_difficulty, Some(2048));
+        // Enter starts the edit with the current value; it is cleared first.
+        setup.handle_key(key(KeyCode::Enter));
+        setup.text_input.clear();
+        type_text(&mut setup, "65,536");
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.start_difficulty, Some(65_536));
+        assert!(setup_text(&setup).contains("65,536"));
+        setup.handle_key(key(KeyCode::Enter));
+        setup.text_input.clear();
+        type_text(&mut setup, "0");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("1 to 2^48"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Esc));
+        // Ports: numbers, not 0, and the two must differ.
+        setup.open_settings(SettingsRow::Sv1Port);
+        for (typed, error) in [
+            ("3336", Some("must differ")),
+            ("0", Some("1 to 65535")),
+            ("3338", None),
+        ] {
+            setup.handle_key(key(KeyCode::Enter));
+            setup.text_input.clear();
+            type_text(&mut setup, typed);
+            setup.handle_key(key(KeyCode::Enter));
+            match error {
+                Some(error) => {
+                    assert!(setup.status_line.contains(error), "{}", setup.status_line);
+                    setup.handle_key(key(KeyCode::Esc));
+                }
+                None => assert_eq!(setup.sv1_port, 3338),
+            }
+        }
+        let options = setup.server_options();
+        assert_eq!(
+            (options.sv1_port, options.sv2_port, options.start_difficulty),
+            (3338, 3336, Some(65_536))
+        );
+        // Joining a pool: backup pools need their key; the pool username.
+        setup.asic_mining = AsicMining::JoinPool;
+        setup.open_settings(SettingsRow::Backups);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "b1.example:3336");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("stratum2+tcp://HOST:PORT/KEY"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Esc));
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(
+            &mut setup,
+            "stratum2+tcp://b1.example:3336/KEY1 stratum2+tcp://b2.example:3336/KEY2",
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.backups.len(), 2);
+        assert!(setup_text(&setup).contains("2, used in order when the pool fails"));
+        setup.open_settings(SettingsRow::PoolUser);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "rig-owner");
+        setup.handle_key(key(KeyCode::Enter));
+        // A profile keeps them, and puts them back.
+        setup.join_address = "pool.example:3336".into();
+        setup.join_key = "KEY".into();
+        let saved = setup.saved_server().unwrap();
+        assert_eq!(saved.backups.len(), 2);
+        assert_eq!(saved.pool_user.as_deref(), Some("rig-owner"));
+        assert_eq!(saved.sv1_port, Some(3338));
+        let settings = SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(saved.clone()),
+            ..SavedConfig::default()
+        };
+        settings.validate().unwrap();
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!(reopened.server_options(), setup.server_options());
+        // An ASIC pool's wrong fee address: Start opens the section at it.
+        let mut pool = setup_for(MiningMode::Pool);
+        pool.config.payout_address = chipnet_payout(3);
+        pool.pool_fee_address = "not-an-address".into();
+        pool.open_settings(SettingsRow::Start);
+        assert!(!pool.advanced_open);
+        pool.handle_key(key(KeyCode::Enter));
+        assert!(pool.advanced_open);
+        assert_eq!(pool.current_row(), SettingsRow::FeeAddress);
+    }
+
     // #### PR #40
     #[test]
     fn an_asic_pool_can_name_its_blocks() {
         let mut setup = setup_for(MiningMode::Pool);
-        assert!(setup.settings_rows().contains(&SettingsRow::PoolName));
+        // #### PR #42: the pool's name is in the Advanced section, which
+        // opens by itself when a row inside it is chosen.
+        assert!(!setup.settings_rows().contains(&SettingsRow::PoolName));
         setup.open_settings(SettingsRow::PoolName);
+        assert!(setup.advanced_open);
+        assert!(setup.settings_rows().contains(&SettingsRow::PoolName));
         setup.handle_key(key(KeyCode::Enter));
         type_text(&mut setup, &"x".repeat(21));
         setup.handle_key(key(KeyCode::Enter));
