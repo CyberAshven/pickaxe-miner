@@ -16,12 +16,16 @@
 //! addresses, serial numbers and host names are never collected.
 
 use super::{
-    device_api::{self, DeviceAction, DeviceReport, OwnApi, PowerMode},
+    device_api::{self, DeviceAction, DeviceReport, OwnApi, PoolEntry, PoolPlan, PowerMode},
     logins::Logins,
 };
 use asic_rs::{
     core::{
-        config::{fan::FanConfig, tuning::TuningConfig},
+        config::{
+            fan::FanConfig,
+            pools::{PoolConfig, PoolGroupConfig},
+            tuning::TuningConfig,
+        },
         data::{
             board::BoardData,
             collector::DataField,
@@ -29,7 +33,7 @@ use asic_rs::{
             hashrate::HashRateUnit,
             miner::{MinerData, MiningMode, TuningTarget},
         },
-        traits::miner::{Miner, MinerAuth},
+        traits::miner::{ExposeSecret, Miner, MinerAuth},
     },
     MinerFactory,
 };
@@ -315,6 +319,139 @@ impl Fleet {
     }
     // #### end PR #42 ####
 
+    // #### PR #42: a device's pools
+    // What: reads a device's pools when its Device panel asks (never while
+    // polling), and writes a confirmed plan: through asic-rs where it sets
+    // pools for the firmware, otherwise Pickaxe's own Avalon (`setpool`, with
+    // its web login) and AxeOS commands.
+    // Why: the owner can point a device at another pool, or back at this
+    // server, from the panel.
+    // Look here if: a device's pools read or change wrongly.
+    /// The device's pools, read now; it blocks, so call it from a background
+    /// thread.
+    pub fn pools(&self, ip: IpAddr) -> Result<DevicePools, String> {
+        if !device_api::queryable(ip) {
+            return Err("only devices on the local network can be controlled".into());
+        }
+        let miner = self.shared.miner(ip);
+        let firmware = miner
+            .as_deref()
+            .map(|miner| miner.get_device_info().firmware)
+            .unwrap_or_default();
+        match miner.as_deref().and_then(own_api) {
+            Some(OwnApi::Avalon) => Ok(DevicePools {
+                entries: device_api::avalon_pools(ip)?,
+                slots: 3,
+                notes: vec![
+                    "Avalons do not report pool passwords; the kept pools get password x.",
+                    "The device restarts to use them.",
+                ],
+            }),
+            Some(OwnApi::AxeOs) => Ok(DevicePools {
+                entries: device_api::axeos_pools(ip)?,
+                slots: 2,
+                notes: vec![
+                    "A Bitaxe holds a pool and a fallback pool.",
+                    "Bitaxes do not report pool passwords; the kept pool gets password x.",
+                    "The device restarts to use them.",
+                ],
+            }),
+            None => {
+                let (Some(miner), Some(runtime)) = (miner, &self.runtime) else {
+                    return Err("this device does not offer its pools".into());
+                };
+                if !miner.supports_pools_config() {
+                    return Err("this device does not offer its pools".into());
+                }
+                let keeps = KEEPS_POOL_PASSWORDS.contains(&firmware.as_str());
+                let (status, config) = runtime
+                    .block_on(async {
+                        tokio::time::timeout(ANSWER, async {
+                            let status = miner.get_pools().await;
+                            let config = if keeps {
+                                miner.get_pools_config().await.ok()
+                            } else {
+                                None
+                            };
+                            (status, config)
+                        })
+                        .await
+                    })
+                    .map_err(|_| "the device did not answer in time".to_owned())?;
+                let entries = asic_rs_pools(&status, config.as_deref());
+                let mut notes = Vec::new();
+                if !keeps {
+                    notes.push("This firmware does not report pool passwords; the kept pools get password x.");
+                }
+                notes.extend(pool_notes(&firmware));
+                Ok(DevicePools {
+                    entries,
+                    slots: 3,
+                    notes,
+                })
+            }
+        }
+    }
+
+    /// Writes a confirmed pool plan and describes the device's answer.
+    pub fn set_pools(&self, ip: IpAddr, plan: &PoolPlan) -> Result<String, String> {
+        if !device_api::queryable(ip) {
+            return Err("only devices on the local network can be controlled".into());
+        }
+        for pool in &plan.pools {
+            device_api::check_pool_url(&pool.url)?;
+        }
+        let miner = self.shared.miner(ip);
+        match miner.as_deref().and_then(own_api) {
+            Some(OwnApi::Avalon) => {
+                let login = self
+                    .shared
+                    .logins
+                    .lock()
+                    .ok()
+                    .and_then(|logins| logins.get(&ip).map(|login| login.auth.clone()));
+                let Some(MinerAuth::UserAndPass(login)) = login else {
+                    return Err(device_api::WEB_LOGIN_NEEDED.into());
+                };
+                device_api::avalon_set_pools(
+                    ip,
+                    (&login.username, login.password.expose_secret()),
+                    &plan.pools,
+                )
+            }
+            Some(OwnApi::AxeOs) => device_api::axeos_set_pools(ip, &plan.pools),
+            None => {
+                let (Some(miner), Some(runtime)) = (miner, &self.runtime) else {
+                    return Err("this device does not offer its pools".into());
+                };
+                let group = PoolGroupConfig {
+                    name: "default".into(),
+                    quota: 1,
+                    pools: plan
+                        .pools
+                        .iter()
+                        .map(|pool| PoolConfig {
+                            url: pool.url.clone().into(),
+                            username: pool.user.clone(),
+                            password: pool.password.clone(),
+                        })
+                        .collect(),
+                };
+                let accepted = runtime
+                    .block_on(async {
+                        tokio::time::timeout(ANSWER, miner.set_pools_config(vec![group])).await
+                    })
+                    .map_err(|_| "the device did not answer in time".to_owned())?;
+                match accepted {
+                    Ok(true) => Ok("the device accepted the pools".into()),
+                    Ok(false) => Err("the device did not accept the pools".into()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        }
+    }
+    // #### end PR #42 ####
+
     /// Runs one confirmed action and describes the device's answer: through
     /// asic-rs where it supports the action, otherwise Pickaxe's own code.
     pub fn control(&self, ip: IpAddr, action: DeviceAction) -> Result<String, String> {
@@ -479,7 +616,32 @@ pub struct DeviceControls {
     pub fan: Option<FanRange>,
     /// #### PR #42: how power is set, beyond Avalon work-level steps.
     pub power: Option<PowerSetting>,
+    /// #### PR #42: how many pools the device holds, when its pools can be
+    /// read and changed; none otherwise.
+    pub pools: Option<usize>,
 }
+
+/// #### PR #42: a device's pools, read on the Device panel's request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DevicePools {
+    /// In the device's order; the first is its main pool.
+    pub entries: Vec<PoolEntry>,
+    /// How many pools the device holds.
+    pub slots: usize,
+    /// What a change does beyond the list, for the confirmation.
+    pub notes: Vec<&'static str>,
+}
+
+/// Firmwares whose pool settings asic-rs reads with their passwords; the
+/// others come back with password "x".
+const KEEPS_POOL_PASSWORDS: [&str; 6] = [
+    "AntMiner Stock",
+    "LuxOS",
+    "Marathon",
+    "Elphapex Stock",
+    "VolcMiner Stock",
+    "SealMiner Stock",
+];
 
 /// #### PR #42: the fan percentages a device accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,6 +747,52 @@ fn factory_with(firmware: Option<&str>, auth: &MinerAuth) -> MinerFactory {
         )
 }
 
+/// #### PR #42: asic-rs's pools as the panel shows them: the first group, in
+/// order, with the passwords its pool settings hold where the firmware
+/// reports them, else "x".
+fn asic_rs_pools(
+    status: &[asic_rs::core::data::pool::PoolGroupData],
+    config: Option<&[PoolGroupConfig]>,
+) -> Vec<PoolEntry> {
+    let Some(group) = status.first() else {
+        return Vec::new();
+    };
+    let saved = config.and_then(|config| config.first());
+    group
+        .pools
+        .iter()
+        .filter_map(|pool| {
+            let url = pool.url.as_ref()?.to_string();
+            let user = pool.user.clone().unwrap_or_default();
+            let password = saved
+                .and_then(|saved| {
+                    saved.pools.iter().find(|kept| {
+                        device_api::host_port(&kept.url.to_string()) == device_api::host_port(&url)
+                            && kept.username == user
+                    })
+                })
+                .map_or_else(|| "x".to_owned(), |kept| kept.password.clone());
+            Some(PoolEntry {
+                url,
+                user,
+                password,
+                active: pool.active.unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// #### PR #42: what a pool change does on this firmware beyond the list.
+fn pool_notes(firmware: &str) -> Vec<&'static str> {
+    match firmware {
+        "LuxOS" => vec!["LuxOS removes all its pool groups, then adds this one."],
+        "VNish" => vec!["VNish keeps only host and port: no SV2 key, no SSL."],
+        "WhatsMiner Stock" => vec!["WhatsMiner changes its first pool group only."],
+        "Braiins" | "SealMiner Stock" => vec!["The device may restart to use them."],
+        _ => Vec::new(),
+    }
+}
+
 /// #### PR #42: what a firmware's login asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginShape {
@@ -609,6 +817,8 @@ pub fn login_shape(firmware: Option<&str>) -> LoginShape {
         Some("FutureBit Stock") => LoginShape::UserAndPassword("futurebit"),
         Some("Proto Stock") => LoginShape::UserAndPassword(""),
         Some("VNish" | "UMC OS" | "WhatsMiner Stock") => LoginShape::Password,
+        // Only an Avalon's pools need its web login.
+        Some("AvalonMiner Stock") => LoginShape::UserAndPassword("admin"),
         Some(_) => LoginShape::None,
     }
 }
@@ -669,6 +879,13 @@ fn controls_of(miner: Option<&dyn Miner>, help: Option<&[String]>) -> DeviceCont
     }
     let info = miner.get_device_info();
     let (fan, power) = settings_offered(&Capabilities::of(miner), help);
+    // #### PR #42: pools, through asic-rs or Pickaxe's own Avalon and AxeOS
+    // commands.
+    let pools = match own_api(miner) {
+        Some(OwnApi::Avalon) => Some(3),
+        Some(OwnApi::AxeOs) => Some(2),
+        None => miner.supports_pools_config().then_some(3),
+    };
     DeviceControls {
         // The same text `from_asic_rs` gives a report's model.
         model: Some(format!("{} {}", info.make, info.model)),
@@ -676,6 +893,7 @@ fn controls_of(miner: Option<&dyn Miner>, help: Option<&[String]>) -> DeviceCont
         actions,
         fan,
         power,
+        pools,
     }
 }
 
@@ -969,6 +1187,7 @@ mod tests {
                 actions: DeviceAction::OWN.to_vec(),
                 fan: None,
                 power: None,
+                pools: None,
             }
         );
         assert!(fleet
@@ -1071,7 +1290,10 @@ mod tests {
         );
         assert_eq!(login_shape(Some("WhatsMiner Stock")), LoginShape::Password);
         assert_eq!(login_shape(Some("LuxOS")), LoginShape::None);
-        assert_eq!(login_shape(Some("AvalonMiner Stock")), LoginShape::None);
+        assert_eq!(
+            login_shape(Some("AvalonMiner Stock")),
+            LoginShape::UserAndPassword("admin")
+        );
         let names: Vec<String> = asic_rs::factory::default_firmware_registry()
             .iter()
             .map(|entry| entry.to_string())

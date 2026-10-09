@@ -254,6 +254,22 @@ When the list cannot be read, the setting is offered and the device decides. A
 Bitaxe accepts changes only from its own local network: through Tailscale or a
 VPN it answers that it refuses, and the panel says so.
 
+**Pools.** "Pools…" reads the device's pools when you ask, marks the one that
+is this server and which one it mines on now, and shows each pool's worker
+name, never a payout address. `n` puts a new pool first: type its address with
+its port (as in `stratum+tcp://pool.example:3333`), the worker and, if the pool
+wants one, a password. `h` puts this server first again, with the worker the
+device already used here. The device's other pools stay as backups, as many as
+it holds (three on most, two on a Bitaxe). Before anything is sent, the panel
+shows the list the device will hold, what is dropped, and what the change
+means: while pool 1 works, the device stops mining on this server, so its
+shares, any block it finds, merge-mined token wins and the donation from its
+work go to that pool. Pools are written through asic-rs on most makes, with
+Canaan's `setpool` on Avalons (it needs the Avalon's web login, entered with
+`l`, and the device reboots), and through AxeOS on a Bitaxe (it restarts).
+Firmwares that do not report pool passwords keep the backups with password
+`x`; the confirmation says so.
+
 **Device logins.** Most firmwares answer Pickaxe with their default login.
 When a device refuses an action because its owner changed the login, the panel
 says so: press `l`, type the device's login (the username comes filled in with

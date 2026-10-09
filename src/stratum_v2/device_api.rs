@@ -270,6 +270,9 @@ pub(super) fn control_at(
 
 const NOT_OFFERED: &str = "this device does not offer that action";
 
+/// The answer when an Avalon's pools need its web login and none is known.
+pub const WEB_LOGIN_NEEDED: &str = "its web login is needed to change its pools";
+
 /// #### PR #42
 /// What: whether a device's or asic-rs's error says the login was refused,
 /// so the Device panel asks for the device's own login.
@@ -292,6 +295,7 @@ pub fn login_refused(text: &str) -> bool {
         "aes decryption failed",
         "wrong password",
         "invalid password",
+        WEB_LOGIN_NEEDED,
     ]
     .iter()
     .any(|sign| text.contains(sign))
@@ -448,6 +452,300 @@ fn axeos_request(
         Some(401) => Err(AXEOS_LOCAL_ONLY.into()),
         _ => Err(format!("the device answered {status}")),
     }
+}
+// #### end PR #42 ####
+
+// #### PR #42: pools, through Pickaxe's own commands
+// What: an Avalon's pools are read with CGMiner's `pools` and written with
+// Canaan's `setpool` (its web login, slots 0 to 2, then a reboot); a Bitaxe's
+// are read from and written to AxeOS (`stratumURL`, `fallbackStratumURL` and
+// their ports and users, then a restart). A pool's address must carry its
+// port, and an Avalon's fields may hold no comma, since `setpool` splits on
+// commas.
+// Why: asic-rs writes pools on most makes, but not on these.
+// Look here if: an Avalon or Bitaxe gets the wrong pools, or a reply shows a
+// worker's password.
+/// One pool as a device holds it. Its password is never shown.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PoolEntry {
+    /// `stratum+tcp://host:port`, or with SV2 `stratum2+tcp://host:port/KEY`.
+    pub url: String,
+    pub user: String,
+    /// The password written back; "x" where the firmware does not return it.
+    pub password: String,
+    /// Whether the device mines on it now.
+    pub active: bool,
+}
+
+impl std::fmt::Debug for PoolEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PoolEntry({}, password hidden)", self.url)
+    }
+}
+
+impl PoolEntry {
+    /// The pool's `host:port`, to compare entries and to find this server.
+    pub fn host_port(&self) -> String {
+        host_port(&self.url)
+    }
+}
+
+/// The `host:port` of a pool address, without scheme or key.
+pub fn host_port(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split('/').next().unwrap_or(rest).to_ascii_lowercase()
+}
+
+/// A device's pools after a change: the new pool first, then the pools it
+/// held (each once), as many as the device holds; the rest are listed as
+/// dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolPlan {
+    pub pools: Vec<PoolEntry>,
+    pub dropped: Vec<PoolEntry>,
+}
+
+impl PoolPlan {
+    pub fn new(current: &[PoolEntry], new: PoolEntry, slots: usize) -> Self {
+        let mut pools = vec![new];
+        for pool in current {
+            if !pools
+                .iter()
+                .any(|kept| kept.host_port() == pool.host_port() && kept.user == pool.user)
+            {
+                pools.push(PoolEntry {
+                    active: false,
+                    ..pool.clone()
+                });
+            }
+        }
+        let dropped = pools.split_off(slots.clamp(1, pools.len()));
+        Self { pools, dropped }
+    }
+}
+
+/// Checks a pool address Pickaxe would write: an optional scheme
+/// (`stratum+tcp`, `stratum+ssl`, `stratum2+tcp`), a host and an explicit
+/// port (asic-rs would read a missing port as port 80), with no spaces.
+pub fn check_pool_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() || url.len() > 255 || url.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("a pool address has no spaces and at most 255 characters".into());
+    }
+    if let Some((scheme, _)) = url.split_once("://") {
+        if !["stratum+tcp", "stratum+ssl", "stratum2+tcp"].contains(&scheme) {
+            return Err(format!(
+                "a pool address starts with stratum+tcp://, not {scheme}://"
+            ));
+        }
+    }
+    let host_port = host_port(url);
+    match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0) => {
+            Ok(())
+        }
+        _ => Err("a pool address needs its port, as in stratum+tcp://pool.example:3333".into()),
+    }
+}
+
+/// An Avalon's pools, from CGMiner's `pools`. Passwords are not reported,
+/// so each comes back as "x".
+pub fn avalon_pools(ip: IpAddr) -> Result<Vec<PoolEntry>, String> {
+    if !queryable(ip) {
+        return Err("only devices on the local network can be controlled".into());
+    }
+    avalon_pools_at(SocketAddr::new(ip.to_canonical(), 4028))
+}
+
+pub(super) fn avalon_pools_at(cgminer: SocketAddr) -> Result<Vec<PoolEntry>, String> {
+    let reply = exchange(
+        cgminer,
+        br#"{"command":"pools"}"#,
+        Instant::now() + DEADLINE,
+        |reply| reply.contains(&0),
+    )
+    .ok_or(NO_ANSWER)?;
+    parse_pools(&reply).ok_or_else(|| "unexpected reply from the device".into())
+}
+
+/// The `POOLS` list of a CGMiner `pools` reply, in priority order.
+pub fn parse_pools(reply: &str) -> Option<Vec<PoolEntry>> {
+    let value: Value = serde_json::from_str(reply.trim_end_matches('\0').trim()).ok()?;
+    let mut pools: Vec<(i64, PoolEntry)> = value
+        .get("POOLS")?
+        .as_array()?
+        .iter()
+        .filter_map(|pool| {
+            let url = pool.get("URL")?.as_str()?.trim();
+            (!url.is_empty()).then(|| {
+                (
+                    pool.get("Priority").and_then(Value::as_i64).unwrap_or(0),
+                    PoolEntry {
+                        url: url.to_owned(),
+                        user: pool
+                            .get("User")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        password: "x".into(),
+                        active: pool
+                            .get("Stratum Active")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    },
+                )
+            })
+        })
+        .collect();
+    pools.sort_by_key(|(priority, _)| *priority);
+    Some(pools.into_iter().map(|(_, pool)| pool).collect())
+}
+
+/// Writes an Avalon's pools with Canaan's `setpool`, slot by slot, then
+/// reboots it so they take effect. `login` is its web login. Nothing is sent
+/// when a field holds a comma, a control character or over 255 bytes. The
+/// device's success message repeats the worker and its password, so it is
+/// never passed on.
+pub fn avalon_set_pools(
+    ip: IpAddr,
+    login: (&str, &str),
+    pools: &[PoolEntry],
+) -> Result<String, String> {
+    if !queryable(ip) {
+        return Err("only devices on the local network can be controlled".into());
+    }
+    avalon_set_pools_at(SocketAddr::new(ip.to_canonical(), 4028), login, pools)
+}
+
+pub(super) fn avalon_set_pools_at(
+    cgminer: SocketAddr,
+    (web_user, web_password): (&str, &str),
+    pools: &[PoolEntry],
+) -> Result<String, String> {
+    for field in [web_user, web_password]
+        .into_iter()
+        .chain(pools.iter().flat_map(|pool| {
+            [
+                pool.url.as_str(),
+                pool.user.as_str(),
+                pool.password.as_str(),
+            ]
+        }))
+    {
+        if field.contains(',') || field.chars().any(char::is_control) || field.len() > 255 {
+            return Err("an Avalon's pool fields cannot hold a comma; nothing was sent".into());
+        }
+    }
+    for (slot, pool) in pools.iter().take(3).enumerate() {
+        let parameter = format!(
+            "{web_user},{web_password},{slot},{},{},{}",
+            pool.url, pool.user, pool.password
+        );
+        let request = serde_json::json!({"command": "setpool", "parameter": parameter}).to_string();
+        let reply = exchange(
+            cgminer,
+            request.as_bytes(),
+            Instant::now() + DEADLINE,
+            |reply| reply.contains(&0),
+        )
+        .ok_or(NO_ANSWER)?;
+        // The device's own message is passed on only when it refuses, and
+        // then without anything that was sent.
+        parse_ascset(&reply).map_err(|refusal| {
+            [web_password, pool.password.as_str(), pool.user.as_str()]
+                .iter()
+                .filter(|text| text.len() > 1)
+                .fold(refusal, |refusal, text| refusal.replace(text, "…"))
+        })?;
+    }
+    ascset(cgminer, "0,reboot,0")?;
+    Ok(format!(
+        "{} pool(s) set; the device restarts to use them",
+        pools.len().min(3)
+    ))
+}
+
+/// A Bitaxe's pool and fallback pool, from AxeOS. Passwords are not
+/// reported, so each comes back as "x".
+pub fn axeos_pools(ip: IpAddr) -> Result<Vec<PoolEntry>, String> {
+    if !queryable(ip) {
+        return Err("only devices on the local network can be controlled".into());
+    }
+    axeos_pools_at(SocketAddr::new(ip.to_canonical(), 80))
+}
+
+pub(super) fn axeos_pools_at(web: SocketAddr) -> Result<Vec<PoolEntry>, String> {
+    let info = axeos_request(web, "GET", "/api/system/info", None)?;
+    let info: Value =
+        serde_json::from_str(&info).map_err(|_| "unexpected reply from the device")?;
+    let text = |key: &str| info.get(key).and_then(Value::as_str).unwrap_or_default();
+    let using_fallback = info
+        .get("isUsingFallbackStratum")
+        .and_then(Value::as_u64)
+        .is_some_and(|flag| flag == 1);
+    Ok([
+        ("stratumURL", "stratumPort", "stratumUser", !using_fallback),
+        (
+            "fallbackStratumURL",
+            "fallbackStratumPort",
+            "fallbackStratumUser",
+            using_fallback,
+        ),
+    ]
+    .into_iter()
+    .filter(|(url, ..)| !text(url).trim().is_empty())
+    .map(|(url, port, user, active)| PoolEntry {
+        url: format!(
+            "stratum+tcp://{}:{}",
+            text(url).trim(),
+            info.get(port).and_then(Value::as_u64).unwrap_or(0)
+        ),
+        user: text(user).to_owned(),
+        password: "x".into(),
+        active,
+    })
+    .collect())
+}
+
+/// Writes a Bitaxe's pool and fallback pool through AxeOS, then restarts it
+/// so they take effect.
+pub fn axeos_set_pools(ip: IpAddr, pools: &[PoolEntry]) -> Result<String, String> {
+    if !queryable(ip) {
+        return Err("only devices on the local network can be controlled".into());
+    }
+    axeos_set_pools_at(SocketAddr::new(ip.to_canonical(), 80), pools)
+}
+
+pub(super) fn axeos_set_pools_at(web: SocketAddr, pools: &[PoolEntry]) -> Result<String, String> {
+    let split = |pool: &PoolEntry| -> Result<(String, u16), String> {
+        let host_port = pool.host_port();
+        let (host, port) = host_port
+            .rsplit_once(':')
+            .ok_or("a pool address needs its port")?;
+        Ok((
+            host.to_owned(),
+            port.parse().map_err(|_| "a pool address needs its port")?,
+        ))
+    };
+    let primary = pools.first().ok_or("no pool to set")?;
+    let (host, port) = split(primary)?;
+    let mut body = serde_json::json!({
+        "stratumURL": host,
+        "stratumPort": port,
+        "stratumUser": primary.user,
+        "stratumPassword": primary.password,
+    });
+    if let Some(fallback) = pools.get(1) {
+        let (host, port) = split(fallback)?;
+        body["fallbackStratumURL"] = host.into();
+        body["fallbackStratumPort"] = port.into();
+        body["fallbackStratumUser"] = fallback.user.clone().into();
+        body["fallbackStratumPassword"] = fallback.password.clone().into();
+    }
+    axeos_request(web, "PATCH", "/api/system", Some(&body.to_string()))?;
+    axeos_request(web, "POST", "/api/system/restart", None)?;
+    Ok("pools set; the device restarts to use them".into())
 }
 // #### end PR #42 ####
 
@@ -756,6 +1054,160 @@ pub(super) mod tests {
     /// A device stand-in that answers one connection per reply, in order,
     /// and hands each request it received to the test. (PR #42: shared with
     /// the `fleet` tests.)
+    fn pool(url: &str, user: &str) -> PoolEntry {
+        PoolEntry {
+            url: url.into(),
+            user: user.into(),
+            password: "x".into(),
+            active: false,
+        }
+    }
+
+    // #### PR #42
+    // What: a pool plan puts the new pool first, keeps each old one once as
+    // a backup, and lists what does not fit; pool addresses need a port and
+    // a stratum scheme.
+    // Look here if: PoolPlan::new or check_pool_url changes.
+    #[test]
+    fn pool_plans_put_the_new_pool_first_and_need_a_port() {
+        let current = [
+            pool("stratum+tcp://192.168.0.55:3333", "rig1"),
+            pool("stratum+tcp://backup.example:3333", "rig1"),
+            pool("stratum+tcp://other.example:3333", "rig1"),
+        ];
+        let plan = PoolPlan::new(&current, pool("stratum+tcp://pool.example:3333", "rig1"), 3);
+        let urls: Vec<_> = plan.pools.iter().map(|pool| pool.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "stratum+tcp://pool.example:3333",
+                "stratum+tcp://192.168.0.55:3333",
+                "stratum+tcp://backup.example:3333"
+            ]
+        );
+        assert_eq!(plan.dropped[0].url, "stratum+tcp://other.example:3333");
+        // The same pool twice is kept once; a Bitaxe holds two.
+        let again = PoolPlan::new(
+            &current,
+            pool("stratum+tcp://BACKUP.example:3333", "rig1"),
+            2,
+        );
+        assert_eq!(again.pools.len(), 2);
+        assert_eq!(again.pools[1].url, "stratum+tcp://192.168.0.55:3333");
+        for good in [
+            "stratum+tcp://pool.example:3333",
+            "pool.example:3333",
+            "stratum2+tcp://pool.example:3336/9bXiEd8boQVhq7WddEcERUL5tyyJVFYdU8th3HfbNXK3Yw6GRXh",
+        ] {
+            assert!(check_pool_url(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "stratum+tcp://pool.example",
+            "pool.example",
+            "http://pool.example:3333",
+            "stratum+tcp://pool example:3333",
+            "stratum+tcp://pool.example:0",
+        ] {
+            assert!(check_pool_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    // #### PR #42
+    // What: an Avalon's pools are read in priority order; `setpool` is sent
+    // slot by slot with the web login and the device is rebooted; the
+    // success message, which repeats the worker and its password, is never
+    // passed on; a refusal is, without anything that was sent; a comma in any
+    // field stops everything before a request.
+    // Look here if: parse_pools or avalon_set_pools_at changes.
+    #[test]
+    fn avalon_pools_are_read_and_set_without_showing_the_password() {
+        let read = parse_pools(
+            r#"{"STATUS":[{"STATUS":"S"}],"POOLS":[
+                {"POOL":1,"URL":"stratum+tcp://backup.example:3333","User":"rig1","Priority":1,"Stratum Active":false},
+                {"POOL":0,"URL":"stratum+tcp://192.168.0.55:3333","User":"rig1","Priority":0,"Stratum Active":true},
+                {"POOL":2,"URL":"","User":"","Priority":2}]}"#,
+        )
+        .unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].url, "stratum+tcp://192.168.0.55:3333");
+        assert!(read[0].active && !read[1].active);
+        let (avalon, requests) = recording_device(vec![
+            br#"{"STATUS":[{"STATUS":"S","Msg":"pool 0 success set to stratum+tcp://pool.example:3333\nworker is rig1\nworkerpassword is secretpw\nPlease reboot miner to make config work."}],"id":1}"#,
+            br#"{"STATUS":[{"STATUS":"S","Msg":"pool 1 success set to stratum+tcp://192.168.0.55:3333\nworker is rig1\nworkerpassword is x\nPlease reboot miner to make config work."}],"id":1}"#,
+            br#"{"STATUS":[{"STATUS":"I","Msg":"ASC 0 set info: reboot"}],"id":1}"#,
+            br#"{"STATUS":[{"STATUS":"E","Msg":"userpass err for webpw"}],"id":1}"#,
+        ]);
+        let mut first = pool("stratum+tcp://pool.example:3333", "rig1");
+        first.password = "secretpw".into();
+        let pools = [first, pool("stratum+tcp://192.168.0.55:3333", "rig1")];
+        let done = avalon_set_pools_at(avalon, ("admin", "webpw"), &pools).unwrap();
+        assert_eq!(done, "2 pool(s) set; the device restarts to use them");
+        assert!(!done.contains("secretpw") && !done.contains("webpw"));
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"setpool","parameter":"admin,webpw,0,stratum+tcp://pool.example:3333,rig1,secretpw"}"#
+        );
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"setpool","parameter":"admin,webpw,1,stratum+tcp://192.168.0.55:3333,rig1,x"}"#
+        );
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,reboot,0"}"#
+        );
+        let refused = avalon_set_pools_at(avalon, ("admin", "webpw"), &pools).unwrap_err();
+        assert!(login_refused(&refused), "{refused}");
+        assert!(!refused.contains("webpw"), "{refused}");
+        requests.recv().unwrap();
+        // A comma anywhere: nothing is sent.
+        let mut comma = pools.clone();
+        comma[1].password = "a,b".into();
+        assert!(avalon_set_pools_at(avalon, ("admin", "webpw"), &comma)
+            .unwrap_err()
+            .contains("comma; nothing was sent"));
+        assert!(avalon_set_pools_at(avalon, ("ad,min", "webpw"), &pools).is_err());
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    // #### PR #42
+    // What: a Bitaxe's pool and fallback are read from AxeOS, written as
+    // host, port, user and password (the old primary becomes the fallback in
+    // a plan), and the device is restarted.
+    // Look here if: axeos_pools_at or axeos_set_pools_at changes.
+    #[test]
+    fn axeos_pools_are_read_and_set_then_the_device_restarts() {
+        let (http, requests) = recording_device(vec![
+            b"HTTP/1.0 200 OK\r\n\r\n{\"stratumURL\":\"192.168.0.55\",\"stratumPort\":3333,\"stratumUser\":\"rig1\",\"fallbackStratumURL\":\"backup.example\",\"fallbackStratumPort\":3334,\"fallbackStratumUser\":\"rig1\",\"isUsingFallbackStratum\":0}",
+            b"HTTP/1.0 200 OK\r\n\r\n",
+            b"HTTP/1.0 200 OK\r\n\r\nSystem will restart shortly.",
+        ]);
+        let read = axeos_pools_at(http).unwrap();
+        assert_eq!(read[0].url, "stratum+tcp://192.168.0.55:3333");
+        assert_eq!(read[1].url, "stratum+tcp://backup.example:3334");
+        assert!(read[0].active && !read[1].active);
+        requests.recv().unwrap();
+        let plan = PoolPlan::new(&read, pool("stratum+tcp://pool.example:3333", "rig1"), 2);
+        assert_eq!(
+            axeos_set_pools_at(http, &plan.pools).unwrap(),
+            "pools set; the device restarts to use them"
+        );
+        let patch = requests.recv().unwrap();
+        assert!(
+            patch.starts_with("PATCH /api/system HTTP/1.0\r\n"),
+            "{patch}"
+        );
+        let body: Value = serde_json::from_str(patch.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["stratumURL"], "pool.example");
+        assert_eq!(body["stratumPort"], 3333);
+        assert_eq!(body["fallbackStratumURL"], "192.168.0.55");
+        assert_eq!(body["fallbackStratumPort"], 3333);
+        assert_eq!(body["fallbackStratumUser"], "rig1");
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("POST /api/system/restart HTTP/1.0\r\n"));
+    }
+
     // #### PR #42
     // What: the ways firmwares and asic-rs say a login was refused, and
     // errors that are not refusals.

@@ -529,7 +529,20 @@ pub fn run(
                                             Instant::now(),
                                         )
                                     });
-                                    if let Some(view) = opened {
+                                    if let Some(mut view) = opened {
+                                        // #### PR #42: where devices reach
+                                        // this server, for the pool pages.
+                                        view.set_server_urls(
+                                            connect_lines(
+                                                bound,
+                                                sv1_bound,
+                                                authority.as_deref(),
+                                                crate::reach::Interfaces::detect(),
+                                            )
+                                            .into_iter()
+                                            .map(|line| (line.place, line.sv2, line.url))
+                                            .collect(),
+                                        );
                                         view.identify(&fleet);
                                         panel = Some(view);
                                     }

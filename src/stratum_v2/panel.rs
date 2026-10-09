@@ -7,13 +7,16 @@
 //! not.
 
 use super::{
-    device_api::{login_refused, DeviceAction, PowerMode},
+    device_api::{
+        check_pool_url, host_port, login_refused, DeviceAction, PoolEntry, PoolPlan, PowerMode,
+    },
     fleet::{
-        login_shape, DeviceControls, FanRange, Fleet, LoginShape, PowerSetting,
+        login_shape, DeviceControls, DevicePools, FanRange, Fleet, LoginShape, PowerSetting,
         IDENTIFIES_WITH_LOGIN,
     },
-    telemetry::{AddressIssue, DeviceSnapshot, Devices},
+    telemetry::{worker_name, AddressIssue, DeviceSnapshot, Devices},
 };
+use crate::reach::Place;
 use asic_rs::core::traits::miner::MinerAuth;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -141,7 +144,12 @@ pub(super) struct DevicePanel {
     reply: Arc<Mutex<Option<String>>>,
     /// #### PR #42: the action a refused login held back, sent again once
     /// the owner enters the device's login (`l`).
-    retry: Arc<Mutex<Option<DeviceAction>>>,
+    retry: Arc<Mutex<Option<Retry>>>,
+    /// #### PR #42: the device's pools, once read on request.
+    pools: Arc<Mutex<Option<Result<DevicePools, String>>>>,
+    /// #### PR #42: where devices reach this server (place, SV2, address),
+    /// to mark it in a device's pools and to point a device back at it.
+    server_urls: Vec<(Place, bool, String)>,
     /// #### PR #42: a login in use but not saved yet; it is saved after the
     /// next action the device accepts.
     unsaved_login: Arc<Mutex<Option<(String, String)>>>,
@@ -158,6 +166,55 @@ enum Page {
     Power(String),
     /// #### PR #42: the device's own login.
     Login(LoginForm),
+    /// #### PR #42: the device's pools.
+    Pools,
+    /// #### PR #42: a new first pool, typed.
+    PoolForm(PoolForm),
+    /// #### PR #42: the pools a change would leave, for confirmation.
+    PoolConfirm(PoolPlan),
+}
+
+/// #### PR #42: what a refused login held back, sent again after `l`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Retry {
+    Action(DeviceAction),
+    Pools(PoolPlan),
+}
+
+/// #### PR #42: the pool typed on the pool page: address, worker and
+/// password (shown as dots).
+#[derive(Clone, PartialEq, Eq)]
+struct PoolForm {
+    url: String,
+    user: String,
+    password: String,
+    /// 0 address, 1 worker, 2 password.
+    field: usize,
+}
+
+impl std::fmt::Debug for PoolForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PoolForm({}, {}, password hidden)", self.url, self.user)
+    }
+}
+
+impl PoolForm {
+    fn blank() -> Self {
+        Self {
+            url: String::new(),
+            user: String::new(),
+            password: "x".into(),
+            field: 0,
+        }
+    }
+
+    fn active(&mut self) -> &mut String {
+        match self.field {
+            0 => &mut self.url,
+            1 => &mut self.user,
+            _ => &mut self.password,
+        }
+    }
 }
 
 /// #### PR #42: the login typed on the login page. Its `Debug` output and the
@@ -203,6 +260,7 @@ enum Item {
     Action(DeviceAction),
     Fan,
     Power,
+    Pools,
 }
 
 /// The highest power limit the power page accepts, in watts.
@@ -277,6 +335,8 @@ impl DevicePanel {
             page: Page::Menu,
             reply: Arc::new(Mutex::new(None)),
             retry: Arc::new(Mutex::new(None)),
+            pools: Arc::new(Mutex::new(None)),
+            server_urls: Vec::new(),
             unsaved_login: Arc::new(Mutex::new(None)),
         }
     }
@@ -317,6 +377,10 @@ impl DevicePanel {
                     Some(Item::Action(action)) => Page::Confirm(*action),
                     Some(Item::Fan) => Page::Fan(String::new()),
                     Some(Item::Power) => Page::Power(String::new()),
+                    Some(Item::Pools) => {
+                        self.read_pools(fleet);
+                        Page::Pools
+                    }
                     None => Page::Menu,
                 }
             }
@@ -404,6 +468,58 @@ impl DevicePanel {
                 self.log_in(form, firmware, fleet);
                 Page::Menu
             }
+            // #### PR #42: the pool pages.
+            (Page::Pools, KeyCode::Esc) => Page::Menu,
+            (Page::Pools, KeyCode::Char('r') | KeyCode::Char('R')) => {
+                self.read_pools(fleet);
+                Page::Pools
+            }
+            (Page::Pools, KeyCode::Char('n') | KeyCode::Char('N')) => {
+                Page::PoolForm(PoolForm::blank())
+            }
+            (Page::Pools, KeyCode::Char('h') | KeyCode::Char('H')) => {
+                match self.this_server_pool() {
+                    Some(form) => Page::PoolForm(form),
+                    None => {
+                        self.set_reply(
+                            "No address of this server reaches this device's network.".into(),
+                        );
+                        Page::Pools
+                    }
+                }
+            }
+            (Page::PoolForm(_), KeyCode::Esc) => Page::Pools,
+            (Page::PoolForm(mut form), KeyCode::Tab) => {
+                form.field = (form.field + 1) % 3;
+                Page::PoolForm(form)
+            }
+            (Page::PoolForm(mut form), KeyCode::BackTab) => {
+                form.field = (form.field + 2) % 3;
+                Page::PoolForm(form)
+            }
+            (Page::PoolForm(mut form), KeyCode::Backspace) => {
+                form.active().pop();
+                Page::PoolForm(form)
+            }
+            (Page::PoolForm(form), KeyCode::Enter) => match self.pool_plan(&form) {
+                Ok(plan) => Page::PoolConfirm(plan),
+                Err(why) => {
+                    self.set_reply(why);
+                    Page::PoolForm(form)
+                }
+            },
+            (Page::PoolForm(mut form), KeyCode::Char(c)) if !c.is_control() => {
+                let field = form.active();
+                if field.chars().count() < 255 {
+                    field.push(c);
+                }
+                Page::PoolForm(form)
+            }
+            (Page::PoolConfirm(plan), KeyCode::Char('y') | KeyCode::Char('Y')) => {
+                self.send_pools(plan, fleet);
+                Page::Menu
+            }
+            (Page::PoolConfirm(_), _) => Page::Pools,
             (Page::Login(mut form), KeyCode::Char(c)) if !c.is_control() => {
                 let field = if form.on_password {
                     &mut form.password
@@ -475,19 +591,25 @@ impl DevicePanel {
                     "Login: the device did not accept it, or did not answer. Nothing was saved."
                         .to_owned()
                 }
-                (Some(firmware), Some(action)) => match fleet.control(ip, action) {
-                    Ok(message) => outcome(action, Ok(message)) + &save(&firmware),
-                    Err(error) if login_refused(&error) => {
-                        fleet.set_login(ip, None);
-                        "Login: the device refused it. Nothing was saved.".to_owned()
-                    }
-                    Err(error) => {
-                        if let Ok(mut unsaved) = unsaved.lock() {
-                            *unsaved = Some((username.clone(), password.clone()));
+                (Some(firmware), Some(retry)) => {
+                    let (name, result) = match retry {
+                        Retry::Action(action) => (action.label(), fleet.control(ip, action)),
+                        Retry::Pools(plan) => ("Pools".to_owned(), fleet.set_pools(ip, &plan)),
+                    };
+                    match result {
+                        Ok(message) => outcome_named(&name, Ok(message)) + &save(&firmware),
+                        Err(error) if login_refused(&error) => {
+                            fleet.set_login(ip, None);
+                            "Login: the device refused it. Nothing was saved.".to_owned()
                         }
-                        outcome(action, Err(error))
+                        Err(error) => {
+                            if let Ok(mut unsaved) = unsaved.lock() {
+                                *unsaved = Some((username.clone(), password.clone()));
+                            }
+                            outcome_named(&name, Err(error))
+                        }
                     }
-                },
+                }
                 (Some(firmware), None) if IDENTIFIES_WITH_LOGIN.contains(&firmware.as_str()) => {
                     format!("Login: the device identified as {firmware}.") + &save(&firmware)
                 }
@@ -504,6 +626,261 @@ impl DevicePanel {
             }
         });
     }
+
+    // #### PR #42: pools
+    // What: the pool pages read the device's pools on request, put a typed
+    // pool (or this server, `h`) first and keep the others as backups, and
+    // write the result only after a confirmation that says what changes.
+    // Why: the owner can move a device to another pool and back from the
+    // panel.
+    // Look here if: the pool pages show or write the wrong pools.
+    /// Where devices reach this server, to mark it in a device's pools and
+    /// point a device back at it.
+    pub(super) fn set_server_urls(&mut self, urls: Vec<(Place, bool, String)>) {
+        self.server_urls = urls;
+    }
+
+    /// Reads the device's pools on a background thread.
+    fn read_pools(&self, fleet: &Arc<Fleet>) {
+        let Ok(ip) = self.target else {
+            return;
+        };
+        if let Ok(mut pools) = self.pools.lock() {
+            *pools = None;
+        }
+        let pools = Arc::clone(&self.pools);
+        let fleet = Arc::clone(fleet);
+        thread::spawn(move || {
+            let read = fleet.pools(ip);
+            if let Ok(mut pools) = pools.lock() {
+                *pools = Some(read);
+            }
+        });
+    }
+
+    /// The pools read, if they were.
+    fn current_pools(&self) -> Option<DevicePools> {
+        self.pools
+            .lock()
+            .ok()
+            .and_then(|pools| pools.clone())
+            .and_then(Result::ok)
+    }
+
+    /// Whether a pool is this server, by host and port.
+    fn is_this_server(&self, pool: &PoolEntry) -> bool {
+        let here = pool.host_port();
+        self.server_urls
+            .iter()
+            .any(|(_, _, url)| host_port(url) == here)
+    }
+
+    /// This server's SV1 address on the device's network, with the worker
+    /// the device already uses here (else its worker name), to put first.
+    fn this_server_pool(&self) -> Option<PoolForm> {
+        let place = if self.network.starts_with("Tailscale") {
+            Place::Tailscale
+        } else {
+            Place::LocalNetwork
+        };
+        let url = self
+            .server_urls
+            .iter()
+            .find(|(at, sv2, _)| !sv2 && *at == place)
+            .or_else(|| {
+                self.server_urls
+                    .iter()
+                    .find(|(at, sv2, _)| !sv2 && *at != Place::ThisComputer)
+            })?
+            .2
+            .clone();
+        let user = self
+            .current_pools()
+            .and_then(|pools| {
+                pools
+                    .entries
+                    .iter()
+                    .find(|pool| pool.host_port() == host_port(&url))
+                    .map(|pool| pool.user.clone())
+            })
+            .unwrap_or_else(|| {
+                self.label
+                    .rsplit_once(" #")
+                    .map_or("pickaxe", |(name, _)| name)
+                    .to_owned()
+            });
+        Some(PoolForm {
+            url,
+            user,
+            password: "x".into(),
+            field: 0,
+        })
+    }
+
+    /// The plan a typed pool makes, once the device's pools are read.
+    fn pool_plan(&self, form: &PoolForm) -> Result<PoolPlan, String> {
+        check_pool_url(&form.url).map_err(|why| capitalized(&why))?;
+        if form.user.trim().is_empty() {
+            return Err("Type the worker name, the pool's username.".into());
+        }
+        let current = self
+            .current_pools()
+            .ok_or_else(|| "The device's pools are not read yet.".to_owned())?;
+        let password = if form.password.is_empty() {
+            "x".to_owned()
+        } else {
+            form.password.clone()
+        };
+        Ok(PoolPlan::new(
+            &current.entries,
+            PoolEntry {
+                url: form.url.trim().to_owned(),
+                user: form.user.trim().to_owned(),
+                password,
+                active: false,
+            },
+            current.slots,
+        ))
+    }
+
+    /// Writes confirmed pools on a background thread; a refused login holds
+    /// them back for `l`.
+    fn send_pools(&self, plan: PoolPlan, fleet: &Arc<Fleet>) {
+        let Ok(ip) = self.target else {
+            return;
+        };
+        self.set_reply("Sending: the new pools…".into());
+        let reply = Arc::clone(&self.reply);
+        let retry = Arc::clone(&self.retry);
+        let unsaved = Arc::clone(&self.unsaved_login);
+        let firmware = self
+            .controls
+            .lock()
+            .ok()
+            .and_then(|controls| controls.as_ref().and_then(|found| found.firmware.clone()));
+        let fleet = Arc::clone(fleet);
+        thread::spawn(move || {
+            let result = fleet.set_pools(ip, &plan);
+            let mut text = outcome_named("Pools", result.clone());
+            match &result {
+                Ok(_) => text.push_str(save_unsaved(&fleet, ip, firmware, &unsaved)),
+                Err(error) if login_refused(error) => {
+                    if let Ok(mut retry) = retry.lock() {
+                        *retry = Some(Retry::Pools(plan));
+                    }
+                    text.push_str(
+                        " Press Esc, then l to enter this device's login; the pools are sent again after it.",
+                    );
+                }
+                Err(_) => (),
+            }
+            if let Ok(mut reply) = reply.lock() {
+                *reply = Some(text);
+            }
+        });
+    }
+
+    /// The pool page's text.
+    fn pools_text(&self) -> String {
+        let mut text = format!("Pools of {}\n\n", self.label);
+        match self.pools.lock().ok().and_then(|pools| pools.clone()) {
+            None => text.push_str("Reading the pools…\n"),
+            Some(Err(error)) => {
+                text.push_str(&format!("Could not read the pools: {}\n", plain(&error)))
+            }
+            Some(Ok(pools)) if pools.entries.is_empty() => {
+                text.push_str("The device holds no pools.\n")
+            }
+            Some(Ok(pools)) => {
+                for (index, pool) in pools.entries.iter().enumerate() {
+                    text.push_str(&format!(
+                        "{}  {}  {}{}{}\n",
+                        index + 1,
+                        pool.url,
+                        who(&pool.user),
+                        if pool.active { " · mining now" } else { "" },
+                        if self.is_this_server(pool) {
+                            " · this server"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
+        }
+        text.push_str(
+            "\nn  Put a new pool first · h  Point it at this server · r  Read again · Esc  Back\n",
+        );
+        text
+    }
+
+    /// The confirmation for a pool change: what the device will hold, what
+    /// is dropped, and what mining elsewhere means.
+    fn confirm_pools_text(&self, plan: &PoolPlan) -> String {
+        let mut text = format!(
+            "Change the pools of {}?\n\nThe device will hold, in order:\n",
+            self.label
+        );
+        for (index, pool) in plan.pools.iter().enumerate() {
+            text.push_str(&format!(
+                "  {}  {}  {}  {}{}\n",
+                index + 1,
+                pool.url,
+                who(&pool.user),
+                if index == 0 { "new" } else { "kept as backup" },
+                if self.is_this_server(pool) {
+                    ", this server"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if !plan.dropped.is_empty() {
+            text.push_str(&format!(
+                "Not kept (the device holds {}): {}\n",
+                plan.pools.len(),
+                plan.dropped
+                    .iter()
+                    .map(|pool| pool.url.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        text.push('\n');
+        if plan
+            .pools
+            .first()
+            .is_some_and(|pool| self.is_this_server(pool))
+        {
+            text.push_str("Pool 1 is this server: the device mines here again.\n");
+        } else {
+            text.push_str(
+                "While pool 1 works, this device stops mining on this server: its shares, any \
+                 block it finds, merge-mined token wins and the donation from its work go to \
+                 pool 1.",
+            );
+            if plan
+                .pools
+                .iter()
+                .skip(1)
+                .any(|pool| self.is_this_server(pool))
+            {
+                text.push_str(" This server stays its backup and takes it back if pool 1 fails.");
+            }
+            text.push('\n');
+        }
+        for note in self
+            .current_pools()
+            .map(|pools| pools.notes)
+            .unwrap_or_default()
+        {
+            text.push_str(note);
+            text.push('\n');
+        }
+        text.push_str("\ny  Yes, change the pools · any other key  No\n");
+        text
+    }
+    // #### end PR #42 ####
 
     /// #### PR #42: the menu: the one-shot actions, then the fan and power
     /// settings the device offers.
@@ -586,22 +963,10 @@ impl DevicePanel {
             let result = fleet.control(ip, action);
             let mut text = outcome(action, result.clone());
             match &result {
-                Ok(_) => {
-                    let login = unsaved.lock().ok().and_then(|mut unsaved| unsaved.take());
-                    if let (Some((username, password)), Some(firmware)) = (login, firmware) {
-                        text.push_str(
-                            match fleet.save_login(ip, &firmware, &username, &password) {
-                                Ok(()) => " The login is saved.",
-                                Err(_) => {
-                                    " The login works but could not be saved; Pickaxe asks again next time."
-                                }
-                            },
-                        );
-                    }
-                }
+                Ok(_) => text.push_str(save_unsaved(&fleet, ip, firmware, &unsaved)),
                 Err(error) if login_refused(error) => {
                     if let Ok(mut retry) = retry.lock() {
-                        *retry = Some(action);
+                        *retry = Some(Retry::Action(action));
                     }
                     text.push_str(
                         " Press l to enter this device's login; the action is sent again after it.",
@@ -689,6 +1054,7 @@ impl DevicePanel {
                                     "Power mode…".to_owned()
                                 }
                                 Item::Power => "Power limit…".to_owned(),
+                                Item::Pools => "Pools…".to_owned(),
                             };
                             text.push_str(&format!("{}  {name}\n", index + 1));
                         }
@@ -714,6 +1080,24 @@ impl DevicePanel {
                          {input}_\n\nEsc  Back\n",
                         self.label
                     )),
+                    // #### PR #42: the pool pages.
+                    Page::Pools => text.push_str(&self.pools_text()),
+                    Page::PoolForm(form) => {
+                        let cursor = |field: usize| if form.field == field { "_" } else { "" };
+                        text.push_str(&format!(
+                            "New first pool for {}\n\nAddress: {}{}\n  as in \
+                             stratum+tcp://pool.example:3333\nWorker: {}{}\nPassword: {}{}\n\n\
+                             Tab  Next field · Enter  Continue · Esc  Back\n",
+                            self.label,
+                            form.url,
+                            cursor(0),
+                            form.user,
+                            cursor(1),
+                            "•".repeat(form.password.chars().count()),
+                            cursor(2)
+                        ));
+                    }
+                    Page::PoolConfirm(plan) => text.push_str(&self.confirm_pools_text(plan)),
                     // #### PR #42: the login page never shows the password.
                     Page::Login(form) => {
                         text.push_str(&format!("Login for {}\n", self.label));
@@ -849,7 +1233,40 @@ fn items_of(found: &DeviceControls) -> Vec<Item> {
     if found.power.is_some() {
         items.push(Item::Power);
     }
+    if found.pools.is_some() {
+        items.push(Item::Pools);
+    }
     items
+}
+
+/// #### PR #42: how a pool's username is shown: its worker part, never a
+/// payout address.
+fn who(user: &str) -> String {
+    match worker_name(user) {
+        Some(name) => format!("worker {name}"),
+        None if user.trim().is_empty() => "no worker".to_owned(),
+        None => "your payout address".to_owned(),
+    }
+}
+
+/// #### PR #42: saves a login that was in use but unsaved, once the device
+/// accepted an action with it; the note for the reply.
+fn save_unsaved(
+    fleet: &Fleet,
+    ip: IpAddr,
+    firmware: Option<String>,
+    unsaved: &Mutex<Option<(String, String)>>,
+) -> &'static str {
+    let login = unsaved.lock().ok().and_then(|mut unsaved| unsaved.take());
+    match (login, firmware) {
+        (Some((username, password)), Some(firmware)) => {
+            match fleet.save_login(ip, &firmware, &username, &password) {
+                Ok(()) => " The login is saved.",
+                Err(_) => " The login works but could not be saved; Pickaxe asks again next time.",
+            }
+        }
+        _ => "",
+    }
 }
 
 /// #### PR #42: the confirmation question for an action.
@@ -889,13 +1306,14 @@ fn watts_choice(input: &str) -> Result<DeviceAction, String> {
 }
 
 fn outcome(action: DeviceAction, result: Result<String, String>) -> String {
+    outcome_named(&action.label(), result)
+}
+
+/// The reply for a named change.
+fn outcome_named(name: &str, result: Result<String, String>) -> String {
     match result {
-        Ok(message) => format!("{}: {}", action.label(), plain(&message)),
-        Err(error) => format!(
-            "{}: not done. {}",
-            action.label(),
-            capitalized(&plain(&error))
-        ),
+        Ok(message) => format!("{name}: {}", plain(&message)),
+        Err(error) => format!("{name}: not done. {}", capitalized(&plain(&error))),
     }
 }
 
@@ -1280,6 +1698,151 @@ mod tests {
         online.model = Some("Avalonminer AvalonNano3s".into());
         *online.controls.lock().unwrap() = Some(identified("Bitaxe Gamma"));
         assert_eq!(online.actions().len(), 2);
+    }
+
+    // #### PR #42
+    // What: the pool pages: the device's pools with this server marked and
+    // no payout address shown; a new pool needs its port and a confirmation
+    // that says what changes; `h` puts this server first with the worker the
+    // device already uses here; nothing is sent before `y`.
+    // Look here if: the pool pages, pool_plan or confirm_pools_text changes.
+    #[test]
+    fn pool_changes_need_a_confirmation_and_name_this_server() {
+        use crate::stratum_v2::{device_api::PoolEntry, fleet::DevicePools};
+        let fleet = Arc::new(Fleet::new());
+        let mut panel = DevicePanel::new(
+            "rig1 #1".into(),
+            true,
+            String::new(),
+            Ok("203.0.113.9".parse().unwrap()),
+        );
+        panel.set_server_urls(vec![
+            (
+                Place::ThisComputer,
+                false,
+                "stratum+tcp://127.0.0.1:3333".into(),
+            ),
+            (
+                Place::LocalNetwork,
+                false,
+                "stratum+tcp://192.168.0.55:3333".into(),
+            ),
+            (
+                Place::LocalNetwork,
+                true,
+                "stratum2+tcp://192.168.0.55:3336/KEY".into(),
+            ),
+        ]);
+        *panel.controls.lock().unwrap() = Some(DeviceControls {
+            firmware: Some("AntMiner Stock".into()),
+            actions: vec![DeviceAction::Restart],
+            pools: Some(3),
+            ..DeviceControls::default()
+        });
+        assert!(screen(&panel).contains("2  Pools…"));
+        panel.handle_key(key(KeyCode::Char('2')), &fleet);
+        assert_eq!(panel.page, Page::Pools);
+        // The read goes to a public address and fails; then the pools are
+        // set here as a device would report them.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while panel.pools.lock().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(screen(&panel).contains("Could not read the pools"));
+        let entry = |url: &str, user: &str, active| PoolEntry {
+            url: url.into(),
+            user: user.into(),
+            password: "x".into(),
+            active,
+        };
+        *panel.pools.lock().unwrap() = Some(Ok(DevicePools {
+            entries: vec![
+                entry("stratum+tcp://192.168.0.55:3333", "rig1", true),
+                entry(
+                    "stratum+tcp://backup.example:3333",
+                    "bitcoincash:qpayoutplaceholder",
+                    false,
+                ),
+                entry("stratum+tcp://old.example:3333", "", false),
+            ],
+            slots: 3,
+            notes: vec!["The device restarts to use them."],
+        }));
+        let text = screen(&panel);
+        assert!(
+            text.contains("worker rig1 · mining now · this server"),
+            "{text}"
+        );
+        assert!(text.contains("your payout address"), "{text}");
+        assert!(!text.contains("qpayoutplaceholder"), "{text}");
+        // A new pool: its port is needed.
+        panel.handle_key(key(KeyCode::Char('n')), &fleet);
+        for c in "stratum+tcp://pool.example".chars() {
+            panel.handle_key(key(KeyCode::Char(c)), &fleet);
+        }
+        panel.handle_key(key(KeyCode::Tab), &fleet);
+        for c in "rig1".chars() {
+            panel.handle_key(key(KeyCode::Char(c)), &fleet);
+        }
+        panel.handle_key(key(KeyCode::Enter), &fleet);
+        assert!(screen(&panel).contains("needs its port"));
+        panel.handle_key(key(KeyCode::BackTab), &fleet);
+        for c in ":3333".chars() {
+            panel.handle_key(key(KeyCode::Char(c)), &fleet);
+        }
+        panel.handle_key(key(KeyCode::Enter), &fleet);
+        assert!(
+            matches!(panel.page, Page::PoolConfirm(_)),
+            "{:?}",
+            panel.page
+        );
+        let text = screen(&panel);
+        for expected in [
+            "Change the pools of rig1 #1?",
+            "1  stratum+tcp://pool.example:3333  worker rig1  new",
+            "2  stratum+tcp://192.168.0.55:3333  worker rig1  kept as backup, this server",
+            "Not kept (the device holds 3): stratum+tcp://old.example:3333",
+            "merge-mined token wins and the donation from its work go to",
+            "This server stays its backup",
+            "The device restarts to use them.",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        // No: back to the pools, nothing sent.
+        panel.handle_key(key(KeyCode::Char('n')), &fleet);
+        assert_eq!(panel.page, Page::Pools);
+        // Back to this server, with the worker it uses here.
+        panel.handle_key(key(KeyCode::Char('h')), &fleet);
+        let Page::PoolForm(form) = &panel.page else {
+            panic!("{:?}", panel.page);
+        };
+        assert_eq!(
+            (form.url.as_str(), form.user.as_str()),
+            ("stratum+tcp://192.168.0.55:3333", "rig1")
+        );
+        panel.handle_key(key(KeyCode::Enter), &fleet);
+        assert!(screen(&panel).contains("Pool 1 is this server: the device mines here again."));
+        assert!(!panel
+            .reply
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|reply| reply.starts_with("Sending")));
+        // Yes: sent in the background; a public address is refused.
+        panel.handle_key(key(KeyCode::Char('y')), &fleet);
+        assert_eq!(panel.page, Page::Menu);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while panel
+            .reply
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|reply| reply.starts_with("Sending"))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(screen(&panel).contains("Pools: not done. Only devices on the local network"));
     }
 
     // #### PR #42

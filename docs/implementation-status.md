@@ -1360,3 +1360,47 @@ it forgets what was identified at the address; refusal texts are recognised
 and unrelated errors are not; and the login page is offered only to firmwares
 with a login, hides the password, and saves nothing when the device does not
 take the login.
+
+## Pools on the Device panel (2026-10-09)
+
+#### PR #42
+
+"Pools…" on the Device panel reads a device's pools on request (never while
+polling) and changes them after a confirmation. The page lists the pools in the
+device's order, marks this server (by host and port, from the server's own
+connection addresses) and the pool it mines on now, and shows workers by name,
+never a payout address. `n` puts a typed pool first; `h` puts this server first
+with the worker the device already used here. The other pools stay as backups,
+each once, as many as the device holds; the confirmation lists what the device
+will hold, what is dropped, any firmware notes (VNish keeps host and port only,
+LuxOS replaces its groups, passwords the firmware does not report become `x`,
+restarts), and says that while pool 1 works the device's shares, blocks,
+merge-mined token wins and donation go to pool 1.
+
+How pools are read and written:
+- through asic-rs (`get_pools`, `get_pools_config` where the firmware keeps
+  passwords, `set_pools_config` with one group);
+- Avalons: CGMiner `pools`, then Canaan's `setpool` slot by slot with the web
+  login, then `ascset 0,reboot,0`. A field with a comma is refused before
+  anything is sent, and the success message, which repeats the worker and its
+  password, is never shown;
+- Bitaxe: AxeOS `system/info`, then `PATCH /api/system` with the pool and its
+  fallback, then `POST /api/system/restart`.
+
+A pool address must carry its port; asic-rs would read a missing one as 80. An
+Avalon without a known web login answers that it needs it, which offers `l`;
+the pools are sent again after the login.
+
+Unverified on a device: no pool was read from or written to a real device (the
+operator's Avalon keeps its pools as they are).
+
+Evidence: host tests check the pool plan (new first, each old pool once,
+dropped listed, two slots on a Bitaxe), the port and scheme rules, an Avalon's
+`pools` read in priority order, `setpool` sent byte for byte with the web
+login then the reboot, the success message never passed on, a refusal shown
+without the web password and recognised as a refused login, a comma refusing
+everything before a request; a Bitaxe's pools read, written with the old
+primary as fallback, then restarted; and the panel's pool pages marking this
+server, hiding a payout address, needing a port, listing the change with its
+consequences, offering this server with its worker, and sending nothing before
+`y`.
