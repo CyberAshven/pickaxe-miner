@@ -1252,3 +1252,28 @@ address list never reaching the JSON or Debug output; and Restart on Avalon
 Nano 3s, A-series and Home Q never going through asic-rs, with Pickaxe's own
 Restart sending exactly `{"command":"ascset","parameter":"0,reboot,0"}` to a
 loopback stand-in. No device was contacted.
+
+## Profiles keep their mode (2026-10-09)
+
+#### PR #42
+
+A saved profile now remembers what it starts: plain GPU mining, a rig joining
+a GPU pool or farm, ASIC solo, ASICs at a pool, an ASIC pool or a GPU pool,
+with that mode's pool values (the pool or coordinator to join and its key, a
+pool's fee, where an ASIC pool's fee comes from, the fee address and the
+pool's name). Opening the profile puts the setup back in that mode, so the
+pool rows and values are there again; before, every profile reopened as GPU
+mining. The profile list names each mode ("ASIC pool · Chipnet · BCH · fee
+1.50%") and never shows a pool's address or key, or any address. Plain GPU
+profiles save exactly the bytes they did before.
+
+Known limit: a profiles file holding a saved mode is refused by older Pickaxe
+versions, which do not know the new field.
+
+Evidence: host tests save and reopen an ASIC pool, a rig and an ASIC joining a
+pool, check that one profile's values never carry over to the next or to a new
+profile, that the list hides pool addresses, keys and names, that a plain GPU
+profile saves no `server` field, and that the saved values are refused when
+the setup would refuse them (a name over 20 characters, joining without an
+address, a space in the address, a fee on solo mining, a bad fee address, an
+ASIC pool's name or fee source on a GPU pool).

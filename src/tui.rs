@@ -2,7 +2,7 @@ use crate::{
     backend::{BackendKind, DeviceSelection, GpuDevice},
     config::{
         ConnectionKind, MiningNetwork, MiningProfiles, MiningToken, RuntimeConfig, SavedConfig,
-        SharedSources,
+        SavedMode, SavedServer, SharedSources,
     },
     protocol::ProofRule,
     runtime::{RuntimeEvent, RuntimeSnapshot, RuntimeSupervisor, SupervisorState},
@@ -347,8 +347,8 @@ impl SetupFlow {
             pool_target: 0,
             join_address: String::new(),
             join_key: String::new(),
-            pool_fee: "1".parse().expect("fee"),
-            pool_fee_mode: crate::donation::bch::FeeMode::Coinbase,
+            pool_fee: SetupFlow::server_defaults().0,
+            pool_fee_mode: SetupFlow::server_defaults().1,
             pool_fee_address: String::new(),
             pool_tag: String::new(),
             token_input: String::new(),
@@ -662,6 +662,111 @@ impl SetupFlow {
         }
     }
 
+    // #### PR #42: profiles keep their mode
+    // What: the setup's mode and pool values go into the profile, and opening
+    // the profile puts them back.
+    // Why: every profile reopened as GPU mining, so pool and ASIC rows and
+    // values were lost.
+    // Look here if: a reopened profile shows the wrong mode or pool values.
+    /// The mode and pool values a profile saves; `None` for plain GPU mining.
+    fn saved_server(&self) -> Option<SavedServer> {
+        let text = |value: &str| Some(value.trim().to_owned()).filter(|v| !v.is_empty());
+        let joining = |mode| SavedServer {
+            mode,
+            join: text(&self.join_address),
+            join_key: text(&self.join_key),
+            pool_fee: None,
+            fee_mode: None,
+            fee_address: None,
+            pool_tag: None,
+        };
+        Some(match self.server_setup()? {
+            ServerSetup::JoinGpuPool { .. } => joining(SavedMode::GpuRig),
+            ServerSetup::JoinPool { .. } => joining(SavedMode::AsicJoin),
+            ServerSetup::Solo => SavedServer {
+                join: None,
+                join_key: None,
+                ..joining(SavedMode::AsicSolo)
+            },
+            ServerSetup::GpuPool { fee, address } => SavedServer {
+                mode: SavedMode::GpuPool,
+                join: None,
+                join_key: None,
+                pool_fee: Some(fee),
+                fee_mode: None,
+                fee_address: address,
+                pool_tag: None,
+            },
+            ServerSetup::Public {
+                fee,
+                mode,
+                address,
+                tag,
+            } => SavedServer {
+                mode: SavedMode::AsicPool,
+                join: None,
+                join_key: None,
+                pool_fee: Some(fee),
+                fee_mode: Some(mode),
+                fee_address: address,
+                pool_tag: tag,
+            },
+        })
+    }
+
+    /// Puts a profile's mode and pool values back; `None` is plain GPU
+    /// mining. Values the profile does not hold go back to their defaults.
+    fn apply_saved_server(&mut self, server: Option<&SavedServer>) {
+        let defaults = SetupFlow::server_defaults();
+        self.gpu_join = false;
+        self.asic_mining = AsicMining::Solo;
+        self.pool_target = 0;
+        self.join_address.clear();
+        self.join_key.clear();
+        self.pool_fee = defaults.0;
+        self.pool_fee_mode = defaults.1;
+        self.pool_fee_address.clear();
+        self.pool_tag.clear();
+        let Some(server) = server else {
+            self.mode = MiningMode::Gpu;
+            return;
+        };
+        self.mode = match server.mode {
+            SavedMode::GpuRig => {
+                self.gpu_join = true;
+                MiningMode::Gpu
+            }
+            SavedMode::AsicSolo => MiningMode::Asic,
+            SavedMode::AsicJoin => {
+                self.asic_mining = AsicMining::JoinPool;
+                MiningMode::Asic
+            }
+            SavedMode::AsicPool => MiningMode::Pool,
+            SavedMode::GpuPool => {
+                self.pool_target = 1;
+                MiningMode::Pool
+            }
+        };
+        self.join_address = server.join.clone().unwrap_or_default();
+        self.join_key = server.join_key.clone().unwrap_or_default();
+        self.pool_fee = server.pool_fee.unwrap_or(defaults.0);
+        self.pool_fee_mode = server.fee_mode.unwrap_or(defaults.1);
+        self.pool_fee_address = server.fee_address.clone().unwrap_or_default();
+        self.pool_tag = server.pool_tag.clone().unwrap_or_default();
+    }
+
+    /// A new pool's fee and where it comes from, before anyone changes them.
+    fn server_defaults() -> (
+        crate::donation::bch::BchDonation,
+        crate::donation::bch::FeeMode,
+    ) {
+        (
+            "1".parse().expect("fee"),
+            crate::donation::bch::FeeMode::Coinbase,
+        )
+    }
+    // #### end PR #42 ####
+
     fn current_row(&self) -> SettingsRow {
         let rows = self.settings_rows();
         rows[self.settings_row.min(rows.len() - 1)]
@@ -729,7 +834,8 @@ impl SetupFlow {
         }
         self.config = config;
         self.apply_connections()?;
-        self.mode = MiningMode::Gpu;
+        // #### PR #42: the profile reopens in its own mode.
+        self.apply_saved_server(profile.settings.server.as_ref());
         self.active_profile = Some(index);
         self.profile_name_input = profile.name.clone();
         self.open_settings(SettingsRow::Start);
@@ -746,7 +852,8 @@ impl SetupFlow {
         self.apply_connections()?;
         self.active_profile = None;
         self.profile_name_input.clear();
-        self.mode = MiningMode::Gpu;
+        // #### PR #42: a new profile starts without another profile's pool.
+        self.apply_saved_server(None);
         self.step = SetupStep::Hardware;
         Ok(())
     }
@@ -1940,6 +2047,8 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
                 // Servers and nodes live in the shared per-network store.
                 settings.fulcrum = None;
                 settings.node_rpc = None;
+                // #### PR #42: the profile keeps its mode and pool values.
+                settings.server = state.saved_server();
                 let mut profiles = state.profiles.clone();
                 let saved = profiles
                     .upsert(state.active_profile, &state.profile_name_input, settings)
@@ -2816,6 +2925,27 @@ fn edit_value(state: &SetupFlow, field: TextField, value: &str, hint: &str) -> S
     }
 }
 
+/// #### PR #42: a profile's line in the list names its mode. It never shows
+/// a pool's address or key, or any payout or fee address.
+fn profile_summary(settings: &SavedConfig, network: MiningNetwork, device: &str) -> String {
+    let network = network_label(network);
+    let token = settings.token.as_deref().unwrap_or("PHOTON");
+    let Some(server) = &settings.server else {
+        return format!("GPU · {network} · {token} · {device}");
+    };
+    let fee = server
+        .pool_fee
+        .map(|fee| format!(" · fee {fee}"))
+        .unwrap_or_default();
+    match server.mode {
+        SavedMode::GpuRig => format!("GPU rig · {network} · {token} · {device}"),
+        SavedMode::AsicSolo => format!("ASIC solo · {network} · BCH"),
+        SavedMode::AsicJoin => format!("ASIC at a pool · {network} · BCH"),
+        SavedMode::AsicPool => format!("ASIC pool · {network} · BCH{fee}"),
+        SavedMode::GpuPool => format!("GPU pool · {network} · {token}{fee}"),
+    }
+}
+
 fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     let mut lines = state
         .profiles
@@ -2838,11 +2968,7 @@ fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             };
             Line::from(vec![
                 Span::raw(format!("{} {name:<18} ", selection_marker(selected))),
-                dim(format!(
-                    "GPU · {} · {} · {device}",
-                    network_label(network),
-                    settings.token.as_deref().unwrap_or("PHOTON")
-                )),
+                dim(profile_summary(settings, network, &device)),
             ])
         })
         .collect::<Vec<_>>();
@@ -4938,6 +5064,90 @@ mod tests {
         assert!(screen.contains("not supported yet"), "{screen}");
         setup.open_settings(SettingsRow::AsicTarget);
         assert!(!setup_text(&setup).contains("coming soon"));
+    }
+
+    // #### PR #42
+    #[test]
+    fn profiles_keep_the_mode_and_pool_values() {
+        use crate::donation::bch::FeeMode;
+        let mut pool = setup_for(MiningMode::Pool);
+        pool.config.payout_address = chipnet_payout(3);
+        pool.pool_fee = "1.5".parse().unwrap();
+        pool.pool_fee_mode = FeeMode::Work;
+        pool.pool_tag = "/MyPool/".into();
+        let pool = pool.saved_server().expect("a pool saves its mode");
+        let mut rig = setup_for(MiningMode::Gpu);
+        rig.gpu_join = true;
+        rig.join_address = "192.0.2.7:3340".into();
+        rig.join_key = "KEY".into();
+        let rig = rig.saved_server().expect("a rig saves its coordinator");
+        let mut join = setup_for(MiningMode::Asic);
+        join.asic_mining = AsicMining::JoinPool;
+        join.join_address = "stratum2+tcp://pool.example:3336/KEY".into();
+        let join = join.saved_server().expect("joining saves the pool");
+        assert_eq!(setup_for(MiningMode::Gpu).saved_server(), None);
+        assert_eq!(
+            setup_for(MiningMode::Asic).saved_server().map(|s| s.mode),
+            Some(SavedMode::AsicSolo)
+        );
+
+        let mut reopened = setup_for(MiningMode::Gpu);
+        for (name, server) in [("Pool", &pool), ("Rig", &rig), ("Join", &join)] {
+            let settings = SavedConfig {
+                network: Some("chipnet".into()),
+                address: Some(chipnet_payout(3)),
+                server: Some(server.clone()),
+                ..SavedConfig::default()
+            };
+            settings.validate().unwrap();
+            reopened
+                .profiles
+                .profiles
+                .push(crate::config::MiningProfile {
+                    name: name.into(),
+                    settings,
+                });
+        }
+        reopened.open_profile(0).unwrap();
+        assert_eq!((reopened.mode, reopened.pool_target), (MiningMode::Pool, 0));
+        assert_eq!(reopened.pool_fee.to_string(), "1.50%");
+        assert_eq!(reopened.pool_fee_mode, FeeMode::Work);
+        assert_eq!(reopened.pool_tag, "/MyPool/");
+        assert_eq!(reopened.saved_server().as_ref(), Some(&pool));
+        assert!(setup_text(&reopened).contains("Start the pool"));
+        reopened.open_profile(1).unwrap();
+        assert_eq!((reopened.mode, reopened.gpu_join), (MiningMode::Gpu, true));
+        assert_eq!(reopened.join_address, "192.0.2.7:3340");
+        assert_eq!(
+            reopened.pool_tag, "",
+            "one profile's values never carry over"
+        );
+        reopened.open_profile(2).unwrap();
+        assert_eq!(
+            (reopened.mode, reopened.asic_mining),
+            (MiningMode::Asic, AsicMining::JoinPool)
+        );
+        assert_eq!(reopened.join_key, "");
+        assert_eq!(reopened.saved_server().as_ref(), Some(&join));
+        // The list names each mode and never shows a pool address or key.
+        reopened.step = SetupStep::Profiles;
+        let list = setup_text(&reopened);
+        for expected in ["ASIC pool", "fee 1.50%", "GPU rig", "ASIC at a pool"] {
+            assert!(list.contains(expected), "{expected}: {list}");
+        }
+        for hidden in ["pool.example", "192.0.2.7", "KEY", "/MyPool/"] {
+            assert!(!list.contains(hidden), "{hidden}: {list}");
+        }
+        // A new profile starts as plain GPU mining.
+        reopened.new_profile().unwrap();
+        assert_eq!(
+            (
+                reopened.mode,
+                reopened.gpu_join,
+                reopened.join_address.as_str()
+            ),
+            (MiningMode::Gpu, false, "")
+        );
     }
 
     #[test]

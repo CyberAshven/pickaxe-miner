@@ -610,7 +610,119 @@ pub struct SavedConfig {
     pub fulcrum: Option<String>,
     pub node_rpc: Option<String>,
     pub source: Option<String>,
+    /// #### PR #42: what the profile starts besides plain GPU mining. Plain
+    /// GPU profiles leave it out, so their saved bytes do not change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<SavedServer>,
 }
+
+// #### PR #42: profiles keep their mode
+// What: a profile saves the setup's mode (a rig joining a GPU pool or farm,
+// ASIC solo, ASIC at a pool, an ASIC pool or a GPU pool) and its pool values,
+// and reopens in that mode.
+// Why: every profile reopened as GPU mining, so a saved pool or ASIC profile
+// lost its pool rows and settings.
+// Look here if: an older Pickaxe refuses the profiles file; it does not know
+// the `server` field (`deny_unknown_fields`).
+/// The kind of miner a profile starts, besides plain GPU mining.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedMode {
+    /// This computer's GPUs join a GPU pool or farm as a rig.
+    GpuRig,
+    /// ASICs mine BCH on the miner's own node.
+    AsicSolo,
+    /// ASICs mine at a remote pool.
+    AsicJoin,
+    /// A public ASIC pool for other miners.
+    AsicPool,
+    /// A public GPU pool for other miners' rigs.
+    GpuPool,
+}
+
+impl SavedMode {
+    /// Whether the mode joins someone else's pool or coordinator.
+    pub fn joins(self) -> bool {
+        matches!(self, Self::GpuRig | Self::AsicJoin)
+    }
+
+    /// Whether the mode runs a pool with a fee.
+    pub fn runs_a_pool(self) -> bool {
+        matches!(self, Self::AsicPool | Self::GpuPool)
+    }
+}
+
+/// A profile's mode and the pool values the setup asked for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SavedServer {
+    pub mode: SavedMode,
+    /// The pool or coordinator to join: `HOST:PORT`, or a one-line SV2
+    /// address with its key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+    /// The pool's or coordinator's key, when `join` does not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_fee: Option<crate::donation::bch::BchDonation>,
+    /// Where an ASIC pool's fee comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_mode: Option<crate::donation::bch::FeeMode>,
+    /// Where the pool fee goes; left out, it goes to the payout address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_address: Option<String>,
+    /// An ASIC pool's name in its blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_tag: Option<String>,
+}
+
+impl SavedServer {
+    /// Rejects values the setup would refuse for this mode on `network`.
+    pub fn validate(&self, network: MiningNetwork) -> Result<(), String> {
+        let join = self.join.as_deref().map(str::trim).unwrap_or("");
+        if self.mode.joins() {
+            if join.is_empty() {
+                return Err("a profile that joins a pool needs the pool's address".into());
+            }
+        } else if self.join.is_some() || self.join_key.is_some() {
+            return Err("only a profile that joins a pool saves a pool address".into());
+        }
+        for value in [join, self.join_key.as_deref().unwrap_or("")] {
+            if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err("a pool address or key has no spaces".into());
+            }
+        }
+        if !self.mode.runs_a_pool()
+            && (self.pool_fee.is_some() || self.fee_mode.is_some() || self.fee_address.is_some())
+        {
+            return Err("only a profile that runs a pool saves a pool fee".into());
+        }
+        if self.mode != SavedMode::AsicPool && (self.fee_mode.is_some() || self.pool_tag.is_some())
+        {
+            return Err("only an ASIC pool saves where its fee comes from and its name".into());
+        }
+        if let Some(address) = &self.fee_address {
+            match self.mode {
+                // A GPU pool's fee is a token claim, which pays a q address.
+                SavedMode::GpuPool => validate_payout_address(network, address),
+                _ => validate_coinbase_address(network, address),
+            }
+            .map_err(|error| format!("pool fee address: {error}"))?;
+        }
+        if let Some(tag) = &self.pool_tag {
+            let tag = tag.trim();
+            if tag.is_empty()
+                || tag.len() > 20
+                || !tag.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+            {
+                return Err("a pool's name is 1 to 20 printable characters".into());
+            }
+        }
+        Ok(())
+    }
+}
+// #### end PR #42 ####
 
 impl SavedConfig {
     /// Applies saved configuration values to a running miner.
@@ -664,6 +776,11 @@ impl SavedConfig {
         }
         let mut runtime = RuntimeConfig::default();
         self.apply_to_runtime(&mut runtime)?;
+        // #### PR #42: a saved mode's pool values are checked as the setup
+        // checks them.
+        if let Some(server) = &self.server {
+            server.validate(runtime.network)?;
+        }
         runtime.validate_payout_network()
     }
 
@@ -737,6 +854,7 @@ impl SavedConfig {
             fulcrum: runtime.fulcrum_url.clone(),
             node_rpc: runtime.node_url.clone(),
             source: Some(runtime.source.as_str().to_string()),
+            server: None,
         }
     }
 }
@@ -1666,6 +1784,91 @@ mod tests {
             assert!(MiningProfiles::default()
                 .upsert(None, "Wrong network", saved)
                 .is_err());
+        }
+    }
+
+    // #### PR #42
+    #[test]
+    fn a_plain_gpu_profile_saves_no_server_and_bad_pool_values_are_refused() {
+        let plain = SavedConfig {
+            network: Some("chipnet".into()),
+            ..SavedConfig::default()
+        };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("server"));
+        let with = |server: SavedServer| SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(server),
+            ..SavedConfig::default()
+        };
+        let pool = SavedServer {
+            mode: SavedMode::AsicPool,
+            join: None,
+            join_key: None,
+            pool_fee: Some("2".parse().unwrap()),
+            fee_mode: Some(crate::donation::bch::FeeMode::Both),
+            fee_address: None,
+            pool_tag: Some("/MyPool/".into()),
+        };
+        with(pool.clone()).validate().unwrap();
+        let text = serde_json::to_string(&with(pool.clone())).unwrap();
+        assert!(text.contains("\"mode\":\"asic-pool\""), "{text}");
+        let back: SavedConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.server, Some(pool.clone()));
+        let joining = SavedServer {
+            mode: SavedMode::AsicJoin,
+            join: Some("stratum2+tcp://pool.example:3336/KEY".into()),
+            join_key: None,
+            pool_fee: None,
+            fee_mode: None,
+            fee_address: None,
+            pool_tag: None,
+        };
+        with(joining.clone()).validate().unwrap();
+        for (bad, why) in [
+            (
+                SavedServer {
+                    pool_tag: Some("x".repeat(21)),
+                    ..pool.clone()
+                },
+                "a 21-character pool name",
+            ),
+            (
+                SavedServer {
+                    join: None,
+                    ..joining.clone()
+                },
+                "joining without an address",
+            ),
+            (
+                SavedServer {
+                    join: Some("pool.example 3336".into()),
+                    ..joining.clone()
+                },
+                "a space in the address",
+            ),
+            (
+                SavedServer {
+                    mode: SavedMode::AsicSolo,
+                    ..pool.clone()
+                },
+                "a fee on solo mining",
+            ),
+            (
+                SavedServer {
+                    fee_address: Some("not-an-address".into()),
+                    ..pool.clone()
+                },
+                "a bad fee address",
+            ),
+            (
+                SavedServer {
+                    mode: SavedMode::GpuPool,
+                    ..pool.clone()
+                },
+                "a GPU pool with an ASIC pool's name and fee source",
+            ),
+        ] {
+            assert!(with(bad).validate().is_err(), "{why}");
         }
     }
 
