@@ -3,7 +3,9 @@
 //! device connections only see immutable jobs and cannot select chain payouts.
 
 use super::{
+    channel::TokenWin,
     journal::Journal,
+    merge::hub::TokenHub,
     provider::{NodeRpc, SubmissionOutcome, TemplateProvider},
     telemetry::Devices,
     template::{BchTemplate, Hash},
@@ -47,6 +49,9 @@ pub struct ServerConfig {
     /// #### PR #40: the pool's name, written into every block's coinbase
     /// (empty for none).
     pub pool_tag: Vec<u8>,
+    /// #### PR #42: the merge-mined tokens jobs carry, and where their wins
+    /// are proven; none unless a token is merge-mined.
+    pub tokens: Option<Arc<TokenHub>>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -79,6 +84,24 @@ pub struct ServerStats {
     pub best_share: Option<(f64, String)>,
     /// #### PR #40: the latest blocks found, newest last.
     pub recent_blocks: VecDeque<FoundBlock>,
+    /// #### PR #42: merge-mined token wins handed to the claim worker, those
+    /// dropped because its queue was full, the latest proven (newest last),
+    /// and why token claims are off, if they are.
+    pub token_wins: u64,
+    pub token_wins_dropped: u64,
+    pub recent_token_wins: VecDeque<FoundTokenWin>,
+    pub tokens_off: Option<String>,
+}
+
+/// #### PR #42: a proven merge-mined token win.
+#[derive(Clone, Debug)]
+pub struct FoundTokenWin {
+    pub token: &'static str,
+    /// 'A' (the share met the token's target) or 'B' (a found block).
+    pub mode: char,
+    pub height: u32,
+    pub worker: String,
+    pub found: Instant,
 }
 
 /// #### PR #40
@@ -99,6 +122,9 @@ const RECENT_BLOCKS: usize = 10;
 #[derive(Clone)]
 struct PublishedJob {
     generation: u64,
+    /// #### PR #42: the token set's serial; a change re-issues jobs on the
+    /// same parent.
+    serial: u64,
     template: Arc<BchTemplate>,
     valid_until: Instant,
 }
@@ -111,6 +137,32 @@ struct Shared {
     fatal: Mutex<Option<&'static str>>,
     stop: Arc<AtomicBool>,
     solved: Mutex<SolvedParents>,
+    /// #### PR #42: the claim worker's queue, bounded; device threads never
+    /// wait on it.
+    claims: Option<SyncSender<(TokenWin, String)>>,
+}
+
+/// How many token wins wait for the claim worker before more are dropped.
+const CLAIM_QUEUE: usize = 64;
+/// How many proven token wins the dashboard keeps.
+const RECENT_TOKEN_WINS: usize = 10;
+
+/// #### PR #42: the template with the pool's name and the current token
+/// set, and that set's serial (0 without tokens).
+fn with_tokens(
+    mut template: BchTemplate,
+    tag: &[u8],
+    tokens: Option<&TokenHub>,
+) -> (BchTemplate, u64) {
+    template.tag(tag);
+    match tokens.and_then(TokenHub::current) {
+        Some(set) => {
+            let serial = set.serial();
+            template.commit(set);
+            (template, serial)
+        }
+        None => (template, 0),
+    }
 }
 
 // #### PR #38
@@ -172,6 +224,54 @@ pub fn run<R: NodeRpc + Send + 'static>(
         stats.active_node = 0;
     }
     let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
+    // #### PR #42: the claim worker
+    // What: proves each token win the device threads hand on (through a
+    // bounded queue they never wait on), saves the proofs and lists them on
+    // the dashboard.
+    // Why: proofs and their journal take disk time; a share's
+    // acknowledgement and BCH mining must never wait for them.
+    // Look here if: token wins are dropped while the queue is not full, or
+    // proofs stop appearing.
+    let (claims, claim_worker) = match config.tokens.clone() {
+        Some(hub) => {
+            let (send, receive) = mpsc::sync_channel::<(TokenWin, String)>(CLAIM_QUEUE);
+            let stats = stats.clone();
+            let stop = stop.clone();
+            let worker = thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match receive.recv_timeout(Duration::from_millis(250)) {
+                        Ok((win, worker)) => {
+                            let proven = hub.record(&win);
+                            if let Ok(mut stats) = stats.lock() {
+                                for found in proven {
+                                    stats.recent_token_wins.push_back(FoundTokenWin {
+                                        token: found.token,
+                                        mode: if found.mode == super::merge::leaf::Mode::ShareTarget
+                                        {
+                                            'A'
+                                        } else {
+                                            'B'
+                                        },
+                                        height: found.height,
+                                        worker: worker.clone(),
+                                        found: Instant::now(),
+                                    });
+                                    while stats.recent_token_wins.len() > RECENT_TOKEN_WINS {
+                                        stats.recent_token_wins.pop_front();
+                                    }
+                                }
+                                stats.tokens_off = hub.off();
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => (),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            });
+            (Some(send), Some(worker))
+        }
+        None => (None, None),
+    };
     let shared = Arc::new(Shared {
         job: RwLock::new(None),
         stats: stats.clone(),
@@ -180,11 +280,13 @@ pub fn run<R: NodeRpc + Send + 'static>(
         fatal: Mutex::new(None),
         stop: stop.clone(),
         solved: Mutex::new(SolvedParents::default()),
+        claims,
     });
     update_journal_stats(&shared)?;
     let node_shared = shared.clone();
     let network = config.network;
     let tag = config.pool_tag.clone();
+    let node_tokens = config.tokens.clone();
     let node = thread::spawn(move || -> Result<(), String> {
         let mut provider = TemplateProvider::new(rpc, network);
         let mut active = 0;
@@ -253,19 +355,42 @@ pub fn run<R: NodeRpc + Send + 'static>(
                 // survive tip changes; no response is treated as acceptance.
                 refreshed = Instant::now() - Duration::from_secs(60);
             }
+            // #### PR #42
+            // What: when a merge-mined token's state changes, the current
+            // template is published again with the new token set, without
+            // asking the node; devices get new jobs on the same parent.
+            // Why: a win moves the token's baton, and work on the old state
+            // can no longer win it. Asking the node again could fail and
+            // revoke all work.
+            // Look here if: jobs do not change after a token win, or a token
+            // win revokes work.
+            if node_tokens.as_ref().is_some_and(|hub| hub.take_changed()) {
+                if let Some((generation, template)) = provider.current() {
+                    let (template, serial) =
+                        with_tokens(template.clone(), &tag, node_tokens.as_deref());
+                    publish(
+                        &node_shared,
+                        Some(PublishedJob {
+                            generation,
+                            serial,
+                            template: Arc::new(template),
+                            valid_until: Instant::now() + Duration::from_secs(30),
+                        }),
+                    );
+                }
+            }
             let current = provider.tip_is_current().unwrap_or(false);
             if !current || refreshed.elapsed() >= Duration::from_secs(15) {
                 match provider.refresh() {
                     Ok((generation, template)) => {
+                        let (template, serial) =
+                            with_tokens(template.clone(), &tag, node_tokens.as_deref());
                         publish(
                             &node_shared,
                             Some(PublishedJob {
                                 generation,
-                                template: Arc::new({
-                                    let mut template = template.clone();
-                                    template.tag(&tag);
-                                    template
-                                }),
+                                serial,
+                                template: Arc::new(template),
                                 valid_until: Instant::now() + Duration::from_secs(30),
                             }),
                         );
@@ -374,6 +499,9 @@ pub fn run<R: NodeRpc + Send + 'static>(
     }
     node.join()
         .map_err(|_| "template worker stopped unexpectedly")??;
+    if let Some(worker) = claim_worker {
+        let _ = worker.join();
+    }
     if let Some(reason) = *shared
         .fatal
         .lock()
@@ -470,6 +598,8 @@ fn publish(shared: &Shared, job: Option<PublishedJob>) {
 // original freshness lease just to keep a connection alive.
 struct JobAvailability {
     generation: Option<u64>,
+    /// #### PR #42: the token set's serial of the job issued last.
+    serial: Option<u64>,
     unavailable_since: Option<Instant>,
     payout: Option<BchPayout>,
     next_id: u32,
@@ -480,6 +610,7 @@ impl JobAvailability {
     fn new(phase: u64) -> Self {
         Self {
             generation: None,
+            serial: None,
             unavailable_since: None,
             payout: None,
             next_id: 0,
@@ -507,7 +638,10 @@ impl JobAvailability {
                     && fee.is_some_and(|fee| self.allocation.fee_work(donation, fee)),
             };
             self.unavailable_since = None;
-            if self.generation == Some(job.generation) && self.payout == Some(payout) {
+            if self.generation == Some(job.generation)
+                && self.serial == Some(job.serial)
+                && self.payout == Some(payout)
+            {
                 return Ok(Vec::new());
             }
             // Policy rotations need unique search space even with the same
@@ -520,11 +654,13 @@ impl JobAvailability {
             let frames =
                 mining.set_job_with_payout(self.next_id, job.generation, job.template, payout)?;
             self.generation = Some(job.generation);
+            self.serial = Some(job.serial);
             self.payout = Some(payout);
             return Ok(frames);
         }
         self.allocation.update(now, false);
         if self.generation.take().is_some() {
+            self.serial = None;
             mining.revoke_job();
         }
         let since = *self.unavailable_since.get_or_insert(now);
@@ -683,6 +819,37 @@ fn serve_device(
                     // it also scans pending disk work on its bounded timeout.
                     let _ = shared.wake.try_send(());
                 }
+                // #### PR #42
+                // What: a share's token wins go to the claim worker, each
+                // token state once; a full queue drops the win (counted)
+                // instead of waiting.
+                // Why: the acknowledgement below must never wait on disk, and
+                // a failing token journal must never stop BCH mining.
+                // Look here if: shares are acknowledged late while tokens are
+                // merge-mined, or the dropped count grows.
+                if let (Some(hub), Some(claims)) = (config.tokens.as_ref(), shared.claims.as_ref())
+                {
+                    for win in responses.token_wins {
+                        if !hub.first(&win) {
+                            continue;
+                        }
+                        let worker = shared
+                            .stats
+                            .lock()
+                            .ok()
+                            .and_then(|stats| stats.device_stats.label(device))
+                            .unwrap_or_default();
+                        let sent = claims.try_send((win, worker)).is_ok();
+                        if let Ok(mut stats) = shared.stats.lock() {
+                            if sent {
+                                stats.token_wins = stats.token_wins.saturating_add(1);
+                            } else {
+                                stats.token_wins_dropped =
+                                    stats.token_wins_dropped.saturating_add(1);
+                            }
+                        }
+                    }
+                }
                 let next_accepted = mining.accepted;
                 let next_rejected = mining.rejected;
                 if let Ok(mut stats) = shared.stats.lock() {
@@ -774,6 +941,7 @@ mod retry_tests {
         );
         let job = PublishedJob {
             generation: 99,
+            serial: 0,
             template: Arc::new(
                 BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap(),
             ),
@@ -824,6 +992,7 @@ mod retry_tests {
         .unwrap();
         let job = PublishedJob {
             generation: 1,
+            serial: 0,
             template: Arc::new(
                 BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap(),
             ),

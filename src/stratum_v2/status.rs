@@ -49,6 +49,7 @@ pub fn status_report() -> String {
          design: {design}\n\
          available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates, optional SV1 adapter)\n\
          validation: local TCP/CPU experiments; live Chipnet and ASIC validation pending\n\
+         merge mining: commitment v1 (draft), both cases in one coinbase; no token registered (Chipnet test token for tests)\n\
          pending: physical ASIC validation, vardiff/device rates, Knuth TP, distributed rigs and pool routing\n\
          evidence: docs/implementation-status.md\n",
         feature = status.feature,

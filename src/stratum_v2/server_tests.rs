@@ -94,19 +94,47 @@ impl NodeRpc for Rpc {
                     MiningNetwork::Chipnet,
                 ))
                 .unwrap();
+                // #### PR #42: a merge-mining coinbase adds a zero-value
+                // commitment (output 0, OP_RETURN) and Case B tickets; the
+                // payouts are the other outputs.
+                let token_outputs = coinbase
+                    .output
+                    .iter()
+                    .filter(|output| {
+                        let script = output.script_pubkey.as_bytes();
+                        output.value.to_sat() == 0
+                            && (script.first() == Some(&0x6a)
+                                || super::merge::registry::is_ticket_script(script))
+                    })
+                    .count();
+                let payouts: Vec<_> = coinbase
+                    .output
+                    .iter()
+                    .filter(|output| {
+                        let script = output.script_pubkey.as_bytes();
+                        !(output.value.to_sat() == 0
+                            && (script.first() == Some(&0x6a)
+                                || super::merge::registry::is_ticket_script(script)))
+                    })
+                    .collect();
                 if node.public {
-                } else if coinbase.output.len() == 1 {
-                    assert_eq!(coinbase.output[0].value.to_sat(), 312_500_000);
-                    assert!(coinbase.output[0].script_pubkey.as_bytes() == donor);
+                } else if payouts.len() == 1 {
+                    assert_eq!(payouts[0].value.to_sat(), 312_500_000);
+                    assert!(payouts[0].script_pubkey.as_bytes() == donor);
                 } else {
-                    assert_eq!(coinbase.output.len(), 2);
-                    assert_eq!(coinbase.output[0].value.to_sat(), 309_375_000);
-                    assert_eq!(coinbase.output[1].value.to_sat(), 3_125_000);
-                    assert!(coinbase.output[0].script_pubkey.as_bytes() == expected);
-                    assert!(coinbase.output[1].script_pubkey.as_bytes() == donor);
+                    assert_eq!(payouts.len(), 2);
+                    assert_eq!(payouts[0].value.to_sat(), 309_375_000);
+                    assert_eq!(payouts[1].value.to_sat(), 3_125_000);
+                    assert!(payouts[0].script_pubkey.as_bytes() == expected);
+                    assert!(payouts[1].script_pubkey.as_bytes() == donor);
                 }
                 assert!(coinbase.input[0].witness.is_empty());
-                assert!((100..=200).contains(&consensus::serialize(coinbase).len()));
+                let size = consensus::serialize(coinbase).len();
+                if token_outputs == 0 {
+                    assert!((100..=200).contains(&size));
+                } else {
+                    assert!((200..=400).contains(&size), "{size}");
+                }
                 node.submissions += 1;
                 if node.reject {
                     Ok(json!("bad-cb-amount"))
@@ -195,6 +223,16 @@ impl Running {
         state_directory: Arc<TestDirectory>,
         public: Option<super::payout::PublicPool>,
     ) -> Self {
+        Self::start_full(nodes, state_directory, public, None)
+    }
+
+    /// #### PR #42: a server that merge-mines `tokens`.
+    fn start_full(
+        nodes: Vec<Arc<Mutex<Node>>>,
+        state_directory: Arc<TestDirectory>,
+        public: Option<super::payout::PublicPool>,
+        tokens: Option<Arc<super::merge::hub::TokenHub>>,
+    ) -> Self {
         let node = nodes[0].clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -213,6 +251,7 @@ impl Running {
             journal_path: state_directory.journal(),
             legacy_sources: vec![[42; 32]],
             pool_tag: Vec::new(),
+            tokens,
         };
         let thread = {
             let stop = stop.clone();
@@ -452,6 +491,70 @@ impl Device {
         assert_eq!(accepted.last_sequence_number, sequence);
         assert_eq!(accepted.new_submits_accepted_count, 1);
         header.block_hash().to_string()
+    }
+}
+
+// #### PR #42
+// What: a device mines the Chipnet test token through the real server: its
+// share wins Case A (the token's target) and, being a block, Case B; the
+// claim worker proves both, saves them owner-only, lists them on the
+// dashboard and moves the test token's baton, which re-issues jobs; a win is
+// never proven twice; the acknowledgement does not wait for any of it.
+// Look here if: the claim worker, the token hand-off or the re-publish on a
+// token change changes.
+#[test]
+fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
+    use super::merge::hub::TokenHub;
+    for extended in [false, true] {
+        let directory = Arc::new(TestDirectory::new());
+        let proofs = directory.0.join("token-proofs.json");
+        // The node's own target, so every share wins the Case A state.
+        let hub = Arc::new(
+            TokenHub::test_token(MiningNetwork::Chipnet, proofs.clone(), 0x207f_ffff).unwrap(),
+        );
+        let node = Arc::new(Mutex::new(Node {
+            height: 325908,
+            tip: "ab".repeat(32),
+            reject: false,
+            submissions: 0,
+            lose_replies: false,
+            submitted: Vec::new(),
+            known: std::collections::HashSet::new(),
+            unavailable: false,
+            public: false,
+        }));
+        let server = Running::start_full(vec![node], directory, None, Some(hub.clone()));
+        let mut device = Device::connect(&server, extended);
+        device.solve_and_submit(0);
+        server.wait(|stats| stats.recent_token_wins.len() >= 2);
+        let stats = server.stats.lock().unwrap().clone();
+        assert_eq!(stats.token_wins, 1, "one share, one hand-off");
+        assert_eq!(stats.token_wins_dropped, 0);
+        assert!(stats.tokens_off.is_none(), "{:?}", stats.tokens_off);
+        let mut modes: Vec<char> = stats.recent_token_wins.iter().map(|win| win.mode).collect();
+        modes.sort_unstable();
+        assert_eq!(modes, ['A', 'B']);
+        assert!(stats
+            .recent_token_wins
+            .iter()
+            .all(|win| win.token == "Pickaxe test token" && win.height == 325909));
+        let saved: Value = serde_json::from_slice(&std::fs::read(&proofs).unwrap()).unwrap();
+        assert_eq!(saved["network"], "chipnet");
+        let entries = saved["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry["status"] == "proven"));
+        assert!(!String::from_utf8(std::fs::read(&proofs).unwrap())
+            .unwrap()
+            .contains(&payout()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&proofs).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // The baton moved to the winning header: a new set, new jobs.
+        assert_eq!(hub.current().unwrap().serial(), 2);
+        device.sender.close();
     }
 }
 

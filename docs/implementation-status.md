@@ -1561,3 +1561,48 @@ Tests cover the floor and its cap, and vardiff ignoring shares that only the
 floor accepts. Session tests cover token wins in the responses beside a block,
 the best share from the carried hash, and new channels and jobs carrying the
 floor.
+
+## Merge-mining on the server: claim worker, proofs and the test token (2026-10-09)
+
+#### PR #42
+
+The server now merge-mines whatever token set it is given, and proves its
+wins. No token is registered on either network, so by default nothing changes:
+no hub, no commitment, the same coinbases.
+
+- Jobs carry the current token set. When a token's state changes, the server
+  publishes the same template again with the new set, without asking the
+  node, so devices get new jobs on the same parent and a failing node call
+  cannot revoke their work.
+- A share's token wins go from the device thread to a claim worker through a
+  bounded queue (64) with `try_send`: the acknowledgement never waits, and a
+  full queue drops the win and counts it. Each token state is handed on once.
+- The claim worker builds each won entry's proof and checks it with the
+  reference verifier exactly as a covenant would, for the job's beneficiary
+  and the donation's split. A proof that fails its own check is never kept and
+  turns token claims off. Passing proofs are saved to
+  `<config>.sv2-token-proofs.json`, owner-only and written whole, the newest
+  256 kept, with status "proven" (no token has a covenant or claim builder
+  yet, so nothing is broadcast). A journal that cannot be written turns token
+  claims off and leaves BCH mining as it is.
+- The dashboard's records line shows token wins (token, case, worker, any
+  dropped) or why tokens are off, and the status file lists them without any
+  address. Join a pool's connection info says merge-mined tokens are off at a
+  pool, since the pool builds the blocks. `stratum-v2 status` names merge
+  mining as a v1 draft.
+- The hidden `stratum-v2 serve --merge-test-token <DIFFICULTY>` merge-mines
+  the Chipnet test token in both cases, with a simulated baton that moves to
+  each winning header. Its registry row is on Chipnet, so mainnet refuses it.
+
+Not yet: Case B ticket maturity tracking (a found block's ticket is proven at
+once and the 100-block wait is left to a token's claim builder), and the
+opt-in live check that BCHN accepts a template with the commitment and a
+ticket (`validateblocktemplate`).
+
+Evidence: an end-to-end host test mines the test token through the real
+server on standard and extended channels: one share wins Case A and, being a
+block, Case B; both proofs are proven, saved owner-only without the payout
+address, listed on the dashboard, and the baton moves (a new set serial); the
+mock node accepts the block with the commitment and the ticket. Other tests
+cover the test token's difficulty and Chipnet-only rule, the records line and
+status file, and the capability report.

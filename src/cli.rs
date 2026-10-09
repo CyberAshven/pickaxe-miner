@@ -221,6 +221,17 @@ pub enum StratumV2Command {
         /// farms of fast ASICs; vardiff moves each device from there.
         #[arg(long, value_name = "DIFFICULTY", conflicts_with = "upstream")]
         start_difficulty: Option<u64>,
+        /// #### PR #42
+        /// Merge-mines the Chipnet test token at this share difficulty, to
+        /// try merge mining with real devices before any token exists;
+        /// refused on mainnet. Hidden: it is for tests.
+        #[arg(
+            long,
+            value_name = "DIFFICULTY",
+            hide = true,
+            conflicts_with = "upstream"
+        )]
+        merge_test_token: Option<u64>,
     },
 }
 

@@ -128,6 +128,7 @@ pub fn run(
         donation,
         pool_tag,
         start_difficulty,
+        merge_test_token,
         ..
     } = action
     else {
@@ -142,6 +143,16 @@ pub fn run(
             );
         }
         return Ok(());
+    };
+    // #### PR #42: the Chipnet merge-mining test token, when asked for; its
+    // registry row decides the network, so mainnet refuses it.
+    let tokens = match merge_test_token {
+        Some(difficulty) => Some(Arc::new(super::merge::hub::TokenHub::test_token(
+            config.network,
+            config_path.with_extension("sv2-token-proofs.json"),
+            super::merge::hub::bits_for_difficulty(difficulty)?,
+        )?)),
+        None => None,
     };
     // #### PR #40: where each device's difficulty starts.
     let share_target = match start_difficulty {
@@ -277,6 +288,7 @@ pub fn run(
                     .collect::<Result<_, _>>()?,
                 public: public.clone(),
                 donation: donation.clone(),
+                tokens: tokens.clone(),
                 #[cfg(test)]
                 allocation_phase: None,
             };
@@ -1360,7 +1372,9 @@ fn connect_text(page: &ConnectPage) -> String {
         }
         ServeMode::JoinPool => {
             "\nUsername: any name for the device; it names the device on the workers page. \
-             This computer mines at the pool for you.\n"
+             This computer mines at the pool for you.\nMerge-mined tokens are off at a pool: \
+             the pool builds the blocks, so this computer cannot add token commitments. Mine \
+             solo or run your own pool to merge-mine.\n"
         }
     });
     text.push_str("Password: anything; it is not checked.\n");
@@ -1465,6 +1479,19 @@ fn status_json(
             "seconds_ago": found.found.elapsed().as_secs(),
             "result": found.result,
         })).collect::<Vec<_>>(),
+        // #### PR #42: merge-mined token wins, with no address or script.
+        "tokens": serde_json::json!({
+            "wins": snapshot.token_wins,
+            "dropped": snapshot.token_wins_dropped,
+            "off": snapshot.tokens_off,
+            "recent": snapshot.recent_token_wins.iter().map(|win| serde_json::json!({
+                "token": win.token,
+                "mode": win.mode.to_string(),
+                "height": win.height,
+                "worker": win.worker,
+                "seconds_ago": win.found.elapsed().as_secs(),
+            })).collect::<Vec<_>>(),
+        }),
         "sv1_local_rejected": snapshot.sv1_local_rejected,
         "sessions_started": snapshot.sessions_started,
         "device_details": devices,
@@ -1889,8 +1916,25 @@ fn records_line(stats: &ServerStats) -> String {
             )
         })
         .collect::<Vec<_>>();
+    // #### PR #42: merge-mined token wins, when a token is merge-mined.
+    let tokens = match (&stats.tokens_off, stats.recent_token_wins.back()) {
+        (Some(off), _) => format!(" · Tokens off: {off}"),
+        (None, Some(last)) => format!(
+            " · Token wins {} (last: {} case {} by {}{})",
+            stats.recent_token_wins.len(),
+            last.token,
+            last.mode,
+            last.worker,
+            if stats.token_wins_dropped > 0 {
+                format!("; {} dropped", stats.token_wins_dropped)
+            } else {
+                String::new()
+            }
+        ),
+        (None, None) => String::new(),
+    };
     format!(
-        "Best share {best} · Recent blocks {}",
+        "Best share {best} · Recent blocks {}{tokens}",
         if blocks.is_empty() {
             "none yet".into()
         } else {
@@ -2006,6 +2050,39 @@ pub(crate) fn load_authority(path: &Path) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #42
+    // What: merge-mined token wins show on the dashboard's records line and
+    // in the status file (token, case, height, worker; never an address),
+    // and a journal failure says token claims are off.
+    // Look here if: records_line or status_json's tokens change.
+    #[test]
+    fn token_wins_show_on_the_dashboard_and_in_the_status() {
+        let mut stats = ServerStats::default();
+        assert!(!records_line(&stats).contains("Token"));
+        stats.token_wins = 2;
+        stats.token_wins_dropped = 1;
+        stats.recent_token_wins.push_back(server::FoundTokenWin {
+            token: "Pickaxe test token",
+            mode: 'A',
+            height: 325_909,
+            worker: "rig1 #1".into(),
+            found: Instant::now(),
+        });
+        let line = records_line(&stats);
+        assert!(
+            line.contains("Token wins 1 (last: Pickaxe test token case A by rig1 #1; 1 dropped)"),
+            "{line}"
+        );
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(status["tokens"]["wins"], 2);
+        assert_eq!(status["tokens"]["dropped"], 1);
+        assert_eq!(status["tokens"]["recent"][0]["mode"], "A");
+        assert_eq!(status["tokens"]["recent"][0]["height"], 325_909);
+        stats.tokens_off = Some("token proofs cannot be saved: disk full".into());
+        assert!(records_line(&stats).contains("Tokens off: token proofs cannot be saved"));
+        assert!(super::super::status_report().contains("merge mining: commitment v1 (draft)"));
+    }
 
     // #### PR #42
     // What: the devices file carries this server's addresses and each

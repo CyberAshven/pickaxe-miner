@@ -1817,6 +1817,7 @@ fn main() {
                                 pool_fee_address,
                                 pool_tag,
                                 start_difficulty: options.start_difficulty.filter(|_| !joining),
+                                merge_test_token: None,
                             };
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(
