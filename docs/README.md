@@ -10,6 +10,9 @@
 - [Fee policy](fee-policy.md)
 - [Rust dependency security](rust-security.md)
 - [Incremental-k search](incremental-k.md) (optional CUDA build feature)
+- [Running a pool](pool.md): an ASIC or GPU pool for other miners, as a service
+- [GPU farms](farm.md): rigs on many machines mining as one
+- [Merge-mining BCH tokens](merge-mining.md): the v1 draft specification for token authors
 
 ## Planning
 
@@ -22,4 +25,5 @@
 ## Records
 
 - [PHOTON fee hotfix](photon-fee-hotfix.md)
+- [Implementation status](implementation-status.md): what each change does and its evidence
 - [Experiments](experiments/README.md): engine evaluations and their raw results
