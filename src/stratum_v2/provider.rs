@@ -17,7 +17,55 @@ pub trait NodeRpc {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String>;
 }
 
+/// #### PR #42: what kind of place templates come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A node over JSON-RPC (getblocktemplate).
+    NodeRpc,
+    /// An SV2 Template Provider (Template Distribution).
+    TemplateProvider,
+}
+
+/// #### PR #42: a place templates come from. The server's node thread works
+/// with the first and fails over across the rest in order.
+pub trait TemplateSource: Send {
+    fn kind(&self) -> SourceKind;
+    /// The template last refreshed, with this source's generation.
+    fn current(&self) -> Option<(u64, &BchTemplate)>;
+    /// Whether the current template still builds on the chain tip.
+    fn tip_is_current(&mut self) -> Result<bool, String>;
+    /// A fresh template; its generation changes when the template does.
+    fn refresh(&mut self) -> Result<(u64, &BchTemplate), String>;
+    /// Sends a saved whole block; `Accepted` only on an exact answer.
+    fn submit_saved(&mut self, pending: &PendingBlock) -> SubmissionOutcome;
+    /// Forgets its templates, as when the server moves to another source.
+    fn reset(&mut self);
+}
+
+impl<R: NodeRpc + Send> TemplateSource for TemplateProvider<R> {
+    fn kind(&self) -> SourceKind {
+        SourceKind::NodeRpc
+    }
+    fn current(&self) -> Option<(u64, &BchTemplate)> {
+        TemplateProvider::current(self)
+    }
+    fn tip_is_current(&mut self) -> Result<bool, String> {
+        TemplateProvider::tip_is_current(self)
+    }
+    fn refresh(&mut self) -> Result<(u64, &BchTemplate), String> {
+        TemplateProvider::refresh(self)
+    }
+    fn submit_saved(&mut self, pending: &PendingBlock) -> SubmissionOutcome {
+        TemplateProvider::submit_saved(self, pending)
+    }
+    fn reset(&mut self) {
+        self.current = None;
+        self.previous.clear();
+    }
+}
+
 // Deliberately no Debug: endpoints may contain locally supplied credentials.
+#[derive(Clone)]
 pub struct NativeNodeRpc {
     endpoint: String,
 }

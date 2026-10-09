@@ -1757,3 +1757,29 @@ Pickaxe client mining at a Pickaxe pool (an SV2 device's block pays 304,734,375
 forwarded share on the custom job and lists the block as submitted by the
 miner's node), and a client falling back with the pool's reason at a pool
 without Job Declaration. Not yet run in two processes on Chipnet.
+
+## Template Distribution client (2026-10-10)
+
+#### PR #42
+
+`serve --template-provider sv2tp://HOST:PORT/KEY` (repeatable) takes
+templates from SV2 Template Providers before the configured nodes. The
+server's template thread now works with any `TemplateSource` (a node over
+JSON-RPC or a provider) and fails over across them in order, with
+server-owned generations so job ids never repeat across sources. The client
+pins the provider's key (unpinned only on loopback), declares a reserve of 122
+bytes (plus 53 and 46 per Case B ticket with tokens), follows NewTemplate and
+SetNewPrevHash, fetches transaction data (2 seconds at most), builds the
+template with the same checks as a node's, and confirms each new parent on
+the selected network through the first node or the network's Fulcrum
+servers. Solutions go back as SubmitSolution and count as accepted once the
+provider names the block as a parent; the first node also gets the whole
+block.
+
+Evidence: host tests for provided templates (height, flags, size limit, and
+each refusal), provider addresses, the reserve (122, 221 with the test
+token), a provider breaking the protocol, the network guard refusing and
+then confirming, and two loopback runs: a Pickaxe mining on another Pickaxe's
+template server (key pinned), whose block reaches both the provider's node
+(relayed) and its own (whole-block fallback), and the same with an unpinned
+provider on this computer. Not yet run against a node bridge or Knuth.

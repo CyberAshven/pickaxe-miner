@@ -255,6 +255,13 @@ pub enum StratumV2Command {
         /// the pool's own jobs. Needs your node, like solo mining.
         #[arg(long, value_name = "MODE", requires = "upstream")]
         job_declaration: Option<JobDeclarationMode>,
+        /// #### PR #42
+        /// Take templates from an SV2 Template Provider, tried before your
+        /// node: sv2tp://HOST:PORT/KEY, such as another Pickaxe's
+        /// --tp-listen. Repeat for more, tried in order. The key may be left
+        /// out only for a provider on this computer.
+        #[arg(long, value_name = "URL")]
+        template_provider: Vec<String>,
     },
 }
 
@@ -565,6 +572,35 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    // #### PR #42
+    // What: --template-provider repeats, in order.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn template_providers_parse_in_order() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--template-provider",
+            "sv2tp://127.0.0.1:48442",
+            "--template-provider",
+            "sv2tp://tp.example:8442/KEY",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command: StratumV2Command::Serve {
+                template_provider, ..
+            },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(
+            template_provider,
+            ["sv2tp://127.0.0.1:48442", "sv2tp://tp.example:8442/KEY"]
+        );
     }
 
     // #### PR #42

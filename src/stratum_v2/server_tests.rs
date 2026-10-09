@@ -259,7 +259,16 @@ impl Running {
         public: Option<super::payout::PublicPool>,
         tokens: Option<Arc<super::merge::hub::TokenHub>>,
     ) -> Self {
-        Self::start_config(nodes, state_directory, public, tokens, None, false, None)
+        Self::start_config(
+            nodes,
+            state_directory,
+            public,
+            tokens,
+            None,
+            false,
+            None,
+            Vec::new(),
+        )
     }
 
     /// #### PR #42: a Job Declaration client's local server on `node`,
@@ -278,6 +287,30 @@ impl Running {
                 identity: payout(),
                 retry: Duration::from_millis(500),
             }),
+            Vec::new(),
+        )
+    }
+
+    /// #### PR #42: a server whose templates come first from `provider`'s
+    /// template server, then from its own `node`.
+    pub(super) fn tdp_client(
+        node: Arc<Mutex<Node>>,
+        provider: super::tdp::client::TdpAddress,
+    ) -> Self {
+        let source = super::tdp::client::TdpSource::new(
+            provider,
+            super::tdp::PAYOUT_RESERVE,
+            Box::new(|_, _| Ok(())),
+        );
+        Self::start_config(
+            vec![node],
+            Arc::new(TestDirectory::new()),
+            None,
+            None,
+            None,
+            false,
+            None,
+            vec![Box::new(source)],
         )
     }
 
@@ -291,6 +324,7 @@ impl Running {
             None,
             true,
             None,
+            Vec::new(),
         )
     }
 
@@ -305,6 +339,7 @@ impl Running {
             Some(true),
             false,
             None,
+            Vec::new(),
         )
     }
 
@@ -319,6 +354,7 @@ impl Running {
             Some(false),
             false,
             None,
+            Vec::new(),
         )
     }
 
@@ -329,6 +365,7 @@ impl Running {
 
     /// `templates`: none, a relay journal only, or a relay journal and a
     /// template listener.
+    #[allow(clippy::too_many_arguments)]
     fn start_config(
         nodes: Vec<Arc<Mutex<Node>>>,
         state_directory: Arc<TestDirectory>,
@@ -337,6 +374,7 @@ impl Running {
         templates: Option<bool>,
         job_declaration: bool,
         uplink: Option<super::jd::client::JdTarget>,
+        mut sources: Vec<Box<dyn super::provider::TemplateSource>>,
     ) -> Self {
         let node = nodes[0].clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -388,7 +426,10 @@ impl Running {
                         devices: listener,
                         templates: template_listener,
                     },
-                    rpcs,
+                    {
+                        sources.extend(server::rpc_sources(rpcs, MiningNetwork::Chipnet));
+                        sources
+                    },
                     config,
                     stop,
                     stats,
@@ -2113,4 +2154,66 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
     stop.store(true, Ordering::Relaxed);
     thread.join().unwrap();
     drop(miner_node);
+}
+
+// #### PR #42
+// What: Pickaxe serves Pickaxe: a server takes its templates from another
+// Pickaxe's template server (key pinned), a CPU device mines a block on
+// them, and the block reaches the provider's node (relayed from
+// SubmitSolution) and the client's own node (the whole-block fallback); the
+// dashboard names the template provider.
+// Look here if: TdpSource, the source failover or the whole-block fallback
+// change.
+#[test]
+fn pickaxe_serves_pickaxe_and_a_block_reaches_both_nodes() {
+    let provider = Running::templates(pool_node(), Arc::new(TestDirectory::new()));
+    let key = {
+        let mut encoded = vec![1, 0];
+        encoded.extend(provider.authority);
+        stratum_core::bitcoin::base58::encode_check(&encoded)
+    };
+    let address = super::tdp::client::TdpAddress::parse(&format!(
+        "sv2tp://{}/{key}",
+        provider.templates.unwrap()
+    ))
+    .unwrap();
+    let client_node = pool_node();
+    let client = Running::tdp_client(client_node.clone(), address);
+    let stats = client.stats.lock().unwrap().clone();
+    assert_eq!(
+        stats.template_source,
+        Some(super::provider::SourceKind::TemplateProvider)
+    );
+    assert_eq!((stats.active_node, stats.nodes), (0, 2));
+    let mut device = Device::connect(&client, true);
+    device.solve_and_submit(0);
+    client.wait(|stats| stats.blocks_accepted == 1);
+    provider.wait(|stats| {
+        stats
+            .template_server
+            .as_ref()
+            .is_some_and(|templates| templates.relay_accepted == 1)
+    });
+    assert_eq!(client_node.lock().unwrap().submissions, 1);
+    assert_eq!(provider.node.lock().unwrap().submissions, 1);
+    device.sender.close();
+}
+
+// #### PR #42
+// What: a provider on this computer may be used without its key (the
+// session is refused for any other address), and its templates mine as a
+// pinned one's do.
+// Look here if: TdpAddress::parse or Session::initiate_unpinned changes.
+#[test]
+fn an_unpinned_provider_on_this_computer_serves_templates() {
+    let provider = Running::templates(pool_node(), Arc::new(TestDirectory::new()));
+    let address =
+        super::tdp::client::TdpAddress::parse(&format!("sv2tp://{}", provider.templates.unwrap()))
+            .unwrap();
+    assert!(address.authority.is_none());
+    let client = Running::tdp_client(pool_node(), address);
+    let mut device = Device::connect(&client, false);
+    device.solve_and_submit(0);
+    client.wait(|stats| stats.blocks_accepted == 1);
+    device.sender.close();
 }

@@ -8,7 +8,7 @@ shares the same code path with a network switch.
 
 | Role | Purpose |
 |---|---|
-| **Template Provider client** | Pull full block templates from the miner's own node (BCHN or Knuth) and keep them fresh. |
+| **Template Provider client** | Pull full block templates from the miner's own node (BCHN over JSON-RPC) or, from PR #42, from an SV2 Template Provider (`--template-provider`), and keep them fresh. |
 | **Mining server** | Serve SV2 mining channels to devices (Bitaxe native SV2 and SV1 via translator). Check shares, submit blocks. |
 | **SV1 translator** | Accept Stratum V1 firmware (Avalon Nano and most home ASICs) and translate to the SV2 mining server. Required in this implementation scope. |
 | **Job Declaration client** (PR #42) | Mine at a Pickaxe pool with your own node's templates (`--job-declaration coinbase`); devices fall back to the pool's own jobs when the pool refuses them. See [job-declaration.md](job-declaration.md). |
@@ -60,13 +60,14 @@ assumptions baked into some SV2 examples:
 | **bchn-sv2-bridge** | External AGPL TP for unmodified BCHN over JSON-RPC; tested on mainnet; keeps JD off because unordered JD breaks CTOR. |
 | **Own JSON-RPC template client** | Current implementation feeds the mining server from BCHN full `getblocktemplate` / `submitblock`. GBT-light remains pending. |
 | **Knuth native TP (future integration)** | Upstream has merged SV2 framing and message building blocks. Those changes do not establish a complete, interoperable template provider. |
+| **SV2 Template Providers** (PR #42) | `--template-provider sv2tp://HOST:PORT/KEY` takes templates from another Pickaxe's template server, a node bridge with a Noise shim, or a node with a provider built in (Knuth has the codecs but no listener yet); see [Templates from a provider](#templates-from-a-provider-template-distribution-client). |
 | **Pickaxe's own template server** (PR #42) | `serve --tp-listen` hands this node's full templates to SV2 pools and P2Pool, the other direction; see [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
 
 ## Open decision: AGPL bridge vs own TP client
 
 **Initial implementation:** an in-tree full JSON-RPC template provider, pinned
-to the source node. GBT-light and a Template Distribution client remain
-pending; the server side is in PR #42.
+to the source node. GBT-light remains pending; PR #42 adds the Template
+Distribution client and server.
 
 **Chipnet test baseline:** use BCHN through the in-tree full-template client.
 This keeps deployment to Pickaxe plus the node, without an external bridge.
@@ -421,6 +422,47 @@ format version 1; the SV2 spec requires 0 and requires clients to refuse other
 versions, so Pickaxe reports "upstream certificate version is not SV2's" there
 until CashStratum fixes it
 ([cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3)).
+
+### Templates from a provider (Template Distribution client)
+
+#### PR #42
+
+A server can take its templates from SV2 Template Providers before (or
+instead of) its nodes:
+
+```text
+pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json \
+  --template-provider sv2tp://192.168.0.160:48442/KEY [--template-provider ...]
+```
+
+The key is the provider's authority key; it may be left out only for a
+provider on this computer. Providers are tried in order, then the configured
+nodes, and the first that gives a verified template goes first; the server
+fails over across all of them as it does across nodes, with job ids that
+never repeat. The overview names the active one ("templates from template
+provider 1 of 2"), and the status file's `template_source` gives its kind
+(`tdp` or `rpc`), place and count, never its address.
+
+- The client declares the coinbase bytes it may add
+  (`CoinbaseOutputConstraints`): 122 for the payouts, plus 53 for a
+  merge-mining commitment and 46 per Case B ticket while tokens are mined
+  (221 with the Chipnet test token). The template's size limit is the
+  provider's transactions, the header and that reserve.
+- A template is checked as a node's is: the prefix a minimal BIP34 height
+  push of at most 8 bytes, no required coinbase outputs and no excess data
+  (either means a Bitcoin provider), the value within the money supply, the
+  provider's target no easier than its bits, the transactions full,
+  witness-free and in CTOR order, and their merkle path the one announced.
+- Template ids must rise, a SetNewPrevHash must name a template announced as
+  future (at most 8 wait), and a current template needs an earlier
+  SetNewPrevHash; a provider that breaks this, or sends no transaction data
+  within 2 seconds, is left for the next source.
+- A provider's new parent is confirmed on the selected network before its
+  template is mined: by the first configured node, or by the network's
+  Fulcrum servers without one.
+- A block on a provider's template is saved in the block journal, sent back as
+  SubmitSolution, and counted accepted once the provider names it as a later
+  parent; meanwhile the first configured node gets the whole block too.
 
 ### Serving templates to a pool (Template Distribution)
 

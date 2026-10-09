@@ -10,7 +10,7 @@ use super::{
     },
     journal::{Journal, PendingBlock},
     merge::hub::TokenHub,
-    provider::{NodeRpc, SubmissionOutcome, TemplateProvider},
+    provider::{NodeRpc, SourceKind, SubmissionOutcome, TemplateProvider, TemplateSource},
     tdp,
     telemetry::Devices,
     template::{BchTemplate, Hash},
@@ -113,6 +113,9 @@ pub struct ServerStats {
     pub jd_server: Option<JdServerStats>,
     /// #### PR #42: the Job Declaration client's state and counts.
     pub jd_client: Option<JdClientSummary>,
+    /// #### PR #42: what kind of source the active one is (`active_node` is
+    /// its place in failover order).
+    pub template_source: Option<SourceKind>,
 }
 
 /// #### PR #42: what the Job Declaration server did. No count names a
@@ -355,22 +358,36 @@ pub fn run<R: NodeRpc + Send + 'static>(
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
+    let sources = rpc_sources(nodes, config.network);
     run_with(
         Listeners {
             devices: listener,
             templates: None,
         },
-        nodes,
+        sources,
         config,
         stop,
         stats,
     )
 }
 
-/// `run`, also serving templates when `listeners` has a template listener.
-pub fn run_with<R: NodeRpc + Send + 'static>(
-    listeners: Listeners,
+/// #### PR #42: nodes as template sources, in failover order.
+pub fn rpc_sources<R: NodeRpc + Send + 'static>(
     nodes: Vec<R>,
+    network: MiningNetwork,
+) -> Vec<Box<dyn TemplateSource>> {
+    nodes
+        .into_iter()
+        .map(|rpc| Box::new(TemplateProvider::new(rpc, network)) as Box<dyn TemplateSource>)
+        .collect()
+}
+
+/// `run` with any template sources (nodes and template providers, in
+/// failover order), also serving templates when `listeners` has a template
+/// listener.
+pub fn run_with(
+    listeners: Listeners,
+    sources: Vec<Box<dyn TemplateSource>>,
     config: ServerConfig,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
@@ -379,9 +396,13 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
         devices: listener,
         templates,
     } = listeners;
-    let total = nodes.len();
-    let mut standby = VecDeque::from(nodes);
-    let rpc = standby.pop_front().ok_or("no BCH node configured")?;
+    let total = sources.len();
+    if total == 0 {
+        return Err("no BCH node configured".into());
+    }
+    // #### PR #42: each source keeps its place in failover order.
+    let mut sources: VecDeque<(usize, Box<dyn TemplateSource>)> =
+        sources.into_iter().enumerate().collect();
     validate_payout_address(config.network, &config.payout)
         .map_err(|_| "invalid payout for selected network")?;
     if config.share_target == [0; 32] {
@@ -421,6 +442,7 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
     if let Ok(mut stats) = stats.lock() {
         stats.nodes = total;
         stats.active_node = 0;
+        stats.template_source = Some(sources[0].1.kind());
         if relay.is_some() {
             stats.template_server = Some(TemplateServerStats::default());
         }
@@ -492,15 +514,22 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
     update_journal_stats(&shared)?;
     update_relay_stats(&shared)?;
     let node_shared = shared.clone();
-    let network = config.network;
     let tag = config.pool_tag.clone();
     let node_tokens = config.tokens.clone();
     let node_uplink = config.uplink.clone();
     let node = thread::spawn(move || -> Result<(), String> {
         // #### PR #42: the plan serial jobs were last published with.
         let mut published_plan: Option<u64> = None;
-        let mut provider = TemplateProvider::new(rpc, network);
-        let mut active = 0;
+        // #### PR #42: server-owned generations
+        // What: the server counts its own template generations: a new one
+        // whenever the active source or its generation changes, the same one
+        // when a template is published again (a token set or a plan change).
+        // Why: each source counts its own generations, and after a failover
+        // an equal number would look like the same template, so devices
+        // would get no new jobs.
+        // Look here if: devices keep old jobs after the server moves to its
+        // next source.
+        let mut generations = Generations::default();
         let mut refreshed = Instant::now() - Duration::from_secs(60);
         let mut retries = RetrySchedule::default();
         let mut relay_retries = RetrySchedule::default();
@@ -515,7 +544,7 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
             // Release its lock before RPC so another device can persist a block
             // while a reply is delayed. Retry old blocks fairly with backoff.
             if let Some((pending, outcome, retry)) =
-                submit_next(&node_shared.journal, &mut retries, &mut provider)?
+                submit_next(&node_shared.journal, &mut retries, &mut sources)?
             {
                 if let Ok(mut stats) = node_shared.stats.lock() {
                     if retry {
@@ -561,7 +590,8 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
             if let Some(relay) = node_shared.relay.as_ref() {
                 let once = relay.once.lock().ok().and_then(|mut once| once.pop_front());
                 if let Some(block) = once {
-                    let accepted = provider.submit_saved(&block) == SubmissionOutcome::Accepted;
+                    let accepted =
+                        submit_saved(&mut sources, &block) == SubmissionOutcome::Accepted;
                     node_shared.template_stats(|stats| {
                         stats.once_sent = stats.once_sent.saturating_add(1);
                         stats.once_accepted =
@@ -569,7 +599,7 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
                     });
                     refreshed = Instant::now() - Duration::from_secs(60);
                 }
-                if submit_next(&relay.journal, &mut relay_retries, &mut provider)?.is_some() {
+                if submit_next(&relay.journal, &mut relay_retries, &mut sources)?.is_some() {
                     update_relay_stats(&node_shared)?;
                     refreshed = Instant::now() - Duration::from_secs(60);
                 }
@@ -593,7 +623,9 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
                 current_plan(uplink).map(|plan| plan.serial) != published_plan
             });
             if node_tokens.as_ref().is_some_and(|hub| hub.take_changed()) || plan_changed {
-                if let Some((generation, template)) = provider.current() {
+                let slot = sources[0].0;
+                if let Some((generation, template)) = sources[0].1.current() {
+                    let generation = generations.of(slot, generation);
                     let (template, serial) =
                         with_tokens(template.clone(), &tag, node_tokens.as_deref());
                     offer(
@@ -606,10 +638,12 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
                     );
                 }
             }
-            let current = provider.tip_is_current().unwrap_or(false);
+            let current = sources[0].1.tip_is_current().unwrap_or(false);
             if !current || refreshed.elapsed() >= Duration::from_secs(15) {
-                match provider.refresh() {
+                let slot = sources[0].0;
+                match sources[0].1.refresh() {
                     Ok((generation, template)) => {
+                        let generation = generations.of(slot, generation);
                         let (template, serial) =
                             with_tokens(template.clone(), &tag, node_tokens.as_deref());
                         offer(
@@ -637,12 +671,16 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
                         // blocks, so they go to the next node too.
                         // Look here if: the node number on the dashboard keeps
                         // changing, which means every node is failing.
-                        if let Some(mut next) = standby.pop_front() {
-                            provider.replace_node(&mut next);
-                            standby.push_back(next);
-                            active = (active + 1) % total;
+                        // #### PR #42: across nodes and template providers
+                        // alike (see `TemplateSource`).
+                        if total > 1 {
+                            if let Some((slot, mut failed)) = sources.pop_front() {
+                                failed.reset();
+                                sources.push_back((slot, failed));
+                            }
                             if let Ok(mut stats) = node_shared.stats.lock() {
-                                stats.active_node = active;
+                                stats.active_node = sources[0].0;
+                                stats.template_source = Some(sources[0].1.kind());
                                 stats.node_switches = stats.node_switches.saturating_add(1);
                             }
                             refreshed = Instant::now() - Duration::from_secs(60);
@@ -834,14 +872,66 @@ impl RetrySchedule {
     }
 }
 
+/// #### PR #42: the server's own generation numbers (see the node thread).
+#[derive(Default)]
+struct Generations {
+    count: u64,
+    last: Option<(usize, u64)>,
+}
+
+impl Generations {
+    /// The server generation of `source`'s generation `generation`.
+    fn of(&mut self, source: usize, generation: u64) -> u64 {
+        if self.last != Some((source, generation)) {
+            self.count += 1;
+            self.last = Some((source, generation));
+        }
+        self.count
+    }
+}
+
+// #### PR #42: the whole-block fallback
+// What: a saved block goes to the active source; when that is a template
+// provider and its answer is not final, the first node among the other
+// sources gets the whole block too.
+// Why: a template provider's template is full, so the journal holds a whole
+// block any node of the network takes (PR #40's rule), and a provider may
+// relay a block slowly or not at all.
+// Look here if: a block found on a provider's template is missing on chain
+// while a node is configured.
+fn submit_saved(
+    sources: &mut VecDeque<(usize, Box<dyn TemplateSource>)>,
+    pending: &PendingBlock,
+) -> SubmissionOutcome {
+    let Some((_, active)) = sources.front_mut() else {
+        return SubmissionOutcome::Pending("no template source");
+    };
+    let outcome = active.submit_saved(pending);
+    if active.kind() == SourceKind::TemplateProvider
+        && matches!(outcome, SubmissionOutcome::Pending(_))
+    {
+        if let Some((_, node)) = sources
+            .iter_mut()
+            .skip(1)
+            .find(|(_, source)| source.kind() == SourceKind::NodeRpc)
+        {
+            let fallback = node.submit_saved(pending);
+            if !matches!(fallback, SubmissionOutcome::Pending(_)) {
+                return fallback;
+            }
+        }
+    }
+    outcome
+}
+
 /// #### PR #38: one saved block from `journal` to the node: the oldest one
 /// due, retried with backoff until the node answers exactly. The journal's
 /// lock is released during the RPC. Returns the block, the node's answer and
 /// whether it was a retry.
-fn submit_next<R: NodeRpc>(
+fn submit_next(
     journal: &Mutex<Journal>,
     retries: &mut RetrySchedule,
-    provider: &mut TemplateProvider<R>,
+    sources: &mut VecDeque<(usize, Box<dyn TemplateSource>)>,
 ) -> Result<Option<(PendingBlock, SubmissionOutcome, bool)>, String> {
     let pending = {
         let journal = journal.lock().map_err(|_| "block journal unavailable")?;
@@ -853,7 +943,7 @@ fn submit_next<R: NodeRpc>(
         return Ok(None);
     };
     let retry = retries.is_retry(&pending.hash);
-    let outcome = provider.submit_saved(&pending);
+    let outcome = submit_saved(sources, &pending);
     match outcome {
         SubmissionOutcome::Accepted | SubmissionOutcome::Rejected(_) => {
             journal
@@ -1101,6 +1191,24 @@ pub(super) fn template_reason(error: &str) -> &'static str {
         }
         "invalid block template" => "invalid block template",
         "template generation exhausted" => "template generation exhausted",
+        // #### PR #42: template providers' reasons, as they are.
+        "template provider closed the connection" => "template provider closed the connection",
+        "template provider broke the protocol" => "template provider broke the protocol",
+        "template provider sent an invalid template" => {
+            "template provider sent an invalid template"
+        }
+        "template provider's network is not confirmed" => {
+            "template provider's network is not confirmed"
+        }
+        "template provider sent no transaction data in time" => {
+            "template provider sent no transaction data in time"
+        }
+        "template too large for SV2" => "template too large for SV2",
+        "template provider sent no template" => "template provider sent no template",
+        "cannot reach the template provider" => "cannot reach the template provider",
+        "template provider requires coinbase outputs (a Bitcoin template?)" => {
+            "template provider requires coinbase outputs (a Bitcoin template?)"
+        }
         _ => "node RPC unavailable",
     }
 }

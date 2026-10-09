@@ -732,3 +732,63 @@ fn provider_revokes_work_on_failure_wrong_network_sync_or_tip_race() {
     let mut provider = TemplateProvider::new(RpcFixture(calls), MiningNetwork::Chipnet);
     assert!(provider.refresh().is_err());
 }
+
+// #### PR #42
+// What: a provider's template is built from what it announced: the height
+// from its push, its flags kept, the size limit from its transactions and
+// the reserve; a prefix over 8 bytes, a non-minimal or missing push, a
+// value over the money supply, a target easier than the bits, transactions
+// out of CTOR order and a merkle path that disagrees are refused.
+// Look here if: BchTemplate::from_provided changes.
+#[test]
+fn provided_templates_are_checked_like_a_nodes() {
+    let (_, txids) = template_with(3);
+    let mut txs: Vec<Value> = (1..=3).map(transaction).collect();
+    txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+    let bytes: Vec<Vec<u8>> = txs
+        .iter()
+        .map(|tx| hex::decode(tx["data"].as_str().unwrap()).unwrap())
+        .collect();
+    let path = coinbase_path(&txids);
+    let base = |prefix: &'static [u8]| Provided {
+        previous_hash: [0xab; 32],
+        version: 0x2000_0000,
+        bits: 0x207f_ffff,
+        target: compact_target(0x207f_ffff).unwrap(),
+        ntime: 1_700_000_010,
+        prefix,
+        value: 312_500_000,
+        transactions: bytes.clone(),
+        merkle_path: &path,
+        reserve: 122,
+    };
+    let template = BchTemplate::from_provided(base(&[3, 0x15, 0xf9, 0x04, 0xaa])).unwrap();
+    assert_eq!(template.height, 325_909);
+    assert_eq!(template.script_head(), [3, 0x15, 0xf9, 0x04, 0xaa]);
+    let size: u64 = bytes.iter().map(|tx| tx.len() as u64).sum();
+    assert_eq!(template.size_limit, 80 + 1 + size + 153 + 122);
+    assert_eq!(template.merkle_path(), path.as_slice());
+    for (prefix, why) in [
+        (&[3, 0x15, 0xf9, 0x04, 1, 2, 3, 4, 5][..], "over 8 bytes"),
+        (&[4, 0x15, 0xf9, 0x04, 0x00][..], "a non-minimal push"),
+        (&[0x00][..], "no height"),
+    ] {
+        assert!(BchTemplate::from_provided(base(prefix)).is_err(), "{why}");
+    }
+    let mut rich = base(&[3, 0x15, 0xf9, 0x04]);
+    rich.value = 21_000_000 * 100_000_000 + 1;
+    assert!(BchTemplate::from_provided(rich).is_err());
+    let mut easy = base(&[3, 0x15, 0xf9, 0x04]);
+    easy.bits = 0x1d00_ffff;
+    assert!(
+        BchTemplate::from_provided(easy).is_err(),
+        "a target easier than the bits"
+    );
+    let mut shuffled = base(&[3, 0x15, 0xf9, 0x04]);
+    shuffled.transactions.reverse();
+    assert!(BchTemplate::from_provided(shuffled).is_err());
+    let wrong_path = vec![[0; 32]; path.len()];
+    let mut wrong = base(&[3, 0x15, 0xf9, 0x04]);
+    wrong.merkle_path = &wrong_path;
+    assert!(BchTemplate::from_provided(wrong).is_err());
+}

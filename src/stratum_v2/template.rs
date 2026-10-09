@@ -107,19 +107,7 @@ impl BchTemplate {
             if total_size > size_limit {
                 return Err("template transactions exceed block size limit".into());
             }
-            // Bitcoin's decoder treats CashTokens prefixes as opaque output
-            // script bytes. Reject witness serialization explicitly: BCH txids
-            // commit to all bytes. No Bitcoin consensus validation is used.
-            let tx: Transaction =
-                consensus::deserialize(&bytes).map_err(|_| "malformed template transaction")?;
-            if tx.is_coinbase()
-                || tx.input.is_empty()
-                || tx.input.iter().any(|input| !input.witness.is_empty())
-                || bytes.get(4) == Some(&0)
-            {
-                return Err("template contains coinbase, empty inputs or witness encoding".into());
-            }
-            let hash = double_sha256(&bytes);
+            let hash = checked_transaction(&bytes)?;
             if display_hash(text(entry, "txid")?)? != hash {
                 return Err("transaction bytes disagree with template txid".into());
             }
@@ -167,6 +155,93 @@ impl BchTemplate {
             coinbase_flags,
             merkle_path: coinbase_path(&transaction_hashes).into(),
             transactions,
+            tokens: None,
+            header_only: false,
+            jd: None,
+        })
+    }
+
+    /// #### PR #42: a Template Distribution provider's template
+    /// What: built from what a provider announced, checked as a node's are:
+    /// the prefix a minimal BIP34 height push (at most 8 bytes, its rest the
+    /// node's flags), the value within the money supply, the provider's
+    /// target no easier than `nBits`'s (the block target is `nBits`'s), the
+    /// transactions full, witness-free and in CTOR order (at most 65,535),
+    /// and their coinbase merkle path the one announced. Its size limit is
+    /// the transactions, the header and the largest coinbase the reserve
+    /// allows, which `coinbase_with_aux` then keeps to.
+    /// Why: TDP carries no size limit and no chain; a provider must not make
+    /// this server mine an invalid or oversized block.
+    /// Look here if: a provider's templates are refused, or a block from one
+    /// is too large.
+    pub fn from_provided(provided: Provided<'_>) -> Result<Self, String> {
+        let prefix = provided.prefix;
+        if prefix.len() > 8 {
+            return Err("template provider sent a coinbase prefix over 8 bytes".into());
+        }
+        let height = match prefix.first() {
+            Some(&op) if (0x51..=0x60).contains(&op) => u32::from(op - 0x50),
+            Some(&length @ 1..=4) => {
+                let bytes = prefix
+                    .get(1..1 + usize::from(length))
+                    .ok_or("template provider sent a truncated height push")?;
+                let mut word = [0; 4];
+                word[..bytes.len()].copy_from_slice(bytes);
+                u32::from_le_bytes(word)
+            }
+            _ => return Err("template provider's coinbase prefix is not a height push".into()),
+        };
+        let push = height_script(height);
+        if height == 0 || height >= 1 << 31 || !prefix.starts_with(&push) {
+            return Err("template provider's height push is not minimal".into());
+        }
+        if provided.value > 21_000_000 * 100_000_000 {
+            return Err("coinbase value exceeds BCH monetary range".into());
+        }
+        let target = compact_target(provided.bits)?;
+        if !meets_target(&provided.target, &target) {
+            return Err("template provider's target is easier than its bits".into());
+        }
+        if provided.transactions.len() > 65_535 {
+            return Err("template too large for SV2".into());
+        }
+        let mut hashes = Vec::with_capacity(provided.transactions.len());
+        let mut previous_display: Option<Hash> = None;
+        let mut size = 0u64;
+        for bytes in &provided.transactions {
+            let hash = checked_transaction(bytes)?;
+            let mut display = hash;
+            display.reverse();
+            if previous_display.is_some_and(|previous| previous >= display) {
+                return Err("template transactions are duplicated or not in CTOR order".into());
+            }
+            previous_display = Some(display);
+            size += bytes.len() as u64;
+            hashes.push(hash);
+        }
+        let merkle_path = coinbase_path(&hashes);
+        if merkle_path != provided.merkle_path {
+            return Err("template provider's merkle path disagrees with its transactions".into());
+        }
+        let mut count = Vec::new();
+        compact_size(provided.transactions.len() + 1, &mut count);
+        Ok(Self {
+            previous_hash: provided.previous_hash,
+            version: provided.version,
+            bits: provided.bits,
+            target,
+            min_time: provided.ntime,
+            current_time: provided.ntime,
+            height,
+            size_limit: 80
+                + count.len() as u64
+                + size
+                + super::tdp::COINBASE_FIXED
+                + u64::from(provided.reserve),
+            coinbase_value: provided.value,
+            coinbase_flags: prefix[push.len()..].to_vec(),
+            transactions: provided.transactions,
+            merkle_path: merkle_path.into(),
             tokens: None,
             header_only: false,
             jd: None,
@@ -545,6 +620,41 @@ impl BchTemplate {
         }
         Ok(())
     }
+}
+
+/// #### PR #42: what a Template Distribution provider announced for one
+/// template, with its transactions.
+pub struct Provided<'a> {
+    pub previous_hash: Hash,
+    pub version: u32,
+    pub bits: u32,
+    /// The provider's target, which may be harder than `bits`'s.
+    pub target: Hash,
+    pub ntime: u32,
+    /// The coinbase prefix: the height push, then any flags.
+    pub prefix: &'a [u8],
+    pub value: u64,
+    pub transactions: Vec<Vec<u8>>,
+    pub merkle_path: &'a [Hash],
+    /// The coinbase output bytes this server declared it may add.
+    pub reserve: u32,
+}
+
+/// A template transaction's hash after the BCH checks: it decodes, is no
+/// coinbase, has inputs and no witness encoding. Bitcoin's decoder treats
+/// CashTokens prefixes as opaque output script bytes; BCH txids commit to
+/// every byte. No Bitcoin consensus validation is used.
+fn checked_transaction(bytes: &[u8]) -> Result<Hash, String> {
+    let tx: Transaction =
+        consensus::deserialize(bytes).map_err(|_| "malformed template transaction")?;
+    if tx.is_coinbase()
+        || tx.input.is_empty()
+        || tx.input.iter().any(|input| !input.witness.is_empty())
+        || bytes.get(4) == Some(&0)
+    {
+        return Err("template contains coinbase, empty inputs or witness encoding".into());
+    }
+    Ok(double_sha256(bytes))
 }
 
 pub fn double_sha256(bytes: &[u8]) -> Hash {

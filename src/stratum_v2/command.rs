@@ -5,7 +5,7 @@
 use super::{
     fleet::Fleet,
     panel::{DevicePanel, Selection},
-    provider::{NativeNodeRpc, TemplateProvider},
+    provider::{NativeNodeRpc, TemplateProvider, TemplateSource},
     server::{self, ServerConfig, ServerStats},
     telemetry::{AddressIssue, DeviceSnapshot},
     template::{compact_target, BchTemplate},
@@ -115,8 +115,34 @@ pub fn run(
         config::validate_payout_address(config.network, &config.payout_address)
             .map_err(|_| "a valid payout for the selected network is required")?;
     }
+    // #### PR #42: template providers, tried before the nodes, told the
+    // coinbase bytes this server may add (with the test token's when asked
+    // for; its registry row decides the network, so mainnet refuses it).
+    let (providers, test_token) = match &action {
+        StratumV2Command::Serve {
+            template_provider,
+            merge_test_token,
+            ..
+        } => (
+            template_provider
+                .iter()
+                .map(|text| super::tdp::client::TdpAddress::parse(text))
+                .collect::<Result<Vec<_>, _>>()?,
+            *merge_test_token,
+        ),
+        _ => (Vec::new(), None),
+    };
+    let tokens = match test_token {
+        Some(difficulty) => Some(Arc::new(super::merge::hub::TokenHub::test_token(
+            config.network,
+            config_path.with_extension("sv2-token-proofs.json"),
+            super::merge::hub::bits_for_difficulty(difficulty)?,
+        )?)),
+        None => None,
+    };
+    let reserve = super::tdp::reserve(tokens.as_ref().and_then(|hub| hub.current()).as_deref());
     let node = if pools.is_empty() || declaring {
-        Some(preflight(config)?)
+        Some(preflight_sources(config, &providers, reserve)?)
     } else {
         None
     };
@@ -125,7 +151,7 @@ pub fn run(
     // for check-node, the dashboard and the saved status.
     let node_client = node
         .as_ref()
-        .and_then(|(nodes, _)| nodes.first())
+        .and_then(|(nodes, _, _)| nodes.first())
         .and_then(|rpc| rpc.info().ok())
         .map(|info| info.client);
     // #### PR #42: whether the pool knows this server by another name than
@@ -143,13 +169,12 @@ pub fn run(
         donation,
         pool_tag,
         start_difficulty,
-        merge_test_token,
         tp_listen,
         accept_job_declaration,
         ..
     } = action
     else {
-        if let Some((_, template)) = &node {
+        if let Some((_, _, template)) = &node {
             println!(
                 "{}",
                 serde_json::json!({
@@ -160,16 +185,6 @@ pub fn run(
             );
         }
         return Ok(());
-    };
-    // #### PR #42: the Chipnet merge-mining test token, when asked for; its
-    // registry row decides the network, so mainnet refuses it.
-    let tokens = match merge_test_token {
-        Some(difficulty) => Some(Arc::new(super::merge::hub::TokenHub::test_token(
-            config.network,
-            config_path.with_extension("sv2-token-proofs.json"),
-            super::merge::hub::bits_for_difficulty(difficulty)?,
-        )?)),
-        None => None,
     };
     // #### PR #40: where each device's difficulty starts.
     let share_target = match start_difficulty {
@@ -335,7 +350,7 @@ pub fn run(
     });
     let uplink_handle = uplink.as_ref().map(|(handle, _)| handle.clone());
     let worker = match (node, listener, authority_secret) {
-        (Some((nodes, _)), Some(listener), Some(authority_secret)) => {
+        (Some((nodes, sources, _)), Some(listener), Some(authority_secret)) => {
             // Difficulty 4096 is each device's starting target; vardiff then
             // moves it toward 20 shares a minute. No nominal device rate is
             // shown as measured.
@@ -371,7 +386,7 @@ pub fn run(
                         devices: listener,
                         templates: tp_listener,
                     },
-                    nodes,
+                    sources,
                     settings,
                     stop,
                     stats,
@@ -1621,6 +1636,15 @@ fn status_json(
         "template_failures": snapshot.template_failures,
         "last_template_error": snapshot.last_template_error,
         "node_active": snapshot.active_node + 1,
+        // #### PR #42: the kind of the active template source.
+        "template_source": snapshot.template_source.map(|kind| serde_json::json!({
+            "kind": match kind {
+                super::provider::SourceKind::NodeRpc => "rpc",
+                super::provider::SourceKind::TemplateProvider => "tdp",
+            },
+            "index": snapshot.active_node,
+            "count": snapshot.nodes,
+        })),
         "nodes": snapshot.nodes,
         "node_switches": snapshot.node_switches,
         "best_share": snapshot.best_share.as_ref().map(|(difficulty, worker)| {
@@ -2214,6 +2238,14 @@ fn records_line(stats: &ServerStats) -> String {
 /// it was read from (the first in failover order), and which node of
 /// several, such as " (Bitcoin Cash Node 29.1.0) · node 1 of 2".
 fn node_label(client: Option<&str>, stats: &ServerStats) -> String {
+    // #### PR #42: templates from a template provider say so.
+    if stats.template_source == Some(super::provider::SourceKind::TemplateProvider) {
+        return format!(
+            " · templates from template provider {} of {}",
+            stats.active_node + 1,
+            stats.nodes
+        );
+    }
     let mut label = node_suffix(client.filter(|_| stats.active_node == 0));
     if stats.nodes > 1 {
         label.push_str(&format!(
@@ -2231,6 +2263,112 @@ fn node_suffix(client: Option<&str>) -> String {
     client
         .map(|client| format!(" ({client})"))
         .unwrap_or_default()
+}
+
+/// #### PR #42: what preflight found: the nodes (for their identity and
+/// client), every template source in failover order, and its first template.
+type Preflight = (
+    Vec<NativeNodeRpc>,
+    Vec<Box<dyn TemplateSource>>,
+    BchTemplate,
+);
+
+// #### PR #42: mixed failover
+// What: the template providers (in their order), then the nodes (in theirs)
+// are tried, and the first that gives a verified template goes first; the
+// server then fails over across all of them. A provider's new parent is
+// confirmed on this network by the first node, or by the network's Fulcrum
+// servers without one.
+// Why: a template provider can stand in for the miner's RPC login, and a
+// node keeps mining going when the provider is down.
+// Look here if: the server starts on another source than expected, or a
+// provider is refused at start.
+fn preflight_sources(
+    config: &RuntimeConfig,
+    providers: &[super::tdp::client::TdpAddress],
+    reserve: u32,
+) -> Result<Preflight, String> {
+    if providers.is_empty() {
+        let (nodes, template) = preflight(config)?;
+        let sources = server::rpc_sources(nodes.clone(), config.network);
+        return Ok((nodes, sources, template));
+    }
+    let endpoints = config.custom_node_endpoints();
+    let mut sources: Vec<Box<dyn TemplateSource>> = providers
+        .iter()
+        .map(|address| {
+            Box::new(super::tdp::client::TdpSource::new(
+                address.clone(),
+                reserve,
+                chain_guard(config),
+            )) as Box<dyn TemplateSource>
+        })
+        .collect();
+    sources.extend(server::rpc_sources(
+        endpoints
+            .iter()
+            .map(|endpoint| NativeNodeRpc::new((*endpoint).to_owned()))
+            .collect(),
+        config.network,
+    ));
+    let nodes = endpoints
+        .iter()
+        .map(|endpoint| NativeNodeRpc::new((*endpoint).to_owned()))
+        .collect();
+    let mut reason = "template provider sent no template";
+    for index in 0..sources.len() {
+        match sources[index].refresh() {
+            Ok((_, template)) => {
+                let template = template.clone();
+                sources.rotate_left(index);
+                return Ok((nodes, sources, template));
+            }
+            Err(error) => reason = server::template_reason(&error),
+        }
+    }
+    Err(format!(
+        "no configured template provider or BCH node supplied a synchronized template for the \
+         selected network ({reason})"
+    ))
+}
+
+/// #### PR #42: confirms a provider's parent on the selected network: by the
+/// first configured node, or by the network's Fulcrum servers.
+fn chain_guard(config: &RuntimeConfig) -> super::tdp::client::Guard {
+    let network = config.network;
+    let node = config
+        .custom_node_endpoints()
+        .first()
+        .map(|node| node.to_string());
+    let fulcrum = config.electrum_endpoints();
+    Box::new(move |previous, height| {
+        let mut display = *previous;
+        display.reverse();
+        let display = hex::encode(display);
+        let parent = height.checked_sub(1).ok_or("no parent")?;
+        if let Some(node) = &node {
+            let header =
+                crate::node::rpc_call(node, "getblockheader", serde_json::json!([display, true]))?;
+            return (header.get("hash").and_then(serde_json::Value::as_str)
+                == Some(display.as_str())
+                && header.get("height").and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(parent)))
+            .then_some(())
+            .ok_or_else(|| "the parent is not on this network".to_owned());
+        }
+        let mut session = crate::electrum::ElectrumSession::connect_failover_for_deployment(
+            &fulcrum,
+            crate::config::MiningToken::Photon.photon_deployment(network),
+        )?;
+        let header = session.rpc("blockchain.block.header", serde_json::json!([parent]))?;
+        let bytes = hex::decode(header.as_str().ok_or("malformed header")?)
+            .map_err(|_| "malformed header")?;
+        let mut hash = super::template::double_sha256(&bytes);
+        hash.reverse();
+        (hex::encode(hash) == display)
+            .then_some(())
+            .ok_or_else(|| "the parent is not on this network".to_owned())
+    })
 }
 
 /// The configured nodes in failover order, starting with the first one that

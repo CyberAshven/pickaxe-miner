@@ -130,6 +130,36 @@ impl Session {
         }
     }
 
+    /// #### PR #42: a session to a server on this computer whose key is
+    /// not pinned (a template provider started without one); refused for any
+    /// peer that is not a loopback address.
+    pub fn initiate_unpinned(mut stream: TcpStream, limits: Limits) -> Result<Self, String> {
+        if !stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback()) {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Err("an unpinned SV2 key is allowed on this computer only".into());
+        }
+        prepare(&stream)?;
+        let result = (|| {
+            let initiator = Initiator::without_pk().map_err(|_| "SV2 handshake setup failed")?;
+            let (message, handshake) = Handshake::initiator(initiator)
+                .step_0()
+                .map_err(|_| "SV2 handshake initialization failed")?;
+            write_until(&mut stream, message.payload(), Instant::now() + IO_TIMEOUT)?;
+            let mut reply = [0; INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE];
+            read_until(&mut stream, &mut reply, Instant::now() + IO_TIMEOUT)?;
+            handshake
+                .step_2(reply)
+                .map_err(|_| "SV2 authority authentication failed".to_owned())
+        })();
+        match result {
+            Ok(state) => Self::from_transport(stream, state, limits),
+            Err(error) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                Err(error)
+            }
+        }
+    }
+
     pub fn accept(
         stream: TcpStream,
         authority: &[u8; 32],
