@@ -121,6 +121,10 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     Mine,
+    /// #### PR #40
+    /// Show the status of a miner running without a screen, such as a GPU
+    /// farm's or pool's coordinator as a service (read-only; same --config).
+    Watch,
     Devices,
     SelfTest,
     Benchmark {

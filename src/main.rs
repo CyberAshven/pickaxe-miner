@@ -5,8 +5,8 @@
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 use pickaxe_miner::{
-    backend, benchmark, cli, config, electrum, mining_lock, node, reach, rigs, runtime, search,
-    self_test, stratum_v2, telemetry, tui, tx,
+    backend, benchmark, cli, config, electrum, mine_watch, mining_lock, node, reach, rigs, runtime,
+    search, self_test, stratum_v2, telemetry, tui, tx,
 };
 
 use config::RuntimeConfig;
@@ -1106,6 +1106,7 @@ fn run_headless_mining(
     json: bool,
     use_tui: bool,
     rigs: Option<rigs::RigHub>,
+    status_file: Option<std::path::PathBuf>,
 ) -> Result<Option<SessionSettings>, String> {
     cfg.ensure_mining_supported()?;
     // #### PR #40
@@ -1172,6 +1173,10 @@ fn run_headless_mining(
         if last_status.elapsed() >= Duration::from_secs(1) {
             print_runtime_snapshot(&snapshot, json);
             let _ = std::io::stdout().flush();
+            // #### PR #40: saved for `pickaxe watch`, without the payout.
+            if let Some(path) = &status_file {
+                mine_watch::save(path, &runtime_snapshot_json(&snapshot));
+            }
             last_status = Instant::now();
         }
         thread::sleep(Duration::from_millis(50));
@@ -1387,6 +1392,13 @@ fn main() {
     };
 
     match args.command.clone().unwrap_or(cli::Commands::Mine) {
+        // #### PR #40: the read-only view of a miner without a screen.
+        cli::Commands::Watch => {
+            if let Err(error) = mine_watch::run(&mine_watch::status_path(&config_path)) {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
+        }
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {
                 eprintln!("error: {error}");
@@ -1872,7 +1884,8 @@ fn main() {
                     }
                 }
             };
-            match run_headless_mining(cfg, &gpus, args.json, use_tui, rig_hub) {
+            let status_file = (!use_tui).then(|| mine_watch::status_path(&config_path));
+            match run_headless_mining(cfg, &gpus, args.json, use_tui, rig_hub, status_file) {
                 Ok(Some(session)) => {
                     if let Some(name) = profile_name {
                         if let Err(error) = persist_session_profile(&profiles_path, &name, &session)

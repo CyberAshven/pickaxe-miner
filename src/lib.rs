@@ -39,6 +39,8 @@ pub mod hip_photon;
 #[allow(dead_code)]
 pub mod m29_table;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod mine_watch;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod mining_lock;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]

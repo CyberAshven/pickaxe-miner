@@ -1101,3 +1101,22 @@ start at (default 4096, the compact target 0x1b0ffff0).
 Evidence: host tests cover a found block and the best share recorded through
 the server, the overview line, and the difficulty-to-target conversion
 (difficulty 1 and 4096 match their compact targets).
+
+## A watch view for a miner without a screen (2026-10-09)
+
+#### PR #40
+
+A `--no-tui` miner, such as a GPU farm's or public pool's coordinator running
+as a service, saves its status line once a second beside its config
+(`NAME.mine-status.json`, written whole and without the payout address).
+`pickaxe watch` with the same `--config` shows it read-only: the coordinator's
+farm and a row per rig (name, GPUs, rate, winners, minutes connected), or a
+miner's own GPUs, with the source, height and winners, and says when the
+miner stopped updating. It never connects to the miner, as `stratum-v2 watch`
+for the ASIC server.
+
+Evidence: a host test saves a coordinator's status (no payout kept), and the
+view shows the farm, the rig row, a stale status and a GPU miner's rows. Live
+on Chipnet on 2026-10-09: a coordinator with no GPU, run without a screen
+beside a running GPU miner, saved its status (mining, the height, its rig
+listener and job source) with no payout address in it.

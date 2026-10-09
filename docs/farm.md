@@ -108,6 +108,13 @@ WantedBy=multi-user.target
 Then `sudo systemctl enable --now pickaxe-rig`, and `journalctl -u pickaxe-rig -f`
 shows its lines. The coordinator runs the same way with its own command.
 
+A miner without a screen (`--no-tui`) saves its status once a second beside
+its config (`mainnet.mine-status.json` for `mainnet.json`), with no payout
+address in it. On that machine, `pickaxe watch` with the same `--config` shows
+it read-only: a coordinator's farm (rigs connected, GPUs, rate, winners) and
+one row per rig, or a miner's own GPUs; `q` leaves the miner running, and the
+header says when the miner stopped updating.
+
 Windows, a task that starts the rig at logon:
 
 ```text
