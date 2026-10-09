@@ -39,6 +39,115 @@ pub(super) fn transaction(nonce: u32) -> Value {
     json!({"data":hex::encode(bytes),"txid":hex::encode(txid)})
 }
 
+/// #### PR #42: a CTOR-ordered template with `count` transactions, and
+/// their hashes in internal byte order.
+fn template_with(count: u32) -> (BchTemplate, Vec<Hash>) {
+    let mut raw = rpc_template();
+    let mut txs: Vec<Value> = (1..=count).map(transaction).collect();
+    txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+    let hashes = txs
+        .iter()
+        .map(|tx| {
+            let mut hash: Hash = hex::decode(tx["txid"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            hash.reverse();
+            hash
+        })
+        .collect();
+    raw["transactions"] = json!(txs);
+    (BchTemplate::from_rpc(&raw).unwrap(), hashes)
+}
+
+// #### PR #42
+// What: folding a coinbase's hash up the branch computed once per template
+// gives the whole tree's root, for every transaction count from 0 to 17
+// (odd levels duplicate their last hash).
+// Look here if: coinbase_path or fold changes.
+#[test]
+fn merkle_root_by_path_equals_the_full_tree() {
+    for count in 0..=17u32 {
+        let (_, txids) = template_with(count);
+        let leaf = double_sha256(&count.to_le_bytes());
+        let mut all = vec![leaf];
+        all.extend_from_slice(&txids);
+        let path = coinbase_path(&txids);
+        assert_eq!(fold(leaf, &path), merkle_root(all), "{count} transactions");
+        let depth = if count == 0 {
+            0
+        } else {
+            (u32::BITS - count.leading_zeros()) as usize
+        };
+        assert_eq!(path.len(), depth, "{count} transactions");
+    }
+}
+
+// #### PR #42
+// What: a coinbase rebuilt from a job's parts (prefix, extranonce, suffix)
+// is byte for byte the full build, and folding its hash up the parts'
+// merkle path gives the full build's root, for 0 to 17 transactions and
+// for miner, donation-work and fee-work payouts.
+// Look here if: coinbase_parts_with_aux, coinbase_with_aux or the extended
+// share rebuild in channel.rs changes.
+#[test]
+fn coinbases_rebuilt_from_parts_equal_the_full_build() {
+    use crate::donation::bch::{BchPayout, FeeMode, PoolFee};
+    let operator = p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], MiningNetwork::Chipnet).unwrap();
+    let fee = Some(PoolFee {
+        rate: "2".parse().unwrap(),
+        mode: FeeMode::Both,
+    });
+    let policies = [
+        BchPayout::default(),
+        BchPayout {
+            donation_work: true,
+            ..BchPayout::default()
+        },
+        BchPayout {
+            fee,
+            fee_work: true,
+            ..BchPayout::default()
+        },
+    ];
+    for count in 0..=17u32 {
+        let (template, txids) = template_with(count);
+        for policy in policies {
+            let operator = policy.fee.map(|_| operator.as_str());
+            let extranonce: Vec<u8> = (0..28u8).collect();
+            let full = template
+                .coinbase_with_payout(
+                    MiningNetwork::Chipnet,
+                    &payout(),
+                    operator,
+                    &extranonce,
+                    policy,
+                )
+                .unwrap();
+            let parts = template
+                .coinbase_parts_with_payout(
+                    MiningNetwork::Chipnet,
+                    &payout(),
+                    operator,
+                    extranonce.len(),
+                    policy,
+                )
+                .unwrap();
+            let mut rebuilt = parts.prefix.clone();
+            rebuilt.extend_from_slice(&extranonce);
+            rebuilt.extend_from_slice(&parts.suffix);
+            assert_eq!(rebuilt, full.bytes, "{count} transactions");
+            assert_eq!(
+                fold(double_sha256(&rebuilt), &parts.merkle_path),
+                full.merkle_root
+            );
+            let mut all = vec![double_sha256(&full.bytes)];
+            all.extend_from_slice(&txids);
+            assert_eq!(full.merkle_root, merkle_root(all));
+        }
+    }
+}
+
 #[test]
 fn header_hash_and_target_match_genesis_vector() {
     let header = hex::decode(concat!(

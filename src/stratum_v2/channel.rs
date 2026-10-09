@@ -8,7 +8,9 @@ use super::merge::{
     set::AuxJob,
 };
 use super::telemetry::expected_hashes;
-use super::template::{double_sha256, meets_target, BchTemplate, Coinbase, CoinbaseParts, Hash};
+use super::template::{
+    double_sha256, fold, meets_target, BchTemplate, Coinbase, CoinbaseParts, Hash,
+};
 use crate::config::MiningNetwork;
 use crate::donation::bch::BchPayout;
 use std::{
@@ -511,23 +513,28 @@ impl Channel {
                 if share.extranonce.len() != DEVICE_EXTRANONCE_SIZE {
                     return Err("invalid-extranonce-size");
                 }
-                let mut extra = job.id.to_le_bytes().to_vec();
-                extra.extend(self.extranonce_prefix);
-                extra.extend_from_slice(share.extranonce);
-                // #### PR #42: merge-mined tokens in each job (see
-                // `install_with_payout`): the per-share rebuild carries the
-                // job's commitment and tickets, as the parts the device
-                // hashed do.
-                job.template
-                    .coinbase_with_aux(
-                        self.network,
-                        &self.payout,
-                        self.operator.as_deref(),
-                        &extra,
-                        job.payout,
-                        job.aux.as_deref().map(|aux| &aux.outputs),
-                    )
-                    .map_err(|_| "invalid-coinbase")?
+                // #### PR #42: extended shares rebuild from the job's parts
+                // What: the coinbase is the job's prefix (ending in the job
+                // id), this channel's extranonce prefix, the device's
+                // extranonce and the job's suffix (with any merge-mining
+                // outputs), hashed once and folded up the job's merkle path.
+                // Why: these are exactly the bytes the device hashed;
+                // rebuilding the payouts and the whole merkle tree for every
+                // share cost a CashAddr decode and n hashes.
+                // Look here if: an extended share gets invalid-coinbase, or a
+                // block's merkle root mismatches.
+                let mut bytes = Vec::with_capacity(
+                    job.parts.prefix.len()
+                        + self.extranonce_prefix.len()
+                        + share.extranonce.len()
+                        + job.parts.suffix.len(),
+                );
+                bytes.extend_from_slice(&job.parts.prefix);
+                bytes.extend_from_slice(&self.extranonce_prefix);
+                bytes.extend_from_slice(share.extranonce);
+                bytes.extend_from_slice(&job.parts.suffix);
+                let merkle_root = fold(double_sha256(&bytes), &job.parts.merkle_path);
+                Coinbase { bytes, merkle_root }
             }
         };
         let header = job

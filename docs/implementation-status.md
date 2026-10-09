@@ -1648,3 +1648,23 @@ Evidence: a host test runs the gate on both networks against a loopback node
 that rejects the claim: skipped without a saved node, and stopping the claim
 with the node's reason on both; the existing Chipnet preflight test still
 passes. No Chipnet comparison remains in the runtime outside tests.
+
+## Template core: the coinbase path once per template (2026-10-09)
+
+#### PR #42
+
+No behavior change; groundwork for Template Distribution and Job
+Declaration. A template now computes the coinbase's merkle branch once, when
+it arrives, and every coinbase's merkle root is its hash folded up that
+branch: log2(n) hashes instead of the whole tree. An extended channel's share
+rebuilds its coinbase from the job's parts (the prefix ending in the job id,
+the channel's extranonce prefix, the device's extranonce and the suffix with
+any merge-mining outputs), which are exactly the bytes the device hashed,
+instead of recomputing the payouts (a CashAddr decode) and the tree for every
+share.
+
+Evidence: host tests check that the folded branch gives the whole tree's root
+and has the right depth for 0 to 17 transactions, and that a coinbase rebuilt
+from parts equals the full build byte for byte, with the same root, for 0 to
+17 transactions and for miner, donation-work and fee-work payouts. All
+existing share, token and server tests pass through the new path.

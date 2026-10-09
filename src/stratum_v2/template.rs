@@ -25,7 +25,9 @@ pub struct BchTemplate {
     pub coinbase_value: u64,
     coinbase_flags: Vec<u8>,
     transactions: Vec<Vec<u8>>,
-    transaction_hashes: Vec<Hash>,
+    /// #### PR #42: the coinbase's merkle branch (index 0), computed once
+    /// from the transactions' hashes, which nothing else needs.
+    merkle_path: Arc<[Hash]>,
     /// #### PR #42: the merge-mined tokens of jobs built from this template.
     tokens: Option<Arc<TokenSet>>,
 }
@@ -155,8 +157,8 @@ impl BchTemplate {
             size_limit,
             coinbase_value,
             coinbase_flags,
+            merkle_path: coinbase_path(&transaction_hashes).into(),
             transactions,
-            transaction_hashes,
             tokens: None,
         })
     }
@@ -313,13 +315,14 @@ impl BchTemplate {
         // #### end PR #42 ####
         bytes.extend_from_slice(&0u32.to_le_bytes());
         self.check_block_size(bytes.len())?;
-        let mut hashes = Vec::with_capacity(self.transaction_hashes.len() + 1);
-        hashes.push(double_sha256(&bytes));
-        hashes.extend_from_slice(&self.transaction_hashes);
-        Ok(Coinbase {
-            bytes,
-            merkle_root: merkle_root(hashes),
-        })
+        // #### PR #42: the coinbase path is computed once per template
+        // What: the merkle root folds the coinbase's hash up the branch
+        // computed when the template arrived, instead of building the whole
+        // tree for every coinbase.
+        // Why: log2(n) hashes instead of n for each job and share.
+        // Look here if: a block's merkle root mismatches.
+        let merkle_root = fold(double_sha256(&bytes), &self.merkle_path);
+        Ok(Coinbase { bytes, merkle_root })
     }
 
     pub fn coinbase_parts(
@@ -367,30 +370,10 @@ impl BchTemplate {
         // The coinbase script is at most 100 bytes, so its CompactSize is one byte.
         let offset =
             4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len();
-        let mut hashes = vec![[0; 32]];
-        hashes.extend_from_slice(&self.transaction_hashes);
-        let mut path = Vec::new();
-        while hashes.len() > 1 {
-            if hashes.len() % 2 == 1 {
-                hashes.push(*hashes.last().unwrap());
-            }
-            path.push(hashes[1]);
-            hashes = hashes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| {
-                    let mut bytes = [0; 64];
-                    bytes[..32].copy_from_slice(&pair[0]);
-                    bytes[32..].copy_from_slice(&pair[1]);
-                    double_sha256(&bytes)
-                })
-                .collect();
-        }
         Ok(CoinbaseParts {
             prefix: coinbase.bytes[..offset].to_vec(),
             suffix: coinbase.bytes[offset + extranonce_len..].to_vec(),
-            merkle_path: path,
+            merkle_path: self.merkle_path.to_vec(),
         })
     }
 
@@ -417,10 +400,8 @@ impl BchTemplate {
     /// Build only a full block; no light-job fallback can truncate its tx list.
     pub fn block(&self, coinbase: &Coinbase, header: [u8; 80]) -> Result<Vec<u8>, String> {
         self.check_block_size(coinbase.bytes.len())?;
-        let mut hashes = vec![double_sha256(&coinbase.bytes)];
-        hashes.extend_from_slice(&self.transaction_hashes);
         if header[4..36] != self.previous_hash
-            || header[36..68] != merkle_root(hashes)
+            || header[36..68] != fold(double_sha256(&coinbase.bytes), &self.merkle_path)
             || header[72..76] != self.bits.to_le_bytes()
         {
             return Err("block header does not belong to this template".into());
@@ -491,7 +472,46 @@ pub fn meets_target(hash: &Hash, target: &Hash) -> bool {
     hash.iter().rev().cmp(target.iter().rev()).is_le()
 }
 
-fn merkle_root(mut hashes: Vec<Hash>) -> Hash {
+/// #### PR #42: the merkle branch of the coinbase (index 0) over the
+/// block's other transactions: one sibling per level.
+pub fn coinbase_path(txids: &[Hash]) -> Vec<Hash> {
+    let mut hashes = vec![[0; 32]];
+    hashes.extend_from_slice(txids);
+    let mut path = Vec::new();
+    while hashes.len() > 1 {
+        if hashes.len() % 2 == 1 {
+            hashes.push(*hashes.last().unwrap());
+        }
+        path.push(hashes[1]);
+        hashes = hashes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let mut bytes = [0; 64];
+                bytes[..32].copy_from_slice(&pair[0]);
+                bytes[32..].copy_from_slice(&pair[1]);
+                double_sha256(&bytes)
+            })
+            .collect();
+    }
+    path
+}
+
+/// #### PR #42: folds the coinbase's hash up its branch at index 0 to the
+/// merkle root.
+pub fn fold(leaf: Hash, path: &[Hash]) -> Hash {
+    path.iter().fold(leaf, |current, sibling| {
+        let mut joined = [0; 64];
+        joined[..32].copy_from_slice(&current);
+        joined[32..].copy_from_slice(sibling);
+        double_sha256(&joined)
+    })
+}
+
+/// The whole tree's root, the reference the branch is checked against.
+#[cfg(test)]
+pub(super) fn merkle_root(mut hashes: Vec<Hash>) -> Hash {
     while hashes.len() > 1 {
         if hashes.len() % 2 == 1 {
             hashes.push(*hashes.last().unwrap());
