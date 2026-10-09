@@ -42,9 +42,10 @@ steps, with `stratum-v2 serve --donation <percent>` or in the dashboard's
 up to two decimals. Other assets keep their own donation policies. Actual
 rewards depend on which work wins.
 
-The ASIC server's workers page shows each device's own report and offers
-confirmed controls (restart, pause, resume, blink its light to find it, Avalon
-work levels) for most makes, through [asic-rs](https://github.com/256foundation/asic-rs).
+The ASIC server's workers page shows each device's own report, and Enter opens
+the highlighted row's Device panel, online or offline, with confirmed controls
+(restart, pause, resume, blink its light to find it, Avalon work levels) for
+most makes, through [asic-rs](https://github.com/256foundation/asic-rs).
 With `--upstream`, it sends SV1 devices to a remote Stratum V2 pool instead of
 your own node, with backup pools in order; there the pool builds the blocks,
 so the donation is that share of mining time at the pool. See [docs/stratum-v2.md](docs/stratum-v2.md).

@@ -7,7 +7,7 @@ use super::{device_api::DeviceReport, template::Hash};
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
@@ -123,15 +123,51 @@ struct Device {
     best_share: Option<f64>,
 }
 
+/// #### PR #42
+/// What: why a worker's address cannot be used for its Device panel.
+/// Why: commands must reach the device itself, so a worker with no local
+/// address, or one whose address several devices share, is not controlled.
+/// Look here if: the panel refuses a device it should control, or controls a
+/// router or VPN gateway instead of the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressIssue {
+    /// No local network address is known: the worker connected from this
+    /// computer (the SV1 adapter's link) or from a public address (a
+    /// router's).
+    Unknown,
+    /// Several devices use this address: a Tailscale subnet router, a VPN
+    /// gateway or CGNAT is in between, and commands would reach it instead of
+    /// the device (see `Devices::sharing`).
+    Shared,
+    /// #### PR #42: two or more connections from this address are all under
+    /// a minute old, so whether they are one device or several is not known
+    /// yet (for example right after the server starts).
+    Settling,
+}
+
 #[derive(Clone)]
 pub struct Devices {
     prefix: u32,
     next_id: u64,
     sockets: HashMap<SocketAddr, u64>,
+    // #### PR #42
+    // What: device addresses live only in their rows (`Device::ip`); the
+    // separate address map is gone. They are still used only to ask or
+    // control the device itself, and never shown or written to JSON.
+    // Why: the map duplicated the connected rows' addresses, and the Device
+    // panel needs offline rows' addresses too, which only the rows keep.
+    // Look here if: the poller asks an offline device, or a device's report
+    // stops after a reconnect.
     rows: BTreeMap<u64, Device>,
-    // Device LAN addresses, used only to query the device itself; never shown
-    // or written to JSON.
-    addresses: HashMap<u64, IpAddr>,
+    // #### PR #42
+    // What: addresses where two devices were seen mining side by side, kept
+    // until no row on the address remains.
+    // Why: the rows that showed it can leave (a reconnect merges the rows it
+    // took over when it closes; old offline rows are pruned), and the address
+    // is still a gateway's.
+    // Look here if: a device behind a gateway can be controlled after its
+    // neighbours' rows are gone, or an address stays refused with no row.
+    shared_addresses: HashSet<IpAddr>,
 }
 
 impl std::fmt::Debug for Devices {
@@ -149,15 +185,16 @@ impl Default for Devices {
             next_id: 0,
             sockets: HashMap::new(),
             rows: BTreeMap::new(),
-            addresses: HashMap::new(),
+            shared_addresses: HashSet::new(),
         }
     }
 }
 
 /// #### PR #40
 /// The worker name in a username, never an address: printable, at most 24
-/// characters.
-fn worker_name(username: &str) -> Option<String> {
+/// characters. (PR #42: visible to the other server modules, so the Device
+/// panel's pool view can name a pool's worker this way, never by an address.)
+pub(super) fn worker_name(username: &str) -> Option<String> {
     let username = username.trim();
     let name = match username.rsplit_once('.') {
         Some((_, name)) => name,
@@ -278,7 +315,6 @@ impl Devices {
     /// public address belongs to a router, not the device.
     pub fn set_address(&mut self, id: u64, ip: IpAddr) {
         if super::device_api::queryable(ip) && self.rows.contains_key(&id) {
-            self.addresses.insert(id, ip);
             // #### PR #42
             // What: one row per device on the local network. A device that
             // connects again takes over its offline rows on that address and
@@ -308,12 +344,16 @@ impl Devices {
 
     /// #### PR #42
     /// What: connection `id` takes over the rows in `old`: it takes the
-    /// number of the latest of them to close, and keeps them aside, out of
-    /// the table, until it closes.
+    /// number of the latest of them to close, and its worker name until the
+    /// device gives its own, and keeps them aside, out of the table, until
+    /// it closes.
     /// Why: the label then follows the device across reconnects, and a short
     /// extra connection that took over another device's row gives it back
-    /// when it closes.
-    /// Look here if: a reconnect renumbers a label, or two rows share one.
+    /// when it closes. The name is kept too because the device names itself
+    /// only after its address is known: "rig1 #12" briefly read "Device
+    /// …-12", and the highlight on the workers page lost its device.
+    /// Look here if: a reconnect renumbers a label, two rows share one, or a
+    /// reconnected device shows a generated label for a moment.
     fn replace(&mut self, id: u64, old: &[u64]) {
         if !self.rows.contains_key(&id) {
             return;
@@ -325,29 +365,152 @@ impl Devices {
         let latest = removed
             .iter()
             .max_by_key(|(other, row)| (row.ended, *other))
-            .map(|(_, row)| row.number);
-        if let (Some(number), Some(row)) = (latest, self.rows.get_mut(&id)) {
+            .map(|(_, row)| (row.number, row.worker.clone()));
+        if let (Some((number, worker)), Some(row)) = (latest, self.rows.get_mut(&id)) {
             row.number = number;
+            if row.worker.is_none() {
+                row.worker = worker;
+            }
             row.label = device_label(self.prefix, row.worker.as_deref(), number);
             row.replaced.extend(removed);
         }
     }
 
-    /// The local network address of a connected worker, for actions the user
-    /// confirms on the workers page. Never shown or written to JSON.
-    pub fn address_for_label(&self, label: &str) -> Option<IpAddr> {
+    /// The row with this label, the connected one first.
+    fn row_labelled(&self, label: &str) -> Option<&Device> {
         self.rows
-            .iter()
-            .find(|(_, row)| row.label == label && row.ended.is_none())
-            .and_then(|(id, _)| self.addresses.get(id).copied())
+            .values()
+            .filter(|row| row.label == label)
+            .max_by_key(|row| row.ended.is_none())
+    }
+
+    /// #### PR #42
+    /// What: the local network address of the worker with this label, online
+    /// or offline, for its Device panel; refused when several devices may use
+    /// it (see `sharing`). Never shown or written to JSON.
+    /// Why: the panel opens on any row, offline rows included (a device that
+    /// stopped mining is the one most likely to need a restart). Behind a
+    /// Tailscale subnet router, a VPN gateway or CGNAT the address is the
+    /// gateway's, so commands would go there instead of the device.
+    /// Look here if: an offline row cannot be controlled, or a device behind a
+    /// shared address can.
+    pub fn address_of(&self, label: &str, now: Instant) -> Result<IpAddr, AddressIssue> {
+        let ip = self
+            .row_labelled(label)
+            .and_then(|row| row.ip)
+            .ok_or(AddressIssue::Unknown)?;
+        match self.sharing(ip, now) {
+            Some(issue) => Err(issue),
+            None => Ok(ip),
+        }
+    }
+
+    /// #### PR #42
+    /// What: how long ago the connection of the worker with this label
+    /// closed; none while it is connected.
+    /// Why: the Device panel shows it, and asks to confirm the device behind
+    /// an offline row that left more than a few minutes ago, since its
+    /// address may have passed to another device.
+    /// Look here if: the panel shows a wrong offline time.
+    pub fn offline_for(&self, label: &str, now: Instant) -> Option<Duration> {
+        let ended = self.row_labelled(label)?.ended?;
+        Some(now.saturating_duration_since(ended))
+    }
+
+    /// #### PR #42
+    /// What: (label, address, refused) for every row with a local network
+    /// address, offline rows included; refused when the address is shared
+    /// or not known yet to be one device's (see `sharing`).
+    /// Why: `stratum-v2 watch` will control devices too, from an owner-only
+    /// file the server writes from this list; the status JSON stays free of
+    /// addresses, as it is world-readable and printed to service logs. Only
+    /// the server modules may read it.
+    /// Look here if: an address reaches the status JSON, or the watch cannot
+    /// find a device's address.
+    #[cfg_attr(not(test), allow(dead_code))] // Read by the watch view's devices file, next.
+    pub(super) fn private_addresses(&self, now: Instant) -> Vec<(String, IpAddr, bool)> {
+        self.rows
+            .values()
+            .filter_map(|row| {
+                let ip = row.ip?;
+                Some((row.label.clone(), ip, self.sharing(ip, now).is_some()))
+            })
+            .collect()
+    }
+
+    /// #### PR #42
+    /// What: why this address must not be controlled now, if it must not.
+    ///
+    /// - `Shared` when two connections there are each open for a minute or
+    ///   more, or when two devices were seen mining side by side there (see
+    ///   `mined_side_by_side`). The second stays until no row on the address
+    ///   remains, offline rows included.
+    /// - `Settling` when two or more connections there are all under a
+    ///   minute old.
+    ///
+    /// A minute-old device beside a younger connection is not refused: that
+    /// is how a firmware's short extra connection looks.
+    ///
+    /// Why: behind a Tailscale subnet router, a VPN gateway or CGNAT every
+    /// device has the gateway's address. Counting only connected rows let a
+    /// command through to the gateway as soon as one device there went
+    /// offline, for a minute after a reconnect, and for the first minute
+    /// after the server started.
+    /// Look here if: a device behind a gateway can be controlled, or a single
+    /// device is refused as shared.
+    fn sharing(&self, ip: IpAddr, now: Instant) -> Option<AddressIssue> {
+        if self.shared_addresses.contains(&ip) || self.mined_side_by_side(ip) {
+            return Some(AddressIssue::Shared);
+        }
+        let ages: Vec<Duration> = self
+            .rows
+            .values()
+            .filter(|row| row.ended.is_none() && row.ip == Some(ip))
+            .map(|row| now.saturating_duration_since(row.started))
+            .collect();
+        let long_lived = ages.iter().filter(|age| **age >= SHORT_LIVED).count();
+        match (long_lived, ages.len()) {
+            (2.., _) => Some(AddressIssue::Shared),
+            (0, 2..) => Some(AddressIssue::Settling),
+            _ => None,
+        }
+    }
+
+    /// #### PR #42
+    /// What: whether two rows on this address (online or offline, and the
+    /// rows a reconnect took over) each accepted a share a minute or more
+    /// after the other connected: two devices mining side by side.
+    /// Why: that holds after one of them goes offline, and it never holds for
+    /// one device: its dead connection stopped mining before its new one
+    /// opened, a probe does not mine, and a share still in flight when it
+    /// reconnects comes within seconds.
+    /// Look here if: two devices behind one gateway are not refused, or one
+    /// device is refused as shared.
+    fn mined_side_by_side(&self, ip: IpAddr) -> bool {
+        let rows: Vec<&Device> = self
+            .rows
+            .values()
+            .filter(|row| row.ip == Some(ip))
+            .flat_map(|row| std::iter::once(row).chain(row.replaced.iter().map(|(_, old)| old)))
+            .collect();
+        let after = |row: &Device, other: &Device| {
+            row.last_share
+                .is_some_and(|share| share.saturating_duration_since(other.started) >= SHORT_LIVED)
+        };
+        rows.iter().enumerate().any(|(index, first)| {
+            rows[index + 1..]
+                .iter()
+                .any(|second| after(first, second) && after(second, first))
+        })
     }
 
     /// Connected devices with a known address.
     pub fn addresses(&self) -> Vec<(u64, IpAddr)> {
-        self.addresses
+        // #### PR #42: read from the rows, which keep each device's address.
+        self.rows
             .iter()
-            .filter(|(id, _)| self.rows.get(id).is_some_and(|row| row.ended.is_none()))
-            .map(|(id, ip)| (*id, *ip))
+            .filter(|(_, row)| row.ended.is_none())
+            .filter_map(|(id, row)| Some((*id, row.ip?)))
             .collect()
     }
 
@@ -442,10 +605,18 @@ impl Devices {
             ended.saturating_duration_since(row.started),
             row.last_share,
         );
-        let replaced = std::mem::take(&mut row.replaced);
         self.sockets.retain(|_, existing| *existing != id);
-        self.addresses.remove(&id);
         if let (true, Some(ip)) = (first, ip) {
+            // #### PR #42: the shared mark is taken before settling, which
+            // can merge away the rows this connection took over.
+            if self.mined_side_by_side(ip) {
+                self.shared_addresses.insert(ip);
+            }
+            let replaced = self
+                .rows
+                .get_mut(&id)
+                .map(|row| std::mem::take(&mut row.replaced))
+                .unwrap_or_default();
             self.settle_closed(id, ip, lived, quiet, replaced);
         }
         // #### end PR #42 ####
@@ -513,8 +684,18 @@ impl Devices {
             .iter()
             .take(closed.len().saturating_sub(RECENT_CLOSED))
         {
+            // #### PR #42: an address stays shared when the rows that showed
+            // it are pruned, and is forgotten once no row on it remains.
+            if let Some(ip) = self.rows.get(id).and_then(|row| row.ip) {
+                if self.mined_side_by_side(ip) {
+                    self.shared_addresses.insert(ip);
+                }
+            }
             self.rows.remove(id);
         }
+        let rows = &self.rows;
+        self.shared_addresses
+            .retain(|ip| rows.values().any(|row| row.ip == Some(*ip)));
     }
 
     pub fn snapshots(&self, now: Instant) -> Vec<DeviceSnapshot> {
@@ -710,6 +891,16 @@ mod tests {
             opened + Duration::from_secs(59),
         );
         assert_eq!(devices.snapshots(opened).len(), 2);
+        // #### PR #42: both devices keep mining side by side.
+        for device in [first, sibling] {
+            devices.share(
+                device,
+                ShareEvent::Accepted([255; 32]),
+                true,
+                start + Duration::from_secs(100),
+            );
+        }
+        let labels = [first, sibling].map(|device| devices.label(device).unwrap());
         // A device that mined for two minutes stays, offline.
         devices.close(first, true, Some("SV1 disconnected"), later);
         let rows = devices.snapshots(later);
@@ -719,6 +910,19 @@ mod tests {
         // The adapter's native socket closing the same row changes nothing.
         devices.close(first, false, Some("SV2 peer disconnected"), later);
         assert_eq!(devices.snapshots(later).len(), 2);
+        // #### PR #42: with one of them offline, neither is controlled: the
+        // address is still the gateway's.
+        for label in &labels {
+            assert_eq!(
+                devices.address_of(label, later),
+                Err(AddressIssue::Shared),
+                "{label}"
+            );
+        }
+        assert!(devices
+            .private_addresses(later)
+            .iter()
+            .all(|(_, ip, refused)| *ip == gateway && *refused));
     }
 
     // #### PR #42
@@ -755,10 +959,8 @@ mod tests {
         let probe = devices.connect("127.0.0.1:6103".parse().unwrap(), true, opened);
         devices.set_address(probe, gateway);
         assert_eq!(devices.label(first), None, "taken over for now");
-        assert_eq!(
-            devices.label(probe),
-            Some(format!("Device {:08x}-{first}", devices.prefix))
-        );
+        // #### PR #42: with the number, the name (the probe gives none).
+        assert_eq!(devices.label(probe), Some(label.clone()));
         let closed = opened + Duration::from_secs(5);
         devices.close(probe, true, Some("SV1 disconnected"), closed);
         let rows = devices.snapshots(closed);
@@ -876,10 +1078,12 @@ mod tests {
     }
 
     // #### PR #42
-    // What: a device that reconnects keeps the number in its label, so
-    // "rig1 #N" survives close, connect, set_address and set_worker.
+    // What: a device that reconnects keeps the number in its label, and its
+    // name until it gives one, so "rig1 #N" survives close, connect,
+    // set_address and set_worker; a new name is taken.
     // Why: a selection that follows the label would jump on a reconnect.
-    // Look here if: connect, set_address or set_worker label with the row id.
+    // Look here if: connect, set_address, replace or set_worker label with
+    // the row id, or drop the name.
     #[test]
     fn a_reconnected_device_keeps_its_number_and_name() {
         let now = Instant::now();
@@ -904,10 +1108,9 @@ mod tests {
         );
         devices.set_address(second, nano);
         assert_eq!(devices.label(first), None, "the offline row is replaced");
-        assert_eq!(
-            devices.label(second),
-            Some(format!("Device {:08x}-{first}", devices.prefix))
-        );
+        // #### PR #42: the name too, before the device gives it again, so
+        // the label never reads "Device …" in between.
+        assert_eq!(devices.label(second), Some(label.clone()));
         devices.set_worker(second, worker);
         assert_eq!(devices.label(second), Some(label.clone()));
         // A name given before the address is kept when the number changes.
@@ -916,7 +1119,7 @@ mod tests {
         devices.set_worker(third, worker);
         assert_eq!(devices.label(third), Some(format!("rig1 #{third}")));
         devices.set_address(third, nano);
-        assert_eq!(devices.label(third), Some(label));
+        assert_eq!(devices.label(third), Some(label.clone()));
         let labels: Vec<_> = devices
             .snapshots(now)
             .into_iter()
@@ -924,6 +1127,13 @@ mod tests {
             .collect();
         assert_eq!(labels.len(), 2, "the device and its neighbour");
         assert_ne!(labels[0], labels[1]);
+        // #### PR #42: a device that comes back under another name takes it.
+        devices.close(third, true, Some("SV1 disconnected"), now);
+        let fourth = devices.connect("127.0.0.1:7005".parse().unwrap(), true, now);
+        devices.set_address(fourth, nano);
+        assert_eq!(devices.label(fourth), Some(label));
+        devices.set_worker(fourth, "account.rig9");
+        assert_eq!(devices.label(fourth), Some(format!("rig9 #{first}")));
     }
 
     // #### PR #40
@@ -1108,11 +1318,15 @@ mod tests {
         assert!(devices.addresses().is_empty());
         devices.set_address(id, "10.9.8.7".parse().unwrap());
         let label = devices.snapshots(now)[0].label.clone();
+        // #### PR #42: `address_of` replaces `address_for_label`.
         assert_eq!(
-            devices.address_for_label(&label),
-            Some("10.9.8.7".parse().unwrap())
+            devices.address_of(&label, now),
+            Ok("10.9.8.7".parse().unwrap())
         );
-        assert_eq!(devices.address_for_label("Device unknown"), None);
+        assert_eq!(
+            devices.address_of("Device unknown", now),
+            Err(AddressIssue::Unknown)
+        );
         assert_eq!(devices.addresses(), vec![(id, "10.9.8.7".parse().unwrap())]);
         devices.set_report(
             id,
@@ -1135,5 +1349,249 @@ mod tests {
         assert!(!json.contains("10.9.8.7"));
         devices.close(id, true, None, now);
         assert!(devices.addresses().is_empty());
+    }
+
+    // #### PR #42
+    // What: a worker that went offline keeps its local address for the
+    // Device panel, while the poller no longer asks it; a worker with no
+    // local address has none.
+    // Why: the panel opens on offline rows too.
+    // Look here if: address_of() or addresses() changes.
+    #[test]
+    fn an_offline_worker_keeps_its_address_for_the_panel() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(120);
+        let nano: IpAddr = "192.168.0.127".parse().unwrap();
+        let mut devices = Devices::default();
+        let id = devices.connect("127.0.0.1:8001".parse().unwrap(), true, start);
+        devices.set_address(id, nano);
+        devices.set_worker(id, "account.rig1");
+        let label = devices.label(id).unwrap();
+        assert_eq!(devices.addresses(), vec![(id, nano)]);
+        assert_eq!(devices.offline_for(&label, later), None, "online");
+        devices.close(id, true, Some("SV1 disconnected"), later);
+        let rows = devices.snapshots(later);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].connected);
+        assert_eq!(devices.address_of(&label, later), Ok(nano));
+        assert!(devices.addresses().is_empty(), "the poller skips it");
+        // #### PR #42: how long ago it left, for the panel.
+        assert_eq!(
+            devices.offline_for(&label, later + Duration::from_secs(90)),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(devices.offline_for("Device unknown", later), None);
+        // A worker seen only from this computer has no address to use.
+        let local = devices.connect("127.0.0.1:8002".parse().unwrap(), true, start);
+        let local_label = devices.label(local).unwrap();
+        assert_eq!(
+            devices.address_of(&local_label, later),
+            Err(AddressIssue::Unknown)
+        );
+    }
+
+    // #### PR #42
+    // What: two workers connected for a minute or more on one address are
+    // not controlled, online or offline; two younger ones are not known yet
+    // to be one device; a short probe beside one device does not count.
+    // Why: that address belongs to a router or VPN gateway, not a device.
+    // Look here if: address_of(), sharing() or SHORT_LIVED changes.
+    #[test]
+    fn workers_sharing_one_address_are_not_controlled() {
+        let start = Instant::now();
+        let gateway: IpAddr = "100.64.0.1".parse().unwrap();
+        let mut devices = Devices::default();
+        let first = devices.connect("127.0.0.1:8101".parse().unwrap(), true, start);
+        devices.set_address(first, gateway);
+        let first_label = devices.label(first).unwrap();
+        // A 5 s probe beside one device leaves its address usable.
+        let opened = start + Duration::from_secs(115);
+        let probe = devices.connect("127.0.0.1:8102".parse().unwrap(), true, opened);
+        devices.set_address(probe, gateway);
+        let now = opened + Duration::from_secs(5);
+        assert_eq!(devices.address_of(&first_label, now), Ok(gateway));
+        devices.close(probe, true, Some("SV1 disconnected"), now);
+        // A second device there: both are refused once each is a minute
+        // old; before that, whether they are one device is not known yet.
+        let second = devices.connect("127.0.0.1:8103".parse().unwrap(), true, start);
+        devices.set_address(second, gateway);
+        let second_label = devices.label(second).unwrap();
+        let young = start + Duration::from_secs(30);
+        assert_eq!(
+            devices.address_of(&first_label, young),
+            Err(AddressIssue::Settling)
+        );
+        assert_eq!(
+            devices.address_of(&first_label, now),
+            Err(AddressIssue::Shared)
+        );
+        assert_eq!(
+            devices.address_of(&second_label, now),
+            Err(AddressIssue::Shared)
+        );
+        // A third device there that went offline is refused too.
+        let third = devices.connect("127.0.0.1:8104".parse().unwrap(), true, start);
+        devices.set_address(third, gateway);
+        let third_label = devices.label(third).unwrap();
+        devices.close(third, true, Some("SV1 disconnected"), now);
+        assert!(devices
+            .snapshots(now)
+            .iter()
+            .any(|row| row.label == third_label && !row.connected));
+        assert_eq!(
+            devices.address_of(&third_label, now),
+            Err(AddressIssue::Shared)
+        );
+    }
+
+    // #### PR #42
+    // What: two devices that mine side by side behind one address are
+    // refused from their first shares a minute apart, after one goes
+    // offline, after it reconnects, and after the rows that showed it are
+    // merged away; a single device whose dead connection was still open
+    // when it reconnected is not refused once that connection closes.
+    // Why: counting only connected rows let a command through to the
+    // gateway as soon as one device there went offline.
+    // Look here if: sharing(), mined_side_by_side(), close() or prune()
+    // changes.
+    #[test]
+    fn an_address_two_devices_mined_from_stays_shared() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let gateway: IpAddr = "100.64.0.1".parse().unwrap();
+        let mut devices = Devices::default();
+        let mine = |devices: &mut Devices, id, seconds| {
+            devices.share(id, ShareEvent::Accepted([255; 32]), true, at(seconds));
+        };
+        let [a, b] = [("a", 8301), ("b", 8302)].map(|(name, port)| {
+            let id = devices.connect(format!("127.0.0.1:{port}").parse().unwrap(), true, start);
+            devices.set_address(id, gateway);
+            devices.set_worker(id, &format!("account.{name}"));
+            id
+        });
+        let labels = [a, b].map(|id| devices.label(id).unwrap());
+        let refused = |devices: &Devices, seconds| {
+            labels
+                .iter()
+                .map(|label| devices.address_of(label, at(seconds)))
+                .collect::<Vec<_>>()
+        };
+        mine(&mut devices, a, 5);
+        mine(&mut devices, b, 6);
+        assert_eq!(refused(&devices, 7), [Err(AddressIssue::Settling); 2]);
+        mine(&mut devices, a, 61);
+        mine(&mut devices, b, 62);
+        assert!(devices.mined_side_by_side(gateway));
+        // b goes offline after two minutes: both stay refused.
+        mine(&mut devices, a, 110);
+        mine(&mut devices, b, 111);
+        devices.close(b, true, Some("SV1 disconnected"), at(120));
+        assert_eq!(refused(&devices, 121), [Err(AddressIssue::Shared); 2]);
+        // b comes back: its young connection takes over its row and label.
+        let b2 = devices.connect("127.0.0.1:8303".parse().unwrap(), true, at(130));
+        devices.set_address(b2, gateway);
+        assert_eq!(devices.label(b2).as_ref(), Some(&labels[1]));
+        assert_eq!(refused(&devices, 131), [Err(AddressIssue::Shared); 2]);
+        // Both leave, one comes back and takes over every offline row
+        // there, then leaves again: the evidence is merged away, the mark
+        // stays while a row on the address remains.
+        mine(&mut devices, b2, 200);
+        mine(&mut devices, a, 201);
+        devices.close(b2, true, Some("SV1 disconnected"), at(250));
+        devices.close(a, true, Some("SV1 disconnected"), at(251));
+        let a2 = devices.connect("127.0.0.1:8304".parse().unwrap(), true, at(260));
+        devices.set_address(a2, gateway);
+        devices.close(a2, true, Some("SV1 disconnected"), at(400));
+        assert_eq!(devices.snapshots(at(401)).len(), 1);
+        assert!(!devices.mined_side_by_side(gateway));
+        assert_eq!(
+            devices.address_of(&labels[0], at(401)),
+            Err(AddressIssue::Shared)
+        );
+        // Once no row on the address remains, it is forgotten.
+        for port in 0..RECENT_CLOSED as u16 {
+            let id = devices.connect(
+                format!("127.0.0.1:{}", 9000 + port).parse().unwrap(),
+                true,
+                at(500),
+            );
+            devices.close(id, true, Some("SV1 disconnected"), at(500));
+        }
+        assert!(devices.shared_addresses.is_empty());
+        // One device: its dead connection stopped mining before the new one
+        // opened, so once it is seen closed the address is the device's.
+        let nano: IpAddr = "192.168.0.127".parse().unwrap();
+        let old = devices.connect("127.0.0.1:8305".parse().unwrap(), true, at(1000));
+        devices.set_address(old, nano);
+        mine(&mut devices, old, 1030);
+        let new = devices.connect("127.0.0.1:8306".parse().unwrap(), true, at(1060));
+        devices.set_address(new, nano);
+        for second in [1065, 1130, 1190] {
+            mine(&mut devices, new, second);
+        }
+        // While the dead connection still looks open, two connections a
+        // minute old are refused, for now.
+        let label = devices.label(new).unwrap();
+        assert_eq!(
+            devices.address_of(&label, at(1190)),
+            Err(AddressIssue::Shared)
+        );
+        devices.close(old, true, Some("SV1 write failed"), at(1200));
+        let label = devices.label(new).unwrap();
+        assert_eq!(devices.address_of(&label, at(1201)), Ok(nano));
+        assert!(devices.shared_addresses.is_empty());
+    }
+
+    // #### PR #42
+    // What: the private address list holds every row with a local address,
+    // offline rows included, with whether the address is shared, and none of
+    // it reaches the JSON snapshots or Debug output.
+    // Why: the owner-only devices file is the only place addresses leave
+    // this module; the status JSON is world-readable and logged.
+    // Look here if: private_addresses() or the snapshots change.
+    #[test]
+    fn private_addresses_lists_local_ips_only_and_never_reaches_json() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(120);
+        let lan: IpAddr = "192.168.0.127".parse().unwrap();
+        let tailscale: IpAddr = "100.101.102.103".parse().unwrap();
+        let gateway: IpAddr = "100.64.0.1".parse().unwrap();
+        let mut devices = Devices::default();
+        // Loopback (the adapter's link) and a public address are not kept.
+        let adapter = devices.connect("127.0.0.1:8201".parse().unwrap(), true, start);
+        devices.set_address(adapter, "127.0.0.1".parse().unwrap());
+        let public = devices.connect("127.0.0.1:8202".parse().unwrap(), true, start);
+        devices.set_address(public, "203.0.113.5".parse().unwrap());
+        let online = devices.connect("127.0.0.1:8203".parse().unwrap(), true, start);
+        devices.set_address(online, lan);
+        let offline = devices.connect("127.0.0.1:8204".parse().unwrap(), true, start);
+        devices.set_address(offline, tailscale);
+        devices.close(offline, true, Some("SV1 disconnected"), now);
+        let behind = [8205, 8206].map(|port| {
+            let id = devices.connect(format!("127.0.0.1:{port}").parse().unwrap(), true, start);
+            devices.set_address(id, gateway);
+            id
+        });
+        let mut listed = devices.private_addresses(now);
+        listed.sort();
+        let mut expected = vec![
+            (devices.label(online).unwrap(), lan, false),
+            (devices.label(offline).unwrap(), tailscale, false),
+            (devices.label(behind[0]).unwrap(), gateway, true),
+            (devices.label(behind[1]).unwrap(), gateway, true),
+        ];
+        expected.sort();
+        assert_eq!(listed, expected);
+        let json = serde_json::to_string(&devices.snapshots(now)).unwrap();
+        let debug = format!("{devices:?}");
+        for address in [
+            "192.168.0.127",
+            "100.101.102.103",
+            "100.64.0.1",
+            "203.0.113.5",
+        ] {
+            assert!(!json.contains(address), "{address}");
+            assert!(!debug.contains(address), "{address}");
+        }
     }
 }

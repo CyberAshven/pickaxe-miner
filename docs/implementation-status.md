@@ -1150,9 +1150,9 @@ where it used to become `rig1 #15`), so the label follows the device.
 Known limits:
 
 - Behind one shared address, a reconnecting device takes over every offline
-  row there, so another device's offline row can disappear and a number can
-  move to a different device. The Device panel will refuse control on such an
-  address.
+  row there, so another device's offline row can disappear and a number (and
+  a name, until the device gives its own) can move to a different device. The
+  Device panel refuses control on such an address (see the next checkpoint).
 - When two or more new connections open on an address before an old one there
   is seen closed (several devices behind a shared address reconnecting at
   once, or a device that opens a second connection that early), the old row
@@ -1168,3 +1168,87 @@ connections leaving the old row offline; a reconnect over several offline rows
 taking the number of the latest to close; and a reconnected device keeping its
 number and worker name whether it is named before or after its address is
 known.
+
+## The Device panel for any row (2026-10-09)
+
+#### PR #42
+
+The workers page highlights one row (arrow keys, PgUp/PgDn, Home, End). The
+highlight is kept by the row's label, so it stays on its device when rows
+re-sort and when the device reconnects. Enter (or `c`) opens the Device panel
+for that row, online or offline. `c` used to open the controls of the row at
+the scroll position, and only while it was online.
+
+- An offline row opens with the address its device last connected from, and
+  shows how long it has been offline. The panel names the network class
+  ("local network", "Tailscale/CGNAT", "IPv6 local"), never the address.
+- Device replies and errors are shown with every address hidden, and cut to
+  240 characters. asic-rs errors name the request's URL, which holds the
+  device's address.
+- The device is identified on a background thread, for at most ten seconds,
+  so the screen stays live. Offline devices are not polled, so an offline
+  row's device is identified afresh. Its address may since belong to another
+  device. Actions are offered only if the device identifies as the make and
+  model the row reported while online. When that cannot be compared, they are
+  offered only within ten minutes of the row going offline.
+- What the panel identified stays known through the poller's passes, which ask
+  only connected devices. A confirmed action then goes the way the panel
+  listed.
+- Identifying a device, and sending an action through asic-rs, no longer
+  panic on tokio's timer, which was made outside the runtime. The panel kept
+  "Identifying the device" or "Sending" after such a panic. The action path
+  had it since PR #40.
+- Restart on every Avalon is Canaan's reboot (`ascset 0,reboot,0`) instead of
+  asic-rs's cgminer `restart`, which restarts only the mining program. asic-rs
+  offers no restart for Avalon Home Q at all.
+- Control is refused for a worker with no local address, and for a shared
+  address (a Tailscale subnet router, a VPN gateway or CGNAT). An address is
+  shared when two connections from it are each a minute old, or once two
+  devices there each kept mining for a minute after the other connected. That
+  mark stays until no row from the address remains, so it holds after one of
+  them goes offline or reconnects. A firmware's short extra connection does
+  not count, nor does a device's dead connection, which stopped mining before
+  the device's new one opened. Several connections from one address, all
+  under a minute old, are refused for that minute.
+- A reconnecting device keeps its worker name with its number until it gives
+  its own, so its label never reads "Device …" in between.
+- The address map beside the rows is gone: each row keeps its device's
+  address, used only to ask or control the device. A private address list
+  (label, address, refused) is ready for the owner-only file `stratum-v2
+  watch` will read. Only the server's modules can read it, and the status
+  JSON stays without addresses.
+
+Known limits:
+
+- Two devices of the same make and model cannot be told apart. An offline
+  row's address that passed to an identical device is controlled.
+- A second device behind a gateway is not refused during its first minute
+  there, unless two devices were already seen mining side by side there.
+- While a device's dead connection still looks open beside its new one, both
+  over a minute old, control is refused until the dead one is seen closed.
+
+Not yet: fan, power and pool settings, device logins, and the panel in
+`stratum-v2 watch`.
+
+Evidence: host tests cover Enter, `c` and Ctrl+C on the workers page (Ctrl+C
+does not open the panel); the panel opening for the highlighted row rather
+than the top one; the highlight following its device when it goes offline,
+when it reconnects before naming itself, and when the rows re-sort; an offline
+row opening with its last address and its offline time, never the address; a
+worker with no address, a shared one or an unsettled one offering nothing; an
+offline row offering actions for the same make and model at any age, never for
+another, and within ten minutes only when they cannot be compared; device
+errors shown without IPv4 or IPv6 addresses (with or without brackets and
+ports) and without reqwest's "for url" part; a choice needing a confirmation,
+with the reply of a sent action shown; the panel's device staying identified
+through a poller pass while another device is forgotten, and the time limit
+around an asic-rs action made inside the runtime; offline rows keeping their
+address while the poller skips them; two long-lived workers on one address
+refused while a 5-second probe is not counted, and two young ones not settled
+yet; two devices that mined side by side refused after one goes offline,
+after it reconnects and after their rows are merged away, until no row
+remains, while a single device's dead connection leaves no mark; the private
+address list never reaching the JSON or Debug output; and Restart on Avalon
+Nano 3s, A-series and Home Q never going through asic-rs, with Pickaxe's own
+Restart sending exactly `{"command":"ascset","parameter":"0,reboot,0"}` to a
+loopback stand-in. No device was contacted.

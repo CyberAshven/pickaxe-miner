@@ -197,10 +197,21 @@ pub fn control(ip: IpAddr, action: DeviceAction) -> Result<String, String> {
         return Err("only devices on the local network can be controlled".into());
     }
     let ip = ip.to_canonical();
-    let cgminer = SocketAddr::new(ip, 4028);
+    control_at(SocketAddr::new(ip, 4028), SocketAddr::new(ip, 80), action)
+}
+
+/// One of Pickaxe's own actions, sent to the device's CGMiner API and, for a
+/// restart it refuses, its web API (Bitaxe). Restart is Canaan's documented
+/// reboot, `ascset 0,reboot,0`, on every Avalon (PR #42, see `fleet`).
+pub(super) fn control_at(
+    cgminer: SocketAddr,
+    web: SocketAddr,
+    action: DeviceAction,
+) -> Result<String, String> {
     match action {
-        DeviceAction::Restart => ascset(cgminer, "0,reboot,0")
-            .or_else(|error| bitaxe_restart(SocketAddr::new(ip, 80)).map_err(|_| error)),
+        DeviceAction::Restart => {
+            ascset(cgminer, "0,reboot,0").or_else(|error| bitaxe_restart(web).map_err(|_| error))
+        }
         DeviceAction::LowerPower => adjust_level(cgminer, false),
         DeviceAction::RaisePower => adjust_level(cgminer, true),
         DeviceAction::Pause
@@ -422,7 +433,7 @@ fn bracket_number(text: &str, key: &str) -> Option<f64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -513,8 +524,9 @@ mod tests {
     }
 
     /// A device stand-in that answers one connection per reply, in order,
-    /// and hands each request it received to the test.
-    fn recording_device(
+    /// and hands each request it received to the test. (PR #42: shared with
+    /// the `fleet` tests.)
+    pub(in crate::stratum_v2) fn recording_device(
         replies: Vec<&'static [u8]>,
     ) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -69,6 +69,16 @@ pub struct Fleet {
 struct Shared {
     factory: MinerFactory,
     known: Mutex<HashMap<IpAddr, Known>>,
+    /// #### PR #42
+    /// What: the address of the device the Device panel opened last; the
+    /// poller's passes keep what is known about it.
+    /// Why: each pass forgets every device that is not connected, and the
+    /// panel opens on offline rows too. A confirmed action then found no
+    /// identified device: Pause or Blink failed, and Restart on a make only
+    /// asic-rs speaks to took Pickaxe's own Canaan and Bitaxe commands.
+    /// Look here if: an action on an offline row fails or takes another path
+    /// than the panel listed, or a farm's churn grows the cache.
+    held: Mutex<Option<IpAddr>>,
 }
 
 #[derive(Clone)]
@@ -96,6 +106,7 @@ impl Fleet {
             shared: Arc::new(Shared {
                 factory: MinerFactory::new().with_identification_timeout(IDENTIFY),
                 known: Mutex::new(HashMap::new()),
+                held: Mutex::new(None),
             }),
         }
     }
@@ -142,28 +153,48 @@ impl Fleet {
         })
     }
 
-    /// What this device offers on its controls page: what asic-rs supports
-    /// for its make and firmware, plus Avalon work levels; Pickaxe's own
-    /// actions for a device asic-rs has not identified.
-    pub fn actions(&self, ip: IpAddr) -> Vec<DeviceAction> {
-        let Some(miner) = self.shared.miner(ip) else {
-            return DeviceAction::OWN.to_vec();
-        };
-        let mut actions = vec![DeviceAction::Restart];
-        actions.extend(
-            [
-                DeviceAction::Pause,
-                DeviceAction::Resume,
-                DeviceAction::LocateOn,
-                DeviceAction::LocateOff,
-            ]
-            .into_iter()
-            .filter(|action| supports(&*miner, *action)),
-        );
-        if is_avalon(&*miner) {
-            actions.extend([DeviceAction::LowerPower, DeviceAction::RaisePower]);
+    /// #### PR #42
+    /// What: what this device offers on its Device panel, from what is
+    /// already known about it; no device is asked. Nothing for an address
+    /// that is not on the local network.
+    /// Why: the panel is drawn every half second and must never wait on a
+    /// device; `identify_now` asks it, on a background thread.
+    /// Look here if: the panel lists the wrong actions for a device.
+    pub fn controls(&self, ip: IpAddr) -> DeviceControls {
+        if !device_api::queryable(ip) {
+            return DeviceControls::default();
         }
-        actions
+        controls_of(self.shared.miner(ip).as_deref())
+    }
+
+    /// #### PR #42
+    /// What: identifies the device for its Device panel, within `IDENTIFY`
+    /// (10 seconds), and returns what it offers, from that identification
+    /// itself. `fresh` asks the device again even if asic-rs knows it (or
+    /// could not identify it lately). The address is held, so the poller
+    /// keeps what was found for the panel's actions. It blocks, so call it
+    /// from a background thread, never the screen's.
+    /// Why: the panel opens on offline rows too, which the poller no longer
+    /// asks; their make may not be known, and their address may since have
+    /// passed to another device, which only a fresh look shows.
+    /// Look here if: the panel stays at "Identifying the device", the screen
+    /// freezes when the panel opens, or an offline row's panel shows the
+    /// make the device had before.
+    pub fn identify_now(&self, ip: IpAddr, fresh: bool) -> DeviceControls {
+        if !device_api::queryable(ip) {
+            return DeviceControls::default();
+        }
+        self.shared.hold(ip);
+        let miner = self.runtime.as_ref().and_then(|runtime| {
+            // The time limit is made inside the runtime (see `control`).
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(IDENTIFY, self.shared.identify(ip, fresh)).await
+                })
+                .ok()
+                .flatten()
+        });
+        controls_of(miner.as_deref())
     }
 
     /// Runs one confirmed action and describes the device's answer: through
@@ -172,17 +203,19 @@ impl Fleet {
         if !device_api::queryable(ip) {
             return Err("only devices on the local network can be controlled".into());
         }
-        let miner = self
-            .shared
-            .miner(ip)
-            .filter(|miner| supports(&**miner, action));
-        match (miner, &self.runtime) {
-            (Some(miner), Some(runtime)) => runtime
-                .block_on(tokio::time::timeout(ANSWER, run(&*miner, action)))
-                .map_err(|_| "the device did not answer in time".to_owned())?,
+        match (self.through_asic_rs(ip, action), &self.runtime) {
+            (Some(miner), Some(runtime)) => run_within_answer(runtime, &*miner, action),
             _ => device_api::control(ip, action)
                 .map(|reply| format!("the device replied \"{reply}\"")),
         }
+    }
+
+    /// The identified device an action goes to through asic-rs, when asic-rs
+    /// supports that action for it; Pickaxe's own code sends the rest.
+    fn through_asic_rs(&self, ip: IpAddr, action: DeviceAction) -> Option<Arc<dyn Miner>> {
+        self.shared
+            .miner(ip)
+            .filter(|miner| supports(&**miner, action))
     }
 }
 
@@ -196,10 +229,21 @@ impl Drop for Fleet {
 }
 
 impl Shared {
-    /// Forgets devices that left, so a farm's churn cannot grow the cache.
+    /// Forgets devices that left, so a farm's churn cannot grow the cache;
+    /// the device the Device panel holds is kept (PR #42, see `held`).
     fn keep_only(&self, devices: &[(u64, IpAddr)]) {
+        let held = self.held.lock().ok().and_then(|held| *held);
         if let Ok(mut known) = self.known.lock() {
-            known.retain(|ip, _| devices.iter().any(|(_, device)| device == ip));
+            known.retain(|ip, _| {
+                held == Some(*ip) || devices.iter().any(|(_, device)| device == ip)
+            });
+        }
+    }
+
+    /// #### PR #42: the Device panel's device, kept through polls.
+    fn hold(&self, ip: IpAddr) {
+        if let Ok(mut held) = self.held.lock() {
+            *held = Some(ip);
         }
     }
 
@@ -212,12 +256,20 @@ impl Shared {
     }
 
     /// Identifies the device once; one asic-rs could not identify is asked
-    /// again only after `RETRY`.
-    async fn identify(&self, ip: IpAddr) -> Option<Arc<dyn Miner>> {
-        let known = self.known.lock().ok()?.get(&ip).cloned();
+    /// again only after `RETRY`. (PR #42: `fresh` forgets what is known and
+    /// asks now, so nothing older is used if this look times out.)
+    async fn identify(&self, ip: IpAddr, fresh: bool) -> Option<Arc<dyn Miner>> {
+        let known = {
+            let mut known = self.known.lock().ok()?;
+            if fresh {
+                known.remove(&ip)
+            } else {
+                known.get(&ip).cloned()
+            }
+        };
         match known {
-            Some(Known::Miner(miner)) => return Some(miner),
-            Some(Known::Unknown(since)) if since.elapsed() < RETRY => return None,
+            Some(Known::Miner(miner)) if !fresh => return Some(miner),
+            Some(Known::Unknown(since)) if !fresh && since.elapsed() < RETRY => return None,
             _ => (),
         }
         let found = tokio::time::timeout(IDENTIFY, self.factory.get_miner(ip)).await;
@@ -242,7 +294,7 @@ impl Shared {
         }
         let own = tokio::task::spawn_blocking(move || device_api::poll(ip));
         let data = async {
-            let miner = self.identify(ip).await?;
+            let miner = self.identify(ip, false).await?;
             tokio::time::timeout(ANSWER, miner.get_data_filtered(NOT_COLLECTED.to_vec()))
                 .await
                 .ok()
@@ -252,9 +304,67 @@ impl Shared {
     }
 }
 
+/// #### PR #42
+/// What a device offers on its Device panel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceControls {
+    /// The firmware asic-rs identified, such as "AvalonMiner Stock"; none
+    /// when it has not identified the device.
+    pub firmware: Option<String>,
+    /// The make and model asic-rs identified, written as a device report's
+    /// model is ("Avalonminer AvalonNano3s"), so an offline row's panel can
+    /// check that the device answering is the row's; none when asic-rs has
+    /// not identified the device.
+    pub model: Option<String>,
+    /// The one-shot actions, each sent only after the user confirms it.
+    pub actions: Vec<DeviceAction>,
+}
+
+/// What a device offers: what asic-rs supports for its make and firmware,
+/// plus Avalon work levels; Pickaxe's own actions for a device asic-rs has
+/// not identified.
+fn controls_of(miner: Option<&dyn Miner>) -> DeviceControls {
+    let Some(miner) = miner else {
+        return DeviceControls {
+            actions: DeviceAction::OWN.to_vec(),
+            ..DeviceControls::default()
+        };
+    };
+    let mut actions = vec![DeviceAction::Restart];
+    actions.extend(
+        [
+            DeviceAction::Pause,
+            DeviceAction::Resume,
+            DeviceAction::LocateOn,
+            DeviceAction::LocateOff,
+        ]
+        .into_iter()
+        .filter(|action| supports(miner, *action)),
+    );
+    if is_avalon(miner) {
+        actions.extend([DeviceAction::LowerPower, DeviceAction::RaisePower]);
+    }
+    let info = miner.get_device_info();
+    DeviceControls {
+        // The same text `from_asic_rs` gives a report's model.
+        model: Some(format!("{} {}", info.make, info.model)),
+        firmware: Some(info.firmware),
+        actions,
+    }
+}
+
 fn supports(miner: &dyn Miner, action: DeviceAction) -> bool {
     match action {
-        DeviceAction::Restart => miner.supports_restart(),
+        // #### PR #42
+        // What: Restart on any Avalon goes to Pickaxe's own Canaan reboot
+        // (`ascset 0,reboot,0`, see `device_api::control`), not to asic-rs.
+        // Why: asic-rs's Avalon restart sends cgminer's `restart`, which
+        // restarts the mining program, not the device, and asic-rs's Avalon
+        // Home Q does not offer it at all; Canaan documents
+        // `ascset 0,reboot,N` as the device reboot.
+        // Look here if: Restart on an Avalon does not reboot it, or a newer
+        // asic-rs reboots Avalons itself.
+        DeviceAction::Restart => !is_avalon(miner) && miner.supports_restart(),
         DeviceAction::Pause => miner.supports_pause(),
         DeviceAction::Resume => miner.supports_resume(),
         DeviceAction::LocateOn | DeviceAction::LocateOff => miner.supports_set_fault_light(),
@@ -269,6 +379,24 @@ fn is_avalon(miner: &dyn Miner) -> bool {
         .make
         .to_ascii_lowercase()
         .starts_with("avalon")
+}
+
+/// #### PR #42
+/// What: runs one action through asic-rs within `ANSWER`, with the time
+/// limit made inside the runtime, in the async block it runs.
+/// Why: tokio's timer panics when it is made outside a runtime ("there is no
+/// reactor running"), as `block_on(timeout(..))` in `control` did: every
+/// action sent through asic-rs ended the panel's background thread, and the
+/// panel kept showing "Sending".
+/// Look here if: an action sent through asic-rs never finishes.
+fn run_within_answer(
+    runtime: &tokio::runtime::Runtime,
+    miner: &dyn Miner,
+    action: DeviceAction,
+) -> Result<String, String> {
+    runtime
+        .block_on(async { tokio::time::timeout(ANSWER, run(miner, action)).await })
+        .map_err(|_| "the device did not answer in time".to_owned())?
 }
 
 async fn run(miner: &dyn Miner, action: DeviceAction) -> Result<String, String> {
@@ -443,7 +571,7 @@ mod tests {
         let fleet = Fleet::new();
         let reports = fleet.poll(&[(1, ip)], &AtomicBool::new(false));
         println!("report: {:?}", reports[0].1);
-        println!("actions: {:?}", fleet.actions(ip));
+        println!("controls: {:?}", fleet.controls(ip));
         let report = reports[0].1.as_ref().expect("the device answered");
         assert!(report.model.is_some(), "asic-rs identified the device");
         assert!(report.hashrate.is_some());
@@ -453,7 +581,15 @@ mod tests {
     fn unidentified_devices_offer_pickaxes_own_actions_and_public_ones_none() {
         let fleet = Fleet::new();
         let ip: IpAddr = "192.168.7.9".parse().unwrap();
-        assert_eq!(fleet.actions(ip), DeviceAction::OWN.to_vec());
+        // #### PR #42: `controls` (no device is asked) replaces `actions`.
+        assert_eq!(
+            fleet.controls(ip),
+            DeviceControls {
+                firmware: None,
+                model: None,
+                actions: DeviceAction::OWN.to_vec(),
+            }
+        );
         assert!(fleet
             .control("8.8.8.8".parse().unwrap(), DeviceAction::Restart)
             .is_err());
@@ -461,5 +597,137 @@ mod tests {
         let stop = AtomicBool::new(false);
         let reports = fleet.poll(&[(1, "8.8.8.8".parse().unwrap())], &stop);
         assert_eq!(reports, vec![(1, None)]);
+        // #### PR #42: nor identified, even freshly, and they offer nothing.
+        for other in ["8.8.8.8", "127.0.0.1"] {
+            let started = Instant::now();
+            let ip: IpAddr = other.parse().unwrap();
+            for fresh in [false, true] {
+                assert_eq!(fleet.identify_now(ip, fresh), DeviceControls::default());
+            }
+            assert_eq!(fleet.controls(ip), DeviceControls::default());
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    // #### PR #42
+    // What: the device the Device panel identified stays known through the
+    // poller's passes, which ask only connected devices, so a confirmed
+    // action on an offline row goes the way the panel listed; a device no
+    // panel holds is still forgotten. Identifying and acting do not panic
+    // on tokio's timer.
+    // Why: each pass forgot every device that was not connected, and Pause,
+    // Blink or Restart on an offline row then failed or took Pickaxe's own
+    // path; a time limit made outside the runtime panicked.
+    // Look here if: keep_only(), hold(), identify_now(), control() or
+    // run_within_answer() changes.
+    #[test]
+    fn the_panels_device_stays_identified_through_polls() {
+        use asic_rs::{
+            avalonminer::{backends::AvalonMiner, firmware::AvalonStockFirmware},
+            core::traits::{firmware::MinerFirmware, miner::MinerConstructor},
+        };
+        type AvalonModel = <AvalonStockFirmware as MinerFirmware>::Model;
+        let fleet = Fleet::new();
+        let held: IpAddr = "192.168.7.9".parse().unwrap();
+        let other: IpAddr = "192.168.7.10".parse().unwrap();
+        // Building asic-rs's miners sends nothing to these addresses.
+        for ip in [held, other] {
+            let model: AvalonModel = "1566".parse().unwrap();
+            let miner = AvalonMiner::new(ip, model, None);
+            fleet
+                .shared
+                .known
+                .lock()
+                .unwrap()
+                .insert(ip, Known::Miner(Arc::from(miner)));
+        }
+        // The panel opens on the row: asic-rs knows the device, so nothing
+        // is sent.
+        let controls = fleet.identify_now(held, false);
+        assert_eq!(controls.firmware.as_deref(), Some("AvalonMiner Stock"));
+        assert!(controls.actions.contains(&DeviceAction::Pause));
+        // A pass with no device connected.
+        assert!(fleet.poll(&[], &AtomicBool::new(false)).is_empty());
+        assert_eq!(fleet.controls(held), controls);
+        assert!(fleet.through_asic_rs(held, DeviceAction::Pause).is_some());
+        assert!(fleet
+            .through_asic_rs(held, DeviceAction::LocateOn)
+            .is_some());
+        assert!(
+            fleet.through_asic_rs(held, DeviceAction::Restart).is_none(),
+            "an Avalon restart is Canaan's own reboot"
+        );
+        assert!(
+            fleet.through_asic_rs(other, DeviceAction::Pause).is_none(),
+            "a device no panel holds is forgotten"
+        );
+        assert_eq!(fleet.controls(other).firmware, None);
+        // The time limit around an asic-rs action is made inside the runtime
+        // (made outside, tokio panicked). An action asic-rs does not send
+        // returns at once, so nothing reaches the device.
+        let miner = fleet.through_asic_rs(held, DeviceAction::Pause).unwrap();
+        assert_eq!(
+            run_within_answer(
+                fleet.runtime.as_ref().unwrap(),
+                &*miner,
+                DeviceAction::LowerPower
+            ),
+            Err("this action is not sent through asic-rs".to_owned())
+        );
+    }
+
+    // #### PR #42
+    // What: Restart on an Avalon (A-series, Nano and Home Q) is never sent
+    // through asic-rs, but is still offered, and Pickaxe's own Restart sends
+    // Canaan's reboot, byte for byte.
+    // Why: asic-rs's Avalon restart only restarts cgminer, and its Home Q
+    // has none.
+    // Look here if: supports(), controls_of() or device_api::control()
+    // changes.
+    #[test]
+    fn avalon_restart_uses_canaans_reboot() {
+        use asic_rs::{
+            avalonminer::{backends::AvalonMiner, firmware::AvalonStockFirmware},
+            core::traits::{firmware::MinerFirmware, miner::MinerConstructor},
+        };
+        type AvalonModel = <AvalonStockFirmware as MinerFirmware>::Model;
+        // Building asic-rs's miner sends nothing to this address.
+        let ip: IpAddr = "192.168.7.9".parse().unwrap();
+        for (model, asic_rs_restarts) in [("NANO3S", true), ("1566", true), ("Q", false)] {
+            let model: AvalonModel = model.parse().unwrap();
+            let miner = AvalonMiner::new(ip, model, None);
+            assert!(is_avalon(&*miner));
+            assert_eq!(miner.supports_restart(), asic_rs_restarts);
+            assert!(!supports(&*miner, DeviceAction::Restart));
+            let controls = controls_of(Some(&*miner));
+            assert_eq!(controls.actions[0], DeviceAction::Restart);
+            assert!(controls.actions.contains(&DeviceAction::RaisePower));
+            assert_eq!(controls.firmware.as_deref(), Some("AvalonMiner Stock"));
+            // #### PR #42: make and model as a report names them.
+            let info = miner.get_device_info();
+            assert_eq!(
+                controls.model,
+                Some(format!("{} {}", info.make, info.model))
+            );
+        }
+        let nano: AvalonModel = "NANO3S".parse().unwrap();
+        assert_eq!(
+            controls_of(Some(&*AvalonMiner::new(ip, nano, None)))
+                .model
+                .as_deref(),
+            Some("Avalonminer AvalonNano3s")
+        );
+        let (avalon, requests) = device_api::tests::recording_device(vec![
+            br#"{"STATUS":[{"STATUS":"I","Msg":"ASC 0 set info: reboot"}],"id":1}"#,
+        ]);
+        let unused_web = std::net::SocketAddr::from(([127, 0, 0, 1], 9));
+        assert_eq!(
+            device_api::control_at(avalon, unused_web, DeviceAction::Restart).unwrap(),
+            "ASC 0 set info: reboot"
+        );
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,reboot,0"}"#
+        );
     }
 }

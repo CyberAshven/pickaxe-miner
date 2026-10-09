@@ -123,7 +123,9 @@ The dashboard opens on a workers table, laid out like a pool's worker list: one
 row per device with its label, status, rate over 5 minutes and over
 1 hour, the device's own report, accepted and rejected shares, reject rate, last
 share, current share difficulty, protocol and latest issue. Tab switches to the
-overview, Arrow/Page keys scroll, and `a` opens Advanced settings. An
+overview, the arrow keys, PgUp/PgDn, Home and End move the highlighted row
+(PR #42; the overview scrolls), Enter opens its Device panel, and `a` opens
+Advanced settings. An
 address-only worker still gets its own row and unique work. Both rates come
 from validated shares after a 30-second warm-up; they are statistical
 estimates, so compare the 1-hour rate with the device's own figure. Up to 64
@@ -210,16 +212,60 @@ journal belongs to the network and payout, not to one node, so the server
 also starts when its first node is down; a journal written by an older
 build opens while its node is still configured.
 
-On the workers page, `c` opens controls for the top row's device, with its
-model, firmware and power. It lists what that make and firmware support
-through asic-rs (Restart, Pause and Resume mining, blink or stop blinking its
-light to find it) plus one work level down or up on Avalon (Pickaxe's own
-Canaan `ascset worklevel` commands, within the device's own range; asic-rs's
-power limit is in watts, which Avalon work levels are not). A device asic-rs
-has not identified offers Pickaxe's own Restart (Canaan's `ascset` reboot or
-Bitaxe's restart endpoint) and work levels. Each action needs a confirmation,
-goes only to a device on the local network, and shows the device's reply. The
-read-only `watch` view has no controls.
+#### PR #42
+
+On the workers page, the arrow keys, PgUp/PgDn, Home and End move a
+highlighted row. Enter (or `c`) opens the Device panel for it, online or
+offline, so a device that stopped mining can be restarted from its offline
+row. The highlight stays on its device when rows re-sort (online rows come
+first) and when the device reconnects. The table scrolls to keep it in view.
+
+The panel shows the device's model, firmware and power, and how it is reached:
+"local network", "Tailscale/CGNAT" or "IPv6 local". It never shows the
+device's address, not even inside a device's reply or error. An offline row
+shows how long it has been offline and uses the address its device last
+connected from.
+
+While the panel opens, Pickaxe identifies the device in the background, for at
+most ten seconds. It then lists what that make and firmware support through
+asic-rs: Restart, Pause and Resume mining, and blink or stop blinking its
+light to find it. Avalons also get one work level down or up, through
+Pickaxe's own Canaan `ascset worklevel` commands, within the device's own
+range (asic-rs sets power in watts, which Avalon work levels are not). Restart
+on any Avalon is Canaan's own reboot (`ascset 0,reboot,0`). asic-rs's Avalon
+restart only restarts the mining program, and its Avalon Home Q has none. A
+device asic-rs does not identify offers Pickaxe's own Restart (Canaan's
+`ascset` reboot or Bitaxe's restart endpoint) and work levels.
+
+Each action needs a confirmation, goes only to a device on the local network
+or Tailscale, and shows the device's reply. The panel takes every key, so `q`
+there never stops the server. Esc goes back.
+
+An offline row's address may since belong to another device, for example
+after its DHCP lease passed on. So for an offline row Pickaxe looks at the
+device there afresh, and offers actions only if it identifies as the same make
+and model the row reported while online. When that cannot be compared (the
+device is not one asic-rs identifies), actions are offered only within ten
+minutes of the row going offline. Two devices of the same model cannot be
+told apart this way.
+
+The panel refuses to control a worker in these cases, and says why:
+
+- Its address is not known: it connected from this computer or from a public
+  address.
+- Its address is shared. Behind a Tailscale subnet router, a VPN gateway or
+  carrier-grade NAT, every device has the gateway's address, and commands
+  would reach the gateway, not the device. An address counts as shared when
+  two connections from it are each a minute old, or once two devices there
+  each kept mining for a minute after the other connected. That second mark
+  stays, even after one of them goes offline, until no row from the address
+  remains. A firmware's short extra connection beside its device does not
+  count. Control such devices from their own network.
+- Several connections from its address are all under a minute old, for
+  example right after the server starts. Pickaxe cannot tell yet whether they
+  are one device. Open the panel again a minute later.
+
+The read-only `watch` view has no Device panel yet.
 
 A server running without a screen, for example as a service with
 `--no-tui --json`, saves the same status once a second beside its config

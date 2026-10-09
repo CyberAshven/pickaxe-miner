@@ -3,8 +3,8 @@
 //! keep authority secrets private, and never print node credentials or payouts.
 
 use super::{
-    device_api::DeviceAction,
     fleet::Fleet,
+    panel::{DevicePanel, Selection},
     provider::{NativeNodeRpc, TemplateProvider},
     server::{self, ServerConfig, ServerStats},
     telemetry::DeviceSnapshot,
@@ -20,7 +20,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Modifier, Style},
-    widgets::{Block, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 use serde::Deserialize;
@@ -327,7 +327,18 @@ pub fn run(
         let mut overview = false;
         let status_file = status_path(config_path);
         let mut status_saved: Option<Instant> = None;
-        let mut controls: Option<Controls> = None;
+        // #### PR #42
+        // What: the workers page highlights one row, moved with the arrow
+        // keys, PgUp/PgDn, Home and End and kept by its label; Enter (or c)
+        // opens the Device panel for that row, online or offline.
+        // Why: `c` opened the controls of the scroll position's row, and only
+        // while it was online, so an offline device could not be restarted
+        // and the row controlled was not always the one the user meant.
+        // Look here if: Enter opens another device than the highlighted one,
+        // or the highlight jumps when rows re-sort.
+        let mut selection = Selection::default();
+        let mut panel: Option<DevicePanel> = None;
+        // #### end PR #42 ####
         let mut connect: Option<ConnectPage> = None;
         while !stop.load(Ordering::Relaxed)
             && worker.as_ref().is_none_or(|worker| !worker.is_finished())
@@ -422,13 +433,16 @@ pub fn run(
                     )
                 };
                 let lines: Vec<WorkerLine> = devices.iter().map(WorkerLine::from).collect();
+                // #### PR #42: the highlight follows its device's label.
+                let labels: Vec<&str> = lines.iter().map(|line| line.label.as_str()).collect();
+                selection.follow(&labels);
                 terminal
                     .terminal
                     .draw(|frame| {
                         if let Some(page) = connect.as_ref() {
                             render_connect(frame, page)
-                        } else if let Some(view) = controls.as_ref() {
-                            render_controls(frame, view)
+                        } else if let Some(view) = panel.as_ref() {
+                            super::panel::render(frame, view)
                         } else if advanced {
                             render_advanced(
                                 frame,
@@ -443,9 +457,8 @@ pub fn run(
                                 frame,
                                 &header,
                                 &lines,
-                                device_offset,
+                                &mut selection.table,
                                 SERVE_FOOTER,
-                                true,
                             )
                         }
                     })
@@ -482,25 +495,40 @@ pub fn run(
                                 }
                                 continue;
                             }
-                            if let Some(view) = controls.as_mut() {
-                                if handle_controls_key(view, key.code, &fleet) {
-                                    controls = None;
+                            // #### PR #42
+                            // What: the Device panel takes every key, so q
+                            // typed there never stops the server; Enter (or
+                            // c) on the workers page opens it for the
+                            // highlighted row, online or offline, and
+                            // Ctrl+C there stops the server instead.
+                            // Why: see the selection note above; Ctrl+C on
+                            // the workers page opened the controls.
+                            // Look here if: a key on the panel reaches the
+                            // workers page, or Enter opens the wrong row.
+                            if let Some(view) = panel.as_mut() {
+                                if view.handle_key(key, &fleet) {
+                                    panel = None;
                                 }
                                 continue;
                             }
                             match key.code {
-                                KeyCode::Char('c') | KeyCode::Char('C')
-                                    if !advanced && !overview =>
-                                {
-                                    if let Some(device) =
-                                        devices.get(device_offset).filter(|device| device.connected)
-                                    {
-                                        let address = stats.lock().ok().and_then(|stats| {
-                                            stats.device_stats.address_for_label(&device.label)
-                                        });
-                                        controls = Some(Controls::new(device, address, &fleet));
+                                _ if super::panel::opens_panel(&key, !advanced && !overview) => {
+                                    // `devices` holds this frame's rows in
+                                    // the table's order.
+                                    let opened = stats.lock().ok().and_then(|stats| {
+                                        DevicePanel::for_selection(
+                                            &stats.device_stats,
+                                            &devices,
+                                            &selection,
+                                            Instant::now(),
+                                        )
+                                    });
+                                    if let Some(view) = opened {
+                                        view.identify(&fleet);
+                                        panel = Some(view);
                                     }
                                 }
+                                // #### end PR #42 ####
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
                                 KeyCode::Char('i') | KeyCode::Char('I') if !advanced => {
                                     connect = Some(ConnectPage {
@@ -544,11 +572,29 @@ pub fn run(
                                 {
                                     stop.store(true, Ordering::Relaxed)
                                 }
-                                KeyCode::Up => device_offset = device_offset.saturating_sub(1),
-                                KeyCode::Down => device_offset = device_offset.saturating_add(1),
-                                KeyCode::PageUp => device_offset = device_offset.saturating_sub(10),
-                                KeyCode::PageDown => {
+                                KeyCode::Up if overview => {
+                                    device_offset = device_offset.saturating_sub(1)
+                                }
+                                KeyCode::Down if overview => {
+                                    device_offset = device_offset.saturating_add(1)
+                                }
+                                KeyCode::PageUp if overview => {
+                                    device_offset = device_offset.saturating_sub(10)
+                                }
+                                KeyCode::PageDown if overview => {
                                     device_offset = device_offset.saturating_add(10)
+                                }
+                                // #### PR #42: on the workers page these keys
+                                // move the highlight (the overview scrolls).
+                                KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::PageUp
+                                | KeyCode::PageDown
+                                | KeyCode::Home
+                                | KeyCode::End
+                                    if !advanced && !overview =>
+                                {
+                                    selection.step(key.code, &labels)
                                 }
                                 _ => (),
                             }
@@ -824,13 +870,19 @@ fn format_difficulty(difficulty: Option<f64>) -> String {
 }
 
 /// The workers table, laid out like a pool's worker list; the default page.
+/// #### PR #42
+/// What: the table scrolls itself to keep the highlighted row (`state`'s
+/// selection) in view and shows it reversed; with no selection (the
+/// read-only watch view) it scrolls from `state`'s offset.
+/// Why: the highlight used to be whichever row was at the scroll position.
+/// Look here if: the highlighted row is off screen or not the one Enter
+/// opens.
 fn render_workers(
     frame: &mut Frame<'_>,
     header: &str,
     devices: &[WorkerLine],
-    offset: usize,
+    state: &mut TableState,
     footer: &str,
-    highlight: bool,
 ) {
     let areas = Layout::vertical([
         Constraint::Length(5),
@@ -849,57 +901,61 @@ fn render_workers(
             .map(crate::telemetry::format_hash_rate)
             .unwrap_or_else(|| "Measuring".into())
     };
-    let rows = devices
-        .iter()
-        .skip(offset)
-        .enumerate()
-        .map(|(index, device)| {
-            let total = device.accepted + device.rejected;
-            let style = if highlight && index == 0 {
-                Style::default().add_modifier(Modifier::REVERSED)
+    let rows = devices.iter().map(|device| {
+        let total = device.accepted + device.rejected;
+        Row::new(vec![
+            device.label.clone(),
+            if device.connected {
+                "Online"
             } else {
-                Style::default()
-            };
-            Row::new(vec![
-                device.label.clone(),
-                if device.connected {
-                    "Online"
-                } else {
-                    "Offline"
-                }
+                "Offline"
+            }
+            .to_owned(),
+            rate(device.hashrate_estimate),
+            rate(device.hashrate_hour),
+            device
+                .reported_hashrate
+                .map(crate::telemetry::format_hash_rate)
+                .unwrap_or_else(|| "—".into()),
+            device
+                .temperature_c
+                .map(|temperature| format!("{temperature:.0} °C"))
+                .unwrap_or_else(|| "—".into()),
+            device.fan.clone().unwrap_or_else(|| "—".into()),
+            device.accepted.to_string(),
+            device.rejected.to_string(),
+            if total == 0 {
+                "—".to_owned()
+            } else {
+                format!("{:.2}%", device.rejected as f64 * 100.0 / total as f64)
+            },
+            ago(device.last_share_seconds),
+            format_difficulty(device.difficulty),
+            device.protocol.clone(),
+            device
+                .adapter_error
+                .as_deref()
+                .or(device.connection_error.as_deref())
+                .or(device.last_rejection.as_deref())
+                .unwrap_or("—")
                 .to_owned(),
-                rate(device.hashrate_estimate),
-                rate(device.hashrate_hour),
-                device
-                    .reported_hashrate
-                    .map(crate::telemetry::format_hash_rate)
-                    .unwrap_or_else(|| "—".into()),
-                device
-                    .temperature_c
-                    .map(|temperature| format!("{temperature:.0} °C"))
-                    .unwrap_or_else(|| "—".into()),
-                device.fan.clone().unwrap_or_else(|| "—".into()),
-                device.accepted.to_string(),
-                device.rejected.to_string(),
-                if total == 0 {
-                    "—".to_owned()
-                } else {
-                    format!("{:.2}%", device.rejected as f64 * 100.0 / total as f64)
-                },
-                ago(device.last_share_seconds),
-                format_difficulty(device.difficulty),
-                device.protocol.clone(),
-                device
-                    .adapter_error
-                    .as_deref()
-                    .or(device.connection_error.as_deref())
-                    .or(device.last_rejection.as_deref())
-                    .unwrap_or("—")
-                    .to_owned(),
-            ])
-            .style(style)
-        });
-    frame.render_widget(
+        ])
+    });
+    let title = match state.selected() {
+        Some(index) if index < devices.len() => {
+            format!("Workers · {} · row {} selected", devices.len(), index + 1)
+        }
+        _ => format!(
+            "Workers · {} · {} onward",
+            devices.len(),
+            if devices.is_empty() {
+                0
+            } else {
+                state.offset() + 1
+            }
+        ),
+    };
+    frame.render_stateful_widget(
         Table::new(
             rows,
             [
@@ -938,17 +994,16 @@ fn render_workers(
             ])
             .style(Style::default().add_modifier(Modifier::BOLD)),
         )
-        .block(Block::bordered().title(format!(
-            "Workers · {} · {} onward",
-            devices.len(),
-            if devices.is_empty() { 0 } else { offset + 1 }
-        ))),
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(Block::bordered().title(title)),
         areas[1],
+        state,
     );
     frame.render_widget(Paragraph::new(footer), areas[2]);
 }
 
-const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Scroll · c  Controls (top row) · i  Connection info · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
+// #### PR #42: Enter opens the Device panel for the highlighted row.
+const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Select · Enter  Device panel · i  Connection info · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
 const WATCH_FOOTER: &str = "↑/↓ PgUp/PgDn  Scroll · q  Quit (the server keeps running)\nRead-only view of the server's saved status; Now and 1 hour come from validated shares.";
 
 /// One row of the workers table, from the live server or its saved status.
@@ -1180,120 +1235,6 @@ fn render_connect(frame: &mut Frame<'_>, page: &ConnectPage) {
     frame.render_widget(
         Paragraph::new(connect_text(page))
             .block(Block::bordered().title("Pickaxe · Connection info"))
-            .wrap(Wrap { trim: false }),
-        frame.area(),
-    );
-}
-
-/// #### PR #40
-/// The controls page for one worker: choose an action, confirm it, and read
-/// the device's reply. The actions are the ones this device offers (see
-/// `Fleet::actions`); they run in the background so the page stays live.
-struct Controls {
-    label: String,
-    /// Model, firmware and power, as the device reports them.
-    details: String,
-    address: Option<std::net::IpAddr>,
-    actions: Vec<DeviceAction>,
-    confirming: Option<DeviceAction>,
-    reply: Arc<Mutex<Option<String>>>,
-}
-
-impl Controls {
-    fn new(device: &DeviceSnapshot, address: Option<std::net::IpAddr>, fleet: &Fleet) -> Self {
-        let details = [
-            device.model.clone(),
-            device
-                .firmware
-                .as_ref()
-                .map(|firmware| format!("firmware {firmware}")),
-            device.power_w.map(|watts| power(Some(watts))),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
-        Self {
-            label: device.label.clone(),
-            details,
-            address,
-            actions: address.map_or_else(|| DeviceAction::OWN.to_vec(), |ip| fleet.actions(ip)),
-            confirming: None,
-            reply: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn set_reply(&self, text: String) {
-        if let Ok(mut reply) = self.reply.lock() {
-            *reply = Some(text);
-        }
-    }
-}
-
-/// Handles one key on the controls page; true closes it.
-fn handle_controls_key(view: &mut Controls, code: KeyCode, fleet: &Arc<Fleet>) -> bool {
-    match (view.confirming, code) {
-        (_, KeyCode::Esc) => return true,
-        (None, KeyCode::Char(choice @ '1'..='9')) => {
-            view.confirming = view.actions.get(usize::from(choice as u8 - b'1')).copied();
-        }
-        (Some(action), KeyCode::Char('y') | KeyCode::Char('Y')) => {
-            view.confirming = None;
-            match view.address {
-                None => view.set_reply(
-                    "This worker's network address is not known, so it cannot be controlled."
-                        .into(),
-                ),
-                Some(ip) => {
-                    view.set_reply(format!("Sending: {}…", action.label()));
-                    let reply = Arc::clone(&view.reply);
-                    let fleet = Arc::clone(fleet);
-                    thread::spawn(move || {
-                        let text = match fleet.control(ip, action) {
-                            Ok(message) => format!("{}: {message}", action.label()),
-                            Err(error) => format!("{}: not done; {error}", action.label()),
-                        };
-                        if let Ok(mut reply) = reply.lock() {
-                            *reply = Some(text);
-                        }
-                    });
-                }
-            }
-        }
-        (Some(_), _) => view.confirming = None,
-        _ => {}
-    }
-    false
-}
-
-fn render_controls(frame: &mut Frame<'_>, view: &Controls) {
-    let mut text = format!("Worker  {}\n", view.label);
-    if !view.details.is_empty() {
-        text.push_str(&format!("{}\n", view.details));
-    }
-    text.push('\n');
-    match view.confirming {
-        Some(action) => text.push_str(&format!(
-            "{} {}?\n\ny  Yes · any other key  No\n",
-            action.label(),
-            view.label
-        )),
-        None => {
-            for (index, action) in view.actions.iter().enumerate() {
-                text.push_str(&format!("{}  {}\n", index + 1, action.label()));
-            }
-            text.push_str("\nEsc  Back to workers\n");
-        }
-    }
-    if let Some(reply) = view.reply.lock().ok().and_then(|reply| reply.clone()) {
-        text.push_str(&format!("\n{reply}\n"));
-    }
-    text.push_str(
-        "\nActions go to the device's own API on your local network and each needs your confirmation. The list is what this device's make and firmware support through asic-rs, plus Avalon work levels; a device not yet identified offers Restart and work levels.",
-    );
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(Block::bordered().title("Pickaxe · Device controls"))
             .wrap(Wrap { trim: false }),
         frame.area(),
     );
@@ -1548,9 +1489,12 @@ fn watch(path: &Path) -> Result<(), String> {
             ),
         };
         offset = offset.min(rows.len().saturating_sub(1));
+        // #### PR #42: read-only, so nothing is highlighted; the table
+        // scrolls from the offset as before.
+        let mut table = TableState::default().with_offset(offset);
         terminal
             .terminal
-            .draw(|frame| render_workers(frame, &header, &rows, offset, WATCH_FOOTER, false))
+            .draw(|frame| render_workers(frame, &header, &rows, &mut table, WATCH_FOOTER))
             .map_err(|_| "cannot draw workers table")?;
         if event::poll(Duration::from_secs(1)).map_err(|_| "cannot read terminal")? {
             if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
@@ -1785,31 +1729,47 @@ mod tests {
             );
         }
         devices.share(first, ShareEvent::Rejected("stale job"), true, start);
+        // #### PR #42: a second worker, highlighted with the arrow keys.
+        devices.connect("127.0.0.1:1001".parse().unwrap(), true, start);
         let rows: Vec<WorkerLine> = devices
             .snapshots(start + Duration::from_secs(45))
             .iter()
             .map(WorkerLine::from)
             .collect();
+        let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+        let mut selection = Selection::default();
+        selection.follow(&labels);
+        selection.step(KeyCode::Down, &labels);
         let mut terminal = Terminal::new(TestBackend::new(180, 20)).unwrap();
         terminal
             .draw(|f| {
                 render_workers(
                     f,
-                    "Chipnet · Node Ready · 1 of 1 workers online",
+                    "Chipnet · Node Ready · 2 of 2 workers online",
                     &rows,
-                    0,
+                    &mut selection.table,
                     SERVE_FOOTER,
-                    true,
                 )
             })
             .unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        // Only the highlighted row is shown reversed.
+        let line_of = |label: &str| {
+            (0..buffer.area.height)
+                .find(|&y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(label)
+                })
+                .unwrap()
+        };
+        let reversed = |y: u16| buffer[(2, y)].modifier.contains(Modifier::REVERSED);
+        assert!(reversed(line_of(&rows[1].label)));
+        assert!(!reversed(line_of(&rows[0].label)));
+        assert!(text.contains("Workers · 2 · row 2 selected"), "{text}");
+        assert!(text.contains("Enter  Device panel"));
         for column in [
             "Worker",
             "Now (5m)",
@@ -1831,55 +1791,6 @@ mod tests {
         assert_eq!(format_difficulty(Some(512.0)), "512");
         assert_eq!(format_difficulty(None), "—");
         assert_eq!(ago(Some(250)), "4m ago");
-    }
-
-    #[test]
-    fn controls_need_a_choice_and_a_confirmation() {
-        use ratatui::{backend::TestBackend, Terminal};
-        let fleet = Arc::new(Fleet::new());
-        let mut stats = ServerStats::default();
-        stats
-            .device_stats
-            .connect("127.0.0.1:1000".parse().unwrap(), true, Instant::now());
-        let mut device = stats.device_stats.snapshots(Instant::now()).remove(0);
-        device.model = Some("Avalonminer AvalonNano3s".into());
-        device.power_w = Some(140.0);
-        let mut view = Controls::new(&device, None, &fleet);
-        // A device not identified by asic-rs offers Pickaxe's own actions.
-        assert_eq!(view.actions, DeviceAction::OWN.to_vec());
-        assert_eq!(view.details, "Avalonminer AvalonNano3s · 140 W");
-        // Choosing an action only asks for confirmation; a number past the
-        // list chooses nothing.
-        assert!(!handle_controls_key(&mut view, KeyCode::Char('9'), &fleet));
-        assert_eq!(view.confirming, None);
-        assert!(!handle_controls_key(&mut view, KeyCode::Char('2'), &fleet));
-        assert_eq!(view.confirming, Some(DeviceAction::LowerPower));
-        // Any key other than y cancels.
-        handle_controls_key(&mut view, KeyCode::Char('n'), &fleet);
-        assert_eq!(view.confirming, None);
-        assert!(view.reply.lock().unwrap().is_none());
-        // Confirmed, but without a known address nothing is sent.
-        handle_controls_key(&mut view, KeyCode::Char('1'), &fleet);
-        handle_controls_key(&mut view, KeyCode::Char('y'), &fleet);
-        assert!(view
-            .reply
-            .lock()
-            .unwrap()
-            .as_deref()
-            .unwrap()
-            .contains("cannot be controlled"));
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-        terminal.draw(|f| render_controls(f, &view)).unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(text.contains("Restart") && text.contains("Raise power"));
-        assert!(text.contains("AvalonNano3s"));
-        assert!(handle_controls_key(&mut view, KeyCode::Esc, &fleet));
     }
 
     // #### PR #40
@@ -2242,7 +2153,15 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(180, 20)).unwrap();
         terminal
-            .draw(|f| render_workers(f, &header, &saved.rows(updated), 0, WATCH_FOOTER, false))
+            .draw(|f| {
+                render_workers(
+                    f,
+                    &header,
+                    &saved.rows(updated),
+                    &mut TableState::default(),
+                    WATCH_FOOTER,
+                )
+            })
             .unwrap();
         let text: String = terminal
             .backend()

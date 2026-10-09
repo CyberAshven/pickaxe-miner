@@ -19,6 +19,9 @@ pub mod journal;
 mod journal_tests;
 #[cfg(all(test, feature = "stratum-v2"))]
 mod live_tests;
+// #### PR #42: the Device panel (row selection and one device's controls).
+#[cfg(feature = "stratum-v2")]
+mod panel;
 #[cfg(feature = "stratum-v2")]
 mod payout;
 #[cfg(feature = "stratum-v2")]
