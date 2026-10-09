@@ -120,16 +120,36 @@ pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json --sv1-listen 127.
 `check-node` is read-only and prints a redacted template summary. `serve`
 binds to `127.0.0.1:3336` unless `--listen IP:PORT` selects a LAN interface.
 The dashboard opens on a workers table, laid out like a pool's worker list: one
-row per session with its generated label, status, rate over 5 minutes and over
+row per device with its label, status, rate over 5 minutes and over
 1 hour, the device's own report, accepted and rejected shares, reject rate, last
 share, current share difficulty, protocol and latest issue. Tab switches to the
 overview, Arrow/Page keys scroll, and `a` opens Advanced settings. An
-address-only worker still gets its own row and unique work; reconnecting creates
-a new session label. Both rates come from validated shares after a 30-second
-warm-up; they are statistical estimates, so compare the 1-hour rate with the
-device's own figure. Up to 64 closed sessions remain visible. JSON
-`device_details` contains the same rows, including last-share age and SV1-local
-reject counts.
+address-only worker still gets its own row and unique work. Both rates come
+from validated shares after a 30-second warm-up; they are statistical
+estimates, so compare the 1-hour rate with the device's own figure. Up to 64
+closed sessions remain visible. JSON `device_details` contains the same rows,
+including last-share age and SV1-local reject counts.
+
+#### PR #42
+
+A device on the local network keeps one row and one label through
+reconnects. When it connects again from the same local address, it takes over
+its offline row and the number in its label (`rig1 #12` stays `rig1 #12`).
+This also works when the device comes back before Pickaxe sees its old
+connection drop, as after a power cut: until then the new connection shows a
+new number beside the old row, and when the old connection closes, the new one
+takes its number. A short extra connection that a firmware opens
+beside its mining one, closed within a minute, leaves no row. A device
+connecting from this computer or from a public address gets a new row and label
+on each reconnect. The address itself is never shown or written to the JSON
+status.
+
+Behind a Tailscale subnet router, a VPN gateway or carrier-grade NAT, many
+devices share one address. A device there that goes offline stays as an
+offline row while the others mine. But when one of them reconnects, it takes
+over every offline row on that address and the number of the one that went
+offline last, so another device's offline row can disappear and a number can
+move to a different device.
 
 "Device says", Temp and Fan are the device's own report. Every 15 seconds
 Pickaxe asks each connected device on the local network (private, link-local,

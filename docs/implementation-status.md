@@ -1120,3 +1120,51 @@ view shows the farm, the rig row, a stale status and a GPU miner's rows. Live
 on Chipnet on 2026-10-09: a coordinator with no GPU, run without a screen
 beside a running GPU miner, saved its status (mining, the height, its rig
 listener and job source) with no payout address in it.
+
+## One row per device (2026-10-09)
+
+#### PR #42
+
+The workers table keeps one row per device on the local network instead of one
+per connection, and the label keeps its number (`rig1 #12` stays `rig1 #12`,
+where it used to become `rig1 #15`), so the label follows the device.
+
+- A device that connects again from the same local address takes over its
+  offline rows there and the number of the one that went offline last.
+- A device that comes back before its old connection is seen closed (after a
+  power cut, a reboot or a pulled cable, the server notices a dead connection
+  only when a write to it fails) gets its old number when that connection
+  closes. The new connection must be the only one on the address that opened
+  after the old one's last accepted share and has not taken over a row.
+- A connection that closes within a minute while another one on its address is
+  online (a firmware's short extra connection) leaves no row, and gives back
+  any offline row it took over.
+- Any other closed connection stays as an offline row, also when another
+  device on the same address is online: behind a Tailscale subnet router, a VPN
+  gateway or CGNAT many devices share one address, and a real device must show
+  offline rather than vanish.
+- Devices seen from this computer or from a public address keep one row per
+  connection, as before. The address is used only to match rows and query the
+  device; it is never shown or written to the JSON status.
+
+Known limits:
+
+- Behind one shared address, a reconnecting device takes over every offline
+  row there, so another device's offline row can disappear and a number can
+  move to a different device. The Device panel will refuse control on such an
+  address.
+- When two or more new connections open on an address before an old one there
+  is seen closed (several devices behind a shared address reconnecting at
+  once, or a device that opens a second connection that early), the old row
+  stays offline and the new connections keep new numbers.
+
+Evidence: host tests cover a reconnect replacing the device's offline row while
+another device's stays; a short extra connection leaving no row; a device that
+mined for two minutes behind a shared 100.64.0.0/10 address staying as an
+offline row while a short probe there still vanishes; a probe there that opens
+after the device went offline giving its row back; a device back before its
+old connection closes ending with one row and its old number, and two new
+connections leaving the old row offline; a reconnect over several offline rows
+taking the number of the latest to close; and a reconnected device keeping its
+number and worker name whether it is named before or after its address is
+known.
