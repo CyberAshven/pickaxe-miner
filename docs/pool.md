@@ -34,6 +34,43 @@ to the internet, through your router's port forwarding or on a server. SV1
 is not encrypted; SV2 is, and miners pin the authority key the server prints
 when it starts.
 
+## Running the pool as a service
+
+The ASIC server has run this way on Debian since 2026-10-08 (solo, on
+Chipnet, with an Avalon Nano 3). Linux (systemd), as
+`/etc/systemd/system/pickaxe-pool.service`, with its own user and state
+directory:
+
+```ini
+[Unit]
+Description=Pickaxe pool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pickaxe
+WorkingDirectory=/var/lib/pickaxe
+ExecStart=/opt/pickaxe/pickaxe stratum-v2 serve --config /var/lib/pickaxe/mainnet.json --listen 0.0.0.0:3336 --sv1-listen 0.0.0.0:3333 --public --pool-fee 2 --pool-tag /MyPool/ --no-tui --json
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then `sudo systemctl enable --now pickaxe-pool`; `journalctl -u pickaxe-pool -f`
+shows its JSON lines, the first of which lists the addresses miners use under
+`connect`, and `sudo -u pickaxe /opt/pickaxe/pickaxe stratum-v2 watch --config
+/var/lib/pickaxe/mainnet.json` shows the workers table read-only. On
+Windows, a task that starts the pool at logon:
+
+```text
+schtasks /Create /TN "Pickaxe pool" /SC ONLOGON /TR "\"C:\Pickaxe\pickaxe.exe\" stratum-v2 serve --listen 0.0.0.0:3336 --sv1-listen 0.0.0.0:3333 --public --pool-fee 2 --no-tui --json"
+```
+
+A GPU pool runs the same way with its `mine --rigs-listen 0.0.0.0:3340
+--rigs-only --rigs-public ... --no-tui` command ([farm.md](farm.md#running-rigs-as-a-service)).
+
 ## How miners connect
 
 Press `i` on the dashboard for **Connection info**: every address miners use,
