@@ -410,8 +410,34 @@ fn validate_block(
         Some(policy) => super::payout::outputs(total, scripts, policy),
         None => vec![(total, scripts[0].clone())],
     };
-    let actual = coinbase
-        .output
+    // #### PR #42: merge-mining outputs in a journaled block
+    // What: a zero-value commitment as output 0 and, after it, zero-value
+    // ticket outputs at the end are set aside before the payouts are
+    // compared; anything else (a valued or malformed output 0, a valued or
+    // unknown trailing output, tickets without a commitment) still refuses
+    // the block. The coinbase total is unchanged, since both are worth 0.
+    // Why: merge-mined tokens add these outputs to the coinbase; the proof
+    // of work and the merkle root already bind their bytes.
+    // Look here if: a block with tokens is refused by the journal, or the
+    // server stops with "cannot persist solved block".
+    let mut outputs = coinbase.output.as_slice();
+    if let Some((first, rest)) = outputs.split_first() {
+        if first.value.to_sat() == 0
+            && super::merge::commitment::AuxCommitment::parse_script(first.script_pubkey.as_bytes())
+                .is_some()
+        {
+            outputs = rest;
+            while let Some((last, rest)) = outputs.split_last() {
+                if last.value.to_sat() != 0
+                    || !super::merge::registry::is_ticket_script(last.script_pubkey.as_bytes())
+                {
+                    break;
+                }
+                outputs = rest;
+            }
+        }
+    }
+    let actual = outputs
         .iter()
         .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
         .collect::<Vec<_>>();

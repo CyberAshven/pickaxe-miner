@@ -2,9 +2,11 @@
 //! Validated BCH full templates. Preserve the node's complete CTOR transaction
 //! list and target; do not inherit Bitcoin witness or fixed block-size rules.
 
+use super::merge::set::{AuxJob, AuxOutputs, TokenSet};
 use crate::config::MiningNetwork;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use stratum_core::bitcoin::{consensus, Transaction};
 
 /// Hash bytes in serialized/internal order, not RPC display order.
@@ -24,6 +26,8 @@ pub struct BchTemplate {
     coinbase_flags: Vec<u8>,
     transactions: Vec<Vec<u8>>,
     transaction_hashes: Vec<Hash>,
+    /// #### PR #42: the merge-mined tokens of jobs built from this template.
+    tokens: Option<Arc<TokenSet>>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +157,7 @@ impl BchTemplate {
             coinbase_flags,
             transactions,
             transaction_hashes,
+            tokens: None,
         })
     }
 
@@ -163,6 +168,51 @@ impl BchTemplate {
     /// `coinbase_with_payout` checks.
     pub fn tag(&mut self, tag: &[u8]) {
         self.coinbase_flags.extend_from_slice(tag);
+    }
+
+    /// #### PR #42
+    /// Attaches the token set to merge-mine in jobs built from this template.
+    /// It only feeds `aux_job`: a coinbase carries the commitment and tickets
+    /// only when the caller passes that job's `outputs` to
+    /// `coinbase_with_aux` or `coinbase_parts_with_aux`, which do not check
+    /// them against this set. `coinbase_with_payout` and
+    /// `coinbase_parts_with_payout` always build token-free coinbases.
+    /// Without a call (no token registered) jobs and coinbases stay as they
+    /// were.
+    pub fn commit(&mut self, set: Arc<TokenSet>) {
+        self.tokens = Some(set);
+    }
+
+    pub fn tokens(&self) -> Option<&Arc<TokenSet>> {
+        self.tokens.as_ref()
+    }
+
+    /// #### PR #42
+    /// One job's merge-mining for this template's token set, or `None`
+    /// without one. Its leaves bind the job's beneficiary (the miner, or
+    /// the donation or operator in their work jobs) and the donation's
+    /// split, and its tickets follow the job's payout outputs.
+    pub fn aux_job(
+        &self,
+        network: MiningNetwork,
+        payout: &str,
+        operator: Option<&str>,
+        policy: crate::donation::bch::BchPayout,
+    ) -> Result<Option<AuxJob>, String> {
+        let Some(set) = &self.tokens else {
+            return Ok(None);
+        };
+        let scripts = super::payout::scripts(network, payout, operator)?;
+        let outputs = super::payout::outputs(self.coinbase_value, &scripts, policy);
+        let first_ticket_vout =
+            u32::try_from(outputs.len() + 1).map_err(|_| "too many coinbase outputs")?;
+        AuxJob::build(
+            set,
+            super::payout::beneficiary(&scripts, policy),
+            super::payout::token_split(policy, &scripts[1]),
+            first_ticket_vout,
+        )
+        .map(Some)
     }
 
     /// Build one channel's coinbase. The caller assigns a unique extranonce;
@@ -183,6 +233,19 @@ impl BchTemplate {
         operator: Option<&str>,
         extranonce: &[u8],
         policy: crate::donation::bch::BchPayout,
+    ) -> Result<Coinbase, String> {
+        self.coinbase_with_aux(network, payout, operator, extranonce, policy, None)
+    }
+
+    /// The coinbase with a job's merge-mining outputs, if any.
+    pub fn coinbase_with_aux(
+        &self,
+        network: MiningNetwork,
+        payout: &str,
+        operator: Option<&str>,
+        extranonce: &[u8],
+        policy: crate::donation::bch::BchPayout,
+        aux: Option<&AuxOutputs>,
     ) -> Result<Coinbase, String> {
         let scripts = super::payout::scripts(network, payout, operator)?;
         let outputs = super::payout::outputs(self.coinbase_value, &scripts, policy);
@@ -205,12 +268,49 @@ impl BchTemplate {
         compact_size(script.len(), &mut bytes);
         bytes.extend(script);
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-        compact_size(outputs.len(), &mut bytes);
+        // #### PR #42: merge-mining commitment in output 0
+        // What: with tokens, output 0 is the 53-byte commitment (value 0) and
+        // each Case B token's 46-byte ticket (value 0) follows the payouts.
+        // Without tokens (`aux` is `None`, the default on both networks) the
+        // coinbase is byte for byte what it was.
+        // Why: a covenant finds output 0 from the single input alone, with no
+        // search, and output 0 does not compete with P2Pool's last-output
+        // share commitment. Case B tickets do come last here; a P2Pool
+        // coinbase would put its commitment after them, which the journal's
+        // trailing-ticket strip does not accept yet.
+        // The payouts, the script, the extranonce offset and the parts are
+        // unchanged, so devices and SV1 firmware see only a longer suffix.
+        // Look here if: a token-enabled block is refused by the node, the
+        // B leaves name the wrong ticket vouts, or the output count reaches
+        // 0xfd.
+        let (commitment, tickets) = match aux {
+            Some(aux) => {
+                if !aux.tickets.is_empty()
+                    && usize::try_from(aux.first_ticket_vout).ok() != Some(outputs.len() + 1)
+                {
+                    return Err("token tickets do not follow the payout outputs".into());
+                }
+                (Some(&aux.commitment), aux.tickets.as_slice())
+            }
+            None => (None, &[][..]),
+        };
+        let count = outputs.len() + usize::from(commitment.is_some()) + tickets.len();
+        if commitment.is_some() && count >= 0xfd {
+            return Err("a merge-mined coinbase needs fewer than 253 outputs".into());
+        }
+        compact_size(count, &mut bytes);
+        if let Some(commitment) = commitment {
+            bytes.extend_from_slice(commitment);
+        }
         for (amount, script) in outputs {
             bytes.extend_from_slice(&amount.to_le_bytes());
             compact_size(script.len(), &mut bytes);
             bytes.extend(script);
         }
+        for ticket in tickets {
+            bytes.extend_from_slice(ticket);
+        }
+        // #### end PR #42 ####
         bytes.extend_from_slice(&0u32.to_le_bytes());
         self.check_block_size(bytes.len())?;
         let mut hashes = Vec::with_capacity(self.transaction_hashes.len() + 1);
@@ -239,11 +339,31 @@ impl BchTemplate {
         extranonce_len: usize,
         policy: crate::donation::bch::BchPayout,
     ) -> Result<CoinbaseParts, String> {
+        self.coinbase_parts_with_aux(network, payout, operator, extranonce_len, policy, None)
+    }
+
+    /// #### PR #42: the parts with a job's merge-mining outputs, which sit
+    /// in the suffix; the prefix and the merkle path are unchanged.
+    pub fn coinbase_parts_with_aux(
+        &self,
+        network: MiningNetwork,
+        payout: &str,
+        operator: Option<&str>,
+        extranonce_len: usize,
+        policy: crate::donation::bch::BchPayout,
+        aux: Option<&AuxOutputs>,
+    ) -> Result<CoinbaseParts, String> {
         if extranonce_len > 64 {
             return Err("extranonce exceeds coinbase budget".into());
         }
-        let coinbase =
-            self.coinbase_with_payout(network, payout, operator, &vec![0; extranonce_len], policy)?;
+        let coinbase = self.coinbase_with_aux(
+            network,
+            payout,
+            operator,
+            &vec![0; extranonce_len],
+            policy,
+            aux,
+        )?;
         // The coinbase script is at most 100 bytes, so its CompactSize is one byte.
         let offset =
             4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len();

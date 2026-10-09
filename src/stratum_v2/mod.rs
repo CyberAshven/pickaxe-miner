@@ -24,6 +24,9 @@ mod live_tests;
 mod logins;
 #[cfg(feature = "stratum-v2")]
 mod panel;
+// #### PR #42: merge mining for BCH covenant tokens (no token registered yet).
+#[cfg(feature = "stratum-v2")]
+pub mod merge;
 #[cfg(feature = "stratum-v2")]
 mod payout;
 #[cfg(feature = "stratum-v2")]

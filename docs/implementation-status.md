@@ -1484,3 +1484,38 @@ Evidence: host tests render the page with a public pool's start values (both
 ports, 65,536, the pool's name, the fee "to another address") and a joined
 server's pools and username, and save a changed donation to the config and to
 its profile, refusing a profile that is gone.
+
+## Merge-mining core: commitment, tree, proofs (2026-10-09)
+
+#### PR #42
+
+The foundation for merge-mining BCH covenant tokens on the same SHA-256
+work (`src/stratum_v2/merge/`, v1 draft): no token exists yet, both
+networks' registries are empty, and nothing runs it, so every coinbase stays
+byte for byte as before.
+
+- One commitment per coinbase, in output 0: value 0, `OP_RETURN` "CTMM",
+  version 1, the aux tree root, its height (at most 16) and nonce, 53 bytes.
+  A covenant finds it from the coinbase's single input, without a search.
+- A tree of 176-byte leaves, one per token and mode: Case A tokens win on a
+  share that meets their target (no BCH block needed); Case B tokens need a
+  found block and claim through a zero-value keyless ticket output after
+  the payouts, spendable once the block is mature. Each leaf binds its
+  anchor, the job's payout and target, and the donation's split.
+- The donation covers merge-mined tokens through the one BCH ASIC setting
+  (0% to 100%, default 1.5%): two thirds as a split in the claim, bound in
+  miner jobs' leaves, and one third through the same work rotation as BCH
+  (donation-work jobs bind the Pickaxe donation address). A public pool's
+  fee reaches tokens only through its fee-work jobs, not its coinbase share.
+- `AuxProof` v1 (canonical bytes) and a Rust reference verifier that checks
+  a proof step for step as a covenant would, for both cases.
+- The block journal accepts a solved block with the commitment and tickets
+  (zero-value, exact scripts only) and still refuses any other extra output.
+
+Evidence: host tests cover the commitment's golden bytes, the leaf layout, slots,
+layouts and branches, the proof encoding, a Case A and a Case B proof that
+verify and one failing check per mutation (coinbase, header, branches,
+slot, category, payout, split, stale anchor, moved output 0, script length,
+output count, target encoding, ticket and start height), the unchanged
+151-byte coinbase, golden 204- and 250-byte coinbases with a token, and
+journals holding token blocks beside current and pre-donation ones.
