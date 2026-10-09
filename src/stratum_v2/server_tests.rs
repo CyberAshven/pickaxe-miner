@@ -35,18 +35,37 @@ use stratum_core::{
     parsers_sv2::Mining,
 };
 
-struct Node {
+pub(super) struct Node {
     height: u32,
     tip: String,
     reject: bool,
-    submissions: usize,
-    lose_replies: bool,
-    submitted: Vec<String>,
+    pub(super) submissions: usize,
+    pub(super) lose_replies: bool,
+    pub(super) submitted: Vec<String>,
     known: std::collections::HashSet<String>,
     unavailable: bool,
     /// #### PR #40: a public pool's blocks pay their own miners; the test
     /// checks those payouts itself.
     public: bool,
+    /// #### PR #42: the template's other transactions (none by default).
+    pub(super) transactions: Vec<Value>,
+}
+
+/// #### PR #42: a node for blocks that pay someone else (a pool's, built by
+/// a template client); the test checks those payouts itself.
+pub(super) fn pool_node() -> Arc<Mutex<Node>> {
+    Arc::new(Mutex::new(Node {
+        height: 325908,
+        tip: "ab".repeat(32),
+        reject: false,
+        submissions: 0,
+        lose_replies: false,
+        submitted: Vec::new(),
+        known: std::collections::HashSet::new(),
+        unavailable: false,
+        public: true,
+        transactions: Vec::new(),
+    }))
 }
 
 struct Rpc(Arc<Mutex<Node>>);
@@ -67,6 +86,7 @@ impl NodeRpc for Rpc {
                 template["previousblockhash"] = json!(node.tip);
                 template["curtime"] = json!(now());
                 template["mintime"] = json!(now() - 1);
+                template["transactions"] = json!(node.transactions);
                 Ok(template)
             }
             "submitblock" => {
@@ -84,7 +104,7 @@ impl NodeRpc for Rpc {
                     };
                 }
                 assert_eq!(block.header.prev_blockhash.to_string(), node.tip);
-                assert_eq!(block.txdata.len(), 1);
+                assert_eq!(block.txdata.len(), 1 + node.transactions.len());
                 let coinbase = &block.txdata[0];
                 assert!(coinbase.is_coinbase());
                 let mut expected = vec![0x76, 0xa9, 0x14];
@@ -162,14 +182,16 @@ impl NodeRpc for Rpc {
     }
 }
 
-struct Running {
+pub(super) struct Running {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<Result<(), String>>>,
-    stats: Arc<Mutex<ServerStats>>,
-    node: Arc<Mutex<Node>>,
+    pub(super) stats: Arc<Mutex<ServerStats>>,
+    pub(super) node: Arc<Mutex<Node>>,
     address: SocketAddr,
-    authority: [u8; 32],
-    state_directory: Arc<TestDirectory>,
+    pub(super) authority: [u8; 32],
+    pub(super) state_directory: Arc<TestDirectory>,
+    /// #### PR #42: the template listener, when it serves templates.
+    pub(super) templates: Option<SocketAddr>,
 }
 
 impl Running {
@@ -184,6 +206,7 @@ impl Running {
             known: std::collections::HashSet::new(),
             unavailable: false,
             public: false,
+            transactions: Vec::new(),
         }));
         Self::start(node, Arc::new(TestDirectory::new()))
     }
@@ -200,6 +223,7 @@ impl Running {
             known: std::collections::HashSet::new(),
             unavailable: false,
             public: true,
+            transactions: Vec::new(),
         }));
         Self::start_with(node, Arc::new(TestDirectory::new()), Some(public))
     }
@@ -233,9 +257,45 @@ impl Running {
         public: Option<super::payout::PublicPool>,
         tokens: Option<Arc<super::merge::hub::TokenHub>>,
     ) -> Self {
+        Self::start_config(nodes, state_directory, public, tokens, None)
+    }
+
+    /// #### PR #42: a server that serves templates on a second listener,
+    /// with its relay journal in `state_directory`.
+    pub(super) fn templates(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
+        Self::start_config(vec![node], state_directory, None, None, Some(true))
+    }
+
+    /// #### PR #42: a server whose relay journal is configured but which
+    /// serves no templates.
+    pub(super) fn relay_only(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
+        Self::start_config(vec![node], state_directory, None, None, Some(false))
+    }
+
+    /// #### PR #42: where a test server keeps its relay journal.
+    pub(super) fn relay_path(&self) -> std::path::PathBuf {
+        self.state_directory.0.join("relay-blocks.json")
+    }
+
+    /// `templates`: none, a relay journal only, or a relay journal and a
+    /// template listener.
+    fn start_config(
+        nodes: Vec<Arc<Mutex<Node>>>,
+        state_directory: Arc<TestDirectory>,
+        public: Option<super::payout::PublicPool>,
+        tokens: Option<Arc<super::merge::hub::TokenHub>>,
+        templates: Option<bool>,
+    ) -> Self {
         let node = nodes[0].clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let template_listener = templates
+            .filter(|listen| *listen)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+        let template_address = template_listener
+            .as_ref()
+            .map(|listener| listener.local_addr().unwrap());
+        let relay_journal_path = templates.map(|_| state_directory.0.join("relay-blocks.json"));
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(ServerStats::default()));
         let secret = [17; 32];
@@ -252,12 +312,24 @@ impl Running {
             legacy_sources: vec![[42; 32]],
             pool_tag: Vec::new(),
             tokens,
+            relay_journal_path,
         };
         let thread = {
             let stop = stop.clone();
             let stats = stats.clone();
             let rpcs: Vec<Rpc> = nodes.into_iter().map(Rpc).collect();
-            thread::spawn(move || server::run(listener, rpcs, config, stop, stats))
+            thread::spawn(move || {
+                server::run_with(
+                    server::Listeners {
+                        devices: listener,
+                        templates: template_listener,
+                    },
+                    rpcs,
+                    config,
+                    stop,
+                    stats,
+                )
+            })
         };
         let running = Self {
             stop,
@@ -267,12 +339,13 @@ impl Running {
             address,
             authority,
             state_directory,
+            templates: template_address,
         };
         running.wait(|stats| stats.template_ready);
         running
     }
 
-    fn wait(&self, condition: impl Fn(&ServerStats) -> bool) {
+    pub(super) fn wait(&self, condition: impl Fn(&ServerStats) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if condition(&self.stats.lock().unwrap()) {
@@ -522,6 +595,7 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
             known: std::collections::HashSet::new(),
             unavailable: false,
             public: false,
+            transactions: Vec::new(),
         }));
         let server = Running::start_full(vec![node], directory, None, Some(hub.clone()));
         let mut device = Device::connect(&server, extended);
@@ -1104,6 +1178,7 @@ fn the_server_moves_to_its_next_node_when_its_node_stops_answering() {
             known: std::collections::HashSet::new(),
             unavailable: false,
             public: false,
+            transactions: Vec::new(),
         }))
     };
     let (first, second) = (node(), node());

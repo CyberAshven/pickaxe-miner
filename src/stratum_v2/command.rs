@@ -129,6 +129,7 @@ pub fn run(
         pool_tag,
         start_difficulty,
         merge_test_token,
+        tp_listen,
         ..
     } = action
     else {
@@ -200,6 +201,18 @@ pub fn run(
         .map(TcpListener::local_addr)
         .transpose()
         .map_err(|_| "cannot read SV1 listener")?;
+    // #### PR #42: the template listener, off unless asked for, and only
+    // beside this server's own node.
+    let tp_listener = tp_listen
+        .filter(|_| node.is_some())
+        .map(TcpListener::bind)
+        .transpose()
+        .map_err(|_| "cannot bind template listener")?;
+    let tp_bound = tp_listener
+        .as_ref()
+        .map(TcpListener::local_addr)
+        .transpose()
+        .map_err(|_| "cannot read template listener")?;
     let authority_secret = node
         .is_some()
         .then(|| load_authority(&config_path.with_extension("sv2-key")))
@@ -247,6 +260,7 @@ pub fn run(
     let started = started_text(&Started {
         sv2: bound,
         sv1: sv1_bound,
+        templates: tp_bound,
         start_difficulty: start_difficulty.unwrap_or(4096),
         pool_tag: String::from_utf8_lossy(&pool_tag).into_owned(),
         pools: pool_address.clone(),
@@ -289,13 +303,23 @@ pub fn run(
                 public: public.clone(),
                 donation: donation.clone(),
                 tokens: tokens.clone(),
+                relay_journal_path: Some(config_path.with_extension("sv2-relay-blocks.json")),
                 #[cfg(test)]
                 allocation_phase: None,
             };
             let stop = stop.clone();
             let stats = stats.clone();
             Some(thread::spawn(move || {
-                server::run(listener, nodes, settings, stop, stats)
+                server::run_with(
+                    server::Listeners {
+                        devices: listener,
+                        templates: tp_listener,
+                    },
+                    nodes,
+                    settings,
+                    stop,
+                    stats,
+                )
             }))
         }
         _ => None,
@@ -365,7 +389,7 @@ pub fn run(
             // The pool's identity may be a payout address: never printed.
             println!(
                 "{}",
-                serde_json::json!({"listen":bound.map(|address| address.to_string()),"sv1_listen":sv1_bound.map(|address| address.to_string()),"authority":authority,"upstream":pool_address,"network":config.network.as_str(),"connect":connect_json(&connect_lines(bound, sv1_bound, authority.as_deref(), interfaces))})
+                serde_json::json!({"listen":bound.map(|address| address.to_string()),"sv1_listen":sv1_bound.map(|address| address.to_string()),"tp_listen":tp_bound.map(|address| address.to_string()),"authority":authority,"upstream":pool_address,"network":config.network.as_str(),"connect":connect_json(&connect_lines(bound, sv1_bound, authority.as_deref(), interfaces)),"templates":template_lines(tp_bound, interfaces).iter().map(|line| line.url.clone()).collect::<Vec<_>>()})
             );
         }
         let mut device_offset = 0usize;
@@ -449,7 +473,7 @@ pub fn run(
                     )
                 } else {
                     format!(
-                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}\n{}",
+                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}\n{}{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
@@ -460,6 +484,7 @@ pub fn run(
                     sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
                     setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", authority.as_deref().unwrap_or("—"))),
                     records_line(&snapshot),
+                    templates_line(&snapshot),
                     )
                 };
                 let online = devices.iter().filter(|device| device.connected).count();
@@ -537,8 +562,11 @@ pub fn run(
                                         connect = None
                                     }
                                     KeyCode::Char(digit @ '1'..='9') => {
-                                        if let Some(line) =
-                                            page.lines.get(digit as usize - '1' as usize)
+                                        if let Some(line) = page
+                                            .lines
+                                            .iter()
+                                            .chain(&page.templates)
+                                            .nth(digit as usize - '1' as usize)
                                         {
                                             page.note = Some(if crate::reach::copy(&line.url) {
                                                 format!("Copied {}", line.url)
@@ -607,13 +635,16 @@ pub fn run(
                                 // #### end PR #42 ####
                                 KeyCode::Char('a') | KeyCode::Char('A') => advanced = !advanced,
                                 KeyCode::Char('i') | KeyCode::Char('I') if !advanced => {
+                                    let interfaces = crate::reach::Interfaces::detect();
                                     connect = Some(ConnectPage {
                                         lines: connect_lines(
                                             bound,
                                             sv1_bound,
                                             authority.as_deref(),
-                                            crate::reach::Interfaces::detect(),
+                                            interfaces,
                                         ),
+                                        templates: template_lines(tp_bound, interfaces),
+                                        key: authority.clone(),
                                         mode: serve_mode,
                                         note: None,
                                     });
@@ -811,6 +842,8 @@ fn save_donation(path: &Path, profile: Option<&str>, value: BchDonation) -> Resu
 struct Started {
     sv2: Option<std::net::SocketAddr>,
     sv1: Option<std::net::SocketAddr>,
+    /// #### PR #42: where templates are served, if they are.
+    templates: Option<std::net::SocketAddr>,
     start_difficulty: u64,
     pool_tag: String,
     /// The pools in failover order, when joining.
@@ -837,10 +870,14 @@ fn started_text(started: &Started) -> String {
     let listen = |name: &str, address: Option<std::net::SocketAddr>| {
         address.map(|address| format!("{name} {address}"))
     };
-    let listeners: Vec<String> = [listen("SV2", started.sv2), listen("SV1", started.sv1)]
-        .into_iter()
-        .flatten()
-        .collect();
+    let listeners: Vec<String> = [
+        listen("SV2", started.sv2),
+        listen("SV1", started.sv1),
+        listen("Templates", started.templates),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if !listeners.is_empty() {
         text.push_str(&format!("Listening  {}\n", listeners.join(" · ")));
     }
@@ -1289,6 +1326,10 @@ struct ConnectLine {
 /// connect to, numbered for copying, and what to put as the username.
 struct ConnectPage {
     lines: Vec<ConnectLine>,
+    /// #### PR #42: where pools take this node's templates, numbered after
+    /// `lines`, and the key they pin.
+    templates: Vec<ConnectLine>,
+    key: Option<String>,
     mode: ServeMode,
     /// The last copy's result.
     note: Option<String>,
@@ -1320,6 +1361,27 @@ fn connect_lines(
         }
     }
     lines
+}
+
+/// #### PR #42: where Template Distribution clients (SV2 pools, P2Pool)
+/// reach this node's templates, at every address this computer is reached
+/// at, as `HOST:PORT`.
+fn template_lines(
+    listen: Option<std::net::SocketAddr>,
+    interfaces: crate::reach::Interfaces,
+) -> Vec<ConnectLine> {
+    listen
+        .map(|listen| {
+            crate::reach::addresses(listen, interfaces)
+                .into_iter()
+                .map(|(place, address)| ConnectLine {
+                    place,
+                    sv2: true,
+                    url: address.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// #### PR #40: the addresses in the JSON start line; never a payout.
@@ -1400,9 +1462,31 @@ fn connect_text(page: &ConnectPage) -> String {
              pool, pointed at an SV2 line above; only encrypted SV2 crosses the internet.\n",
         );
     }
+    // #### PR #42: where pools take this node's templates.
+    if !page.templates.is_empty() {
+        text.push_str(
+            "\nSV2 pools and P2Pool take this node's templates here (SV2 Template \
+             Distribution, with the same key):\n",
+        );
+        for (index, line) in page.templates.iter().enumerate() {
+            text.push_str(&format!(
+                "  {}  {:<14} {}\n",
+                page.lines.len() + index + 1,
+                line.place.label(),
+                line.url
+            ));
+        }
+        if let (Some(first), Some(key)) = (page.templates.first(), page.key.as_deref()) {
+            text.push_str(&format!(
+                "An SRI pool or Job Declaration client takes them with:\n  \
+                 [template_provider_type.Sv2Tp]\n  address = \"{}\"\n  public_key = \"{key}\"\n",
+                first.url
+            ));
+        }
+    }
     text.push_str(&format!(
         "\n{}  Copy a line · i or Esc  Back · q  Stop server",
-        match page.lines.len() {
+        match page.lines.len() + page.templates.len() {
             0 | 1 => "1".to_owned(),
             count => format!("1-{count}"),
         }
@@ -1492,6 +1576,27 @@ fn status_json(
                 "seconds_ago": win.found.elapsed().as_secs(),
             })).collect::<Vec<_>>(),
         }),
+        // #### PR #42: the template server's counts, with no address.
+        "template_server": snapshot.template_server.as_ref().map(|templates| serde_json::json!({
+            "clients": templates.clients,
+            "sent": templates.sent,
+            "withheld": templates.withheld,
+            "solutions": {
+                "received": templates.solutions,
+                "invalid": templates.invalid,
+                "refused_locally": templates.refused_locally,
+                "unsaved": templates.unsaved,
+            },
+            "relayed": {
+                "pending": templates.relay_pending,
+                "accepted": templates.relay_accepted,
+                "rejected": templates.relay_rejected,
+            },
+            "sent_once": {
+                "sent": templates.once_sent,
+                "accepted": templates.once_accepted,
+            },
+        })),
         "sv1_local_rejected": snapshot.sv1_local_rejected,
         "sessions_started": snapshot.sessions_started,
         "device_details": devices,
@@ -1895,6 +2000,30 @@ fn difficulty_target(difficulty: u64) -> Result<super::template::Hash, String> {
 /// #### PR #40
 /// The overview's records: the best share since start and the latest blocks
 /// found, newest first, as "#327035 rig1 accepted 2m ago".
+/// #### PR #42: the template server's line on the overview, while it serves
+/// templates or holds relayed blocks.
+fn templates_line(stats: &ServerStats) -> String {
+    let Some(templates) = &stats.template_server else {
+        return String::new();
+    };
+    let refused = templates.invalid + templates.refused_locally;
+    format!(
+        "\nTemplate clients {} · {} templates sent · {} withheld · Pool blocks relayed {} \
+         accepted / {} pending / {} rejected{}",
+        templates.clients,
+        templates.sent,
+        templates.withheld,
+        templates.relay_accepted + templates.once_accepted,
+        templates.relay_pending,
+        templates.relay_rejected,
+        if refused > 0 {
+            format!(" · {refused} solutions refused")
+        } else {
+            String::new()
+        }
+    )
+}
+
 fn records_line(stats: &ServerStats) -> String {
     let best = stats
         .best_share
@@ -2082,6 +2211,84 @@ mod tests {
         stats.tokens_off = Some("token proofs cannot be saved: disk full".into());
         assert!(records_line(&stats).contains("Tokens off: token proofs cannot be saved"));
         assert!(super::super::status_report().contains("merge mining: commitment v1 (draft)"));
+    }
+
+    // #### PR #42
+    // What: the template server's counts show on the overview and in the
+    // status file, which never holds an address; Connection info lists where
+    // pools take the templates, numbered after the device lines, with SRI's
+    // configuration lines and the key.
+    // Look here if: templates_line, status_json's template_server or
+    // connect_text's template section changes.
+    #[test]
+    fn the_template_server_shows_its_counts_and_where_pools_connect() {
+        use crate::reach::{Interfaces, Place};
+        let mut stats = ServerStats::default();
+        assert_eq!(templates_line(&stats), "");
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert!(status["template_server"].is_null());
+        stats.template_server = Some(server::TemplateServerStats {
+            clients: 2,
+            sent: 341,
+            withheld: 1,
+            solutions: 3,
+            invalid: 1,
+            refused_locally: 1,
+            unsaved: 0,
+            relay_pending: 0,
+            relay_accepted: 1,
+            relay_rejected: 0,
+            once_sent: 1,
+            once_accepted: 0,
+        });
+        let line = templates_line(&stats);
+        assert!(
+            line.contains(
+                "Template clients 2 · 341 templates sent · 1 withheld · Pool blocks relayed 1 \
+                 accepted / 0 pending / 0 rejected · 2 solutions refused"
+            ),
+            "{line}"
+        );
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        let templates = &status["template_server"];
+        assert_eq!(templates["clients"], 2);
+        assert_eq!(templates["sent"], 341);
+        assert_eq!(templates["solutions"]["refused_locally"], 1);
+        assert_eq!(templates["relayed"]["accepted"], 1);
+        assert_eq!(templates["sent_once"]["sent"], 1);
+        assert!(!templates.to_string().contains("192.168"));
+        let local: std::net::IpAddr = "192.168.0.160".parse().unwrap();
+        let interfaces = Interfaces {
+            local: Some(local),
+            tailscale: None,
+        };
+        let page = ConnectPage {
+            lines: connect_lines(
+                Some("0.0.0.0:3336".parse().unwrap()),
+                Some("0.0.0.0:3333".parse().unwrap()),
+                Some("KEY"),
+                interfaces,
+            ),
+            templates: template_lines(Some("0.0.0.0:48442".parse().unwrap()), interfaces),
+            key: Some("KEY".into()),
+            mode: ServeMode::Solo,
+            note: None,
+        };
+        assert_eq!(page.templates[0].place, Place::LocalNetwork);
+        let text = connect_text(&page);
+        let number = page.lines.len() + 1;
+        assert!(
+            text.contains(&format!("  {number}  your network   192.168.0.160:48442")),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "[template_provider_type.Sv2Tp]\n  address = \"192.168.0.160:48442\"\n  \
+                 public_key = \"KEY\""
+            ),
+            "{text}"
+        );
+        assert!(text.contains(&format!("1-{number}  Copy a line")), "{text}");
     }
 
     // #### PR #42
@@ -2382,6 +2589,8 @@ mod tests {
         );
         let public = ConnectPage {
             lines,
+            templates: Vec::new(),
+            key: None,
             mode: ServeMode::Public,
             note: None,
         };
@@ -2412,6 +2621,8 @@ mod tests {
                     tailscale: None,
                 },
             ),
+            templates: Vec::new(),
+            key: None,
             mode: ServeMode::Solo,
             note: Some("Copied stratum+tcp://192.168.0.160:3333".into()),
         };
@@ -2441,6 +2652,8 @@ mod tests {
                 Some("KEY"),
                 both,
             ),
+            templates: Vec::new(),
+            key: None,
             mode: ServeMode::Solo,
             note: None,
         };
@@ -2668,6 +2881,7 @@ mod tests {
                     &started_text(&Started {
                         sv2: Some("0.0.0.0:3336".parse().unwrap()),
                         sv1: Some("0.0.0.0:3338".parse().unwrap()),
+                        templates: Some("0.0.0.0:48442".parse().unwrap()),
                         start_difficulty: 65_536,
                         pool_tag: "/MyPool/".into(),
                         pools: None,
@@ -2699,6 +2913,7 @@ mod tests {
         for expected in [
             "apply after a restart",
             "SV1 0.0.0.0:3338",
+            "Templates 0.0.0.0:48442",
             "65,536",
             "/MyPool/",
             "1.50% from",
@@ -2709,6 +2924,7 @@ mod tests {
         let joined = started_text(&Started {
             sv2: None,
             sv1: Some("0.0.0.0:3333".parse().unwrap()),
+            templates: None,
             start_difficulty: 4096,
             pool_tag: String::new(),
             pools: Some("pool.example:3336 → b1.example:3336".into()),

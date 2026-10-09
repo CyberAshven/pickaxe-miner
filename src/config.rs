@@ -35,6 +35,15 @@ impl MiningNetwork {
         }
     }
 
+    /// #### PR #42: the SV2 Template Distribution port a server listens on
+    /// by default on this network.
+    pub fn template_port(self) -> u16 {
+        match self {
+            Self::Mainnet => crate::protocol::TEMPLATE_PORT,
+            Self::Chipnet => crate::protocol::CHIPNET_TEMPLATE_PORT,
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mainnet" => Ok(Self::Mainnet),
@@ -697,6 +706,10 @@ pub struct SavedServer {
     pub backups: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_user: Option<String>,
+    /// #### PR #42: the port an ASIC server with its own node serves its
+    /// templates on (SV2 Template Distribution); left out, it serves none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tp_port: Option<u16>,
 }
 
 impl SavedServer {
@@ -741,7 +754,8 @@ impl SavedServer {
             || self.sv2_port.is_some()
             || self.start_difficulty.is_some()
             || !self.backups.is_empty()
-            || self.pool_user.is_some();
+            || self.pool_user.is_some()
+            || self.tp_port.is_some();
         if advanced && !asic {
             return Err(
                 "only an ASIC server saves ports, a start difficulty or backup pools".into(),
@@ -752,6 +766,22 @@ impl SavedServer {
         }
         if self.sv1_port.unwrap_or(3333) == self.sv2_port.unwrap_or(3336) {
             return Err("the SV1 and SV2 ports must differ".into());
+        }
+        // #### PR #42: templates come from this server's own node.
+        if let Some(port) = self.tp_port {
+            if !matches!(self.mode, SavedMode::AsicSolo | SavedMode::AsicPool) {
+                return Err("only an ASIC server with its own node serves templates".into());
+            }
+            if port == 0
+                || port == self.sv1_port.unwrap_or(3333)
+                || port == self.sv2_port.unwrap_or(3336)
+            {
+                return Err(
+                    "the template port is 1 to 65535 and differs from the SV1 and SV2 \
+                            ports"
+                        .into(),
+                );
+            }
         }
         if self
             .start_difficulty
@@ -1928,6 +1958,7 @@ mod tests {
             start_difficulty: Some(65_536),
             backups: Vec::new(),
             pool_user: None,
+            tp_port: Some(48442),
         };
         with(pool.clone()).validate().unwrap();
         let text = serde_json::to_string(&with(pool.clone())).unwrap();
@@ -1947,6 +1978,7 @@ mod tests {
             start_difficulty: None,
             backups: vec!["stratum2+tcp://backup.example:3336/KEY".into()],
             pool_user: Some("rig-owner".into()),
+            tp_port: None,
         };
         with(joining.clone()).validate().unwrap();
         for (bad, why) in [
@@ -2019,6 +2051,28 @@ mod tests {
                     ..pool.clone()
                 },
                 "a pool username on an ASIC pool",
+            ),
+            // #### PR #42
+            (
+                SavedServer {
+                    tp_port: Some(48442),
+                    ..joining.clone()
+                },
+                "templates served while joining a pool",
+            ),
+            (
+                SavedServer {
+                    tp_port: Some(3338),
+                    ..pool.clone()
+                },
+                "the template port on the SV1 port",
+            ),
+            (
+                SavedServer {
+                    tp_port: Some(0),
+                    ..pool.clone()
+                },
+                "template port 0",
             ),
         ] {
             assert!(with(bad).validate().is_err(), "{why}");

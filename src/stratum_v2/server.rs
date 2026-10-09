@@ -4,9 +4,10 @@
 
 use super::{
     channel::TokenWin,
-    journal::Journal,
+    journal::{Journal, PendingBlock},
     merge::hub::TokenHub,
     provider::{NodeRpc, SubmissionOutcome, TemplateProvider},
+    tdp,
     telemetry::Devices,
     template::{BchTemplate, Hash},
     transport::Session,
@@ -21,7 +22,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender},
         Arc, Mutex, RwLock,
     },
@@ -52,6 +53,9 @@ pub struct ServerConfig {
     /// #### PR #42: the merge-mined tokens jobs carry, and where their wins
     /// are proven; none unless a token is merge-mined.
     pub tokens: Option<Arc<TokenHub>>,
+    /// #### PR #42: where blocks found on this server's templates by
+    /// Template Distribution clients are saved until the node answers.
+    pub relay_journal_path: Option<PathBuf>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -91,6 +95,37 @@ pub struct ServerStats {
     pub token_wins_dropped: u64,
     pub recent_token_wins: VecDeque<FoundTokenWin>,
     pub tokens_off: Option<String>,
+    /// #### PR #42: the Template Distribution server's counts, when it
+    /// serves templates or still holds relayed blocks.
+    pub template_server: Option<TemplateServerStats>,
+}
+
+/// #### PR #42: what the Template Distribution server did. No count names a
+/// client or an address.
+#[derive(Default, Clone, Debug)]
+pub struct TemplateServerStats {
+    /// Clients connected now.
+    pub clients: usize,
+    pub sent: u64,
+    /// Templates a client's coinbase reserve did not fit.
+    pub withheld: u64,
+    pub solutions: u64,
+    /// Solutions with no block to send: an unknown template or a malformed
+    /// coinbase.
+    pub invalid: u64,
+    /// Solutions Pickaxe's own checks refused; one per 10 s still goes to
+    /// the node.
+    pub refused_locally: u64,
+    /// Solutions the relay journal could not save; each still goes to the
+    /// node once.
+    pub unsaved: u64,
+    pub relay_pending: usize,
+    pub relay_accepted: u64,
+    pub relay_rejected: u64,
+    /// Blocks sent to the node once, outside the journal, and those it
+    /// accepted.
+    pub once_sent: u64,
+    pub once_accepted: u64,
 }
 
 /// #### PR #42: a proven merge-mined token win.
@@ -120,26 +155,100 @@ pub struct FoundBlock {
 const RECENT_BLOCKS: usize = 10;
 
 #[derive(Clone)]
-struct PublishedJob {
-    generation: u64,
+pub(super) struct PublishedJob {
+    pub(super) generation: u64,
     /// #### PR #42: the token set's serial; a change re-issues jobs on the
     /// same parent.
     serial: u64,
-    template: Arc<BchTemplate>,
+    pub(super) template: Arc<BchTemplate>,
     valid_until: Instant,
 }
 
-struct Shared {
-    job: RwLock<Option<PublishedJob>>,
+pub(super) struct Shared {
+    pub(super) job: RwLock<Option<PublishedJob>>,
     stats: Arc<Mutex<ServerStats>>,
-    wake: SyncSender<()>,
+    pub(super) wake: SyncSender<()>,
     journal: Mutex<Journal>,
     fatal: Mutex<Option<&'static str>>,
-    stop: Arc<AtomicBool>,
+    pub(super) stop: Arc<AtomicBool>,
     solved: Mutex<SolvedParents>,
     /// #### PR #42: the claim worker's queue, bounded; device threads never
     /// wait on it.
     claims: Option<SyncSender<(TokenWin, String)>>,
+    /// #### PR #42: what Template Distribution sessions share with the node
+    /// worker, when templates are served or relayed blocks wait.
+    pub(super) relay: Option<Relay>,
+}
+
+impl Shared {
+    /// #### PR #42: changes the Template Distribution counts.
+    pub(super) fn template_stats(&self, change: impl FnOnce(&mut TemplateServerStats)) {
+        if let Ok(mut stats) = self.stats.lock() {
+            change(stats.template_server.get_or_insert_with(Default::default));
+        }
+    }
+}
+
+/// #### PR #42: the relay side of the Template Distribution server.
+pub(super) struct Relay {
+    pub(super) journal: Mutex<Journal>,
+    /// One relayed block per parent, as for this server's own blocks.
+    pub(super) solved: Mutex<SolvedParents>,
+    /// Blocks the node worker submits once, outside the journal: those the
+    /// journal could not save, and at most one a check refused per 10 s.
+    once: Mutex<VecDeque<PendingBlock>>,
+    pub(super) unchecked_at: Mutex<Option<Instant>>,
+    last_id: AtomicU64,
+}
+
+/// Blocks waiting for their one submission outside the journal.
+const ONCE_QUEUE: usize = 8;
+
+impl Relay {
+    fn new(journal: Journal) -> Self {
+        Self {
+            journal: Mutex::new(journal),
+            solved: Mutex::new(SolvedParents::default()),
+            once: Mutex::new(VecDeque::new()),
+            unchecked_at: Mutex::new(None),
+            last_id: AtomicU64::new(0),
+        }
+    }
+
+    /// A new template id: `max(last + 1, unix milliseconds)`, so ids rise
+    /// within a session and across restarts, as the spec allows.
+    pub(super) fn next_id(&self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        let next = |last: u64| last.saturating_add(1).max(now);
+        let last = self
+            .last_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                Some(next(last))
+            })
+            .unwrap_or_else(|last| last);
+        next(last)
+    }
+
+    /// Hands `block` (its hash and bytes) to the node worker for one
+    /// submission outside the journal; the oldest waiting one gives way.
+    pub(super) fn submit_once(&self, hash: String, block: &[u8]) {
+        if let Ok(mut once) = self.once.lock() {
+            if once.len() >= ONCE_QUEUE {
+                once.pop_front();
+            }
+            once.push_back(PendingBlock {
+                hash,
+                block: hex::encode(block),
+                payout: None,
+                miner: None,
+                operator: None,
+            });
+        }
+    }
 }
 
 /// How many token wins wait for the claim worker before more are dropped.
@@ -173,13 +282,13 @@ fn with_tokens(
 // fraction of a second, and a refused save stops the server. Keep one per
 // parent, for the most recent parents only.
 #[derive(Default)]
-struct SolvedParents(VecDeque<Hash>);
+pub(super) struct SolvedParents(VecDeque<Hash>);
 
 impl SolvedParents {
     const RECENT: usize = 64;
 
     /// Records `parent`; false when a block on it was already saved.
-    fn first(&mut self, parent: &Hash) -> bool {
+    pub(super) fn first(&mut self, parent: &Hash) -> bool {
         if self.0.contains(parent) {
             return false;
         }
@@ -189,6 +298,13 @@ impl SolvedParents {
         self.0.push_back(*parent);
         true
     }
+}
+
+/// #### PR #42: the listeners a server serves: devices, and Template
+/// Distribution clients when asked (`--tp-listen`).
+pub struct Listeners {
+    pub devices: TcpListener,
+    pub templates: Option<TcpListener>,
 }
 
 /// Bind the listener before calling this function. The caller owns the stop
@@ -201,6 +317,30 @@ pub fn run<R: NodeRpc + Send + 'static>(
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
+    run_with(
+        Listeners {
+            devices: listener,
+            templates: None,
+        },
+        nodes,
+        config,
+        stop,
+        stats,
+    )
+}
+
+/// `run`, also serving templates when `listeners` has a template listener.
+pub fn run_with<R: NodeRpc + Send + 'static>(
+    listeners: Listeners,
+    nodes: Vec<R>,
+    config: ServerConfig,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<ServerStats>>,
+) -> Result<(), String> {
+    let Listeners {
+        devices: listener,
+        templates,
+    } = listeners;
     let total = nodes.len();
     let mut standby = VecDeque::from(nodes);
     let rpc = standby.pop_front().ok_or("no BCH node configured")?;
@@ -219,9 +359,28 @@ pub fn run<R: NodeRpc + Send + 'static>(
         &config.payout,
         &config.legacy_sources,
     )?;
+    // #### PR #42: the relay journal opens with the template listener, and
+    // also without it while its file exists, so blocks a pool found before a
+    // restart without --tp-listen still reach the node.
+    let relay = match (&templates, config.relay_journal_path.as_deref()) {
+        (Some(_), None) => return Err("the template server needs a relay journal".into()),
+        (Some(_), Some(path)) => Some(Relay::new(Journal::open_relay(path, config.network)?)),
+        (None, Some(path)) if path.exists() => {
+            Some(Relay::new(Journal::open_relay(path, config.network)?))
+        }
+        _ => None,
+    };
+    if let Some(templates) = &templates {
+        templates
+            .set_nonblocking(true)
+            .map_err(|_| "cannot configure template listener")?;
+    }
     if let Ok(mut stats) = stats.lock() {
         stats.nodes = total;
         stats.active_node = 0;
+        if relay.is_some() {
+            stats.template_server = Some(TemplateServerStats::default());
+        }
     }
     let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
     // #### PR #42: the claim worker
@@ -281,8 +440,10 @@ pub fn run<R: NodeRpc + Send + 'static>(
         stop: stop.clone(),
         solved: Mutex::new(SolvedParents::default()),
         claims,
+        relay,
     });
     update_journal_stats(&shared)?;
+    update_relay_stats(&shared)?;
     let node_shared = shared.clone();
     let network = config.network;
     let tag = config.pool_tag.clone();
@@ -292,6 +453,7 @@ pub fn run<R: NodeRpc + Send + 'static>(
         let mut active = 0;
         let mut refreshed = Instant::now() - Duration::from_secs(60);
         let mut retries = RetrySchedule::default();
+        let mut relay_retries = RetrySchedule::default();
         while !node_shared.stop.load(Ordering::Relaxed) {
             match receive_blocks.recv_timeout(Duration::from_millis(250)) {
                 Ok(()) => (),
@@ -302,46 +464,27 @@ pub fn run<R: NodeRpc + Send + 'static>(
             // The journal is authoritative; a coalesced wake cannot lose work.
             // Release its lock before RPC so another device can persist a block
             // while a reply is delayed. Retry old blocks fairly with backoff.
-            let pending = {
-                let journal = node_shared
-                    .journal
-                    .lock()
-                    .map_err(|_| "block journal unavailable")?;
-                retries
-                    .next(&journal.pending_hashes(), Instant::now())
-                    .and_then(|hash| journal.pending(&hash))
-            };
-            if let Some(pending) = pending {
-                if retries.is_retry(&pending.hash) {
-                    if let Ok(mut stats) = node_shared.stats.lock() {
+            if let Some((pending, outcome, retry)) =
+                submit_next(&node_shared.journal, &mut retries, &mut provider)?
+            {
+                if let Ok(mut stats) = node_shared.stats.lock() {
+                    if retry {
                         stats.block_retries = stats.block_retries.saturating_add(1);
                     }
-                }
-                let outcome = provider.submit_saved(&pending);
-                let result = match outcome {
-                    SubmissionOutcome::Accepted => Some(true),
-                    SubmissionOutcome::Rejected(_) => Some(false),
-                    SubmissionOutcome::Pending(_) => None,
-                };
-                if let Some(accepted) = result {
-                    node_shared
-                        .journal
-                        .lock()
-                        .map_err(|_| "block journal unavailable")?
-                        .finish(&pending.hash, accepted)?;
                     // #### PR #40: the node's answer, on the dashboard's list.
-                    if let Ok(mut stats) = node_shared.stats.lock() {
-                        if let Some(found) = stats
-                            .recent_blocks
-                            .iter_mut()
-                            .find(|found| found.hash == pending.hash)
-                        {
-                            found.result = Some(if accepted { "accepted" } else { "rejected" });
-                        }
+                    let result = match outcome {
+                        SubmissionOutcome::Accepted => Some("accepted"),
+                        SubmissionOutcome::Rejected(_) => Some("rejected"),
+                        SubmissionOutcome::Pending(_) => None,
+                    };
+                    if let Some(found) = stats
+                        .recent_blocks
+                        .iter_mut()
+                        .find(|found| found.hash == pending.hash)
+                        .filter(|_| result.is_some())
+                    {
+                        found.result = result;
                     }
-                    retries.remove(&pending.hash);
-                } else {
-                    retries.defer(&pending.hash, Instant::now());
                 }
                 update_journal_stats(&node_shared)?;
                 if let Ok(mut stats) = node_shared.stats.lock() {
@@ -355,6 +498,33 @@ pub fn run<R: NodeRpc + Send + 'static>(
                 // survive tip changes; no response is treated as acceptance.
                 refreshed = Instant::now() - Duration::from_secs(60);
             }
+            // #### PR #42: relayed blocks
+            // What: blocks Template Distribution clients found go to the node
+            // like this server's own: from the relay journal, retried with
+            // backoff until the node answers exactly. A block the journal
+            // could not save, or one Pickaxe's checks refused (one per 10 s),
+            // is sent once.
+            // Why: an SRI pool sends its blocks only to its template
+            // provider; this is their only way to the chain.
+            // Look here if: a pool's block is missing on chain, or the relay
+            // counts on the dashboard do not move.
+            if let Some(relay) = node_shared.relay.as_ref() {
+                let once = relay.once.lock().ok().and_then(|mut once| once.pop_front());
+                if let Some(block) = once {
+                    let accepted = provider.submit_saved(&block) == SubmissionOutcome::Accepted;
+                    node_shared.template_stats(|stats| {
+                        stats.once_sent = stats.once_sent.saturating_add(1);
+                        stats.once_accepted =
+                            stats.once_accepted.saturating_add(u64::from(accepted));
+                    });
+                    refreshed = Instant::now() - Duration::from_secs(60);
+                }
+                if submit_next(&relay.journal, &mut relay_retries, &mut provider)?.is_some() {
+                    update_relay_stats(&node_shared)?;
+                    refreshed = Instant::now() - Duration::from_secs(60);
+                }
+            }
+            // #### end PR #42 ####
             // #### PR #42
             // What: when a merge-mined token's state changes, the current
             // template is published again with the new token set, without
@@ -430,6 +600,7 @@ pub fn run<R: NodeRpc + Send + 'static>(
     });
     let config = Arc::new(config);
     let mut devices: Vec<(u64, thread::JoinHandle<()>)> = Vec::new();
+    let mut template_clients: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut listener_error = None;
     while !stop.load(Ordering::Relaxed) {
         if node.is_finished() {
@@ -447,8 +618,19 @@ pub fn run<R: NodeRpc + Send + 'static>(
             }
         }
         devices = remaining;
+        let mut waiting = Vec::new();
+        for client in template_clients.drain(..) {
+            if !client.is_finished() {
+                waiting.push(client);
+            } else if client.join().is_err() {
+                shared.template_stats(|stats| stats.clients = stats.clients.saturating_sub(1));
+            }
+        }
+        template_clients = waiting;
+        let mut idle = true;
         match listener.accept() {
             Ok((stream, peer)) => {
+                idle = false;
                 // #### PR #40
                 // What: accepted sockets block again before the handshake.
                 // Why: on Windows an accepted socket inherits the listener's
@@ -459,39 +641,81 @@ pub fn run<R: NodeRpc + Send + 'static>(
                 // inherit the mode, which is why the live ASIC never showed it.
                 // Check: SV2 devices and the SV1 adapter connect on a Windows
                 // host under load (the release-mode server tests).
-                if devices.len() >= MAX_CONNECTIONS || stream.set_nonblocking(false).is_err() {
-                    drop(stream);
-                    continue;
+                if devices.len() < MAX_CONNECTIONS && stream.set_nonblocking(false).is_ok() {
+                    let shared = shared.clone();
+                    let config = config.clone();
+                    let id = if let Ok(mut stats) = shared.stats.lock() {
+                        stats.connections += 1;
+                        stats.sessions_started = stats.sessions_started.saturating_add(1);
+                        let id = stats.device_stats.connect(peer, false, Instant::now());
+                        stats.device_stats.set_address(id, peer.ip());
+                        id
+                    } else {
+                        0
+                    };
+                    devices.push((
+                        id,
+                        thread::spawn(move || {
+                            let result = serve_device(stream, public, &config, &shared, id);
+                            device_ended(&shared, id, result.as_ref().err().map(String::as_str));
+                        }),
+                    ));
                 }
-                let shared = shared.clone();
-                let config = config.clone();
-                let id = if let Ok(mut stats) = shared.stats.lock() {
-                    stats.connections += 1;
-                    stats.sessions_started = stats.sessions_started.saturating_add(1);
-                    let id = stats.device_stats.connect(peer, false, Instant::now());
-                    stats.device_stats.set_address(id, peer.ip());
-                    id
-                } else {
-                    0
-                };
-                devices.push((
-                    id,
-                    thread::spawn(move || {
-                        let result = serve_device(stream, public, &config, &shared, id);
-                        device_ended(&shared, id, result.as_ref().err().map(String::as_str));
-                    }),
-                ));
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20))
-            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
             Err(_) => {
                 listener_error = Some("mining listener failed".to_owned());
                 break;
             }
         }
+        // #### PR #42: the template listener
+        // What: Template Distribution clients (SV2 pools, Job Declaration
+        // clients, P2Pool, another Pickaxe) connect here, at most 8 at once,
+        // each on its own thread with the mining listener's key. The
+        // accepted socket blocks again before the handshake (the PR #40
+        // rule above).
+        // Why: SRI's pool takes its templates from a template provider; this
+        // node's templates reach it without the node's RPC login.
+        // Look here if: a template client is dropped at connect, or a ninth
+        // is accepted.
+        if let Some(templates) = templates.as_ref() {
+            match templates.accept() {
+                Ok((stream, _)) => {
+                    idle = false;
+                    if template_clients.len() < tdp::MAX_TP_CLIENTS
+                        && stream.set_nonblocking(false).is_ok()
+                    {
+                        let shared = shared.clone();
+                        let config = config.clone();
+                        shared.template_stats(|stats| stats.clients += 1);
+                        template_clients.push(thread::spawn(move || {
+                            let _ = tdp::server::serve(
+                                stream,
+                                public,
+                                &config.authority_secret,
+                                &shared,
+                            );
+                            shared.template_stats(|stats| {
+                                stats.clients = stats.clients.saturating_sub(1)
+                            });
+                        }));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(_) => {
+                    listener_error = Some("template listener failed".to_owned());
+                    break;
+                }
+            }
+        }
+        if idle {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
     stop.store(true, Ordering::Relaxed);
+    for client in template_clients {
+        let _ = client.join();
+    }
     for (id, device) in devices {
         if device.join().is_err() {
             device_ended(&shared, id, Some("device worker panicked"));
@@ -541,6 +765,57 @@ impl RetrySchedule {
     fn remove(&mut self, hash: &str) {
         self.0.remove(hash);
     }
+}
+
+/// #### PR #38: one saved block from `journal` to the node: the oldest one
+/// due, retried with backoff until the node answers exactly. The journal's
+/// lock is released during the RPC. Returns the block, the node's answer and
+/// whether it was a retry.
+fn submit_next<R: NodeRpc>(
+    journal: &Mutex<Journal>,
+    retries: &mut RetrySchedule,
+    provider: &mut TemplateProvider<R>,
+) -> Result<Option<(PendingBlock, SubmissionOutcome, bool)>, String> {
+    let pending = {
+        let journal = journal.lock().map_err(|_| "block journal unavailable")?;
+        retries
+            .next(&journal.pending_hashes(), Instant::now())
+            .and_then(|hash| journal.pending(&hash))
+    };
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+    let retry = retries.is_retry(&pending.hash);
+    let outcome = provider.submit_saved(&pending);
+    match outcome {
+        SubmissionOutcome::Accepted | SubmissionOutcome::Rejected(_) => {
+            journal
+                .lock()
+                .map_err(|_| "block journal unavailable")?
+                .finish(&pending.hash, outcome == SubmissionOutcome::Accepted)?;
+            retries.remove(&pending.hash);
+        }
+        SubmissionOutcome::Pending(_) => retries.defer(&pending.hash, Instant::now()),
+    }
+    Ok(Some((pending, outcome, retry)))
+}
+
+/// #### PR #42: the relay journal's counts, for the dashboard.
+pub(super) fn update_relay_stats(shared: &Shared) -> Result<(), String> {
+    let Some(relay) = shared.relay.as_ref() else {
+        return Ok(());
+    };
+    let (pending, accepted, rejected) = relay
+        .journal
+        .lock()
+        .map_err(|_| "relay journal unavailable")?
+        .counts();
+    shared.template_stats(|stats| {
+        stats.relay_pending = pending;
+        stats.relay_accepted = accepted;
+        stats.relay_rejected = rejected;
+    });
+    Ok(())
 }
 
 fn update_journal_stats(shared: &Shared) -> Result<(), String> {

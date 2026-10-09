@@ -622,3 +622,47 @@ fn pending_block_and_receipt_survive_process_exit_without_destructors() {
         assert!(!journal.enqueue(&solved_share(77)).unwrap());
     }
 }
+
+// #### PR #42
+// What: the relay journal keeps a block that pays someone else (a pool's
+// coinbase), once, across a reopen, owner-only; it refuses blocks without a
+// valid merkle root, takes no payout-bound share, and never opens as (or
+// in place of) the block journal or another network's relay journal.
+// Look here if: open_relay, enqueue_relayed or the relay binding changes.
+#[test]
+fn relay_journal_is_owner_only_and_never_mixes_with_the_block_journal() {
+    let dir = TestDirectory::new();
+    let path = dir.0.join("relay-blocks.json");
+    let pool =
+        crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x56; 20], MiningNetwork::Chipnet).unwrap();
+    let share = solved_share_for(5, Default::default(), &pool, None);
+    let bytes = share.template.block(&share.coinbase, share.header).unwrap();
+    let mut relay = Journal::open_relay(&path, MiningNetwork::Chipnet).unwrap();
+    assert!(relay.enqueue(&share).is_err(), "no payout-bound shares");
+    let mut broken = bytes.clone();
+    // A byte of the coinbase's script: the merkle root no longer matches.
+    broken[80 + 1 + 4 + 1 + 32 + 4 + 1 + 2] ^= 1;
+    assert!(relay.enqueue_relayed(&broken).is_err());
+    assert!(relay.enqueue_relayed(&bytes).unwrap());
+    assert!(!relay.enqueue_relayed(&bytes).unwrap(), "saved once");
+    assert_eq!(relay.counts(), (1, 0, 0));
+    drop(relay);
+    let relay = Journal::open_relay(&path, MiningNetwork::Chipnet).unwrap();
+    assert_eq!(relay.counts(), (1, 0, 0));
+    let pending = relay.pending(&relay.pending_hashes()[0]).unwrap();
+    assert_eq!(hex::decode(&pending.block).unwrap(), bytes);
+    assert!(pending.payout.is_none() && pending.miner.is_none() && pending.operator.is_none());
+    drop(relay);
+    assert!(Journal::open(&path, MiningNetwork::Chipnet, &payout(), &[]).is_err());
+    assert!(Journal::open_relay(&path, MiningNetwork::Mainnet).is_err());
+    let mut own = open(&dir);
+    assert!(own.enqueue_relayed(&bytes).is_err(), "no relayed blocks");
+    drop(own);
+    assert!(Journal::open_relay(&dir.journal(), MiningNetwork::Chipnet).is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}

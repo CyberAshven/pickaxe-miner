@@ -40,6 +40,9 @@ mod server_tests;
 mod status;
 #[cfg(feature = "stratum-v2")]
 pub mod sv1;
+// #### PR #42: Template Distribution: this server's templates for SV2 pools.
+#[cfg(feature = "stratum-v2")]
+pub mod tdp;
 #[cfg(feature = "stratum-v2")]
 pub mod telemetry;
 #[cfg(feature = "stratum-v2")]

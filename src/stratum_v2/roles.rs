@@ -11,6 +11,9 @@ pub enum Role {
     MiningServer,
     /// Translate SV1 firmware onto the same mining server.
     Sv1Translator,
+    /// #### PR #42: serve this node's templates to SV2 pools, Job
+    /// Declaration clients and P2Pool (Template Distribution).
+    TemplateProviderServer,
 }
 
 impl Role {
@@ -20,6 +23,7 @@ impl Role {
             Self::TemplateProviderClient => "template_provider_client",
             Self::MiningServer => "mining_server",
             Self::Sv1Translator => "sv1_translator",
+            Self::TemplateProviderServer => "template_provider_server",
         }
     }
 
@@ -29,6 +33,7 @@ impl Role {
             Self::TemplateProviderClient,
             Self::MiningServer,
             Self::Sv1Translator,
+            Self::TemplateProviderServer,
         ]
     }
 }
@@ -53,9 +58,10 @@ mod tests {
     #[test]
     fn planned_roles_are_distinct() {
         let labels: Vec<_> = Role::all().iter().map(|r| r.as_str()).collect();
-        assert_eq!(labels.len(), 3);
+        assert_eq!(labels.len(), 4);
         assert!(labels.contains(&"template_provider_client"));
         assert!(labels.contains(&"mining_server"));
         assert!(labels.contains(&"sv1_translator"));
+        assert!(labels.contains(&"template_provider_server"));
     }
 }

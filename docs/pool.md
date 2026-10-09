@@ -139,6 +139,18 @@ The dashboard header shows `Public pool, fee 2.00% from coinbase`. With SV2,
 miners see every coinbase output in the jobs they receive, so nobody can hide
 a fee; with SV1 they can decode the coinbase parts of each job.
 
+## Templates for other pools and P2Pool
+
+#### PR #42
+
+Your node's templates can also serve other pools: the **Serve templates** row
+under Advanced (or `--tp-listen 0.0.0.0:8442`, 48442 on Chipnet) lets an SV2
+pool, a Job Declaration client or P2Pool take them over SV2 Template
+Distribution, pinned to your server's key. Their blocks pay their own
+coinbase; Pickaxe saves each one before sending it to your node and retries
+until the node answers. Details and SRI's configuration lines are in
+[stratum-v2.md](stratum-v2.md#serving-templates-to-a-pool-template-distribution).
+
 ## A public GPU pool
 
 In the setup choose **Run a pool**, then **GPU pool**: this computer

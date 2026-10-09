@@ -11,6 +11,7 @@ shares the same code path with a network switch.
 | **Template Provider client** | Pull full block templates from the miner's own node (BCHN or Knuth) and keep them fresh. |
 | **Mining server** | Serve SV2 mining channels to devices (Bitaxe native SV2 and SV1 via translator). Check shares, submit blocks. |
 | **SV1 translator** | Accept Stratum V1 firmware (Avalon Nano and most home ASICs) and translate to the SV2 mining server. Required in this implementation scope. |
+| **Template Provider server** (PR #42) | Serve this node's templates to SV2 pools, Job Declaration clients and P2Pool over SV2 Template Distribution (`--tp-listen`), and relay the blocks they find. See [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
 
 GPU CashToken mining stays on its existing path. This work adds an ASIC-facing
 SV2 surface; it does not replace the portable GPU product bar.
@@ -57,11 +58,13 @@ assumptions baked into some SV2 examples:
 | **bchn-sv2-bridge** | External AGPL TP for unmodified BCHN over JSON-RPC; tested on mainnet; keeps JD off because unordered JD breaks CTOR. |
 | **Own JSON-RPC template client** | Current implementation feeds the mining server from BCHN full `getblocktemplate` / `submitblock`. GBT-light remains pending. |
 | **Knuth native TP (future integration)** | Upstream has merged SV2 framing and message building blocks. Those changes do not establish a complete, interoperable template provider. |
+| **Pickaxe's own template server** (PR #42) | `serve --tp-listen` hands this node's full templates to SV2 pools and P2Pool, the other direction; see [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
 
 ## Open decision: AGPL bridge vs own TP client
 
 **Initial implementation:** an in-tree full JSON-RPC template provider, pinned
-to the source node. GBT-light and native Template Distribution remain pending.
+to the source node. GBT-light and a Template Distribution client remain
+pending; the server side is in PR #42.
 
 **Chipnet test baseline:** use BCHN through the in-tree full-template client.
 This keeps deployment to Pickaxe plus the node, without an external bridge.
@@ -417,6 +420,79 @@ versions, so Pickaxe reports "upstream certificate version is not SV2's" there
 until CashStratum fixes it
 ([cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3)).
 
+### Serving templates to a pool (Template Distribution)
+
+#### PR #42
+
+A server with its own node can also hand that node's block templates to SV2
+pools, Job Declaration clients and P2Pool over SV2 Template Distribution, so
+they mine on this node's templates without its RPC login. It is off by
+default:
+
+```text
+pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json --tp-listen 0.0.0.0:48442
+```
+
+In the setup it is the **Serve templates** row under Advanced, for solo mining
+and an ASIC pool, on the network's template port: 8442 on mainnet, 48442 on
+Chipnet. Joining a pool cannot serve templates: that pool's come from its own
+node. The listener uses the mining listener's key, so a client pins the same
+authority. Connection info (`i`) lists its addresses, numbered for copying,
+and SRI's configuration lines:
+
+```toml
+[template_provider_type.Sv2Tp]
+address = "192.168.0.160:48442"
+public_key = "<the server's authority key>"
+```
+
+What a client gets:
+
+- `SetupConnection` for protocol 2, version 2 and no flags. Anything else is
+  refused with its error code, echoing unsupported flags, and the session
+  closes.
+- After its `CoinbaseOutputConstraints` (within 10 seconds): on a new parent,
+  a future `NewTemplate` and at once its `SetNewPrevHash` (the node's current
+  time, `nBits`, and the target `compact(nBits)`); on the same parent, a
+  current `NewTemplate` only. A lease renewal or a merge-mined token's change
+  sends nothing. A change of constraints sends the template again, at most
+  once a second.
+- The coinbase prefix is the BIP34 height push alone. A BCH template asks for
+  no coinbase outputs and has no witness commitment, so the client's outputs
+  take the whole `coinbase_tx_value_remaining`.
+- Template ids are `max(last + 1, Unix milliseconds)`, rising across restarts.
+- A template is withheld, and counted, when 153 bytes plus the client's
+  reserve do not fit beside its transactions within the block size limit.
+- `RequestTransactionData` returns the transactions in block (CTOR) order. A
+  template whose parent was replaced answers `stale-template-id`, an unknown
+  one `template-id-not-found`, and one beyond SV2's single frame (16,777,215
+  bytes or 65,535 transactions, possible under ABLA) `template-too-large`.
+- A client can name its 16 latest templates; those on a replaced parent
+  answer for 10 seconds more. At most 8 clients connect at once. A client
+  frame over 64 KiB, or more than four transaction-data requests a second,
+  closes the session.
+
+A solution (`SubmitSolution`) is assembled into the template's block. SRI's
+pools submit a coinbase with BIP141's marker, flag and one 32-byte witness
+item; Pickaxe strips exactly those and refuses any other witness, since BCH has
+no witnesses and the block carries the plain coinbase. The coinbase script
+must begin with the height push sent, the version may differ only in the
+version-rolling bits, and the header must meet the target. A block that passes
+is saved in `<config>.sv2-relay-blocks.json`, owner-only beside the block
+journal and never mixed with it, and then submitted and retried like this
+server's own blocks until the node answers. A restart, even without
+`--tp-listen`, still submits what that file holds. One block per parent is
+kept. A solution that fails Pickaxe's checks still goes to the node, at most
+one every 10 seconds, and is never saved: a bug in those checks must not drop
+a pool's only submission. The overview shows the template clients, the
+templates sent and withheld, and the relayed blocks; the status file's
+`template_server` has the same counts and never an address.
+
+Sigops are not counted on BCH, which counts SigChecks while scripts run, so
+the client's sigops reserve is ignored. Pickaxe's own Template Distribution
+client, for templates from another Pickaxe or a native template provider, is
+the next step.
+
 The full-template provider checks network, synchronization, tip identity,
 CTOR, transaction bytes/IDs, header target and adaptive block size. It revokes
 work on an unavailable source. A block is counted accepted only when the
@@ -480,8 +556,8 @@ is mined best effort. Vardiff counts and estimates only at its own target.
 Only the first solved block on each parent is saved; later
 solutions on the same parent count as shares. SV1 adapter rejects count in the
 shared dashboard totals; separate adapter/native connection error fields can
-both describe the same disconnected session. Knuth TP, distributed rigs and
-pool routing are still pending.
+both describe the same disconnected session. A Template Distribution client,
+distributed rigs and pool routing are still pending.
 BCH uses an adjustable donation, defaulting to 1.5%: one third of it is mining
 work and two thirds is the block reward (0.5% and 1% at the default). The
 dashboard shows the total and both parts, each rounded up to two decimals; the

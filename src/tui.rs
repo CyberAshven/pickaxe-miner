@@ -85,6 +85,9 @@ pub struct ServerOptions {
     pub backups: Vec<String>,
     /// The username at the pool; `None` is the payout address.
     pub pool_user: Option<String>,
+    /// The port this node's templates are served on to SV2 pools and
+    /// P2Pool; `None` serves none.
+    pub template_port: Option<u16>,
 }
 
 impl Default for ServerOptions {
@@ -95,6 +98,7 @@ impl Default for ServerOptions {
             start_difficulty: None,
             backups: Vec::new(),
             pool_user: None,
+            template_port: None,
         }
     }
 }
@@ -253,6 +257,8 @@ enum SettingsRow {
     StartDifficulty,
     Sv1Port,
     Sv2Port,
+    /// Serving this node's templates to SV2 pools and P2Pool.
+    Templates,
     /// Backup pools for Join a pool, in failover order.
     Backups,
     /// The username at the pool (the payout address by default).
@@ -328,6 +334,8 @@ struct SetupFlow {
     start_difficulty: Option<u64>,
     sv1_port: u16,
     sv2_port: u16,
+    /// The port templates are served on; `None` serves none.
+    template_port: Option<u16>,
     /// Backup pools, each a one-line SV2 address with its key.
     backups: Vec<String>,
     /// Empty: the payout address.
@@ -432,6 +440,7 @@ impl SetupFlow {
             start_difficulty: None,
             sv1_port: DEFAULT_SV1_PORT,
             sv2_port: DEFAULT_SV2_PORT,
+            template_port: None,
             backups: Vec::new(),
             pool_user: String::new(),
             token_input: String::new(),
@@ -702,6 +711,7 @@ impl SetupFlow {
                     SettingsRow::StartDifficulty,
                     SettingsRow::Sv1Port,
                     SettingsRow::Sv2Port,
+                    SettingsRow::Templates,
                     SettingsRow::Fulcrum,
                 ],
             ),
@@ -730,6 +740,7 @@ impl SetupFlow {
                     SettingsRow::StartDifficulty,
                     SettingsRow::Sv1Port,
                     SettingsRow::Sv2Port,
+                    SettingsRow::Templates,
                     SettingsRow::Donation,
                 ],
             ),
@@ -783,7 +794,25 @@ impl SetupFlow {
             start_difficulty: self.start_difficulty,
             backups: self.backups.clone(),
             pool_user: Some(self.pool_user.trim().to_owned()).filter(|user| !user.is_empty()),
+            template_port: self.template_port,
         }
+    }
+
+    /// Serving templates on and off, on the network's template port, which
+    /// must differ from the SV1 and SV2 ports.
+    fn toggle_templates(&mut self) {
+        self.template_port = match self.template_port {
+            Some(_) => None,
+            None => {
+                let port = self.config.network.template_port();
+                if port == self.sv1_port || port == self.sv2_port {
+                    self.status_line =
+                        format!("Port {port} is the SV1 or SV2 port; change that port first.");
+                    return;
+                }
+                Some(port)
+            }
+        };
     }
     // #### end PR #42 ####
 
@@ -846,6 +875,7 @@ impl SetupFlow {
                 Vec::new()
             },
             pool_user: options.pool_user.clone().filter(|_| asic),
+            tp_port: None,
         };
         Some(match self.server_setup()? {
             ServerSetup::JoinGpuPool { .. } => joining(SavedMode::GpuRig),
@@ -855,6 +885,7 @@ impl SetupFlow {
                 join_key: None,
                 backups: Vec::new(),
                 pool_user: None,
+                tp_port: options.template_port,
                 ..joining(SavedMode::AsicSolo)
             },
             ServerSetup::GpuPool { fee, address } => SavedServer {
@@ -882,6 +913,7 @@ impl SetupFlow {
                 pool_tag: tag,
                 backups: Vec::new(),
                 pool_user: None,
+                tp_port: options.template_port,
                 ..joining(SavedMode::AsicPool)
             },
         })
@@ -904,6 +936,7 @@ impl SetupFlow {
         self.start_difficulty = None;
         self.sv1_port = DEFAULT_SV1_PORT;
         self.sv2_port = DEFAULT_SV2_PORT;
+        self.template_port = None;
         self.backups.clear();
         self.pool_user.clear();
         let Some(server) = server else {
@@ -935,6 +968,7 @@ impl SetupFlow {
         self.start_difficulty = server.start_difficulty;
         self.sv1_port = server.sv1_port.unwrap_or(DEFAULT_SV1_PORT);
         self.sv2_port = server.sv2_port.unwrap_or(DEFAULT_SV2_PORT);
+        self.template_port = server.tp_port;
         self.backups = server.backups.clone();
         self.pool_user = server.pool_user.clone().unwrap_or_default();
     }
@@ -1360,12 +1394,14 @@ impl SetupFlow {
                     SettingsRow::StartDifficulty => {
                         self.start_difficulty = step_difficulty(self.start_difficulty, forward)
                     }
+                    SettingsRow::Templates => self.toggle_templates(),
                     _ => {}
                 }
             }
             KeyCode::Enter => match row {
                 // #### PR #42: the Advanced section.
                 SettingsRow::Advanced => self.toggle_advanced(),
+                SettingsRow::Templates => self.toggle_templates(),
                 SettingsRow::StartDifficulty => {
                     let value = self
                         .start_difficulty
@@ -1768,6 +1804,9 @@ impl SetupFlow {
                 };
                 if port == other {
                     return Err("the SV1 and SV2 ports must differ".into());
+                }
+                if Some(port) == self.template_port {
+                    return Err("that port serves templates; turn that off first".into());
                 }
                 if field == TextField::Sv1Port {
                     self.sv1_port = port;
@@ -3674,6 +3713,17 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 edit_value(state, TextField::Sv2Port, &state.sv2_port.to_string(), ""),
                 "[Enter]",
             ),
+            // #### PR #42: Template Distribution, off by default.
+            SettingsRow::Templates => (
+                "Serve templates",
+                match state.template_port {
+                    None => dim("off; SV2 pools and P2Pool can take this node's templates"),
+                    Some(port) => Span::raw(format!(
+                        "on, port {port}: SV2 pools and P2Pool take this node's templates"
+                    )),
+                },
+                "< > [Enter]",
+            ),
             SettingsRow::Backups => (
                 "Backup pools",
                 match state.backups.len() {
@@ -5520,6 +5570,73 @@ mod tests {
         pool.handle_key(key(KeyCode::Enter));
         assert!(pool.advanced_open);
         assert_eq!(pool.current_row(), SettingsRow::FeeAddress);
+    }
+
+    // #### PR #42
+    // What: serving templates is an Advanced row of solo and ASIC-pool
+    // setups, off by default; Left/Right or Enter turns it on at the
+    // network's template port (48442 on Chipnet) and off; it cannot take the
+    // SV1 or SV2 port, which then cannot take it either; a profile keeps it,
+    // and a joining profile never does.
+    // Look here if: toggle_templates or the Templates row changes.
+    #[test]
+    fn serving_templates_is_an_advanced_row_saved_with_the_profile() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.open_settings(SettingsRow::Templates);
+        assert!(setup.advanced_open);
+        assert!(setup_text(&setup).contains("off; SV2 pools and P2Pool"));
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.template_port, Some(48442));
+        assert!(setup_text(&setup).contains("on, port 48442"));
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.template_port, None);
+        setup.sv2_port = 48442;
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.template_port, None);
+        assert!(
+            setup
+                .status_line
+                .contains("Port 48442 is the SV1 or SV2 port"),
+            "{}",
+            setup.status_line
+        );
+        setup.sv2_port = 3336;
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.template_port, Some(48442));
+        setup.open_settings(SettingsRow::Sv1Port);
+        setup.handle_key(key(KeyCode::Enter));
+        setup.text_input.clear();
+        type_text(&mut setup, "48442");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("serves templates"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Esc));
+        assert_eq!(setup.server_options().template_port, Some(48442));
+        let saved = setup.saved_server().unwrap();
+        assert_eq!(saved.tp_port, Some(48442));
+        SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(saved.clone()),
+            ..SavedConfig::default()
+        }
+        .validate()
+        .unwrap();
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!(reopened.template_port, Some(48442));
+        let pool = setup_for(MiningMode::Pool);
+        assert!(pool.with_advanced(Vec::new(), Vec::new()).len() >= 3);
+        let mut pool = pool;
+        pool.advanced_open = true;
+        assert!(pool.settings_rows().contains(&SettingsRow::Templates));
+        setup.asic_mining = AsicMining::JoinPool;
+        setup.join_address = "pool.example:3336".into();
+        setup.join_key = "KEY".into();
+        assert!(!setup.settings_rows().contains(&SettingsRow::Templates));
+        assert_eq!(setup.saved_server().unwrap().tp_port, None);
     }
 
     // #### PR #40

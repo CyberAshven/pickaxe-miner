@@ -396,6 +396,11 @@ pub const NODE_RPC_BOOTSTRAP: &[&str] = &[];
 /// #### PR #42: Chipnet's curated node RPCs (none yet), so the node list is
 /// network data, as Fulcrum's is.
 pub const CHIPNET_NODE_RPC_BOOTSTRAP: &[&str] = &[];
+/// #### PR #42: the port an SV2 Template Distribution server listens on by
+/// default: 8442 on mainnet, as SV2 template providers use, and 48442 on
+/// Chipnet.
+pub const TEMPLATE_PORT: u16 = 8442;
+pub const CHIPNET_TEMPLATE_PORT: u16 = 48442;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotonDerivedState {

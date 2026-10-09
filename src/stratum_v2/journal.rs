@@ -55,9 +55,21 @@ pub struct Journal {
     path: PathBuf,
     _lock: File,
     network: MiningNetwork,
-    payout: String,
-    scripts: Vec<Vec<u8>>,
+    binding: JournalBinding,
     state: State,
+}
+
+/// #### PR #42: what a journal's blocks are checked against.
+pub enum JournalBinding {
+    /// This server's own blocks: they pay its payout (with the donation and
+    /// any pool fee).
+    Payout {
+        payout: String,
+        scripts: Vec<Vec<u8>>,
+    },
+    /// Blocks relayed for a Template Distribution client (a pool): they pay
+    /// the client's coinbase, which this server neither builds nor knows.
+    Relay,
 }
 
 /// #### PR #40
@@ -99,6 +111,46 @@ impl Journal {
         // Look here if: a journal is refused as another network's or
         // payout's, or "a node that is no longer configured".
         let context = binding(None, network, &scripts[0]);
+        let legacy: Vec<String> = legacy_sources
+            .iter()
+            .map(|source| binding(Some(source), network, &scripts[0]))
+            .collect();
+        Self::open_bound(
+            path,
+            network,
+            JournalBinding::Payout { payout, scripts },
+            context,
+            &legacy,
+        )
+    }
+
+    /// #### PR #42: the relay journal
+    /// What: `<config>.sv2-relay-blocks.json`, owner-only like the block
+    /// journal, holds the blocks Template Distribution clients (pools) find
+    /// on this server's templates, until the node answers. Its binding names
+    /// the network alone, and its blocks are checked for size, merkle root,
+    /// proof of work and no witness, never for a payout.
+    /// Why: an SRI pool sends its blocks only to its template provider, so
+    /// this file is the block's only way to the chain, and the PR #38 rule
+    /// applies: persist first, then submit, retried until the node answers.
+    /// These blocks pay the pool, so they never enter the payout-bound
+    /// journal.
+    /// Look here if: a pool's block is missing on chain, or the relay
+    /// journal is refused as another network's.
+    pub fn open_relay(path: &Path, network: MiningNetwork) -> Result<Self, String> {
+        let mut context = b"pickaxe relay journal: ".to_vec();
+        context.extend(network.as_str().as_bytes());
+        let context = hex::encode(double_sha256(&context));
+        Self::open_bound(path, network, JournalBinding::Relay, context, &[])
+    }
+
+    fn open_bound(
+        path: &Path,
+        network: MiningNetwork,
+        binding: JournalBinding,
+        context: String,
+        legacy: &[String],
+    ) -> Result<Self, String> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -135,9 +187,7 @@ impl Journal {
             }
             let mut state: State = serde_json::from_slice(&bytes)
                 .map_err(|_| "invalid block journal; refusing to replace it")?;
-            let legacy = legacy_sources
-                .iter()
-                .any(|source| state.context == binding(Some(source), network, &scripts[0]));
+            let legacy = legacy.contains(&state.context);
             if state.version != 1 || (state.context != context && !legacy) {
                 return Err(
                     "block journal belongs to another network or payout, or to a node that is \
@@ -158,13 +208,12 @@ impl Journal {
                 rejected: 0,
             }
         };
-        validate_state(&state, network, &scripts)?;
+        validate_state(&state, network, &binding)?;
         let journal = Self {
             path: path.to_owned(),
             _lock: lock,
             network,
-            payout,
-            scripts,
+            binding,
             state,
         };
         if !path.exists() || rebound {
@@ -191,27 +240,51 @@ impl Journal {
         if !share.block {
             return Err("cannot journal a non-block share".into());
         }
+        let JournalBinding::Payout { payout, scripts } = &self.binding else {
+            return Err("the relay journal takes relayed blocks only".into());
+        };
         let bytes = share.template.block(&share.coinbase, share.header)?;
-        let miner = (share.miner != self.payout).then(|| share.miner.clone());
+        let miner = (&share.miner != payout).then(|| share.miner.clone());
         let scripts = block_scripts(
             self.network,
-            &self.scripts,
+            scripts,
             miner.as_deref(),
             share.operator.as_deref(),
         )?;
-        let hash = validate_block(&bytes, &scripts, Some(share.payout))?;
-        if self.state.completed.contains(&hash) || self.state.pending.iter().any(|b| b.hash == hash)
-        {
-            return Ok(false);
-        }
-        let mut next = self.state.clone();
-        next.pending.push(PendingBlock {
+        let hash = validate_block(&bytes, Some((scripts.as_slice(), Some(share.payout))))?;
+        self.push(PendingBlock {
             hash,
             block: hex::encode(bytes),
             payout: Some(share.payout),
             miner,
             operator: share.operator.clone(),
-        });
+        })
+    }
+
+    /// #### PR #42: saves a block a Template Distribution client found;
+    /// false when it is already saved. Only the relay journal takes them.
+    pub fn enqueue_relayed(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        if !matches!(self.binding, JournalBinding::Relay) {
+            return Err("relayed blocks go to the relay journal".into());
+        }
+        let hash = validate_block(bytes, None)?;
+        self.push(PendingBlock {
+            hash,
+            block: hex::encode(bytes),
+            payout: None,
+            miner: None,
+            operator: None,
+        })
+    }
+
+    fn push(&mut self, block: PendingBlock) -> Result<bool, String> {
+        if self.state.completed.contains(&block.hash)
+            || self.state.pending.iter().any(|b| b.hash == block.hash)
+        {
+            return Ok(false);
+        }
+        let mut next = self.state.clone();
+        next.pending.push(block);
         // Existing entries were checked at load/enqueue. Do not hash every
         // stored full block again while another device waits to journal work.
         validate_limits(&next)?;
@@ -330,7 +403,7 @@ fn block_scripts(
 fn validate_state(
     state: &State,
     network: MiningNetwork,
-    scripts: &[Vec<u8>],
+    binding: &JournalBinding,
 ) -> Result<(), String> {
     validate_limits(state)?;
     let mut seen = std::collections::HashSet::new();
@@ -353,15 +426,26 @@ fn validate_state(
             return Err("pending blocks exceed journal storage budget".into());
         }
         let bytes = hex::decode(&pending.block).map_err(|_| "invalid journal block encoding")?;
-        let scripts = block_scripts(
-            network,
-            scripts,
-            pending.miner.as_deref(),
-            pending.operator.as_deref(),
-        )?;
-        if validate_block(&bytes, &scripts, pending.payout)? != pending.hash
-            || !seen.insert(pending.hash.clone())
-        {
+        let hash = match binding {
+            JournalBinding::Payout { scripts, .. } => {
+                let scripts = block_scripts(
+                    network,
+                    scripts,
+                    pending.miner.as_deref(),
+                    pending.operator.as_deref(),
+                )?;
+                validate_block(&bytes, Some((scripts.as_slice(), pending.payout)))?
+            }
+            // #### PR #42: a relayed block names no payout.
+            JournalBinding::Relay => {
+                if pending.payout.is_some() || pending.miner.is_some() || pending.operator.is_some()
+                {
+                    return Err("invalid relayed journal block".into());
+                }
+                validate_block(&bytes, None)?
+            }
+        };
+        if hash != pending.hash || !seen.insert(pending.hash.clone()) {
             return Err("invalid or duplicate journal block".into());
         }
     }
@@ -383,10 +467,12 @@ fn validate_limits(state: &State) -> Result<(), String> {
     Ok(())
 }
 
+/// The block's hash after its checks. `expected` holds the payout scripts
+/// and policy a block of this server must pay; a relayed block (#### PR #42)
+/// has none, and its coinbase's outputs are the client's.
 fn validate_block(
     bytes: &[u8],
-    scripts: &[Vec<u8>],
-    payout: Option<BchPayout>,
+    expected: Option<(&[Vec<u8>], Option<BchPayout>)>,
 ) -> Result<String, String> {
     if bytes.len() > MAX_BLOCK_BYTES {
         return Err("block exceeds journal storage budget".into());
@@ -400,6 +486,17 @@ fn validate_block(
         .txdata
         .first()
         .ok_or("journal block has no coinbase")?;
+    if block
+        .txdata
+        .iter()
+        .any(|tx| tx.input.iter().any(|input| !input.witness.is_empty()))
+        || !coinbase.is_coinbase()
+    {
+        return Err("journal block payout or transaction encoding does not match".into());
+    }
+    let Some((scripts, payout)) = expected else {
+        return Ok(block.block_hash().to_string());
+    };
     let total = coinbase
         .output
         .iter()
@@ -441,13 +538,7 @@ fn validate_block(
         .iter()
         .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
         .collect::<Vec<_>>();
-    if !coinbase.is_coinbase()
-        || actual != expected
-        || block
-            .txdata
-            .iter()
-            .any(|tx| tx.input.iter().any(|input| !input.witness.is_empty()))
-    {
+    if actual != expected {
         return Err("journal block payout or transaction encoding does not match".into());
     }
     Ok(block.block_hash().to_string())

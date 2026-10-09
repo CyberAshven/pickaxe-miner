@@ -1668,3 +1668,36 @@ and has the right depth for 0 to 17 transactions, and that a coinbase rebuilt
 from parts equals the full build byte for byte, with the same root, for 0 to
 17 transactions and for miner, donation-work and fee-work payouts. All
 existing share, token and server tests pass through the new path.
+
+## Template Distribution server (2026-10-09)
+
+#### PR #42
+
+`serve --tp-listen ADDRESS` (the setup's **Serve templates** row, on port 8442
+on mainnet and 48442 on Chipnet) serves this node's templates over SV2
+Template Distribution with the mining listener's key, to at most 8 clients:
+SRI's pool, a Job Declaration client, P2Pool or another Pickaxe. A new parent
+comes as a future `NewTemplate` and its `SetNewPrevHash`, a same-parent
+refresh as a current template only; the coinbase prefix is the height push
+alone and no coinbase outputs are required. Transaction data comes in block
+order, or as `stale-template-id`, `template-id-not-found` or
+`template-too-large` beyond SV2's single 16 MiB frame. A template the client's
+reserve does not fit is withheld. Solutions are assembled into blocks with
+BIP141's one 32-byte witness item stripped, checked (prefix, version, proof of
+work, size), saved in the owner-only relay journal and submitted with the
+block journal's retries; a solution that fails Pickaxe's checks still reaches
+the node once per 10 seconds. Device sessions keep their 1 MiB frame limits;
+template sessions take 64 KiB in and send up to 16 MiB.
+
+Evidence: host tests with an SRI-shaped client on the reference crates over
+Noise against the real server: golden bytes for `NewTemplate` (45 bytes) and
+`SetNewPrevHash` (80 bytes); setup refusals; no template before the
+constraints and a silent client closed; future and current templates and
+rising ids; an SRI-shaped coinbase with a BIP141 witness stripped, relayed
+once and finished in the relay journal while the block journal stays empty;
+two locally refused solutions giving one submission; transaction data for
+current, stale and unknown templates and at the 16 MiB and 65,535 limits; a
+withheld template that follows smaller constraints; a relayed block surviving
+lost replies and a restart without the listener; the 8-client cap; a 70 KB
+client frame closing the session; device frames still capped at 1 MiB. Not
+yet run against a live SRI pool or P2Pool.

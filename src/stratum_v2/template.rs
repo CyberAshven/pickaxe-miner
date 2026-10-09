@@ -406,31 +406,68 @@ impl BchTemplate {
         {
             return Err("block header does not belong to this template".into());
         }
+        Ok(self.assemble(&coinbase.bytes, &header))
+    }
+
+    /// #### PR #42: the block's bytes, unchecked: the header, the count,
+    /// the coinbase and the template's transactions. A Template
+    /// Distribution client's solution is assembled with it before its
+    /// checks, so even a refused one can still reach the node (D24).
+    pub fn assemble(&self, coinbase: &[u8], header: &[u8; 80]) -> Vec<u8> {
         let mut block = header.to_vec();
         compact_size(self.transactions.len() + 1, &mut block);
-        block.extend_from_slice(&coinbase.bytes);
+        block.extend_from_slice(coinbase);
         for tx in &self.transactions {
             block.extend_from_slice(tx);
         }
-        Ok(block)
+        block
     }
 
     pub fn transaction_count(&self) -> usize {
         self.transactions.len() + 1
     }
 
-    fn check_block_size(&self, coinbase_size: usize) -> Result<(), String> {
+    /// #### PR #42: the BIP34 height push that begins every coinbase
+    /// script; a Template Distribution client's coinbase prefix.
+    pub fn height_push(&self) -> Vec<u8> {
+        height_script(self.height)
+    }
+
+    /// #### PR #42: the coinbase's merkle branch, deepest sibling first.
+    pub fn merkle_path(&self) -> &[Hash] {
+        &self.merkle_path
+    }
+
+    /// #### PR #42: the block's other transactions, in block (CTOR) order.
+    pub fn transactions(&self) -> &[Vec<u8>] {
+        &self.transactions
+    }
+
+    /// #### PR #42: the bytes a coinbase may take in a block of this
+    /// template: the size limit less the header, the transaction count and
+    /// every other transaction.
+    pub fn coinbase_budget(&self) -> u64 {
         let mut count = Vec::new();
         compact_size(self.transaction_count(), &mut count);
-        let size = 80u64
-            + count.len() as u64
-            + coinbase_size as u64
-            + self
-                .transactions
-                .iter()
-                .map(|tx| tx.len() as u64)
-                .sum::<u64>();
-        if size > self.size_limit {
+        let others = self
+            .transactions
+            .iter()
+            .map(|tx| tx.len() as u64)
+            .sum::<u64>();
+        self.size_limit
+            .saturating_sub(80 + count.len() as u64 + others)
+    }
+
+    /// #### PR #42: the template with other transactions, unchecked (its
+    /// merkle path is not recomputed), for transaction-data size tests.
+    #[cfg(test)]
+    pub(super) fn with_transactions(mut self, transactions: Vec<Vec<u8>>) -> Self {
+        self.transactions = transactions;
+        self
+    }
+
+    fn check_block_size(&self, coinbase_size: usize) -> Result<(), String> {
+        if coinbase_size as u64 > self.coinbase_budget() {
             return Err("coinbase exceeds template block size budget".into());
         }
         Ok(())

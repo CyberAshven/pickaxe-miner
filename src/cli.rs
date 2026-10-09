@@ -232,6 +232,14 @@ pub enum StratumV2Command {
             conflicts_with = "upstream"
         )]
         merge_test_token: Option<u64>,
+        /// #### PR #42
+        /// Serve this node's block templates to SV2 pools, Job Declaration
+        /// clients and P2Pool (SV2 Template Distribution) at this address,
+        /// such as 0.0.0.0:8442 (mainnet) or 0.0.0.0:48442 (Chipnet), with
+        /// the mining listener's key. Off by default. Not with --upstream: a
+        /// pool's templates come from its own node.
+        #[arg(long, value_name = "ADDRESS", conflicts_with = "upstream")]
+        tp_listen: Option<std::net::SocketAddr>,
     },
 }
 
@@ -525,6 +533,41 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    // #### PR #42
+    // What: --tp-listen takes an address and cannot be used with --upstream,
+    // where the pool's templates come from its own node.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn tp_listen_serves_templates_and_conflicts_with_upstream() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--tp-listen",
+            "0.0.0.0:48442",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command: StratumV2Command::Serve { tp_listen, .. },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(tp_listen, Some("0.0.0.0:48442".parse().unwrap()));
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--tp-listen",
+            "0.0.0.0:48442",
+            "--upstream",
+            "stratum2+tcp://pool.example:3336/KEY",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+        ])
+        .is_err());
     }
 
     // #### PR #40

@@ -1818,6 +1818,11 @@ fn main() {
                                 pool_tag,
                                 start_difficulty: options.start_difficulty.filter(|_| !joining),
                                 merge_test_token: None,
+                                // #### PR #42: templates from this node.
+                                tp_listen: options
+                                    .template_port
+                                    .filter(|_| !joining)
+                                    .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port))),
                             };
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(
