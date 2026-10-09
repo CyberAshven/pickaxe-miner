@@ -1,5 +1,11 @@
 # Pickaxe Miner Sponsorship
+#
+# GitHub's Sponsor box shows web links only, so it links to the donate page,
+# which shows both addresses with QR codes and Open in wallet buttons.
+# The page is built from the addresses below.
+#
+# "bitcoincash:qze95tc2dqrnltvxfa5yhunwx5952f34fvw4g6365k" # BCH
+# "bitcoincash:zze95tc2dqrnltvxfa5yhunwx5952f34fvflmylut9" # CashTokens-aware
 
 custom:
-  - "bitcoincash:qze95tc2dqrnltvxfa5yhunwx5952f34fvw4g6365k" # BCH
-  - "bitcoincash:zze95tc2dqrnltvxfa5yhunwx5952f34fvflmylut9" # CashTokens-aware
+  - "https://cyberashven.github.io/pickaxe-miner/"
