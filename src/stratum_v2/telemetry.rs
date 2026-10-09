@@ -73,6 +73,9 @@ pub struct DeviceSnapshot {
 struct Device {
     label: String,
     protocol: &'static str,
+    /// #### PR #41: the device's local network address, kept after it
+    /// disconnects so a reconnect replaces its row.
+    ip: Option<IpAddr>,
     started: Instant,
     ended: Option<Instant>,
     channels: usize,
@@ -167,6 +170,7 @@ impl Devices {
             id,
             Device {
                 label: format!("Device {:08x}-{id}", self.prefix),
+                ip: None,
                 protocol: if adapter { "SV1" } else { "SV2" },
                 started: now,
                 ended: None,
@@ -222,6 +226,19 @@ impl Devices {
     pub fn set_address(&mut self, id: u64, ip: IpAddr) {
         if super::device_api::queryable(ip) && self.rows.contains_key(&id) {
             self.addresses.insert(id, ip);
+            // #### PR #41
+            // What: one row per device on the local network. A device that
+            // connects again replaces its own offline row.
+            // Why: every connection was a row of its own, so a reconnect left
+            // an offline twin beside the device, and a firmware's short extra
+            // connections made rows come and go.
+            // Look here if: two devices behind one local address merge (only
+            // local addresses are matched; routers' public ones never are).
+            self.rows
+                .retain(|other, row| *other == id || row.ended.is_none() || row.ip != Some(ip));
+            if let Some(row) = self.rows.get_mut(&id) {
+                row.ip = Some(ip);
+            }
         }
     }
 
@@ -321,8 +338,19 @@ impl Devices {
         } else {
             row.connection_error = error.map(connection_reason);
         }
+        let ip = row.ip;
         self.sockets.retain(|_, existing| *existing != id);
         self.addresses.remove(&id);
+        // #### PR #41: a short extra connection from a device that is still
+        // online leaves no row behind.
+        if ip.is_some()
+            && self
+                .rows
+                .iter()
+                .any(|(other, row)| *other != id && row.ended.is_none() && row.ip == ip)
+        {
+            self.rows.remove(&id);
+        }
         self.prune();
     }
 
@@ -458,6 +486,40 @@ pub fn connection_reason(error: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #41
+    #[test]
+    fn a_device_keeps_one_row_through_reconnects_and_extra_connections() {
+        let now = Instant::now();
+        let nano: IpAddr = "192.168.0.127".parse().unwrap();
+        let other: IpAddr = "192.168.0.128".parse().unwrap();
+        let mut devices = Devices::default();
+        let first = devices.connect("127.0.0.1:5001".parse().unwrap(), true, now);
+        devices.set_address(first, nano);
+        let neighbour = devices.connect("127.0.0.1:5002".parse().unwrap(), true, now);
+        devices.set_address(neighbour, other);
+        devices.close(neighbour, true, Some("SV1 disconnected"), now);
+        devices.close(first, true, Some("SV1 disconnected"), now);
+        assert_eq!(
+            devices.snapshots(now).len(),
+            2,
+            "offline rows stay until the device returns"
+        );
+        // The device reconnects: its offline row goes, another device's stays.
+        let second = devices.connect("127.0.0.1:5003".parse().unwrap(), true, now);
+        devices.set_address(second, nano);
+        let rows = devices.snapshots(now);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.connected));
+        assert_eq!(rows.iter().filter(|row| !row.connected).count(), 1);
+        // A short extra connection from the same device leaves no row.
+        let probe = devices.connect("127.0.0.1:5004".parse().unwrap(), true, now);
+        devices.set_address(probe, nano);
+        assert_eq!(devices.snapshots(now).len(), 3);
+        devices.close(probe, true, Some("SV1 disconnected"), now);
+        assert_eq!(devices.snapshots(now).len(), 2);
+        assert!(devices.snapshots(now).iter().any(|row| row.connected));
+    }
 
     // #### PR #40
     #[test]
