@@ -59,7 +59,9 @@ pub struct Channel {
     pub id: u32,
     pub kind: ChannelKind,
     pub target: Hash,
-    pub extranonce_prefix: [u8; 16],
+    /// The session salt and the channel id (16 bytes), or under Job
+    /// Declaration the channel's lane (4 bytes, #### PR #42).
+    pub extranonce_prefix: Vec<u8>,
     network: MiningNetwork,
     payout: String,
     /// #### PR #40: a public pool operator's fee address.
@@ -142,6 +144,9 @@ pub struct ValidatedShare {
     pub aux: Option<Arc<AuxJob>>,
     pub token_wins: Vec<u16>,
     pub merkle_path: Vec<Hash>,
+    /// #### PR #42: the share as the pool takes it, on a Job Declaration
+    /// job.
+    pub forward: Option<super::jd::ForwardShare>,
 }
 
 impl ValidatedShare {
@@ -220,9 +225,8 @@ impl Channel {
         }
         let payout = crate::config::validate_coinbase_address(network, payout)
             .map_err(|_| "invalid payout for selected network")?;
-        let mut extranonce_prefix = [0; 16];
-        extranonce_prefix[..12].copy_from_slice(&session_salt);
-        extranonce_prefix[12..].copy_from_slice(&id.to_le_bytes());
+        let mut extranonce_prefix = session_salt.to_vec();
+        extranonce_prefix.extend_from_slice(&id.to_le_bytes());
         Ok(Self {
             id,
             kind,
@@ -245,6 +249,14 @@ impl Channel {
                 .map_or(MIN_HASHRATE, |rate| rate as f32),
             custom_only: false,
         })
+    }
+
+    /// #### PR #42: a Job Declaration client's local channel: its
+    /// extranonce prefix is its lane, unique across the server, so that the
+    /// job id, the lane and the device's 8 bytes fit the 16 the pool lets
+    /// the client roll.
+    pub fn set_lane(&mut self, lane: u32) {
+        self.extranonce_prefix = lane.to_le_bytes().to_vec();
     }
 
     /// #### PR #42: the rollable extranonce bytes this channel's shares
@@ -283,8 +295,29 @@ impl Channel {
         // before the channel/device extranonce so restarting the firmware's
         // nonce search cannot repeat headers from a retained job. The device
         // cannot overwrite this prefix; its extranonce size stays unchanged.
-        let mut extra = id.to_le_bytes().to_vec();
-        extra.extend(self.extranonce_prefix);
+        // #### PR #42: the nested extranonce layout
+        // What: under Job Declaration the script carries the pool channel's
+        // prefix, then the job id, the plan's pad, this channel's lane and
+        // the device's 8 bytes; the job id onwards is what the pool lets
+        // the client roll. A standard channel's device bytes are zeros. The
+        // standalone layout (job id, salt, channel id, device) is unchanged.
+        // Why: the pool rebuilds the coinbase from its own prefix and the
+        // client's rolled bytes, so the local server's coinbases must have
+        // exactly that shape.
+        // Look here if: the pool refuses forwarded shares, or the local
+        // devices' coinbases differ from the custom job's.
+        let (upstream, pad) = template.jd_plan().map_or((&[][..], &[][..]), |plan| {
+            (plan.upstream_prefix.as_slice(), plan.pad.as_slice())
+        });
+        let mut extra = upstream.to_vec();
+        extra.extend(id.to_le_bytes());
+        extra.extend_from_slice(pad);
+        extra.extend_from_slice(&self.extranonce_prefix);
+        let parts_extranonce = extra.len() + DEVICE_EXTRANONCE_SIZE;
+        if template.jd_plan().is_some() && self.kind == ChannelKind::Standard {
+            extra.extend([0; DEVICE_EXTRANONCE_SIZE]);
+        }
+        // #### end PR #42 ####
         // #### PR #42: merge-mined tokens in each job
         // What: a job built from a template with a token set gets its own
         // merge-mining (`aux`): leaves that bind this job's beneficiary (the
@@ -316,12 +349,14 @@ impl Channel {
             self.network,
             &self.payout,
             self.operator.as_deref(),
-            extra.len() + DEVICE_EXTRANONCE_SIZE,
+            parts_extranonce,
             payout,
             outputs,
         )?;
         // #### end PR #42 ####
+        parts.prefix.extend_from_slice(upstream);
         parts.prefix.extend(id.to_le_bytes());
+        parts.prefix.extend_from_slice(pad);
         self.retain_previous(&template);
         self.job = Some(Job {
             id,
@@ -674,6 +709,19 @@ impl Channel {
             job.parts.merkle_path.clone()
         };
         // #### end PR #42 ####
+        // #### PR #42: shares forwarded to the pool (Job Declaration): the
+        // rolled bytes start at the job id, at the end of the job's prefix.
+        let forward = job.template.jd_plan().map(|plan| {
+            let start = job.parts.prefix.len() - plan.pad.len() - 4;
+            super::jd::ForwardShare {
+                serial: job.generation,
+                version: share.version,
+                ntime: share.time,
+                nonce: share.nonce,
+                extranonce: coinbase.bytes[start..start + plan.rollable()].to_vec(),
+                hash,
+            }
+        });
         // Vardiff counts shares at the current target only, so work still
         // arriving at an older, easier target cannot inflate its estimate.
         // #### PR #42: the share-target floor (see `settle`): only shares
@@ -696,6 +744,7 @@ impl Channel {
             aux: job.aux.clone(),
             token_wins,
             merkle_path,
+            forward,
         })
     }
 
@@ -1237,7 +1286,7 @@ mod tests {
         let result = channel.check(input, 1700000010).unwrap();
         let job = channel.job().unwrap();
         let mut assembled = job.parts.prefix.clone();
-        assembled.extend(channel.extranonce_prefix);
+        assembled.extend(&channel.extranonce_prefix);
         assembled.extend([0x23; DEVICE_EXTRANONCE_SIZE]);
         assembled.extend(&job.parts.suffix);
         assert_eq!(assembled, result.coinbase.bytes);
@@ -1762,5 +1811,89 @@ mod tests {
         assert_ne!(channel.vardiff_target, hard);
         assert_eq!(told, times(&channel.vardiff_target, TOKEN_FLOOR_CAP));
         assert_eq!(channel.target, told);
+    }
+
+    // #### PR #42
+    // What: under a Job Declaration plan, a local channel's coinbase script
+    // is the head, the pool's prefix, the job id, the pad, the lane and the
+    // device's bytes; a share's forwarded bytes are exactly the rolled ones
+    // the pool rebuilds with, and the coinbase pays the plan's outputs.
+    // Look here if: the nested layout or ForwardShare changes.
+    #[test]
+    fn nested_layout_puts_the_pool_prefix_before_the_lane() {
+        use super::super::jd::{plan::JdPlan, token::PoolRates};
+        let mut template =
+            BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
+        let plan = JdPlan {
+            serial: 3,
+            upstream_prefix: vec![0xee; 16],
+            pad: vec![0; 2],
+            scripts: vec![vec![0x51], vec![0x52]],
+            rates: PoolRates {
+                donation_bps: 0,
+                fee_bps: 100,
+                donation_output: None,
+                fee_output: Some(1),
+            },
+            pool_target: [0xff; 32],
+        };
+        template.declare(Arc::new(plan.clone()));
+        let template = Arc::new(template);
+        let mut channel = Channel::new(
+            1,
+            ChannelKind::Extended,
+            [255; 32],
+            [9; 12],
+            MiningNetwork::Chipnet,
+            &super::super::template_tests::payout(),
+        )
+        .unwrap();
+        channel.set_lane(7);
+        let job = channel.install(5, 11, template.clone()).unwrap();
+        let head = template.script_head();
+        let mut expected_prefix = job.parts.prefix[..42 + head.len()].to_vec();
+        expected_prefix.extend([0xee; 16]);
+        expected_prefix.extend(5u32.to_le_bytes());
+        expected_prefix.extend([0, 0]);
+        assert_eq!(job.parts.prefix, expected_prefix);
+        assert_eq!(
+            job.parts.prefix[41] as usize,
+            head.len() + 16 + plan.rollable()
+        );
+        let device = [0x42; 8];
+        let mut coinbase = job.parts.prefix.clone();
+        coinbase.extend(7u32.to_le_bytes());
+        coinbase.extend(device);
+        coinbase.extend(&job.parts.suffix);
+        let outputs = super::super::jd::codec::serialize_outputs(&plan.outputs(312_500_000));
+        assert!(job.parts.suffix[4..].starts_with(&outputs));
+        let mut header = [0; 80];
+        header[..4].copy_from_slice(&template.version.to_le_bytes());
+        header[4..36].copy_from_slice(&template.previous_hash);
+        header[36..68].copy_from_slice(&double_sha256(&coinbase));
+        header[68..72].copy_from_slice(&template.current_time.to_le_bytes());
+        header[72..76].copy_from_slice(&template.bits.to_le_bytes());
+        let share = channel
+            .check(
+                Share {
+                    channel_id: 1,
+                    job_id: 5,
+                    sequence: 1,
+                    version: template.version,
+                    time: template.current_time,
+                    nonce: 0,
+                    extranonce: &device,
+                },
+                template.current_time,
+            )
+            .unwrap();
+        let forward = share.forward.unwrap();
+        assert_eq!(forward.serial, 11);
+        let mut rolled = 5u32.to_le_bytes().to_vec();
+        rolled.extend([0, 0]);
+        rolled.extend(7u32.to_le_bytes());
+        rolled.extend(device);
+        assert_eq!(forward.extranonce, rolled);
+        assert_eq!(share.coinbase.bytes, coinbase);
     }
 }

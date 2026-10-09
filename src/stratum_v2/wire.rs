@@ -7,13 +7,19 @@ use super::{
         share_work, Channel, ChannelKind, Share, TokenWin, ValidatedShare, DEVICE_EXTRANONCE_SIZE,
         VERSION_ROLLING_MASK,
     },
-    jd::{codec::parse_outputs, server::Declarator, CUSTOM_JOB_BIT, JD_ROLLABLE},
+    jd::{codec::parse_outputs, server::Declarator, ForwardShare, CUSTOM_JOB_BIT, JD_ROLLABLE},
     telemetry::ShareEvent,
     template::{meets_target, BchTemplate, CoinbaseParts, Hash},
 };
 use crate::config::MiningNetwork;
 use crate::donation::bch::BchPayout;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 use stratum_core::{
     binary_sv2::{self, GetSize, Serialize, Sv2Option},
     codec_sv2::{EncodableFrame, MessageFrame, SerializedFrame},
@@ -53,6 +59,9 @@ pub struct MiningSession {
     declarator: Option<Arc<Declarator>>,
     work_selection: bool,
     custom_jobs: u32,
+    /// #### PR #42: a Job Declaration client's local server: each channel
+    /// takes a lane from this server-wide counter as its extranonce prefix.
+    lanes: Option<Arc<AtomicU32>>,
 }
 
 pub struct Responses {
@@ -65,6 +74,8 @@ pub struct Responses {
     /// #### PR #42: a SetCustomMiningJob's outcome, its error code when
     /// refused.
     pub custom_job: Option<Result<(), &'static str>>,
+    /// #### PR #42: accepted shares on Job Declaration jobs, for the pool.
+    pub forward: Vec<ForwardShare>,
 }
 
 impl MiningSession {
@@ -98,7 +109,14 @@ impl MiningSession {
             declarator: None,
             work_selection: false,
             custom_jobs: 0,
+            lanes: None,
         })
+    }
+
+    /// #### PR #42: a Job Declaration client's local server, whose channels
+    /// take lanes from `lanes`.
+    pub fn set_lanes(&mut self, lanes: Option<Arc<AtomicU32>>) {
+        self.lanes = lanes;
     }
 
     /// #### PR #42: a public pool that accepts miners' own templates.
@@ -306,6 +324,7 @@ impl MiningSession {
                 token_wins,
                 share_event,
                 custom_job: None,
+                forward: Vec::new(),
             });
         }
         let flags = self
@@ -318,6 +337,7 @@ impl MiningSession {
             return Err("incorrect SV2 channel flag".into());
         }
         let mut custom_job = None;
+        let mut forward = Vec::new();
         match msg {
             Mining::OpenStandardMiningChannel(request) => {
                 let maximum = request
@@ -373,6 +393,7 @@ impl MiningSession {
                     &mut frames,
                     &mut blocks,
                     &mut token_wins,
+                    &mut forward,
                 )?);
             }
             Mining::SubmitSharesExtended(request) => {
@@ -392,6 +413,7 @@ impl MiningSession {
                     &mut frames,
                     &mut blocks,
                     &mut token_wins,
+                    &mut forward,
                 )?);
             }
             Mining::UpdateChannel(request) => {
@@ -473,6 +495,7 @@ impl MiningSession {
             token_wins,
             share_event,
             custom_job,
+            forward,
         })
     }
 
@@ -642,6 +665,9 @@ impl MiningSession {
         if let Some(public) = &self.public {
             channel.set_operator(Some(&public.address))?;
         }
+        if let Some(lanes) = &self.lanes {
+            channel.set_lane(lanes.fetch_add(1, Ordering::Relaxed));
+        }
         if custom_only {
             channel.custom_only = true;
             let (_, _, template) = self.current.as_ref().unwrap();
@@ -694,6 +720,7 @@ impl MiningSession {
         Ok(frames)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit(
         &mut self,
         share: Share<'_>,
@@ -702,6 +729,7 @@ impl MiningSession {
         frames: &mut Vec<SerializedFrame>,
         blocks: &mut Vec<ValidatedShare>,
         token_wins: &mut Vec<TokenWin>,
+        forward: &mut Vec<ForwardShare>,
     ) -> Result<ShareEvent, String> {
         let id = share.channel_id;
         let sequence = share.sequence;
@@ -747,6 +775,9 @@ impl MiningSession {
                     token_wins.push(win);
                 }
                 // #### end PR #42 ####
+                if let Some(share) = share.forward.clone() {
+                    forward.push(share);
+                }
                 if share.block {
                     blocks.push(share);
                 }

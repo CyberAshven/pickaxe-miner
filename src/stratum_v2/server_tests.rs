@@ -187,11 +187,13 @@ pub(super) struct Running {
     thread: Option<thread::JoinHandle<Result<(), String>>>,
     pub(super) stats: Arc<Mutex<ServerStats>>,
     pub(super) node: Arc<Mutex<Node>>,
-    address: SocketAddr,
+    pub(super) address: SocketAddr,
     pub(super) authority: [u8; 32],
     pub(super) state_directory: Arc<TestDirectory>,
     /// #### PR #42: the template listener, when it serves templates.
     pub(super) templates: Option<SocketAddr>,
+    /// #### PR #42: a Job Declaration client's uplink thread.
+    uplink: Option<thread::JoinHandle<()>>,
 }
 
 impl Running {
@@ -257,7 +259,26 @@ impl Running {
         public: Option<super::payout::PublicPool>,
         tokens: Option<Arc<super::merge::hub::TokenHub>>,
     ) -> Self {
-        Self::start_config(nodes, state_directory, public, tokens, None, false)
+        Self::start_config(nodes, state_directory, public, tokens, None, false, None)
+    }
+
+    /// #### PR #42: a Job Declaration client's local server on `node`,
+    /// declaring its templates to `pool`.
+    pub(super) fn jd_client(node: Arc<Mutex<Node>>, pool: &Running) -> Self {
+        Self::start_config(
+            vec![node],
+            Arc::new(TestDirectory::new()),
+            None,
+            None,
+            None,
+            false,
+            Some(super::jd::client::JdTarget {
+                address: pool.address.to_string(),
+                authority: pool.authority,
+                identity: payout(),
+                retry: Duration::from_millis(500),
+            }),
+        )
     }
 
     /// #### PR #42: a public pool that accepts miners' own templates.
@@ -269,19 +290,36 @@ impl Running {
             None,
             None,
             true,
+            None,
         )
     }
 
     /// #### PR #42: a server that serves templates on a second listener,
     /// with its relay journal in `state_directory`.
     pub(super) fn templates(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
-        Self::start_config(vec![node], state_directory, None, None, Some(true), false)
+        Self::start_config(
+            vec![node],
+            state_directory,
+            None,
+            None,
+            Some(true),
+            false,
+            None,
+        )
     }
 
     /// #### PR #42: a server whose relay journal is configured but which
     /// serves no templates.
     pub(super) fn relay_only(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
-        Self::start_config(vec![node], state_directory, None, None, Some(false), false)
+        Self::start_config(
+            vec![node],
+            state_directory,
+            None,
+            None,
+            Some(false),
+            false,
+            None,
+        )
     }
 
     /// #### PR #42: where a test server keeps its relay journal.
@@ -298,6 +336,7 @@ impl Running {
         tokens: Option<Arc<super::merge::hub::TokenHub>>,
         templates: Option<bool>,
         job_declaration: bool,
+        uplink: Option<super::jd::client::JdTarget>,
     ) -> Self {
         let node = nodes[0].clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -320,6 +359,7 @@ impl Running {
         });
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(ServerStats::default()));
+        let uplink = uplink.map(|target| super::jd::client::spawn(target, stop.clone()));
         let secret = [17; 32];
         let authority = server::authority_public(&secret).unwrap();
         let config = ServerConfig {
@@ -336,6 +376,7 @@ impl Running {
             tokens,
             relay_journal_path,
             declarator,
+            uplink: uplink.as_ref().map(|(handle, _)| handle.clone()),
         };
         let thread = {
             let stop = stop.clone();
@@ -363,6 +404,7 @@ impl Running {
             authority,
             state_directory,
             templates: template_address,
+            uplink: uplink.map(|(_, thread)| thread),
         };
         running.wait(|stats| stats.template_ready);
         running
@@ -391,6 +433,9 @@ impl Drop for Running {
             if !thread::panicking() {
                 assert!(matches!(result, Ok(Ok(()))));
             }
+        }
+        if let Some(uplink) = self.uplink.take() {
+            let _ = uplink.join();
         }
     }
 }
@@ -1940,4 +1985,132 @@ fn jd_is_refused_when_the_pool_does_not_accept_it() {
     let error: stratum_core::common_messages_sv2::SetupConnectionError =
         binary_sv2::from_bytes(reply.payload()).unwrap();
     assert_eq!(error.error_code.as_ref(), b"unsupported-protocol");
+}
+
+// #### PR #42
+// What: a Pickaxe Job Declaration client (a local server on the miner's node
+// and an uplink) mines at a Pickaxe pool that accepts Coinbase-only Job
+// Declaration, on loopback: an SV2 device mines the local server's job,
+// whose coinbase pays [miner 304,734,375, fee 3,078,125, donation
+// 4,687,500]; the share reaches the pool on the declared custom job and is
+// accepted there; the block goes to the miner's node only, and the pool
+// lists it as submitted by the miner's node.
+// Look here if: the uplink, the nested layout or the plan-gated publishing
+// change.
+#[test]
+fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
+    let pool = Running::jd_pool(super::payout::PublicPool {
+        fee: Some(crate::donation::bch::PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: crate::donation::bch::FeeMode::Work,
+        }),
+        address: address(0x34),
+    });
+    let miner_node = pool_node();
+    let client = Running::jd_client(miner_node.clone(), &pool);
+    client.wait(|stats| {
+        stats
+            .jd_client
+            .as_ref()
+            .is_some_and(|jd| jd.state == "active")
+    });
+    let mut device = Device::connect(&client, true);
+    assert_eq!(device.prefix.len(), 4, "the local channel's lane");
+    device.solve_and_submit(0);
+    client.wait(|stats| stats.blocks_accepted == 1);
+    let submitted = miner_node.lock().unwrap().submitted.clone();
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(pool.node.lock().unwrap().submissions, 0);
+    let block: Block = consensus::deserialize(&hex::decode(&submitted[0]).unwrap()).unwrap();
+    let outputs: Vec<(u64, Vec<u8>)> = block.txdata[0]
+        .output
+        .iter()
+        .map(|output| (output.value.to_sat(), output.script_pubkey.to_bytes()))
+        .collect();
+    let p2pkh = |hash: [u8; 20]| {
+        let mut script = vec![0x76, 0xa9, 0x14];
+        script.extend(hash);
+        script.extend([0x88, 0xac]);
+        script
+    };
+    let donation =
+        crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(MiningNetwork::Chipnet))
+            .unwrap();
+    assert_eq!(
+        outputs,
+        vec![
+            (304_734_375, p2pkh([0x12; 20])),
+            (
+                3_078_125,
+                crate::tx::cashaddr_to_coinbase_locking(&address(0x34)).unwrap()
+            ),
+            (4_687_500, donation),
+        ]
+    );
+    pool.wait(|stats| {
+        stats
+            .jd_server
+            .as_ref()
+            .is_some_and(|jd| jd.custom_jobs >= 1 && jd.blocks >= 1)
+            && stats.shares_accepted >= 1
+    });
+    client.wait(|stats| {
+        stats
+            .jd_client
+            .as_ref()
+            .is_some_and(|jd| jd.forwarded >= 1 && jd.accepted >= 1)
+    });
+    let found = pool
+        .stats
+        .lock()
+        .unwrap()
+        .recent_blocks
+        .back()
+        .cloned()
+        .unwrap();
+    assert_eq!(found.result, Some("submitted by the miner's node"));
+    let summary = format!("{:?}", client.stats.lock().unwrap().jd_client);
+    assert!(!summary.contains("bchtest"), "{summary}");
+    device.sender.close();
+}
+
+// #### PR #42
+// What: when the pool refuses Job Declaration (here it does not accept it),
+// the client's local server publishes no work and the uplink counts a
+// fallback with the pool's reason, so devices go to the pool's own jobs.
+// Look here if: the uplink's fallback or the plan gate changes.
+#[test]
+fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
+    let pool = Running::new(false);
+    let miner_node = pool_node();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (handle, thread) = super::jd::client::spawn(
+        super::jd::client::JdTarget {
+            address: pool.address.to_string(),
+            authority: pool.authority,
+            identity: payout(),
+            retry: Duration::from_millis(200),
+        },
+        stop.clone(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let summary = handle.status.summary.lock().unwrap().clone();
+        if summary.fallbacks >= 1 {
+            assert!(
+                summary
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("unsupported-protocol")),
+                "{summary:?}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "no fallback");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(handle.status.plan.read().unwrap().is_none());
+    stop.store(true, Ordering::Relaxed);
+    thread.join().unwrap();
+    drop(miner_node);
 }

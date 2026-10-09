@@ -2,6 +2,7 @@
 //! Validated BCH full templates. Preserve the node's complete CTOR transaction
 //! list and target; do not inherit Bitcoin witness or fixed block-size rules.
 
+use super::jd::plan::JdPlan;
 use super::merge::set::{AuxJob, AuxOutputs, TokenSet};
 use crate::config::MiningNetwork;
 use serde_json::Value;
@@ -33,6 +34,10 @@ pub struct BchTemplate {
     /// #### PR #42: a custom job's template (Job Declaration), which checks
     /// headers but has no transactions to build a block with.
     header_only: bool,
+    /// #### PR #42: the Job Declaration plan of a client's local server:
+    /// jobs built from this template pay the pool's outputs and nest their
+    /// extranonce inside the pool channel's.
+    jd: Option<Arc<JdPlan>>,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +169,7 @@ impl BchTemplate {
             transactions,
             tokens: None,
             header_only: false,
+            jd: None,
         })
     }
 
@@ -193,7 +199,27 @@ impl BchTemplate {
             merkle_path: merkle_path.into(),
             tokens: None,
             header_only: true,
+            jd: None,
         }
+    }
+
+    /// #### PR #42: builds this template's jobs for a pool through Job
+    /// Declaration: they pay `plan`'s outputs, nest their extranonce inside
+    /// the pool channel's, and carry no merge-mined tokens yet.
+    pub fn declare(&mut self, plan: Arc<JdPlan>) {
+        self.jd = Some(plan);
+    }
+
+    pub fn jd_plan(&self) -> Option<&Arc<JdPlan>> {
+        self.jd.as_ref()
+    }
+
+    /// #### PR #42: the coinbase script's head: the BIP34 height push, the
+    /// node's flags and the pool's name; a custom job's `coinbase_prefix`.
+    pub fn script_head(&self) -> Vec<u8> {
+        let mut head = height_script(self.height);
+        head.extend_from_slice(&self.coinbase_flags);
+        head
     }
 
     /// #### PR #42: a custom job's template, without transactions.
@@ -239,7 +265,7 @@ impl BchTemplate {
         operator: Option<&str>,
         policy: crate::donation::bch::BchPayout,
     ) -> Result<Option<AuxJob>, String> {
-        let Some(set) = &self.tokens else {
+        let Some(set) = self.tokens.as_ref().filter(|_| self.jd.is_none()) else {
             return Ok(None);
         };
         let scripts = super::payout::scripts(network, payout, operator)?;
@@ -287,8 +313,14 @@ impl BchTemplate {
         policy: crate::donation::bch::BchPayout,
         aux: Option<&AuxOutputs>,
     ) -> Result<Coinbase, String> {
-        let scripts = super::payout::scripts(network, payout, operator)?;
-        let outputs = super::payout::outputs(self.coinbase_value, &scripts, policy);
+        // #### PR #42: Job Declaration jobs pay the pool's outputs.
+        let outputs = match &self.jd {
+            Some(plan) => plan.outputs(self.coinbase_value),
+            None => {
+                let scripts = super::payout::scripts(network, payout, operator)?;
+                super::payout::outputs(self.coinbase_value, &scripts, policy)
+            }
+        };
         if extranonce.len() > 64 {
             return Err("extranonce exceeds coinbase budget".into());
         }

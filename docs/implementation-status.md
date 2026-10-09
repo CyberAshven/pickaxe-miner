@@ -1730,3 +1730,30 @@ custom-job shares and blocks; and a loopback test where a scripted client
 allocates a token, sets a custom job paying 304,734,375 / 3,078,125 /
 4,687,500 and mines it through the real server. Not yet run against another
 implementation's client.
+
+## Job Declaration client, Coinbase-only (2026-10-09)
+
+#### PR #42
+
+`serve --upstream stratum2+tcp://POOL:3336/KEY --job-declaration coinbase`
+runs the miner's node and a local server, as solo mining does, and an uplink
+to the first pool: a Job Declaration session and one work-selection channel,
+both pinned to the pool's key, with two tokens in hand. While the uplink holds
+a plan (the pool channel's prefix, the pool's outputs and rates from its PX v1
+token, its target), the local server publishes jobs that pay the pool's
+outputs and nest their extranonce inside the pool channel's (job id, pad,
+lane, device), and hands each template to the uplink, which declares it with
+SetCustomMiningJob. Accepted local shares meeting the pool's target are
+forwarded with try_send, held (256 per job) until the pool confirms the job.
+Blocks go to the JD journal and the miner's node. When the pool refuses a job
+other than for a tip race, or the link fails, the plan goes, the local server
+offers no work and the SV1 adapter moves devices to the pools' own jobs; the
+uplink retries after 30 seconds. Non-Pickaxe pools (opaque tokens) are refused.
+
+Evidence: host tests for the plan's outputs against the pool's rule, the
+nested layout and forwarded bytes, the JD journal, and two loopback tests: a
+Pickaxe client mining at a Pickaxe pool (an SV2 device's block pays 304,734,375
+/ 3,078,125 / 4,687,500, reaches the miner's node only, the pool accepts the
+forwarded share on the custom job and lists the block as submitted by the
+miner's node), and a client falling back with the pool's reason at a pool
+without Job Declaration. Not yet run in two processes on Chipnet.

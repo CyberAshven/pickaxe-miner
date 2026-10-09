@@ -1824,6 +1824,7 @@ fn main() {
                                     .filter(|_| !joining)
                                     .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port))),
                                 accept_job_declaration: None,
+                                job_declaration: None,
                             };
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(

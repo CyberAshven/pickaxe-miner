@@ -666,3 +666,28 @@ fn relay_journal_is_owner_only_and_never_mixes_with_the_block_journal() {
         assert_eq!(mode & 0o777, 0o600);
     }
 }
+
+// #### PR #42
+// What: the JD journal keeps a Job Declaration client's block, which pays
+// the pool's outputs rather than this server's payout, across a reopen; it
+// never opens as the block or relay journal, or they as it.
+// Look here if: open_declared or the Declared binding changes.
+#[test]
+fn declared_blocks_enqueue_and_reopen_and_never_mix_with_other_journals() {
+    let dir = TestDirectory::new();
+    let path = dir.0.join("jd-blocks.json");
+    let pool =
+        crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x56; 20], MiningNetwork::Chipnet).unwrap();
+    let share = solved_share_for(6, Default::default(), &pool, None);
+    let mut declared = Journal::open_declared(&path, MiningNetwork::Chipnet).unwrap();
+    assert!(declared.enqueue(&share).unwrap());
+    assert!(!declared.enqueue(&share).unwrap());
+    drop(declared);
+    let declared = Journal::open_declared(&path, MiningNetwork::Chipnet).unwrap();
+    assert_eq!(declared.counts(), (1, 0, 0));
+    drop(declared);
+    assert!(Journal::open_relay(&path, MiningNetwork::Chipnet).is_err());
+    assert!(Journal::open(&path, MiningNetwork::Chipnet, &payout(), &[]).is_err());
+    drop(open(&dir));
+    assert!(Journal::open_declared(&dir.journal(), MiningNetwork::Chipnet).is_err());
+}

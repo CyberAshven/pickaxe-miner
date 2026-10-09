@@ -4,10 +4,10 @@
 
 SV2 Job Declaration lets a miner choose the transactions in the blocks they
 mine while still mining at a pool: the miner's own node builds the template,
-and the pool checks that the coinbase still pays what the pool requires. This
-page describes Pickaxe's pool side, which ships first in **Coinbase-only**
-mode. The client side (Join a pool with your own templates) and Full-Template
-mode follow.
+and the pool checks that the coinbase still pays what the pool requires.
+Pickaxe has both sides in **Coinbase-only** mode: a public pool that accepts
+miners' own templates, and Join a pool with your node's templates.
+Full-Template mode follows.
 
 No other BCH pool offers Job Declaration today. SRI's and ckpool's Job
 Declaration servers validate through Bitcoin Core's IPC, which BCH nodes do
@@ -127,11 +127,49 @@ Pickaxe can follow the rule above only when it knows the rates, so its custom
 jobs pass when the pool's fee and donation are both 0, or when it reads them
 from the token.
 
+## Mining at a pool with your node's templates
+
+The client side runs your node and a local server, as solo mining does, and
+declares each template to the first pool:
+
+```text
+pickaxe_miner stratum-v2 serve --config miner.json --sv1-listen 0.0.0.0:3333 \
+  --upstream stratum2+tcp://POOL:3336/KEY --job-declaration coinbase
+```
+
+- The pool must be a Pickaxe pool that accepts Job Declaration: other pools'
+  tokens are opaque, so their fee and donation cannot be known.
+- The identity at the pool is your payout address (the pool pays your blocks
+  there); `--upstream-user` must be that address too.
+- An uplink keeps a Job Declaration session and one work-selection channel at
+  the pool, both pinned to the pool's key, and two tokens in hand. While it is
+  active, the local server builds its jobs for the pool: the coinbase pays the
+  pool's outputs (you, the pool's fee and the donation, as its tokens say) and
+  its script carries the pool channel's prefix, then the job id, the lane of
+  the device's channel and the device's 8 bytes, which are the 16 bytes the
+  pool lets you roll. Each template is declared with `SetCustomMiningJob`.
+- Devices connect to the SV1 listener as usual; the SV1 adapter tries the
+  local server first, then the pools' own jobs. Accepted shares that meet the
+  pool's target go to the pool on the declared job; until the pool confirms a
+  job, up to 256 wait. The local server never waits on the pool.
+- Blocks: your node builds and submits them, after they are saved in
+  `<config>.sv2-jd-blocks.json` (owner-only, apart from the solo block journal).
+- When the pool refuses a custom job (other than for a tip race), the link
+  fails or the pool's fee or donation changes, the local server stops offering
+  work and devices move to the pool's own jobs; the uplink tries again after 30
+  seconds. Devices come back once they reconnect.
+- The overview shows a line such as "Job Declaration at pool.example:3336:
+  active · 12 custom jobs · 0 refused · 340 shares sent (338 accepted, 2
+  rejected) · 0 fallbacks", and the status file's `jd_client` the same counts.
+- The donation is paid in the coinbase, as the pool's rule requires, so there
+  is no donation work under Job Declaration.
+
 ## Not yet
 
 - Full-Template mode (`DeclareMiningJob`, missing transactions, BCHN's
   `validateblocktemplate`, `PushSolution`), so the pool can propagate blocks
   and SRI-style clients can connect.
-- The client side: Join a pool with your node's templates, falling back to the
-  pool's jobs when the pool refuses them.
-- Setup rows and the dashboard's Job Declaration page.
+- Merge-mined tokens under Job Declaration: the commitment and tickets in the
+  declared coinbase.
+- Devices returning to Job Declaration without reconnecting, backup Job
+  Declaration servers, and the setup rows.

@@ -70,6 +70,9 @@ pub enum JournalBinding {
     /// Blocks relayed for a Template Distribution client (a pool): they pay
     /// the client's coinbase, which this server neither builds nor knows.
     Relay,
+    /// #### PR #42: a Job Declaration client's blocks: they pay the pool's
+    /// outputs (the miner, the pool's fee and the donation).
+    Declared,
 }
 
 /// #### PR #40
@@ -142,6 +145,22 @@ impl Journal {
         context.extend(network.as_str().as_bytes());
         let context = hex::encode(double_sha256(&context));
         Self::open_bound(path, network, JournalBinding::Relay, context, &[])
+    }
+
+    /// #### PR #42: the JD journal
+    /// What: `<config>.sv2-jd-blocks.json`, owner-only, holds a Job
+    /// Declaration client's own blocks until its node answers. They pay the
+    /// pool's outputs, so the journal checks size, merkle root, proof of work
+    /// and no witness, never this server's payout; it opens apart from the
+    /// solo block journal, which older binaries read.
+    /// Why: the PR #38 rule: a found block is saved before anything else, and
+    /// Coinbase-only blocks reach the chain only through the miner's node.
+    /// Look here if: a Job Declaration block is missing on chain.
+    pub fn open_declared(path: &Path, network: MiningNetwork) -> Result<Self, String> {
+        let mut context = b"pickaxe declared journal: ".to_vec();
+        context.extend(network.as_str().as_bytes());
+        let context = hex::encode(double_sha256(&context));
+        Self::open_bound(path, network, JournalBinding::Declared, context, &[])
     }
 
     fn open_bound(
@@ -240,10 +259,23 @@ impl Journal {
         if !share.block {
             return Err("cannot journal a non-block share".into());
         }
-        let JournalBinding::Payout { payout, scripts } = &self.binding else {
-            return Err("the relay journal takes relayed blocks only".into());
-        };
         let bytes = share.template.block(&share.coinbase, share.header)?;
+        let (payout, scripts) = match &self.binding {
+            JournalBinding::Payout { payout, scripts } => (payout, scripts),
+            JournalBinding::Declared => {
+                let hash = validate_block(&bytes, None)?;
+                return self.push(PendingBlock {
+                    hash,
+                    block: hex::encode(bytes),
+                    payout: None,
+                    miner: None,
+                    operator: None,
+                });
+            }
+            JournalBinding::Relay => {
+                return Err("the relay journal takes relayed blocks only".into())
+            }
+        };
         let miner = (&share.miner != payout).then(|| share.miner.clone());
         let scripts = block_scripts(
             self.network,
@@ -436,8 +468,8 @@ fn validate_state(
                 )?;
                 validate_block(&bytes, Some((scripts.as_slice(), pending.payout)))?
             }
-            // #### PR #42: a relayed block names no payout.
-            JournalBinding::Relay => {
+            // #### PR #42: a relayed or declared block names no payout.
+            JournalBinding::Relay | JournalBinding::Declared => {
                 if pending.payout.is_some() || pending.miner.is_some() || pending.operator.is_some()
                 {
                     return Err("invalid relayed journal block".into());

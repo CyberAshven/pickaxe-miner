@@ -63,7 +63,7 @@ fn live_chipnet_node_validates_standard_and_extended_block_proposals() {
             job.standard_coinbase.clone()
         } else {
             let mut bytes = job.parts.prefix.clone();
-            bytes.extend(channel.extranonce_prefix);
+            bytes.extend(&channel.extranonce_prefix);
             bytes.extend([0x59; 8]);
             bytes.extend(&job.parts.suffix);
             let mut root = double_sha256(&bytes);

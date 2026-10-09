@@ -6,11 +6,14 @@
 //! pays the miner, the pool's fee and the Pickaxe donation. See
 //! docs/job-declaration.md.
 
+pub mod client;
 pub mod codec;
+pub mod plan;
 pub mod policy;
 pub mod server;
 pub mod token;
 
+use super::template::Hash;
 use std::time::Duration;
 
 /// Rollable extranonce bytes a work-selection channel gets.
@@ -24,6 +27,20 @@ pub const MAX_TOKENS: usize = 1_024;
 pub const ALLOCATIONS_PER_MINUTE: usize = 20;
 /// Custom job ids carry this bit, so they never meet the pool's own.
 pub const CUSTOM_JOB_BIT: u32 = 0x8000_0000;
+
+/// An accepted share on a Job Declaration job, on its way to the pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardShare {
+    /// The local server's template generation the job was built from.
+    pub serial: u64,
+    pub version: u32,
+    pub ntime: u32,
+    pub nonce: u32,
+    /// The bytes the pool lets the client roll: the job id, the pad, the
+    /// lane and the device's 8.
+    pub extranonce: Vec<u8>,
+    pub hash: Hash,
+}
 
 /// The Job Declaration modes a pool accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

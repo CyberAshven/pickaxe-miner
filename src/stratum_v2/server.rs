@@ -4,7 +4,10 @@
 
 use super::{
     channel::TokenWin,
-    jd::server::{Declarator, DeclaratorSession},
+    jd::{
+        client::{JdClientSummary, UplinkEvent, UplinkHandle},
+        server::{Declarator, DeclaratorSession},
+    },
     journal::{Journal, PendingBlock},
     merge::hub::TokenHub,
     provider::{NodeRpc, SubmissionOutcome, TemplateProvider},
@@ -23,7 +26,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, SyncSender},
         Arc, Mutex, RwLock,
     },
@@ -60,6 +63,9 @@ pub struct ServerConfig {
     /// #### PR #42: a public pool's Job Declaration rules, when it accepts
     /// miners' own templates.
     pub declarator: Option<Arc<Declarator>>,
+    /// #### PR #42: a Job Declaration client's uplink, when this server is
+    /// the local server that mines its own templates at a pool.
+    pub uplink: Option<UplinkHandle>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -105,6 +111,8 @@ pub struct ServerStats {
     /// #### PR #42: the Job Declaration server's counts, when the pool
     /// accepts miners' own templates.
     pub jd_server: Option<JdServerStats>,
+    /// #### PR #42: the Job Declaration client's state and counts.
+    pub jd_client: Option<JdClientSummary>,
 }
 
 /// #### PR #42: what the Job Declaration server did. No count names a
@@ -199,6 +207,8 @@ pub(super) struct Shared {
     /// #### PR #42: what Template Distribution sessions share with the node
     /// worker, when templates are served or relayed blocks wait.
     pub(super) relay: Option<Relay>,
+    /// #### PR #42: the lanes a Job Declaration client's local channels take.
+    lanes: Arc<AtomicU32>,
 }
 
 impl Shared {
@@ -381,12 +391,17 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
     listener
         .set_nonblocking(true)
         .map_err(|_| "cannot configure mining listener")?;
-    let journal = Journal::open(
-        &config.journal_path,
-        config.network,
-        &config.payout,
-        &config.legacy_sources,
-    )?;
+    // #### PR #42: a Job Declaration client's blocks pay the pool's outputs.
+    let journal = if config.uplink.is_some() {
+        Journal::open_declared(&config.journal_path, config.network)?
+    } else {
+        Journal::open(
+            &config.journal_path,
+            config.network,
+            &config.payout,
+            &config.legacy_sources,
+        )?
+    };
     // #### PR #42: the relay journal opens with the template listener, and
     // also without it while its file exists, so blocks a pool found before a
     // restart without --tp-listen still reach the node.
@@ -472,6 +487,7 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
         solved: Mutex::new(SolvedParents::default()),
         claims,
         relay,
+        lanes: Arc::new(AtomicU32::new(0)),
     });
     update_journal_stats(&shared)?;
     update_relay_stats(&shared)?;
@@ -479,7 +495,10 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
     let network = config.network;
     let tag = config.pool_tag.clone();
     let node_tokens = config.tokens.clone();
+    let node_uplink = config.uplink.clone();
     let node = thread::spawn(move || -> Result<(), String> {
+        // #### PR #42: the plan serial jobs were last published with.
+        let mut published_plan: Option<u64> = None;
         let mut provider = TemplateProvider::new(rpc, network);
         let mut active = 0;
         let mut refreshed = Instant::now() - Duration::from_secs(60);
@@ -565,18 +584,25 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
             // revoke all work.
             // Look here if: jobs do not change after a token win, or a token
             // win revokes work.
-            if node_tokens.as_ref().is_some_and(|hub| hub.take_changed()) {
+            // #### PR #42: a Job Declaration plan that came or went re-offers
+            // the current template (see `offer`).
+            let plan_changed = node_uplink.as_ref().is_some_and(|uplink| {
+                if let Ok(mut stats) = node_shared.stats.lock() {
+                    stats.jd_client = uplink.status.summary.lock().ok().map(|s| s.clone());
+                }
+                current_plan(uplink).map(|plan| plan.serial) != published_plan
+            });
+            if node_tokens.as_ref().is_some_and(|hub| hub.take_changed()) || plan_changed {
                 if let Some((generation, template)) = provider.current() {
                     let (template, serial) =
                         with_tokens(template.clone(), &tag, node_tokens.as_deref());
-                    publish(
+                    offer(
                         &node_shared,
-                        Some(PublishedJob {
-                            generation,
-                            serial,
-                            template: Arc::new(template),
-                            valid_until: Instant::now() + Duration::from_secs(30),
-                        }),
+                        node_uplink.as_ref(),
+                        &mut published_plan,
+                        generation,
+                        serial,
+                        template,
                     );
                 }
             }
@@ -586,14 +612,13 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
                     Ok((generation, template)) => {
                         let (template, serial) =
                             with_tokens(template.clone(), &tag, node_tokens.as_deref());
-                        publish(
+                        offer(
                             &node_shared,
-                            Some(PublishedJob {
-                                generation,
-                                serial,
-                                template: Arc::new(template),
-                                valid_until: Instant::now() + Duration::from_secs(30),
-                            }),
+                            node_uplink.as_ref(),
+                            &mut published_plan,
+                            generation,
+                            serial,
+                            template,
                         );
                         refreshed = Instant::now();
                     }
@@ -896,6 +921,68 @@ fn device_ended(shared: &Shared, id: u64, error: Option<&str>) {
     }
 }
 
+/// #### PR #42: the Job Declaration plan the uplink holds now.
+fn current_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
+    uplink.status.plan.read().ok().and_then(|plan| plan.clone())
+}
+
+// #### PR #42: the JD plan gates local jobs
+// What: a Job Declaration client's local server publishes a template only
+// while the uplink holds a plan: the template carries the plan (the pool's
+// outputs, the nested extranonce) and goes to the uplink to declare. Without
+// a plan nothing is published, so devices fall back to the pool's own jobs
+// through the SV1 adapter. A plan change gives new jobs on the same
+// template (its serial joins the token set's).
+// Why: a custom job the pool has not accepted earns the miner nothing.
+// Look here if: devices get no work while Job Declaration is active, or keep
+// mining local jobs after a fallback.
+/// Publishes a refreshed template, or under Job Declaration offers it.
+fn offer(
+    shared: &Shared,
+    uplink: Option<&UplinkHandle>,
+    published_plan: &mut Option<u64>,
+    generation: u64,
+    serial: u64,
+    mut template: BchTemplate,
+) {
+    let valid_until = Instant::now() + Duration::from_secs(30);
+    let Some(uplink) = uplink else {
+        publish(
+            shared,
+            Some(PublishedJob {
+                generation,
+                serial,
+                template: Arc::new(template),
+                valid_until,
+            }),
+        );
+        return;
+    };
+    let plan = current_plan(uplink);
+    *published_plan = plan.as_ref().map(|plan| plan.serial);
+    let Some(plan) = plan else {
+        publish(shared, None);
+        return;
+    };
+    let plan_serial = plan.serial;
+    template.declare(plan);
+    let template = Arc::new(template);
+    let _ = uplink.events.try_send(UplinkEvent::Published {
+        serial: generation,
+        template: template.clone(),
+    });
+    publish(
+        shared,
+        Some(PublishedJob {
+            generation,
+            serial: (plan_serial << 32) | (serial & 0xffff_ffff),
+            template,
+            valid_until,
+        }),
+    );
+}
+// #### end PR #42 ####
+
 fn publish(shared: &Shared, job: Option<PublishedJob>) {
     let ready = job.is_some();
     let height = job.as_ref().map(|job| job.template.height);
@@ -1102,6 +1189,7 @@ fn serve_device(
         )?;
         mining.set_public(config.public.clone());
         mining.set_declarator(config.declarator.clone());
+        mining.set_lanes(config.uplink.as_ref().map(|_| shared.lanes.clone()));
         let fee = config.public.as_ref().and_then(|public| public.fee);
         let phase = rand::random();
         #[cfg(test)]
@@ -1117,12 +1205,17 @@ fn serve_device(
                     .map(|job| job.clone())
                     .map_err(|_| "template state unavailable")
             };
+            // #### PR #42: under Job Declaration the custom job's coinbase
+            // pays the donation, so no local job is donation work.
             let donation = || {
+                if config.uplink.is_some() {
+                    return BchDonation::try_from(0);
+                }
                 config
                     .donation
                     .read()
                     .map(|value| *value)
-                    .map_err(|_| "donation setting unavailable")
+                    .map_err(|_| "donation setting unavailable".to_owned())
             };
             for frame in availability.update(
                 &mut mining,
@@ -1169,6 +1262,13 @@ fn serve_device(
                     .as_secs();
                 let now = u32::try_from(now).map_err(|_| "system time exceeds header range")?;
                 let responses = mining.receive(frame, now)?;
+                // #### PR #42: shares for the pool, handed over without
+                // waiting (see `jd::client::forward`).
+                if let Some(uplink) = config.uplink.as_ref() {
+                    for share in &responses.forward {
+                        let _ = uplink.events.try_send(UplinkEvent::Share(share.clone()));
+                    }
+                }
                 // #### PR #42: a custom job's outcome on the dashboard.
                 if let Some(outcome) = responses.custom_job {
                     shared.jd_stats(|stats| match outcome {

@@ -247,7 +247,23 @@ pub enum StratumV2Command {
         /// fee and the Pickaxe donation in full. Off by default.
         #[arg(long, value_name = "MODE", requires = "public")]
         accept_job_declaration: Option<AcceptJobDeclaration>,
+        /// #### PR #42
+        /// Mine at the first --upstream pool with your own node's templates
+        /// (SV2 Job Declaration): `coinbase` declares each template to a
+        /// Pickaxe pool that accepts Job Declaration, and your node builds
+        /// and submits the blocks. While the pool refuses them, devices mine
+        /// the pool's own jobs. Needs your node, like solo mining.
+        #[arg(long, value_name = "MODE", requires = "upstream")]
+        job_declaration: Option<JobDeclarationMode>,
     },
+}
+
+/// #### PR #42: how a miner declares its templates to a pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum JobDeclarationMode {
+    /// Coinbase-only: custom jobs from tokens; the pool never sees the
+    /// transactions, and this node submits the blocks.
+    Coinbase,
 }
 
 /// #### PR #42: the Job Declaration modes a public pool accepts.
@@ -611,6 +627,29 @@ mod tests {
             panic!("serve options missing")
         };
         assert_eq!(accept_job_declaration, Some(AcceptJobDeclaration::Coinbase));
+        assert!(
+            Cli::try_parse_from([
+                "pickaxe",
+                "stratum-v2",
+                "serve",
+                "--job-declaration",
+                "coinbase",
+            ])
+            .is_err(),
+            "declaring templates needs a pool"
+        );
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--upstream",
+            "stratum2+tcp://pool.example:3336/KEY",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--job-declaration",
+            "coinbase",
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from([
             "pickaxe",
             "stratum-v2",

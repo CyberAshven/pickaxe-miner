@@ -96,11 +96,26 @@ pub fn run(
         }),
         _ => None,
     };
-    if matches!(action, StratumV2Command::Serve { .. }) && pools.is_empty() {
+    // #### PR #42: Join a pool with JD runs a node and a local server
+    // What: with --job-declaration the miner's own node and a local server
+    // run as in solo mining; the local server's jobs pay the pool's outputs
+    // and are declared to the first pool, and the SV1 adapter tries the local
+    // server first, then the pools' own jobs.
+    // Why: the miner chooses the transactions while the pool still pays.
+    // Look here if: Join a pool with Job Declaration starts without a node,
+    // or devices never reach the local server.
+    let declaring = matches!(
+        &action,
+        StratumV2Command::Serve {
+            job_declaration: Some(_),
+            ..
+        }
+    );
+    if matches!(action, StratumV2Command::Serve { .. }) && (pools.is_empty() || declaring) {
         config::validate_payout_address(config.network, &config.payout_address)
             .map_err(|_| "a valid payout for the selected network is required")?;
     }
-    let node = if pools.is_empty() {
+    let node = if pools.is_empty() || declaring {
         Some(preflight(config)?)
     } else {
         None
@@ -243,7 +258,7 @@ pub fn run(
     // remains pinned.
     let public_pool = public.clone();
     let upstreams = match (bound, public_key) {
-        _ if !pools.is_empty() => pools.clone(),
+        _ if !pools.is_empty() && !declaring => pools.clone(),
         (Some(mut local), Some(public)) => {
             if local.ip().is_unspecified() {
                 local.set_ip(if local.is_ipv4() {
@@ -254,11 +269,16 @@ pub fn run(
             }
             // #### PR #40: a public pool's devices open their channel
             // under their own username.
-            vec![if public_pool.is_some() {
+            let mut list = vec![if public_pool.is_some() {
                 super::sv1::Upstream::local_public(local, public)
             } else {
                 super::sv1::Upstream::local(local, public)
-            }]
+            }];
+            // #### PR #42: under Job Declaration the pools' own jobs follow.
+            if declaring {
+                list.extend(pools.iter().cloned());
+            }
+            list
         }
         _ => return Err("mining server unavailable".into()),
     };
@@ -301,6 +321,19 @@ pub fn run(
         Some(TerminalSession::enter()?)
     };
     let stats = Arc::new(Mutex::new(ServerStats::default()));
+    // #### PR #42: the Job Declaration uplink to the first pool.
+    let uplink = pools.first().filter(|_| declaring).map(|pool| {
+        super::jd::client::spawn(
+            super::jd::client::JdTarget {
+                address: pool.address.clone(),
+                authority: pool.authority,
+                identity: pool.identity.clone(),
+                retry: Duration::from_secs(30),
+            },
+            stop.clone(),
+        )
+    });
+    let uplink_handle = uplink.as_ref().map(|(handle, _)| handle.clone());
     let worker = match (node, listener, authority_secret) {
         (Some((nodes, _)), Some(listener), Some(authority_secret)) => {
             // Difficulty 4096 is each device's starting target; vardiff then
@@ -311,7 +344,11 @@ pub fn run(
                 payout: config.payout_address.clone(),
                 authority_secret,
                 share_target,
-                journal_path: config_path.with_extension("sv2-blocks.json"),
+                journal_path: config_path.with_extension(if declaring {
+                    "sv2-jd-blocks.json"
+                } else {
+                    "sv2-blocks.json"
+                }),
                 pool_tag: pool_tag.clone(),
                 legacy_sources: nodes
                     .iter()
@@ -322,6 +359,7 @@ pub fn run(
                 tokens: tokens.clone(),
                 relay_journal_path: Some(config_path.with_extension("sv2-relay-blocks.json")),
                 declarator: declarator.clone(),
+                uplink: uplink_handle.clone(),
                 #[cfg(test)]
                 allocation_phase: None,
             };
@@ -477,7 +515,8 @@ pub fn run(
                 }
             }
             if let Some(terminal) = terminal.as_mut() {
-                let overview_text = if let Some(pool) = &pool_address {
+                let overview_text = if let Some(pool) = pool_address.as_ref().filter(|_| !declaring)
+                {
                     format!(
                         "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nThe pool builds the blocks; the donation is that share of mining time under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
                         config.network.as_str(),
@@ -491,7 +530,7 @@ pub fn run(
                     )
                 } else {
                     format!(
-                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}\n{}{}{}",
+                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
@@ -504,6 +543,7 @@ pub fn run(
                     records_line(&snapshot),
                     templates_line(&snapshot),
                     jd_line(&snapshot),
+                    jd_client_line(&snapshot, pool_address.as_deref()),
                     )
                 };
                 let online = devices.iter().filter(|device| device.connected).count();
@@ -512,7 +552,7 @@ pub fn run(
                     .filter(|device| device.connected)
                     .filter_map(|device| device.hashrate_estimate)
                     .sum();
-                let header = if let Some(pool) = &pool_address {
+                let header = if let Some(pool) = pool_address.as_ref().filter(|_| !declaring) {
                     format!(
                         "{} · Pool {pool} (SV2, encrypted) · the pool builds blocks and pays\n{online} of {} workers online · {} · Shares {} accepted / {} rejected\n{devices_hint}",
                         config.network.as_str(),
@@ -736,6 +776,9 @@ pub fn run(
     })();
     stop.store(true, Ordering::Relaxed);
     let _ = reports.join();
+    if let Some((_, uplink)) = uplink {
+        let _ = uplink.join();
+    }
     let firmware_result = firmware
         .map(|worker| {
             worker
@@ -1603,6 +1646,17 @@ fn status_json(
                 "seconds_ago": win.found.elapsed().as_secs(),
             })).collect::<Vec<_>>(),
         }),
+        // #### PR #42: the Job Declaration client's state and counts.
+        "jd_client": snapshot.jd_client.as_ref().map(|jd| serde_json::json!({
+            "state": jd.state,
+            "custom_jobs": jd.custom_jobs,
+            "refused": jd.refused,
+            "forwarded": jd.forwarded,
+            "accepted": jd.accepted,
+            "rejected": jd.rejected,
+            "fallbacks": jd.fallbacks,
+            "last_error": jd.last_error,
+        })),
         // #### PR #42: the Job Declaration server's counts, with no identity,
         // token or address.
         "jd_server": snapshot.jd_server.as_ref().map(|jd| serde_json::json!({
@@ -2037,6 +2091,32 @@ fn difficulty_target(difficulty: u64) -> Result<super::template::Hash, String> {
 /// #### PR #40
 /// The overview's records: the best share since start and the latest blocks
 /// found, newest first, as "#327035 rig1 accepted 2m ago".
+/// #### PR #42: the Job Declaration client's line on the overview, when this
+/// server declares its templates to a pool.
+fn jd_client_line(stats: &ServerStats, pool: Option<&str>) -> String {
+    let Some(jd) = &stats.jd_client else {
+        return String::new();
+    };
+    let pool = pool
+        .and_then(|pools| pools.split(" → ").next())
+        .unwrap_or("the pool");
+    format!(
+        "\nJob Declaration at {pool}: {} · {} custom jobs · {} refused · {} shares sent ({} \
+         accepted, {} rejected) · {} fallbacks{}",
+        jd.state,
+        jd.custom_jobs,
+        jd.refused,
+        jd.forwarded,
+        jd.accepted,
+        jd.rejected,
+        jd.fallbacks,
+        jd.last_error
+            .as_deref()
+            .map(|error| format!(" (last: {error})"))
+            .unwrap_or_default(),
+    )
+}
+
 /// #### PR #42: the Job Declaration server's line on the overview, when the
 /// pool accepts miners' own templates.
 fn jd_line(stats: &ServerStats) -> String {
