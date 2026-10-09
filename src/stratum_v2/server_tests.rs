@@ -656,6 +656,32 @@ fn upstream_reference_device_authenticates_and_mines_successor_blocks() {
     drop(valid);
 }
 
+// #### PR #40
+#[test]
+fn the_dashboard_records_the_best_share_and_each_block_found() {
+    let server = Running::new(false);
+    let mut device = Device::connect(&server, false);
+    device.solve_and_submit(0);
+    server.wait(|stats| stats.blocks_accepted == 1);
+    server.wait(|stats| {
+        stats
+            .recent_blocks
+            .back()
+            .is_some_and(|found| found.result == Some("accepted"))
+    });
+    let stats = server.stats.lock().unwrap().clone();
+    assert_eq!(stats.recent_blocks.len(), 1);
+    let found = &stats.recent_blocks[0];
+    assert_eq!(found.height, 325909);
+    assert_eq!(found.hash.len(), 64);
+    let (best, worker) = stats.best_share.clone().expect("a best share");
+    assert!(best > 0.0);
+    assert_eq!(worker, found.worker);
+    let devices = stats.device_stats.snapshots(Instant::now());
+    assert_eq!(devices[0].best_share, Some(best));
+    device.sender.close();
+}
+
 #[test]
 fn share_acknowledgement_does_not_claim_node_block_acceptance() {
     let server = Running::new(true);

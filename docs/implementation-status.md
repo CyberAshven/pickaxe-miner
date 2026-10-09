@@ -1086,3 +1086,18 @@ Nothing is written by default.
 Evidence: host tests cover the name in the coinbase with the coinbase parts
 still fitting around the extranonce, a name too long for the 100-byte script
 refused, the flag, and the setup row.
+
+## Best share, recent blocks and the starting difficulty (2026-10-09)
+
+#### PR #40
+
+The server records each share's hash difficulty: the workers' best shares
+(in the JSON status per device) and the server's best since start with its
+worker; the overview (Tab) and the status list the last blocks found (height,
+hash, worker, age, and the node's answer once it has one), as ASICseer's
+dashboard does. `--start-difficulty N` sets the share difficulty devices
+start at (default 4096, the compact target 0x1b0ffff0).
+
+Evidence: host tests cover a found block and the best share recorded through
+the server, the overview line, and the difficulty-to-target conversion
+(difficulty 1 and 4096 match their compact targets).

@@ -116,6 +116,8 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
+// #### PR #40: parsed once at start, so the server options' size is no cost.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     Mine,
@@ -147,6 +149,7 @@ pub enum ConfigCommand {
     Save,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum StratumV2Command {
     /// Print implementation and validation status.
@@ -209,6 +212,11 @@ pub enum StratumV2Command {
         /// Not with --upstream: the pool there builds the blocks.
         #[arg(long, value_name = "TEXT", conflicts_with = "upstream")]
         pool_tag: Option<String>,
+        /// #### PR #40
+        /// The share difficulty every device starts at (default 4096), for
+        /// farms of fast ASICs; vardiff moves each device from there.
+        #[arg(long, value_name = "DIFFICULTY", conflicts_with = "upstream")]
+        start_difficulty: Option<u64>,
     },
 }
 

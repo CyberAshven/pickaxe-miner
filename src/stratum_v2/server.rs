@@ -75,7 +75,26 @@ pub struct ServerStats {
     pub active_node: usize,
     pub nodes: usize,
     pub node_switches: u64,
+    /// #### PR #40: the highest share difficulty since start, and its worker.
+    pub best_share: Option<(f64, String)>,
+    /// #### PR #40: the latest blocks found, newest last.
+    pub recent_blocks: VecDeque<FoundBlock>,
 }
+
+/// #### PR #40
+/// A block a device found: when, by which worker, and the node's answer once
+/// it has one.
+#[derive(Clone, Debug)]
+pub struct FoundBlock {
+    pub height: u32,
+    pub hash: String,
+    pub worker: String,
+    pub found: Instant,
+    pub result: Option<&'static str>,
+}
+
+/// How many found blocks the dashboard keeps.
+const RECENT_BLOCKS: usize = 10;
 
 #[derive(Clone)]
 struct PublishedJob {
@@ -208,6 +227,16 @@ pub fn run<R: NodeRpc + Send + 'static>(
                         .lock()
                         .map_err(|_| "block journal unavailable")?
                         .finish(&pending.hash, accepted)?;
+                    // #### PR #40: the node's answer, on the dashboard's list.
+                    if let Ok(mut stats) = node_shared.stats.lock() {
+                        if let Some(found) = stats
+                            .recent_blocks
+                            .iter_mut()
+                            .find(|found| found.hash == pending.hash)
+                        {
+                            found.result = Some(if accepted { "accepted" } else { "rejected" });
+                        }
+                    }
                     retries.remove(&pending.hash);
                 } else {
                     retries.defer(&pending.hash, Instant::now());
@@ -631,6 +660,24 @@ fn serve_device(
                         shared.stop.store(true, Ordering::Relaxed);
                         return Err("cannot persist solved block; mining stopped".into());
                     }
+                    // #### PR #40: the dashboard lists the blocks found.
+                    if saved == Ok(true) {
+                        if let Ok(mut stats) = shared.stats.lock() {
+                            let mut hash = super::template::double_sha256(&block.header);
+                            hash.reverse();
+                            let worker = stats.device_stats.label(device).unwrap_or_default();
+                            stats.recent_blocks.push_back(FoundBlock {
+                                height: block.template.height,
+                                hash: hex::encode(hash),
+                                worker,
+                                found: Instant::now(),
+                                result: None,
+                            });
+                            while stats.recent_blocks.len() > RECENT_BLOCKS {
+                                stats.recent_blocks.pop_front();
+                            }
+                        }
+                    }
                     update_journal_stats(shared)?;
                     // A full wake slot already guarantees the worker wakes;
                     // it also scans pending disk work on its bounded timeout.
@@ -646,6 +693,18 @@ fn serve_device(
                         .shares_rejected
                         .saturating_add(next_rejected.saturating_sub(rejected));
                     stats.device_stats.channels(device, mining.channels.len());
+                    // #### PR #40: best shares, the device's and the pool's.
+                    if let Some(difficulty) = mining.share_difficulty.take() {
+                        if let Some(worker) = stats.device_stats.best_share(device, difficulty) {
+                            if stats
+                                .best_share
+                                .as_ref()
+                                .is_none_or(|(best, _)| difficulty > *best)
+                            {
+                                stats.best_share = Some((difficulty, worker));
+                            }
+                        }
+                    }
                     // #### PR #40: named by its channel's user identity.
                     if let Some(identity) = mining.identity.take() {
                         stats.device_stats.set_worker(device, &identity);

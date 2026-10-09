@@ -24,6 +24,14 @@ pub enum ShareEvent {
     Rejected(&'static str),
 }
 
+/// #### PR #40
+/// The difficulty a share's hash reached (pool difficulty: 1 is one in 2^32
+/// hashes), for best-share records; the target's difficulty is the same
+/// measure of what was asked.
+pub fn share_difficulty(hash: &Hash) -> f64 {
+    expected_hashes(hash) / 2f64.powi(32)
+}
+
 pub fn expected_hashes(target: &Hash) -> f64 {
     let denominator = num_bigint::BigUint::from_bytes_le(target) + 1u8;
     2f64.powi(256) / denominator.to_f64().expect("256-bit target fits f64")
@@ -44,6 +52,8 @@ pub struct DeviceSnapshot {
     pub hashrate_hour: Option<f64>,
     /// Difficulty of the last accepted share's target.
     pub difficulty: Option<f64>,
+    /// #### PR #40: the highest difficulty one of its shares reached.
+    pub best_share: Option<f64>,
     pub estimate_seconds: f64,
     pub last_share_seconds: Option<u64>,
     pub connection_error: Option<&'static str>,
@@ -79,6 +89,7 @@ struct Device {
     connection_error: Option<&'static str>,
     adapter_error: Option<&'static str>,
     report: Option<DeviceReport>,
+    best_share: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -171,10 +182,27 @@ impl Devices {
                 connection_error: None,
                 adapter_error: None,
                 report: None,
+                best_share: None,
             },
         );
         self.prune();
         id
+    }
+
+    /// #### PR #40: a device's label, for records kept outside the table.
+    pub fn label(&self, id: u64) -> Option<String> {
+        self.rows.get(&id).map(|row| row.label.clone())
+    }
+
+    /// #### PR #40
+    /// Records a share's difficulty as the device's best when it is; returns
+    /// the device's label, for the pool's own best share.
+    pub fn best_share(&mut self, id: u64, difficulty: f64) -> Option<String> {
+        let row = self.rows.get_mut(&id)?;
+        if row.best_share.is_none_or(|best| difficulty > best) {
+            row.best_share = Some(difficulty);
+        }
+        Some(row.label.clone())
     }
 
     /// #### PR #40
@@ -358,6 +386,7 @@ impl Devices {
                         None
                     },
                     difficulty: row.difficulty,
+                    best_share: row.best_share,
                     estimate_seconds: seconds,
                     last_share_seconds: row
                         .last_share

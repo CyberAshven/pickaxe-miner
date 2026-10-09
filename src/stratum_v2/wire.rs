@@ -38,6 +38,9 @@ pub struct MiningSession {
     /// #### PR #40: the latest channel's user identity, taken by the server
     /// to name the device on the workers page.
     pub identity: Option<String>,
+    /// #### PR #40: the difficulty the latest accepted share's hash reached,
+    /// taken by the server for best-share records.
+    pub share_difficulty: Option<f64>,
     pub accepted: u64,
     pub rejected: u64,
 }
@@ -73,6 +76,7 @@ impl MiningSession {
             payout_policy: BchPayout::default(),
             public: None,
             identity: None,
+            share_difficulty: None,
             accepted: 0,
             rejected: 0,
         })
@@ -473,6 +477,9 @@ impl MiningSession {
         match result {
             Ok(share) => {
                 let event = ShareEvent::Accepted(share.share_target);
+                self.share_difficulty = Some(super::telemetry::share_difficulty(
+                    &super::template::double_sha256(&share.header),
+                ));
                 let work = share_work(&share.share_target);
                 self.accepted = self.accepted.saturating_add(1);
                 frames.push(mining(Mining::SubmitSharesSuccess(SubmitSharesSuccess {

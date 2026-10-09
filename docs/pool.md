@@ -20,6 +20,10 @@ pickaxe_miner stratum-v2 serve --config pool.json \
   --pool-tag "/MyPool/"
 ```
 
+`--start-difficulty N` sets the share difficulty devices start at (4096 by
+default); a farm of fast ASICs starts nearer its own, and vardiff moves each
+device toward 20 shares a minute from there.
+
 `--pool-tag` (the setup's Pool name row) writes your pool's name into the
 coinbase of every block the pool finds, as pools such as ViaBTC do, so block
 explorers show it: at most 20 printable characters. Without it no name is

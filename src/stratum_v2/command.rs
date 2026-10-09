@@ -114,6 +114,7 @@ pub fn run(
         sv1_listen,
         donation,
         pool_tag,
+        start_difficulty,
         ..
     } = action
     else {
@@ -128,6 +129,11 @@ pub fn run(
             );
         }
         return Ok(());
+    };
+    // #### PR #40: where each device's difficulty starts.
+    let share_target = match start_difficulty {
+        None => compact_target(0x1b0ffff0)?,
+        Some(difficulty) => difficulty_target(difficulty)?,
     };
     // #### PR #40: the pool's name, at most 20 printable characters.
     let pool_tag: Vec<u8> = match pool_tag.as_deref().map(str::trim) {
@@ -232,7 +238,7 @@ pub fn run(
                 network: config.network,
                 payout: config.payout_address.clone(),
                 authority_secret,
-                share_target: compact_target(0x1b0ffff0)?,
+                share_target,
                 journal_path: config_path.with_extension("sv2-blocks.json"),
                 pool_tag: pool_tag.clone(),
                 legacy_sources: nodes
@@ -370,7 +376,7 @@ pub fn run(
                     )
                 } else {
                     format!(
-                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}",
+                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}\n{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
@@ -380,6 +386,7 @@ pub fn run(
                     bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
                     sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
                     setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", authority.as_deref().unwrap_or("—"))),
+                    records_line(&snapshot),
                     )
                 };
                 let online = devices.iter().filter(|device| device.connected).count();
@@ -703,7 +710,7 @@ fn render_dashboard(
     offset: usize,
 ) {
     let areas = Layout::vertical([
-        Constraint::Length(9),
+        Constraint::Length(10),
         Constraint::Min(4),
         Constraint::Length(2),
     ])
@@ -1339,6 +1346,16 @@ fn status_json(
         "node_active": snapshot.active_node + 1,
         "nodes": snapshot.nodes,
         "node_switches": snapshot.node_switches,
+        "best_share": snapshot.best_share.as_ref().map(|(difficulty, worker)| {
+            serde_json::json!({"difficulty": difficulty, "worker": worker})
+        }),
+        "recent_blocks": snapshot.recent_blocks.iter().map(|found| serde_json::json!({
+            "height": found.height,
+            "hash": found.hash,
+            "worker": found.worker,
+            "seconds_ago": found.found.elapsed().as_secs(),
+            "result": found.result,
+        })).collect::<Vec<_>>(),
         "sv1_local_rejected": snapshot.sv1_local_rejected,
         "sessions_started": snapshot.sessions_started,
         "device_details": devices,
@@ -1504,6 +1521,55 @@ fn public_pool_suffix(public: Option<&super::payout::PublicPool>) -> String {
         Some(None) => " · Public pool, no fee".into(),
         Some(Some(fee)) => format!(" · Public pool, fee {} from {}", fee.rate, fee.mode),
     }
+}
+
+/// #### PR #40
+/// The share target of a pool difficulty: difficulty 1 is the target of
+/// compact bits 0x1d00ffff, so 4096 is the default start (0x1b0ffff0).
+fn difficulty_target(difficulty: u64) -> Result<super::template::Hash, String> {
+    if difficulty == 0 || difficulty > 1 << 48 {
+        return Err("--start-difficulty must be from 1 to 2^48".into());
+    }
+    let target = (num_bigint::BigUint::from(0xffffu32) << 208u32) / difficulty;
+    let mut bytes = target.to_bytes_le();
+    bytes.resize(32, 0);
+    bytes
+        .try_into()
+        .map_err(|_| "--start-difficulty is out of range".into())
+}
+
+/// #### PR #40
+/// The overview's records: the best share since start and the latest blocks
+/// found, newest first, as "#327035 rig1 accepted 2m ago".
+fn records_line(stats: &ServerStats) -> String {
+    let best = stats
+        .best_share
+        .as_ref()
+        .map(|(difficulty, worker)| format!("{} by {worker}", format_difficulty(Some(*difficulty))))
+        .unwrap_or_else(|| "none yet".into());
+    let blocks = stats
+        .recent_blocks
+        .iter()
+        .rev()
+        .take(3)
+        .map(|found| {
+            format!(
+                "#{} {} {} {}",
+                found.height,
+                found.worker,
+                found.result.unwrap_or("waiting"),
+                ago(Some(found.found.elapsed().as_secs()))
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Best share {best} · Recent blocks {}",
+        if blocks.is_empty() {
+            "none yet".into()
+        } else {
+            blocks.join(", ")
+        }
+    )
 }
 
 /// #### PR #40
@@ -1753,6 +1819,52 @@ mod tests {
         assert!(text.contains("Restart") && text.contains("Raise power"));
         assert!(text.contains("AvalonNano3s"));
         assert!(handle_controls_key(&mut view, KeyCode::Esc, &fleet));
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_start_difficulty_is_the_matching_share_target() {
+        assert_eq!(
+            difficulty_target(4096).unwrap(),
+            compact_target(0x1b0ffff0).unwrap()
+        );
+        assert_eq!(
+            difficulty_target(1).unwrap(),
+            compact_target(0x1d00ffff).unwrap()
+        );
+        let fast = difficulty_target(65_536).unwrap();
+        assert!(super::super::telemetry::expected_hashes(&fast) > 2f64.powi(47));
+        assert!(difficulty_target(0).is_err());
+        assert!(difficulty_target(u64::MAX).is_err());
+    }
+
+    // #### PR #40
+    #[test]
+    fn the_overview_records_the_best_share_and_recent_blocks() {
+        let mut stats = ServerStats::default();
+        assert_eq!(
+            records_line(&stats),
+            "Best share none yet · Recent blocks none yet"
+        );
+        stats.best_share = Some((2_500_000.0, "rig1 #3".into()));
+        for (height, result) in [(327_034, Some("accepted")), (327_035, None)] {
+            stats
+                .recent_blocks
+                .push_back(super::super::server::FoundBlock {
+                    height,
+                    hash: "00".repeat(32),
+                    worker: "rig1 #3".into(),
+                    found: Instant::now(),
+                    result,
+                });
+        }
+        let line = records_line(&stats);
+        assert!(line.starts_with("Best share 2.50M by rig1 #3"), "{line}");
+        assert!(
+            line.contains("#327035 rig1 #3 waiting") && line.contains("#327034 rig1 #3 accepted"),
+            "{line}"
+        );
+        assert!(line.find("#327035").unwrap() < line.find("#327034").unwrap());
     }
 
     #[test]
