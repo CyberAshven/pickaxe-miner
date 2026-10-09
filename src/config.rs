@@ -1223,6 +1223,28 @@ impl MiningProfiles {
     }
 }
 
+/// #### PR #42
+/// What: a private file written whole: a temporary file beside it is made
+/// owner-only before anything is written, synced, then renamed over the old
+/// one, so a crash leaves the old file or the new one, never half of one.
+/// Why: device logins (and later other private server files) are rewritten
+/// while the server runs.
+/// Look here if: a private file is readable by other users, or a crash
+/// leaves a half-written one.
+#[cfg(feature = "stratum-v2")]
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".tmp-{:016x}", rand::random::<u64>()));
+    let temp = PathBuf::from(temp);
+    let written = write_private_config(&temp, bytes).and_then(|()| {
+        fs::rename(&temp, path).map_err(|error| format!("write {}: {error}", path.display()))
+    });
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
+}
+
 fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // An existing file is restricted before it is truncated. A failed
     // permission change must leave the previous payout and node URL in place.
@@ -1785,6 +1807,31 @@ mod tests {
                 .upsert(None, "Wrong network", saved)
                 .is_err());
         }
+    }
+
+    // #### PR #42
+    #[cfg(feature = "stratum-v2")]
+    #[test]
+    fn private_atomic_write_replaces_whole_and_leaves_no_temporary_file() {
+        let dir =
+            std::env::temp_dir().join(format!("pickaxe-private-{:016x}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logins.json");
+        write_private_atomic(&path, b"first").unwrap();
+        write_private_atomic(&path, b"second, longer").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second, longer");
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     // #### PR #42

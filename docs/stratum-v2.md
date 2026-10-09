@@ -254,6 +254,18 @@ When the list cannot be read, the setting is offered and the device decides. A
 Bitaxe accepts changes only from its own local network: through Tailscale or a
 VPN it answers that it refuses, and the panel says so.
 
+**Device logins.** Most firmwares answer Pickaxe with their default login.
+When a device refuses an action because its owner changed the login, the panel
+says so: press `l`, type the device's login (the username comes filled in with
+the firmware's default; the password shows as dots), and the action is sent
+again with it. `l` works at any time, for example for a stock Antminer whose
+password was changed, which cannot even be identified without it. The login is
+saved only after the device accepts it, in `<config>.sv2-logins.json` beside
+the server's config, readable by this computer's owner alone. It is used only
+for that device and only for the firmware it was saved for, since another
+device may get the address later. It is never shown, logged or written to the
+status file.
+
 Each action and setting needs a confirmation, goes only to a device on the
 local network or Tailscale, and shows the device's reply. The panel takes
 every key, so `q` there never stops the server. Esc goes back.

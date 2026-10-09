@@ -15,7 +15,10 @@
 //! Pool settings (their worker names are often payout addresses), MAC
 //! addresses, serial numbers and host names are never collected.
 
-use super::device_api::{self, DeviceAction, DeviceReport, OwnApi, PowerMode};
+use super::{
+    device_api::{self, DeviceAction, DeviceReport, OwnApi, PowerMode},
+    logins::Logins,
+};
 use asic_rs::{
     core::{
         config::{fan::FanConfig, tuning::TuningConfig},
@@ -26,13 +29,14 @@ use asic_rs::{
             hashrate::HashRateUnit,
             miner::{MinerData, MiningMode, TuningTarget},
         },
-        traits::miner::Miner,
+        traits::miner::{Miner, MinerAuth},
     },
     MinerFactory,
 };
 use std::{
     collections::HashMap,
     net::IpAddr,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -87,6 +91,21 @@ struct Shared {
     /// read when its Device panel identifies it; `None` when it listed
     /// nothing readable.
     avalon_help: Mutex<HashMap<IpAddr, Option<Vec<String>>>>,
+    /// #### PR #42: the device logins in use: the owner's saved ones, and
+    /// one entered on the Device panel until the device accepts or refuses
+    /// it.
+    logins: Mutex<HashMap<IpAddr, DeviceLogin>>,
+    /// The saved logins file, when this server keeps one.
+    store: Mutex<Option<Logins>>,
+}
+
+/// #### PR #42: a login for one device, for the firmware it was saved for;
+/// one without a firmware lets whichever firmware answers use it (a device
+/// that cannot be identified without its login).
+#[derive(Clone)]
+struct DeviceLogin {
+    firmware: Option<String>,
+    auth: MinerAuth,
 }
 
 #[derive(Clone)]
@@ -116,6 +135,8 @@ impl Fleet {
                 known: Mutex::new(HashMap::new()),
                 held: Mutex::new(None),
                 avalon_help: Mutex::new(HashMap::new()),
+                logins: Mutex::new(HashMap::new()),
+                store: Mutex::new(None),
             }),
         }
     }
@@ -215,6 +236,84 @@ impl Fleet {
             });
         controls_of(miner.as_deref(), help.as_deref())
     }
+
+    // #### PR #42: device logins
+    // What: the owner's saved logins (`<config>.sv2-logins.json`) are loaded
+    // at start, and a login entered on the Device panel is used at once and
+    // saved once the device accepts it. Identification uses the login: for
+    // the firmware it was saved for, or for any firmware while it has none.
+    // Why: stock Antminer, Elphapex, VolcMiner and SealMiner log in even to
+    // be identified, so a changed password left them unidentified; others
+    // refuse actions without the owner's login.
+    // Look here if: a device with a changed password stays unidentified, or
+    // a login is used for another device.
+    /// Loads the saved device logins beside this config.
+    pub fn load_logins(&self, config_path: &Path) -> Result<(), String> {
+        let logins = Logins::load(config_path)?;
+        if let Ok(mut known) = self.shared.logins.lock() {
+            for (ip, login) in logins.all() {
+                known.insert(
+                    ip,
+                    DeviceLogin {
+                        firmware: Some(login.firmware.clone()),
+                        auth: login.auth(),
+                    },
+                );
+            }
+        }
+        if let Ok(mut store) = self.shared.store.lock() {
+            *store = Some(logins);
+        }
+        Ok(())
+    }
+
+    /// Uses this login for the device from now on, or none, and forgets what
+    /// was identified there, so the next look logs in with it. `firmware`
+    /// limits it to that firmware; `None` lets any firmware use it.
+    pub fn set_login(&self, ip: IpAddr, login: Option<(Option<String>, MinerAuth)>) {
+        if let Ok(mut logins) = self.shared.logins.lock() {
+            match login {
+                Some((firmware, auth)) => {
+                    logins.insert(ip, DeviceLogin { firmware, auth });
+                }
+                None => {
+                    logins.remove(&ip);
+                }
+            }
+        }
+        if let Ok(mut known) = self.shared.known.lock() {
+            known.remove(&ip);
+        }
+    }
+
+    /// Saves a login the device accepted, for its firmware, and keeps using
+    /// it for that firmware only.
+    pub fn save_login(
+        &self,
+        ip: IpAddr,
+        firmware: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        {
+            let mut store = self
+                .shared
+                .store
+                .lock()
+                .map_err(|_| "device logins are unavailable".to_owned())?;
+            store
+                .as_mut()
+                .ok_or_else(|| "this server keeps no device logins file".to_owned())?
+                .save(ip, firmware, username, password)?;
+        }
+        if let Ok(mut logins) = self.shared.logins.lock() {
+            if let Some(login) = logins.get_mut(&ip) {
+                login.firmware = Some(firmware.to_owned());
+            }
+        }
+        Ok(())
+    }
+    // #### end PR #42 ####
 
     /// Runs one confirmed action and describes the device's answer: through
     /// asic-rs where it supports the action, otherwise Pickaxe's own code.
@@ -317,7 +416,19 @@ impl Shared {
             Some(Known::Unknown(since)) if !fresh && since.elapsed() < RETRY => return None,
             _ => (),
         }
-        let found = tokio::time::timeout(IDENTIFY, self.factory.get_miner(ip)).await;
+        // #### PR #42: with the owner's login when there is one.
+        let login = self
+            .logins
+            .lock()
+            .ok()
+            .and_then(|logins| logins.get(&ip).cloned());
+        let found = match login {
+            Some(login) => {
+                let factory = factory_with(login.firmware.as_deref(), &login.auth);
+                tokio::time::timeout(IDENTIFY, factory.get_miner(ip)).await
+            }
+            None => tokio::time::timeout(IDENTIFY, self.factory.get_miner(ip)).await,
+        };
         let entry = match found {
             Ok(Ok(Some(miner))) => Known::Miner(Arc::from(miner)),
             _ => Known::Unknown(Instant::now()),
@@ -457,6 +568,59 @@ fn settings_offered(
         }
     }
 }
+
+/// #### PR #42
+/// What: a factory that logs in with the owner's login: for the firmware it
+/// was saved for, or for every firmware while it has none.
+/// Why: asic-rs hands an identified miner its login only through the
+/// factory; `set_auth` needs the miner to itself, which a shared one is not.
+/// Look here if: a device whose login was entered stays unidentified.
+fn factory_with(firmware: Option<&str>, auth: &MinerAuth) -> MinerFactory {
+    asic_rs::factory::default_firmware_registry()
+        .iter()
+        .filter(|entry| firmware.is_none_or(|firmware| entry.to_string() == firmware))
+        .fold(
+            MinerFactory::new().with_identification_timeout(IDENTIFY),
+            |factory, entry| factory.with_firmware_discovery_auth(entry.as_ref(), auth.clone()),
+        )
+}
+
+/// #### PR #42: what a firmware's login asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginShape {
+    /// The firmware has no login Pickaxe uses.
+    None,
+    /// A password alone (the firmware sets the username itself).
+    Password,
+    /// A username, offered with the firmware's default, and a password.
+    UserAndPassword(&'static str),
+}
+
+/// The login a firmware asks for, by the name asic-rs gives it; a device
+/// asic-rs has not identified is offered the most common one (`root`).
+pub fn login_shape(firmware: Option<&str>) -> LoginShape {
+    match firmware {
+        None => LoginShape::UserAndPassword("root"),
+        Some("AntMiner Stock" | "Elphapex Stock" | "VolcMiner Stock" | "Marathon" | "Braiins") => {
+            LoginShape::UserAndPassword("root")
+        }
+        Some("Auradine Stock") => LoginShape::UserAndPassword("admin"),
+        Some("SealMiner Stock") => LoginShape::UserAndPassword("seal"),
+        Some("FutureBit Stock") => LoginShape::UserAndPassword("futurebit"),
+        Some("Proto Stock") => LoginShape::UserAndPassword(""),
+        Some("VNish" | "UMC OS" | "WhatsMiner Stock") => LoginShape::Password,
+        Some(_) => LoginShape::None,
+    }
+}
+
+/// Firmwares asic-rs identifies only after logging in: a device that
+/// identifies as one with a login entered has accepted that login.
+pub const IDENTIFIES_WITH_LOGIN: [&str; 4] = [
+    "AntMiner Stock",
+    "Elphapex Stock",
+    "VolcMiner Stock",
+    "SealMiner Stock",
+];
 
 /// Pickaxe's own API for a device's fan and power, if any.
 fn own_api(miner: &dyn Miner) -> Option<OwnApi> {
@@ -891,6 +1055,55 @@ mod tests {
             ),
             Err("this action is not sent through asic-rs".to_owned())
         );
+    }
+
+    // #### PR #42
+    // What: a login is used for its own firmware only (or for every firmware
+    // while it has none), a firmware asks for the login it uses, and
+    // set_login forgets what was identified at the address.
+    // Look here if: factory_with, login_shape or set_login changes.
+    #[test]
+    fn logins_follow_their_firmware() {
+        assert_eq!(login_shape(None), LoginShape::UserAndPassword("root"));
+        assert_eq!(
+            login_shape(Some("Auradine Stock")),
+            LoginShape::UserAndPassword("admin")
+        );
+        assert_eq!(login_shape(Some("WhatsMiner Stock")), LoginShape::Password);
+        assert_eq!(login_shape(Some("LuxOS")), LoginShape::None);
+        assert_eq!(login_shape(Some("AvalonMiner Stock")), LoginShape::None);
+        let names: Vec<String> = asic_rs::factory::default_firmware_registry()
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        for firmware in IDENTIFIES_WITH_LOGIN {
+            assert!(
+                names.iter().any(|name| name == firmware),
+                "{firmware}: {names:?}"
+            );
+        }
+        let fleet = Fleet::new();
+        let ip: IpAddr = "192.168.7.9".parse().unwrap();
+        fleet
+            .shared
+            .known
+            .lock()
+            .unwrap()
+            .insert(ip, Known::Unknown(Instant::now()));
+        fleet.set_login(
+            ip,
+            Some((Some("AntMiner Stock".into()), MinerAuth::new("root", "x"))),
+        );
+        assert!(fleet.shared.known.lock().unwrap().get(&ip).is_none());
+        assert!(fleet.shared.logins.lock().unwrap().contains_key(&ip));
+        // Without a logins file nothing is saved, and the login stays in
+        // memory only.
+        assert!(fleet
+            .save_login(ip, "AntMiner Stock", "root", "x")
+            .unwrap_err()
+            .contains("no device logins file"));
+        fleet.set_login(ip, None);
+        assert!(fleet.shared.logins.lock().unwrap().is_empty());
     }
 
     // #### PR #42

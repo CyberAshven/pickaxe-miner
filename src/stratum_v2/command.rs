@@ -268,6 +268,12 @@ pub fn run(
     // Device reports every 15 seconds, outside the stats lock, from asic-rs
     // mixed with Pickaxe's own reader; all devices are asked in parallel.
     let fleet = Arc::new(Fleet::new());
+    // #### PR #42: the device logins the owner saved on the Device panel. A
+    // logins file that cannot be read leaves the devices on their default
+    // logins; mining is not affected.
+    if let Err(error) = fleet.load_logins(config_path) {
+        eprintln!("Device logins not loaded: {error}");
+    }
     let reports = {
         let stop = stop.clone();
         let stats = stats.clone();

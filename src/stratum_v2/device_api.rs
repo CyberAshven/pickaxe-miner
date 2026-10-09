@@ -269,6 +269,33 @@ pub(super) fn control_at(
 }
 
 const NOT_OFFERED: &str = "this device does not offer that action";
+
+/// #### PR #42
+/// What: whether a device's or asic-rs's error says the login was refused,
+/// so the Device panel asks for the device's own login.
+/// Why: firmwares word it differently: HTTP 401 or 403, Canaan's "username
+/// err" and "userpass err", WhatsMiner's failed decryption with a wrong
+/// password.
+/// Look here if: a refused login is not followed by the login page, or an
+/// unrelated error is.
+pub fn login_refused(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "status code 401",
+        "status code 403",
+        "unauthorized",
+        "forbidden",
+        "authentication failed",
+        "username err",
+        "userpass err",
+        "invalid token",
+        "aes decryption failed",
+        "wrong password",
+        "invalid password",
+    ]
+    .iter()
+    .any(|sign| text.contains(sign))
+}
 const NO_ANSWER: &str = "the device did not answer";
 
 // #### PR #42: fan and power settings through Pickaxe's own commands
@@ -729,6 +756,33 @@ pub(super) mod tests {
     /// A device stand-in that answers one connection per reply, in order,
     /// and hands each request it received to the test. (PR #42: shared with
     /// the `fleet` tests.)
+    // #### PR #42
+    // What: the ways firmwares and asic-rs say a login was refused, and
+    // errors that are not refusals.
+    // Look here if: login_refused changes.
+    #[test]
+    fn login_refusals_are_recognised() {
+        for refused in [
+            "HTTP request failed with status code 401 Unauthorized",
+            "status code 403",
+            "Forbidden",
+            "Authentication failed",
+            "username err",
+            "userpass err",
+            "invalid token",
+            "AES decryption failed",
+        ] {
+            assert!(login_refused(refused), "{refused}");
+        }
+        for other in [
+            "the device did not answer",
+            "worklevel 4011",
+            "error:1 not support set workmode max_mode[0]",
+        ] {
+            assert!(!login_refused(other), "{other}");
+        }
+    }
+
     // #### PR #42
     // What: Pickaxe's own Avalon fan and work-mode commands, byte for byte;
     // a fan speed outside 15% to 100% refused before anything is sent; the

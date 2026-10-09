@@ -1317,3 +1317,46 @@ Avalon with and without a help listing, Bitaxe); an Avalon's fan and power
 never going through asic-rs; and the panel's fan and power pages refusing a
 value the device does not take, asking for a confirmation, and sending nothing
 until `y`.
+
+## Device logins on the Device panel (2026-10-09)
+
+#### PR #42
+
+A device whose owner changed its login can now be controlled. When a device
+refuses an action (HTTP 401 or 403, "unauthorized", Canaan's "username err",
+WhatsMiner's failed decryption and similar), the panel keeps the action and
+says to press `l`. The login page asks for what the firmware uses: a username,
+filled in with its default (`root`, `admin` for Auradine, `seal` for
+SealMiner), and a password, or a password alone (VNish, ePIC, WhatsMiner). The
+password shows as dots and never appears in `Debug` output.
+
+The login is used at once: asic-rs identifies the device again with it (stock
+Antminer, Elphapex, VolcMiner and SealMiner log in even to be identified), and
+the held-back action is sent again. It is saved only once the device accepts
+it: when that action goes through, when the device identifies as one of the
+firmwares above, or after the next action that goes through. A login the
+device refuses is dropped and nothing is saved.
+
+Saved logins live in `<config>.sv2-logins.json`, readable by the owner alone
+(0600 on Unix; the owner's account alone on Windows), written whole through a
+temporary file. Each is used only for its device's address and for the
+firmware it was saved for; addresses outside the local network are never
+saved or loaded, and a symlink or anything but a plain file is refused. The
+server loads them at start; a file that cannot be read leaves devices on their
+default logins and mining unaffected.
+
+Not yet: the logins in `stratum-v2 watch` (it gets the panel in a later
+slice), and Avalon's web login, which only its pool settings need.
+
+Unverified on a device: no login was sent to a real device.
+
+Evidence: host tests save and reload a login, use it only for its own
+firmware, refuse public addresses, keep another Pickaxe's saved login when
+saving, forget one, keep the file at 0600 on Unix, skip public addresses in a
+file and refuse a directory or symlink; the atomic writer replaces a file whole
+and leaves no temporary file; the firmware names that log in to be identified
+match asic-rs's registry; a login is kept for its own firmware and forgetting
+it forgets what was identified at the address; refusal texts are recognised
+and unrelated errors are not; and the login page is offered only to firmwares
+with a login, hides the password, and saves nothing when the device does not
+take the login.

@@ -7,10 +7,14 @@
 //! not.
 
 use super::{
-    device_api::{DeviceAction, PowerMode},
-    fleet::{DeviceControls, FanRange, Fleet, PowerSetting},
+    device_api::{login_refused, DeviceAction, PowerMode},
+    fleet::{
+        login_shape, DeviceControls, FanRange, Fleet, LoginShape, PowerSetting,
+        IDENTIFIES_WITH_LOGIN,
+    },
     telemetry::{AddressIssue, DeviceSnapshot, Devices},
 };
+use asic_rs::core::traits::miner::MinerAuth;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     widgets::{Block, Paragraph, TableState, Wrap},
@@ -135,6 +139,12 @@ pub(super) struct DevicePanel {
     controls: Arc<Mutex<Option<DeviceControls>>>,
     page: Page,
     reply: Arc<Mutex<Option<String>>>,
+    /// #### PR #42: the action a refused login held back, sent again once
+    /// the owner enters the device's login (`l`).
+    retry: Arc<Mutex<Option<DeviceAction>>>,
+    /// #### PR #42: a login in use but not saved yet; it is saved after the
+    /// next action the device accepts.
+    unsaved_login: Arc<Mutex<Option<(String, String)>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,7 +156,46 @@ enum Page {
     /// #### PR #42: the power: a mode by its number, or watts typed then
     /// Enter.
     Power(String),
+    /// #### PR #42: the device's own login.
+    Login(LoginForm),
 }
+
+/// #### PR #42: the login typed on the login page. Its `Debug` output and the
+/// screen never show the password.
+#[derive(Clone, PartialEq, Eq)]
+struct LoginForm {
+    username: String,
+    password: String,
+    /// Typing goes to the password (else the username).
+    on_password: bool,
+    /// The firmware asks for a password alone.
+    password_only: bool,
+}
+
+impl std::fmt::Debug for LoginForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LoginForm({}, password hidden)", self.username)
+    }
+}
+
+impl LoginForm {
+    /// The form for a firmware's login, with its default username.
+    fn for_shape(shape: LoginShape) -> Self {
+        let (username, password_only) = match shape {
+            LoginShape::UserAndPassword(user) => (user.to_owned(), false),
+            LoginShape::Password | LoginShape::None => (String::new(), true),
+        };
+        Self {
+            username,
+            password: String::new(),
+            on_password: true,
+            password_only,
+        }
+    }
+}
+
+/// The longest username or password the login page takes.
+const MAX_LOGIN: usize = 64;
 
 /// #### PR #42: one entry of the panel's menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +276,8 @@ impl DevicePanel {
             controls: Arc::new(Mutex::new(None)),
             page: Page::Menu,
             reply: Arc::new(Mutex::new(None)),
+            retry: Arc::new(Mutex::new(None)),
+            unsaved_login: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -327,9 +378,131 @@ impl DevicePanel {
                 input.pop();
                 Page::Power(input)
             }
+            // #### PR #42: the device's login.
+            (Page::Menu, KeyCode::Char('l') | KeyCode::Char('L'))
+                if self.login_shape() != Some(LoginShape::None) && self.login_shape().is_some() =>
+            {
+                Page::Login(LoginForm::for_shape(
+                    self.login_shape().unwrap_or(LoginShape::None),
+                ))
+            }
+            (Page::Login(_), KeyCode::Esc) => Page::Menu,
+            (Page::Login(mut form), KeyCode::Tab | KeyCode::BackTab) => {
+                form.on_password = form.password_only || !form.on_password;
+                Page::Login(form)
+            }
+            (Page::Login(mut form), KeyCode::Backspace) => {
+                if form.on_password {
+                    form.password.pop();
+                } else {
+                    form.username.pop();
+                }
+                Page::Login(form)
+            }
+            (Page::Login(form), KeyCode::Enter) if !form.password.is_empty() => {
+                let firmware = found.as_ref().and_then(|found| found.firmware.clone());
+                self.log_in(form, firmware, fleet);
+                Page::Menu
+            }
+            (Page::Login(mut form), KeyCode::Char(c)) if !c.is_control() => {
+                let field = if form.on_password {
+                    &mut form.password
+                } else {
+                    &mut form.username
+                };
+                if field.chars().count() < MAX_LOGIN {
+                    field.push(c);
+                }
+                Page::Login(form)
+            }
             (page, _) => page,
         };
         false
+    }
+
+    /// #### PR #42: the login this device's firmware asks for, once the
+    /// panel offers actions for it.
+    fn login_shape(&self) -> Option<LoginShape> {
+        match self.offer() {
+            Offer::Ready(found) => Some(login_shape(found.firmware.as_deref())),
+            _ => None,
+        }
+    }
+
+    /// #### PR #42
+    /// What: tries a login the owner typed. It is used at once: the device
+    /// is identified again with it, and an action a refused login held back
+    /// is sent again. It is saved (owner-only) once the device accepts it:
+    /// when that action goes through, when the device identifies as a
+    /// firmware that logs in to be identified, or else after the next action
+    /// that goes through. A refused login is dropped and nothing is saved.
+    /// Why: a login is never kept unless the device took it.
+    /// Look here if: a wrong login is saved, or a right one is asked for
+    /// again.
+    fn log_in(&self, form: LoginForm, firmware: Option<String>, fleet: &Arc<Fleet>) {
+        let Ok(ip) = self.target else {
+            return;
+        };
+        let retry = self.retry.lock().ok().and_then(|mut retry| retry.take());
+        self.set_reply("Trying the login…".into());
+        let reply = Arc::clone(&self.reply);
+        let controls = Arc::clone(&self.controls);
+        let unsaved = Arc::clone(&self.unsaved_login);
+        let fleet = Arc::clone(fleet);
+        thread::spawn(move || {
+            let LoginForm {
+                username, password, ..
+            } = form;
+            fleet.set_login(
+                ip,
+                Some((firmware, MinerAuth::new(username.clone(), password.clone()))),
+            );
+            let found = fleet.identify_now(ip, true);
+            let identified = found.firmware.clone();
+            if let Ok(mut controls) = controls.lock() {
+                *controls = Some(found);
+            }
+            let save = |firmware: &str| match fleet.save_login(ip, firmware, &username, &password) {
+                Ok(()) => " The login is saved.".to_owned(),
+                Err(error) => format!(
+                    " The login works but could not be saved ({}); Pickaxe asks again next time.",
+                    plain(&error)
+                ),
+            };
+            let text = match (identified, retry) {
+                (None, _) => {
+                    fleet.set_login(ip, None);
+                    "Login: the device did not accept it, or did not answer. Nothing was saved."
+                        .to_owned()
+                }
+                (Some(firmware), Some(action)) => match fleet.control(ip, action) {
+                    Ok(message) => outcome(action, Ok(message)) + &save(&firmware),
+                    Err(error) if login_refused(&error) => {
+                        fleet.set_login(ip, None);
+                        "Login: the device refused it. Nothing was saved.".to_owned()
+                    }
+                    Err(error) => {
+                        if let Ok(mut unsaved) = unsaved.lock() {
+                            *unsaved = Some((username.clone(), password.clone()));
+                        }
+                        outcome(action, Err(error))
+                    }
+                },
+                (Some(firmware), None) if IDENTIFIES_WITH_LOGIN.contains(&firmware.as_str()) => {
+                    format!("Login: the device identified as {firmware}.") + &save(&firmware)
+                }
+                (Some(_), None) => {
+                    if let Ok(mut unsaved) = unsaved.lock() {
+                        *unsaved = Some((username.clone(), password.clone()));
+                    }
+                    "Login: in use now. It is saved after the device accepts the next action."
+                        .to_owned()
+                }
+            };
+            if let Ok(mut reply) = reply.lock() {
+                *reply = Some(text);
+            }
+        });
     }
 
     /// #### PR #42: the menu: the one-shot actions, then the fan and power
@@ -400,8 +573,42 @@ impl DevicePanel {
         self.set_reply(format!("Sending: {}…", action.label()));
         let reply = Arc::clone(&self.reply);
         let fleet = Arc::clone(fleet);
+        // #### PR #42: a refused login holds the action back for `l`; a login
+        // not saved yet is saved once an action goes through.
+        let retry = Arc::clone(&self.retry);
+        let unsaved = Arc::clone(&self.unsaved_login);
+        let firmware = self
+            .controls
+            .lock()
+            .ok()
+            .and_then(|controls| controls.as_ref().and_then(|found| found.firmware.clone()));
         thread::spawn(move || {
-            let text = outcome(action, fleet.control(ip, action));
+            let result = fleet.control(ip, action);
+            let mut text = outcome(action, result.clone());
+            match &result {
+                Ok(_) => {
+                    let login = unsaved.lock().ok().and_then(|mut unsaved| unsaved.take());
+                    if let (Some((username, password)), Some(firmware)) = (login, firmware) {
+                        text.push_str(
+                            match fleet.save_login(ip, &firmware, &username, &password) {
+                                Ok(()) => " The login is saved.",
+                                Err(_) => {
+                                    " The login works but could not be saved; Pickaxe asks again next time."
+                                }
+                            },
+                        );
+                    }
+                }
+                Err(error) if login_refused(error) => {
+                    if let Ok(mut retry) = retry.lock() {
+                        *retry = Some(action);
+                    }
+                    text.push_str(
+                        " Press l to enter this device's login; the action is sent again after it.",
+                    );
+                }
+                Err(_) => (),
+            }
             if let Ok(mut reply) = reply.lock() {
                 *reply = Some(text);
             }
@@ -507,6 +714,41 @@ impl DevicePanel {
                          {input}_\n\nEsc  Back\n",
                         self.label
                     )),
+                    // #### PR #42: the login page never shows the password.
+                    Page::Login(form) => {
+                        text.push_str(&format!("Login for {}\n", self.label));
+                        text.push_str(match &found.firmware {
+                            Some(_) => "\n",
+                            None => "Not identified yet: most firmwares use the username root.\n\n",
+                        });
+                        let cursor = |active: bool| if active { "_" } else { "" };
+                        if !form.password_only {
+                            text.push_str(&format!(
+                                "Username: {}{}\n",
+                                form.username,
+                                cursor(!form.on_password)
+                            ));
+                        }
+                        text.push_str(&format!(
+                            "Password: {}{}\n\n",
+                            "•".repeat(form.password.chars().count()),
+                            cursor(form.on_password)
+                        ));
+                        if !form.password_only {
+                            text.push_str("Tab  Username or password · ");
+                        }
+                        text.push_str(
+                            "Enter  Log in · Esc  Back\n\nThe login is saved for this device, \
+                             readable by this computer's owner alone, once the device accepts \
+                             it. It is never shown.\n",
+                        );
+                    }
+                }
+                // #### PR #42: the login, for firmwares that have one.
+                if self.page == Page::Menu
+                    && login_shape(found.firmware.as_deref()) != LoginShape::None
+                {
+                    text.push_str("l  Enter this device's login\n");
                 }
             }
         }
@@ -1038,6 +1280,78 @@ mod tests {
         online.model = Some("Avalonminer AvalonNano3s".into());
         *online.controls.lock().unwrap() = Some(identified("Bitaxe Gamma"));
         assert_eq!(online.actions().len(), 2);
+    }
+
+    // #### PR #42
+    // What: the login page: offered for firmwares with a login, prefilled
+    // with the default username, the password shown as dots and never in
+    // Debug output, and a login the device does not take saves nothing.
+    // Look here if: the login page, log_in or LoginForm changes.
+    #[test]
+    fn the_login_page_hides_the_password_and_a_refused_login_saves_nothing() {
+        let fleet = Arc::new(Fleet::new());
+        // A public address: the device is never asked, so the login fails.
+        let mut panel = DevicePanel::new(
+            "rig1 #1".into(),
+            true,
+            String::new(),
+            Ok("203.0.113.9".parse().unwrap()),
+        );
+        let found = |firmware: &str| DeviceControls {
+            firmware: Some(firmware.into()),
+            actions: vec![DeviceAction::Restart],
+            ..DeviceControls::default()
+        };
+        *panel.controls.lock().unwrap() = Some(found("LuxOS"));
+        assert!(!screen(&panel).contains("Enter this device's login"));
+        panel.handle_key(key(KeyCode::Char('l')), &fleet);
+        assert_eq!(panel.page, Page::Menu, "LuxOS has no login");
+        *panel.controls.lock().unwrap() = Some(found("AntMiner Stock"));
+        assert!(screen(&panel).contains("l  Enter this device's login"));
+        panel.handle_key(key(KeyCode::Char('l')), &fleet);
+        let Page::Login(form) = &panel.page else {
+            panic!("{:?}", panel.page);
+        };
+        assert_eq!(form.username, "root");
+        for c in "hunter2".chars() {
+            panel.handle_key(key(KeyCode::Char(c)), &fleet);
+        }
+        let text = screen(&panel);
+        assert!(text.contains("Username: root"), "{text}");
+        assert!(text.contains("Password: •••••••_"), "{text}");
+        assert!(!text.contains("hunter2"));
+        assert!(!format!("{:?}", panel.page).contains("hunter2"));
+        // Tab moves to the username; q is typed, never a quit.
+        panel.handle_key(key(KeyCode::Tab), &fleet);
+        panel.handle_key(key(KeyCode::Char('q')), &fleet);
+        let Page::Login(form) = &panel.page else {
+            panic!("{:?}", panel.page);
+        };
+        assert_eq!((form.username.as_str(), form.password.len()), ("rootq", 7));
+        panel.handle_key(key(KeyCode::Backspace), &fleet);
+        panel.handle_key(key(KeyCode::Enter), &fleet);
+        assert_eq!(panel.page, Page::Menu);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while panel
+            .reply
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|reply| reply.starts_with("Trying"))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let text = screen(&panel);
+        assert!(text.contains("did not accept it"), "{text}");
+        assert!(text.contains("Nothing was saved"), "{text}");
+        assert!(panel.unsaved_login.lock().unwrap().is_none());
+        // A password-only firmware asks for the password alone.
+        *panel.controls.lock().unwrap() = Some(found("VNish"));
+        panel.handle_key(key(KeyCode::Char('l')), &fleet);
+        assert!(!screen(&panel).contains("Username:"));
+        panel.handle_key(key(KeyCode::Esc), &fleet);
+        assert_eq!(panel.page, Page::Menu);
     }
 
     // #### PR #42
