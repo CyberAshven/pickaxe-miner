@@ -33,6 +33,14 @@ pub struct MiningSession {
     maximum_targets: BTreeMap<u32, Hash>,
     current: Option<(u32, u64, Arc<BchTemplate>)>,
     payout_policy: BchPayout,
+    /// #### PR #40: a public pool, where each channel pays its user.
+    public: Option<super::payout::PublicPool>,
+    /// #### PR #40: the latest channel's user identity, taken by the server
+    /// to name the device on the workers page.
+    pub identity: Option<String>,
+    /// #### PR #40: the difficulty the latest accepted share's hash reached,
+    /// taken by the server for best-share records.
+    pub share_difficulty: Option<f64>,
     pub accepted: u64,
     pub rejected: u64,
 }
@@ -50,7 +58,7 @@ impl MiningSession {
         salt: [u8; 12],
         share_target: Hash,
     ) -> Result<Self, String> {
-        crate::config::validate_payout_address(network, &payout)
+        crate::config::validate_coinbase_address(network, &payout)
             .map_err(|_| "invalid payout for selected network")?;
         if share_target == [0; 32] {
             return Err("share target cannot be zero".into());
@@ -66,6 +74,9 @@ impl MiningSession {
             maximum_targets: BTreeMap::new(),
             current: None,
             payout_policy: BchPayout::default(),
+            public: None,
+            identity: None,
+            share_difficulty: None,
             accepted: 0,
             rejected: 0,
         })
@@ -242,6 +253,7 @@ impl MiningSession {
                     request.nominal_hash_rate,
                     maximum,
                     0,
+                    request.user_identity.as_utf8_or_hex().as_str(),
                 )?);
             }
             Mining::OpenExtendedMiningChannel(request) => {
@@ -262,6 +274,7 @@ impl MiningSession {
                         request.nominal_hash_rate,
                         maximum,
                         request.min_extranonce_size,
+                        request.user_identity.as_utf8_or_hex().as_str(),
                     )?);
                 }
             }
@@ -348,6 +361,14 @@ impl MiningSession {
         })
     }
 
+    /// #### PR #40
+    /// Makes this connection a public pool's: each channel pays the address
+    /// its user connects with, and the operator's fee address is added.
+    pub fn set_public(&mut self, public: Option<super::payout::PublicPool>) {
+        self.public = public;
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn open(
         &mut self,
         request: u32,
@@ -355,6 +376,7 @@ impl MiningSession {
         rate: f32,
         maximum: Hash,
         extra: u16,
+        identity: &str,
     ) -> Result<Vec<SerializedFrame>, String> {
         let error = if !rate.is_finite() || rate < 0.0 {
             Some("invalid-nominal-hashrate")
@@ -376,6 +398,17 @@ impl MiningSession {
         if !meets_target(&template.target, &maximum) {
             return Ok(vec![open_error(request, "max-target-out-of-range")?]);
         }
+        if identity != super::sv1::LOCAL_IDENTITY {
+            self.identity = Some(identity.to_owned());
+        }
+        // #### PR #40: in a public pool, the user's own address.
+        let payout = match &self.public {
+            Some(_) => match super::payout::identity_payout(self.network, identity) {
+                Ok(payout) => payout,
+                Err(_) => return Ok(vec![open_error(request, "unknown-user")?]),
+            },
+            None => self.payout.clone(),
+        };
         self.next_channel += 1;
         // Every device starts at the configured share target; vardiff moves
         // it from there.
@@ -385,8 +418,11 @@ impl MiningSession {
             self.share_target,
             self.salt,
             self.network,
-            &self.payout,
+            &payout,
         )?;
+        if let Some(public) = &self.public {
+            channel.set_operator(Some(&public.address))?;
+        }
         let (id, generation, template) = self.current.as_ref().unwrap();
         channel.settle(&template.target, &maximum);
         let target = channel.target;
@@ -441,6 +477,9 @@ impl MiningSession {
         match result {
             Ok(share) => {
                 let event = ShareEvent::Accepted(share.share_target);
+                self.share_difficulty = Some(super::telemetry::share_difficulty(
+                    &super::template::double_sha256(&share.header),
+                ));
                 let work = share_work(&share.share_target);
                 self.accepted = self.accepted.saturating_add(1);
                 frames.push(mining(Mining::SubmitSharesSuccess(SubmitSharesSuccess {
@@ -718,8 +757,8 @@ mod tests {
         server.receive(open(), 1700000010).unwrap();
         let id = *server.channels.keys().next().unwrap();
         assert_eq!(server.channels[&id].target, server.share_target);
-        // A silent device: twenty seconds without shares eases its target.
-        server.channels.get_mut(&id).unwrap().vardiff_window(20, 0);
+        // A silent device: a minute without shares eases its target.
+        server.channels.get_mut(&id).unwrap().vardiff_window(60, 0);
         let mut next_id = 10;
         let mut frames = server.retarget(&mut next_id).unwrap();
         assert_eq!(frames.len(), 2);

@@ -13,12 +13,19 @@ use crate::protocol::{derive_photon_state, PhotonDeployment};
 use native_tls::TlsConnector;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
 const NODE_RPC_USER_ENV: &str = "PICKAXE_NODE_RPC_USER";
 const NODE_RPC_PASSWORD_ENV: &str = "PICKAXE_NODE_RPC_PASSWORD";
+/// #### PR #40
+/// A node cookie file in a place Pickaxe does not look by itself.
+const NODE_RPC_COOKIE_ENV: &str = "PICKAXE_NODE_RPC_COOKIE";
+/// The node answered HTTP 401: it wants a user and password, or a cookie
+/// Pickaxe could not read.
+pub const NODE_RPC_LOGIN_REFUSED: &str = "the node refused the RPC login";
 
 /// Probe node RPC with `getblockchaininfo` (or `getblockcount` fallback).
 pub fn connect_failover(endpoints: &[String]) -> Result<(String, Value), String> {
@@ -126,11 +133,11 @@ pub struct NativePhotonSession {
 
 /// Reconstruct the PHOTON live state from BCHN's native UTXO/token RPCs.
 ///
-/// This provider is intentionally not advertised to the runtime source router
-/// yet. `scantxoutset` bootstraps the confirmed baton, then the mempool is used
+/// `scantxoutset` bootstraps the confirmed baton, then the mempool is used
 /// only when that baton has already been spent by an unconfirmed successor.
-/// Runtime capability remains fail-closed until the normalized state is proven
-/// equivalent to the canonical Fulcrum path.
+/// #### PR #40: with a node configured, this is the miner's job source
+/// (`ElectrumSession::connect_node_failover`); the Fulcrum path is the
+/// fallback, and proves a node it routes to as before.
 impl NativePhotonSession {
     pub fn endpoint(&self) -> &str {
         &self.url
@@ -167,6 +174,40 @@ impl NativePhotonSession {
 
         Err(format!(
             "All native node PHOTON-state RPCs failed (sequential, ban-safe):\n{}",
+            failures.join("\n")
+        ))
+    }
+
+    /// #### PR #40
+    /// Connects from a baton already known (the job being mined, or a
+    /// Fulcrum server's answer at start, which the node checks), so the UTXO
+    /// set is scanned only when that baton and its successor are both lost.
+    pub fn resume(
+        endpoints: &[String],
+        deployment: &PhotonDeployment,
+        job: &LiveJob,
+    ) -> Result<Self, String> {
+        if endpoints.is_empty() {
+            return Err("no native node endpoints configured for PHOTON state".into());
+        }
+        let mut failures = Vec::new();
+        for url in endpoints {
+            let mut session = Self {
+                url: url.clone(),
+                deployment: *deployment,
+                baton: baton_from_live_job(job),
+                snapshot: LiveStateSnapshot {
+                    tip_hash: job.tip_hash.clone(),
+                    job: job.clone(),
+                },
+            };
+            match session.refresh() {
+                Ok(_) => return Ok(session),
+                Err(error) => failures.push(format!("{}: {error}", redact_url(url))),
+            }
+        }
+        Err(format!(
+            "All native node PHOTON-state RPCs failed:\n{}",
             failures.join("\n")
         ))
     }
@@ -250,16 +291,29 @@ fn bootstrap_native_photon(
         return Err("scantxoutset did not complete successfully".into());
     }
 
-    let height = scan
+    let reported_height = scan
         .get("height")
         .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or("scantxoutset omitted a valid tip height")?;
-    let bestblock = scan
+        .and_then(|value| u32::try_from(value).ok());
+    let reported_bestblock = scan
         .get("bestblock")
         .and_then(Value::as_str)
         .filter(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
-        .ok_or("scantxoutset omitted a valid bestblock")?;
+        .map(str::to_owned);
+    // #### PR #40
+    // What: when the scan does not say which tip it saw, the tip read right
+    // after it stands in.
+    // Why: Bitcoin Cash Node (29.1) answers scantxoutset without `height` and
+    // `bestblock` (Bitcoin Core's fields), so mining from a BCHN node never
+    // started. Every later read checks this tip (gettxout's `bestblock`, then
+    // getbestblockhash), so a block found during the scan is caught there and
+    // the start retried.
+    // Look here if: a node start fails with a tip or baton mismatch.
+    let (height, bestblock) = match (reported_height, reported_bestblock) {
+        (Some(height), Some(bestblock)) => (height, bestblock),
+        _ => fetch_native_chain_tip(url)?,
+    };
+    let bestblock = bestblock.as_str();
     let unspents = scan
         .get("unspents")
         .and_then(Value::as_array)
@@ -971,10 +1025,244 @@ fn select_node_rpc_basic_auth(
 }
 
 /// Builds the HTTP basic-auth header for a node request.
-fn node_rpc_basic_auth(url_auth: Option<&str>) -> Result<Option<String>, String> {
+fn node_rpc_basic_auth(target: &NodeRpcTarget) -> Result<Option<String>, String> {
     let env_user = std::env::var(NODE_RPC_USER_ENV).ok();
     let env_password = std::env::var(NODE_RPC_PASSWORD_ENV).ok();
-    select_node_rpc_basic_auth(url_auth, env_user.as_deref(), env_password.as_deref())
+    node_rpc_login(
+        target,
+        env_user.as_deref(),
+        env_password.as_deref(),
+        std::env::var_os(NODE_RPC_COOKIE_ENV).map(PathBuf::from),
+        &bchn_data_dirs(),
+    )
+}
+
+/// The login for a node: URL credentials, then the environment pair, then
+/// a cookie file (`cookie_file`, or BCHN's for a node on this computer).
+fn node_rpc_login(
+    target: &NodeRpcTarget,
+    env_user: Option<&str>,
+    env_password: Option<&str>,
+    cookie_file: Option<PathBuf>,
+    data_dirs: &[PathBuf],
+) -> Result<Option<String>, String> {
+    let auth = select_node_rpc_basic_auth(target.url_auth.as_deref(), env_user, env_password)?;
+    Ok(auth.or_else(|| {
+        let paths = match cookie_file {
+            Some(path) => vec![path],
+            None => bchn_cookie_paths(&target.host, target.port, data_dirs),
+        };
+        paths.iter().find_map(|path| read_cookie(path))
+    }))
+}
+
+// #### PR #40
+// With no RPC password set, BCHN writes a fresh cookie (`__cookie__:<hex>`)
+// to `.cookie` in its network's data folder at every start
+// (rpc/protocol.cpp), so a node on the same computer needs no password.
+// Pickaxe reads it for a loopback address on BCHN's default RPC port, from
+// BCHN's default data folders; `PICKAXE_NODE_RPC_COOKIE` names any other
+// cookie file. A password in the URL or the environment comes first, and
+// the cookie is read again for every call, so a node restart is picked up.
+
+/// The cookie files BCHN would write for a node at `host:port`: only a
+/// loopback host on mainnet's or Chipnet's default port (chainparamsbase.cpp:
+/// 8332 with no network folder, 48332 in `chipnet`).
+fn bchn_cookie_paths(host: &str, port: u16, data_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let folder = match port {
+        8332 => None,
+        48332 => Some("chipnet"),
+        _ => return Vec::new(),
+    };
+    if !loopback {
+        return Vec::new();
+    }
+    data_dirs
+        .iter()
+        .map(|dir| match folder {
+            Some(folder) => dir.join(folder).join(".cookie"),
+            None => dir.join(".cookie"),
+        })
+        .collect()
+}
+
+/// BCHN's default data folder (util/system.cpp `GetDefaultDataDir`), and on
+/// Linux also the folder of its systemd service (contrib/init/bitcoind.service).
+fn bchn_data_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        dirs.push(PathBuf::from(appdata).join("Bitcoin"));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("Library/Application Support/Bitcoin"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join(".bitcoin"));
+        }
+        dirs.push(PathBuf::from("/var/lib/bitcoind"));
+    }
+    dirs
+}
+
+/// A cookie file's `user:password` line, if the file is readable and holds one.
+fn read_cookie(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let cookie = text.trim();
+    (cookie.contains(':') && !cookie.contains(char::is_whitespace)).then(|| cookie.to_owned())
+}
+
+/// #### PR #40
+/// What a BCH node says about itself: shown when a node is chosen and when
+/// the ASIC server starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeInfo {
+    /// Client and version from the node's user agent, such as
+    /// "Bitcoin Cash Node 29.1.0".
+    pub client: String,
+    /// BCHN's chain name: "main" or "chip".
+    pub chain: String,
+    pub blocks: u64,
+    pub headers: u64,
+    /// True during the node's initial block download.
+    pub syncing: bool,
+    /// The node's estimate of how much of the chain it has checked, 0..=1.
+    pub progress: f64,
+}
+
+impl NodeInfo {
+    /// The network of the node's chain, if Pickaxe mines it.
+    pub fn network(&self) -> Option<crate::config::MiningNetwork> {
+        match self.chain.as_str() {
+            "main" => Some(crate::config::MiningNetwork::Mainnet),
+            "chip" => Some(crate::config::MiningNetwork::Chipnet),
+            _ => None,
+        }
+    }
+
+    /// One line for screens, such as
+    /// "Bitcoin Cash Node 29.1.0 · synced at height 326900".
+    pub fn summary(&self) -> String {
+        if self.syncing || self.blocks < self.headers {
+            format!(
+                "{} · syncing, height {} of {} ({:.0}%)",
+                self.client,
+                self.blocks,
+                self.headers,
+                (self.progress * 100.0).clamp(0.0, 100.0).floor()
+            )
+        } else {
+            format!("{} · synced at height {}", self.client, self.blocks)
+        }
+    }
+}
+
+/// "Bitcoin Cash Node 29.1.0" from a user agent such as
+/// "/Bitcoin Cash Node:29.1.0(EB32.0)/". Text from the node is shown on
+/// screen, so control characters are dropped and the length is capped.
+fn client_from_subversion(subversion: &str) -> Option<String> {
+    let first = subversion.trim_matches('/').split('/').next()?;
+    let (name, version) = first.split_once(':')?;
+    let version = version.split('(').next().unwrap_or(version);
+    let client: String = format!("{} {}", name.trim(), version.trim())
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(64)
+        .collect();
+    (!name.trim().is_empty() && !version.trim().is_empty()).then_some(client)
+}
+
+/// Asks a node for its client, chain and sync state.
+pub fn node_info(url: &str) -> Result<NodeInfo, String> {
+    node_info_timed(url, RPC_CONNECT_TIMEOUT, RPC_READ_TIMEOUT)
+}
+
+fn node_info_timed(url: &str, connect: Duration, read: Duration) -> Result<NodeInfo, String> {
+    let network = rpc_call_timed(url, "getnetworkinfo", json!([]), connect, read)?;
+    let chain = rpc_call_timed(url, "getblockchaininfo", json!([]), connect, read)?;
+    let client = network
+        .get("subversion")
+        .and_then(Value::as_str)
+        .and_then(client_from_subversion)
+        .unwrap_or_else(|| "BCH node".into());
+    Ok(NodeInfo {
+        client,
+        chain: chain
+            .get("chain")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(16)
+            .collect(),
+        blocks: chain.get("blocks").and_then(Value::as_u64).unwrap_or(0),
+        headers: chain.get("headers").and_then(Value::as_u64).unwrap_or(0),
+        syncing: chain
+            .get("initialblockdownload")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        progress: chain
+            .get("verificationprogress")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+    })
+}
+
+/// #### PR #40
+/// What answers at BCHN's default RPC address on this computer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalNode {
+    /// Nothing answers there.
+    Missing,
+    /// A node answers but refuses the login: it has an RPC password set, or
+    /// a cookie Pickaxe cannot read.
+    NeedsLogin,
+    /// A node answered with its report.
+    Found(NodeInfo),
+}
+
+/// BCHN's RPC address on this computer for a network.
+pub fn local_node_url(network: crate::config::MiningNetwork) -> &'static str {
+    match network {
+        crate::config::MiningNetwork::Mainnet => "http://127.0.0.1:8332",
+        crate::config::MiningNetwork::Chipnet => "http://127.0.0.1:48332",
+    }
+}
+
+/// Whether a saved node URL is the node `local_node_url` names: a loopback
+/// host on the network's default port, with or without a login.
+pub fn is_local_node_url(url: &str, network: crate::config::MiningNetwork) -> bool {
+    let Ok(local) = parse_node_rpc_target(local_node_url(network)) else {
+        return false;
+    };
+    parse_node_rpc_target(url).is_ok_and(|target| {
+        target.port == local.port
+            && target.path == local.path
+            && (target.host.eq_ignore_ascii_case("localhost")
+                || target
+                    .host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback()))
+    })
+}
+
+/// Looks for a BCH node on this computer, briefly: refused connections take
+/// about two seconds on Windows, so screens run this in the background.
+pub fn probe_local_node(network: crate::config::MiningNetwork) -> LocalNode {
+    match node_info_timed(
+        local_node_url(network),
+        Duration::from_secs(3),
+        Duration::from_secs(5),
+    ) {
+        Ok(info) => LocalNode::Found(info),
+        Err(error) if error == NODE_RPC_LOGIN_REFUSED => LocalNode::NeedsLogin,
+        Err(_) => LocalNode::Missing,
+    }
 }
 
 /// Light block template from BCHN. Prefers `getblocktemplatelight`, falls back to `getblocktemplate`.
@@ -1249,6 +1537,7 @@ pub(crate) fn rpc_source_identity(url: &str) -> Result<[u8; 32], String> {
 }
 impl<T: Read + Write> NodeRpcStream for T {}
 
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(12);
 const SCAN_TXOUTSET_READ_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -1262,8 +1551,24 @@ fn rpc_read_timeout(method: &str) -> Duration {
 
 /// Sends a JSON-RPC request and validates its response.
 pub(crate) fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
+    rpc_call_timed(
+        url,
+        method,
+        params,
+        RPC_CONNECT_TIMEOUT,
+        rpc_read_timeout(method),
+    )
+}
+
+fn rpc_call_timed(
+    url: &str,
+    method: &str,
+    params: Value,
+    connect: Duration,
+    read: Duration,
+) -> Result<Value, String> {
     let target = parse_node_rpc_target(url)?;
-    let auth = node_rpc_basic_auth(target.url_auth.as_deref())?;
+    let auth = node_rpc_basic_auth(&target)?;
     let host = &target.host;
     let port = target.port;
     let path = &target.path;
@@ -1290,9 +1595,9 @@ pub(crate) fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, 
         .map_err(|e| format!("resolve: {e}"))?
         .next()
         .ok_or_else(|| "resolve: no addrs".to_string())?;
-    let tcp_stream = TcpStream::connect_timeout(&addr, Duration::from_secs(8))
-        .map_err(|e| format!("connect: {e}"))?;
-    let _ = tcp_stream.set_read_timeout(Some(rpc_read_timeout(method)));
+    let tcp_stream =
+        TcpStream::connect_timeout(&addr, connect).map_err(|e| format!("connect: {e}"))?;
+    let _ = tcp_stream.set_read_timeout(Some(read));
     let _ = tcp_stream.set_write_timeout(Some(Duration::from_secs(8)));
     let mut stream: Box<dyn NodeRpcStream> = match target.scheme {
         NodeRpcScheme::Http => Box::new(tcp_stream),
@@ -1316,6 +1621,11 @@ pub(crate) fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, 
     let Some(idx) = text.find("\r\n\r\n") else {
         return Err("malformed HTTP response".into());
     };
+    // #### PR #40
+    // BCHN answers a wrong or missing login with HTTP 401 and no body.
+    if text.split_whitespace().nth(1) == Some("401") {
+        return Err(NODE_RPC_LOGIN_REFUSED.into());
+    }
     let body = text[idx + 4..].trim();
     let v: Value = serde_json::from_str(body).map_err(|e| format!("json: {e}"))?;
     if let Some(err) = v.get("error") {
@@ -1556,6 +1866,157 @@ mod gbt_tests {
         let result = rpc_call(&endpoint, "getblockchaininfo", json!([])).unwrap();
         server.join().unwrap();
         assert_eq!(result.get("chain").and_then(Value::as_str), Some("main"));
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_node_on_this_computer_logs_in_with_its_cookie() {
+        let dir = std::env::temp_dir().join(format!("pickaxe-cookie-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("chipnet")).unwrap();
+        std::fs::write(dir.join(".cookie"), "__cookie__:00aa\n").unwrap();
+        std::fs::write(dir.join("chipnet").join(".cookie"), "__cookie__:11bb").unwrap();
+        let dirs = [PathBuf::from("missing"), dir.clone()];
+        let login = |url: &str, env: Option<(&str, &str)>, file: Option<PathBuf>| {
+            node_rpc_login(
+                &parse_node_rpc_target(url).unwrap(),
+                env.map(|(user, _)| user),
+                env.map(|(_, password)| password),
+                file,
+                &dirs,
+            )
+            .unwrap()
+        };
+
+        // BCHN's folder for the network on the default port, first readable
+        // data folder wins.
+        assert_eq!(
+            login("http://127.0.0.1:8332", None, None).as_deref(),
+            Some("__cookie__:00aa")
+        );
+        assert_eq!(
+            login("http://localhost:48332", None, None).as_deref(),
+            Some("__cookie__:11bb")
+        );
+        assert_eq!(
+            login("http://[::1]:48332", None, None).as_deref(),
+            Some("__cookie__:11bb")
+        );
+        // A password comes first; another computer or port gets no cookie.
+        assert_eq!(
+            login("http://u:p@127.0.0.1:48332", None, None).as_deref(),
+            Some("u:p")
+        );
+        assert_eq!(
+            login("http://127.0.0.1:48332", Some(("user", "pass")), None).as_deref(),
+            Some("user:pass")
+        );
+        assert_eq!(login("http://192.168.0.55:48332", None, None), None);
+        assert_eq!(login("http://127.0.0.1:18332", None, None), None);
+        // A cookie file named by the environment applies to any node.
+        assert_eq!(
+            login(
+                "http://192.168.0.55:48332",
+                None,
+                Some(dir.join("chipnet").join(".cookie"))
+            )
+            .as_deref(),
+            Some("__cookie__:11bb")
+        );
+
+        std::fs::write(dir.join("chipnet").join(".cookie"), "no login here").unwrap();
+        assert_eq!(login("http://127.0.0.1:48332", None, None), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_login_is_named_and_a_node_reports_itself() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let refused = rpc_call(&format!("http://{address}"), "getnetworkinfo", json!([]));
+        server.join().unwrap();
+        assert_eq!(refused, Err(NODE_RPC_LOGIN_REFUSED.to_string()));
+
+        let (url, server) = serve_json_rpc_sequence(vec![
+            (
+                "getnetworkinfo",
+                json!({"subversion": "/Bitcoin Cash Node:29.1.0(EB32.0)/"}),
+            ),
+            (
+                "getblockchaininfo",
+                json!({"chain": "chip", "blocks": 326900, "headers": 326900,
+                    "initialblockdownload": false, "verificationprogress": 0.99999}),
+            ),
+        ]);
+        let info = node_info(&url).unwrap();
+        server.join().unwrap();
+        assert_eq!(info.client, "Bitcoin Cash Node 29.1.0");
+        assert_eq!(info.network(), Some(crate::config::MiningNetwork::Chipnet));
+        assert_eq!(
+            info.summary(),
+            "Bitcoin Cash Node 29.1.0 · synced at height 326900"
+        );
+        let syncing = NodeInfo {
+            blocks: 120000,
+            syncing: true,
+            progress: 0.374,
+            ..info
+        };
+        assert_eq!(
+            syncing.summary(),
+            "Bitcoin Cash Node 29.1.0 · syncing, height 120000 of 326900 (37%)"
+        );
+        assert_eq!(
+            client_from_subversion("/Satoshi:27.0.0/").as_deref(),
+            Some("Satoshi 27.0.0")
+        );
+        assert_eq!(client_from_subversion("garbage"), None);
+        assert_eq!(
+            client_from_subversion("/Evil\u{1b}[2J:1.0/").as_deref(),
+            Some("Evil[2J 1.0")
+        );
+    }
+
+    #[test]
+    fn the_local_node_address_matches_saved_forms_of_it() {
+        use crate::config::MiningNetwork::{Chipnet, Mainnet};
+        assert_eq!(local_node_url(Chipnet), "http://127.0.0.1:48332");
+        assert!(is_local_node_url("http://127.0.0.1:48332", Chipnet));
+        assert!(is_local_node_url("http://u:p@localhost:48332", Chipnet));
+        assert!(is_local_node_url("http://[::1]:48332/", Chipnet));
+        assert!(!is_local_node_url("http://127.0.0.1:48332", Mainnet));
+        assert!(!is_local_node_url("http://192.168.0.55:48332", Chipnet));
+        assert!(!is_local_node_url(
+            "http://127.0.0.1:48332/wallet/x",
+            Chipnet
+        ));
+        assert!(is_local_node_url("http://127.0.0.1", Mainnet));
+    }
+
+    /// Opt-in: a real BCH node on this computer, found and reported as the
+    /// setup screen shows it. `PICKAXE_TEST_LOCAL_NODE` is `chipnet` or
+    /// `mainnet`; `PICKAXE_NODE_RPC_COOKIE` may name its cookie file.
+    #[test]
+    #[ignore = "needs a BCH node on this computer"]
+    fn real_local_node_is_found_and_reported() {
+        let network = match std::env::var("PICKAXE_TEST_LOCAL_NODE").as_deref() {
+            Ok("mainnet") => crate::config::MiningNetwork::Mainnet,
+            _ => crate::config::MiningNetwork::Chipnet,
+        };
+        match probe_local_node(network) {
+            LocalNode::Found(info) => {
+                println!("{}", info.summary());
+                assert_eq!(info.network(), Some(network));
+            }
+            other => panic!("no usable node on this computer: {other:?}"),
+        }
     }
 
     #[test]

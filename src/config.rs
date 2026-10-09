@@ -440,6 +440,35 @@ impl RuntimeConfig {
 
 /// Validates a payout for the selected chain and returns its canonical CashAddr.
 /// An omitted prefix uses the selected chain's checksum, never another network's.
+/// #### PR #40
+/// A BCH coinbase payout for `network`: P2PKH (q) or P2SH (p), such as a pool
+/// operator's multisig, in its canonical lower-case CashAddr form.
+pub fn validate_coinbase_address(network: MiningNetwork, address: &str) -> Result<String, String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err("payout address required".into());
+    }
+    let canonical = if trimmed.contains(':') {
+        trimmed.to_ascii_lowercase()
+    } else {
+        format!(
+            "{}:{}",
+            network.cashaddr_prefix(),
+            trimmed.to_ascii_lowercase()
+        )
+    };
+    crate::tx::cashaddr_to_coinbase_locking(trimmed)
+        .map_err(|e| format!("invalid payout CashAddr: {e}"))?;
+    if !canonical.starts_with(&format!("{}:", network.cashaddr_prefix())) {
+        return Err(format!(
+            "payout address must use {}: on {}",
+            network.cashaddr_prefix(),
+            network.as_str()
+        ));
+    }
+    Ok(canonical)
+}
+
 pub fn validate_payout_address(network: MiningNetwork, address: &str) -> Result<String, String> {
     let trimmed = address.trim();
     if trimmed.is_empty() {

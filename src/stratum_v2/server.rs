@@ -38,8 +38,15 @@ pub struct ServerConfig {
     pub authority_secret: [u8; 32],
     pub share_target: Hash,
     pub journal_path: PathBuf,
-    pub source_identity: [u8; 32],
+    /// #### PR #40: the configured nodes' identities, so a journal written
+    /// when journals were bound to one node still opens (and is rebound).
+    pub legacy_sources: Vec<[u8; 32]>,
     pub donation: Arc<RwLock<BchDonation>>,
+    /// #### PR #40: a public pool, where each miner's blocks pay them.
+    pub public: Option<super::payout::PublicPool>,
+    /// #### PR #40: the pool's name, written into every block's coinbase
+    /// (empty for none).
+    pub pool_tag: Vec<u8>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -63,7 +70,31 @@ pub struct ServerStats {
     pub template_failures: u64,
     pub last_template_error: Option<&'static str>,
     pub height: Option<u32>,
+    /// #### PR #40: the node templates come from (0 is the first in failover
+    /// order), how many nodes there are, and how often the server moved on.
+    pub active_node: usize,
+    pub nodes: usize,
+    pub node_switches: u64,
+    /// #### PR #40: the highest share difficulty since start, and its worker.
+    pub best_share: Option<(f64, String)>,
+    /// #### PR #40: the latest blocks found, newest last.
+    pub recent_blocks: VecDeque<FoundBlock>,
 }
+
+/// #### PR #40
+/// A block a device found: when, by which worker, and the node's answer once
+/// it has one.
+#[derive(Clone, Debug)]
+pub struct FoundBlock {
+    pub height: u32,
+    pub hash: String,
+    pub worker: String,
+    pub found: Instant,
+    pub result: Option<&'static str>,
+}
+
+/// How many found blocks the dashboard keeps.
+const RECENT_BLOCKS: usize = 10;
 
 #[derive(Clone)]
 struct PublishedJob {
@@ -110,13 +141,17 @@ impl SolvedParents {
 
 /// Bind the listener before calling this function. The caller owns the stop
 /// flag and display, so native TUI and CPU tests use the same server lifecycle.
+/// `nodes` are the BCH nodes in failover order, the one to start with first.
 pub fn run<R: NodeRpc + Send + 'static>(
     listener: TcpListener,
-    rpc: R,
+    nodes: Vec<R>,
     config: ServerConfig,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
 ) -> Result<(), String> {
+    let total = nodes.len();
+    let mut standby = VecDeque::from(nodes);
+    let rpc = standby.pop_front().ok_or("no BCH node configured")?;
     validate_payout_address(config.network, &config.payout)
         .map_err(|_| "invalid payout for selected network")?;
     if config.share_target == [0; 32] {
@@ -130,8 +165,12 @@ pub fn run<R: NodeRpc + Send + 'static>(
         &config.journal_path,
         config.network,
         &config.payout,
-        config.source_identity,
+        &config.legacy_sources,
     )?;
+    if let Ok(mut stats) = stats.lock() {
+        stats.nodes = total;
+        stats.active_node = 0;
+    }
     let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
     let shared = Arc::new(Shared {
         job: RwLock::new(None),
@@ -145,8 +184,10 @@ pub fn run<R: NodeRpc + Send + 'static>(
     update_journal_stats(&shared)?;
     let node_shared = shared.clone();
     let network = config.network;
+    let tag = config.pool_tag.clone();
     let node = thread::spawn(move || -> Result<(), String> {
         let mut provider = TemplateProvider::new(rpc, network);
+        let mut active = 0;
         let mut refreshed = Instant::now() - Duration::from_secs(60);
         let mut retries = RetrySchedule::default();
         while !node_shared.stop.load(Ordering::Relaxed) {
@@ -186,6 +227,16 @@ pub fn run<R: NodeRpc + Send + 'static>(
                         .lock()
                         .map_err(|_| "block journal unavailable")?
                         .finish(&pending.hash, accepted)?;
+                    // #### PR #40: the node's answer, on the dashboard's list.
+                    if let Ok(mut stats) = node_shared.stats.lock() {
+                        if let Some(found) = stats
+                            .recent_blocks
+                            .iter_mut()
+                            .find(|found| found.hash == pending.hash)
+                        {
+                            found.result = Some(if accepted { "accepted" } else { "rejected" });
+                        }
+                    }
                     retries.remove(&pending.hash);
                 } else {
                     retries.defer(&pending.hash, Instant::now());
@@ -210,7 +261,11 @@ pub fn run<R: NodeRpc + Send + 'static>(
                             &node_shared,
                             Some(PublishedJob {
                                 generation,
-                                template: Arc::new(template.clone()),
+                                template: Arc::new({
+                                    let mut template = template.clone();
+                                    template.tag(&tag);
+                                    template
+                                }),
                                 valid_until: Instant::now() + Duration::from_secs(30),
                             }),
                         );
@@ -222,6 +277,25 @@ pub fn run<R: NodeRpc + Send + 'static>(
                             stats.last_template_error = Some(template_reason(&error));
                         }
                         publish(&node_shared, None);
+                        // #### PR #40
+                        // What: with more than one node, move to the next in
+                        // failover order when this one gives no template, and
+                        // try it at once; the failed node waits at the back.
+                        // Why: one node down stopped the whole server while
+                        // its other nodes were fine. Saved blocks are whole
+                        // blocks, so they go to the next node too.
+                        // Look here if: the node number on the dashboard keeps
+                        // changing, which means every node is failing.
+                        if let Some(mut next) = standby.pop_front() {
+                            provider.replace_node(&mut next);
+                            standby.push_back(next);
+                            active = (active + 1) % total;
+                            if let Ok(mut stats) = node_shared.stats.lock() {
+                                stats.active_node = active;
+                                stats.node_switches = stats.node_switches.saturating_add(1);
+                            }
+                            refreshed = Instant::now() - Duration::from_secs(60);
+                        }
                     }
                 }
             }
@@ -419,12 +493,18 @@ impl JobAvailability {
         current: Option<PublishedJob>,
         now: Instant,
         donation: BchDonation,
+        fee: Option<crate::donation::bch::PoolFee>,
     ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
         if let Some(job) = current.filter(|job| now < job.valid_until) {
             self.allocation.update(now, !mining.channels.is_empty());
+            let donation_work = self.allocation.donation_work(donation);
             let payout = BchPayout {
                 donation,
-                donation_work: self.allocation.donation_work(donation),
+                donation_work,
+                // #### PR #40: a public pool's fee, after the donation.
+                fee,
+                fee_work: !donation_work
+                    && fee.is_some_and(|fee| self.allocation.fee_work(donation, fee)),
             };
             self.unavailable_since = None;
             if self.generation == Some(job.generation) && self.payout == Some(payout) {
@@ -470,8 +550,9 @@ impl JobAvailability {
     }
 }
 
-fn template_reason(error: &str) -> &'static str {
+pub(super) fn template_reason(error: &str) -> &'static str {
     match error {
+        crate::node::NODE_RPC_LOGIN_REFUSED => "node refused the RPC login",
         "node tip changed while fetching the template" => "tip changed during refresh",
         "node is on the wrong network" => "wrong network",
         "node is not fully synchronized" => "node not synchronized",
@@ -500,6 +581,8 @@ fn serve_device(
             rand::random(),
             config.share_target,
         )?;
+        mining.set_public(config.public.clone());
+        let fee = config.public.as_ref().and_then(|public| public.fee);
         let phase = rand::random();
         #[cfg(test)]
         let phase = config.allocation_phase.unwrap_or(phase);
@@ -521,9 +604,13 @@ fn serve_device(
                     .map(|value| *value)
                     .map_err(|_| "donation setting unavailable")
             };
-            for frame in
-                availability.update(&mut mining, current_job()?, Instant::now(), donation()?)?
-            {
+            for frame in availability.update(
+                &mut mining,
+                current_job()?,
+                Instant::now(),
+                donation()?,
+                fee,
+            )? {
                 sender.send(frame)?;
             }
             for frame in availability.retarget(&mut mining)? {
@@ -532,9 +619,13 @@ fn serve_device(
             if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
                 // A node failure or tip change may have occurred while waiting
                 // for a device frame; resample before validating that frame.
-                for update in
-                    availability.update(&mut mining, current_job()?, Instant::now(), donation()?)?
-                {
+                for update in availability.update(
+                    &mut mining,
+                    current_job()?,
+                    Instant::now(),
+                    donation()?,
+                    fee,
+                )? {
                     sender.send(update)?;
                 }
                 let now = SystemTime::now()
@@ -569,6 +660,24 @@ fn serve_device(
                         shared.stop.store(true, Ordering::Relaxed);
                         return Err("cannot persist solved block; mining stopped".into());
                     }
+                    // #### PR #40: the dashboard lists the blocks found.
+                    if saved == Ok(true) {
+                        if let Ok(mut stats) = shared.stats.lock() {
+                            let mut hash = super::template::double_sha256(&block.header);
+                            hash.reverse();
+                            let worker = stats.device_stats.label(device).unwrap_or_default();
+                            stats.recent_blocks.push_back(FoundBlock {
+                                height: block.template.height,
+                                hash: hex::encode(hash),
+                                worker,
+                                found: Instant::now(),
+                                result: None,
+                            });
+                            while stats.recent_blocks.len() > RECENT_BLOCKS {
+                                stats.recent_blocks.pop_front();
+                            }
+                        }
+                    }
                     update_journal_stats(shared)?;
                     // A full wake slot already guarantees the worker wakes;
                     // it also scans pending disk work on its bounded timeout.
@@ -584,6 +693,22 @@ fn serve_device(
                         .shares_rejected
                         .saturating_add(next_rejected.saturating_sub(rejected));
                     stats.device_stats.channels(device, mining.channels.len());
+                    // #### PR #40: best shares, the device's and the pool's.
+                    if let Some(difficulty) = mining.share_difficulty.take() {
+                        if let Some(worker) = stats.device_stats.best_share(device, difficulty) {
+                            if stats
+                                .best_share
+                                .as_ref()
+                                .is_none_or(|(best, _)| difficulty > *best)
+                            {
+                                stats.best_share = Some((difficulty, worker));
+                            }
+                        }
+                    }
+                    // #### PR #40: named by its channel's user identity.
+                    if let Some(identity) = mining.identity.take() {
+                        stats.device_stats.set_worker(device, &identity);
+                    }
                     if let Some(event) = responses.share_event {
                         stats
                             .device_stats
@@ -666,6 +791,7 @@ mod retry_tests {
                     Some(job.clone()),
                     start + Duration::from_secs(seconds),
                     rate.parse().unwrap(),
+                    None,
                 )
                 .unwrap();
             let current = mining.channels[&1].job().unwrap();
@@ -679,7 +805,8 @@ mod retry_tests {
                 &mut mining,
                 Some(job),
                 start + Duration::from_secs(6),
-                "2".parse().unwrap()
+                "2".parse().unwrap(),
+                None,
             )
             .unwrap()
             .is_empty());
@@ -709,6 +836,7 @@ mod retry_tests {
                 Some(job.clone()),
                 start,
                 BchDonation::default(),
+                None,
             )
             .unwrap();
         assert_eq!(availability.generation, Some(1));
@@ -718,6 +846,7 @@ mod retry_tests {
                 Some(job.clone()),
                 job.valid_until,
                 BchDonation::default(),
+                None,
             )
             .unwrap();
         assert_eq!(availability.generation, None);
@@ -727,6 +856,7 @@ mod retry_tests {
                 None,
                 job.valid_until + Duration::from_secs(2),
                 BchDonation::default(),
+                None,
             )
             .unwrap();
         assert!(availability
@@ -734,7 +864,8 @@ mod retry_tests {
                 &mut mining,
                 Some(job.clone()),
                 job.valid_until + TEMPLATE_RECOVERY_GRACE,
-                BchDonation::default()
+                BchDonation::default(),
+                None,
             )
             .is_err());
         assert_eq!(

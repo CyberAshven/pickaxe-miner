@@ -116,9 +116,15 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
-#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+// #### PR #40: parsed once at start, so the server options' size is no cost.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     Mine,
+    /// #### PR #40
+    /// Show the status of a miner running without a screen, such as a GPU
+    /// farm's or pool's coordinator as a service (read-only; same --config).
+    Watch,
     Devices,
     SelfTest,
     Benchmark {
@@ -147,12 +153,16 @@ pub enum ConfigCommand {
     Save,
 }
 
-#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum StratumV2Command {
     /// Print implementation and validation status.
     Status,
     /// Check the configured BCH node and full block template without mining.
     CheckNode,
+    /// Show a running server's workers table, read-only (for example a
+    /// service started with --no-tui). Use the same --config as the server.
+    Watch,
     /// Serve encrypted BCH mining jobs to SV2 devices.
     Serve {
         /// Listener address. Use a LAN address to connect an external ASIC.
@@ -164,6 +174,53 @@ pub enum StratumV2Command {
         /// BCH donation percentage, 0 to 100 (default 1.5). Defaults to the saved setting.
         #[arg(long)]
         donation: Option<crate::donation::bch::BchDonation>,
+        /// #### PR #40
+        /// Mine at a remote SV2 pool instead of your own node: HOST:PORT of
+        /// the pool (another Pickaxe server, or a BCH SV2 pool). SV1 devices
+        /// connect to --sv1-listen; no node is needed. Repeat for backup
+        /// pools, tried in order.
+        /// #### PR #40: HOST:PORT, or the pool's one-line SV2 address with
+        /// its key, stratum2+tcp://HOST:PORT/KEY.
+        #[arg(long, requires = "sv1_listen")]
+        upstream: Vec<String>,
+        /// The pool's authority public key, as the pool publishes it; one per
+        /// --upstream, in the same order. Not needed when each --upstream
+        /// carries its key.
+        #[arg(long, requires = "upstream")]
+        upstream_key: Vec<String>,
+        /// The identity the pool knows you by: an account or worker name, or
+        /// for a solo pool your payout address. Defaults to the configured
+        /// payout address.
+        #[arg(long, requires = "upstream")]
+        upstream_user: Option<String>,
+        /// #### PR #40
+        /// Run a public pool: each miner's username is their own payout
+        /// address (q or p, optionally with .worker) and the blocks they find
+        /// pay them; the Pickaxe donation comes off first, then your fee.
+        #[arg(long, conflicts_with = "upstream")]
+        public: bool,
+        /// The public pool's fee: a percentage of what the donation leaves,
+        /// 0 to 100 (default 0).
+        #[arg(long, requires = "public")]
+        pool_fee: Option<crate::donation::bch::BchDonation>,
+        /// Where the fee comes from: coinbase, work or both (default coinbase).
+        #[arg(long, requires = "public")]
+        pool_fee_mode: Option<crate::donation::bch::FeeMode>,
+        /// The fee's address, q or p (such as a multisig); defaults to the
+        /// configured payout address.
+        #[arg(long, requires = "public")]
+        pool_fee_address: Option<String>,
+        /// #### PR #40
+        /// The pool's name, written into the coinbase of every block this
+        /// server builds (at most 20 printable characters), such as /MyPool/.
+        /// Not with --upstream: the pool there builds the blocks.
+        #[arg(long, value_name = "TEXT", conflicts_with = "upstream")]
+        pool_tag: Option<String>,
+        /// #### PR #40
+        /// The share difficulty every device starts at (default 4096), for
+        /// farms of fast ASICs; vardiff moves each device from there.
+        #[arg(long, value_name = "DIFFICULTY", conflicts_with = "upstream")]
+        start_difficulty: Option<u64>,
     },
 }
 
@@ -424,6 +481,17 @@ mod tests {
     }
 
     #[test]
+    fn clap_parses_stratum_v2_watch_without_server_options() {
+        let cli = Cli::try_parse_from(["pickaxe", "--chipnet", "stratum-v2", "watch"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Watch
+            })
+        ));
+    }
+
+    #[test]
     fn bch_donation_flag_accepts_percentages_from_zero_to_one_hundred() {
         for (text, expected) in [("0", 0), ("1.5", 150), ("2.01", 201), ("100", 10_000)] {
             let cli = Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--donation", text])
@@ -446,6 +514,178 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_public_pool_takes_a_fee_from_a_chosen_source_and_cannot_also_join_a_pool() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--public",
+            "--pool-fee",
+            "2",
+            "--pool-fee-mode",
+            "both",
+            "--pool-fee-address",
+            "bchtest:pqpool",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    public,
+                    pool_fee,
+                    pool_fee_mode,
+                    pool_fee_address,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("public pool options missing")
+        };
+        assert!(public);
+        assert_eq!(pool_fee, Some("2".parse().unwrap()));
+        assert_eq!(pool_fee_mode, Some(crate::donation::bch::FeeMode::Both));
+        assert_eq!(pool_fee_address.as_deref(), Some("bchtest:pqpool"));
+        // Fee options need a public pool, and a public pool is not a miner
+        // at someone else's pool.
+        assert!(
+            Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--pool-fee", "2"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--public",
+            "--upstream",
+            "pool.example:3336",
+            "--upstream-key",
+            "key",
+            "--sv1-listen",
+            "0.0.0.0:3333"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--public",
+            "--pool-fee-mode",
+            "half"
+        ])
+        .is_err());
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_server_names_its_blocks_but_a_pool_member_cannot() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["pickaxe", "stratum-v2", "serve"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        let Some(Commands::StratumV2 {
+            command: StratumV2Command::Serve { pool_tag, .. },
+        }) = parse(&["--public", "--pool-tag", "/MyPool/"])
+            .unwrap()
+            .command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(pool_tag.as_deref(), Some("/MyPool/"));
+        assert!(parse(&[
+            "--pool-tag",
+            "/MyPool/",
+            "--upstream",
+            "pool.example:3336",
+            "--upstream-key",
+            "key",
+            "--sv1-listen",
+            "0.0.0.0:3333"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn pool_mode_needs_the_pool_key_and_an_sv1_listener_and_keeps_the_donation() {
+        let base = [
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--upstream",
+            "pool.example:3336",
+        ];
+        let with = |extra: &[&'static str]| {
+            Cli::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        let cli = with(&[
+            "--upstream-key",
+            "9auqWEzQDVyLAAnYFbEqV2LDhYMyMEcuBJdJzkWW4GEk2Ss4Dnf",
+            "--upstream-user",
+            "me.rig1",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    upstream,
+                    upstream_user: Some(user),
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("pool options missing")
+        };
+        assert_eq!(upstream, ["pool.example:3336"]);
+        assert_eq!(user, "me.rig1");
+        // Backup pools repeat both options, in order.
+        let cli = with(&[
+            "--upstream-key",
+            "key-a",
+            "--upstream",
+            "backup.example:3336",
+            "--upstream-key",
+            "key-b",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    upstream,
+                    upstream_key,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("pool options missing")
+        };
+        assert_eq!(upstream, ["pool.example:3336", "backup.example:3336"]);
+        assert_eq!(upstream_key, ["key-a", "key-b"]);
+        // A listener for the devices is required; the pool's key may come in
+        // its address, so a missing key is found when the server starts.
+        assert!(with(&["--sv1-listen", "0.0.0.0:3333"]).is_ok());
+        assert!(with(&["--upstream-key", "key"]).is_err());
+        // #### PR #40: at a pool the donation is mining time, set as anywhere.
+        assert!(with(&[
+            "--upstream-key",
+            "key",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--donation",
+            "2"
+        ])
+        .is_ok());
+        // Pool identity options need a pool.
+        assert!(
+            Cli::try_parse_from(["pickaxe", "stratum-v2", "serve", "--upstream-user", "me"])
+                .is_err()
+        );
     }
 
     #[test]

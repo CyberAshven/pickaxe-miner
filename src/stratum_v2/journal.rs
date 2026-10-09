@@ -31,6 +31,12 @@ pub struct PendingBlock {
     // bytes; it must never silently rebuild an already solved coinbase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payout: Option<BchPayout>,
+    /// #### PR #40: in a public pool, the miner this block pays when it is
+    /// not the configured payout, and the pool's fee address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -48,8 +54,28 @@ struct State {
 pub struct Journal {
     path: PathBuf,
     _lock: File,
-    scripts: [Vec<u8>; 2],
+    network: MiningNetwork,
+    payout: String,
+    scripts: Vec<Vec<u8>>,
     state: State,
+}
+
+/// #### PR #40
+/// What a journal belongs to: its network and payout script, and before
+/// PR #40 also the node it was written with (`source`).
+fn binding(source: Option<&[u8; 32]>, network: MiningNetwork, script: &[u8]) -> String {
+    let mut context = match source {
+        Some(source) => source.to_vec(),
+        None => b"pickaxe block journal: network and payout".to_vec(),
+    };
+    context.extend(network.as_str().as_bytes());
+    context.extend(script);
+    hex::encode(double_sha256(&context))
+}
+
+#[cfg(test)]
+pub(super) fn legacy_binding(source: &[u8; 32], network: MiningNetwork, script: &[u8]) -> String {
+    binding(Some(source), network, script)
 }
 
 impl Journal {
@@ -57,14 +83,22 @@ impl Journal {
         path: &Path,
         network: MiningNetwork,
         payout: &str,
-        source: [u8; 32],
+        legacy_sources: &[[u8; 32]],
     ) -> Result<Self, String> {
-        let payout = config::validate_payout_address(network, payout)?;
-        let scripts = super::payout::scripts(network, &payout)?;
-        let mut context = source.to_vec();
-        context.extend(network.as_str().as_bytes());
-        context.extend(&scripts[0]);
-        let context = hex::encode(double_sha256(&context));
+        let payout = config::validate_coinbase_address(network, payout)?;
+        let scripts = super::payout::scripts(network, &payout, None)?;
+        // #### PR #40
+        // What: the journal belongs to its network and payout, no longer to
+        // the one node it was first written with.
+        // Why: with several nodes the server moves to the next when one stops
+        // answering, and it may start on its second node when the first is
+        // down; a journal bound to the first node refused to open then. Its
+        // blocks are whole blocks, valid at any node of the same network.
+        // A journal written under the old binding opens when its node is
+        // still configured (`legacy_sources`), and is rebound.
+        // Look here if: a journal is refused as another network's or
+        // payout's, or "a node that is no longer configured".
+        let context = binding(None, network, &scripts[0]);
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -87,6 +121,7 @@ impl Journal {
         config::restrict_private_config(&lock_path)
             .map_err(|_| "cannot protect block journal lock")?;
         regular_if_present(path)?;
+        let mut rebound = false;
         let state = if path.exists() {
             config::restrict_private_config(path).map_err(|_| "cannot protect block journal")?;
             let mut bytes = Vec::new();
@@ -98,11 +133,20 @@ impl Journal {
             if bytes.len() as u64 > MAX_FILE_BYTES {
                 return Err("block journal exceeds storage budget".into());
             }
-            let state: State = serde_json::from_slice(&bytes)
+            let mut state: State = serde_json::from_slice(&bytes)
                 .map_err(|_| "invalid block journal; refusing to replace it")?;
-            if state.version != 1 || state.context != context {
-                return Err("block journal belongs to another node, network or payout".into());
+            let legacy = legacy_sources
+                .iter()
+                .any(|source| state.context == binding(Some(source), network, &scripts[0]));
+            if state.version != 1 || (state.context != context && !legacy) {
+                return Err(
+                    "block journal belongs to another network or payout, or to a node that is \
+                     no longer configured"
+                        .into(),
+                );
             }
+            rebound = state.context != context;
+            state.context = context.clone();
             state
         } else {
             State {
@@ -114,14 +158,16 @@ impl Journal {
                 rejected: 0,
             }
         };
-        validate_state(&state, &scripts)?;
+        validate_state(&state, network, &scripts)?;
         let journal = Self {
             path: path.to_owned(),
             _lock: lock,
+            network,
+            payout,
             scripts,
             state,
         };
-        if !path.exists() {
+        if !path.exists() || rebound {
             journal.persist(&journal.state)?;
         }
         Ok(journal)
@@ -146,7 +192,14 @@ impl Journal {
             return Err("cannot journal a non-block share".into());
         }
         let bytes = share.template.block(&share.coinbase, share.header)?;
-        let hash = validate_block(&bytes, &self.scripts, Some(share.payout))?;
+        let miner = (share.miner != self.payout).then(|| share.miner.clone());
+        let scripts = block_scripts(
+            self.network,
+            &self.scripts,
+            miner.as_deref(),
+            share.operator.as_deref(),
+        )?;
+        let hash = validate_block(&bytes, &scripts, Some(share.payout))?;
         if self.state.completed.contains(&hash) || self.state.pending.iter().any(|b| b.hash == hash)
         {
             return Ok(false);
@@ -156,6 +209,8 @@ impl Journal {
             hash,
             block: hex::encode(bytes),
             payout: Some(share.payout),
+            miner,
+            operator: share.operator.clone(),
         });
         // Existing entries were checked at load/enqueue. Do not hash every
         // stored full block again while another device waits to journal work.
@@ -248,7 +303,35 @@ fn regular_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
-fn validate_state(state: &State, scripts: &[Vec<u8>; 2]) -> Result<(), String> {
+/// #### PR #40
+/// The recipients a recorded block pays: the configured payout and the
+/// donation, or in a public pool the block's own miner, plus any fee address.
+fn block_scripts(
+    network: MiningNetwork,
+    configured: &[Vec<u8>],
+    miner: Option<&str>,
+    operator: Option<&str>,
+) -> Result<Vec<Vec<u8>>, String> {
+    match (miner, operator) {
+        (None, None) => Ok(configured.to_vec()),
+        (Some(miner), operator) => super::payout::scripts(network, miner, operator),
+        (None, Some(operator)) => {
+            let mut scripts = configured.to_vec();
+            scripts.extend(
+                super::payout::scripts(network, operator, None)?
+                    .into_iter()
+                    .take(1),
+            );
+            Ok(scripts)
+        }
+    }
+}
+
+fn validate_state(
+    state: &State,
+    network: MiningNetwork,
+    scripts: &[Vec<u8>],
+) -> Result<(), String> {
     validate_limits(state)?;
     let mut seen = std::collections::HashSet::new();
     for hash in &state.completed {
@@ -270,7 +353,13 @@ fn validate_state(state: &State, scripts: &[Vec<u8>; 2]) -> Result<(), String> {
             return Err("pending blocks exceed journal storage budget".into());
         }
         let bytes = hex::decode(&pending.block).map_err(|_| "invalid journal block encoding")?;
-        if validate_block(&bytes, scripts, pending.payout)? != pending.hash
+        let scripts = block_scripts(
+            network,
+            scripts,
+            pending.miner.as_deref(),
+            pending.operator.as_deref(),
+        )?;
+        if validate_block(&bytes, &scripts, pending.payout)? != pending.hash
             || !seen.insert(pending.hash.clone())
         {
             return Err("invalid or duplicate journal block".into());
@@ -296,7 +385,7 @@ fn validate_limits(state: &State) -> Result<(), String> {
 
 fn validate_block(
     bytes: &[u8],
-    scripts: &[Vec<u8>; 2],
+    scripts: &[Vec<u8>],
     payout: Option<BchPayout>,
 ) -> Result<String, String> {
     if bytes.len() > MAX_BLOCK_BYTES {

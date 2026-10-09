@@ -133,12 +133,83 @@ reject counts.
 
 "Device says", Temp and Fan are the device's own report. Every 15 seconds
 Pickaxe asks each connected device on the local network (private, link-local,
-100.64.0.0/10 and IPv6 local addresses, never a public address) with read-only
-commands: the CGMiner API's `summary` and `estats` on port 4028 (Avalon and most
-SHA-256 miners) or Bitaxe's `/api/system/info`. It shows the device's 5-minute
-rate when reported, its hottest temperature and its fan speed. Each device gets
-three seconds per report. Device addresses are used only for these queries and
-never appear in the dashboard or JSON; no device setting is changed.
+100.64.0.0/10 and IPv6 local addresses, never a public address), all devices
+in parallel, from two sources:
+
+- [asic-rs](https://github.com/256foundation/asic-rs) (256 Foundation,
+  Apache-2.0) identifies the make, model and firmware once and reads each
+  device's own API: Antminer, Whatsminer, Avalon, Bitaxe, NerdAxe, Braiins OS,
+  Vnish, LuxOS, ePIC, Auradine and more. It supplies the model, firmware and
+  power draw, and the rate, temperature and fans for makes Pickaxe's own reader
+  does not know.
+- Pickaxe's own read-only reader (the CGMiner API's `summary` and `estats` on
+  port 4028, or Bitaxe's `/api/system/info`, three seconds per device) leads
+  where it is closer to the device's own app: the 5-minute rate (asic-rs reads
+  Avalon's 1-minute rate), the hottest temperature, the fan as the device
+  states it, and Avalon Nano power (asic-rs reads the Nano's input voltage,
+  27.56 V, as 2,756 W). It also answers alone for a device asic-rs cannot
+  identify, which is asked again after five minutes.
+
+Pool settings (their worker names are often payout addresses), MAC
+addresses, serial numbers and host names are never collected. Device
+addresses are used only for these queries and never appear in the dashboard
+or JSON. The overview page (Tab) shows each device's model and power.
+
+The setup screen starts the same server: choose ASIC, then "BCH + all
+merge-mined tokens", and set a payout address and your BCH node. It listens on
+the local network (SV1 on port 3333, SV2 on 3336) and the workers page shows
+this computer's address to point devices at, and names each device by the
+worker name its owner set (`rig1`, or `rig1` in `ADDRESS.rig1`; an address
+alone is never shown); `i` opens Connection info, with
+every address (your network and Tailscale), SV1 for stock firmware and SV2
+with the authority key in the address (`stratum2+tcp://HOST:3336/KEY`), each
+ready to copy. SV1 has no encryption, so use it on a trusted network.
+
+Your BCH node: the setup's BCH node list looks for Bitcoin Cash Node on this
+computer (`127.0.0.1:8332` on mainnet, `127.0.0.1:48332` on Chipnet) and offers
+it with its version and sync height; Enter saves it. BCHN answers once its
+`bitcoin.conf` has `server=1` (and `chipnet=1` for Chipnet). With no
+`rpcpassword` set, BCHN writes a login cookie at every start and Pickaxe reads
+it from BCHN's default folder (`%APPDATA%\Bitcoin` on Windows, `~/.bitcoin` or
+the service's `/var/lib/bitcoind` on Linux, `~/Library/Application
+Support/Bitcoin` on macOS, with `chipnet` inside it for Chipnet), so no
+password is needed; `PICKAXE_NODE_RPC_COOKIE` names a cookie file elsewhere. A
+node on another computer needs its RPC login in the address
+(`http://USER:PASSWORD@HOST:PORT`) or in `PICKAXE_NODE_RPC_USER` and
+`PICKAXE_NODE_RPC_PASSWORD`. `check-node`, the dashboard and `watch` show the
+node's client and version, and a node that cannot be used is named with its
+reason, such as a refused login or a node still synchronizing.
+
+Several nodes: add more to the node list (node1, node2, …). The server starts
+on the first that gives a synchronized template and moves to the next, in
+order, whenever its node gives none; it tries the new node at once, and the
+failed one waits at the back of the list. The dashboard and `watch` show
+"node 2 of 3" and the status counts the moves. Found blocks are saved whole,
+so a block waiting for a reply goes to whichever node is in use. The block
+journal belongs to the network and payout, not to one node, so the server
+also starts when its first node is down; a journal written by an older
+build opens while its node is still configured.
+
+On the workers page, `c` opens controls for the top row's device, with its
+model, firmware and power. It lists what that make and firmware support
+through asic-rs (Restart, Pause and Resume mining, blink or stop blinking its
+light to find it) plus one work level down or up on Avalon (Pickaxe's own
+Canaan `ascset worklevel` commands, within the device's own range; asic-rs's
+power limit is in watts, which Avalon work levels are not). A device asic-rs
+has not identified offers Pickaxe's own Restart (Canaan's `ascset` reboot or
+Bitaxe's restart endpoint) and work levels. Each action needs a confirmation,
+goes only to a device on the local network, and shows the device's reply. The
+read-only `watch` view has no controls.
+
+A server running without a screen, for example as a service with
+`--no-tui --json`, saves the same status once a second beside its config
+(`chipnet.sv2-status.json` for `chipnet.json`). On that machine,
+`stratum-v2 watch` with the same network flag and `--config` shows the
+server's workers table, read-only: it never connects to the server or changes
+anything, and `q` leaves the server running. The status file holds no payout
+addresses or credentials; reading a service's state directory may need
+`sudo`. The header shows "Server not updating" when the saved status is older
+than five seconds.
 
 The dashboard also shows the public authority key that devices must pin. Its
 private key is created beside the config as `chipnet.sv2-key`, protected with
@@ -156,11 +227,76 @@ The adapter's connection to the local SV2 server is encrypted and pins its key.
 It supports version-mask negotiation, subscribe/authorize in either order,
 and forwards success only after upstream share validation. Node block acceptance
 is reported separately. Jobs, pending replies, input size and setup/partial-I/O
-time are bounded. The initial adapter handles one extended channel per device
-and the server's immediate acknowledgements; it is not a general upstream pool
-translator. Avalon Nano 3 has been tested; Antminer and native Bitaxe SV2
-validation remain pending. Each listener currently caps connections at 64;
-this is not a claim of 1,000-device capacity.
+time are bounded. The adapter handles one extended channel per device. Avalon
+Nano 3 has been tested; Antminer and native Bitaxe SV2 validation remain
+pending. Each listener currently caps connections at 64; this is not a claim
+of 1,000-device capacity.
+
+### Pool mode: SV1 devices at a remote SV2 pool
+
+Solo mining on your own node stays the default. To mine at a Stratum V2 pool
+instead, such as another Pickaxe server or a BCH SV2 pool, give the pool's
+address and authority key:
+
+```text
+pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
+  --upstream POOL-HOST:PORT --upstream-key POOL-AUTHORITY-KEY [--upstream-user IDENTITY] \
+  [--upstream BACKUP-HOST:PORT --upstream-key BACKUP-AUTHORITY-KEY ...]
+```
+
+Repeat `--upstream` and `--upstream-key`, in the same order, for backup pools.
+A pool's one-line SV2 address carries its key, so `--upstream
+stratum2+tcp://HOST:PORT/KEY` needs no `--upstream-key`; the setup's Pool row
+takes the same line and fills the key. An SV1 pool address
+(`stratum+tcp://…`) is refused: Pickaxe joins SV2 pools only and translates
+SV1 for the devices on this side.
+Each device takes the first pool that completes the handshake, the setup and
+the channel, so a pool that is down, or one whose certificate fails, is
+skipped; a device that reconnects starts again from the first pool. All pools
+share the identity. If every pool fails, the device's row shows the last
+pool's reason.
+
+No node runs and no SV2 listener opens; SV1 devices point at
+`stratum+tcp://LAN-IP:3333` as usual. Each device gets its own encrypted SV2
+connection to the pool, pinned to the pool's key, and an extended channel opened
+with `--upstream-user`: an account or worker name, or for a solo pool your
+payout address with an optional `.worker` suffix. Without `--upstream-user` it
+is the configured payout address. The identity is never printed or saved in
+the status file. The channel declares 1 TH/s, and pools set their first
+difficulty from that.
+
+Pools may acknowledge shares in batches, so in pool mode a device gets its
+reply once the adapter has checked and forwarded the share, and the workers
+page counts the pool's own verdicts as they arrive. A pool that changes a
+channel's extranonce or asks for a reconnect closes that device's connection,
+and the device reconnects for a new channel. A pool must allocate at least
+eight miner extranonce bytes per channel; the adapter gives each device four
+bytes of its own as extranonce1 and lets it roll four as extranonce2, and puts
+the pool's channel prefix into the coinbase part the device receives.
+
+The donation applies in pool mode too, as mining time: since the pool builds
+the blocks, Pickaxe cannot add a coinbase output, so the whole BCH donation
+setting (1.5% by default, 0% to 100% in Advanced settings or `--donation`) is
+that share of each device's mining time, mined at the same pool under the
+donation address on a second channel. A 10-minute cycle per device decides
+which channel feeds it (9 seconds at 1.5%); a switch sends the channel's
+difficulty and a clean job, so the device never reconnects or falls back to
+its own backup pools. At 0% no donation channel is opened. A pool that refuses
+the second channel, for example one whose usernames are accounts rather than
+addresses, keeps the device mining on its own channel, and the workers page
+shows why. Native SV2 devices such as Bitaxe can connect to SV2 pools
+themselves.
+
+Evidence, 2026-10-08: Pickaxe's own server as the pool, over TCP with Noise
+and a host name (two blocks mined, both counted by the adapter), and SoloFury's
+BTC SV2 endpoint, read-only with a throwaway identity: setup accepted, extended
+channel opened with a 4-byte extranonce prefix and 8-byte extranonce2,
+difficulty 1024, and a first job delivered to an SV1 device stand-in.
+SoloFury's BCH SV2 endpoints run CashStratum, which signs its certificate with
+format version 1; the SV2 spec requires 0 and requires clients to refuse other
+versions, so Pickaxe reports "upstream certificate version is not SV2's" there
+until CashStratum fixes it
+([cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3)).
 
 The full-template provider checks network, synchronization, tip identity,
 CTOR, transaction bytes/IDs, header target and adaptive block size. It revokes
@@ -205,7 +341,10 @@ use synthetic solved blocks; actual node/ASIC evidence is recorded separately.
 
 Each device starts at share difficulty 4096. Vardiff (SRI's reference rules)
 then moves it toward about 20 shares a minute, for 1 TH/s miners and 1 PH/s
-ones alike, with a floor equal to 1 MH/s. A new target is sent as SetTarget and
+ones alike, with a floor equal to 1 MH/s. Like ckpool and P2Poolv2, it acts
+only on enough evidence (72 shares, four minutes, or a silent minute) and
+ignores changes under 25%, which are share luck, so the difficulty does not
+jump on a short run of lucky shares. A new target is sent as SetTarget and
 at once as a fresh job on the same template, so SV1 firmware receives
 `set_difficulty` and a notify that keeps work in flight. When the network has
 easier work, the device's target follows it down so firmware does not discard

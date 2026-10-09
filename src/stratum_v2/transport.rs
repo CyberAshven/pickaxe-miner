@@ -51,9 +51,18 @@ impl Session {
             write_until(&mut stream, message.payload(), Instant::now() + IO_TIMEOUT)?;
             let mut reply = [0; INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE];
             read_until(&mut stream, &mut reply, Instant::now() + IO_TIMEOUT)?;
-            handshake
-                .step_2(reply)
-                .map_err(|_| "SV2 authority authentication failed".to_owned())
+            handshake.step_2(reply).map_err(|error| match error {
+                // #### PR #40
+                // Name a certificate whose format version is not SV2's 0:
+                // SoloFury's BCH endpoints sent version 1 on 2026-10-08, and
+                // the spec requires refusing it, so the user sees why.
+                stratum_core::codec_sv2::Error::NoiseSv2Error(
+                    stratum_core::noise_sv2::Error::InvalidCertificate(certificate),
+                ) if certificate.version != stratum_core::noise_sv2::CERTIFICATE_VERSION => {
+                    "SV2 certificate version unsupported".to_owned()
+                }
+                _ => "SV2 authority authentication failed".to_owned(),
+            })
         })();
         match result {
             Ok(state) => Self::from_transport(stream, state),

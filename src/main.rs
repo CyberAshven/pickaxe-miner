@@ -5,8 +5,8 @@
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 use pickaxe_miner::{
-    backend, benchmark, cli, config, electrum, mining_lock, node, rigs, runtime, search, self_test,
-    stratum_v2, telemetry, tui, tx,
+    backend, benchmark, cli, config, electrum, mine_watch, mining_lock, node, reach, rigs, runtime,
+    search, self_test, stratum_v2, telemetry, tui, tx,
 };
 
 use config::RuntimeConfig;
@@ -1106,9 +1106,22 @@ fn run_headless_mining(
     json: bool,
     use_tui: bool,
     rigs: Option<rigs::RigHub>,
+    status_file: Option<std::path::PathBuf>,
 ) -> Result<Option<SessionSettings>, String> {
     cfg.ensure_mining_supported()?;
-    let _gpu_lock = mining_lock::acquire_gpu_lock()?;
+    // #### PR #40
+    // What: a coordinator with no GPU of its own (`--rigs-only`, or Run a
+    // pool, GPU pool) does not take the GPU lock.
+    // Why: the lock keeps two miners off the same GPUs; such a coordinator uses
+    // none, and taking it stopped a farm's coordinator from running on a PC
+    // that also mines.
+    // Look here if: two processes mine the same GPU (only a process with GPUs
+    // takes the lock).
+    let _gpu_lock = if gpus.is_empty() && rigs.is_some() {
+        None
+    } else {
+        Some(mining_lock::acquire_gpu_lock()?)
+    };
     // Cache device information before the live miner starts so `/devices` never
     // probes drivers or creates temporary GPU contexts in the mining hot path.
     // A coordinator with no GPU (`--rigs-only`) never loads a GPU driver.
@@ -1160,6 +1173,10 @@ fn run_headless_mining(
         if last_status.elapsed() >= Duration::from_secs(1) {
             print_runtime_snapshot(&snapshot, json);
             let _ = std::io::stdout().flush();
+            // #### PR #40: saved for `pickaxe watch`, without the payout.
+            if let Some(path) = &status_file {
+                mine_watch::save(path, &runtime_snapshot_json(&snapshot));
+            }
             last_status = Instant::now();
         }
         thread::sleep(Duration::from_millis(50));
@@ -1208,6 +1225,40 @@ fn persist_session_profile(
 // a shell must not pause on errors.
 #[cfg(not(windows))]
 const TERMINAL_RELAUNCH_ENV: &str = "PICKAXE_TERMINAL_LAUNCHED";
+
+/// #### PR #32 / #40
+/// Mines as a rig of the given coordinators (from `--coordinator`, or the
+/// setup's Join a GPU pool or farm) until stopped. A public GPU pool claims
+/// the rig's wins to its payout.
+fn run_as_rig(
+    coordinators: &[(String, String)],
+    name: Option<&str>,
+    payout: &str,
+    gpus: &[backend::GpuDevice],
+    intensity: u8,
+    json: bool,
+) {
+    let result = (|| {
+        let _gpu_lock = mining_lock::acquire_gpu_lock()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&stop);
+        ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+            .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
+        rigs::run_rig(
+            coordinators,
+            name,
+            Some(payout).filter(|payout| !payout.trim().is_empty()),
+            gpus,
+            intensity,
+            json,
+            stop,
+        )
+    })();
+    if let Err(error) = result {
+        eprintln!("error: {error}");
+        exit_after_error(1);
+    }
+}
 
 /// Exits after an error, keeping a console opened just for the miner open.
 fn exit_after_error(code: i32) -> ! {
@@ -1340,7 +1391,14 @@ fn main() {
         }
     };
 
-    match args.command.unwrap_or(cli::Commands::Mine) {
+    match args.command.clone().unwrap_or(cli::Commands::Mine) {
+        // #### PR #40: the read-only view of a miner without a screen.
+        cli::Commands::Watch => {
+            if let Err(error) = mine_watch::run(&mine_watch::status_path(&config_path)) {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
+        }
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {
                 eprintln!("error: {error}");
@@ -1564,30 +1622,22 @@ fn main() {
                     .cloned()
                     .zip(args.coordinator_key.iter().cloned())
                     .collect();
-                let result = (|| {
-                    let _gpu_lock = mining_lock::acquire_gpu_lock()?;
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let signal = Arc::clone(&stop);
-                    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
-                        .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
-                    rigs::run_rig(
-                        &coordinators,
-                        args.rig_name.as_deref(),
-                        // #### PR #32: a public GPU pool pays the rig's own.
-                        Some(cfg.payout_address.as_str())
-                            .filter(|payout| !payout.trim().is_empty()),
-                        &selected_gpus,
-                        cfg.intensity,
-                        args.json,
-                        stop,
-                    )
-                })();
-                if let Err(error) = result {
-                    eprintln!("error: {error}");
-                    exit_after_error(1);
-                }
+                run_as_rig(
+                    &coordinators,
+                    args.rig_name.as_deref(),
+                    &cfg.payout_address,
+                    &selected_gpus,
+                    cfg.intensity,
+                    args.json,
+                );
                 return;
             }
+            // #### PR #32 / #40: the rig hub's settings, from the flags or
+            // from the setup's Run a pool → GPU pool.
+            let mut rigs_listen = args.rigs_listen;
+            let mut rigs_public = args.rigs_public;
+            let mut rigs_fee = args.rigs_fee;
+            let mut rigs_fee_address = args.rigs_fee_address.clone();
             let (cfg, gpus, profile_name) = match startup {
                 MineStartup::InteractiveSetup => {
                     // Setup lists each physical GPU once, numbered as
@@ -1663,23 +1713,123 @@ fn main() {
                             exit_after_error(1);
                         }
                     };
-                    (setup.config, setup.gpus, Some(setup.profile_name))
+                    // #### PR #40
+                    // Run a pool → GPU pool: this computer coordinates the
+                    // pool's rigs on every interface (port 3340) with no GPU
+                    // of its own, as `--rigs-listen 0.0.0.0:3340 --rigs-only
+                    // --rigs-public` would.
+                    // #### PR #40: Join a GPU pool or farm: these GPUs mine as a
+                    // rig of its coordinator, as `--coordinator` does.
+                    if let Some(tui::ServerSetup::JoinGpuPool { address, key }) =
+                        setup.server.clone()
+                    {
+                        println!(
+                            "Mining as a rig of {address} on {} GPU(s); Ctrl+C stops.",
+                            setup.gpus.len()
+                        );
+                        run_as_rig(
+                            &[(address, key)],
+                            None,
+                            &setup.config.payout_address,
+                            &setup.gpus,
+                            setup.config.intensity,
+                            false,
+                        );
+                        return;
+                    }
+                    if let Some(tui::ServerSetup::GpuPool { fee, address }) = setup.server.clone() {
+                        rigs_listen = Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3340)));
+                        rigs_public = true;
+                        rigs_fee = Some(fee);
+                        rigs_fee_address = address;
+                        (setup.config, Vec::new(), Some(setup.profile_name))
+                    } else {
+                        // #### PR #40
+                        // ASIC mode from setup runs the BCH ASIC server for devices
+                        // on the local network (SV1 on 3333, SV2 on 3336): solo
+                        // on the miner's node, at someone's pool, or as a public
+                        // pool for other miners.
+                        if let Some(server) = setup.server.clone() {
+                            let mut pool_tag = None;
+                            let (
+                                upstream,
+                                upstream_key,
+                                public,
+                                pool_fee,
+                                pool_fee_mode,
+                                pool_fee_address,
+                            ) = match server {
+                                tui::ServerSetup::Solo => {
+                                    (Vec::new(), Vec::new(), false, None, None, None)
+                                }
+                                tui::ServerSetup::JoinPool { address, key } => {
+                                    (vec![address], vec![key], false, None, None, None)
+                                }
+                                tui::ServerSetup::Public {
+                                    fee,
+                                    mode,
+                                    address,
+                                    tag,
+                                } => {
+                                    pool_tag = tag;
+                                    (Vec::new(), Vec::new(), true, Some(fee), Some(mode), address)
+                                }
+                                // Started above, as a GPU coordinator or rig.
+                                tui::ServerSetup::GpuPool { .. }
+                                | tui::ServerSetup::JoinGpuPool { .. } => unreachable!(),
+                            };
+                            let action = cli::StratumV2Command::Serve {
+                                listen: std::net::SocketAddr::from(([0, 0, 0, 0], 3336)),
+                                sv1_listen: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3333))),
+                                donation: None,
+                                upstream,
+                                upstream_key,
+                                upstream_user: None,
+                                public,
+                                pool_fee,
+                                pool_fee_mode,
+                                pool_fee_address,
+                                pool_tag,
+                                start_difficulty: None,
+                            };
+                            #[cfg(feature = "stratum-v2")]
+                            let result = stratum_v2::command::run(
+                                action,
+                                &setup.config,
+                                &config_path,
+                                false,
+                                false,
+                            );
+                            #[cfg(not(feature = "stratum-v2"))]
+                            let result: Result<(), String> = {
+                                let _ = action;
+                                Err("this build does not include Stratum V2; build with --features stratum-v2"
+                                .into())
+                            };
+                            if let Err(error) = result {
+                                eprintln!("error: {error}");
+                                exit_after_error(1);
+                            }
+                            return;
+                        }
+                        (setup.config, setup.gpus, Some(setup.profile_name))
+                    }
                 }
                 MineStartup::Direct => (cfg, selected_gpus, None),
             };
             let use_tui = !(args.no_tui || args.json);
             // #### PR #32
             // --rigs-listen makes this miner the coordinator its rigs follow.
-            let rig_hub = match args.rigs_listen {
+            let rig_hub = match rigs_listen {
                 None => None,
                 Some(listen) => {
                     match rigs::RigHub::start(listen, &config_path.with_extension("rigs-key")) {
                         Ok(hub) => {
                             // #### PR #32: a public GPU pool.
-                            if args.rigs_public {
+                            if rigs_public {
                                 let address = match config::validate_payout_address(
                                     cfg.network,
-                                    args.rigs_fee_address
+                                    rigs_fee_address
                                         .as_deref()
                                         .unwrap_or(cfg.payout_address.as_str()),
                                 ) {
@@ -1690,18 +1840,41 @@ fn main() {
                                     }
                                 };
                                 hub.set_public(Some(rigs::PublicRigs {
-                                    fee_bps: args.rigs_fee.map_or(0, u16::from),
+                                    fee_bps: rigs_fee.map_or(0, u16::from),
                                     address,
                                 }));
                             }
+                            // #### PR #40: where rigs reach this coordinator.
+                            let interfaces = reach::Interfaces::detect();
+                            let connect: Vec<_> = hub
+                                .listen()
+                                .parse()
+                                .map(|listen| reach::addresses(listen, interfaces))
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(place, address)| {
+                                    serde_json::json!({
+                                        "place": place.label(),
+                                        "address": address.to_string(),
+                                    })
+                                })
+                                .collect();
                             println!(
                                 "{}",
                                 serde_json::json!({
                                     "event": "rigs",
                                     "listen": hub.listen(),
                                     "coordinator_key": hub.key(),
+                                    "connect": connect,
                                 })
                             );
+                            if !args.json && !use_tui {
+                                for (place, command) in
+                                    rigs::join_lines(&hub.summary(), cfg.network, interfaces)
+                                {
+                                    println!("rigs join ({}): {command}", place.label());
+                                }
+                            }
                             Some(hub)
                         }
                         Err(error) => {
@@ -1711,7 +1884,8 @@ fn main() {
                     }
                 }
             };
-            match run_headless_mining(cfg, &gpus, args.json, use_tui, rig_hub) {
+            let status_file = (!use_tui).then(|| mine_watch::status_path(&config_path));
+            match run_headless_mining(cfg, &gpus, args.json, use_tui, rig_hub, status_file) {
                 Ok(Some(session)) => {
                     if let Some(name) = profile_name {
                         if let Err(error) = persist_session_profile(&profiles_path, &name, &session)

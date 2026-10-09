@@ -2638,10 +2638,7 @@ impl RuntimeSupervisor {
             None,
             ReconnectPreference::RotateAway,
         );
-        let mut session = ElectrumSession::connect_failover_for_deployment(
-            &endpoints,
-            cfg.token.photon_deployment(cfg.network),
-        )?;
+        let mut session = connect_job_source(&cfg, &endpoints, None)?;
         let journal_path = submission_journal_path(cfg.network);
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
         let mut initial = session.fetch_live_job()?;
@@ -3163,18 +3160,16 @@ fn run_supervisor(
                     Some(&active_fulcrum_endpoint),
                     reconnect_preference,
                 );
-                let reconnect_result = if endpoints.is_empty() {
-                    Err(
-                        "no eligible Fulcrum source is currently available under source policy"
-                            .to_string(),
-                    )
-                } else {
-                    ElectrumSession::connect_failover_for_deployment(
-                        &endpoints,
-                        cfg.token.photon_deployment(cfg.network),
-                    )
-                    .and_then(|mut next| next.fetch_live_job().map(|job| (next, job)))
-                };
+                let reconnect_result =
+                    if endpoints.is_empty() && cfg.custom_node_endpoints().is_empty() {
+                        Err(
+                            "no eligible Fulcrum source is currently available under source policy"
+                                .to_string(),
+                        )
+                    } else {
+                        connect_job_source(&cfg, &endpoints, Some(&live))
+                            .and_then(|mut next| next.fetch_live_job().map(|job| (next, job)))
+                    };
                 match reconnect_result {
                     Ok((next_session, next_job)) => {
                         let connected_endpoint = next_session.url.clone();
@@ -3959,6 +3954,56 @@ fn refresh_native_with_current_proof(
     }
 }
 
+/// #### PR #40
+/// What: the PHOTON job source. With a BCH node configured, the miner's own
+/// node comes first: it finds the baton in its UTXO set, follows it through
+/// its mempool and blocks, and sends the claims. The Fulcrum servers are used
+/// when no node is configured or none can give the PHOTON state.
+/// Why: mining is for nodes. Before, a node was trusted only after Fulcrum
+/// confirmed its view, so mining needed Fulcrum to start and stopped after a
+/// claim whenever Fulcrum was unreachable.
+/// Look here if: a miner with a node mines from Fulcrum (its node failed the
+/// scan or the RPC login; the error names it), or a node mines a stale baton.
+fn connect_job_source(
+    cfg: &RuntimeConfig,
+    fulcrum: &[String],
+    mining: Option<&LiveJob>,
+) -> Result<ElectrumSession, String> {
+    let deployment = cfg.token.photon_deployment(cfg.network);
+    let nodes: Vec<String> = cfg
+        .custom_node_endpoints()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if nodes.is_empty() {
+        return ElectrumSession::connect_failover_for_deployment(fulcrum, deployment);
+    }
+    // A baton to start from: the job being mined on a reconnect, or at start
+    // a Fulcrum server's answer, which the node checks for itself; without
+    // either the node scans its UTXO set.
+    let mut fallback = None;
+    let known = match mining {
+        Some(job) => Some(job.clone()),
+        None if fulcrum.is_empty() => None,
+        None => match ElectrumSession::connect_failover_for_deployment(fulcrum, deployment) {
+            Ok(mut session) => {
+                let job = session.fetch_live_job().ok();
+                fallback = Some(session);
+                job
+            }
+            Err(_) => None,
+        },
+    };
+    match ElectrumSession::connect_node_failover(&nodes, deployment, known.as_ref()) {
+        Ok(session) => Ok(session),
+        Err(node_error) => match fallback {
+            Some(session) => Ok(session),
+            None => ElectrumSession::connect_failover_for_deployment(fulcrum, deployment)
+                .map_err(|error| format!("{node_error}\n{error}")),
+        },
+    }
+}
+
 /// Refreshes the PHOTON job on the periodic source cadence.
 fn refresh_photon_job_on_cadence(
     cfg: &RuntimeConfig,
@@ -3967,6 +4012,16 @@ fn refresh_photon_job_on_cadence(
     native_session: &mut Option<crate::node::NativePhotonSession>,
     epoch: Instant,
 ) -> Result<PhotonBoundaryRefresh, String> {
+    // #### PR #40: on the miner's own node, its state is the job.
+    if canonical.is_node() {
+        *native_session = None;
+        return canonical
+            .fetch_live_snapshot()
+            .map(|snapshot| PhotonBoundaryRefresh {
+                job: snapshot.job,
+                route_warning: None,
+            });
+    }
     let now_ms = source_capability_now_ms(epoch);
     let canonical_started = Instant::now();
     let canonical_result = canonical.fetch_live_snapshot();

@@ -114,6 +114,13 @@ impl BchDonation {
         (u128::from(units) * u128::from(self.0)).div_ceil(30_000) as u64
     }
 
+    /// #### PR #40
+    /// The work share when the whole donation is work, as at a remote pool,
+    /// where Pickaxe cannot add a coinbase output: 1.5% at the default.
+    pub fn pool_work_units(self, units: u64) -> u64 {
+        (u128::from(units) * u128::from(self.0)).div_ceil(10_000) as u64
+    }
+
     /// The block-reward share: two thirds of the total (1% of each block
     /// reward at the 1.5% default). Any fractional satoshi stays with the
     /// miner.
@@ -130,28 +137,155 @@ impl BchDonation {
     }
 }
 
+/// #### PR #40
+/// Where a public pool's operator takes its fee from: the coinbase of every
+/// block, the mining work, or both (one third work, two thirds coinbase, the
+/// donation's own split).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeeMode {
+    Coinbase,
+    Work,
+    Both,
+}
+
+impl FromStr for FeeMode {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "coinbase" => Ok(Self::Coinbase),
+            "work" => Ok(Self::Work),
+            "both" | "hybrid" => Ok(Self::Both),
+            _ => Err("use coinbase, work or both".into()),
+        }
+    }
+}
+
+impl fmt::Display for FeeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Coinbase => "coinbase",
+            Self::Work => "work",
+            Self::Both => "both",
+        })
+    }
+}
+
+/// #### PR #40
+/// A public pool operator's fee, in hundredths of a percent of what is left
+/// after the Pickaxe donation: the donation is taken in full first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolFee {
+    pub rate: BchDonation,
+    pub mode: FeeMode,
+}
+
+impl PoolFee {
+    /// The work share of `units` of work left after the donation's.
+    pub fn work_units(self, units: u64) -> u64 {
+        match self.mode {
+            FeeMode::Coinbase => 0,
+            FeeMode::Work => self.rate.pool_work_units(units),
+            FeeMode::Both => self.rate.work_units(units),
+        }
+    }
+
+    /// The coinbase share of `units` of reward left after the donation's;
+    /// any fractional satoshi stays with the miner.
+    pub fn reward_units(self, units: u64) -> u64 {
+        match self.mode {
+            FeeMode::Coinbase => {
+                (u128::from(units) * u128::from(u16::from(self.rate)) / 10_000) as u64
+            }
+            FeeMode::Work => 0,
+            FeeMode::Both => self.rate.reward_units(units),
+        }
+    }
+}
+
 /// Immutable policy attached to a job and its durable solved-block record.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BchPayout {
     pub donation: BchDonation,
     pub donation_work: bool,
+    /// #### PR #40: a public pool's fee, and whether this job is its work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<PoolFee>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fee_work: bool,
 }
 
 impl BchPayout {
-    pub fn amounts(self, reward: u64) -> [u64; 2] {
-        let donation = if self.donation_work {
-            reward
-        } else {
-            self.donation.reward_units(reward)
-        };
-        [reward - donation, donation]
+    /// The miner's, the donation's and the pool operator's amounts. The
+    /// donation comes off first; the operator's fee comes off what is left.
+    pub fn amounts(self, reward: u64) -> [u64; 3] {
+        if self.donation_work {
+            return [0, reward, 0];
+        }
+        if self.fee_work {
+            return [0, 0, reward];
+        }
+        let donation = self.donation.reward_units(reward);
+        let left = reward - donation;
+        let fee = self.fee.map_or(0, |fee| fee.reward_units(left));
+        [left - fee, donation, fee]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #40
+    #[test]
+    fn a_pool_fee_comes_off_what_the_donation_leaves() {
+        let donation: BchDonation = "1.5".parse().unwrap();
+        let fee = |mode| PoolFee {
+            rate: "2".parse().unwrap(),
+            mode,
+        };
+        let reward = 312_500_000;
+        let payout = |fee| BchPayout {
+            donation,
+            fee: Some(fee),
+            ..BchPayout::default()
+        };
+        // Coinbase: 1% of the reward to the donation, then 2% of the rest.
+        let [miner, given, taken] = payout(fee(FeeMode::Coinbase)).amounts(reward);
+        assert_eq!(given, 3_125_000);
+        assert_eq!(taken, 6_187_500);
+        assert_eq!(miner + given + taken, reward);
+        // Work: no coinbase fee; the operator's work jobs pay it in full.
+        assert_eq!(payout(fee(FeeMode::Work)).amounts(reward)[2], 0);
+        let work_job = BchPayout {
+            fee_work: true,
+            ..payout(fee(FeeMode::Work))
+        };
+        assert_eq!(work_job.amounts(reward), [0, 0, reward]);
+        // Both: two thirds of the fee from the coinbase, a third as work.
+        assert_eq!(payout(fee(FeeMode::Both)).amounts(reward)[2], 4_125_000);
+        assert_eq!(fee(FeeMode::Both).work_units(30_000), 200);
+        assert_eq!(fee(FeeMode::Work).work_units(10_000), 200);
+        assert_eq!(fee(FeeMode::Coinbase).work_units(10_000), 0);
+        // A donation work job pays the donation in full, fee or not.
+        let donation_job = BchPayout {
+            donation_work: true,
+            ..payout(fee(FeeMode::Coinbase))
+        };
+        assert_eq!(donation_job.amounts(reward), [0, reward, 0]);
+        // Old journal records without a fee still read.
+        let old: BchPayout =
+            serde_json::from_str(r#"{"donation":150,"donation_work":false}"#).unwrap();
+        assert_eq!(old.fee, None);
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"donation":150,"donation_work":false}"#
+        );
+        assert_eq!("hybrid".parse::<FeeMode>().unwrap(), FeeMode::Both);
+        assert!("half".parse::<FeeMode>().is_err());
+    }
 
     #[test]
     fn each_network_donates_to_its_own_address_through_the_shared_guard() {
@@ -214,11 +348,13 @@ mod tests {
                     let split = BchPayout {
                         donation,
                         donation_work,
+                        ..BchPayout::default()
                     }
                     .amounts(value);
                     assert_eq!(split[0] + split[1], value);
+                    assert_eq!(split[2], 0);
                     if donation_work {
-                        assert_eq!(split, [0, value]);
+                        assert_eq!(split, [0, value, 0]);
                     }
                 }
             }

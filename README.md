@@ -2,13 +2,34 @@
 
 ![Pickaxe Miner](docs/assets/pickaxe-miner-logo.png)
 
-Rust-first, GPU-only miner for CashTokens on Bitcoin Cash.
+Rust-first miner for Bitcoin Cash: CashTokens on GPUs and BCH on ASICs, solo,
+in farms and in pools.
+
+## What do you want to do?
+
+Run `pickaxe` for the setup, or use the command line.
+
+| You want to | In the setup | Command line | More |
+|---|---|---|---|
+| Mine PHOTON on your GPUs | GPU mining | `pickaxe mine --address <yours>` | [Quick start](#quick-start-mainnet-tui) |
+| Mine with GPUs on many machines | GPU mining; rigs: Join a GPU pool or farm | coordinator `--rigs-listen 0.0.0.0:3340`, rigs `--coordinator HOST:3340 --coordinator-key KEY` | [docs/farm.md](docs/farm.md) |
+| Join someone's GPU pool | GPU mining, Join a GPU pool or farm | `pickaxe mine --coordinator HOST:3340 --coordinator-key KEY --address <yours>` | [docs/farm.md](docs/farm.md) |
+| Run a GPU pool | Run a pool, GPU pool | `pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --rigs-public --rigs-fee 2 --address <yours>` | [docs/pool.md](docs/pool.md#a-public-gpu-pool) |
+| Mine BCH solo with your ASICs | ASIC mining, Solo | `pickaxe stratum-v2 serve` (your BCH node) | [docs/stratum-v2.md](docs/stratum-v2.md) |
+| Point your ASICs at a pool | ASIC mining, Join a pool | `pickaxe stratum-v2 serve --sv1-listen 0.0.0.0:3333 --upstream stratum2+tcp://HOST:PORT/KEY` | [docs/stratum-v2.md](docs/stratum-v2.md) |
+| Run a BCH pool for others | Run a pool, ASIC pool | `pickaxe stratum-v2 serve --public --pool-fee 2 --pool-tag /MyPool/` | [docs/pool.md](docs/pool.md) |
+
+A server or coordinator shows where devices and rigs connect on its
+dashboard (`i` or `I`, Connection info), ready to copy, for your network and,
+with [Tailscale](https://tailscale.com), from anywhere. Mining BCH needs a
+BCH node (Fulcrum cannot build blocks); PHOTON uses yours when you have one
+and public Fulcrum servers when you do not.
 
 ## Scope
 
 Pickaxe Miner first candidate is PHOTON which is live covenant and CashToken baton it is the first minable CashToken in the BCH network: the baton outpoint, NFT commitment, token amount, and PHOTON target. BCH `getblocktemplate` and `getblocktemplatelight` are not a mining job source.
 
-Fulcrum/Electrum discovers the indexed baton. Native node RPC is used for chain validation and raw transaction broadcast.
+With a BCH node in your settings, PHOTON jobs come from your own node: it finds the baton in its UTXO set (a one-time scan, a minute or two on mainnet), follows it through its mempool and blocks, and sends your claims; no transaction index is needed and a pruned node works. Without a node, or when it cannot give the PHOTON state, the public Fulcrum servers do the same. BCH (ASIC) mining always needs a node: Fulcrum cannot build or submit blocks.
 
 Mainnet and Chipnet run the PHOTON v3.2 contract (mainnet category `53bd86e3f123918d2d7040449f88f7ed1bbddc309b66f2ac67cd429278f5ea58`). The retired PHOTON v0 is no longer mined; releases before v0.0.3 mine only v0.
 
@@ -20,6 +41,26 @@ steps, with `stratum-v2 serve --donation <percent>` or in the dashboard's
 **Advanced settings** (`a`); changes are saved. Shown percentages are rounded
 up to two decimals. Other assets keep their own donation policies. Actual
 rewards depend on which work wins.
+
+The ASIC server's workers page shows each device's own report and offers
+confirmed controls (restart, pause, resume, blink its light to find it, Avalon
+work levels) for most makes, through [asic-rs](https://github.com/256foundation/asic-rs).
+With `--upstream`, it sends SV1 devices to a remote Stratum V2 pool instead of
+your own node, with backup pools in order; there the pool builds the blocks,
+so the donation is that share of mining time at the pool. See [docs/stratum-v2.md](docs/stratum-v2.md).
+
+### For pool operators
+
+Run a public BCH pool with Pickaxe: SV1 and SV2 miners connect with their own
+payout address, and the blocks they find pay them directly in the coinbase, so
+the pool holds no one's money. You choose your fee and where it comes from (the
+coinbase, mining work, or both) and the address it goes to, including a
+multisig; miners can see every fee in the coinbase. `stratum-v2 serve --public
+--pool-fee 2 --pool-fee-address <address>`; see [docs/pool.md](docs/pool.md).
+Run a pool also starts a GPU pool, where each rig mines for its own address and
+your fee is a share of mining time. Press `i` on the dashboard for Connection
+info: the addresses (and, for rigs, the command) miners copy, for your network
+and, with [Tailscale](https://tailscale.com), from anywhere.
 
 ## Supported platforms
 
@@ -89,7 +130,7 @@ Your other machines can mine as rigs of one coordinator, so they never compete f
 | The coordinator | your usual `mine` command plus `--rigs-listen 0.0.0.0:3340`; add `--rigs-only` for a coordinator that uses no GPU, on any computer |
 | Each rig | `pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key>`, optionally `--rig-name <name>` |
 
-The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. Repeat `--coordinator` and `--coordinator-key` (in the same order) to give a rig backup coordinators, tried in order. For farms (rigs as services, ports, the live test) see [docs/farm.md](docs/farm.md); with `--rigs-public` a coordinator runs a public GPU pool, where each rig mines for its own `--address` and the operator's fee is a share of mining time.
+The coordinator prints its key when it starts and shows it on the dashboard with the rigs connected, their GPUs, rate and winners. Rigs need no address, server or node of their own and report their status as text lines; without the coordinator they pause. Repeat `--coordinator` and `--coordinator-key` (in the same order) to give a rig backup coordinators, tried in order. Press `I` on the coordinator's dashboard for the exact command each rig runs, for your network and, with Tailscale, from anywhere. For farms (rigs as services, ports, rigs in other places, the live test) see [docs/farm.md](docs/farm.md); with `--rigs-public` a coordinator runs a public GPU pool, where each rig mines for its own `--address` and the operator's fee is a share of mining time.
 
 ### Browser miner
 
@@ -136,10 +177,10 @@ Headless, from the same directory:
 Without `--no-tui`, the miner opens a short setup:
 
 1. **Profiles**: your saved profiles. Enter on one opens its settings with Start selected, so a second Enter mines. `R` renames and `D` deletes (with a confirmation).
-2. **Hardware**: GPU or ASIC.
+2. **What to do**: GPU mining, ASIC mining, or run a pool for other miners.
 3. **Network**: Mainnet or Chipnet.
-4. **Token**: the GPU tokens for that network, or for ASIC, "BCH + all merge-mined tokens" or an ASIC-exclusive token. ASIC mining is not supported yet.
-5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page.
+4. **Token**: the GPU tokens for that network, or for ASIC, "BCH + all merge-mined tokens" or an ASIC-exclusive token. Choosing BCH starts the BCH ASIC server, which builds blocks from your own BCH node (see [docs/stratum-v2.md](docs/stratum-v2.md)); the BCH node list finds Bitcoin Cash Node on the same computer, which needs no password. ASIC-exclusive tokens come later.
+5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. GPU mining adds a Mining row: alone, or join a GPU pool or farm with its coordinator's address and key (its Connection info shows them), as a rig. ASIC mining adds a Mining row: solo on your node, or join a pool (a normal pool's address and key; P2Pool v2 is coming). Running a pool asks what miners will mine: an ASIC pool asks for the pool type, your node, the pool fee, where it comes from (coinbase, mining work or both) and its address, then starts a public pool; a GPU pool asks for the pool type, the token's servers, the fee (a share of each rig's mining time) and its address, then coordinates the pool's rigs ([docs/pool.md](docs/pool.md)). The Pool row of Join a pool takes the pool's address or its one-line `stratum2+tcp://HOST:PORT/KEY`, which fills the key.
 
 Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session; `A` opens Advanced settings.
 

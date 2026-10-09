@@ -45,9 +45,17 @@ day each fact was checked.
   - a public ASIC pool that pays each miner at their own address in the
     coinbase, with an operator fee from the coinbase, the mining work or both,
     to a q or p (multisig) address;
-  - finding a BCH node on the same computer (its cookie login);
+  - finding a BCH node on the same computer (its cookie login), and moving to
+    the next configured node when one stops answering;
   - Connection info: the stratum addresses devices and rigs use, for the local
-    network and Tailscale, ready to copy.
+    network and Tailscale, ready to copy, and joining an SV2 pool by its
+    one-line `stratum2+tcp://HOST:PORT/KEY`;
+  - PHOTON jobs from the miner's own BCH node when one is configured (Fulcrum
+    as the fallback), live on a pruned Chipnet BCHN with no transaction index;
+  - Run a pool for GPUs (the public GPU pool, live with two rigs on Chipnet)
+    and joining a GPU pool or farm from the setup;
+  - workers named by their owners (never by an address), and a pool's name
+    written into the blocks it finds.
 
 ## Product direction
 

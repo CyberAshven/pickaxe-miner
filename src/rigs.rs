@@ -26,6 +26,49 @@ pub struct RigSummary {
     pub rejected: u64,
     /// One line per connected rig, in connection order.
     pub rigs: Vec<RigLine>,
+    /// #### PR #40: a public GPU pool, where each rig names its payout.
+    pub public: bool,
+}
+
+/// #### PR #40
+/// The command each rig runs to join, once per address other computers can
+/// reach this coordinator at (its local network and Tailscale addresses for
+/// a wildcard listener). A public pool's rigs add their own payout, which a
+/// rig checks against its network, so a Chipnet coordinator's command says
+/// `--chipnet`. Then the same addresses as one line,
+/// `stratum2+tcp://HOST:PORT/KEY`, which the setup's Join a GPU pool or farm
+/// takes whole.
+pub fn join_lines(
+    summary: &RigSummary,
+    network: crate::config::MiningNetwork,
+    interfaces: crate::reach::Interfaces,
+) -> Vec<(crate::reach::Place, String)> {
+    let Ok(listen) = summary.listen.parse() else {
+        return Vec::new();
+    };
+    let addresses = crate::reach::addresses(listen, interfaces);
+    let one_line = addresses
+        .iter()
+        .map(|(place, address)| (*place, format!("stratum2+tcp://{address}/{}", summary.key)))
+        .collect::<Vec<_>>();
+    addresses
+        .into_iter()
+        .map(|(place, address)| {
+            let network = match network {
+                crate::config::MiningNetwork::Mainnet => "",
+                crate::config::MiningNetwork::Chipnet => " --chipnet",
+            };
+            let mut command = format!(
+                "pickaxe mine{network} --coordinator {address} --coordinator-key {}",
+                summary.key
+            );
+            if summary.public {
+                command.push_str(" --address YOUR_BCH_ADDRESS");
+            }
+            (place, command)
+        })
+        .chain(one_line)
+        .collect()
 }
 
 /// One connected rig as the coordinator shows it.
@@ -545,6 +588,7 @@ mod net {
                         connected_secs: rig.since.elapsed().as_secs(),
                     })
                     .collect(),
+                public: state.public.is_some(),
             }
         }
     }
@@ -1284,6 +1328,60 @@ mod tests {
         assert_eq!(wire.payout_address, rig_payout);
         assert_eq!(wire.generation_id, job.generation_id);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // #### PR #40
+    #[test]
+    fn the_coordinator_shows_the_command_each_rig_runs() {
+        use crate::reach::{Interfaces, Place};
+        let interfaces = Interfaces {
+            local: Some("192.168.0.160".parse().unwrap()),
+            tailscale: Some("100.101.102.103".parse().unwrap()),
+        };
+        let mut summary = RigSummary {
+            listen: "0.0.0.0:3340".into(),
+            key: "KEY".into(),
+            ..RigSummary::default()
+        };
+        let mainnet = crate::config::MiningNetwork::Mainnet;
+        assert_eq!(
+            join_lines(&summary, mainnet, interfaces),
+            [
+                (
+                    Place::LocalNetwork,
+                    "pickaxe mine --coordinator 192.168.0.160:3340 --coordinator-key KEY".into()
+                ),
+                (
+                    Place::Tailscale,
+                    "pickaxe mine --coordinator 100.101.102.103:3340 --coordinator-key KEY".into()
+                ),
+                (
+                    Place::LocalNetwork,
+                    "stratum2+tcp://192.168.0.160:3340/KEY".into()
+                ),
+                (
+                    Place::Tailscale,
+                    "stratum2+tcp://100.101.102.103:3340/KEY".into()
+                ),
+            ]
+        );
+        // A public pool's rigs name their own payout, checked against the
+        // network; a loopback coordinator takes rigs on this computer only.
+        summary.public = true;
+        summary.listen = "127.0.0.1:3340".into();
+        assert_eq!(
+            join_lines(&summary, crate::config::MiningNetwork::Chipnet, interfaces),
+            [
+                (
+                    Place::ThisComputer,
+                    "pickaxe mine --chipnet --coordinator 127.0.0.1:3340 --coordinator-key KEY --address YOUR_BCH_ADDRESS".into()
+                ),
+                (
+                    Place::ThisComputer,
+                    "stratum2+tcp://127.0.0.1:3340/KEY".into()
+                ),
+            ]
+        );
     }
 
     #[test]

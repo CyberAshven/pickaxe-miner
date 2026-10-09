@@ -24,6 +24,14 @@ pub enum ShareEvent {
     Rejected(&'static str),
 }
 
+/// #### PR #40
+/// The difficulty a share's hash reached (pool difficulty: 1 is one in 2^32
+/// hashes), for best-share records; the target's difficulty is the same
+/// measure of what was asked.
+pub fn share_difficulty(hash: &Hash) -> f64 {
+    expected_hashes(hash) / 2f64.powi(32)
+}
+
 pub fn expected_hashes(target: &Hash) -> f64 {
     let denominator = num_bigint::BigUint::from_bytes_le(target) + 1u8;
     2f64.powi(256) / denominator.to_f64().expect("256-bit target fits f64")
@@ -44,6 +52,8 @@ pub struct DeviceSnapshot {
     pub hashrate_hour: Option<f64>,
     /// Difficulty of the last accepted share's target.
     pub difficulty: Option<f64>,
+    /// #### PR #40: the highest difficulty one of its shares reached.
+    pub best_share: Option<f64>,
     pub estimate_seconds: f64,
     pub last_share_seconds: Option<u64>,
     pub connection_error: Option<&'static str>,
@@ -52,6 +62,11 @@ pub struct DeviceSnapshot {
     pub reported_hashrate: Option<f64>,
     pub temperature_c: Option<f64>,
     pub fan: Option<String>,
+    /// #### PR #40
+    /// Make and model, firmware and power draw, from asic-rs's report.
+    pub model: Option<String>,
+    pub firmware: Option<String>,
+    pub power_w: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +89,7 @@ struct Device {
     connection_error: Option<&'static str>,
     adapter_error: Option<&'static str>,
     report: Option<DeviceReport>,
+    best_share: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -105,6 +121,32 @@ impl Default for Devices {
             addresses: HashMap::new(),
         }
     }
+}
+
+/// #### PR #40
+/// The worker name in a username, never an address: printable, at most 24
+/// characters.
+fn worker_name(username: &str) -> Option<String> {
+    let username = username.trim();
+    let name = match username.rsplit_once('.') {
+        Some((_, name)) => name,
+        None => username,
+    };
+    let name: String = name.chars().filter(char::is_ascii_graphic).collect();
+    if name.is_empty() || looks_like_address(&name) {
+        return None;
+    }
+    Some(name.chars().take(24).collect())
+}
+
+/// A CashAddr, with or without its prefix, or anything with a prefix.
+fn looks_like_address(text: &str) -> bool {
+    const CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let lower = text.to_ascii_lowercase();
+    lower.contains(':')
+        || (lower.len() >= 40
+            && (lower.starts_with('q') || lower.starts_with('p'))
+            && lower.chars().all(|c| CHARSET.contains(c)))
 }
 
 impl Devices {
@@ -140,10 +182,38 @@ impl Devices {
                 connection_error: None,
                 adapter_error: None,
                 report: None,
+                best_share: None,
             },
         );
         self.prune();
         id
+    }
+
+    /// #### PR #40: a device's label, for records kept outside the table.
+    pub fn label(&self, id: u64) -> Option<String> {
+        self.rows.get(&id).map(|row| row.label.clone())
+    }
+
+    /// #### PR #40
+    /// Records a share's difficulty as the device's best when it is; returns
+    /// the device's label, for the pool's own best share.
+    pub fn best_share(&mut self, id: u64, difficulty: f64) -> Option<String> {
+        let row = self.rows.get_mut(&id)?;
+        if row.best_share.is_none_or(|best| difficulty > best) {
+            row.best_share = Some(difficulty);
+        }
+        Some(row.label.clone())
+    }
+
+    /// #### PR #40
+    /// Names a worker by the name its owner gave it: the part after the payout
+    /// address (`bitcoincash:q....rig1` gives `rig1`), or the whole username
+    /// when it is not an address. An address alone keeps the generated label:
+    /// payout addresses are never shown. The number keeps labels unique.
+    pub fn set_worker(&mut self, id: u64, username: &str) {
+        if let (Some(name), Some(row)) = (worker_name(username), self.rows.get_mut(&id)) {
+            row.label = format!("{name} #{id}");
+        }
     }
 
     /// Records where a device can be asked for its own report. Only local
@@ -153,6 +223,15 @@ impl Devices {
         if super::device_api::queryable(ip) && self.rows.contains_key(&id) {
             self.addresses.insert(id, ip);
         }
+    }
+
+    /// The local network address of a connected worker, for actions the user
+    /// confirms on the workers page. Never shown or written to JSON.
+    pub fn address_for_label(&self, label: &str) -> Option<IpAddr> {
+        self.rows
+            .iter()
+            .find(|(_, row)| row.label == label && row.ended.is_none())
+            .and_then(|(id, _)| self.addresses.get(id).copied())
     }
 
     /// Connected devices with a known address.
@@ -221,6 +300,14 @@ impl Devices {
                     row.adapter_rejected = row.adapter_rejected.saturating_add(1);
                 }
             }
+        }
+    }
+
+    /// #### PR #40: a problem the adapter reports while the device mines,
+    /// such as a pool refusing the donation channel.
+    pub fn note_adapter(&mut self, id: u64, issue: &'static str) {
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.adapter_error = Some(issue);
         }
     }
 
@@ -299,6 +386,7 @@ impl Devices {
                         None
                     },
                     difficulty: row.difficulty,
+                    best_share: row.best_share,
                     estimate_seconds: seconds,
                     last_share_seconds: row
                         .last_share
@@ -308,6 +396,9 @@ impl Devices {
                     reported_hashrate: row.report.as_ref().and_then(|r| r.hashrate),
                     temperature_c: row.report.as_ref().and_then(|r| r.temperature_c),
                     fan: row.report.as_ref().and_then(|r| r.fan.clone()),
+                    model: row.report.as_ref().and_then(|r| r.model.clone()),
+                    firmware: row.report.as_ref().and_then(|r| r.firmware.clone()),
+                    power_w: row.report.as_ref().and_then(|r| r.power_w),
                 }
             })
             .collect();
@@ -347,6 +438,19 @@ pub fn connection_reason(error: &str) -> &'static str {
         | "SV2 handshake failed"
         | "SV2 authority authentication failed" => "authentication or framing failed",
         "device worker panicked" => "device worker stopped unexpectedly",
+        // #### PR #40: a remote pool's answers, in pool mode.
+        "SV2 server unavailable" => "upstream unavailable",
+        "SV2 setup rejected" | "SV2 setup incompatible" => "upstream refused the connection",
+        "SV2 channel rejected" => "upstream refused the channel; check the pool identity",
+        "unexpected SV2 extranonce allocation" => "upstream extranonce size does not fit SV1",
+        "SV2 upstream asked to reconnect" | "SV2 upstream changed the extranonce" => {
+            "upstream asked to reconnect"
+        }
+        "SV2 upstream closed the channel" => "upstream closed the channel",
+        "invalid SV2 authority key" => "upstream key is not an SV2 authority key",
+        "SV2 certificate version unsupported" => {
+            "upstream certificate version is not SV2's; the pool must fix it"
+        }
         _ => "protocol or connection failure",
     }
 }
@@ -354,6 +458,39 @@ pub fn connection_reason(error: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #40
+    #[test]
+    fn workers_are_named_by_their_owners_but_never_by_an_address() {
+        let address = crate::tx::p2pkh_hash_to_cashaddr_for_network(
+            &[0x11; 20],
+            crate::config::MiningNetwork::Mainnet,
+        )
+        .unwrap();
+        let address = address.as_str();
+        let bare = address.strip_prefix("bitcoincash:").unwrap();
+        assert_eq!(
+            worker_name(&format!("{address}.rig1")).as_deref(),
+            Some("rig1")
+        );
+        assert_eq!(worker_name(&format!("{bare}.r2")).as_deref(), Some("r2"));
+        assert_eq!(worker_name("rack-7").as_deref(), Some("rack-7"));
+        assert_eq!(worker_name("account.worker1").as_deref(), Some("worker1"));
+        assert_eq!(worker_name(address), None);
+        assert_eq!(worker_name(bare), None);
+        assert_eq!(worker_name(" \u{1b} "), None);
+        let mut devices = Devices::default();
+        let id = devices.connect("127.0.0.1:4000".parse().unwrap(), true, Instant::now());
+        devices.set_worker(id, address);
+        assert!(devices.snapshots(Instant::now())[0]
+            .label
+            .starts_with("Device "));
+        devices.set_worker(id, &format!("{address}.rig1"));
+        assert_eq!(
+            devices.snapshots(Instant::now())[0].label,
+            format!("rig1 #{id}")
+        );
+    }
 
     #[test]
     fn rates_weight_validated_targets_and_decay_when_work_stops() {
@@ -503,6 +640,12 @@ mod tests {
         devices.set_address(id, "203.0.113.5".parse().unwrap());
         assert!(devices.addresses().is_empty());
         devices.set_address(id, "10.9.8.7".parse().unwrap());
+        let label = devices.snapshots(now)[0].label.clone();
+        assert_eq!(
+            devices.address_for_label(&label),
+            Some("10.9.8.7".parse().unwrap())
+        );
+        assert_eq!(devices.address_for_label("Device unknown"), None);
         assert_eq!(devices.addresses(), vec![(id, "10.9.8.7".parse().unwrap())]);
         devices.set_report(
             id,
@@ -510,12 +653,17 @@ mod tests {
                 hashrate: Some(4.0e12),
                 temperature_c: Some(61.0),
                 fan: Some("40%".into()),
+                model: Some("Avalonminer AvalonNano3s".into()),
+                power_w: Some(140.0),
+                ..DeviceReport::default()
             }),
         );
         let row = devices.snapshots(now).remove(0);
         assert_eq!(row.reported_hashrate, Some(4.0e12));
         assert_eq!(row.temperature_c, Some(61.0));
         assert_eq!(row.fan.as_deref(), Some("40%"));
+        assert_eq!(row.model.as_deref(), Some("Avalonminer AvalonNano3s"));
+        assert_eq!(row.power_w, Some(140.0));
         let json = serde_json::to_string(&devices.snapshots(now)).unwrap();
         assert!(!json.contains("10.9.8.7"));
         devices.close(id, true, None, now);

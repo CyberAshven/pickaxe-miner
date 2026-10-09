@@ -26,15 +26,15 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
-| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; workers page, read-only device reports and per-device vardiff host-tested, physical observation pending |
+| S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; workers page, read-only device reports and per-device vardiff observed on the Avalon Nano 3 on 2026-10-08; the read-only `watch` view and calmer vardiff host-tested |
 | S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | Default 1.5% policy, dashboard controls and saved configuration implemented; host/reference checks and four live-node proposals pass; updated physical ASIC payout observation pending |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check; a coordinator crash during a claim is not exercised live |
 | G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live; backup coordinators host-tested; live failover and rigs on separate machines pending |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | Pending |
-| D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pending |
-| D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Pending |
+| D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | SV1 devices at SV2 pools with backup pools in order implemented and tested (pool mode below); Job Declaration and coinbase payouts pending |
+| D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Setup finds a BCHN on this computer and offers it with client, version and sync height; cookie login; unusable nodes named with their reason; live-checked against a throwaway Chipnet BCHN (below). GPU broadcasts already fall back to Fulcrum; ASIC mode has no fallback, since only a node supplies full templates |
 | T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | Pending protocol/deployment evidence |
 | T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Pending author covenant design |
 | F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Needs audit |
@@ -576,6 +576,281 @@ all-target/all-feature Clippy with warnings denied passed. Vardiff convergence
 is simulated for 1 TH/s, 4 TH/s, 90 TH/s, 200 TH/s and 1 PH/s devices. Physical
 observation on the Avalon Nano 3 and exact pushed-commit CI are separate gates.
 
+## Workers view and calmer vardiff checkpoint (2026-10-08)
+
+#### PR #40
+
+Live evidence before this change, from the Avalon Nano 3 on the Chipnet
+service running PR #38's head (`03135d3`), about ten minutes after the
+restart: the device's own report (3.92 TH/s five-minute rate, 94 °C hottest,
+fan 73%) beside Pickaxe's measured 4.47 TH/s over five minutes and 4.31 TH/s
+since the restart; 93 accepted shares and one stale; the donation at 1.50%;
+three brief node RPC failures recovered without dropping the device. Vardiff
+had moved the difficulty from 4096 to about 5,297, above the expected 2,800 to
+3,100: SRI's rules alone can act on a short run of lucky shares, the likely
+cause of that overshoot.
+
+This change adds `stratum-v2 watch`, a read-only workers table for a server
+running without a screen, fed by a status file the server saves each second
+beside its config, and makes vardiff calmer: it acts only on 72 shares, four
+minutes or a silent minute, and ignores changes under 25%, as ckpool and
+P2Poolv2 do.
+
+Validation: Windows all-feature host suite, 429 library and 16 binary tests
+passed, 19 opt-in tests ignored, 34 hardware tests filtered; formatting and
+all-target/all-feature Clippy with warnings denied passed. Physical
+observation of the calmer vardiff and the `watch` view on the Avalon's service
+is a separate gate.
+
+## Device reports and controls through asic-rs (2026-10-08)
+
+#### PR #40
+
+Device reports and controls now come from asic-rs 0.8.5 (256 Foundation,
+Apache-2.0), which identifies most SHA-256 makes and firmwares, mixed with
+Pickaxe's own CGMiner and Bitaxe code as the extension (`fleet.rs`). asic-rs
+supplies model, firmware, power and the reports of makes Pickaxe did not read;
+Pickaxe's reader keeps the 5-minute rate, the hottest reading and the fan
+where a device gives them, reads Avalon Nano power, answers for unidentified
+devices, and sends Avalon work levels. Controls list what asic-rs supports
+for the device (Restart, Pause, Resume, blink the light) plus Avalon work
+levels. Pool settings, MAC addresses, serial numbers and host names are never
+collected. All connected devices are asked in parallel (up to 32 at once).
+
+Live, read-only check against the operator's Avalon Nano 3 on the local
+network (opt-in test `real_device_is_identified_and_reported`): asic-rs
+identified "AvalonNano3", firmware 25103101_0736b2e, and offered Restart,
+Pause, Resume and both light actions; the mixed report showed 3.42 TH/s
+(five-minute), 95 °C hottest, fan 74% and 127 W. asic-rs alone read the
+Nano's power as 2,756 W: the Nano's `PS[0 0 0 4 2756 126 330]` holds its
+27.56 V input fifth and watts sixth, while asic-rs reads the fifth value as
+watts for every Avalon. Pickaxe reads Nano power itself; this is worth
+reporting to asic-rs.
+
+Dependencies: asic-rs brings tokio, reqwest with rustls and the makes and
+firmwares crates; it builds on Windows and Linux. cargo-deny (advisories,
+bans, licenses, sources) passes with one scoped exception: webpki-root-certs
+1.0.9, Mozilla's root certificates as data under CDLA-Permissive-2.0.
+
+Validation: Windows all-feature host suite, 438 library and 16 binary tests
+passed, 20 opt-in tests ignored, 31 hardware tests filtered; formatting,
+all-target/all-feature Clippy and the server-only (`stratum-v2`) Clippy with
+warnings denied passed. A device control action was not sent in this check.
+
+## Pool mode: SV1 devices at a remote SV2 pool (2026-10-08)
+
+#### PR #40
+
+`stratum-v2 serve --upstream HOST:PORT --upstream-key KEY [--upstream-user ID]`
+runs only the SV1 adapter, pointed at a remote SV2 pool: no node and no local
+SV2 server. Each device gets an encrypted, key-pinned SV2 connection and an
+extended channel under the identity (default: the payout address, never
+printed). Pools may batch acknowledgements, so the adapter answers firmware
+once a share is checked and forwarded and counts the pool's verdicts itself;
+a changed extranonce, a closed channel or a Reconnect closes the device for a
+fresh channel. Local mode keeps its exact behavior: per-share
+acknowledgements from Pickaxe's own server before firmware gets its reply.
+The donation does not apply in pool mode, since the pool builds the blocks
+(changed the same day: see "Pool mode: the donation as mining time").
+Backup pools repeat `--upstream` and `--upstream-key` in order: each device
+takes the first pool that completes the handshake, setup and channel, and a
+device whose pools all fail keeps a row with the last pool's reason.
+
+Evidence: an end-to-end test with Pickaxe's own server as the pool, reached
+by host name over Noise after a first pool with the wrong key is skipped,
+mines two blocks with SV1 firmware, and the adapter's separate statistics
+count both verdicts. Read-only against SoloFury's BTC SV2
+(`eu-btc.solofury.com:3333`) with a throwaway identity, an SV1 device stand-in
+got a 4-byte extranonce prefix, an 8-byte extranonce2, difficulty 1024 and a
+first job (opt-in test `real_sv2_pool_sends_work_to_sv1_firmware`). SoloFury's
+BCH SV2 endpoints send a Noise certificate with format version 1 (CashStratum
+`src/sv2_noise.c` sets it); the SV2 spec requires 0 and requires clients to
+refuse other versions, as SRI's `noise_sv2` 2.0 does, so Pickaxe names that
+reason on the workers page. Reported as
+[cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3).
+
+Validation: Windows all-feature host suite, 443 library and 16 binary tests
+passed, 21 opt-in tests ignored, 31 hardware tests filtered; formatting,
+all-target/all-feature Clippy and the server-only Clippy with warnings
+denied passed.
+
+## Own BCH node: found on this computer, cookie login (2026-10-08)
+
+#### PR #40
+
+The guided own-node step (D3). The BCH node list in setup looks for Bitcoin
+Cash Node on this computer in the background, at BCHN's default RPC address
+(`127.0.0.1:8332` on mainnet, `127.0.0.1:48332` on Chipnet, from its
+`chainparamsbase.cpp`), and offers it with its client, version and sync
+height; Enter saves it for every profile on that network. A node that wants
+a login, a node on the other network and no node at all are each explained,
+with what makes BCHN answer (`server=1`, plus `chipnet=1` for Chipnet).
+Start in ASIC mode without a node opens this list directly.
+
+With no `rpcpassword` set, BCHN writes `__cookie__:<hex>` to `.cookie` in its
+network's data folder at every start (`rpc/protocol.cpp`). Pickaxe reads it
+for every call, only for a loopback host on those default ports, from BCHN's
+default data folder (`util/system.cpp`) and on Linux also its service folder
+`/var/lib/bitcoind` (`contrib/init/bitcoind.service`);
+`PICKAXE_NODE_RPC_COOKIE` names another file. A login in the URL or the
+environment still comes first. The cookie is never printed or saved.
+
+A node's HTTP 401 is now named ("the node refused the RPC login") instead of
+a JSON parse error, and `check-node` and `serve` say why no configured node
+could be used (a refused login, the wrong network, not synchronized).
+`check-node`, the dashboard header and the status `watch` reads show the
+node's client and version, such as "Node Ready (Bitcoin Cash Node 29.1.0)".
+
+Fallback: GPU broadcasts already fall back from a node to Fulcrum servers.
+ASIC mode has none, since only a node supplies full block templates; saved
+nodes are tried in order at start.
+
+Evidence: host tests cover the cookie paths per network and host (other hosts
+and ports get none), login precedence, the 401 mapping, the node report and
+its summary, user agents with control characters, saved forms of the local
+address, and the setup flow (the offer, Enter saving it, the saved state, the
+other network, a login wanted, no node). Live, against a throwaway BCHN 29.1.0
+Chipnet container with no peers and no password, reachable from this computer
+only: the opt-in `real_local_node_is_found_and_reported` read
+"Bitcoin Cash Node 29.1.0 · syncing, height 0 of 0 (0%)" with its cookie and
+`NeedsLogin` without it, and `check-node` named "node not synchronized" and
+"node refused the RPC login" respectively. No synchronized node on this
+computer was available, so a synced node in the offer is host-tested only.
+
+Validation: Windows all-feature host suite, 444 library and 16 binary tests
+passed, 22 opt-in tests ignored, 34 hardware tests filtered (one run also saw
+the timing-sensitive `sv1_same_tip_refresh_accepts_inflight_block_and_new_tip_rejects_it`
+time out under parallel load; it passed alone three times and does not use
+the node code changed here); formatting, all-target/all-feature Clippy on Rust
+1.94 and 1.99 and the server-only Clippy with warnings denied passed.
+
+## Windows: accepted sockets block again (2026-10-08)
+
+#### PR #40
+
+The release-mode test run on GitHub's Windows runner failed in a server test
+whose simulated firmware lost its connection before its first job. Locally,
+two or three of every five or six release-mode runs of the server tests
+failed the same way, in different tests. The cause: on Windows an accepted
+socket inherits its listener's non-blocking mode (Linux does not), and both
+the SV2 server and the SV1 adapter accept on non-blocking listeners. The SV2
+server's Noise handshake then read at once, and when the client's first bytes
+came a moment after the connection it failed and dropped the client; the SV1
+adapter's reads and writes likewise failed instead of waiting out their
+timeouts. Both now set each accepted socket blocking before using it. A
+Windows-hosted server could drop SV2 devices this way; the physical ASIC runs
+against the Linux service, which is unaffected.
+
+Validation: eight release-mode runs of the server tests with 16 threads
+passed (two or three of every five or six failed before); the Windows
+all-feature host suite passed 444 library and 16 binary tests; formatting,
+all-feature Clippy and server-only Clippy with warnings denied passed.
+
+## Pool mode: the donation as mining time (2026-10-08)
+
+#### PR #40
+
+The operator decided the donation applies however Pickaxe is used, including
+at a remote pool, with the BCH setting's 0% option kept. A pool builds its own
+blocks, so the whole BCH donation is mining time there: for that share of each
+device's time (9 seconds of every 10 minutes at the 1.5% default), the device
+mines at the same pool under the network's donation address, on a second
+extended channel of the same encrypted connection. The schedule is the
+server's own per-device work clock, counted while the device has work. At 0%
+no donation channel is opened.
+
+To switch channels without reconnecting the device (which could make it fall
+back to its own backup pools), the adapter now owns a pool-mode device's
+extranonce: extranonce1 is four bytes it picks and extranonce2 the four the
+device rolls, together the channel's eight miner bytes; the pool's channel
+prefix, and zero padding if a pool grants more than eight bytes, goes into the
+coinbase part the device receives. A switch sends the channel's difficulty and
+a clean job; the donation channel's jobs carry the top bit in their SV1 job
+number, so each share returns to the channel its job came from, with its
+extranonce rebuilt. A pool that refuses or later closes or changes the
+donation channel leaves the device mining on its own channel and puts the
+reason on its workers-page row. Local mode (this server's own listener, which
+the Avalon Nano uses) is unchanged. `--donation` now works with `--upstream`.
+
+Evidence: unit tests cover the extranonce split and coinbase prefix, opening
+the donation channel only once the device is ready, the switch at 100% with a
+clean job of donation number and padding for a ten-byte grant, a donation
+share's channel, job and extranonce, the switch back at 0%, and a refused or
+closed donation channel. End to end, with Pickaxe's own server as the pool
+over Noise, SV1 firmware at a 100% donation mined a block from a donation
+channel job; the pool validated the share and the node fixture accepted the
+block, which checks the coinbase the device built from the adapter's
+extranonce. The existing pool test (two blocks, verdicts counted, fallback
+past a wrong key) passes with the new extranonce split. Not yet run against a
+real BCH SV2 pool: SoloFury's BCH endpoints still send the certificate version
+reported in cashstratum/cashstratum#3.
+
+Validation: Windows all-feature host suite, 447 library and 16 binary tests
+passed, 22 opt-in tests ignored, 34 hardware tests filtered; formatting,
+all-target/all-feature Clippy on Rust 1.94 and 1.99 and the server-only Clippy
+with warnings denied passed.
+
+## Public pool: each miner paid at their own address (2026-10-08)
+
+#### PR #40
+
+`stratum-v2 serve --public [--pool-fee P --pool-fee-mode coinbase|work|both
+--pool-fee-address A]` runs the ASIC server as a public pool
+([pool.md](pool.md)). Each channel pays the payout its user names (an
+address, with or without its network prefix, optionally followed by
+`.worker`); a name that is not a payout on the pool's network gets the SV2
+`unknown-user` error, which SV1 firmware sees as a refused authorize. The
+coinbase pays the miner, then the Pickaxe donation (first and in full), then
+the operator's fee from what the donation leaves: from the coinbase, from
+mining work (the server's work clock gives the operator's slice right after
+the donation's), or both (a third work, two thirds coinbase). No custody:
+nothing is paid out later. The dashboard header names the public pool and
+its fee.
+
+SV1 firmware cannot give its username before its subscription is answered,
+so in a public pool the adapter answers the subscription with an extranonce
+of its own (as at a remote pool), opens the device's channel only at
+authorize under the device's username, and answers the authorize when the
+server accepts or refuses that name. The block journal records the miner and
+the fee address of a block that does not pay the configured payout and
+checks every pending block against them on restart. Coinbase payouts, the
+fee address and pool miners' addresses now accept P2SH (`p`, such as a
+multisig, with a 20-byte or 32-byte hash) as well as P2PKH; PHOTON payouts
+stay P2PKH.
+
+Evidence: end to end with this server's own node fixture, two SV2 devices
+(a standard and an extended channel, one with a bare address and a worker
+name) each mined a block that paid exactly their address, the donation's 1%
+and a 2% coinbase fee of the remainder; through the SV1 adapter, two SV1
+devices with their own addresses were each paid by their own block with a
+1% fee, and a non-address username was refused at authorize. Unit tests cover
+the fee arithmetic in each mode (the donation first), old journal records
+without a fee, usernames with and without prefixes and workers, P2SH and
+P2SH32 scripts, a journal restart with a public pool's block and a tampered
+miner failing closed, the adapter's held authorize, and the new options. Not
+yet run with real public miners.
+
+Validation: Windows all-feature host suite, 455 library and 16 binary tests
+passed, 22 opt-in tests ignored, 34 hardware tests filtered; formatting,
+all-target/all-feature Clippy on Rust 1.94 and 1.99 and the server-only Clippy
+with warnings denied passed.
+
+## Setup: solo, join a pool, or run one (2026-10-08)
+
+#### PR #40
+
+The setup's first screen now offers GPU mining, ASIC mining and Run a pool.
+ASIC mining's settings page has a Mining row: solo on your node, or join a
+pool, which asks for the pool type (a normal pool; P2Pool v2 is listed as
+coming), the pool's `HOST:PORT` and its authority key, and starts pool mode.
+Run a pool asks what miners mine (an ASIC pool; a GPU pool needs the GPU farm
+of PR #32 in the same build), the pool type, the payout address and node, the
+pool fee in 0.5% steps, where it comes from (coinbase, mining work, or both)
+and its address (q or p, checked for the network), and starts the public pool.
+Host tests walk each path, including the refusals for P2Pool v2, a GPU pool
+in this build, a missing pool address or key, a bad fee address and a missing
+node. Pool settings last for the session, as the hardware choice does.
+
 ## GPU farm: a coordinator with no GPU and two live rigs (2026-10-08)
 
 #### PR #32
@@ -639,3 +914,209 @@ window; the direct-reward lifecycle refuses a winner paying another address
 unless the coordinator vouches for it. Not yet run with rigs on other
 machines. A PHOTON claim can be broadcast by anyone, so the fee is
 voluntary for a modified rig, as the donation is.
+
+## Connection info for rigs (2026-10-08)
+
+#### PR #40
+
+The coordinator's dashboard has a Connection info page (`I`): the exact
+`pickaxe mine --coordinator ADDRESS --coordinator-key KEY` command a rig runs
+(a public pool adds `--address YOUR_BCH_ADDRESS`), once per address other
+computers can use, with a number key to copy each. `src/reach.rs` finds the
+addresses: a wildcard listener is shown at this computer's address on the
+local network and, when Tailscale is up, its Tailscale address (100.64.0.0/10),
+found by asking the system which interface it would send from (a connected UDP
+socket; nothing is sent and no outside service is asked). A loopback listener
+is shown as reachable from this computer only. Copying uses the terminal's
+OSC 52 (which also reaches an SSH client's clipboard) and the system's own
+tool where there is one (`clip` on Windows, `pbcopy` on macOS). Without a
+Tailscale address the page suggests Tailscale for rigs in other places. The
+`rigs` start line lists the addresses under `connect`; headless text mode
+prints each command as a `rigs join` line.
+
+Evidence: host tests cover the Tailscale range, interface sorting (including
+a Tailscale exit node), the listener expansion, the commands for private and
+public pools (with `--chipnet` on Chipnet, which a rig needs to accept a
+Chipnet `--address`), and the rendered page with and without Tailscale. Live:
+the public GPU pool test in [farm.md](farm.md#tested) joined one rig at the
+local-network address and one at the Tailscale address from `connect`.
+
+## Connection info for devices, joining by one line, and the GPU pool from setup (2026-10-08)
+
+#### PR #40
+
+- **Connection info** (`i` on the server dashboard), modeled on ASICseer's:
+  every address devices use, SV1 lines first (stock Antminer, Avalon and
+  Whatsminer firmware speak only SV1) and SV2 lines with the authority key in
+  the address, `stratum2+tcp://HOST:PORT/KEY` (the form ckpool and Braiins
+  publish), each at this computer's local-network address and, when
+  Tailscale is up, its Tailscale address (`src/reach.rs`; nothing is sent).
+  The page says what the username means for a solo server, a public pool and
+  a pool member, that the password is not checked, suggests Tailscale when it
+  is not running, and, for ASICs elsewhere, a Pickaxe at their site joining
+  this server over SV2. Number keys copy a line (OSC 52, plus `clip` or
+  `pbcopy`). The header's "Point devices at" line names `i`, and the JSON
+  start line lists the addresses under `connect`.
+- **Joining by one line**: `--upstream` and the setup's Pool row accept the
+  pool's `stratum2+tcp://HOST:PORT/KEY`; the key may then be left out, must
+  match when given twice, and an SV1 pool address is refused with the reason.
+- **Run a pool → GPU pool** starts the public GPU pool (as `mine --rigs-listen
+  0.0.0.0:3340 --rigs-only --rigs-public`): the token's servers instead of a
+  node, the fee as a share of each rig's mining time, and a `q` fee address,
+  since token claims pay P2PKH. P2Pool v2 is now the only option marked
+  coming soon.
+
+Evidence: host tests cover the address lines for every listener kind, the
+page for each mode, the JSON lines, the one-line pool address (with and
+without a key, IPv6, SV1 refused) through to the pool list, and the setup's
+GPU pool rows, validation and result.
+
+## Node failover for the ASIC server (2026-10-08)
+
+#### PR #40
+
+The server keeps every configured BCH node, in failover order starting with
+the first that gave a synchronized template at start. When its node gives no
+template (down, refusing the login, or still synchronizing), it moves to the
+next one at once; the failed node waits at the back, so a later failure moves
+on again. Work on the old node's templates is revoked and devices take a new
+job; template generations keep counting, so no job identifier repeats. Saved
+blocks are whole blocks, so a block waiting for a node's reply goes to
+whichever node is in use. The dashboard and the status show "node N of M"
+and the number of moves.
+
+The block journal is now bound to its network and payout script instead of
+also the node it was first written with (PR #38's binding), which refused to
+open when the server started on its second node. A journal written under the
+old binding opens while its node is still configured and is rebound.
+
+Evidence: host tests cover moving to the second node when the first stops
+answering (a block found then goes to the second node only) and back when the
+second fails, the rebinding of a journal written under the old binding (and
+its refusal without that node or with another payout), and the dashboard
+label. Not yet run against two live nodes.
+
+## PHOTON from the miner's own node (2026-10-08)
+
+#### PR #40
+
+With a BCH node configured, the PHOTON job source is the node: the session
+(`ElectrumSession` with a node link) finds the baton with `scantxoutset` on
+the covenant script, follows it with `gettxout` and the mempool's successor,
+rescans when it loses it, and answers the other calls the miner makes with
+standard RPCs: `getmempoolinfo` and `getnetworkinfo` for the relay fee,
+`sendrawtransaction` for claims, and `getrawtransaction` for a transaction by
+id, which without a transaction index looks in the mempool, then in the block
+holding one of its unspent outputs, then in the last 24 blocks. The runtime
+connects to the node first, at start and on every reconnect, and to the
+Fulcrum servers when no node is configured or none can give the PHOTON state;
+on the node, each refresh is the node's state, with no Fulcrum proof. Before,
+the node was a fallback route trusted only within a proof lease from Fulcrum,
+so mining needed Fulcrum to start and stopped after a claim without it.
+
+Evidence: host tests with a scripted node cover the RPC answers and the
+transaction lookup without an index (and a pruned block's data counting as
+not found). Live on 2026-10-09 against a pruned Chipnet Bitcoin Cash Node
+29.1.0 with no transaction index (`real_node_gives_the_photon_job_alone`,
+opt-in): the PHOTON job came from the node alone by its UTXO-set scan (0.4 s
+on Chipnet), the baton's transaction was found by id, resuming from the
+known baton took 18 ms, and the job matched a public Chipnet Fulcrum's
+(baton, reward and target) at the same tip. That test found that BCHN's
+`scantxoutset` reports no `height` or `bestblock` (Bitcoin Core's fields),
+so the node route had never started against BCHN; the tip read right after
+the scan now stands in, checked by every later read. A coordinator with no
+GPU then mined from the node for three minutes beside a running GPU miner,
+its job and refreshes from the node, with no reconnect. Not yet live: a claim
+sent through the node.
+
+## Worker names on the workers page (2026-10-09)
+
+#### PR #40
+
+A device is named by the worker name in its username: the part after the
+payout address (`ADDRESS.rig1` gives `rig1`), or the whole username when it
+is not an address, at most 24 printable characters, with its session number
+to keep labels unique (`rig1 #3`). An address alone keeps the generated label,
+so payout addresses are still never shown. SV1 devices are named by the
+adapter when they authorize; native SV2 devices by their channel's user
+identity (the adapter's own channel identity is not a name).
+
+Evidence: host tests cover names from addresses with and without a prefix,
+account-style usernames, bare addresses and control characters, and the label
+change.
+
+## Joining a GPU pool or farm from the setup (2026-10-09)
+
+#### PR #40
+
+GPU mining's settings have a Mining row: alone (claims to your address), or
+join a GPU pool or farm. Joining asks for the coordinator's address and key
+(the one-line `stratum2+tcp://HOST:PORT/KEY` fills both) and your payout
+address, which a public pool claims your wins to; it shows no Fulcrum or node
+rows, since a rig takes its jobs from its coordinator. Start mines as a rig
+of that coordinator on the chosen GPUs, as `--coordinator` does (both use one
+`run_as_rig` path), printing its status lines.
+
+Evidence: a host test walks the setup from the Mining row to the result,
+including the one-line address filling the key and the checks for a missing
+coordinator address.
+
+## A coordinator with no GPU takes no GPU lock (2026-10-09)
+
+#### PR #40
+
+A coordinator that mines with its rigs only (`--rigs-only`, or Run a pool,
+GPU pool) no longer takes the GPU lock, which keeps two miners off the same
+GPUs: it uses none, and the lock stopped a farm's coordinator from running on
+a PC that also mines. Any process with GPUs still takes it.
+
+Evidence: the live run above, beside a running GPU miner.
+
+## A pool's name in its blocks (2026-10-09)
+
+#### PR #40
+
+`stratum-v2 serve --pool-tag TEXT` (the setup's Pool name row for an ASIC
+pool) writes the name into the coinbase script of every block the server
+builds, after the node's coinbase flags and before the extranonce, as
+ckpool's and ASICseer's pool identifiers are; at most 20 printable
+characters, refused with `--upstream`, where the pool builds the blocks.
+Nothing is written by default.
+
+Evidence: host tests cover the name in the coinbase with the coinbase parts
+still fitting around the extranonce, a name too long for the 100-byte script
+refused, the flag, and the setup row.
+
+## Best share, recent blocks and the starting difficulty (2026-10-09)
+
+#### PR #40
+
+The server records each share's hash difficulty: the workers' best shares
+(in the JSON status per device) and the server's best since start with its
+worker; the overview (Tab) and the status list the last blocks found (height,
+hash, worker, age, and the node's answer once it has one), as ASICseer's
+dashboard does. `--start-difficulty N` sets the share difficulty devices
+start at (default 4096, the compact target 0x1b0ffff0).
+
+Evidence: host tests cover a found block and the best share recorded through
+the server, the overview line, and the difficulty-to-target conversion
+(difficulty 1 and 4096 match their compact targets).
+
+## A watch view for a miner without a screen (2026-10-09)
+
+#### PR #40
+
+A `--no-tui` miner, such as a GPU farm's or public pool's coordinator running
+as a service, saves its status line once a second beside its config
+(`NAME.mine-status.json`, written whole and without the payout address).
+`pickaxe watch` with the same `--config` shows it read-only: the coordinator's
+farm and a row per rig (name, GPUs, rate, winners, minutes connected), or a
+miner's own GPUs, with the source, height and winners, and says when the
+miner stopped updating. It never connects to the miner, as `stratum-v2 watch`
+for the ASIC server.
+
+Evidence: a host test saves a coordinator's status (no payout kept), and the
+view shows the farm, the rig row, a stale status and a GPU miner's rows. Live
+on Chipnet on 2026-10-09: a coordinator with no GPU, run without a screen
+beside a running GPU miner, saved its status (mining, the height, its rig
+listener and job source) with no payout address in it.

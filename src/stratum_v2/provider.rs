@@ -1,6 +1,10 @@
 //! #### PR #38
 //! Pin full-template submission to its source node. A failed refresh revokes
 //! work; a light-job payload must never be sent as a full block on failover.
+//! #### PR #40: the server now moves to its next node when one fails
+//! (`replace_node`). Only full templates are used and the journal saves whole
+//! blocks, so a block saved from one node's template is a complete, valid
+//! block for any node of the same network.
 
 use super::channel::MAX_ACTIVE_JOBS;
 use super::journal::PendingBlock;
@@ -25,6 +29,12 @@ impl NativeNodeRpc {
 
     pub fn source_identity(&self) -> Result<[u8; 32], String> {
         crate::node::rpc_source_identity(&self.endpoint)
+    }
+
+    /// #### PR #40
+    /// The node's client, chain and sync state.
+    pub fn info(&self) -> Result<crate::node::NodeInfo, String> {
+        crate::node::node_info(&self.endpoint)
     }
 }
 
@@ -58,6 +68,17 @@ impl<R: NodeRpc> TemplateProvider<R> {
             current: None,
             previous: VecDeque::new(),
         }
+    }
+
+    /// #### PR #40
+    /// Takes templates from another node from now on and hands the old one
+    /// back in `node`. Work on the old node's templates is revoked, as after
+    /// a failed refresh, so devices take a new job from the new node; the
+    /// generation keeps counting, so no job identifier repeats.
+    pub fn replace_node(&mut self, node: &mut R) {
+        std::mem::swap(&mut self.rpc, node);
+        self.current = None;
+        self.previous.clear();
     }
 
     pub fn current(&self) -> Option<(u64, &BchTemplate)> {
@@ -259,6 +280,8 @@ mod durable_tests {
             hash: hex::encode(hash),
             block: hex::encode(block),
             payout: Some(share.payout),
+            miner: None,
+            operator: None,
         }
     }
     fn tip() -> Value {

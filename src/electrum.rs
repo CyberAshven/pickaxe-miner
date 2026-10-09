@@ -67,11 +67,116 @@ fn donation_summary_line() -> String {
 pub struct ElectrumSession {
     pub url: String,
     pub server_version: Value,
-    ws: Ws,
-    next_id: u64,
-    buf: String,
+    link: Link,
     deployment: &'static PhotonDeployment,
     pub(crate) fee_policy: Option<(std::time::Instant, u64)>,
+}
+
+/// #### PR #40
+/// Where a session's answers come from: a Fulcrum server over its WebSocket,
+/// or the miner's own BCH node over JSON-RPC ("mining is for nodes").
+enum Link {
+    Fulcrum {
+        ws: Box<Ws>,
+        next_id: u64,
+        buf: String,
+    },
+    Node {
+        endpoint: String,
+        photon: Box<crate::node::NativePhotonSession>,
+    },
+}
+
+/// #### PR #40
+/// How many recent blocks a node without a transaction index searches for a
+/// transaction by id; claims looked up this way are recent.
+const NODE_RECENT_BLOCKS: u64 = 24;
+
+/// #### PR #40
+/// The Fulcrum methods the miner uses, answered by a BCH node with standard
+/// RPCs (no transaction index needed).
+fn node_rpc(endpoint: &str, method: &str, params: &Value) -> Result<Value, String> {
+    use crate::node::rpc_call;
+    match method {
+        "server.ping" => rpc_call(endpoint, "getblockcount", json!([])).map(|_| Value::Null),
+        "server.version" => rpc_call(endpoint, "getnetworkinfo", json!([])).map(|info| {
+            json!([
+                info.get("subversion").cloned().unwrap_or(Value::Null),
+                "node"
+            ])
+        }),
+        "mempool.get_info" => rpc_call(endpoint, "getmempoolinfo", json!([])),
+        "blockchain.relayfee" => rpc_call(endpoint, "getnetworkinfo", json!([]))?
+            .get("relayfee")
+            .cloned()
+            .ok_or_else(|| "the node's getnetworkinfo omitted relayfee".into()),
+        "blockchain.transaction.broadcast" => {
+            rpc_call(endpoint, "sendrawtransaction", json!([params[0].clone()]))
+        }
+        "blockchain.transaction.get" => {
+            let txid = params[0]
+                .as_str()
+                .ok_or("transaction id must be a string")?;
+            node_raw_transaction(endpoint, txid)?
+                .map(Value::String)
+                .ok_or_else(|| "no such transaction at the node".into())
+        }
+        _ => Err(format!("{method} is not answered by a node")),
+    }
+}
+
+/// #### PR #40
+/// A transaction's bytes from a node without a transaction index: from its
+/// mempool; else from the block holding one of its unspent outputs; else from
+/// one of the last blocks. `None` when none of them has it.
+fn node_raw_transaction(endpoint: &str, txid: &str) -> Result<Option<String>, String> {
+    use crate::node::rpc_call;
+    match rpc_call(endpoint, "getrawtransaction", json!([txid, false])) {
+        Ok(Value::String(raw)) => return Ok(Some(raw)),
+        Ok(_) => return Err("the node returned non-hex transaction data".into()),
+        // Without a transaction index a confirmed transaction is "no such";
+        // anything else is the node failing.
+        Err(error) if error.to_ascii_lowercase().contains("no such") => {}
+        Err(error) => return Err(error),
+    }
+    // A pruned node no longer has old blocks' data: not found there either.
+    let in_block = |hash: &Value| -> Result<Option<String>, String> {
+        match rpc_call(endpoint, "getrawtransaction", json!([txid, false, hash])) {
+            Ok(Value::String(raw)) => Ok(Some(raw)),
+            Ok(_) => Err("the node returned non-hex transaction data".into()),
+            Err(error)
+                if ["no such", "pruned", "not available"]
+                    .iter()
+                    .any(|gone| error.to_ascii_lowercase().contains(gone)) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let tip = rpc_call(endpoint, "getblockcount", json!([]))?
+        .as_u64()
+        .ok_or("getblockcount returned a non-number")?;
+    for vout in 0..4u32 {
+        let output = rpc_call(endpoint, "gettxout", json!([txid, vout, false]))?;
+        let Some(confirmations) = output.get("confirmations").and_then(Value::as_u64) else {
+            continue;
+        };
+        if confirmations == 0 || confirmations > tip + 1 {
+            break;
+        }
+        let hash = rpc_call(endpoint, "getblockhash", json!([tip + 1 - confirmations]))?;
+        if let Some(raw) = in_block(&hash)? {
+            return Ok(Some(raw));
+        }
+    }
+    for depth in 0..NODE_RECENT_BLOCKS.min(tip + 1) {
+        let hash = rpc_call(endpoint, "getblockhash", json!([tip - depth]))?;
+        if let Some(raw) = in_block(&hash)? {
+            return Ok(Some(raw));
+        }
+    }
+    Ok(None)
 }
 
 impl ElectrumSession {
@@ -109,6 +214,42 @@ impl ElectrumSession {
         ))
     }
 
+    /// #### PR #40
+    /// Connects to the miner's own BCH node(s), in order. The PHOTON baton is
+    /// taken from `known` (the job being mined, or a Fulcrum server's answer)
+    /// once the node confirms it, and otherwise found in the node's UTXO set
+    /// (a scan of a minute or two on mainnet); it is then followed through
+    /// the node's mempool and blocks, and claims go out through the node.
+    pub fn connect_node_failover(
+        endpoints: &[String],
+        deployment: &'static PhotonDeployment,
+        known: Option<&LiveJob>,
+    ) -> Result<Self, String> {
+        deployment.verify()?;
+        let photon = match known {
+            Some(job) => crate::node::NativePhotonSession::resume(endpoints, deployment, job)?,
+            None => crate::node::NativePhotonSession::connect_failover(endpoints, deployment)?,
+        };
+        let endpoint = photon.endpoint().to_owned();
+        let server_version =
+            node_rpc(&endpoint, "server.version", &json!([])).unwrap_or(Value::Null);
+        Ok(Self {
+            url: crate::node::redact_url(&endpoint),
+            server_version,
+            link: Link::Node {
+                endpoint,
+                photon: Box::new(photon),
+            },
+            deployment,
+            fee_policy: None,
+        })
+    }
+
+    /// #### PR #40: whether this session is the miner's own node.
+    pub fn is_node(&self) -> bool {
+        matches!(self.link, Link::Node { .. })
+    }
+
     /// Connects to one Fulcrum endpoint and verifies its response.
     fn connect_one(url_str: &str, deployment: &'static PhotonDeployment) -> Result<Self, String> {
         let (ws, _resp) = connect(url_str).map_err(|e| format!("connect: {e}"))?;
@@ -128,9 +269,11 @@ impl ElectrumSession {
         let mut session = Self {
             url: url_str.to_string(),
             server_version: Value::Null,
-            ws,
-            next_id: 1,
-            buf: String::new(),
+            link: Link::Fulcrum {
+                ws: Box::new(ws),
+                next_id: 1,
+                buf: String::new(),
+            },
             deployment,
             fee_policy: None,
         };
@@ -140,14 +283,18 @@ impl ElectrumSession {
         Ok(session)
     }
 
-    /// Sends an Electrum JSON-RPC request over the WebSocket.
+    /// Sends an Electrum JSON-RPC request over the WebSocket, or asks the
+    /// node the same question in its own RPCs.
     pub fn rpc(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        let id = self.next_id;
-        self.next_id += 1;
+        let (ws, next_id, buf) = match &mut self.link {
+            Link::Fulcrum { ws, next_id, buf } => (ws, next_id, buf),
+            Link::Node { endpoint, .. } => return node_rpc(endpoint, method, &params),
+        };
+        let id = *next_id;
+        *next_id += 1;
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let line = format!("{req}\n");
-        self.ws
-            .send(Message::Text(line.into()))
+        ws.send(Message::Text(line.into()))
             .map_err(|e| format!("transport: send: {e}"))?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -155,16 +302,15 @@ impl ElectrumSession {
             if std::time::Instant::now() > deadline {
                 return Err(format!("timeout: rpc waiting for id={id} ({method})"));
             }
-            let msg = self.ws.read().map_err(websocket_read_error)?;
+            let msg = ws.read().map_err(websocket_read_error)?;
             match msg {
                 Message::Text(t) => {
-                    if let Some(result) = consume_rpc_text(&mut self.buf, &t, id)? {
+                    if let Some(result) = consume_rpc_text(buf, &t, id)? {
                         return Ok(result);
                     }
                 }
                 Message::Ping(p) => {
-                    self.ws
-                        .send(Message::Pong(p))
+                    ws.send(Message::Pong(p))
                         .map_err(|e| format!("transport: pong send: {e}"))?;
                 }
                 Message::Close(_) => return Err("transport: socket closed".into()),
@@ -217,6 +363,10 @@ impl ElectrumSession {
 
     /// Fetches the authoritative live PHOTON baton snapshot.
     pub fn fetch_live_snapshot(&mut self) -> Result<LiveStateSnapshot, String> {
+        // #### PR #40: the node follows its baton from its own state.
+        if let Link::Node { photon, .. } = &mut self.link {
+            return photon.refresh();
+        }
         let mut last_error = String::new();
         for _ in 0..4 {
             match self.read_live_snapshot() {
@@ -520,5 +670,220 @@ mod tests {
             consume_rpc_text(&mut buf, payload, 9).unwrap(),
             Some(json!(["ok"]))
         );
+    }
+
+    // #### PR #40
+    /// A scripted BCH node: answers each JSON-RPC call in order, checking its
+    /// method, with a result or an RPC error.
+    fn scripted_node(
+        calls: Vec<(&'static str, Result<Value, &'static str>)>,
+    ) -> (String, thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (method, answer) in calls {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let start = loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break end + 4;
+                        }
+                    }
+                    assert!(read > 0, "connection closed before the request");
+                };
+                let body: Value = serde_json::from_slice(&request[start..]).unwrap();
+                assert_eq!(body["method"], method);
+                let reply = match answer {
+                    Ok(result) => json!({"result": result, "error": null, "id": body["id"]}),
+                    Err(message) => json!({"result": null,
+                        "error": {"code": -5, "message": message}, "id": body["id"]}),
+                }
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.len(),
+                    reply
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_node_answers_the_miners_fulcrum_calls() {
+        let (node, server) = scripted_node(vec![
+            ("getmempoolinfo", Ok(json!({"mempoolminfee": 0.00001}))),
+            ("getnetworkinfo", Ok(json!({"relayfee": 0.00001}))),
+            ("sendrawtransaction", Ok(json!("ab".repeat(32)))),
+            (
+                "getnetworkinfo",
+                Ok(json!({"subversion": "/Bitcoin Cash Node:29.1.0(EB32.0)/"})),
+            ),
+            ("getblockcount", Ok(json!(100))),
+        ]);
+        assert_eq!(
+            node_rpc(&node, "mempool.get_info", &json!([])).unwrap()["mempoolminfee"],
+            json!(0.00001)
+        );
+        assert_eq!(
+            node_rpc(&node, "blockchain.relayfee", &json!([])).unwrap(),
+            json!(0.00001)
+        );
+        assert_eq!(
+            node_rpc(&node, "blockchain.transaction.broadcast", &json!(["00"])).unwrap(),
+            json!("ab".repeat(32))
+        );
+        assert_eq!(
+            node_rpc(&node, "server.version", &json!([])).unwrap()[1],
+            json!("node")
+        );
+        assert_eq!(
+            node_rpc(&node, "server.ping", &json!([])).unwrap(),
+            Value::Null
+        );
+        assert!(node_rpc(&node, "blockchain.scripthash.listunspent", &json!([])).is_err());
+        server.join().unwrap();
+    }
+
+    // #### PR #40
+    #[test]
+    fn a_node_without_a_transaction_index_finds_recent_and_unspent_transactions() {
+        let txid = "cd".repeat(32);
+        let missing = "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
+        let not_in_block = "No such transaction found in the provided block.";
+        // In the mempool.
+        let (node, server) = scripted_node(vec![("getrawtransaction", Ok(json!("aa")))]);
+        assert_eq!(
+            node_raw_transaction(&node, &txid).unwrap().as_deref(),
+            Some("aa")
+        );
+        server.join().unwrap();
+        // Confirmed, with an unspent output that tells its block.
+        let (node, server) = scripted_node(vec![
+            ("getrawtransaction", Err(missing)),
+            ("getblockcount", Ok(json!(100))),
+            ("gettxout", Ok(json!({"confirmations": 3}))),
+            ("getblockhash", Ok(json!("98"))),
+            ("getrawtransaction", Ok(json!("bb"))),
+        ]);
+        assert_eq!(
+            node_raw_transaction(&node, &txid).unwrap().as_deref(),
+            Some("bb")
+        );
+        server.join().unwrap();
+        // Its outputs spent, but in one of the last blocks.
+        let mut calls = vec![
+            ("getrawtransaction", Err(missing)),
+            ("getblockcount", Ok(json!(100))),
+        ];
+        calls.extend(std::iter::repeat_n(("gettxout", Ok(Value::Null)), 4));
+        calls.extend([
+            ("getblockhash", Ok(json!("100"))),
+            ("getrawtransaction", Err(not_in_block)),
+            ("getblockhash", Ok(json!("99"))),
+            ("getrawtransaction", Ok(json!("cc"))),
+        ]);
+        let (node, server) = scripted_node(calls);
+        assert_eq!(
+            node_raw_transaction(&node, &txid).unwrap().as_deref(),
+            Some("cc")
+        );
+        server.join().unwrap();
+        // A node that fails is an error, not "unknown".
+        let (node, server) = scripted_node(vec![(
+            "getrawtransaction",
+            Err("Work queue depth exceeded"),
+        )]);
+        assert!(node_raw_transaction(&node, &txid).is_err());
+        server.join().unwrap();
+    }
+
+    // #### PR #40
+    /// Opt-in, with a synced node: `PICKAXE_TEST_NODE_URL=http://USER:PASS@HOST:PORT`
+    /// (Chipnet) starts PHOTON from the node alone, by its UTXO-set scan, reads
+    /// the job and the baton's transaction back through the miner's session,
+    /// and resumes from that baton without a scan.
+    #[test]
+    #[ignore = "needs a synced Chipnet BCHN in PICKAXE_TEST_NODE_URL"]
+    fn real_node_gives_the_photon_job_alone() {
+        let Ok(url) = std::env::var("PICKAXE_TEST_NODE_URL") else {
+            return;
+        };
+        let deployment = crate::config::MiningToken::Photon
+            .photon_deployment(crate::config::MiningNetwork::Chipnet);
+        let started = std::time::Instant::now();
+        let mut session =
+            ElectrumSession::connect_node_failover(std::slice::from_ref(&url), deployment, None)
+                .unwrap();
+        let scan = started.elapsed();
+        assert!(session.is_node());
+        if let Some((login, _)) = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('@'))
+        {
+            assert!(!session.url.contains(login), "the login is never shown");
+        }
+        let job = session.fetch_live_job().unwrap();
+        assert_eq!(job.baton_txid.len(), 64);
+        assert!(session.transaction_known(&job.baton_txid).unwrap());
+        let fee = session.rpc("mempool.get_info", json!([])).unwrap();
+        assert!(fee.get("mempoolminfee").is_some());
+        let started = std::time::Instant::now();
+        let mut resumed =
+            ElectrumSession::connect_node_failover(&[url], deployment, Some(&job)).unwrap();
+        let resume = started.elapsed();
+        let again = resumed.fetch_live_job().unwrap();
+        assert_eq!(
+            (again.baton_txid.as_str(), again.baton_vout),
+            (job.baton_txid.as_str(), job.baton_vout)
+        );
+        println!(
+            "node job: height {}, baton {}:{}, reward {}, scan {:?}, resume {:?}",
+            job.height, job.baton_txid, job.baton_vout, job.reward_raw, scan, resume
+        );
+        // The same state as a public Chipnet Fulcrum's, when one answers at
+        // the same tip.
+        let fulcrum: Vec<String> = crate::protocol::CHIPNET_FULCRUM_WSS_BOOTSTRAP
+            .iter()
+            .map(|url| url.to_string())
+            .collect();
+        if let Ok(mut public) =
+            ElectrumSession::connect_failover_for_deployment(&fulcrum, deployment)
+        {
+            let theirs = public.fetch_live_job().unwrap();
+            if theirs.tip_hash == job.tip_hash {
+                assert_eq!(
+                    (
+                        theirs.baton_txid.as_str(),
+                        theirs.baton_vout,
+                        theirs.reward_raw,
+                        theirs.target_le_hex.as_str()
+                    ),
+                    (
+                        job.baton_txid.as_str(),
+                        job.baton_vout,
+                        job.reward_raw,
+                        job.target_le_hex.as_str()
+                    )
+                );
+                println!("matches {} at the same tip", public.url);
+            } else {
+                println!("{} is at another tip; not compared", public.url);
+            }
+        }
     }
 }

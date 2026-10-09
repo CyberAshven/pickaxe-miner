@@ -98,6 +98,35 @@ fn full_template_preserves_ctor_transactions_and_reference_merkle() {
     assert!(BchTemplate::from_rpc(&raw).is_err());
 }
 
+// #### PR #40
+#[test]
+fn a_pool_name_is_written_into_the_coinbase_and_the_parts_still_fit() {
+    let mut raw = rpc_template();
+    raw["coinbaseaux"] = json!({"flags":"0454455354"});
+    let mut template = BchTemplate::from_rpc(&raw).unwrap();
+    template.tag(b"/MyPool/");
+    let extra = [7u8; 16];
+    let coinbase = template
+        .coinbase(MiningNetwork::Chipnet, &payout(), &extra)
+        .unwrap();
+    assert!(coinbase
+        .bytes
+        .windows(8)
+        .any(|window| window == b"/MyPool/"));
+    let parts = template
+        .coinbase_parts(MiningNetwork::Chipnet, &payout(), extra.len())
+        .unwrap();
+    let mut bytes = parts.prefix.clone();
+    bytes.extend(extra);
+    bytes.extend(&parts.suffix);
+    assert_eq!(bytes, coinbase.bytes);
+    // A name too long for the 100-byte coinbase script is refused.
+    template.tag(&[b'x'; 80]);
+    assert!(template
+        .coinbase(MiningNetwork::Chipnet, &payout(), &extra)
+        .is_err());
+}
+
 #[test]
 fn extended_coinbase_parts_preserve_nonempty_odd_and_even_merkle_trees() {
     use stratum_core::bitcoin::hashes::{sha256d, Hash as _};

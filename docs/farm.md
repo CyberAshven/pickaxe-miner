@@ -25,23 +25,35 @@ On any computer, with or without a GPU:
 pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --address <payout> --no-tui
 ```
 
-`--rigs-only` uses no GPU on that computer and never loads a GPU driver.
+`--rigs-only` uses no GPU on that computer and never loads a GPU driver, so
+it also runs beside a miner on the same computer.
 Without it, the coordinator also mines on its own GPUs, as a normal miner does.
 It prints its key when it starts (the `rigs` line's `coordinator_key`) and
 keeps it in `config.rigs-key` beside its configuration, so the key stays the
 same across restarts. Keep that file private: it is the coordinator's identity.
 
 Without `--no-tui`, the dashboard shows a Rigs row (rigs connected, their GPUs,
-the farm's rate, winners and rejected winners, the listen address and the key)
-and one row per rig (name, GPUs, rate, winners, minutes connected). Its
-Hashrate row adds the rigs' rate to the coordinator's own. `--json` status
-lines carry the same under `rigs`.
+the farm's rate, winners and rejected winners, the listen address) and one row
+per rig (name, GPUs, rate, winners, minutes connected). Its Hashrate row adds
+the rigs' rate to the coordinator's own. `--json` status lines carry the same
+under `rigs`.
+
+Press `I` for Connection info: the exact command a rig runs, once for each
+address other computers reach the coordinator at (its address on your network
+and, when Tailscale is running, its Tailscale address), with a number key to
+copy each. The `rigs` start line lists the same addresses under `connect`;
+with `--no-tui` and without `--json`, the coordinator also prints each command
+as a `rigs join` line.
 
 ## Rigs
 
 ```text
 pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key> --rig-name rack1-07 --no-tui
 ```
+
+In the setup, choose GPU mining and set Mining to "Join a GPU pool or farm"
+with the coordinator's address and key (the one-line
+`stratum2+tcp://HOST:3340/KEY` fills both); Start mines as a rig.
 
 A rig needs no address, Fulcrum server or node of its own, and mines with the
 coordinator's donation setting (never below the token's minimum). It mines on
@@ -96,6 +108,13 @@ WantedBy=multi-user.target
 Then `sudo systemctl enable --now pickaxe-rig`, and `journalctl -u pickaxe-rig -f`
 shows its lines. The coordinator runs the same way with its own command.
 
+A miner without a screen (`--no-tui`) saves its status once a second beside
+its config (`mainnet.mine-status.json` for `mainnet.json`), with no payout
+address in it. On that machine, `pickaxe watch` with the same `--config` shows
+it read-only: a coordinator's farm (rigs connected, GPUs, rate, winners) and
+one row per rig, or a miner's own GPUs; `q` leaves the miner running, and the
+header says when the miner stopped updating.
+
 Windows, a task that starts the rig at logon:
 
 ```text
@@ -108,6 +127,19 @@ schtasks /Create /TN "Pickaxe rig" /SC ONLOGON /TR "\"C:\Pickaxe\pickaxe.exe\" m
 - Any machine that reaches the port can connect as a rig, but it can only mine
   for your payout, and every winner is checked before it is claimed.
 - Up to 1,024 rigs can be connected at once.
+
+### Rigs in other places
+
+- Easiest: install [Tailscale](https://tailscale.com) on the coordinator and
+  on every rig, signed in to the same account. Rigs then reach the coordinator
+  at its Tailscale address wherever they are, with no router port opened, and
+  Connection info shows that address. [Headscale](https://github.com/juanfont/headscale)
+  runs the same network on your own server; any VPN that puts the machines on
+  one network works too.
+- Without a VPN, forward TCP 3340 on the coordinator's router to it and give
+  rigs your public IP address or domain; a public pool publishes that address.
+- Pickaxe never opens router ports by itself, and the link to every rig is
+  encrypted and pinned to the coordinator's key either way.
 
 ## Tested
 
@@ -122,6 +154,18 @@ A Chipnet Fulcrum server then had 346 of the 349 claims in two blocks and the
 other 3 in its mempool. Neither rig reconnected, and the coordinator's process
 showed no GPU activity. That build reported each rig's rate as 0; rigs now
 measure their own rate (fixed after the test, host-tested).
+
+A public GPU pool, live on Chipnet on 2026-10-08 with PR #40's build: the
+coordinator with `--rigs-public --rigs-fee 20` (20% only so fee windows show
+in a 10-minute test) and the same two GPUs as two rigs, each with its own
+payout: rig A joined at the coordinator's local-network address and rig B at
+its Tailscale address, both from the coordinator's `connect` list. The rigs
+sent 95 winners (rig A 94, rig B 1) and the coordinator claimed all 95. On
+Chipnet, by the output carrying the tokens, 75 claims paid rig A's address,
+1 paid rig B's, 16 the operator's fee address (17% of the rigs' claims,
+against a 20% fee window) and 3 the donation; none paid anyone else, and all
+95 confirmed. Chipnet's PHOTON target was about six times harder than in the
+first test.
 
 Not yet tested live: rigs on separate machines, a backup coordinator taking
 over, and more than two rigs.

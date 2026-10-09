@@ -16,6 +16,16 @@ fn solved_share_with_payout(
     salt: u8,
     payout_policy: crate::donation::bch::BchPayout,
 ) -> ValidatedShare {
+    solved_share_for(salt, payout_policy, &payout(), None)
+}
+
+/// #### PR #40: a block solved for any miner, with any pool fee address.
+fn solved_share_for(
+    salt: u8,
+    payout_policy: crate::donation::bch::BchPayout,
+    miner: &str,
+    operator: Option<&str>,
+) -> ValidatedShare {
     let template = Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap());
     let mut channel = Channel::new(
         1,
@@ -23,9 +33,10 @@ fn solved_share_with_payout(
         [255; 32],
         [salt; 12],
         MiningNetwork::Chipnet,
-        &payout(),
+        miner,
     )
     .unwrap();
+    channel.set_operator(operator).unwrap();
     let job = channel
         .install_with_payout(1, 1, template.clone(), payout_policy)
         .unwrap();
@@ -60,7 +71,57 @@ fn solved_share_with_payout(
 }
 
 fn open(dir: &TestDirectory) -> Journal {
-    Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), [42; 32]).unwrap()
+    Journal::open(
+        &dir.journal(),
+        MiningNetwork::Chipnet,
+        &payout(),
+        &[[42; 32]],
+    )
+    .unwrap()
+}
+
+// #### PR #40
+#[test]
+fn a_public_pool_block_for_another_miner_survives_a_restart() {
+    use crate::donation::bch::{BchPayout, FeeMode, PoolFee};
+    let miner = crate::config::reprefix_p2pkh_payout(
+        &crate::reward::p2pkh_cashaddr_from_public_key(
+            &secp256k1::PublicKey::from_secret_key(
+                &secp256k1::SecretKey::from_secret_bytes([5; 32]).unwrap(),
+            )
+            .serialize(),
+        )
+        .unwrap(),
+        MiningNetwork::Chipnet,
+    )
+    .unwrap();
+    let operator = payout();
+    let policy = BchPayout {
+        fee: Some(PoolFee {
+            rate: "2".parse().unwrap(),
+            mode: FeeMode::Both,
+        }),
+        ..BchPayout::default()
+    };
+    let dir = TestDirectory::new();
+    let share = solved_share_for(7, policy, &miner, Some(&operator));
+    let hash = {
+        let mut journal = open(&dir);
+        assert!(journal.enqueue(&share).unwrap());
+        journal.pending_hashes()[0].clone()
+    };
+    // Reopened, the pending block still checks against its own miner.
+    let journal = open(&dir);
+    let pending = journal.pending(&hash).unwrap();
+    assert_eq!(pending.miner.as_deref(), Some(miner.as_str()));
+    assert_eq!(pending.operator.as_deref(), Some(operator.as_str()));
+    assert_eq!(pending.payout, Some(policy));
+    // A tampered miner fails closed.
+    drop(journal);
+    let path = dir.journal();
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, text.replace(&miner, &operator)).unwrap();
+    assert!(Journal::open(&path, MiningNetwork::Chipnet, &payout(), &[[42; 32]]).is_err());
 }
 
 #[test]
@@ -73,10 +134,12 @@ fn journal_recovers_each_jobs_rate_and_rejects_policy_tampering() {
         BchPayout {
             donation: "2".parse().unwrap(),
             donation_work: false,
+            ..BchPayout::default()
         },
         BchPayout {
             donation: "2.01".parse().unwrap(),
             donation_work: true,
+            ..BchPayout::default()
         },
     ]
     .into_iter()
@@ -101,9 +164,13 @@ fn journal_recovers_each_jobs_rate_and_rejects_policy_tampering() {
         let mut state: serde_json::Value = serde_json::from_slice(&original).unwrap();
         state["pending"][0]["payout"] = replacement;
         fs::write(dir.journal(), serde_json::to_vec(&state).unwrap()).unwrap();
-        assert!(
-            Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), [42; 32]).is_err()
-        );
+        assert!(Journal::open(
+            &dir.journal(),
+            MiningNetwork::Chipnet,
+            &payout(),
+            &[[42; 32]]
+        )
+        .is_err());
     }
 }
 
@@ -173,23 +240,88 @@ fn solved_block_and_completion_receipt_survive_reopen_without_double_counting() 
     }
 }
 
+// #### PR #40
+#[test]
+fn a_journal_bound_to_one_node_opens_while_that_node_is_configured_and_is_rebound() {
+    let dir = TestDirectory::new();
+    drop(open(&dir));
+    // Bind the journal to node [42; 32], as journals were before PR #40.
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.journal()).unwrap()).unwrap();
+    let script = super::payout::scripts(MiningNetwork::Chipnet, &payout(), None)
+        .unwrap()
+        .remove(0);
+    state["context"] = serde_json::json!(super::journal::legacy_binding(
+        &[42; 32],
+        MiningNetwork::Chipnet,
+        &script
+    ));
+    fs::write(dir.journal(), state.to_string()).unwrap();
+    // Without its node it cannot be told apart from another miner's journal.
+    assert!(Journal::open(
+        &dir.journal(),
+        MiningNetwork::Chipnet,
+        &payout(),
+        &[[43; 32]]
+    )
+    .is_err());
+    // With its node among the configured ones it opens and is rebound, so
+    // it then opens with any node of the network.
+    drop(
+        Journal::open(
+            &dir.journal(),
+            MiningNetwork::Chipnet,
+            &payout(),
+            &[[43; 32], [42; 32]],
+        )
+        .unwrap(),
+    );
+    drop(Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), &[]).unwrap());
+    // Another payout still cannot open it.
+    let other =
+        crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], MiningNetwork::Chipnet).unwrap();
+    assert!(Journal::open(&dir.journal(), MiningNetwork::Chipnet, &other, &[[42; 32]]).is_err());
+}
+
 #[test]
 fn journal_refuses_concurrent_writer_foreign_context_and_corrupt_state() {
     let dir = TestDirectory::new();
     let journal = open(&dir);
-    assert!(Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), [42; 32]).is_err());
+    assert!(Journal::open(
+        &dir.journal(),
+        MiningNetwork::Chipnet,
+        &payout(),
+        &[[42; 32]]
+    )
+    .is_err());
     drop(journal);
     let original = fs::read(dir.journal()).unwrap();
-    assert!(Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), [43; 32]).is_err());
+    // #### PR #40: another node of the same network opens it, unchanged.
+    drop(
+        Journal::open(
+            &dir.journal(),
+            MiningNetwork::Chipnet,
+            &payout(),
+            &[[43; 32]],
+        )
+        .unwrap(),
+    );
+    assert_eq!(fs::read(dir.journal()).unwrap(), original);
     let other =
         crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], MiningNetwork::Chipnet).unwrap();
-    assert!(Journal::open(&dir.journal(), MiningNetwork::Chipnet, &other, [42; 32]).is_err());
+    assert!(Journal::open(&dir.journal(), MiningNetwork::Chipnet, &other, &[[42; 32]]).is_err());
     let main =
         crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x12; 20], MiningNetwork::Mainnet).unwrap();
-    assert!(Journal::open(&dir.journal(), MiningNetwork::Mainnet, &main, [42; 32]).is_err());
+    assert!(Journal::open(&dir.journal(), MiningNetwork::Mainnet, &main, &[[42; 32]]).is_err());
     assert_eq!(fs::read(dir.journal()).unwrap(), original);
     fs::write(dir.journal(), b"partial journal").unwrap();
-    assert!(Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), [42; 32]).is_err());
+    assert!(Journal::open(
+        &dir.journal(),
+        MiningNetwork::Chipnet,
+        &payout(),
+        &[[42; 32]]
+    )
+    .is_err());
     assert_eq!(fs::read(dir.journal()).unwrap(), b"partial journal");
 }
 
@@ -212,7 +344,13 @@ fn corrupt_saved_block_and_failed_atomic_commit_cannot_be_acknowledged() {
     bytes[36] ^= 1;
     state["pending"][0]["block"] = serde_json::json!(hex::encode(bytes));
     fs::write(dir.journal(), serde_json::to_vec(&state).unwrap()).unwrap();
-    assert!(Journal::open(&dir.journal(), MiningNetwork::Chipnet, &payout(), [42; 32]).is_err());
+    assert!(Journal::open(
+        &dir.journal(),
+        MiningNetwork::Chipnet,
+        &payout(),
+        &[[42; 32]]
+    )
+    .is_err());
 }
 
 #[test]
@@ -261,7 +399,7 @@ fn pending_block_and_receipt_survive_process_exit_without_destructors() {
             std::path::Path::new(&path),
             MiningNetwork::Chipnet,
             &payout(),
-            [42; 32],
+            &[[42; 32]],
         )
         .unwrap();
         if journal.counts().0 == 0 {

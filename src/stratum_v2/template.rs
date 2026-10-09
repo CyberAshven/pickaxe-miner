@@ -156,6 +156,15 @@ impl BchTemplate {
         })
     }
 
+    /// #### PR #40
+    /// Writes the pool's name (`--pool-tag`) into the coinbase script of every
+    /// block built from this template, after the node's flags and before the
+    /// extranonce; the coinbase script stays within 100 bytes, which
+    /// `coinbase_with_payout` checks.
+    pub fn tag(&mut self, tag: &[u8]) {
+        self.coinbase_flags.extend_from_slice(tag);
+    }
+
     /// Build one channel's coinbase. The caller assigns a unique extranonce;
     /// devices never control the payout or the transaction ordering.
     pub fn coinbase(
@@ -164,17 +173,18 @@ impl BchTemplate {
         payout: &str,
         extranonce: &[u8],
     ) -> Result<Coinbase, String> {
-        self.coinbase_with_payout(network, payout, extranonce, Default::default())
+        self.coinbase_with_payout(network, payout, None, extranonce, Default::default())
     }
 
     pub fn coinbase_with_payout(
         &self,
         network: MiningNetwork,
         payout: &str,
+        operator: Option<&str>,
         extranonce: &[u8],
         policy: crate::donation::bch::BchPayout,
     ) -> Result<Coinbase, String> {
-        let scripts = super::payout::scripts(network, payout)?;
+        let scripts = super::payout::scripts(network, payout, operator)?;
         let outputs = super::payout::outputs(self.coinbase_value, &scripts, policy);
         if extranonce.len() > 64 {
             return Err("extranonce exceeds coinbase budget".into());
@@ -218,13 +228,14 @@ impl BchTemplate {
         payout: &str,
         extranonce_len: usize,
     ) -> Result<CoinbaseParts, String> {
-        self.coinbase_parts_with_payout(network, payout, extranonce_len, Default::default())
+        self.coinbase_parts_with_payout(network, payout, None, extranonce_len, Default::default())
     }
 
     pub fn coinbase_parts_with_payout(
         &self,
         network: MiningNetwork,
         payout: &str,
+        operator: Option<&str>,
         extranonce_len: usize,
         policy: crate::donation::bch::BchPayout,
     ) -> Result<CoinbaseParts, String> {
@@ -232,7 +243,7 @@ impl BchTemplate {
             return Err("extranonce exceeds coinbase budget".into());
         }
         let coinbase =
-            self.coinbase_with_payout(network, payout, &vec![0; extranonce_len], policy)?;
+            self.coinbase_with_payout(network, payout, operator, &vec![0; extranonce_len], policy)?;
         // The coinbase script is at most 100 bytes, so its CompactSize is one byte.
         let offset =
             4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len();
