@@ -1373,6 +1373,24 @@ fn write_status(path: &Path, status: &serde_json::Value) -> std::io::Result<()> 
     })
 }
 
+/// #### PR #40: the saved best share.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WatchBest {
+    difficulty: f64,
+    worker: String,
+}
+
+/// #### PR #40: a saved found block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WatchBlock {
+    height: u32,
+    worker: String,
+    seconds_ago: u64,
+    result: Option<String>,
+}
+
 /// The saved status as `stratum-v2 watch` reads it.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -1385,6 +1403,9 @@ struct WatchStatus {
     /// #### PR #40: which node of several templates come from (1-based).
     node_active: usize,
     nodes: usize,
+    /// #### PR #40: the best share since start and the latest blocks found.
+    best_share: Option<WatchBest>,
+    recent_blocks: Vec<WatchBlock>,
     updated: u64,
     ready: bool,
     height: Option<u32>,
@@ -1447,6 +1468,46 @@ impl WatchStatus {
             self.shares_rejected,
             self.blocks_accepted,
             self.blocks_pending,
+        ) + &self.records(age)
+    }
+
+    /// #### PR #40
+    /// The third header line: the best share and the latest blocks found,
+    /// their ages counted to now.
+    fn records(&self, age: u64) -> String {
+        let best = self
+            .best_share
+            .as_ref()
+            .map(|best| {
+                format!(
+                    "{} by {}",
+                    format_difficulty(Some(best.difficulty)),
+                    best.worker
+                )
+            })
+            .unwrap_or_else(|| "none yet".into());
+        let blocks: Vec<String> = self
+            .recent_blocks
+            .iter()
+            .rev()
+            .take(3)
+            .map(|found| {
+                format!(
+                    "#{} {} {} {}",
+                    found.height,
+                    found.worker,
+                    found.result.as_deref().unwrap_or("waiting"),
+                    ago(Some(found.seconds_ago + age))
+                )
+            })
+            .collect();
+        format!(
+            "\nBest share {best} · Recent blocks {}",
+            if blocks.is_empty() {
+                "none yet".to_owned()
+            } else {
+                blocks.join(", ")
+            }
         )
     }
 
@@ -2126,6 +2187,17 @@ mod tests {
         stats.template_ready = true;
         stats.height = Some(326930);
         stats.shares_accepted = 1;
+        // #### PR #40: the records a service's watch view shows too.
+        stats.best_share = Some((5000.0, "rig1 #1".into()));
+        stats
+            .recent_blocks
+            .push_back(super::super::server::FoundBlock {
+                height: 326930,
+                hash: "00".repeat(32),
+                worker: "rig1 #1".into(),
+                found: start,
+                result: Some("accepted"),
+            });
         let devices = stats
             .device_stats
             .snapshots(start + Duration::from_secs(40));
@@ -2157,6 +2229,8 @@ mod tests {
             "0.50% of work",
             "Live",
             "1 of 1 workers",
+            "Best share 5.00K by rig1 #1",
+            "#326930 rig1 #1 accepted",
         ] {
             assert!(header.contains(part), "{part}");
         }
