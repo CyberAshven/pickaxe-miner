@@ -1519,3 +1519,45 @@ slot, category, payout, split, stale anchor, moved output 0, script length,
 output count, target encoding, ticket and start height), the unchanged
 151-byte coinbase, golden 204- and 250-byte coinbases with a token, and
 journals holding token blocks beside current and pre-donation ones.
+
+## Merge-mining share path: token wins and the share-target floor (2026-10-09)
+
+#### PR #42
+
+Every accepted share is now checked for merge-mined token wins
+(`src/stratum_v2/channel.rs`, `wire.rs`). No token is registered on either
+network, so nothing changes at runtime yet. Jobs carry no merge-mining, and
+coinbases stay byte for byte as before. The server takes no wins until its
+wiring lands.
+
+- A job built from a template with tokens gets its own merge-mining. Its
+  leaves bind the job's payout and the donation's split. The payout is the
+  miner's, the Pickaxe donation address in donation-work jobs, or a public
+  pool operator's in fee-work jobs. The job's coinbases carry the commitment
+  and the tickets. This holds on standard and extended channels, and for SV1
+  firmware through the adapter.
+- Each share costs one compare with the job's easiest Case A target. A
+  winning share hands on its job, header, coinbase and merkle branch: all a
+  proof needs. It goes beside the acknowledgement, whether or not the share
+  is also a block. Case B tokens win only with a found block.
+- A duplicate never yields a second proof. A share over the per-job cap is
+  refused, so it yields no proof.
+- While Case A tokens are merge-mined, a device's share target is made
+  easier, up to the easiest token target. It is never more than 15 times
+  easier than vardiff's target (about 5 shares a second), and never easier
+  than the device allows. Within that range firmware sends every hash that
+  wins a token. A token target easier than that is mined best effort: only
+  hashes that meet the capped target reach the server.
+- Vardiff counts and estimates only at its own target.
+- The best-share record uses the hash the check computed. That saves one
+  double SHA-256 per share.
+
+Evidence: host tests cover a token win's header, coinbase and branch on
+standard and extended channels. Its proof verifies as a covenant would check
+it. Other tests cover shares without tokens, a block's Case B win and
+duplicates. They show that public-pool, donation-work and fee-work jobs bind
+their own payout and split, and that retained jobs keep their own commitments.
+Tests cover the floor and its cap, and vardiff ignoring shares that only the
+floor accepts. Session tests cover token wins in the responses beside a block,
+the best share from the carried hash, and new channels and jobs carrying the
+floor.

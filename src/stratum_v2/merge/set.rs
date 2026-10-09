@@ -9,6 +9,7 @@
 //! the donation's split.
 
 use super::{
+    super::template::meets_target,
     commitment::{AuxCommitment, OUTPUT_LEN},
     leaf::{Leaf, Mode, MAX_SPLIT_BPS},
     registry::{MergeToken, MAX_TICKETS, MAX_TOKENS, TICKET_LEN},
@@ -347,6 +348,23 @@ impl AuxJob {
     pub fn branch(&self, index: usize) -> Option<Vec<Hash>> {
         Some(self.tree.branch(self.entries.get(index)?.slot))
     }
+
+    /// The entries a share whose header hashes to `hash` wins, as indices
+    /// in set order: Case A entries whose target the hash meets (`hash <=
+    /// target`, the header rule) and, when the share is a BCH block, every
+    /// Case B entry.
+    pub fn wins(&self, hash: &Hash, block: bool) -> Vec<u16> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| match (entry.mode, &entry.target) {
+                (Mode::ShareTarget, Some(target)) => meets_target(hash, target),
+                (Mode::BlockRequired, _) => block,
+                (Mode::ShareTarget, None) => false,
+            })
+            .filter_map(|(index, _)| u16::try_from(index).ok())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -479,6 +497,28 @@ pub(crate) mod tests {
         assert!(TokenSet::new(MiningNetwork::Chipnet, many, 1)
             .unwrap_err()
             .contains("at most 16"));
+    }
+
+    // #### PR #42: token wins on the share path
+    #[test]
+    fn a_share_wins_case_a_by_target_and_case_b_only_with_a_block() {
+        let set = test_set(&[Mode::ShareTarget, Mode::BlockRequired]);
+        let job = AuxJob::build(&set, &[0x51], None, 2).unwrap();
+        let target = test_state().target;
+        // The header rule: a hash equal to the target wins, one above misses.
+        assert_eq!(target[0], 0);
+        let mut above = target;
+        above[0] = 1;
+        assert_eq!(job.wins(&target, false), [0]);
+        assert_eq!(job.wins(&[0; 32], false), [0]);
+        assert_eq!(job.wins(&above, false), Vec::<u16>::new());
+        // Case B needs a block, whatever the hash.
+        assert_eq!(job.wins(&target, true), [0, 1]);
+        assert_eq!(job.wins(&above, true), [1]);
+        let b_only = AuxJob::build(&test_set(&[Mode::BlockRequired]), &[0x51], None, 2).unwrap();
+        assert_eq!(b_only.easiest_a, None);
+        assert_eq!(b_only.wins(&[0; 32], false), Vec::<u16>::new());
+        assert_eq!(b_only.wins(&[0xff; 32], true), [0]);
     }
 
     fn double(bytes: &[u8]) -> Hash {

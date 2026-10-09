@@ -26,7 +26,20 @@ fn solved_share_for(
     miner: &str,
     operator: Option<&str>,
 ) -> ValidatedShare {
-    let template = Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap());
+    let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+    solved_share_on(template, salt, payout_policy, miner, operator)
+}
+
+/// #### PR #42: the same on any template (one with merge-mined tokens too),
+/// through a channel's share path.
+fn solved_share_on(
+    template: BchTemplate,
+    salt: u8,
+    payout_policy: crate::donation::bch::BchPayout,
+    miner: &str,
+    operator: Option<&str>,
+) -> ValidatedShare {
+    let template = Arc::new(template);
     let mut channel = Channel::new(
         1,
         ChannelKind::Standard,
@@ -81,7 +94,8 @@ fn open(dir: &TestDirectory) -> Journal {
 }
 
 /// #### PR #42: a block solved with the test token merge-mined in both
-/// modes: a commitment as output 0 and a ticket after the payouts.
+/// modes: a commitment as output 0 and a ticket after the payouts. It comes
+/// from a channel's share path, which names the ticket's entry as won.
 fn solved_token_share(salt: u8) -> ValidatedShare {
     use super::merge::{leaf::Mode, set::tests::test_set};
     let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
@@ -89,44 +103,9 @@ fn solved_token_share(salt: u8) -> ValidatedShare {
         Mode::ShareTarget,
         Mode::BlockRequired,
     ])));
-    let template = Arc::new(template);
-    let policy = crate::donation::bch::BchPayout::default();
-    let job = template
-        .aux_job(MiningNetwork::Chipnet, &payout(), None, policy)
-        .unwrap()
-        .unwrap();
-    let coinbase = template
-        .coinbase_with_aux(
-            MiningNetwork::Chipnet,
-            &payout(),
-            None,
-            &[salt; 20],
-            policy,
-            Some(&job.outputs),
-        )
-        .unwrap();
-    let header = (0..10_000)
-        .map(|nonce| {
-            template
-                .header(&coinbase, template.version, template.current_time, nonce)
-                .unwrap()
-        })
-        .find(|bytes| {
-            let header: Header = consensus::deserialize(bytes).unwrap();
-            header.validate_pow(header.target()).is_ok()
-        })
-        .unwrap();
-    ValidatedShare {
-        generation: 1,
-        template,
-        coinbase,
-        header,
-        block: true,
-        share_target: [255; 32],
-        payout: policy,
-        miner: payout(),
-        operator: None,
-    }
+    let share = solved_share_on(template, salt, Default::default(), &payout(), None);
+    assert!(share.block && share.token_wins.contains(&1));
+    share
 }
 
 /// #### PR #42: journals a token block, rewrites its coinbase with

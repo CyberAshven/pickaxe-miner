@@ -471,7 +471,13 @@ valid Chipnet blocks, and returns on the next normal template (Chipnet allows
 difficulty-1 blocks after a 20-minute gap). A device target limit that cannot
 accommodate easier block work is rejected. Older jobs accept shares at the
 easier of their own target and the current one, and each share is credited at
-the target it met. Only the first solved block on each parent is saved; later
+the target it met. While merge-mined tokens are mined (none is registered
+yet), a device's target is made easier, up to the easiest token target that
+needs no block. It is never more than 15 times easier than vardiff's (about 5
+shares a second), and never easier than the device allows. Within that range
+firmware sends every hash that wins a token. A token target easier than that
+is mined best effort. Vardiff counts and estimates only at its own target.
+Only the first solved block on each parent is saved; later
 solutions on the same parent count as shares. SV1 adapter rejects count in the
 shared dashboard totals; separate adapter/native connection error fields can
 both describe the same disconnected session. Knuth TP, distributed rigs and
@@ -488,7 +494,9 @@ fails) and the username at the pool (your payout address by default). A
 saved profile keeps them.
 
 `--donation 2` selects 2%; the dashboard's Advanced settings (`a`) change the
-saved setting in 0.5% steps from 0% to 100%. Token policies remain separate.
+saved setting in 0.5% steps from 0% to 100%. Merge-mined tokens share this
+setting: two thirds as a split in each token claim, and one third through the
+same donation work. GPU token policies remain separate.
 Mainnet and Chipnet each donate to their own built-in address
 (`src/donation/bch.rs`), checked by the same payout validation as the miner's.
 The BCH policy is attached to each job; changing the setting never changes an

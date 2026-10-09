@@ -3,6 +3,10 @@
 //! Version rolling is restricted to BIP320's general-purpose bits. Devices
 //! receive disjoint coinbases and cannot alter payouts or template tx order.
 
+use super::merge::{
+    proof::{assemble, AuxProof, ProofError},
+    set::AuxJob,
+};
 use super::telemetry::expected_hashes;
 use super::template::{double_sha256, meets_target, BchTemplate, Coinbase, CoinbaseParts, Hash};
 use crate::config::MiningNetwork;
@@ -38,6 +42,10 @@ const VARDIFF_SHARES: u32 = 72;
 const VARDIFF_SECONDS: u64 = 240;
 const VARDIFF_SILENT_SECONDS: u64 = 60;
 const VARDIFF_HYSTERESIS: f64 = 1.25;
+/// #### PR #42: the share-target floor for merge-mined tokens is at most
+/// this many times easier than vardiff's target: about 5 shares a second at
+/// vardiff's 20 a minute.
+pub const TOKEN_FLOOR_CAP: u8 = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -64,6 +72,10 @@ pub struct Channel {
     /// told: this one, made easier while the block target is easier, and
     /// never easier than the device's maximum.
     desired: Hash,
+    /// #### PR #42: the target vardiff counts shares at and estimates from:
+    /// `target` without the merge-mined token floor (the same while no
+    /// token is merge-mined).
+    vardiff_target: Hash,
     vardiff: VardiffState,
     /// Vardiff's latest hash rate estimate, the baseline for its next check.
     hashrate: f32,
@@ -78,6 +90,9 @@ pub struct Job {
     pub parts: CoinbaseParts,
     pub target: Hash,
     pub payout: BchPayout,
+    /// #### PR #42: this job's merge-mining (its leaves bind this job's
+    /// payout), or `None` while no token is merge-mined.
+    pub aux: Option<Arc<AuxJob>>,
 }
 
 pub struct Share<'a> {
@@ -101,6 +116,77 @@ pub struct ValidatedShare {
     /// #### PR #40: who the block pays, which a public pool's journal records.
     pub miner: String,
     pub operator: Option<String>,
+    /// #### PR #42: the header's hash, computed once by the check.
+    pub hash: Hash,
+    /// #### PR #42: the job's merge-mining, the indices of the entries this
+    /// share wins (Case A entries whose target the hash meets, Case B
+    /// entries when it is a block), and the coinbase's merkle branch, which
+    /// is filled only when it wins one.
+    pub aux: Option<Arc<AuxJob>>,
+    pub token_wins: Vec<u16>,
+    pub merkle_path: Vec<Hash>,
+}
+
+impl ValidatedShare {
+    /// #### PR #42
+    /// What a share that wins merge-mined tokens hands on, or `None` for a
+    /// share that wins none (the usual case, which costs nothing).
+    pub fn token_win(&self) -> Option<TokenWin> {
+        if self.token_wins.is_empty() {
+            return None;
+        }
+        Some(TokenWin {
+            aux: self.aux.clone()?,
+            entries: self.token_wins.clone(),
+            coinbase: self.coinbase.bytes.clone(),
+            merkle_path: self.merkle_path.clone(),
+            header: self.header,
+            hash: self.hash,
+            block: self.block,
+            height: self.template.height,
+            payout: self.payout,
+            miner: self.miner.clone(),
+            operator: self.operator.clone(),
+        })
+    }
+}
+
+/// #### PR #42
+/// A share that wins merge-mined tokens, with everything their proofs need.
+/// It is built only for a win, and the server hands it on without waiting
+/// for disk or network. No `Debug`: it names the miner's payout address.
+pub struct TokenWin {
+    /// The job's merge-mining: its entries, tree and commitment.
+    pub aux: Arc<AuxJob>,
+    /// Indices into `aux.entries` of the entries won.
+    pub entries: Vec<u16>,
+    pub coinbase: Vec<u8>,
+    /// The coinbase's merkle branch (the coinbase is at index 0).
+    pub merkle_path: Vec<Hash>,
+    pub header: [u8; 80],
+    pub hash: Hash,
+    /// Also a BCH block: its Case B tickets mature 100 blocks after
+    /// `height`.
+    pub block: bool,
+    pub height: u32,
+    /// Whose work it was, as a block records it: the policy and addresses
+    /// that give the payout and split the leaves bind.
+    pub payout: BchPayout,
+    pub miner: String,
+    pub operator: Option<String>,
+}
+
+impl TokenWin {
+    /// The `AuxProof` of entry `entry` (an index into `aux.entries`).
+    pub fn proof(&self, entry: u16) -> Result<AuxProof, ProofError> {
+        assemble(
+            &self.aux,
+            entry,
+            &self.coinbase,
+            &self.merkle_path,
+            Some(self.header),
+        )
+    }
 }
 
 impl Channel {
@@ -135,6 +221,7 @@ impl Channel {
             accepted: 0,
             rejected: 0,
             desired: target,
+            vardiff_target: target,
             vardiff: VardiffState::new_with_min(MIN_HASHRATE)
                 .map_err(|_| "invalid system clock")?,
             hashrate: hash_rate_from_target(target.into(), f64::from(SHARES_PER_MINUTE))
@@ -170,20 +257,42 @@ impl Channel {
         // cannot overwrite this prefix; its extranonce size stays unchanged.
         let mut extra = id.to_le_bytes().to_vec();
         extra.extend(self.extranonce_prefix);
-        let standard_coinbase = template.coinbase_with_payout(
+        // #### PR #42: merge-mined tokens in each job
+        // What: a job built from a template with a token set gets its own
+        // merge-mining (`aux`): leaves that bind this job's beneficiary (the
+        // miner, or the donation or the pool operator in their work jobs)
+        // and the donation's split, their tree, and the commitment (output
+        // 0) and tickets its coinbases carry. The standard coinbase, the
+        // extended parts and the extended per-share rebuild in
+        // `check_inner` all use them.
+        // Why: a token win must pay whoever the job works for, so leaves are
+        // built per job. With no token merge-mined (the default on both
+        // networks) `aux` is `None` and every coinbase is byte for byte what
+        // it was.
+        // Look here if: a token job's coinbase lacks output 0 or a ticket,
+        // its leaves name another payout, or a share's rebuilt coinbase does
+        // not reach the merkle root the device hashed.
+        let aux = template
+            .aux_job(self.network, &self.payout, self.operator.as_deref(), payout)?
+            .map(Arc::new);
+        let outputs = aux.as_deref().map(|aux| &aux.outputs);
+        let standard_coinbase = template.coinbase_with_aux(
             self.network,
             &self.payout,
             self.operator.as_deref(),
             &extra,
             payout,
+            outputs,
         )?;
-        let mut parts = template.coinbase_parts_with_payout(
+        let mut parts = template.coinbase_parts_with_aux(
             self.network,
             &self.payout,
             self.operator.as_deref(),
             extra.len() + DEVICE_EXTRANONCE_SIZE,
             payout,
+            outputs,
         )?;
+        // #### end PR #42 ####
         parts.prefix.extend(id.to_le_bytes());
         // #### PR #38
         // A mempool/time refresh on the same parent does not invalidate work
@@ -212,6 +321,7 @@ impl Channel {
             parts,
             target: self.target,
             payout,
+            aux,
         });
         Ok(self.job.as_ref().unwrap())
     }
@@ -232,8 +342,10 @@ impl Channel {
     /// Chipnet's difficulty-1 windows this follows the block target down and,
     /// on the next normal template, back up; before, the device stayed on
     /// the easy target and flooded shares until it reconnected. Returns
-    /// whether the target changed; vardiff then counts afresh.
-    pub fn settle(&mut self, block: &Hash, maximum: &Hash) -> bool {
+    /// whether the target changed. Vardiff counts afresh when its own target
+    /// changes (#### PR #42: `tokens`, the easiest Case A token target, can
+    /// make the device's target easier still; see below).
+    pub fn settle(&mut self, block: &Hash, tokens: Option<&Hash>, maximum: &Hash) -> bool {
         let mut target = if meets_target(&self.desired, block) {
             *block
         } else {
@@ -242,11 +354,41 @@ impl Channel {
         if !meets_target(&target, maximum) {
             target = *maximum;
         }
+        // #### PR #42: the share-target floor for merge-mined tokens
+        // What: while Case A tokens are merge-mined, the device's target is
+        // made easier, up to the easiest token target but never more than
+        // TOKEN_FLOOR_CAP (15) times easier than vardiff's target, and never
+        // easier than the device's maximum. Vardiff keeps its own target:
+        // it counts only shares that meet it (`check_inner`) and estimates
+        // from it (`retarget`), so the floor never drags vardiff harder.
+        // Why: firmware sends only hashes that meet its target, so a target
+        // harder than a token's would hold back every win between the two;
+        // with several miners racing for one baton, those wins are lost.
+        // The cap bounds the extra shares (vardiff aims at 20 a minute). A
+        // token target easier than the cap or the device's maximum is mined
+        // best effort: only hashes that meet the capped target reach the
+        // server. Without tokens nothing changes.
+        // Look here if: devices get a SetTarget easier than vardiff's when
+        // tokens change, share rates jump towards several a second, or
+        // vardiff drifts while tokens are merge-mined.
+        if target != self.vardiff_target {
+            self.vardiff_target = target;
+            let _ = self.vardiff.reset_counter();
+        }
+        if let Some(floor) = tokens.map(|easiest| token_floor(&target, easiest)) {
+            if !meets_target(&floor, &target) {
+                target = if meets_target(&floor, maximum) {
+                    floor
+                } else {
+                    *maximum
+                };
+            }
+        }
+        // #### end PR #42 ####
         if target == self.target {
             return false;
         }
         self.target = target;
-        let _ = self.vardiff.reset_counter();
         true
     }
 
@@ -255,7 +397,14 @@ impl Channel {
     /// aim, the desired target follows the measured hash rate. Returns the
     /// new target when the device must be told.
     pub fn retarget(&mut self, maximum: &Hash) -> Option<Hash> {
-        let block = self.job.as_ref()?.template.target;
+        // #### PR #42: the share-target floor for merge-mined tokens (see
+        // `settle`): a vardiff retarget keeps the floor at the current
+        // template's easiest Case A token target.
+        let (block, tokens) = {
+            let template = &self.job.as_ref()?.template;
+            let tokens = template.tokens().and_then(|set| set.easiest_a()).copied();
+            (template.target, tokens)
+        };
         let shares = self.vardiff.shares_since_last_update;
         let elapsed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -271,7 +420,9 @@ impl Channel {
             .vardiff
             .try_vardiff(
                 self.hashrate,
-                &Target::from_le_bytes(self.target),
+                // #### PR #42: the shares counted are those that meet
+                // vardiff's own target, not the token floor's.
+                &Target::from_le_bytes(self.vardiff_target),
                 SHARES_PER_MINUTE,
             )
             .ok()
@@ -295,7 +446,8 @@ impl Channel {
         }
         self.hashrate = hashrate;
         self.desired = desired;
-        self.settle(&block, maximum).then_some(self.target)
+        self.settle(&block, tokens.as_ref(), maximum)
+            .then_some(self.target)
     }
 
     /// Test hook: pretend `seconds` passed with `shares` counted.
@@ -362,13 +514,18 @@ impl Channel {
                 let mut extra = job.id.to_le_bytes().to_vec();
                 extra.extend(self.extranonce_prefix);
                 extra.extend_from_slice(share.extranonce);
+                // #### PR #42: merge-mined tokens in each job (see
+                // `install_with_payout`): the per-share rebuild carries the
+                // job's commitment and tickets, as the parts the device
+                // hashed do.
                 job.template
-                    .coinbase_with_payout(
+                    .coinbase_with_aux(
                         self.network,
                         &self.payout,
                         self.operator.as_deref(),
                         &extra,
                         job.payout,
+                        job.aux.as_deref().map(|aux| &aux.outputs),
                     )
                     .map_err(|_| "invalid-coinbase")?
             }
@@ -401,9 +558,42 @@ impl Channel {
             return Err("job-share-limit");
         }
         seen.insert(hash);
+        // #### PR #42: token wins on the share path
+        // What: after the duplicate check and the per-job cap, one compare
+        // with the job's easiest Case A target (or a found block) decides
+        // whether to look at its entries: Case A entries win when the hash
+        // meets their target, Case B entries when the share is a block. The
+        // coinbase's merkle branch is copied only for a win.
+        // Why: a duplicate must never yield a second proof. A share over the
+        // per-job cap is refused, so it yields no proof. Shares that win no
+        // token (all of them while none is merge-mined) cost one compare at
+        // most.
+        // Look here if: a share that meets a token's target yields no win,
+        // or one share yields two proofs of the same entry.
+        let token_wins = match job.aux.as_deref() {
+            Some(aux)
+                if block
+                    || aux
+                        .easiest_a
+                        .as_ref()
+                        .is_some_and(|easiest| meets_target(&hash, easiest)) =>
+            {
+                aux.wins(&hash, block)
+            }
+            _ => Vec::new(),
+        };
+        let merkle_path = if token_wins.is_empty() {
+            Vec::new()
+        } else {
+            job.parts.merkle_path.clone()
+        };
+        // #### end PR #42 ####
         // Vardiff counts shares at the current target only, so work still
         // arriving at an older, easier target cannot inflate its estimate.
-        if meets_target(&hash, &self.target) {
+        // #### PR #42: the share-target floor (see `settle`): only shares
+        // that meet vardiff's own target count, never those that only the
+        // token floor accepts.
+        if meets_target(&hash, &self.vardiff_target) {
             self.vardiff.increment_shares_since_last_update();
         }
         Ok(ValidatedShare {
@@ -416,6 +606,10 @@ impl Channel {
             payout: job.payout,
             miner: self.payout.clone(),
             operator: self.operator.clone(),
+            hash,
+            aux: job.aux.clone(),
+            token_wins,
+            merkle_path,
         })
     }
 
@@ -435,6 +629,35 @@ impl Channel {
     }
 }
 
+/// #### PR #42
+/// The share-target floor for a device whose vardiff target is `vardiff`:
+/// the easiest Case A token target, but at most `TOKEN_FLOOR_CAP` times
+/// easier than `vardiff`.
+fn token_floor(vardiff: &Hash, easiest: &Hash) -> Hash {
+    let cap = times(vardiff, TOKEN_FLOOR_CAP);
+    if meets_target(easiest, &cap) {
+        *easiest
+    } else {
+        cap
+    }
+}
+
+/// `target × factor` (little-endian), saturating at the easiest target.
+fn times(target: &Hash, factor: u8) -> Hash {
+    let mut product = [0; 32];
+    let mut carry = 0u16;
+    for (out, byte) in product.iter_mut().zip(target) {
+        let value = u16::from(*byte) * u16::from(factor) + carry;
+        *out = value.to_le_bytes()[0];
+        carry = value >> 8;
+    }
+    if carry == 0 {
+        product
+    } else {
+        [0xff; 32]
+    }
+}
+
 /// Report difficulty-one work units in SubmitSharesSuccess, not merely the
 /// number of accepted headers. Dashboard rate uses the same target accounting.
 pub fn share_work(target: &Hash) -> u64 {
@@ -451,11 +674,26 @@ pub fn share_work(target: &Hash) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::merge::{
+        leaf::Mode,
+        registry::TEST_TOKEN,
+        set::{SetEntry, TokenSet, TokenState},
+        verify::{verify_a, verify_b, ClaimView},
+        OutPoint,
+    };
     use super::super::template::compact_target;
-    use super::super::template_tests::{payout, rpc_template};
+    use super::super::template_tests::{payout, rpc_template, transaction};
     use super::*;
-    use stratum_core::bitcoin::{consensus, Block};
+    use stratum_core::bitcoin::{consensus, Block, Transaction};
     fn channel(id: u32, kind: ChannelKind) -> Channel {
+        channel_on(
+            id,
+            kind,
+            Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+        )
+    }
+    /// #### PR #42: the same on any template, one with tokens too.
+    fn channel_on(id: u32, kind: ChannelKind, template: Arc<BchTemplate>) -> Channel {
         let mut channel = Channel::new(
             id,
             kind,
@@ -465,13 +703,7 @@ mod tests {
             &payout(),
         )
         .unwrap();
-        channel
-            .install(
-                1,
-                3,
-                Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
-            )
-            .unwrap();
+        channel.install(1, 3, template).unwrap();
         channel
     }
     fn share(sequence: u32) -> Share<'static> {
@@ -488,9 +720,24 @@ mod tests {
     #[test]
     fn retained_jobs_keep_exact_payouts_across_rate_and_work_rotations() {
         use crate::donation::bch::BchDonation;
-        for kind in [ChannelKind::Standard, ChannelKind::Extended] {
-            let mut channel = channel(1, kind);
+        // #### PR #42: merge-mined tokens in each job
+        // With tokens, each retained job also keeps its own commitment (worth
+        // 0, leading) and ticket (worth 0, trailing): a payout rotation
+        // changes what the leaves bind.
+        let jobs = [false, true].into_iter().flat_map(|tokens| {
+            [ChannelKind::Standard, ChannelKind::Extended].map(|kind| (tokens, kind))
+        });
+        for (tokens, kind) in jobs {
+            let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+            if tokens {
+                template.commit(token_set(
+                    &[Mode::ShareTarget, Mode::BlockRequired],
+                    TOKEN_BITS,
+                ));
+            }
+            let mut channel = channel_on(1, kind, Arc::new(template));
             let template = channel.job().unwrap().template.clone();
+            let mut roots = Vec::new();
             let plans = [
                 BchPayout::default(),
                 BchPayout {
@@ -524,16 +771,33 @@ mod tests {
                     .iter()
                     .map(|o| o.value.to_sat())
                     .collect::<Vec<_>>();
-                assert_eq!(
-                    values,
-                    [
-                        vec![309_375_000, 3_125_000],
-                        vec![308_333_334, 4_166_666],
-                        vec![312_500_000]
-                    ][index]
-                );
+                let payouts = [
+                    vec![309_375_000, 3_125_000],
+                    vec![308_333_334, 4_166_666],
+                    vec![312_500_000],
+                ][index]
+                    .clone();
+                let expected = if tokens {
+                    [vec![0], payouts, vec![0]].concat()
+                } else {
+                    payouts
+                };
+                assert_eq!(values, expected);
                 assert_eq!(values.iter().sum::<u64>(), template.coinbase_value);
+                match &result.aux {
+                    Some(aux) => {
+                        assert_eq!(
+                            tx.output[0].script_pubkey.as_bytes(),
+                            aux.commitment.script()
+                        );
+                        roots.push(aux.commitment.root);
+                    }
+                    None => assert!(!tokens),
+                }
             }
+            roots.sort_unstable();
+            roots.dedup();
+            assert_eq!(roots.len(), if tokens { 3 } else { 0 });
         }
     }
     #[test]
@@ -823,13 +1087,13 @@ mod tests {
         let mut channel = device_channel(start);
         // Chipnet's difficulty-1 window: follow the block target down...
         let easy = compact_target(0x1d00ffff).unwrap();
-        assert!(channel.settle(&easy, &[255; 32]));
+        assert!(channel.settle(&easy, None, &[255; 32]));
         assert_eq!(channel.target, easy);
         // ...and return to the share difficulty on the next normal template.
-        assert!(channel.settle(&compact_target(0x1a00ffff).unwrap(), &[255; 32]));
+        assert!(channel.settle(&compact_target(0x1a00ffff).unwrap(), None, &[255; 32]));
         assert_eq!(channel.target, start);
         // A device maximum caps how easy the target gets.
-        assert!(!channel.settle(&easy, &start));
+        assert!(!channel.settle(&easy, None, &start));
         assert_eq!(channel.target, start);
     }
 
@@ -847,7 +1111,7 @@ mod tests {
         // Lowered: the next job carries the easier target, and the older job
         // accepts it too, credited at it and counted by vardiff.
         channel.desired = [255; 32];
-        assert!(channel.settle(&block, &[255; 32]));
+        assert!(channel.settle(&block, None, &[255; 32]));
         assert_eq!(channel.vardiff.shares_since_last_update, 0);
         channel.install(2, 4, hard_template()).unwrap();
         let mut retry = share(1);
@@ -860,7 +1124,7 @@ mod tests {
         // Raised: the older job keeps its own easier target, but vardiff does
         // not count that work; the new job needs the new target.
         channel.desired = hard;
-        assert!(channel.settle(&block, &[255; 32]));
+        assert!(channel.settle(&block, None, &[255; 32]));
         channel.install(3, 5, hard_template()).unwrap();
         let mut older = share(2);
         older.job_id = 2;
@@ -898,5 +1162,519 @@ mod tests {
         input.extranonce = &[0x24; DEVICE_EXTRANONCE_SIZE];
         assert!(channel.check(input, 1700000010).is_ok());
         assert!(channel.check(share(2), 1700000010).is_err());
+    }
+
+    /// #### PR #42: the test token's Case A target in these tests, 2^248:
+    /// about one share in 256 wins.
+    const TOKEN_BITS: u32 = 0x2001_0000;
+    /// #### PR #42: the test token's baton.
+    const BATON: OutPoint = OutPoint {
+        txid: [0x22; 32],
+        vout: 0,
+    };
+
+    /// #### PR #42: the test token in `modes`, its Case A target `bits`.
+    fn token_set(modes: &[Mode], bits: u32) -> Arc<TokenSet> {
+        let state = TokenState::new(BATON, bits).unwrap();
+        let entries = modes
+            .iter()
+            .map(|mode| match mode {
+                Mode::ShareTarget => SetEntry::share_target(&TEST_TOKEN, state),
+                Mode::BlockRequired => SetEntry::block_required(&TEST_TOKEN),
+            })
+            .collect();
+        Arc::new(TokenSet::new(MiningNetwork::Chipnet, entries, 1).unwrap())
+    }
+
+    /// #### PR #42: a template with three transactions (a two-level
+    /// coinbase branch) and mainnet-like block difficulty (no test share is
+    /// a block), merge-mining `set`.
+    fn token_template(set: Arc<TokenSet>) -> Arc<BchTemplate> {
+        let mut raw = rpc_template();
+        let mut txs = vec![transaction(1), transaction(2), transaction(3)];
+        txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+        raw["transactions"] = serde_json::json!(txs);
+        let mut template = BchTemplate::from_rpc(&raw).unwrap();
+        template.target = compact_target(0x1a00ffff).unwrap();
+        template.commit(set);
+        Arc::new(template)
+    }
+
+    /// #### PR #42: a Chipnet job's payout, donation and (with an
+    /// operator) fee scripts.
+    fn scripts(miner: &str, operator: Option<&str>) -> Vec<Vec<u8>> {
+        super::super::payout::scripts(MiningNetwork::Chipnet, miner, operator).unwrap()
+    }
+
+    /// #### PR #42: what the token's covenant sees in the claim of a miner
+    /// job's Case A win at the default donation: the miner's output, and
+    /// two thirds of the 1.5% donation as the split.
+    fn claim_view(scripts: &[Vec<u8>]) -> ClaimView<'_> {
+        ClaimView {
+            category: TEST_TOKEN.category,
+            anchor: BATON,
+            ticket: None,
+            payout: &scripts[0],
+            split: Some((100, &scripts[1])),
+            target_bits: TOKEN_BITS,
+            ext: [0; 32],
+            max_aux_height: TEST_TOKEN.max_aux_height,
+            start_height: 0,
+        }
+    }
+
+    /// #### PR #42: submits nonces 0.. on job 1 until a share wins the Case
+    /// A token, checking that every share before it misses the token's
+    /// target and carries no token work. Returns the win and its nonce.
+    fn submit_until_win(
+        channel: &mut Channel,
+        sequence: &mut u32,
+        extranonce: &'static [u8],
+    ) -> (ValidatedShare, u32) {
+        let target = channel
+            .job()
+            .unwrap()
+            .aux
+            .as_ref()
+            .unwrap()
+            .easiest_a
+            .unwrap();
+        for nonce in 0..10_000 {
+            let mut input = share(*sequence);
+            *sequence += 1;
+            input.nonce = nonce;
+            input.extranonce = extranonce;
+            let share = channel.check(input, 1700000010).unwrap();
+            assert!(!share.block);
+            assert_eq!(share.hash, double_sha256(&share.header));
+            if meets_target(&share.hash, &target) {
+                return (share, nonce);
+            }
+            assert!(share.token_wins.is_empty() && share.merkle_path.is_empty());
+            assert!(share.token_win().is_none());
+        }
+        panic!("no share won the token");
+    }
+
+    /// #### PR #42: a device extranonce for `kind`'s shares.
+    fn device_extranonce(kind: ChannelKind) -> &'static [u8] {
+        match kind {
+            ChannelKind::Standard => &[],
+            ChannelKind::Extended => &[0x23; DEVICE_EXTRANONCE_SIZE],
+        }
+    }
+
+    // #### PR #42: token wins on the share path
+    #[test]
+    fn token_win_carries_the_exact_header_coinbase_and_branches() {
+        let set = token_set(&[Mode::ShareTarget, Mode::BlockRequired], TOKEN_BITS);
+        let scripts = scripts(&payout(), None);
+        for kind in [ChannelKind::Standard, ChannelKind::Extended] {
+            let mut channel = channel_on(1, kind, token_template(set.clone()));
+            let job = channel.job().unwrap().clone();
+            let aux = job.aux.clone().unwrap();
+            assert_eq!(job.parts.merkle_path.len(), 2);
+            let mut sequence = 0;
+            let (share, _) = submit_until_win(&mut channel, &mut sequence, device_extranonce(kind));
+            // The Case A entry only: Case B needs a block.
+            assert_eq!(share.token_wins, [0]);
+            assert!(Arc::ptr_eq(share.aux.as_ref().unwrap(), &aux));
+            let win = share.token_win().unwrap();
+            assert!(Arc::ptr_eq(&win.aux, &aux));
+            assert_eq!(win.entries, [0]);
+            assert_eq!(win.header, share.header);
+            assert_eq!(win.hash, share.hash);
+            assert_eq!(win.coinbase, share.coinbase.bytes);
+            assert_eq!(win.merkle_path, job.parts.merkle_path);
+            assert!(!win.block);
+            assert_eq!(win.height, 325_909);
+            assert_eq!((win.payout, &win.miner), (BchPayout::default(), &payout()));
+            assert_eq!(win.operator, None);
+            // The coinbase carries the job's commitment as output 0, and its
+            // branch folds to the header's merkle root.
+            let head = 47 + usize::from(win.coinbase[41]);
+            assert_eq!(win.coinbase[head..head + 53], aux.outputs.commitment);
+            let mut root = double_sha256(&win.coinbase);
+            for sibling in &win.merkle_path {
+                root = double_sha256(&[&root[..], &sibling[..]].concat());
+            }
+            assert_eq!(root, win.header[36..68]);
+            // The proof verifies as the token's covenant would check it,
+            // also after the journal's bytes.
+            let proof = win.proof(0).unwrap();
+            verify_a(&proof, &claim_view(&scripts)).unwrap();
+            let bytes = proof.to_bytes().unwrap();
+            verify_a(
+                &AuxProof::from_bytes(&bytes).unwrap(),
+                &claim_view(&scripts),
+            )
+            .unwrap();
+            // The same coinbase and header make a whole block.
+            let block = job.template.block(&share.coinbase, share.header).unwrap();
+            let decoded: Block = consensus::deserialize(&block).unwrap();
+            assert!(decoded.check_merkle_root());
+        }
+    }
+
+    // #### PR #42: token wins on the share path
+    #[test]
+    fn shares_without_tokens_have_no_token_work_and_carry_their_hash() {
+        for kind in [ChannelKind::Standard, ChannelKind::Extended] {
+            let mut channel = channel(1, kind);
+            let job = channel.job().unwrap();
+            assert!(job.aux.is_none());
+            // The coinbase is the one built without tokens.
+            let plain = job
+                .template
+                .coinbase_parts_with_payout(
+                    MiningNetwork::Chipnet,
+                    &payout(),
+                    None,
+                    28,
+                    BchPayout::default(),
+                )
+                .unwrap();
+            assert_eq!(job.parts.suffix, plain.suffix);
+            // Blocks (about half of these shares) and other shares alike.
+            for nonce in 0..32 {
+                let mut input = share(nonce);
+                input.nonce = nonce;
+                input.extranonce = device_extranonce(kind);
+                let share = channel.check(input, 1700000010).unwrap();
+                assert_eq!(share.hash, double_sha256(&share.header));
+                assert!(share.aux.is_none());
+                assert!(share.token_wins.is_empty() && share.merkle_path.is_empty());
+                assert!(share.token_win().is_none());
+            }
+        }
+    }
+
+    // #### PR #42: token wins on the share path
+    #[test]
+    fn a_block_wins_the_case_b_tokens_and_other_shares_do_not() {
+        // The easy test template: about half the shares are blocks.
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        template.commit(token_set(&[Mode::BlockRequired], TOKEN_BITS));
+        let mut channel = channel_on(1, ChannelKind::Standard, Arc::new(template));
+        let aux = channel.job().unwrap().aux.clone().unwrap();
+        assert_eq!(aux.easiest_a, None);
+        let scripts = scripts(&payout(), None);
+        let (mut blocks, mut others) = (0, 0);
+        for nonce in 0..64 {
+            let mut input = share(nonce);
+            input.nonce = nonce;
+            let share = channel.check(input, 1700000010).unwrap();
+            if !share.block {
+                others += 1;
+                assert!(share.token_wins.is_empty() && share.token_win().is_none());
+                continue;
+            }
+            blocks += 1;
+            assert_eq!(share.token_wins, [0]);
+            let win = share.token_win().unwrap();
+            assert!(win.block);
+            // Its claim spends the ticket of this very coinbase.
+            let ticket = OutPoint {
+                txid: double_sha256(&win.coinbase),
+                vout: aux.entries[0].ticket_vout.unwrap(),
+            };
+            let view = ClaimView {
+                ticket: Some(ticket),
+                ..claim_view(&scripts)
+            };
+            verify_b(&win.proof(0).unwrap(), &view).unwrap();
+        }
+        assert!(blocks > 0 && others > 0);
+    }
+
+    // #### PR #42: token wins on the share path
+    #[test]
+    fn a_duplicate_share_never_yields_a_second_token_win() {
+        let set = token_set(&[Mode::ShareTarget], TOKEN_BITS);
+        for kind in [ChannelKind::Standard, ChannelKind::Extended] {
+            let mut channel = channel_on(1, kind, token_template(set.clone()));
+            let mut sequence = 0;
+            let (first, nonce) =
+                submit_until_win(&mut channel, &mut sequence, device_extranonce(kind));
+            assert_eq!(first.token_wins, [0]);
+            // The same header again, under a new sequence number.
+            let mut again = share(sequence);
+            again.nonce = nonce;
+            again.extranonce = device_extranonce(kind);
+            assert!(matches!(
+                channel.check(again, 1700000010),
+                Err("duplicate-share")
+            ));
+            // Still a duplicate once a same-tip refresh has retained the job.
+            channel.install(2, 4, token_template(set.clone())).unwrap();
+            let mut retained = share(sequence + 1);
+            retained.nonce = nonce;
+            retained.extranonce = device_extranonce(kind);
+            assert!(matches!(
+                channel.check(retained, 1700000010),
+                Err("duplicate-share")
+            ));
+        }
+    }
+
+    // #### PR #42: merge-mined tokens in each job
+    #[test]
+    fn public_pool_leaves_bind_each_channels_payout() {
+        use crate::donation::bch::{FeeMode, PoolFee};
+        let network = MiningNetwork::Chipnet;
+        let template = token_template(token_set(
+            &[Mode::ShareTarget, Mode::BlockRequired],
+            TOKEN_BITS,
+        ));
+        let operator = crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], network).unwrap();
+        let other = crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x56; 20], network).unwrap();
+        let policy = BchPayout {
+            fee: Some(PoolFee {
+                rate: "2".parse().unwrap(),
+                mode: FeeMode::Coinbase,
+            }),
+            ..BchPayout::default()
+        };
+        let jobs: Vec<_> = [payout(), other]
+            .into_iter()
+            .zip(1u32..)
+            .map(|(miner, id)| {
+                let mut channel = Channel::new(
+                    id,
+                    ChannelKind::Extended,
+                    [255; 32],
+                    [9; 12],
+                    network,
+                    &miner,
+                )
+                .unwrap();
+                channel.set_operator(Some(&operator)).unwrap();
+                let job = channel
+                    .install_with_payout(1, 3, template.clone(), policy)
+                    .unwrap()
+                    .clone();
+                (job, scripts(&miner, Some(&operator)))
+            })
+            .collect();
+        for (job, scripts) in &jobs {
+            let aux = job.aux.as_ref().unwrap();
+            for entry in &aux.entries {
+                assert_eq!(entry.leaf.payout_hash, double_sha256(&scripts[0]));
+                assert_eq!(entry.leaf.split_bps, 100);
+                assert_eq!(entry.leaf.split_hash, double_sha256(&scripts[1]));
+            }
+            // SV1 firmware and extended channels find the commitment in the
+            // suffix, after the sequence and the output count, and the
+            // ticket after the miner's, the donation's and the fee's outputs.
+            assert_eq!(job.parts.suffix[5..58], aux.outputs.commitment);
+            assert_eq!(aux.entries[1].ticket_vout, Some(4));
+        }
+        let first = jobs[0].0.aux.as_ref().unwrap();
+        let second = jobs[1].0.aux.as_ref().unwrap();
+        assert_ne!(first.commitment.root, second.commitment.root);
+        assert_eq!(first.commitment.height, second.commitment.height);
+        assert_eq!(first.commitment.nonce, second.commitment.nonce);
+        let slots = |aux: &AuxJob| aux.entries.iter().map(|e| e.slot).collect::<Vec<_>>();
+        assert_eq!(slots(first), slots(second));
+    }
+
+    // #### PR #42: merge-mined tokens in each job
+    #[test]
+    fn donation_and_fee_work_jobs_bind_their_payout_and_no_split() {
+        use crate::donation::bch::{FeeMode, PoolFee};
+        let network = MiningNetwork::Chipnet;
+        let template = token_template(token_set(&[Mode::ShareTarget], TOKEN_BITS));
+        let operator = crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], network).unwrap();
+        let scripts = scripts(&payout(), Some(&operator));
+        let miner_job = BchPayout {
+            fee: Some(PoolFee {
+                rate: "2".parse().unwrap(),
+                mode: FeeMode::Work,
+            }),
+            ..BchPayout::default()
+        };
+        let donation_job = BchPayout {
+            donation_work: true,
+            ..miner_job
+        };
+        let fee_job = BchPayout {
+            fee_work: true,
+            ..miner_job
+        };
+        let mut channel = Channel::new(
+            1,
+            ChannelKind::Standard,
+            [255; 32],
+            [9; 12],
+            network,
+            &payout(),
+        )
+        .unwrap();
+        channel.set_operator(Some(&operator)).unwrap();
+        let cases = [
+            (miner_job, &scripts[0], Some(&scripts[1])),
+            (donation_job, &scripts[1], None),
+            (fee_job, &scripts[2], None),
+        ];
+        for (id, (policy, beneficiary, split)) in (1u32..).zip(cases) {
+            let job = channel
+                .install_with_payout(id, 3, template.clone(), policy)
+                .unwrap();
+            let leaf = job.aux.as_ref().unwrap().entries[0].leaf;
+            assert_eq!(leaf.payout_hash, double_sha256(beneficiary));
+            match split {
+                Some(donation) => {
+                    assert_eq!(leaf.split_bps, 100);
+                    assert_eq!(leaf.split_hash, double_sha256(donation));
+                }
+                None => {
+                    assert_eq!(leaf.split_bps, 0);
+                    assert_eq!(leaf.split_hash, [0; 32]);
+                }
+            }
+            // The commitment (worth 0) first, then the job's own payouts.
+            let tx: Transaction = consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
+            assert_eq!(tx.output[0].value.to_sat(), 0);
+            assert_eq!(tx.output[1].script_pubkey.as_bytes(), &beneficiary[..]);
+        }
+    }
+
+    // #### PR #42: the share-target floor for merge-mined tokens
+    #[test]
+    fn share_target_floors_at_the_easiest_token_target_within_15x() {
+        let vardiff = compact_target(0x1d00ffff).unwrap();
+        let mut channel = device_channel(vardiff);
+        let block = channel.job().unwrap().template.target;
+        let open = [255; 32];
+        // No token: vardiff's target.
+        assert!(!channel.settle(&block, None, &open));
+        assert_eq!(channel.target, vardiff);
+        // A token target harder than vardiff's changes nothing.
+        let harder = compact_target(0x1c00ffff).unwrap();
+        assert!(!channel.settle(&block, Some(&harder), &open));
+        assert_eq!(channel.target, vardiff);
+        // Up to 15 times easier: the token's own target. Vardiff keeps its
+        // count, since its own target did not change.
+        channel.vardiff_window(30, 5);
+        let four = compact_target(0x1d03fffc).unwrap();
+        assert_eq!(four, times(&vardiff, 4));
+        assert!(channel.settle(&block, Some(&four), &open));
+        assert_eq!(channel.target, four);
+        assert_eq!(channel.vardiff.shares_since_last_update, 5);
+        // Easier still: 15 times vardiff's target, no more.
+        let easy = compact_target(0x1e00ffff).unwrap();
+        assert!(channel.settle(&block, Some(&easy), &open));
+        assert_eq!(channel.target, times(&vardiff, TOKEN_FLOOR_CAP));
+        let ratio = expected_hashes(&vardiff) / expected_hashes(&channel.target);
+        assert!((14.99..=15.01).contains(&ratio), "{ratio}");
+        // The device's maximum still caps it.
+        let maximum = times(&vardiff, 2);
+        assert!(channel.settle(&block, Some(&easy), &maximum));
+        assert_eq!(channel.target, maximum);
+        // Vardiff's own target never moved, and the device's target comes
+        // back to it once the tokens are gone.
+        assert_eq!(channel.vardiff_target, vardiff);
+        assert_eq!(channel.vardiff.shares_since_last_update, 5);
+        assert!(channel.settle(&block, None, &open));
+        assert_eq!(channel.target, vardiff);
+        // When vardiff's own target changes, it counts afresh.
+        channel.desired = four;
+        assert!(channel.settle(&block, Some(&easy), &open));
+        assert_eq!(channel.vardiff_target, four);
+        assert_eq!(channel.target, times(&four, TOKEN_FLOOR_CAP));
+        assert_eq!(channel.vardiff.shares_since_last_update, 0);
+        // The arithmetic carries between bytes and saturates at the easiest
+        // target.
+        let mut small = [0; 32];
+        small[0] = 0x12;
+        let mut product = [0; 32];
+        product[..2].copy_from_slice(&[0x0e, 0x01]);
+        assert_eq!(times(&small, 15), product);
+        assert_eq!(times(&[0x11; 32], 15), [0xff; 32]);
+        assert_eq!(times(&[0x12; 32], 15), [0xff; 32]);
+        assert_eq!(token_floor(&[0x12; 32], &[0xfe; 32]), [0xfe; 32]);
+        assert_eq!(times(&[0; 32], 15), [0; 32]);
+    }
+
+    // #### PR #42: the share-target floor for merge-mined tokens
+    #[test]
+    fn vardiff_ignores_shares_accepted_only_by_the_floor() {
+        // Counting: vardiff aims at about one share in 256; the token's
+        // target, eight times easier, is what the device mines at.
+        let vardiff = compact_target(TOKEN_BITS).unwrap();
+        let token_bits = 0x2008_0000;
+        let floor = compact_target(token_bits).unwrap();
+        assert_eq!(floor, times(&vardiff, 8));
+        let template = token_template(token_set(&[Mode::ShareTarget], token_bits));
+        let mut channel = Channel::new(
+            1,
+            ChannelKind::Standard,
+            vardiff,
+            [9; 12],
+            MiningNetwork::Chipnet,
+            &payout(),
+        )
+        .unwrap();
+        let tokens = template.tokens().and_then(|set| set.easiest_a());
+        assert!(channel.settle(&template.target, tokens, &[255; 32]));
+        assert_eq!(channel.target, floor);
+        channel.install(1, 3, template).unwrap();
+        assert_eq!(channel.job().unwrap().target, floor);
+        let (mut counted, mut floor_only) = (0, 0);
+        for nonce in 0..4_000 {
+            let mut input = share(nonce);
+            input.nonce = nonce;
+            let Ok(share) = channel.check(input, 1700000010) else {
+                continue;
+            };
+            // Accepted and credited at the floor, and every one wins the
+            // token: no win waits behind a harder share target.
+            assert_eq!(share.share_target, floor);
+            assert_eq!(share.token_wins, [0]);
+            if meets_target(&share.hash, &vardiff) {
+                counted += 1;
+            } else {
+                floor_only += 1;
+            }
+        }
+        assert!(
+            counted > 0 && floor_only > counted,
+            "{counted} {floor_only}"
+        );
+        assert_eq!(channel.vardiff.shares_since_last_update, counted);
+
+        // Estimating, for a real device (difficulty 1, above vardiff's
+        // 1 MH/s floor) under a token floor eight times easier: 20 shares a
+        // minute at vardiff's own target is the aim, so nothing changes.
+        // Read against the floor, the same count would be an eighth of the
+        // hash rate and ease vardiff's target.
+        let hard = compact_target(0x1d00ffff).unwrap();
+        let template = token_template(token_set(&[Mode::ShareTarget], 0x1d07_fff8));
+        let mut channel = Channel::new(
+            1,
+            ChannelKind::Standard,
+            hard,
+            [9; 12],
+            MiningNetwork::Chipnet,
+            &payout(),
+        )
+        .unwrap();
+        let tokens = template.tokens().and_then(|set| set.easiest_a());
+        assert!(channel.settle(&template.target, tokens, &[255; 32]));
+        assert_eq!(channel.target, times(&hard, 8));
+        channel.install(1, 3, template).unwrap();
+        channel.vardiff_window(300, 100);
+        assert_eq!(channel.retarget(&[255; 32]), None);
+        assert_eq!(channel.desired, hard);
+        assert_eq!(channel.vardiff_target, hard);
+        assert_eq!(channel.target, times(&hard, 8));
+        // Twice the hash rate is a real change: vardiff's target halves,
+        // and the floor, capped at 15 times it, now sits below the token's.
+        channel.vardiff_window(300, 200);
+        let told = channel.retarget(&[255; 32]).unwrap();
+        assert!(meets_target(&channel.vardiff_target, &hard));
+        assert_ne!(channel.vardiff_target, hard);
+        assert_eq!(told, times(&channel.vardiff_target, TOKEN_FLOOR_CAP));
+        assert_eq!(channel.target, told);
     }
 }
