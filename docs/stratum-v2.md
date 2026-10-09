@@ -310,7 +310,15 @@ The panel refuses to control a worker in these cases, and says why:
   example right after the server starts. Pickaxe cannot tell yet whether they
   are one device. Open the panel again a minute later.
 
-The read-only `watch` view has no Device panel yet.
+`stratum-v2 watch` has the same highlight and Device panel. It acts on the
+devices itself, never through the server: it takes each worker's address from
+`<config>.sv2-devices.json`, which the server keeps beside its config,
+readable by the server's user alone, and uses the server's saved device
+logins. So run watch as the server's user (for example `sudo -u pickaxe
+pickaxe stratum-v2 watch --config …`); otherwise the panel says it cannot read
+the list. Every address in that file is checked again before use, so an edited
+file cannot point Pickaxe at a public address. Device addresses never go into
+the status file, which everyone can read and which service logs print.
 
 A server running without a screen, for example as a service with
 `--no-tui --json`, saves the same status once a second beside its config

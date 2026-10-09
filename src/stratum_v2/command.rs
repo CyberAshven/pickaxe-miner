@@ -7,7 +7,7 @@ use super::{
     panel::{DevicePanel, Selection},
     provider::{NativeNodeRpc, TemplateProvider},
     server::{self, ServerConfig, ServerStats},
-    telemetry::DeviceSnapshot,
+    telemetry::{AddressIssue, DeviceSnapshot},
     template::{compact_target, BchTemplate},
 };
 use crate::{
@@ -49,7 +49,7 @@ pub fn run(
         return Ok(());
     }
     if let StratumV2Command::Watch = action {
-        return watch(&status_path(config_path));
+        return watch(config_path);
     }
     // #### PR #40
     // Pool mode: SV1 devices mine at a remote SV2 pool through the adapter,
@@ -333,6 +333,11 @@ pub fn run(
         let mut overview = false;
         let status_file = status_path(config_path);
         let mut status_saved: Option<Instant> = None;
+        // #### PR #42: the owner-only devices file the watch view controls
+        // devices from; written whole, and only when it changes.
+        let devices_file = devices_path(config_path);
+        let devices_server = connect_lines(bound, sv1_bound, authority.as_deref(), interfaces);
+        let mut devices_saved: Option<Vec<u8>> = None;
         // #### PR #42
         // What: the workers page highlights one row, moved with the arrow
         // keys, PgUp/PgDn, Home and End and kept by its label; Enter (or c)
@@ -377,6 +382,15 @@ pub fn run(
             if status_saved.is_none_or(|saved| saved.elapsed() >= Duration::from_secs(1)) {
                 let _ = write_status(&status_file, &status);
                 status_saved = Some(Instant::now());
+                let list = devices_json(
+                    &devices_server,
+                    &snapshot.device_stats.private_addresses(Instant::now()),
+                );
+                if devices_saved.as_deref() != Some(list.as_slice())
+                    && crate::config::write_private_atomic(&devices_file, &list).is_ok()
+                {
+                    devices_saved = Some(list);
+                }
             }
             if let Some(terminal) = terminal.as_mut() {
                 let overview_text = if let Some(pool) = &pool_address {
@@ -1023,7 +1037,7 @@ fn render_workers(
 
 // #### PR #42: Enter opens the Device panel for the highlighted row.
 const SERVE_FOOTER: &str = "Tab  Overview · ↑/↓ PgUp/PgDn  Select · Enter  Device panel · i  Connection info · a  Advanced settings · q  Stop server\nNow and 1 hour come from validated shares (30s warm-up); Device says, Temp and Fan are the device's own report.";
-const WATCH_FOOTER: &str = "↑/↓ PgUp/PgDn  Scroll · q  Quit (the server keeps running)\nRead-only view of the server's saved status; Now and 1 hour come from validated shares.";
+const WATCH_FOOTER: &str = "↑/↓ PgUp/PgDn  Select · Enter  Device panel · q  Quit (the server keeps running)\nThe server's saved status; Now and 1 hour come from validated shares. Device actions go straight to the device.";
 
 /// One row of the workers table, from the live server or its saved status.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -1322,6 +1336,137 @@ fn status_json(
     })
 }
 
+// #### PR #42: the devices file
+// What: the server writes `<config>.sv2-devices.json`, readable by its owner
+// alone: where devices reach it, and each worker's label with its local
+// address (and whether that address is shared). `stratum-v2 watch` reads it
+// to open a Device panel for a row; every address is checked again before
+// use, so an edited file cannot point Pickaxe at a public address.
+// Why: the status file is readable by everyone and its lines are printed to
+// service logs, so device addresses never go there.
+// Look here if: watch cannot control a device, or an address appears in the
+// status file.
+/// The devices file beside a server's config.
+fn devices_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("sv2-devices.json")
+}
+
+fn place_name(place: crate::reach::Place) -> &'static str {
+    match place {
+        crate::reach::Place::ThisComputer => "this-computer",
+        crate::reach::Place::LocalNetwork => "local-network",
+        crate::reach::Place::Tailscale => "tailscale",
+    }
+}
+
+fn devices_json(server: &[ConnectLine], devices: &[(String, std::net::IpAddr, bool)]) -> Vec<u8> {
+    serde_json::json!({
+        "version": 1,
+        "server": server
+            .iter()
+            .map(|line| serde_json::json!({
+                "place": place_name(line.place),
+                "sv2": line.sv2,
+                "url": line.url,
+            }))
+            .collect::<Vec<_>>(),
+        "devices": devices
+            .iter()
+            .map(|(label, ip, shared)| serde_json::json!({
+                "label": label,
+                "ip": ip.to_string(),
+                "shared": shared,
+            }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// The devices file as the watch view reads it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct DevicesFile {
+    server: Vec<ServerLine>,
+    devices: Vec<DeviceLine>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ServerLine {
+    place: String,
+    sv2: bool,
+    url: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct DeviceLine {
+    label: String,
+    ip: Option<std::net::IpAddr>,
+    shared: bool,
+}
+
+impl DevicesFile {
+    fn read(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    /// The address of the worker with this label, only on the local network
+    /// or Tailscale, and never a shared one.
+    fn target(&self, label: &str) -> Result<std::net::IpAddr, AddressIssue> {
+        let line = self
+            .devices
+            .iter()
+            .find(|line| line.label == label)
+            .ok_or(AddressIssue::Unknown)?;
+        if line.shared {
+            return Err(AddressIssue::Shared);
+        }
+        line.ip
+            .filter(|ip| super::device_api::queryable(*ip))
+            .ok_or(AddressIssue::Unknown)
+    }
+
+    fn server_urls(&self) -> Vec<(crate::reach::Place, bool, String)> {
+        self.server
+            .iter()
+            .filter_map(|line| {
+                let place = match line.place.as_str() {
+                    "this-computer" => crate::reach::Place::ThisComputer,
+                    "local-network" => crate::reach::Place::LocalNetwork,
+                    "tailscale" => crate::reach::Place::Tailscale,
+                    _ => return None,
+                };
+                Some((place, line.sv2, line.url.clone()))
+            })
+            .collect()
+    }
+}
+
+/// #### PR #42: the Device panel for a row of the watch view, from the
+/// server's devices file; refused when the file cannot be read.
+fn watch_panel(devices_file: &Path, row: &WorkerLine) -> DevicePanel {
+    let file = DevicesFile::read(devices_file);
+    let target = match &file {
+        Some(file) => file.target(&row.label),
+        None => Err(AddressIssue::Unlisted),
+    };
+    let mut view = DevicePanel::for_line(
+        row.label.clone(),
+        row.connected,
+        row.model.as_deref(),
+        row.firmware.as_deref(),
+        row.power_w,
+        target,
+    );
+    if let Some(file) = &file {
+        view.set_server_urls(file.server_urls());
+    }
+    view
+}
+// #### end PR #42 ####
+
 /// Replaces the status file whole, so a reader never sees half of it.
 fn write_status(path: &Path, status: &serde_json::Value) -> std::io::Result<()> {
     let mut temp = path.as_os_str().to_owned();
@@ -1489,12 +1634,25 @@ impl WatchStatus {
 /// `stratum-v2 watch`: the workers table of a server running elsewhere on
 /// this machine, such as a service started with --no-tui. Read-only: it reads
 /// the status the server saves each second and never touches the server.
-fn watch(path: &Path) -> Result<(), String> {
+// #### PR #42: the watch view controls devices
+// What: `stratum-v2 watch` highlights a row like the server's workers page,
+// and Enter opens the same Device panel. It acts on the devices itself, with
+// the addresses from the server's owner-only devices file and the server's
+// saved logins; it never talks to the server.
+// Why: a server running as a service had no way to control its devices.
+// Look here if: watch opens the wrong device, or cannot control any.
+fn watch(config_path: &Path) -> Result<(), String> {
+    let path = status_path(config_path);
+    let devices_file = devices_path(config_path);
+    let fleet = Arc::new(Fleet::new());
+    // Without the server's logins, devices answer their default ones.
+    let _ = fleet.load_logins(config_path);
     let mut terminal = TerminalSession::enter()?;
-    let mut offset = 0usize;
+    let mut selection = Selection::default();
+    let mut panel: Option<DevicePanel> = None;
     loop {
         let now = unix_now();
-        let status = fs::read_to_string(path)
+        let status = fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<WatchStatus>(&text).ok());
         let (header, rows) = match &status {
@@ -1507,28 +1665,38 @@ fn watch(path: &Path) -> Result<(), String> {
                 Vec::new(),
             ),
         };
-        offset = offset.min(rows.len().saturating_sub(1));
-        // #### PR #42: read-only, so nothing is highlighted; the table
-        // scrolls from the offset as before.
-        let mut table = TableState::default().with_offset(offset);
+        let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+        selection.follow(&labels);
         terminal
             .terminal
-            .draw(|frame| render_workers(frame, &header, &rows, &mut table, WATCH_FOOTER))
+            .draw(|frame| match panel.as_ref() {
+                Some(view) => super::panel::render(frame, view),
+                None => render_workers(frame, &header, &rows, &mut selection.table, WATCH_FOOTER),
+            })
             .map_err(|_| "cannot draw workers table")?;
-        if event::poll(Duration::from_secs(1)).map_err(|_| "cannot read terminal")? {
+        if event::poll(Duration::from_millis(500)).map_err(|_| "cannot read terminal")? {
             if let Event::Key(key) = event::read().map_err(|_| "cannot read terminal")? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            break
-                        }
-                        KeyCode::Up => offset = offset.saturating_sub(1),
-                        KeyCode::Down => offset = offset.saturating_add(1),
-                        KeyCode::PageUp => offset = offset.saturating_sub(10),
-                        KeyCode::PageDown => offset = offset.saturating_add(10),
-                        _ => (),
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // The panel takes every key, so `q` there never quits.
+                if let Some(view) = panel.as_mut() {
+                    if view.handle_key(key, &fleet) {
+                        panel = None;
                     }
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    _ if super::panel::opens_panel(&key, true) => {
+                        if let Some(row) = selection.index().and_then(|index| rows.get(index)) {
+                            let view = watch_panel(&devices_file, row);
+                            view.identify(&fleet);
+                            panel = Some(view);
+                        }
+                    }
+                    code => selection.step(code, &labels),
                 }
             }
         }
@@ -1703,6 +1871,76 @@ pub(crate) fn load_authority(path: &Path) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #42
+    // What: the devices file carries this server's addresses and each
+    // worker's local address; the watch view takes a worker's address from
+    // it only when it is local and not shared, refuses an edited public one,
+    // and explains how to run watch when the file cannot be read.
+    // Look here if: devices_json, DevicesFile or watch_panel changes.
+    #[test]
+    fn the_watch_view_controls_devices_only_through_the_owner_only_devices_file() {
+        let dir = super::super::journal::TestDirectory::new();
+        let config = dir.0.join("chipnet.json");
+        let lines = vec![ConnectLine {
+            place: crate::reach::Place::LocalNetwork,
+            sv2: false,
+            url: "stratum+tcp://192.168.0.55:3333".into(),
+        }];
+        let devices = vec![
+            ("rig1 #1".to_owned(), "192.168.0.80".parse().unwrap(), false),
+            ("rig2 #2".to_owned(), "100.64.0.9".parse().unwrap(), true),
+        ];
+        let bytes = devices_json(&lines, &devices);
+        crate::config::write_private_atomic(&devices_path(&config), &bytes).unwrap();
+        let file = DevicesFile::read(&devices_path(&config)).unwrap();
+        assert_eq!(file.target("rig1 #1"), Ok("192.168.0.80".parse().unwrap()));
+        assert_eq!(file.target("rig2 #2"), Err(AddressIssue::Shared));
+        assert_eq!(file.target("rig9 #9"), Err(AddressIssue::Unknown));
+        assert_eq!(
+            file.server_urls(),
+            vec![(
+                crate::reach::Place::LocalNetwork,
+                false,
+                "stratum+tcp://192.168.0.55:3333".to_owned()
+            )]
+        );
+        // An edited file cannot point at a public address.
+        let edited = String::from_utf8(bytes)
+            .unwrap()
+            .replace("192.168.0.80", "8.8.8.8");
+        fs::write(devices_path(&config), edited).unwrap();
+        let file = DevicesFile::read(&devices_path(&config)).unwrap();
+        assert_eq!(file.target("rig1 #1"), Err(AddressIssue::Unknown));
+        // The panel for a watch row; without the file, it explains.
+        let row = WorkerLine {
+            label: "rig1 #1".into(),
+            connected: true,
+            model: Some("Avalonminer AvalonNano3s".into()),
+            ..WorkerLine::default()
+        };
+        let missing = dir.0.join("other.json");
+        let view = watch_panel(&devices_path(&missing), &row);
+        let text = {
+            let backend = ratatui::backend::TestBackend::new(100, 40);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| super::super::panel::render(frame, &view))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(
+            text.contains("cannot read the server's list of device"),
+            "{text}"
+        );
+        assert!(text.contains("Run watch as that user"), "{text}");
+    }
 
     #[test]
     fn donation_control_persists_only_the_bch_setting_and_fails_closed() {

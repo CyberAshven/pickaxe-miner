@@ -317,6 +317,21 @@ impl DevicePanel {
         panel
     }
 
+    /// #### PR #42: the panel for a row of `stratum-v2 watch`, which reads
+    /// the address from the server's owner-only devices file.
+    pub(super) fn for_line(
+        label: String,
+        online: bool,
+        model: Option<&str>,
+        firmware: Option<&str>,
+        power_w: Option<f64>,
+        target: Result<IpAddr, AddressIssue>,
+    ) -> Self {
+        let mut panel = Self::new(label, online, details(model, firmware, power_w), target);
+        panel.model = model.map(str::to_owned);
+        panel
+    }
+
     fn new(
         label: String,
         online: bool,
@@ -1011,6 +1026,12 @@ impl DevicePanel {
                     "\nSeveral connections from this address are under a minute old. Pickaxe \
                      cannot tell yet whether they are one device. Open this panel again in a \
                      minute.\n"
+                }
+                AddressIssue::Unlisted => {
+                    "\nThis view cannot read the server's list of device addresses \
+                     (sv2-devices.json beside its config), which only the server's user can \
+                     read. Run watch as that user to control devices, for example: sudo -u \
+                     pickaxe pickaxe stratum-v2 watch --config <the server's config>\n"
                 }
             }),
             Offer::Identifying => text.push_str(&format!(

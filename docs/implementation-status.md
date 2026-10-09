@@ -1404,3 +1404,27 @@ primary as fallback, then restarted; and the panel's pool pages marking this
 server, hiding a payout address, needing a port, listing the change with its
 consequences, offering this server with its worker, and sending nothing before
 `y`.
+
+## The Device panel in `stratum-v2 watch` (2026-10-09)
+
+#### PR #42
+
+`stratum-v2 watch` now highlights a row and opens the same Device panel as the
+server's workers page, so a server running as a service (the operator's
+Debian server) can have its devices controlled over SSH. The watch view acts
+on the devices itself and never talks to the server. The server writes
+`<config>.sv2-devices.json` once a second when it changes, readable by its
+user alone and written whole: where devices reach this server, and each
+worker's label with its local address and whether that address is shared.
+The watch view reads it when a panel opens, checks the address again
+(local network or Tailscale only, never a shared one) and uses the server's
+saved device logins. Without the file (watch not run as the server's user) the
+panel explains how to run it. The status file, which everyone can read and
+which `--json` prints to service logs, still holds no device address.
+
+Unverified on a device: watch was not run against the operator's server yet.
+
+Evidence: host tests write and read the devices file, take a worker's address
+from it, refuse a shared or unknown one, refuse an edited public address, read
+the server's own addresses back, and show the "run watch as the server's
+user" explanation when the file cannot be read.

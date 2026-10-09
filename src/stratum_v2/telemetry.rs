@@ -143,6 +143,10 @@ pub enum AddressIssue {
     /// a minute old, so whether they are one device or several is not known
     /// yet (for example right after the server starts).
     Settling,
+    /// #### PR #42: the watch view cannot read the server's owner-only list
+    /// of device addresses, so it has none (it does not run as the server's
+    /// user).
+    Unlisted,
 }
 
 #[derive(Clone)]

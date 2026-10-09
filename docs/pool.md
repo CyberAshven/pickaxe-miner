@@ -61,7 +61,9 @@ WantedBy=multi-user.target
 Then `sudo systemctl enable --now pickaxe-pool`; `journalctl -u pickaxe-pool -f`
 shows its JSON lines, the first of which lists the addresses miners use under
 `connect`, and `sudo -u pickaxe /opt/pickaxe/pickaxe stratum-v2 watch --config
-/var/lib/pickaxe/mainnet.json` shows the workers table read-only. On
+/var/lib/pickaxe/mainnet.json` shows the workers table, where Enter opens a
+device's Device panel (run it as the service's user, which alone can read the
+device addresses the server keeps). On
 Windows, a task that starts the pool at logon:
 
 ```text
