@@ -264,14 +264,19 @@ impl Relay {
             .map_or(0, |elapsed| {
                 u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
             });
-        let next = |last: u64| last.saturating_add(1).max(now);
-        let last = self
-            .last_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-                Some(next(last))
-            })
-            .unwrap_or_else(|last| last);
-        next(last)
+        let mut last = self.last_id.load(Ordering::Relaxed);
+        loop {
+            let next = last.saturating_add(1).max(now);
+            match self.last_id.compare_exchange_weak(
+                last,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => last = actual,
+            }
+        }
     }
 
     /// Hands `block` (its hash and bytes) to the node worker for one
