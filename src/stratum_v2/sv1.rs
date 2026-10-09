@@ -321,7 +321,11 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
                 .try_into()
                 .map_err(|_| "invalid vendor")?,
             hardware_version: "".try_into().map_err(|_| "invalid version")?,
-            firmware: "".try_into().map_err(|_| "invalid firmware")?,
+            // #### PR #42: names this adapter's version, so a Pickaxe pool
+            // can tell adapters that follow group channels.
+            firmware: concat!("pickaxe ", env!("CARGO_PKG_VERSION"))
+                .try_into()
+                .map_err(|_| "invalid firmware")?,
             device_id: "".try_into().map_err(|_| "invalid device")?,
         },
         0,
@@ -492,6 +496,9 @@ fn serve_session(
 /// remote pool the donation's.
 struct Lane {
     channel: u32,
+    /// #### PR #42: the group channel the pool put this channel in (0 for
+    /// none); messages addressed to it reach this lane too.
+    group: u32,
     prefix: Vec<u8>,
     /// The channel's miner extranonce size.
     extra_size: usize,
@@ -508,6 +515,7 @@ impl Lane {
     fn new(open: &OpenExtendedMiningChannelSuccess<'_>) -> Result<Self, String> {
         Ok(Self {
             channel: open.channel_id,
+            group: open.group_channel_id,
             prefix: open.extranonce_prefix.as_ref().to_vec(),
             extra_size: open.extranonce_size as usize,
             target: open
@@ -692,6 +700,7 @@ impl Bridge {
         Self {
             user: Lane {
                 channel: 0,
+                group: 0,
                 prefix: Vec::new(),
                 extra_size: POOL_EXTRANONCE1 + POOL_EXTRANONCE2,
                 target: [255; 32],
@@ -770,6 +779,34 @@ impl Bridge {
             _ => None,
         };
         std::iter::once(&mut self.user).chain(donation)
+    }
+
+    // #### PR #42: the SV1 adapter follows the pool's group channel
+    // What: jobs, parents, targets and closes addressed to a lane's group
+    // channel reach every lane in that group (the device's own and the
+    // donation's); `SetGroupChannel` moves lanes between groups. Share
+    // verdicts stay per channel.
+    // Why: SRI-based pools put every extended channel in its connection's
+    // group and send every refresh to the group once standard jobs are not
+    // required. The adapter took only its own channel ids, so a device at
+    // such a pool got one job and then dropped with "unexpected firmware
+    // job".
+    // Look here if: a device at a pool gets one job, then drops with
+    // "unexpected firmware job" or "wrong mining channel".
+    /// The lanes a message for `channel` reaches: false is the device's own,
+    /// true the donation's; none is an error.
+    fn lanes_for(&self, channel: u32, error: &'static str) -> Result<Vec<bool>, String> {
+        let lanes: Vec<bool> = [false, true]
+            .into_iter()
+            .filter(|donation| {
+                self.lane(*donation)
+                    .is_some_and(|lane| addressed_to(channel, lane.channel, lane.group))
+            })
+            .collect();
+        if lanes.is_empty() {
+            return Err(error.into());
+        }
+        Ok(lanes)
     }
 
     /// Whether a channel-specific message is the donation channel's; an
@@ -1185,19 +1222,22 @@ impl Bridge {
                 }
                 out.extend(self.drop_donation("the pool refused the donation channel")?);
             }
+            // #### PR #42: a job, parent or target may be addressed to the
+            // lanes' group channel, and then reaches each lane in it.
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
                 let job: NewExtendedMiningJob =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid mining job")?;
-                let donation = self.on_lane(job.channel_id, "unexpected firmware job")?;
-                if donation && job.job_id & DONATION_JOBS != 0 {
-                    out.extend(
-                        self.drop_donation(
+                for donation in self.lanes_for(job.channel_id, "unexpected firmware job")? {
+                    if donation && job.job_id & DONATION_JOBS != 0 {
+                        out.extend(self.drop_donation(
                             "the pool's job numbers do not fit the donation channel",
-                        )?,
-                    );
-                } else {
-                    let lane = self.lane_mut(donation).ok_or("unexpected firmware job")?;
-                    if let Some((prev, job)) = lane.job(job)? {
+                        )?);
+                        continue;
+                    }
+                    let Some(lane) = self.lane_mut(donation) else {
+                        continue;
+                    };
+                    if let Some((prev, job)) = lane.job(job.clone())? {
                         out.extend(self.activate(donation, prev, job, false)?);
                     }
                 }
@@ -1205,21 +1245,27 @@ impl Bridge {
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
                 let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload())
                     .map_err(|_| "invalid job activation")?;
-                let donation = self.on_lane(prev.channel_id, "wrong mining channel")?;
-                let lane = self.lane_mut(donation).ok_or("wrong mining channel")?;
-                let (prev, job) = lane.parent(prev)?;
-                out.extend(self.activate(donation, prev, job, true)?);
+                for donation in self.lanes_for(prev.channel_id, "wrong mining channel")? {
+                    let Some(lane) = self.lane_mut(donation) else {
+                        continue;
+                    };
+                    let (prev, job) = lane.parent(prev.clone())?;
+                    out.extend(self.activate(donation, prev, job, true)?);
+                }
             }
             MESSAGE_TYPE_SET_TARGET => {
                 let target: SetTarget =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid target")?;
-                let donation = self.on_lane(target.channel_id, "wrong mining channel")?;
-                let lane = self.lane_mut(donation).ok_or("wrong mining channel")?;
-                lane.target = target
+                let maximum: [u8; 32] = target
                     .maximum_target
                     .as_ref()
                     .try_into()
                     .map_err(|_| "invalid target")?;
+                for donation in self.lanes_for(target.channel_id, "wrong mining channel")? {
+                    if let Some(lane) = self.lane_mut(donation) {
+                        lane.target = maximum;
+                    }
+                }
             }
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS => {
                 let ack: SubmitSharesSuccess = binary_sv2::from_bytes(frame.payload())
@@ -1289,19 +1335,30 @@ impl Bridge {
                 }
                 out.extend(self.drop_donation("the pool changed the donation channel")?);
             }
+            // #### PR #42: closing the lanes' group closes each lane in it:
+            // the device's own lane reconnects, the donation's stops.
             MESSAGE_TYPE_CLOSE_CHANNEL => {
                 let closed: CloseChannel = binary_sv2::from_bytes(frame.payload())
                     .map_err(|_| "SV2 upstream closed the channel")?;
-                if self
-                    .lane(true)
-                    .is_none_or(|lane| lane.channel != closed.channel_id)
-                {
+                let lanes = self.lanes_for(closed.channel_id, "SV2 upstream closed the channel")?;
+                if lanes.contains(&false) {
                     return Err("SV2 upstream closed the channel".into());
                 }
                 out.extend(self.drop_donation("the pool closed the donation channel")?);
             }
-            // Group channels only matter for standard channels.
-            MESSAGE_TYPE_SET_GROUP_CHANNEL if self.remote => (),
+            // #### PR #42: the pool moves channels between group channels.
+            MESSAGE_TYPE_SET_GROUP_CHANNEL if self.remote => {
+                let moved: SetGroupChannel =
+                    binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid group channel")?;
+                let channels = moved.channel_ids.into_inner();
+                for donation in [false, true] {
+                    if let Some(lane) = self.lane_mut(donation) {
+                        if channels.contains(&lane.channel) {
+                            lane.group = moved.group_channel_id;
+                        }
+                    }
+                }
+            }
             _ => return Err("unexpected upstream firmware message".into()),
         }
         Ok((out, verdicts))
@@ -1453,6 +1510,12 @@ impl Lines {
     }
 }
 
+/// #### PR #42: whether a message for `id` reaches the channel `channel`
+/// in group `group` (0 is no group).
+pub(super) fn addressed_to(id: u32, channel: u32, group: u32) -> bool {
+    id == channel || (group != 0 && id == group)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1528,6 +1591,197 @@ mod tests {
     /// #### PR #40: at a remote pool the device rolls four extranonce2 bytes.
     fn remote_submit(id: u64) -> Value {
         json!({"id":id,"method":"mining.submit","params":["worker","4","00000000","00000001","00000002"]})
+    }
+
+    /// #### PR #42: an extended job and its parent, for a channel or group.
+    fn group_job(channel_id: u32, job_id: u32) -> SerializedFrame {
+        encoded(
+            NewExtendedMiningJob {
+                channel_id,
+                job_id,
+                min_ntime: binary_sv2::Sv2Option::new(None),
+                version: 0x20000000,
+                version_rolling_allowed: true,
+                merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+                coinbase_tx_prefix: [1u8; 32].as_slice().try_into().unwrap(),
+                coinbase_tx_suffix: [2u8; 32].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            true,
+        )
+        .unwrap()
+    }
+
+    fn group_parent(channel_id: u32, job_id: u32) -> SerializedFrame {
+        encoded(
+            SetNewPrevHash {
+                channel_id,
+                job_id,
+                prev_hash: (&[0u8; 32]).into(),
+                min_ntime: 1700000000,
+                nbits: 0x1d00ffff,
+            },
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// A pool bridge whose device channel 3 sits in group 9, as SRI pools
+    /// put every extended channel in its connection's group.
+    fn grouped_bridge(donation: Option<DonationRoute>) -> Bridge {
+        let mut bridge = Bridge::new(
+            OpenExtendedMiningChannelSuccess {
+                request_id: 1,
+                channel_id: 3,
+                group_channel_id: 9,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 8,
+                extranonce_prefix: [7u8; 4].as_slice().try_into().unwrap(),
+            },
+            true,
+            donation,
+        )
+        .unwrap();
+        bridge
+            .request(json!({"id":1,"method":"mining.subscribe","params":[]}))
+            .unwrap();
+        bridge
+            .request(json!({"id":2,"method":"mining.authorize","params":["worker", ""]}))
+            .unwrap();
+        bridge
+    }
+
+    // #### PR #42
+    // What: jobs and parents addressed to the group reach the device as
+    // clean notifies, and a same-parent group refresh follows without
+    // reconnecting; an unknown id is still refused.
+    // Look here if: lanes_for or the job and parent arms change.
+    #[test]
+    fn a_group_job_and_activation_reach_firmware() {
+        let mut bridge = grouped_bridge(None);
+        bridge.upstream(group_job(9, 5)).unwrap();
+        let notified = bridge.upstream(group_parent(9, 5)).unwrap().0;
+        let notify = notified
+            .iter()
+            .find(|message| message["method"] == "mining.notify")
+            .expect("a notify");
+        assert_eq!(notify["params"][0], "5");
+        assert_eq!(notify["params"][8], true);
+        // A same-parent refresh to the group (a job with a time is
+        // immediate): kept work, clean false.
+        let immediate = encoded(
+            NewExtendedMiningJob {
+                channel_id: 9,
+                job_id: 6,
+                min_ntime: binary_sv2::Sv2Option::new(Some(1700000000)),
+                version: 0x20000000,
+                version_rolling_allowed: true,
+                merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+                coinbase_tx_prefix: [1u8; 32].as_slice().try_into().unwrap(),
+                coinbase_tx_suffix: [2u8; 32].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            true,
+        )
+        .unwrap();
+        let refreshed = bridge.upstream(immediate).unwrap().0;
+        let notify = refreshed
+            .iter()
+            .find(|message| message["method"] == "mining.notify")
+            .expect("a refresh");
+        assert_eq!(notify["params"][0], "6");
+        assert_eq!(notify["params"][8], false);
+        assert_eq!(
+            bridge.upstream(group_job(99, 7)).err().as_deref(),
+            Some("unexpected firmware job")
+        );
+    }
+
+    // #### PR #42
+    // What: a group job feeds the device's lane and the donation's when both
+    // are in the group, so the work clock can switch the device by job alone.
+    #[test]
+    fn a_group_job_feeds_both_lanes_and_the_device_switches_by_job_alone() {
+        let rate = Arc::new(RwLock::new("100".parse::<BchDonation>().unwrap()));
+        let mut bridge = grouped_bridge(Some(DonationRoute {
+            identity: "donation".into(),
+            rate: rate.clone(),
+        }));
+        bridge.upstream(group_job(9, 5)).unwrap();
+        bridge.upstream(group_parent(9, 5)).unwrap();
+        bridge
+            .donation_request()
+            .unwrap()
+            .expect("donation channel");
+        let opened = encoded(
+            OpenExtendedMiningChannelSuccess {
+                request_id: DONATION_REQUEST,
+                channel_id: 11,
+                group_channel_id: 9,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 10,
+                extranonce_prefix: [9u8; 2].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            false,
+        )
+        .unwrap();
+        bridge.upstream(opened).unwrap();
+        // One group job and parent: both lanes get them.
+        bridge.upstream(group_job(9, 6)).unwrap();
+        bridge.upstream(group_parent(9, 6)).unwrap();
+        assert!(bridge.lane(true).unwrap().active.contains_key(&6));
+        assert!(bridge.user.active.contains_key(&6));
+        let switched = bridge.tick(Instant::now()).unwrap();
+        assert_eq!(switched[1]["params"][0], (6 | DONATION_JOBS).to_string());
+    }
+
+    // #### PR #42
+    // What: SetGroupChannel moves the device's lane to another group, whose
+    // jobs it then takes; ids of neither its channel nor its group are still
+    // refused.
+    #[test]
+    fn set_group_channel_moves_a_lane_and_other_ids_are_still_refused() {
+        let mut bridge = grouped_bridge(None);
+        let moved = encoded(
+            SetGroupChannel {
+                group_channel_id: 12,
+                channel_ids: vec![3u32].try_into().unwrap(),
+            },
+            MESSAGE_TYPE_SET_GROUP_CHANNEL,
+            false,
+        )
+        .unwrap();
+        assert!(bridge.upstream(moved).unwrap().0.is_empty());
+        assert_eq!(bridge.user.group, 12);
+        bridge.upstream(group_job(12, 5)).unwrap();
+        assert!(bridge.upstream(group_parent(12, 5)).is_ok());
+        assert!(bridge.upstream(group_job(9, 6)).is_err(), "the old group");
+        assert!(bridge.upstream(group_job(3, 6)).is_ok(), "its own channel");
+    }
+
+    // #### PR #42
+    // What: closing the group closes the device's lane: the adapter ends the
+    // connection so the device reconnects for a new channel.
+    #[test]
+    fn closing_the_group_closes_its_lanes() {
+        let mut bridge = grouped_bridge(None);
+        let close = encoded(
+            CloseChannel {
+                channel_id: 9,
+                reason_code: "bye".try_into().unwrap(),
+            },
+            MESSAGE_TYPE_CLOSE_CHANNEL,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            bridge.upstream(close).err().as_deref(),
+            Some("SV2 upstream closed the channel")
+        );
+        assert!(addressed_to(9, 3, 9) && addressed_to(3, 3, 9));
+        assert!(!addressed_to(0, 3, 0) && !addressed_to(9, 3, 0));
     }
 
     // #### PR #40

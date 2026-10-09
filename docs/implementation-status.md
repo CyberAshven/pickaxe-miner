@@ -1606,3 +1606,28 @@ address, listed on the dashboard, and the baton moves (a new set serial); the
 mock node accepts the block with the commitment and the ticket. Other tests
 cover the test token's difficulty and Chipnet-only rule, the records line and
 status file, and the capability report.
+
+## Join a pool follows the pool's group channel (2026-10-09)
+
+#### PR #42
+
+A bug fix for Join a pool at SRI-based SV2 pools (such as LoneStrike's BCH
+stack). Those pools put every extended channel in its connection's group
+channel and send every job refresh, new parent and target to the group. The
+SV1 adapter accepted only its own channel ids, so a device there got its first
+job and then dropped with "unexpected firmware job".
+
+The adapter now records each channel's group (from the pool's channel reply)
+and takes jobs, parents, targets and closes addressed to it on every lane in
+the group: the device's own and the donation's. `SetGroupChannel` moves its
+lanes between groups. Share verdicts stay per channel. Closing the group
+closes the device's lane, so the device reconnects. The adapter now names its
+version in its `SetupConnection`, so a Pickaxe pool can tell adapters that
+follow group channels.
+
+Evidence: host tests check that group jobs and parents reach the device as
+notifies (clean for a new parent, not clean for a same-parent refresh), that
+one group job feeds both lanes so the device switches to donation work by job
+alone, that `SetGroupChannel` moves a lane while other ids are still refused,
+and that closing the group closes the device's lane. Not yet run against a
+live SRI pool.
