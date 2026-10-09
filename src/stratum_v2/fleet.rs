@@ -15,12 +15,16 @@
 //! Pool settings (their worker names are often payout addresses), MAC
 //! addresses, serial numbers and host names are never collected.
 
-use super::device_api::{self, DeviceAction, DeviceReport};
+use super::device_api::{self, DeviceAction, DeviceReport, OwnApi, PowerMode};
 use asic_rs::{
     core::{
+        config::{fan::FanConfig, tuning::TuningConfig},
         data::{
-            board::BoardData, collector::DataField, fan::FanData, hashrate::HashRateUnit,
-            miner::MinerData,
+            board::BoardData,
+            collector::DataField,
+            fan::FanData,
+            hashrate::HashRateUnit,
+            miner::{MinerData, MiningMode, TuningTarget},
         },
         traits::miner::Miner,
     },
@@ -79,6 +83,10 @@ struct Shared {
     /// Look here if: an action on an offline row fails or takes another path
     /// than the panel listed, or a farm's churn grows the cache.
     held: Mutex<Option<IpAddr>>,
+    /// #### PR #42: what each Avalon listed in its `ascset 0,help` reply,
+    /// read when its Device panel identifies it; `None` when it listed
+    /// nothing readable.
+    avalon_help: Mutex<HashMap<IpAddr, Option<Vec<String>>>>,
 }
 
 #[derive(Clone)]
@@ -107,6 +115,7 @@ impl Fleet {
                 factory: MinerFactory::new().with_identification_timeout(IDENTIFY),
                 known: Mutex::new(HashMap::new()),
                 held: Mutex::new(None),
+                avalon_help: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -164,7 +173,8 @@ impl Fleet {
         if !device_api::queryable(ip) {
             return DeviceControls::default();
         }
-        controls_of(self.shared.miner(ip).as_deref())
+        let help = self.shared.avalon_help(ip);
+        controls_of(self.shared.miner(ip).as_deref(), help.as_deref())
     }
 
     /// #### PR #42
@@ -194,7 +204,16 @@ impl Fleet {
                 .ok()
                 .flatten()
         });
-        controls_of(miner.as_deref())
+        // #### PR #42: an Avalon lists the settings it accepts (read-only).
+        let help = miner
+            .as_deref()
+            .filter(|miner| is_avalon(*miner))
+            .and_then(|_| {
+                let help = device_api::avalon_options(ip);
+                self.shared.remember_help(ip, help.clone());
+                help
+            });
+        controls_of(miner.as_deref(), help.as_deref())
     }
 
     /// Runs one confirmed action and describes the device's answer: through
@@ -205,8 +224,17 @@ impl Fleet {
         }
         match (self.through_asic_rs(ip, action), &self.runtime) {
             (Some(miner), Some(runtime)) => run_within_answer(runtime, &*miner, action),
-            _ => device_api::control(ip, action)
-                .map(|reply| format!("the device replied \"{reply}\"")),
+            // #### PR #42: fan and power settings asic-rs does not send for
+            // this device go to Pickaxe's own Avalon or AxeOS commands.
+            _ => match (
+                is_setting(action),
+                self.shared.miner(ip).as_deref().and_then(own_api),
+            ) {
+                (true, Some(api)) => device_api::setting(ip, api, action),
+                (true, None) => Err("this device does not offer that action".into()),
+                (false, _) => device_api::control(ip, action),
+            }
+            .map(|reply| format!("the device replied \"{reply}\"")),
         }
     }
 
@@ -237,6 +265,23 @@ impl Shared {
             known.retain(|ip, _| {
                 held == Some(*ip) || devices.iter().any(|(_, device)| device == ip)
             });
+        }
+        if let Ok(mut help) = self.avalon_help.lock() {
+            help.retain(|ip, _| {
+                held == Some(*ip) || devices.iter().any(|(_, device)| device == ip)
+            });
+        }
+    }
+
+    /// #### PR #42: what an Avalon listed in its `ascset 0,help` reply;
+    /// `None` when it has not been asked or listed nothing readable.
+    fn avalon_help(&self, ip: IpAddr) -> Option<Vec<String>> {
+        self.avalon_help.lock().ok()?.get(&ip).cloned().flatten()
+    }
+
+    fn remember_help(&self, ip: IpAddr, help: Option<Vec<String>>) {
+        if let Ok(mut known) = self.avalon_help.lock() {
+            known.insert(ip, help);
         }
     }
 
@@ -318,12 +363,126 @@ pub struct DeviceControls {
     pub model: Option<String>,
     /// The one-shot actions, each sent only after the user confirms it.
     pub actions: Vec<DeviceAction>,
+    /// #### PR #42: the fan setting offered: automatic, or a percentage in
+    /// this range; none when the device offers no fan setting.
+    pub fan: Option<FanRange>,
+    /// #### PR #42: how power is set, beyond Avalon work-level steps.
+    pub power: Option<PowerSetting>,
 }
+
+/// #### PR #42: the fan percentages a device accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FanRange {
+    pub min: u8,
+    pub max: u8,
+}
+
+/// #### PR #42: how a device's power is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerSetting {
+    /// Named modes: Low, Normal and High.
+    Modes,
+    /// A limit in watts.
+    Watts,
+}
+
+/// The firmware asic-rs names ePIC's ("UMC OS"): its power limit is set
+/// through its tuning.
+const EPIC: &str = "UMC OS";
+/// Firmwares whose power is set by named modes through asic-rs.
+const NAMED_MODES: [&str; 2] = ["AntMiner Stock", "WhatsMiner Stock"];
+/// The target temperature an automatic fan keeps when the device reports
+/// none (ePIC and Proto need one).
+const AUTO_FAN_TARGET_C: f64 = 65.0;
+
+/// #### PR #42: what decides a device's fan and power settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Capabilities {
+    own: Option<OwnApi>,
+    firmware: String,
+    fan_config: bool,
+    power_limit: bool,
+    tuning_config: bool,
+}
+
+impl Capabilities {
+    fn of(miner: &dyn Miner) -> Self {
+        Self {
+            own: own_api(miner),
+            firmware: miner.get_device_info().firmware,
+            fan_config: miner.supports_fan_config(),
+            power_limit: miner.supports_set_power_limit(),
+            tuning_config: miner.supports_tuning_config(),
+        }
+    }
+}
+
+// #### PR #42: fan and power settings on the Device panel
+// What: the settings a device offers. Avalons: Canaan's fan (15% to 100%)
+// and work modes, each when the device's `ascset 0,help` lists it (`fan-spd`,
+// `workmode`) or lists nothing readable, so the device has the last word;
+// their power otherwise stays in work-level steps. Bitaxe and NerdAxe:
+// AxeOS's fan. Others: what asic-rs sets for the firmware: a fan (stock
+// Antminer, ePIC, Proto), a power limit in watts (where asic-rs sets one,
+// and ePIC through its tuning), or named modes (stock Antminer, WhatsMiner).
+// Why: the panel offers only what will be sent. asic-rs sends an Avalon's
+// "power limit" as watts text in place of a work level, so Avalon power never
+// goes through it.
+// Look here if: a panel misses a fan or power setting the device has, or
+// offers one it refuses.
+fn settings_offered(
+    caps: &Capabilities,
+    help: Option<&[String]>,
+) -> (Option<FanRange>, Option<PowerSetting>) {
+    let lists = |option: &str| help.is_none_or(|help| help.iter().any(|word| word == option));
+    let any_fan = FanRange { min: 0, max: 100 };
+    match caps.own {
+        Some(OwnApi::Avalon) => (
+            lists("fan-spd").then_some(FanRange {
+                min: device_api::AVALON_FAN.0,
+                max: device_api::AVALON_FAN.1,
+            }),
+            lists("workmode").then_some(PowerSetting::Modes),
+        ),
+        Some(OwnApi::AxeOs) => (Some(any_fan), None),
+        None => {
+            let power = if caps.power_limit || (caps.firmware == EPIC && caps.tuning_config) {
+                Some(PowerSetting::Watts)
+            } else if caps.tuning_config && NAMED_MODES.contains(&caps.firmware.as_str()) {
+                Some(PowerSetting::Modes)
+            } else {
+                None
+            };
+            (caps.fan_config.then_some(any_fan), power)
+        }
+    }
+}
+
+/// Pickaxe's own API for a device's fan and power, if any.
+fn own_api(miner: &dyn Miner) -> Option<OwnApi> {
+    if is_avalon(miner) {
+        return Some(OwnApi::Avalon);
+    }
+    let firmware = miner.get_device_info().firmware;
+    (firmware == "Bitaxe Stock" || firmware == "Nerdaxe Stock").then_some(OwnApi::AxeOs)
+}
+
+/// Whether the action is a fan or power setting rather than a one-shot.
+fn is_setting(action: DeviceAction) -> bool {
+    matches!(
+        action,
+        DeviceAction::FanAuto
+            | DeviceAction::FanPercent(_)
+            | DeviceAction::PowerWatts(_)
+            | DeviceAction::PowerMode(_)
+    )
+}
+// #### end PR #42 ####
 
 /// What a device offers: what asic-rs supports for its make and firmware,
 /// plus Avalon work levels; Pickaxe's own actions for a device asic-rs has
 /// not identified.
-fn controls_of(miner: Option<&dyn Miner>) -> DeviceControls {
+fn controls_of(miner: Option<&dyn Miner>, help: Option<&[String]>) -> DeviceControls {
     let Some(miner) = miner else {
         return DeviceControls {
             actions: DeviceAction::OWN.to_vec(),
@@ -345,11 +504,14 @@ fn controls_of(miner: Option<&dyn Miner>) -> DeviceControls {
         actions.extend([DeviceAction::LowerPower, DeviceAction::RaisePower]);
     }
     let info = miner.get_device_info();
+    let (fan, power) = settings_offered(&Capabilities::of(miner), help);
     DeviceControls {
         // The same text `from_asic_rs` gives a report's model.
         model: Some(format!("{} {}", info.make, info.model)),
         firmware: Some(info.firmware),
         actions,
+        fan,
+        power,
     }
 }
 
@@ -370,6 +532,22 @@ fn supports(miner: &dyn Miner, action: DeviceAction) -> bool {
         DeviceAction::LocateOn | DeviceAction::LocateOff => miner.supports_set_fault_light(),
         // Work levels are Pickaxe's own Canaan commands.
         DeviceAction::LowerPower | DeviceAction::RaisePower => false,
+        // #### PR #42: fan and power settings asic-rs sets for this firmware
+        // (see `settings_offered`); Avalons, Bitaxes and NerdAxes use
+        // Pickaxe's own commands.
+        DeviceAction::FanAuto | DeviceAction::FanPercent(_) => {
+            own_api(miner).is_none() && miner.supports_fan_config()
+        }
+        DeviceAction::PowerWatts(_) => {
+            own_api(miner).is_none()
+                && (miner.supports_set_power_limit()
+                    || (miner.get_device_info().firmware == EPIC && miner.supports_tuning_config()))
+        }
+        DeviceAction::PowerMode(_) => {
+            own_api(miner).is_none()
+                && miner.supports_tuning_config()
+                && NAMED_MODES.contains(&miner.get_device_info().firmware.as_str())
+        }
     }
 }
 
@@ -408,6 +586,43 @@ async fn run(miner: &dyn Miner, action: DeviceAction) -> Result<String, String> 
         DeviceAction::LocateOff => miner.set_fault_light(false).await,
         DeviceAction::LowerPower | DeviceAction::RaisePower => {
             return Err("this action is not sent through asic-rs".into())
+        }
+        // #### PR #42: fan and power settings through asic-rs.
+        DeviceAction::FanAuto => {
+            // Keep the device's own target temperature when it has one.
+            let target = match miner.get_fan_config().await {
+                Ok(FanConfig::Auto { target_temp, .. }) => target_temp,
+                _ => AUTO_FAN_TARGET_C,
+            };
+            miner.set_fan_config(FanConfig::auto(target, None)).await
+        }
+        DeviceAction::FanPercent(percent) => {
+            miner
+                .set_fan_config(FanConfig::manual(u64::from(percent)))
+                .await
+        }
+        DeviceAction::PowerWatts(watts) => {
+            let target = TuningTarget::from_watts(f64::from(watts));
+            if miner.get_device_info().firmware == EPIC {
+                miner
+                    .set_tuning_config(TuningConfig::new(target), None)
+                    .await
+            } else {
+                let TuningTarget::Power(limit) = target else {
+                    return Err("this action is not sent through asic-rs".into());
+                };
+                miner.set_power_limit(limit).await
+            }
+        }
+        DeviceAction::PowerMode(mode) => {
+            let mode = match mode {
+                PowerMode::Low => MiningMode::Low,
+                PowerMode::Normal => MiningMode::Normal,
+                PowerMode::High => MiningMode::High,
+            };
+            miner
+                .set_tuning_config(TuningConfig::new(TuningTarget::MiningMode(mode)), None)
+                .await
         }
     };
     match accepted {
@@ -588,6 +803,8 @@ mod tests {
                 firmware: None,
                 model: None,
                 actions: DeviceAction::OWN.to_vec(),
+                fan: None,
+                power: None,
             }
         );
         assert!(fleet
@@ -677,6 +894,109 @@ mod tests {
     }
 
     // #### PR #42
+    // What: the fan and power settings each kind of device offers, and that
+    // an Avalon's go to Pickaxe's own commands, never through asic-rs.
+    // Look here if: settings_offered, supports or own_api changes.
+    #[test]
+    fn fan_and_power_settings_follow_the_firmware_and_avalon_help() {
+        use asic_rs::{
+            avalonminer::{backends::AvalonMiner, firmware::AvalonStockFirmware},
+            core::traits::{firmware::MinerFirmware, miner::MinerConstructor},
+        };
+        let caps = |own, firmware: &str, fan_config, power_limit, tuning_config| Capabilities {
+            own,
+            firmware: firmware.into(),
+            fan_config,
+            power_limit,
+            tuning_config,
+        };
+        let avalon_fan = Some(FanRange { min: 15, max: 100 });
+        let any_fan = Some(FanRange { min: 0, max: 100 });
+        // asic-rs says it sets an Avalon's power limit; it is never offered.
+        let avalon = caps(
+            Some(OwnApi::Avalon),
+            "AvalonMiner Stock",
+            false,
+            true,
+            false,
+        );
+        let listed = ["fan-spd".to_owned(), "worklevel".to_owned()];
+        assert_eq!(settings_offered(&avalon, Some(&listed)), (avalon_fan, None));
+        assert_eq!(
+            settings_offered(&avalon, None),
+            (avalon_fan, Some(PowerSetting::Modes)),
+            "an Avalon that lists nothing readable has the last word"
+        );
+        assert_eq!(
+            settings_offered(&avalon, Some(&["reboot".to_owned()])),
+            (None, None)
+        );
+        let bitaxe = caps(Some(OwnApi::AxeOs), "Bitaxe Stock", false, false, false);
+        assert_eq!(settings_offered(&bitaxe, None), (any_fan, None));
+        for (firmware, fan, power, tuning, offered) in [
+            (
+                "AntMiner Stock",
+                true,
+                false,
+                true,
+                (any_fan, Some(PowerSetting::Modes)),
+            ),
+            (
+                "WhatsMiner Stock",
+                false,
+                true,
+                true,
+                (None, Some(PowerSetting::Watts)),
+            ),
+            (
+                "Braiins",
+                false,
+                true,
+                false,
+                (None, Some(PowerSetting::Watts)),
+            ),
+            (
+                "UMC OS",
+                true,
+                false,
+                true,
+                (any_fan, Some(PowerSetting::Watts)),
+            ),
+            ("LuxOS", false, false, false, (None, None)),
+            (
+                "Proto Stock",
+                true,
+                true,
+                true,
+                (any_fan, Some(PowerSetting::Watts)),
+            ),
+        ] {
+            assert_eq!(
+                settings_offered(&caps(None, firmware, fan, power, tuning), None),
+                offered,
+                "{firmware}"
+            );
+        }
+        // A real Avalon object: everything goes to Pickaxe's own commands.
+        type AvalonModel = <AvalonStockFirmware as MinerFirmware>::Model;
+        let model: AvalonModel = "NANO3S".parse().unwrap();
+        let miner = AvalonMiner::new("192.168.7.9".parse().unwrap(), model, None);
+        assert_eq!(own_api(&*miner), Some(OwnApi::Avalon));
+        for action in [
+            DeviceAction::FanAuto,
+            DeviceAction::FanPercent(60),
+            DeviceAction::PowerWatts(140),
+            DeviceAction::PowerMode(PowerMode::Low),
+        ] {
+            assert!(!supports(&*miner, action), "{action:?}");
+            assert!(is_setting(action));
+        }
+        assert!(!is_setting(DeviceAction::Restart));
+        let controls = controls_of(Some(&*miner), Some(&listed));
+        assert_eq!((controls.fan, controls.power), (avalon_fan, None));
+    }
+
+    // #### PR #42
     // What: Restart on an Avalon (A-series, Nano and Home Q) is never sent
     // through asic-rs, but is still offered, and Pickaxe's own Restart sends
     // Canaan's reboot, byte for byte.
@@ -699,7 +1019,7 @@ mod tests {
             assert!(is_avalon(&*miner));
             assert_eq!(miner.supports_restart(), asic_rs_restarts);
             assert!(!supports(&*miner, DeviceAction::Restart));
-            let controls = controls_of(Some(&*miner));
+            let controls = controls_of(Some(&*miner), None);
             assert_eq!(controls.actions[0], DeviceAction::Restart);
             assert!(controls.actions.contains(&DeviceAction::RaisePower));
             assert_eq!(controls.firmware.as_deref(), Some("AvalonMiner Stock"));
@@ -712,7 +1032,7 @@ mod tests {
         }
         let nano: AvalonModel = "NANO3S".parse().unwrap();
         assert_eq!(
-            controls_of(Some(&*AvalonMiner::new(ip, nano, None)))
+            controls_of(Some(&*AvalonMiner::new(ip, nano, None)), None)
                 .model
                 .as_deref(),
             Some("Avalonminer AvalonNano3s")

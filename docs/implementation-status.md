@@ -1277,3 +1277,43 @@ profile saves no `server` field, and that the saved values are refused when
 the setup would refuse them (a name over 20 characters, joining without an
 address, a space in the address, a fee on solo mining, a bad fee address, an
 ASIC pool's name or fee source on a GPU pool).
+
+## Fan and power on the Device panel (2026-10-09)
+
+#### PR #42
+
+The Device panel now sets fans and power where the device allows it. "Fan
+speed…" takes `a` for automatic or a speed in percent; "Power mode…" offers
+Low, Normal and High, and "Power limit…" takes watts. Every value is checked
+against what the device accepts and then needs a confirmation, as every other
+action does.
+
+Which device gets what:
+- through asic-rs: fans on stock Antminer, ePIC and Proto firmware; a power
+  limit in watts where asic-rs sets one (Braiins, VNish, WhatsMiner, Auradine,
+  Proto, SealMiner, and ePIC through its tuning); named modes on stock Antminer
+  and WhatsMiner when they offer no limit in watts.
+- through Pickaxe's own commands: an Avalon's fan (`ascset 0,fan-spd`, -1 for
+  automatic, otherwise 15% to 100%) and work modes (`ascset 0,workmode,set`),
+  each offered when the device's `ascset 0,help` lists it or lists nothing
+  readable; a Bitaxe's or NerdAxe's fan through AxeOS (`PATCH /api/system`,
+  under `manualFanSpeed` from AxeOS v2.12 and `fanspeed` before).
+- never: an Avalon's power through asic-rs, which sends watts text as a work
+  level.
+
+Not yet: Bitaxe's identify light, and VNish's power percentage.
+
+Unverified on a device: the Avalon Nano 3's `help` listing and `fan-spd` range,
+and whether it has work modes. The panel only reads `help` (read-only); no fan
+or power setting was sent to a real device.
+
+Evidence: host tests check the exact Canaan requests for an automatic fan, 60%
+and the High work mode; a fan under 15% refused before anything is sent; a
+device's refusal shown as it is; an Avalon's help listing read; a Bitaxe's fan
+sent under `manualFanSpeed` or `fanspeed` as its firmware reports, automatic
+sent without reading first, and AxeOS's 401 explained; which settings each
+firmware is offered (stock Antminer, WhatsMiner, Braiins, ePIC, LuxOS, Proto,
+Avalon with and without a help listing, Bitaxe); an Avalon's fan and power
+never going through asic-rs; and the panel's fan and power pages refusing a
+value the device does not take, asking for a confirmation, and sending nothing
+until `y`.

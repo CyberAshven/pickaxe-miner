@@ -170,6 +170,14 @@ pub enum DeviceAction {
     LocateOff,
     LowerPower,
     RaisePower,
+    /// #### PR #42: the fan follows the device's temperature.
+    FanAuto,
+    /// #### PR #42: the fan at a fixed percentage.
+    FanPercent(u8),
+    /// #### PR #42: a power limit in watts.
+    PowerWatts(u32),
+    /// #### PR #42: a named power mode.
+    PowerMode(PowerMode),
 }
 
 impl DeviceAction {
@@ -177,15 +185,50 @@ impl DeviceAction {
     /// identified.
     pub const OWN: [Self; 3] = [Self::Restart, Self::LowerPower, Self::RaisePower];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::Restart => "Restart",
-            Self::Pause => "Pause mining",
-            Self::Resume => "Resume mining",
-            Self::LocateOn => "Blink its light (to find it)",
-            Self::LocateOff => "Stop blinking its light",
-            Self::LowerPower => "Lower power (one work level down)",
-            Self::RaisePower => "Raise power (one work level up)",
+            Self::Restart => "Restart".into(),
+            Self::Pause => "Pause mining".into(),
+            Self::Resume => "Resume mining".into(),
+            Self::LocateOn => "Blink its light (to find it)".into(),
+            Self::LocateOff => "Stop blinking its light".into(),
+            Self::LowerPower => "Lower power (one work level down)".into(),
+            Self::RaisePower => "Raise power (one work level up)".into(),
+            Self::FanAuto => "Fan speed: automatic".into(),
+            Self::FanPercent(percent) => format!("Fan speed: {percent}%"),
+            Self::PowerWatts(watts) => format!("Power limit: {watts} W"),
+            Self::PowerMode(mode) => format!("Power mode: {}", mode.name()),
+        }
+    }
+}
+
+/// #### PR #42: a power mode, for firmwares that name their modes: asic-rs's
+/// mining modes (stock Antminer, WhatsMiner) and Canaan's work modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerMode {
+    Low,
+    Normal,
+    High,
+}
+
+impl PowerMode {
+    pub const ALL: [Self; 3] = [Self::Low, Self::Normal, Self::High];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Normal => "Normal",
+            Self::High => "High",
+        }
+    }
+
+    /// Canaan's work mode number (0 Eco, 1 Standard, 2 Super on the Avalon
+    /// Q).
+    fn avalon(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::High => 2,
         }
     }
 }
@@ -217,9 +260,169 @@ pub(super) fn control_at(
         DeviceAction::Pause
         | DeviceAction::Resume
         | DeviceAction::LocateOn
-        | DeviceAction::LocateOff => Err("this device does not offer that action".into()),
+        | DeviceAction::LocateOff
+        | DeviceAction::FanAuto
+        | DeviceAction::FanPercent(_)
+        | DeviceAction::PowerWatts(_)
+        | DeviceAction::PowerMode(_) => Err(NOT_OFFERED.into()),
     }
 }
+
+const NOT_OFFERED: &str = "this device does not offer that action";
+const NO_ANSWER: &str = "the device did not answer";
+
+// #### PR #42: fan and power settings through Pickaxe's own commands
+// What: Canaan's `ascset 0,fan-spd` (automatic is -1, otherwise 15% to 100%)
+// and `ascset 0,workmode,set` for Avalons, and AxeOS's settings for a Bitaxe
+// or NerdAxe (`PATCH /api/system`). An Avalon's `ascset 0,help` lists which
+// of these it accepts.
+// Why: asic-rs sets fans only on stock Antminer, ePIC and Proto firmware, and
+// sets no fan or power mode on these devices.
+// Look here if: an Avalon or Bitaxe refuses a fan or power setting its panel
+// offered, or a Bitaxe on Tailscale answers 401.
+/// The API Pickaxe's own settings go to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnApi {
+    /// Canaan's CGMiner fork, port 4028.
+    Avalon,
+    /// Bitaxe's and NerdAxe's web API, port 80.
+    AxeOs,
+}
+
+/// The fan percentages an Avalon accepts (`fan-spd`); -1 is automatic.
+pub const AVALON_FAN: (u8, u8) = (15, 100);
+
+/// The answer AxeOS gives (401) to a request from outside its local network.
+const AXEOS_LOCAL_ONLY: &str = "the Bitaxe only accepts changes from its own local network \
+     (10.x, 172.16-31.x or 192.168.x), not through Tailscale or a VPN";
+
+/// Sends a fan or power setting through Pickaxe's own commands to a device
+/// on the local network and returns the device's own reply.
+pub fn setting(ip: IpAddr, api: OwnApi, action: DeviceAction) -> Result<String, String> {
+    if !queryable(ip) {
+        return Err("only devices on the local network can be controlled".into());
+    }
+    let ip = ip.to_canonical();
+    setting_at(
+        SocketAddr::new(ip, 4028),
+        SocketAddr::new(ip, 80),
+        api,
+        action,
+    )
+}
+
+pub(super) fn setting_at(
+    cgminer: SocketAddr,
+    web: SocketAddr,
+    api: OwnApi,
+    action: DeviceAction,
+) -> Result<String, String> {
+    match (api, action) {
+        (OwnApi::Avalon, DeviceAction::FanAuto) => ascset(cgminer, "0,fan-spd,-1"),
+        (OwnApi::Avalon, DeviceAction::FanPercent(percent)) => {
+            let (low, high) = AVALON_FAN;
+            if !(low..=high).contains(&percent) {
+                return Err(format!(
+                    "an Avalon's fan takes {low}% to {high}%; nothing was sent"
+                ));
+            }
+            ascset(cgminer, &format!("0,fan-spd,{percent}"))
+        }
+        (OwnApi::Avalon, DeviceAction::PowerMode(mode)) => {
+            ascset(cgminer, &format!("0,workmode,set,{}", mode.avalon()))
+        }
+        (OwnApi::AxeOs, DeviceAction::FanAuto) => axeos_fan(web, None),
+        (OwnApi::AxeOs, DeviceAction::FanPercent(percent)) if percent <= 100 => {
+            axeos_fan(web, Some(percent))
+        }
+        _ => Err(NOT_OFFERED.into()),
+    }
+}
+
+/// The options an Avalon lists in its `ascset 0,help` reply, in lower case;
+/// `None` when it does not answer or lists nothing readable. Read-only.
+pub fn avalon_options(ip: IpAddr) -> Option<Vec<String>> {
+    if !queryable(ip) {
+        return None;
+    }
+    avalon_options_at(SocketAddr::new(ip.to_canonical(), 4028))
+}
+
+pub(super) fn avalon_options_at(cgminer: SocketAddr) -> Option<Vec<String>> {
+    let message = ascset(cgminer, "0,help").ok()?;
+    let options: Vec<String> = message
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    (!options.is_empty()).then_some(options)
+}
+
+/// Sets a Bitaxe's fan: automatic, or a fixed percentage under the key the
+/// firmware reads (`manualFanSpeed` from AxeOS v2.12, `fanspeed` before).
+fn axeos_fan(web: SocketAddr, percent: Option<u8>) -> Result<String, String> {
+    let body = match percent {
+        None => serde_json::json!({ "autofanspeed": 1 }),
+        Some(percent) => {
+            let info = axeos_request(web, "GET", "/api/system/info", None)?;
+            let newer = serde_json::from_str::<Value>(&info)
+                .ok()
+                .is_some_and(|info| info.get("manualFanSpeed").is_some());
+            let key = if newer { "manualFanSpeed" } else { "fanspeed" };
+            let mut body = serde_json::json!({ "autofanspeed": 0 });
+            body[key] = percent.into();
+            body
+        }
+    };
+    axeos_request(web, "PATCH", "/api/system", Some(&body.to_string()))?;
+    Ok(match percent {
+        None => "fan set to automatic".into(),
+        Some(percent) => format!("fan set to {percent}%"),
+    })
+}
+
+/// One AxeOS request; `Ok` carries the reply's body when its status is
+/// 2xx.
+fn axeos_request(
+    web: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let host = match web.ip() {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    let body = body.unwrap_or("");
+    let content_type = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
+    };
+    let request = format!(
+        "{method} {path} HTTP/1.0\r\nHost: {host}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let reply = exchange(
+        web,
+        request.as_bytes(),
+        Instant::now() + DEADLINE,
+        http_complete,
+    )
+    .ok_or(NO_ANSWER)?;
+    let (head, body) = reply.split_once("\r\n\r\n").unwrap_or((&reply, ""));
+    let status = head.lines().next().unwrap_or_default();
+    match status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+    {
+        Some(200..=299) => Ok(body.to_owned()),
+        Some(401) => Err(AXEOS_LOCAL_ONLY.into()),
+        _ => Err(format!("the device answered {status}")),
+    }
+}
+// #### end PR #42 ####
 
 /// One CGMiner `ascset` command for the first device; `Ok` carries the
 /// device's message when it reports success or information.
@@ -231,7 +434,7 @@ fn ascset(address: SocketAddr, parameter: &str) -> Result<String, String> {
         Instant::now() + DEADLINE,
         |reply| reply.contains(&0),
     )
-    .ok_or("the device did not answer")?;
+    .ok_or(NO_ANSWER)?;
     parse_ascset(&reply)
 }
 
@@ -526,6 +729,114 @@ pub(super) mod tests {
     /// A device stand-in that answers one connection per reply, in order,
     /// and hands each request it received to the test. (PR #42: shared with
     /// the `fleet` tests.)
+    // #### PR #42
+    // What: Pickaxe's own Avalon fan and work-mode commands, byte for byte;
+    // a fan speed outside 15% to 100% refused before anything is sent; the
+    // device's own refusal shown; an Avalon's help listing read; watts never
+    // sent this way.
+    // Look here if: setting_at or avalon_options_at changes.
+    #[test]
+    fn avalon_fan_and_workmode_send_canaan_commands() {
+        let (avalon, requests) = recording_device(vec![
+            br#"{"STATUS":[{"STATUS":"S","Msg":"ASC 0 set OK"}],"id":1}"#,
+            br#"{"STATUS":[{"STATUS":"S","Msg":"ASC 0 set OK"}],"id":1}"#,
+            br#"{"STATUS":[{"STATUS":"E","Msg":"error:1 not support set workmode max_mode[0]"}],"id":1}"#,
+            br#"{"STATUS":[{"STATUS":"I","Msg":"ASC 0 set info: help: fan-spd|reboot|worklevel|ledset"}],"id":1}"#,
+        ]);
+        let web = SocketAddr::from(([127, 0, 0, 1], 9));
+        let set = |action| setting_at(avalon, web, OwnApi::Avalon, action);
+        assert_eq!(set(DeviceAction::FanAuto).unwrap(), "ASC 0 set OK");
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,fan-spd,-1"}"#
+        );
+        // Below 15% nothing is sent: the next request is the 60%.
+        assert!(set(DeviceAction::FanPercent(10))
+            .unwrap_err()
+            .contains("15% to 100%; nothing was sent"));
+        assert_eq!(set(DeviceAction::FanPercent(60)).unwrap(), "ASC 0 set OK");
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,fan-spd,60"}"#
+        );
+        assert_eq!(
+            set(DeviceAction::PowerMode(PowerMode::High)).unwrap_err(),
+            "error:1 not support set workmode max_mode[0]"
+        );
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,workmode,set,2"}"#
+        );
+        let options = avalon_options_at(avalon).unwrap();
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,help"}"#
+        );
+        assert!(options.contains(&"fan-spd".to_owned()));
+        assert!(!options.contains(&"workmode".to_owned()));
+        assert_eq!(
+            set(DeviceAction::PowerWatts(3000)).unwrap_err(),
+            "this device does not offer that action"
+        );
+        assert_eq!(
+            set(DeviceAction::Restart).unwrap_err(),
+            "this device does not offer that action"
+        );
+    }
+
+    // #### PR #42
+    // What: a Bitaxe's fan is set under the key its firmware reads
+    // (`manualFanSpeed` from AxeOS v2.12, `fanspeed` before), automatic needs
+    // no reading first, and AxeOS's 401 for a request from outside its local
+    // network is explained.
+    // Look here if: axeos_fan or axeos_request changes.
+    #[test]
+    fn axeos_fan_uses_the_key_the_device_reports_and_explains_a_401() {
+        let (http, requests) = recording_device(vec![
+            b"HTTP/1.0 200 OK\r\n\r\n{\"manualFanSpeed\":55,\"autofanspeed\":1}",
+            b"HTTP/1.0 200 OK\r\n\r\n",
+            b"HTTP/1.0 200 OK\r\n\r\n{\"fanspeed\":55,\"autofanspeed\":1}",
+            b"HTTP/1.0 200 OK\r\n\r\n",
+            b"HTTP/1.0 401 Unauthorized\r\n\r\nUnauthorized",
+        ]);
+        let cgminer = SocketAddr::from(([127, 0, 0, 1], 9));
+        let set = |action| setting_at(cgminer, http, OwnApi::AxeOs, action);
+        assert_eq!(set(DeviceAction::FanPercent(60)).unwrap(), "fan set to 60%");
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /api/system/info HTTP/1.0\r\n"));
+        let patch = requests.recv().unwrap();
+        assert!(
+            patch.starts_with("PATCH /api/system HTTP/1.0\r\n"),
+            "{patch}"
+        );
+        assert!(patch.contains("Content-Type: application/json\r\n"));
+        assert!(
+            patch.ends_with("\r\n\r\n{\"autofanspeed\":0,\"manualFanSpeed\":60}"),
+            "{patch}"
+        );
+        assert_eq!(set(DeviceAction::FanPercent(40)).unwrap(), "fan set to 40%");
+        requests.recv().unwrap();
+        assert!(requests
+            .recv()
+            .unwrap()
+            .ends_with("\r\n\r\n{\"autofanspeed\":0,\"fanspeed\":40}"));
+        let refused = set(DeviceAction::FanAuto).unwrap_err();
+        assert!(
+            refused.contains("only accepts changes from its own local network"),
+            "{refused}"
+        );
+        assert!(requests
+            .recv()
+            .unwrap()
+            .ends_with("\r\n\r\n{\"autofanspeed\":1}"));
+        // Over 100% and power settings are refused without a request.
+        assert!(set(DeviceAction::FanPercent(101)).is_err());
+        assert!(set(DeviceAction::PowerMode(PowerMode::Low)).is_err());
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
     pub(in crate::stratum_v2) fn recording_device(
         replies: Vec<&'static [u8]>,
     ) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {

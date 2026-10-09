@@ -237,9 +237,26 @@ restart only restarts the mining program, and its Avalon Home Q has none. A
 device asic-rs does not identify offers Pickaxe's own Restart (Canaan's
 `ascset` reboot or Bitaxe's restart endpoint) and work levels.
 
-Each action needs a confirmation, goes only to a device on the local network
-or Tailscale, and shows the device's reply. The panel takes every key, so `q`
-there never stops the server. Esc goes back.
+The panel also sets the fan and the power where the device allows it:
+
+- **Fan speed:** `a` for automatic (the device follows its temperature), or a
+  speed typed in percent. Through asic-rs on stock Antminer, ePIC and Proto
+  firmware. On an Avalon through Canaan's `ascset 0,fan-spd` (15% to 100%), and
+  on a Bitaxe or NerdAxe through AxeOS's settings.
+- **Power:** a limit in watts where asic-rs sets one (Braiins, VNish,
+  WhatsMiner, Auradine, Proto, SealMiner, and ePIC through its tuning), or the
+  Low, Normal and High modes (stock Antminer). An Avalon gets Canaan's work
+  modes when it lists `workmode`, beside its work levels.
+
+An Avalon lists the settings it accepts in its `ascset 0,help` reply, which
+the panel reads once when it opens. A setting it does not list is not offered.
+When the list cannot be read, the setting is offered and the device decides. A
+Bitaxe accepts changes only from its own local network: through Tailscale or a
+VPN it answers that it refuses, and the panel says so.
+
+Each action and setting needs a confirmation, goes only to a device on the
+local network or Tailscale, and shows the device's reply. The panel takes
+every key, so `q` there never stops the server. Esc goes back.
 
 An offline row's address may since belong to another device, for example
 after its DHCP lease passed on. So for an offline row Pickaxe looks at the

@@ -7,8 +7,8 @@
 //! not.
 
 use super::{
-    device_api::DeviceAction,
-    fleet::{DeviceControls, Fleet},
+    device_api::{DeviceAction, PowerMode},
+    fleet::{DeviceControls, FanRange, Fleet, PowerSetting},
     telemetry::{AddressIssue, DeviceSnapshot, Devices},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -137,11 +137,27 @@ pub(super) struct DevicePanel {
     reply: Arc<Mutex<Option<String>>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Page {
     Menu,
     Confirm(DeviceAction),
+    /// #### PR #42: the fan: `a` for automatic, or a speed typed then Enter.
+    Fan(String),
+    /// #### PR #42: the power: a mode by its number, or watts typed then
+    /// Enter.
+    Power(String),
 }
+
+/// #### PR #42: one entry of the panel's menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Item {
+    Action(DeviceAction),
+    Fan,
+    Power,
+}
+
+/// The highest power limit the power page accepts, in watts.
+const MAX_WATTS: u32 = 100_000;
 
 /// What the panel offers at the moment.
 enum Offer {
@@ -237,25 +253,92 @@ impl DevicePanel {
     /// `q` here never stops the server. A number chooses an action, `y`
     /// confirms it, any other key cancels, and Esc goes back.
     pub(super) fn handle_key(&mut self, key: KeyEvent, fleet: &Arc<Fleet>) -> bool {
-        match (self.page, key.code) {
+        let found = match self.offer() {
+            Offer::Ready(found) => Some(found),
+            _ => None,
+        };
+        let power = found.as_ref().and_then(|found| found.power);
+        let page = std::mem::replace(&mut self.page, Page::Menu);
+        self.page = match (page, key.code) {
             (Page::Menu, KeyCode::Esc) => return true,
             (Page::Menu, KeyCode::Char(choice @ '1'..='9')) => {
-                if let Some(action) = self
-                    .actions()
-                    .get(usize::from(choice as u8 - b'1'))
-                    .copied()
-                {
-                    self.page = Page::Confirm(action);
+                match self.items().get(usize::from(choice as u8 - b'1')) {
+                    Some(Item::Action(action)) => Page::Confirm(*action),
+                    Some(Item::Fan) => Page::Fan(String::new()),
+                    Some(Item::Power) => Page::Power(String::new()),
+                    None => Page::Menu,
                 }
             }
             (Page::Confirm(action), KeyCode::Char('y') | KeyCode::Char('Y')) => {
-                self.page = Page::Menu;
                 self.send(action, fleet);
+                Page::Menu
             }
-            (Page::Confirm(_), _) => self.page = Page::Menu,
-            (Page::Menu, _) => {}
-        }
+            (Page::Confirm(_), _) => Page::Menu,
+            // #### PR #42: the fan and power pages. A value is checked
+            // against what the device accepts, then confirmed like any action.
+            (Page::Fan(_) | Page::Power(_), KeyCode::Esc) => Page::Menu,
+            (Page::Fan(input), KeyCode::Char('a') | KeyCode::Char('A')) if input.is_empty() => {
+                Page::Confirm(DeviceAction::FanAuto)
+            }
+            (Page::Fan(input), KeyCode::Enter) => {
+                match fan_choice(&input, found.as_ref().and_then(|found| found.fan)) {
+                    Ok(action) => Page::Confirm(action),
+                    Err(why) => {
+                        self.set_reply(why);
+                        Page::Fan(input)
+                    }
+                }
+            }
+            (Page::Fan(mut input), KeyCode::Char(digit @ '0'..='9')) => {
+                if input.len() < 3 {
+                    input.push(digit);
+                }
+                Page::Fan(input)
+            }
+            (Page::Power(_), KeyCode::Char(choice @ '1'..='3'))
+                if power == Some(PowerSetting::Modes) =>
+            {
+                Page::Confirm(DeviceAction::PowerMode(
+                    PowerMode::ALL[usize::from(choice as u8 - b'1')],
+                ))
+            }
+            (Page::Power(input), KeyCode::Enter) if power == Some(PowerSetting::Watts) => {
+                match watts_choice(&input) {
+                    Ok(action) => Page::Confirm(action),
+                    Err(why) => {
+                        self.set_reply(why);
+                        Page::Power(input)
+                    }
+                }
+            }
+            (Page::Power(mut input), KeyCode::Char(digit @ '0'..='9'))
+                if power == Some(PowerSetting::Watts) =>
+            {
+                if input.len() < 6 {
+                    input.push(digit);
+                }
+                Page::Power(input)
+            }
+            (Page::Fan(mut input), KeyCode::Backspace) => {
+                input.pop();
+                Page::Fan(input)
+            }
+            (Page::Power(mut input), KeyCode::Backspace) => {
+                input.pop();
+                Page::Power(input)
+            }
+            (page, _) => page,
+        };
         false
+    }
+
+    /// #### PR #42: the menu: the one-shot actions, then the fan and power
+    /// settings the device offers.
+    fn items(&self) -> Vec<Item> {
+        match self.offer() {
+            Offer::Ready(found) => items_of(&found),
+            _ => Vec::new(),
+        }
     }
 
     /// What the panel can offer now.
@@ -300,6 +383,7 @@ impl DevicePanel {
 
     /// The actions offered: none without a usable address, until the device
     /// is identified, or for an offline row's device that is not confirmed.
+    #[cfg(test)]
     fn actions(&self) -> Vec<DeviceAction> {
         match self.offer() {
             Offer::Ready(found) => found.actions,
@@ -380,20 +464,49 @@ impl DevicePanel {
             Offer::Ready(found) => {
                 text.push_str(&self.reached(&found));
                 text.push('\n');
-                match self.page {
+                let items = items_of(&found);
+                match &self.page {
                     Page::Confirm(action) => text.push_str(&format!(
-                        "{} {}?\n\ny  Yes · any other key  No\n",
-                        action.label(),
-                        self.label
+                        "{}\n\ny  Yes · any other key  No\n",
+                        question(*action, &self.label)
                     )),
-                    Page::Menu if found.actions.is_empty() => {
+                    Page::Menu if items.is_empty() => {
                         text.push_str("This device offers no actions.\n")
                     }
                     Page::Menu => {
-                        for (index, action) in found.actions.iter().take(9).enumerate() {
-                            text.push_str(&format!("{}  {}\n", index + 1, action.label()));
+                        for (index, item) in items.iter().take(9).enumerate() {
+                            let name = match item {
+                                Item::Action(action) => action.label(),
+                                Item::Fan => "Fan speed…".to_owned(),
+                                Item::Power if found.power == Some(PowerSetting::Modes) => {
+                                    "Power mode…".to_owned()
+                                }
+                                Item::Power => "Power limit…".to_owned(),
+                            };
+                            text.push_str(&format!("{}  {name}\n", index + 1));
                         }
                     }
+                    // #### PR #42: the fan and power pages.
+                    Page::Fan(input) => {
+                        let range = found.fan.unwrap_or(FanRange { min: 0, max: 100 });
+                        text.push_str(&format!(
+                            "Fan speed of {}\n\na  Automatic: the device sets it by its \
+                             temperature\nOr type a speed from {}% to {}% and press Enter: \
+                             {input}_\n\nEsc  Back\n",
+                            self.label, range.min, range.max
+                        ));
+                    }
+                    Page::Power(_) if found.power == Some(PowerSetting::Modes) => {
+                        text.push_str(&format!(
+                            "Power mode of {}\n\n1  Low\n2  Normal\n3  High\n\nEsc  Back\n",
+                            self.label
+                        ));
+                    }
+                    Page::Power(input) => text.push_str(&format!(
+                        "Power limit of {}\n\nType the limit in watts and press Enter: \
+                         {input}_\n\nEsc  Back\n",
+                        self.label
+                    )),
                 }
             }
         }
@@ -406,9 +519,9 @@ impl DevicePanel {
         text.push_str(
             "\nActions go straight to the device, on your local network or Tailscale. Each one \
              needs your confirmation. The device's address is never shown. The list is what \
-             asic-rs supports for this make and firmware, plus Avalon work levels. Restart on \
-             an Avalon is Canaan's own reboot. A device asic-rs does not identify offers \
-             Restart and work levels.",
+             asic-rs supports for this make and firmware, plus Pickaxe's own Avalon work \
+             levels, fans and work modes, and Bitaxe fans. Restart on an Avalon is Canaan's \
+             own reboot. A device asic-rs does not identify offers Restart and work levels.",
         );
         text
     }
@@ -485,6 +598,54 @@ fn span(duration: Duration) -> String {
 /// hold one. The panel never shows an address.
 /// Look here if: an address shows on the Device panel, or a reply is cut
 /// short or reads oddly.
+/// #### PR #42: the menu of an identified device.
+fn items_of(found: &DeviceControls) -> Vec<Item> {
+    let mut items: Vec<Item> = found.actions.iter().copied().map(Item::Action).collect();
+    if found.fan.is_some() {
+        items.push(Item::Fan);
+    }
+    if found.power.is_some() {
+        items.push(Item::Power);
+    }
+    items
+}
+
+/// #### PR #42: the confirmation question for an action.
+fn question(action: DeviceAction, worker: &str) -> String {
+    match action {
+        DeviceAction::FanAuto => format!("Set the fan of {worker} to automatic?"),
+        DeviceAction::FanPercent(percent) => format!("Set the fan of {worker} to {percent}%?"),
+        DeviceAction::PowerWatts(watts) => format!("Limit {worker} to {watts} W?"),
+        DeviceAction::PowerMode(mode) => {
+            format!("Switch {worker} to the {} power mode?", mode.name())
+        }
+        other => format!("{} {worker}?", other.label()),
+    }
+}
+
+/// #### PR #42: the fan speed typed on the fan page, within what the device
+/// accepts.
+fn fan_choice(input: &str, range: Option<FanRange>) -> Result<DeviceAction, String> {
+    let range = range.ok_or_else(|| "This device offers no fan setting.".to_owned())?;
+    match input.parse::<u8>() {
+        Ok(percent) if (range.min..=range.max).contains(&percent) => {
+            Ok(DeviceAction::FanPercent(percent))
+        }
+        _ => Err(format!(
+            "Type a fan speed from {}% to {}%, or a for automatic.",
+            range.min, range.max
+        )),
+    }
+}
+
+/// #### PR #42: the power limit typed on the power page.
+fn watts_choice(input: &str) -> Result<DeviceAction, String> {
+    match input.parse::<u32>() {
+        Ok(watts) if (1..=MAX_WATTS).contains(&watts) => Ok(DeviceAction::PowerWatts(watts)),
+        _ => Err(format!("Type a power limit from 1 to {MAX_WATTS} watts.")),
+    }
+}
+
 fn outcome(action: DeviceAction, result: Result<String, String>) -> String {
     match result {
         Ok(message) => format!("{}: {}", action.label(), plain(&message)),
@@ -835,6 +996,7 @@ mod tests {
             firmware: Some("AvalonMiner Stock".into()),
             model: Some(model.into()),
             actions: vec![DeviceAction::Restart, DeviceAction::Pause],
+            ..DeviceControls::default()
         };
         let open = |seconds: u64, found: DeviceControls| {
             let now = left + Duration::from_secs(seconds);
@@ -876,6 +1038,92 @@ mod tests {
         online.model = Some("Avalonminer AvalonNano3s".into());
         *online.controls.lock().unwrap() = Some(identified("Bitaxe Gamma"));
         assert_eq!(online.actions().len(), 2);
+    }
+
+    // #### PR #42
+    // What: the fan and power pages: a choice, a value within what the
+    // device accepts, and a confirmation before anything is sent.
+    // Look here if: handle_key, fan_choice, watts_choice or question changes.
+    #[test]
+    fn fan_and_power_need_a_value_and_a_confirmation() {
+        let fleet = Arc::new(Fleet::new());
+        let mut panel = DevicePanel::new(
+            "rig1 #1".into(),
+            true,
+            String::new(),
+            Ok("203.0.113.9".parse().unwrap()),
+        );
+        let found = |power| DeviceControls {
+            firmware: Some("AvalonMiner Stock".into()),
+            actions: vec![DeviceAction::Restart],
+            fan: Some(FanRange { min: 15, max: 100 }),
+            power: Some(power),
+            ..DeviceControls::default()
+        };
+        *panel.controls.lock().unwrap() = Some(found(PowerSetting::Modes));
+        let text = screen(&panel);
+        assert!(text.contains("2  Fan speed…"), "{text}");
+        assert!(text.contains("3  Power mode…"), "{text}");
+        let press = |panel: &mut DevicePanel, keys: &str| {
+            for c in keys.chars() {
+                panel.handle_key(key(KeyCode::Char(c)), &fleet);
+            }
+        };
+        // A speed the device does not take is refused, then a good one is
+        // only asked about.
+        press(&mut panel, "2");
+        assert_eq!(panel.page, Page::Fan(String::new()));
+        assert!(screen(&panel).contains("from 15% to 100%"));
+        press(&mut panel, "10");
+        panel.handle_key(key(KeyCode::Enter), &fleet);
+        assert_eq!(panel.page, Page::Fan("10".into()));
+        assert!(screen(&panel).contains("Type a fan speed from 15% to 100%"));
+        panel.handle_key(key(KeyCode::Backspace), &fleet);
+        panel.handle_key(key(KeyCode::Backspace), &fleet);
+        press(&mut panel, "60");
+        panel.handle_key(key(KeyCode::Enter), &fleet);
+        assert_eq!(panel.page, Page::Confirm(DeviceAction::FanPercent(60)));
+        assert!(screen(&panel).contains("Set the fan of rig1 #1 to 60%?"));
+        press(&mut panel, "n");
+        assert_eq!(panel.page, Page::Menu);
+        // Automatic is one key.
+        press(&mut panel, "2a");
+        assert_eq!(panel.page, Page::Confirm(DeviceAction::FanAuto));
+        assert!(screen(&panel).contains("Set the fan of rig1 #1 to automatic?"));
+        assert!(!panel.handle_key(key(KeyCode::Esc), &fleet));
+        // Modes by number.
+        press(&mut panel, "3");
+        let modes = screen(&panel);
+        for mode in ["1  Low", "2  Normal", "3  High"] {
+            assert!(modes.contains(mode), "{mode}: {modes}");
+        }
+        press(&mut panel, "3");
+        assert_eq!(
+            panel.page,
+            Page::Confirm(DeviceAction::PowerMode(PowerMode::High))
+        );
+        assert!(screen(&panel).contains("Switch rig1 #1 to the High power mode?"));
+        press(&mut panel, "x");
+        // Watts are typed.
+        *panel.controls.lock().unwrap() = Some(found(PowerSetting::Watts));
+        assert!(screen(&panel).contains("3  Power limit…"));
+        press(&mut panel, "3");
+        panel.handle_key(key(KeyCode::Enter), &fleet);
+        assert!(screen(&panel).contains("Type a power limit from 1 to 100000 watts."));
+        press(&mut panel, "3200");
+        panel.handle_key(key(KeyCode::Enter), &fleet);
+        assert_eq!(panel.page, Page::Confirm(DeviceAction::PowerWatts(3200)));
+        assert!(screen(&panel).contains("Limit rig1 #1 to 3200 W?"));
+        // Esc on a page goes back; nothing was ever sent.
+        press(&mut panel, "n3");
+        assert!(!panel.handle_key(key(KeyCode::Esc), &fleet));
+        assert_eq!(panel.page, Page::Menu);
+        assert!(!panel
+            .reply
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|reply| reply.starts_with("Sending")));
     }
 
     // #### PR #42 (moved from command.rs, where it tested the controls page)
