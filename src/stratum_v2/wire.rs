@@ -5,9 +5,11 @@
 use super::{
     channel::{
         share_work, Channel, ChannelKind, Share, TokenWin, ValidatedShare, DEVICE_EXTRANONCE_SIZE,
+        VERSION_ROLLING_MASK,
     },
+    jd::{codec::parse_outputs, server::Declarator, CUSTOM_JOB_BIT, JD_ROLLABLE},
     telemetry::ShareEvent,
-    template::{meets_target, BchTemplate, Hash},
+    template::{meets_target, BchTemplate, CoinbaseParts, Hash},
 };
 use crate::config::MiningNetwork;
 use crate::donation::bch::BchPayout;
@@ -45,6 +47,12 @@ pub struct MiningSession {
     pub share_difficulty: Option<f64>,
     pub accepted: u64,
     pub rejected: u64,
+    /// #### PR #42: a public pool's Job Declaration rules, when it accepts
+    /// miners' own templates; this connection negotiated work selection;
+    /// the custom jobs it set so far.
+    declarator: Option<Arc<Declarator>>,
+    work_selection: bool,
+    custom_jobs: u32,
 }
 
 pub struct Responses {
@@ -54,6 +62,9 @@ pub struct Responses {
     /// not they are also blocks.
     pub token_wins: Vec<TokenWin>,
     pub share_event: Option<ShareEvent>,
+    /// #### PR #42: a SetCustomMiningJob's outcome, its error code when
+    /// refused.
+    pub custom_job: Option<Result<(), &'static str>>,
 }
 
 impl MiningSession {
@@ -84,7 +95,20 @@ impl MiningSession {
             share_difficulty: None,
             accepted: 0,
             rejected: 0,
+            declarator: None,
+            work_selection: false,
+            custom_jobs: 0,
         })
+    }
+
+    /// #### PR #42: a public pool that accepts miners' own templates.
+    pub fn set_declarator(&mut self, declarator: Option<Arc<Declarator>>) {
+        self.declarator = declarator;
+    }
+
+    /// #### PR #42: whether the connection's SetupConnection was accepted.
+    pub fn is_set_up(&self) -> bool {
+        self.setup_flags.is_some()
     }
 
     /// Test hook: adds a channel together with its device maximum target.
@@ -136,6 +160,27 @@ impl MiningSession {
             if !meets_target(&template.target, maximum) {
                 return Err("device maximum target would discard valid block work".into());
             }
+            // #### PR #42: custom-only channels
+            // What: a Job Declaration client's channel never gets the pool's
+            // jobs; a new parent (or bits) revokes its custom jobs, and its
+            // target follows the block target as a device's does.
+            // Why: the client mines its own templates; a job on an old parent
+            // can no longer make a block, so its shares are stale.
+            // Look here if: a JD client gets pool jobs, or its shares on the
+            // previous parent are still accepted.
+            if channel.custom_only {
+                if !immediate {
+                    channel.revoke();
+                }
+                if channel.settle(&template.target, None, maximum) {
+                    frames.push(mining(Mining::SetTarget(SetTarget {
+                        channel_id: channel.id,
+                        maximum_target: (&channel.target).into(),
+                    }))?);
+                }
+                continue;
+            }
+            // #### end PR #42 ####
             // #### PR #38
             // Follow an easier block target down and, on the next normal
             // template, back up to the share difficulty. SetTarget precedes
@@ -170,6 +215,15 @@ impl MiningSession {
             let Some(target) = channel.retarget(maximum) else {
                 continue;
             };
+            // #### PR #42: a custom-only channel's client re-issues its own
+            // jobs; it gets the target alone.
+            if channel.custom_only {
+                frames.push(mining(Mining::SetTarget(SetTarget {
+                    channel_id: channel.id,
+                    maximum_target: (&target).into(),
+                }))?);
+                continue;
+            }
             let (generation, template, payout) = {
                 let job = channel.job().ok_or("channel has no job")?;
                 (job.generation, job.template.clone(), job.payout)
@@ -200,18 +254,30 @@ impl MiningSession {
             }
             let setup: SetupConnection =
                 binary_sv2::from_bytes(frame.payload()).map_err(|_| "malformed setup message")?;
+            // 0: header-only channels; 2: version rolling.
+            // #### PR #42: work selection accepted with a Declarator
+            // What: bit 1 (REQUIRES_WORK_SELECTION) is accepted when this
+            // public pool accepts miners' own templates; such a connection's
+            // extended channels are custom-only.
+            // Why: a Job Declaration client sets its own jobs on its mining
+            // connection; without Job Declaration the bit stays refused.
+            // Look here if: a JD client's mining setup is refused, or a device
+            // gets custom-only channels.
+            let allowed = if self.declarator.is_some() {
+                0b111
+            } else {
+                0b101
+            };
             let error = if setup.protocol != Protocol::MiningProtocol {
                 Some((0, "unsupported-protocol"))
             } else if setup.min_version > 2 || setup.max_version < 2 {
                 Some((0, "protocol-version-mismatch"))
-            }
-            // 0: header-only channels; 2: version rolling. Work selection is
-            // not offered until BCH Job Declaration is implemented.
-            else if setup.flags & !0b101 != 0 {
-                Some((setup.flags & !0b101, "unsupported-feature-flags"))
+            } else if setup.flags & !allowed != 0 {
+                Some((setup.flags & !allowed, "unsupported-feature-flags"))
             } else {
                 None
             };
+            self.work_selection = error.is_none() && setup.flags & 0b010 != 0;
             if let Some((flags, code)) = error {
                 frames.push(encoded(
                     SetupConnectionError {
@@ -239,6 +305,7 @@ impl MiningSession {
                 blocks,
                 token_wins,
                 share_event,
+                custom_job: None,
             });
         }
         let flags = self
@@ -250,6 +317,7 @@ impl MiningSession {
         if msg.channel_bit() != header.channel_msg() {
             return Err("incorrect SV2 channel flag".into());
         }
+        let mut custom_job = None;
         match msg {
             Mining::OpenStandardMiningChannel(request) => {
                 let maximum = request
@@ -364,6 +432,39 @@ impl MiningSession {
                 self.channels.remove(&request.channel_id);
                 self.maximum_targets.remove(&request.channel_id);
             }
+            // #### PR #42: SetCustomMiningJob (Coinbase-only)
+            // What: a Job Declaration client sets its own job on its
+            // custom-only channel with a token the pool allocated; the pool
+            // checks the parent, bits, version, start time, prefix and
+            // coinbase version against its own template and the coinbase's
+            // outputs against the token's payout rule, then answers with a
+            // job id carrying 0x8000_0000.
+            // Why: Coinbase-only Job Declaration lets a miner mine its own
+            // node's templates at this pool while the coinbase still pays the
+            // pool's fee and the Pickaxe donation.
+            // Look here if: a JD client's custom jobs are refused, or its
+            // shares are credited to the wrong job.
+            Mining::SetCustomMiningJob(request) => {
+                let (channel_id, request_id) = (request.channel_id, request.request_id);
+                let outcome = self.custom_job(&request, now);
+                custom_job = Some(outcome.map(|_| ()));
+                frames.push(match outcome {
+                    Ok(job_id) => mining(Mining::SetCustomMiningJobSuccess(
+                        SetCustomMiningJobSuccess {
+                            channel_id,
+                            request_id,
+                            job_id,
+                        },
+                    ))?,
+                    Err(code) => {
+                        mining(Mining::SetCustomMiningJobError(SetCustomMiningJobError {
+                            channel_id,
+                            request_id,
+                            error_code: code.try_into().map_err(|_| "error code too long")?,
+                        }))?
+                    }
+                });
+            }
             _ => return Err("unsupported downstream mining message".into()),
         }
         Ok(Responses {
@@ -371,7 +472,101 @@ impl MiningSession {
             blocks,
             token_wins,
             share_event,
+            custom_job,
         })
+    }
+
+    /// #### PR #42: the checks of a Coinbase-only custom job, in the order of
+    /// their error codes, and the job id of one that passes.
+    fn custom_job(&mut self, request: &SetCustomMiningJob, now: u32) -> Result<u32, &'static str> {
+        let declarator = self
+            .declarator
+            .clone()
+            .filter(|_| self.work_selection)
+            .ok_or("jd-not-supported")?;
+        let payout = self
+            .channels
+            .get(&request.channel_id)
+            .filter(|channel| channel.custom_only)
+            .ok_or("invalid-channel-id")?
+            .payout()
+            .to_owned();
+        let context = self
+            .current
+            .as_ref()
+            .map(|(_, _, template)| template.clone())
+            .ok_or("stale-chain-tip")?;
+        if request.prev_hash.as_ref() != context.previous_hash.as_slice() {
+            return Err("stale-chain-tip");
+        }
+        if request.nbits != context.bits {
+            return Err("invalid-nbits");
+        }
+        if (request.version ^ context.version) & !VERSION_ROLLING_MASK != 0 {
+            return Err("invalid-version");
+        }
+        if request.min_ntime < context.min_time || request.min_ntime > now.saturating_add(600) {
+            return Err("invalid-min-ntime");
+        }
+        let prefix = request.coinbase_prefix.as_ref();
+        // The script: the client's prefix, this channel's 16-byte prefix and
+        // the client's 16 rollable bytes, at most 100 bytes.
+        let script = prefix.len() + 16 + JD_ROLLABLE;
+        if !prefix.starts_with(&context.height_push()) || script > 100 {
+            return Err("invalid-coinbase-prefix");
+        }
+        if !matches!(request.coinbase_tx_version, 1 | 2) {
+            return Err("invalid-coinbase-tx-version");
+        }
+        let outputs = request.coinbase_tx_outputs.as_ref();
+        let mut head = request.coinbase_tx_version.to_le_bytes().to_vec();
+        head.push(1);
+        head.extend_from_slice(&[0; 32]);
+        head.extend_from_slice(&u32::MAX.to_le_bytes());
+        head.push(script as u8);
+        head.extend_from_slice(prefix);
+        let mut suffix = request.coinbase_tx_input_n_sequence.to_le_bytes().to_vec();
+        suffix.extend_from_slice(outputs);
+        suffix.extend_from_slice(&request.coinbase_tx_locktime.to_le_bytes());
+        if head.len() + 16 + JD_ROLLABLE + suffix.len() < 65 {
+            return Err("invalid-coinbase-tx");
+        }
+        let merkle_path = request
+            .merkle_path
+            .iter()
+            .map(|hash| Hash::try_from(hash.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "invalid-merkle-path")?;
+        let rule = declarator.redeem(request.token.as_ref(), &payout, std::time::Instant::now())?;
+        let outputs = parse_outputs(outputs).map_err(|_| "invalid-coinbase-tx-outputs")?;
+        rule.check(&outputs)
+            .map_err(|_| "invalid-coinbase-tx-outputs")?;
+        let count = self
+            .custom_jobs
+            .checked_add(1)
+            .filter(|count| *count < CUSTOM_JOB_BIT);
+        self.custom_jobs = count.ok_or("invalid-coinbase-tx")?;
+        let id = CUSTOM_JOB_BIT | self.custom_jobs;
+        let template = Arc::new(BchTemplate::custom(
+            &context,
+            request.version,
+            request.min_ntime,
+            merkle_path.clone(),
+        ));
+        self.channels
+            .get_mut(&request.channel_id)
+            .ok_or("invalid-channel-id")?
+            .install_custom(
+                id,
+                template,
+                CoinbaseParts {
+                    prefix: head,
+                    suffix,
+                    merkle_path,
+                },
+            )
+            .map_err(|_| "invalid-coinbase-tx")?;
+        Ok(id)
     }
 
     /// #### PR #40
@@ -391,9 +586,20 @@ impl MiningSession {
         extra: u16,
         identity: &str,
     ) -> Result<Vec<SerializedFrame>, String> {
-        let error = if !rate.is_finite() || rate < 0.0 {
+        // #### PR #42: a work-selection connection's extended channels are
+        // custom-only, with 16 rollable bytes; its standard channels are
+        // refused, as the spec names.
+        let custom_only = self.work_selection && kind == ChannelKind::Extended;
+        let rollable = if custom_only {
+            JD_ROLLABLE
+        } else {
+            DEVICE_EXTRANONCE_SIZE
+        };
+        let error = if self.work_selection && kind == ChannelKind::Standard {
+            Some("standard-channels-not-supported-for-custom-work")
+        } else if !rate.is_finite() || rate < 0.0 {
             Some("invalid-nominal-hashrate")
-        } else if extra as usize > DEVICE_EXTRANONCE_SIZE {
+        } else if extra as usize > rollable {
             Some("unsupported-min-extranonce-size")
         } else if maximum == [0; 32] {
             Some("max-target-out-of-range")
@@ -435,6 +641,24 @@ impl MiningSession {
         )?;
         if let Some(public) = &self.public {
             channel.set_operator(Some(&public.address))?;
+        }
+        if custom_only {
+            channel.custom_only = true;
+            let (_, _, template) = self.current.as_ref().unwrap();
+            channel.settle(&template.target, None, &maximum);
+            let frame = mining(Mining::OpenExtendedMiningChannelSuccess(
+                OpenExtendedMiningChannelSuccess {
+                    request_id: request,
+                    channel_id: channel.id,
+                    target: (&channel.target).into(),
+                    extranonce_size: JD_ROLLABLE as u16,
+                    extranonce_prefix: channel.extranonce_prefix.as_slice().try_into().unwrap(),
+                    group_channel_id: 0,
+                },
+            ))?;
+            self.channels.insert(channel.id, channel);
+            self.maximum_targets.insert(self.next_channel, maximum);
+            return Ok(vec![frame]);
         }
         let (id, generation, template) = self.current.as_ref().unwrap();
         // #### PR #42: a new channel starts with the token floor too (see
@@ -1135,5 +1359,305 @@ mod tests {
         assert_eq!(set.maximum_target.as_ref(), floor);
         let channel = server.channels.values().next().unwrap();
         assert_eq!(channel.job().unwrap().target, floor);
+    }
+
+    /// #### PR #42: a public pool's session that accepts Job Declaration,
+    /// set up with `flags`, its declarator, and the miner's channel when
+    /// `open` (its id and extranonce prefix).
+    fn jd_session(flags: u32) -> (MiningSession, Arc<Declarator>, u32, Vec<u8>) {
+        let declarator = Arc::new(super::super::jd::server::tests::declarator());
+        let mut server = session();
+        server.set_public(Some(declarator.public.clone()));
+        server.set_declarator(Some(declarator.clone()));
+        let reply = server.receive(setup(flags), NOW).unwrap();
+        assert_eq!(reply.frames[0].header().msg_type(), 1, "setup accepted");
+        let mut frames = server
+            .receive(
+                mining(Mining::OpenExtendedMiningChannel(
+                    OpenExtendedMiningChannel {
+                        request_id: 2,
+                        user_identity: payout().as_str().try_into().unwrap(),
+                        nominal_hash_rate: 1e12,
+                        max_target: (&[255; 32]).into(),
+                        min_extranonce_size: if flags & 0b010 != 0 {
+                            JD_ROLLABLE as u16
+                        } else {
+                            DEVICE_EXTRANONCE_SIZE as u16
+                        },
+                    },
+                ))
+                .unwrap(),
+                NOW,
+            )
+            .unwrap()
+            .frames;
+        let success: OpenExtendedMiningChannelSuccess =
+            binary_sv2::from_bytes(frames[0].payload()).unwrap();
+        let (channel, prefix) = (
+            success.channel_id,
+            success.extranonce_prefix.as_ref().to_vec(),
+        );
+        if flags & 0b010 != 0 {
+            assert_eq!(success.extranonce_size, JD_ROLLABLE as u16);
+            assert_eq!(
+                frames.len(),
+                1,
+                "no job of the pool's on a custom-only channel"
+            );
+        }
+        (server, declarator, channel, prefix)
+    }
+
+    /// The coinbase fields of a custom job, as a JD client sets them.
+    struct CustomJob {
+        token: Vec<u8>,
+        version: u32,
+        prev: Hash,
+        min_ntime: u32,
+        bits: u32,
+        tx_version: u32,
+        prefix: Vec<u8>,
+        outputs: Vec<u8>,
+    }
+
+    impl CustomJob {
+        /// A job paying the pool's rule exactly, with a fresh token.
+        fn valid(declarator: &Declarator) -> Self {
+            let rule = super::super::jd::policy::PayoutRule::public_pool(
+                MiningNetwork::Chipnet,
+                &payout(),
+                &declarator.public,
+                Default::default(),
+            )
+            .unwrap();
+            let (allocated, rates) = rule.allocated_outputs();
+            let token = declarator
+                .book
+                .lock()
+                .unwrap()
+                .allocate(0, payout(), rates, std::time::Instant::now())
+                .unwrap()
+                .encode()
+                .to_vec();
+            let amounts = [304_734_375, 3_078_125, 4_687_500];
+            let outputs: Vec<(u64, Vec<u8>)> = allocated
+                .into_iter()
+                .zip(amounts)
+                .map(|((_, script), amount)| (amount, script))
+                .collect();
+            let mut prefix = vec![0x03, 0x15, 0xf9, 0x04];
+            prefix.extend(b"jd");
+            Self {
+                token,
+                version: 0x2000_0000,
+                prev: [0xab; 32],
+                min_ntime: NOW,
+                bits: 0x207f_ffff,
+                tx_version: 2,
+                prefix,
+                outputs: super::super::jd::codec::serialize_outputs(&outputs),
+            }
+        }
+
+        fn frame(&self, channel: u32) -> SerializedFrame {
+            mining(Mining::SetCustomMiningJob(SetCustomMiningJob {
+                channel_id: channel,
+                request_id: 4,
+                token: self.token.as_slice().try_into().unwrap(),
+                version: self.version,
+                prev_hash: (&self.prev).into(),
+                min_ntime: self.min_ntime,
+                nbits: self.bits,
+                coinbase_tx_version: self.tx_version,
+                coinbase_prefix: self.prefix.as_slice().try_into().unwrap(),
+                coinbase_tx_input_n_sequence: u32::MAX,
+                coinbase_tx_outputs: self.outputs.as_slice().try_into().unwrap(),
+                coinbase_tx_locktime: 0,
+                merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+            }))
+            .unwrap()
+        }
+
+        /// The coinbase with this channel's prefix and `extranonce`.
+        fn coinbase(&self, channel_prefix: &[u8], extranonce: &[u8]) -> Vec<u8> {
+            let mut bytes = self.tx_version.to_le_bytes().to_vec();
+            bytes.push(1);
+            bytes.extend([0; 32]);
+            bytes.extend(u32::MAX.to_le_bytes());
+            bytes.push((self.prefix.len() + channel_prefix.len() + extranonce.len()) as u8);
+            bytes.extend(&self.prefix);
+            bytes.extend(channel_prefix);
+            bytes.extend(extranonce);
+            bytes.extend(u32::MAX.to_le_bytes());
+            bytes.extend(&self.outputs);
+            bytes.extend(0u32.to_le_bytes());
+            bytes
+        }
+    }
+
+    /// The reply to `job` on `channel`: its job id, or its error code.
+    fn set_custom(
+        server: &mut MiningSession,
+        channel: u32,
+        job: &CustomJob,
+    ) -> Result<u32, String> {
+        let mut responses = server.receive(job.frame(channel), NOW).unwrap();
+        let mut frame = responses.frames.remove(0);
+        match frame.header().msg_type() {
+            MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_SUCCESS => {
+                let success: SetCustomMiningJobSuccess =
+                    binary_sv2::from_bytes(frame.payload()).unwrap();
+                assert_eq!(responses.custom_job, Some(Ok(())));
+                Ok(success.job_id)
+            }
+            MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR => {
+                let error: SetCustomMiningJobError =
+                    binary_sv2::from_bytes(frame.payload()).unwrap();
+                let code = String::from_utf8(error.error_code.as_ref().to_vec()).unwrap();
+                assert!(matches!(responses.custom_job, Some(Err(refused)) if refused == code));
+                Err(code)
+            }
+            other => panic!("unexpected reply {other:#x}"),
+        }
+    }
+
+    // #### PR #42
+    // What: every Coinbase-only rule has its own error code, one case each,
+    // and a job that meets them all gets id 0x8000_0001, a second
+    // 0x8000_0002; a token works once and only for its identity.
+    // Look here if: MiningSession::custom_job changes.
+    #[test]
+    fn set_custom_mining_job_checks_every_coinbase_only_rule() {
+        let (mut plain, declarator, channel, _) = jd_session(0b100);
+        assert_eq!(
+            set_custom(&mut plain, channel, &CustomJob::valid(&declarator)),
+            Err("jd-not-supported".into())
+        );
+        let (mut server, declarator, channel, _) = jd_session(0b110);
+        type Change = Box<dyn Fn(&mut CustomJob)>;
+        let cases: Vec<(&str, Change)> = vec![
+            ("stale-chain-tip", Box::new(|job| job.prev = [0xcd; 32])),
+            ("invalid-nbits", Box::new(|job| job.bits = 0x207f_fffe)),
+            ("invalid-version", Box::new(|job| job.version ^= 1)),
+            (
+                "invalid-min-ntime",
+                Box::new(|job| job.min_ntime = 1_699_999_999),
+            ),
+            (
+                "invalid-coinbase-prefix",
+                Box::new(|job| job.prefix[1] ^= 1),
+            ),
+            (
+                "invalid-coinbase-prefix",
+                Box::new(|job| job.prefix.resize(69, 0)),
+            ),
+            (
+                "invalid-coinbase-tx-version",
+                Box::new(|job| job.tx_version = 3),
+            ),
+            (
+                "invalid-mining-job-token",
+                Box::new(|job| job.token[25] ^= 1),
+            ),
+            (
+                "invalid-coinbase-tx-outputs",
+                Box::new(|job| {
+                    let mut outputs = super::super::jd::codec::parse_outputs(&job.outputs).unwrap();
+                    outputs[1].0 -= 1;
+                    outputs[0].0 += 1;
+                    job.outputs = super::super::jd::codec::serialize_outputs(&outputs);
+                }),
+            ),
+        ];
+        for (code, change) in cases {
+            let mut job = CustomJob::valid(&declarator);
+            change(&mut job);
+            assert_eq!(
+                set_custom(&mut server, channel, &job),
+                Err(code.into()),
+                "{code}"
+            );
+        }
+        assert_eq!(
+            set_custom(&mut server, 99, &CustomJob::valid(&declarator)),
+            Err("invalid-channel-id".into())
+        );
+        let job = CustomJob::valid(&declarator);
+        assert_eq!(set_custom(&mut server, channel, &job), Ok(0x8000_0001));
+        assert_eq!(
+            set_custom(&mut server, channel, &job),
+            Err("invalid-mining-job-token".into()),
+            "a token works once"
+        );
+        assert_eq!(
+            set_custom(&mut server, channel, &CustomJob::valid(&declarator)),
+            Ok(0x8000_0002)
+        );
+    }
+
+    // #### PR #42
+    // What: a work-selection connection's extended channel is custom-only
+    // with 16 rollable bytes and no job of the pool's; its standard channel
+    // is refused; a share on a custom job rebuilds the client's coinbase,
+    // and a block share comes back on a header-only template (the client's
+    // node submits it); a new parent revokes the custom job.
+    // Look here if: custom-only channels or Channel::install_custom change.
+    #[test]
+    fn work_selection_channels_get_16_rollable_bytes_and_mine_custom_jobs() {
+        let (mut server, declarator, channel, prefix) = jd_session(0b110);
+        let mut refused = server.receive(open(), NOW).unwrap().frames;
+        let error: OpenMiningChannelError = binary_sv2::from_bytes(refused[0].payload()).unwrap();
+        assert_eq!(
+            error.error_code.as_ref(),
+            b"standard-channels-not-supported-for-custom-work"
+        );
+        let job = CustomJob::valid(&declarator);
+        let id = set_custom(&mut server, channel, &job).unwrap();
+        let extranonce = [0x42u8; JD_ROLLABLE];
+        let coinbase = job.coinbase(&prefix, &extranonce);
+        let mut header = [0; 80];
+        header[..4].copy_from_slice(&job.version.to_le_bytes());
+        header[4..36].copy_from_slice(&job.prev);
+        header[36..68].copy_from_slice(&double_sha256(&coinbase));
+        header[68..72].copy_from_slice(&NOW.to_le_bytes());
+        header[72..76].copy_from_slice(&job.bits.to_le_bytes());
+        let nonce = (0..10_000u32)
+            .find(|nonce| {
+                header[76..].copy_from_slice(&nonce.to_le_bytes());
+                meets_target(&double_sha256(&header), &compact_target(job.bits).unwrap())
+            })
+            .unwrap();
+        let share = |extranonce: &[u8], sequence| {
+            mining(Mining::SubmitSharesExtended(SubmitSharesExtended {
+                channel_id: channel,
+                sequence_number: sequence,
+                job_id: id,
+                nonce,
+                ntime: NOW,
+                version: job.version,
+                extranonce: extranonce.try_into().unwrap(),
+            }))
+            .unwrap()
+        };
+        let short = server.receive(share(&extranonce[..8], 1), NOW).unwrap();
+        assert_eq!(
+            short.frames[0].header().msg_type(),
+            MESSAGE_TYPE_SUBMIT_SHARES_ERROR
+        );
+        let responses = server.receive(share(&extranonce, 2), NOW).unwrap();
+        assert_eq!(responses.blocks.len(), 1);
+        let block = &responses.blocks[0];
+        assert!(block.template.is_header_only());
+        assert_eq!(block.coinbase.bytes, coinbase);
+        assert!(block.template.block(&block.coinbase, block.header).is_err());
+        assert!(block.token_wins.is_empty());
+        let mut next = rpc_template();
+        next["previousblockhash"] = serde_json::json!("cd".repeat(32));
+        server
+            .set_job(10, 4, Arc::new(BchTemplate::from_rpc(&next).unwrap()))
+            .unwrap();
+        let mut stale = server.receive(share(&extranonce, 3), NOW).unwrap();
+        let error: SubmitSharesError = binary_sv2::from_bytes(stale.frames[0].payload()).unwrap();
+        assert_eq!(error.error_code.as_ref(), b"stale-share");
     }
 }

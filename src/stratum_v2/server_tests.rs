@@ -257,19 +257,31 @@ impl Running {
         public: Option<super::payout::PublicPool>,
         tokens: Option<Arc<super::merge::hub::TokenHub>>,
     ) -> Self {
-        Self::start_config(nodes, state_directory, public, tokens, None)
+        Self::start_config(nodes, state_directory, public, tokens, None, false)
+    }
+
+    /// #### PR #42: a public pool that accepts miners' own templates.
+    pub(super) fn jd_pool(public: super::payout::PublicPool) -> Self {
+        Self::start_config(
+            vec![pool_node()],
+            Arc::new(TestDirectory::new()),
+            Some(public),
+            None,
+            None,
+            true,
+        )
     }
 
     /// #### PR #42: a server that serves templates on a second listener,
     /// with its relay journal in `state_directory`.
     pub(super) fn templates(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
-        Self::start_config(vec![node], state_directory, None, None, Some(true))
+        Self::start_config(vec![node], state_directory, None, None, Some(true), false)
     }
 
     /// #### PR #42: a server whose relay journal is configured but which
     /// serves no templates.
     pub(super) fn relay_only(node: Arc<Mutex<Node>>, state_directory: Arc<TestDirectory>) -> Self {
-        Self::start_config(vec![node], state_directory, None, None, Some(false))
+        Self::start_config(vec![node], state_directory, None, None, Some(false), false)
     }
 
     /// #### PR #42: where a test server keeps its relay journal.
@@ -285,6 +297,7 @@ impl Running {
         public: Option<super::payout::PublicPool>,
         tokens: Option<Arc<super::merge::hub::TokenHub>>,
         templates: Option<bool>,
+        job_declaration: bool,
     ) -> Self {
         let node = nodes[0].clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -296,13 +309,22 @@ impl Running {
             .as_ref()
             .map(|listener| listener.local_addr().unwrap());
         let relay_journal_path = templates.map(|_| state_directory.0.join("relay-blocks.json"));
+        let donation = Arc::new(std::sync::RwLock::new(Default::default()));
+        let declarator = public.clone().filter(|_| job_declaration).map(|public| {
+            Arc::new(super::jd::server::Declarator::new(
+                super::jd::AcceptJd::CoinbaseOnly,
+                MiningNetwork::Chipnet,
+                public,
+                donation.clone(),
+            ))
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(ServerStats::default()));
         let secret = [17; 32];
         let authority = server::authority_public(&secret).unwrap();
         let config = ServerConfig {
             public,
-            donation: Arc::new(std::sync::RwLock::new(Default::default())),
+            donation,
             allocation_phase: Some(300_000_000_000),
             network: MiningNetwork::Chipnet,
             payout: payout(),
@@ -313,6 +335,7 @@ impl Running {
             pool_tag: Vec::new(),
             tokens,
             relay_journal_path,
+            declarator,
         };
         let thread = {
             let stop = stop.clone();
@@ -1666,4 +1689,255 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
     }
     assert_eq!(stats.lock().unwrap().sv1_connection_errors, 1);
     drop(device);
+}
+
+// #### PR #42
+// What: a scripted Job Declaration client on loopback opens a JD session and
+// a mining session on the pool's one SV2 port and key, allocates a token,
+// sets a custom job paying [miner 304,734,375, fee 3,078,125, donation
+// 4,687,500] and mines it: the share is accepted, the block is listed as
+// submitted by the miner's node (the pool's node gets nothing), and the JD
+// session is no device on the workers page.
+// Look here if: serve_declarator, the SetCustomMiningJob arm or custom
+// blocks change.
+#[test]
+fn a_scripted_jd_client_sets_a_custom_job_and_mines_it() {
+    use stratum_core::job_declaration_sv2::{
+        AllocateMiningJobToken, AllocateMiningJobTokenSuccess,
+        MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN,
+    };
+    let fee_address = address(0x34);
+    let server = Running::jd_pool(super::payout::PublicPool {
+        fee: Some(crate::donation::bch::PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: crate::donation::bch::FeeMode::Work,
+        }),
+        address: fee_address,
+    });
+    let miner = payout();
+    let setup = |protocol, flags| {
+        encoded(
+            SetupConnection {
+                protocol,
+                min_version: 2,
+                max_version: 2,
+                flags,
+                endpoint_host: "localhost".try_into().unwrap(),
+                endpoint_port: server.address.port(),
+                vendor: "scripted JD client".try_into().unwrap(),
+                hardware_version: "".try_into().unwrap(),
+                firmware: "".try_into().unwrap(),
+                device_id: "".try_into().unwrap(),
+            },
+            0,
+            false,
+        )
+        .unwrap()
+    };
+    let connect = || {
+        Session::initiate(
+            TcpStream::connect(server.address).unwrap(),
+            server.authority,
+        )
+        .unwrap()
+        .split()
+    };
+    let (mut jd, mut jd_replies) = connect();
+    jd.send(setup(Protocol::JobDeclarationProtocol, 0)).unwrap();
+    let reply = jd_replies.receive(Duration::from_secs(3)).unwrap().unwrap();
+    assert_eq!(reply.header().msg_type(), 1);
+    jd.send(
+        encoded(
+            AllocateMiningJobToken {
+                user_identifier: miner.as_str().try_into().unwrap(),
+                request_id: 1,
+            },
+            MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN,
+            false,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut reply = jd_replies.receive(Duration::from_secs(3)).unwrap().unwrap();
+    let allocated: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(reply.payload()).unwrap();
+    let token = allocated.mining_job_token.as_ref().to_vec();
+    let scripts: Vec<Vec<u8>> =
+        super::jd::codec::parse_outputs(allocated.coinbase_outputs.as_ref())
+            .unwrap()
+            .into_iter()
+            .map(|(_, script)| script)
+            .collect();
+    let outputs = super::jd::codec::serialize_outputs(
+        &[304_734_375, 3_078_125, 4_687_500]
+            .into_iter()
+            .zip(scripts.clone())
+            .collect::<Vec<_>>(),
+    );
+    let (mut mining_link, mut replies) = connect();
+    mining_link
+        .send(setup(Protocol::MiningProtocol, 0b110))
+        .unwrap();
+    let reply = replies.receive(Duration::from_secs(3)).unwrap().unwrap();
+    assert_eq!(reply.header().msg_type(), 1);
+    mining_link
+        .send(
+            mining(Mining::OpenExtendedMiningChannel(
+                OpenExtendedMiningChannel {
+                    request_id: 1,
+                    user_identity: miner.as_str().try_into().unwrap(),
+                    nominal_hash_rate: 1000.0,
+                    max_target: (&[255; 32]).into(),
+                    min_extranonce_size: 16,
+                },
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let mut reply = replies.receive(Duration::from_secs(3)).unwrap().unwrap();
+    let opened: OpenExtendedMiningChannelSuccess = binary_sv2::from_bytes(reply.payload()).unwrap();
+    assert_eq!(opened.extranonce_size, 16);
+    let (channel, channel_prefix) = (
+        opened.channel_id,
+        opened.extranonce_prefix.as_ref().to_vec(),
+    );
+    let time = now();
+    let mut prefix = vec![0x03, 0x15, 0xf9, 0x04];
+    prefix.extend(b"jd");
+    mining_link
+        .send(
+            mining(Mining::SetCustomMiningJob(SetCustomMiningJob {
+                channel_id: channel,
+                request_id: 2,
+                token: token.as_slice().try_into().unwrap(),
+                version: 0x2000_0000,
+                prev_hash: (&[0xab; 32]).into(),
+                min_ntime: time,
+                nbits: 0x207f_ffff,
+                coinbase_tx_version: 2,
+                coinbase_prefix: prefix.as_slice().try_into().unwrap(),
+                coinbase_tx_input_n_sequence: u32::MAX,
+                coinbase_tx_outputs: outputs.as_slice().try_into().unwrap(),
+                coinbase_tx_locktime: 0,
+                merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    // Any frame before the answer (a SetTarget) is skipped.
+    let job_id = loop {
+        let mut reply = replies.receive(Duration::from_secs(3)).unwrap().unwrap();
+        if reply.header().msg_type() == MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_SUCCESS {
+            let success: SetCustomMiningJobSuccess =
+                binary_sv2::from_bytes(reply.payload()).unwrap();
+            break success.job_id;
+        }
+        assert_ne!(
+            reply.header().msg_type(),
+            MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR,
+            "the custom job was refused"
+        );
+    };
+    assert_eq!(job_id, 0x8000_0001);
+    let extranonce = [0x42u8; 16];
+    let mut coinbase = 2u32.to_le_bytes().to_vec();
+    coinbase.push(1);
+    coinbase.extend([0; 32]);
+    coinbase.extend(u32::MAX.to_le_bytes());
+    coinbase.push((prefix.len() + 32) as u8);
+    coinbase.extend(&prefix);
+    coinbase.extend(&channel_prefix);
+    coinbase.extend(extranonce);
+    coinbase.extend(u32::MAX.to_le_bytes());
+    coinbase.extend(&outputs);
+    coinbase.extend(0u32.to_le_bytes());
+    let mut bytes = 0x2000_0000u32.to_le_bytes().to_vec();
+    bytes.extend([0xab; 32]);
+    bytes.extend(sha256d::Hash::hash(&coinbase).to_byte_array());
+    bytes.extend(time.to_le_bytes());
+    bytes.extend(0x207f_ffffu32.to_le_bytes());
+    bytes.extend(0u32.to_le_bytes());
+    let mut header: Header = consensus::deserialize(&bytes).unwrap();
+    let nonce = (0..10_000)
+        .find(|nonce| {
+            header.nonce = *nonce;
+            header.validate_pow(header.target()).is_ok()
+        })
+        .unwrap();
+    mining_link
+        .send(
+            mining(Mining::SubmitSharesExtended(SubmitSharesExtended {
+                channel_id: channel,
+                sequence_number: 1,
+                job_id,
+                nonce,
+                ntime: time,
+                version: 0x2000_0000,
+                extranonce: extranonce.as_slice().try_into().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let accepted = loop {
+        let reply = replies.receive(Duration::from_secs(3)).unwrap().unwrap();
+        let kind = reply.header().msg_type();
+        if kind == MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS || kind == MESSAGE_TYPE_SUBMIT_SHARES_ERROR {
+            break kind;
+        }
+    };
+    assert_eq!(accepted, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS);
+    server.wait(|stats| {
+        stats.jd_server.as_ref().is_some_and(|jd| {
+            jd.clients == 1 && jd.tokens == 1 && jd.custom_jobs == 1 && jd.blocks == 1
+        })
+    });
+    let stats = server.stats.lock().unwrap().clone();
+    let found = stats.recent_blocks.back().unwrap();
+    assert_eq!(found.result, Some("submitted by the miner's node"));
+    assert_eq!(found.hash, header.block_hash().to_string());
+    assert_eq!(stats.connections, 1, "the JD session is not a device");
+    assert_eq!(stats.device_stats.snapshots(Instant::now()).len(), 1);
+    assert_eq!(server.node.lock().unwrap().submissions, 0);
+    drop(jd);
+    drop(jd_replies);
+    server.wait(|stats| stats.jd_server.as_ref().is_some_and(|jd| jd.clients == 0));
+}
+
+// #### PR #42
+// What: a pool that does not accept Job Declaration answers a JD
+// SetupConnection with unsupported-protocol, as before.
+// Look here if: the JD dispatch in serve_device changes.
+#[test]
+fn jd_is_refused_when_the_pool_does_not_accept_it() {
+    let server = Running::new(false);
+    let (mut link, mut replies) = Session::initiate(
+        TcpStream::connect(server.address).unwrap(),
+        server.authority,
+    )
+    .unwrap()
+    .split();
+    link.send(
+        encoded(
+            SetupConnection {
+                protocol: Protocol::JobDeclarationProtocol,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                endpoint_host: "localhost".try_into().unwrap(),
+                endpoint_port: server.address.port(),
+                vendor: "scripted JD client".try_into().unwrap(),
+                hardware_version: "".try_into().unwrap(),
+                firmware: "".try_into().unwrap(),
+                device_id: "".try_into().unwrap(),
+            },
+            0,
+            false,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut reply = replies.receive(Duration::from_secs(3)).unwrap().unwrap();
+    assert_eq!(reply.header().msg_type(), 2);
+    let error: stratum_core::common_messages_sv2::SetupConnectionError =
+        binary_sv2::from_bytes(reply.payload()).unwrap();
+    assert_eq!(error.error_code.as_ref(), b"unsupported-protocol");
 }

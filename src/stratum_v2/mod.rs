@@ -13,6 +13,9 @@ pub mod command;
 pub mod device_api;
 #[cfg(feature = "stratum-v2")]
 pub mod fleet;
+// #### PR #42: Job Declaration: miners' own templates at a public pool.
+#[cfg(feature = "stratum-v2")]
+pub mod jd;
 #[cfg(feature = "stratum-v2")]
 pub mod journal;
 #[cfg(all(test, feature = "stratum-v2"))]

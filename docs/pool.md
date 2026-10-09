@@ -139,6 +139,18 @@ The dashboard header shows `Public pool, fee 2.00% from coinbase`. With SV2,
 miners see every coinbase output in the jobs they receive, so nobody can hide
 a fee; with SV1 they can decode the coinbase parts of each job.
 
+## Miners' own templates
+
+#### PR #42
+
+`--accept-job-declaration coinbase` lets miners mine their own node's
+templates at your pool (SV2 Job Declaration, Coinbase-only), on the pool's SV2
+port. Their coinbase must pay your fee and the Pickaxe donation in full,
+whatever your fee mode, because their jobs cannot rotate work; the pool checks
+every custom job's outputs before accepting it. Their nodes submit their
+blocks. Details, the error codes and the token format are in
+[job-declaration.md](job-declaration.md).
+
 ## Templates for other pools and P2Pool
 
 #### PR #42

@@ -130,6 +130,7 @@ pub fn run(
         start_difficulty,
         merge_test_token,
         tp_listen,
+        accept_job_declaration,
         ..
     } = action
     else {
@@ -169,6 +170,21 @@ pub fn run(
         Some(_) => return Err("--pool-tag must be 1 to 20 printable characters".into()),
     };
     let donation = Arc::new(RwLock::new(donation.unwrap_or(config.bch_donation)));
+    // #### PR #42: a public pool that accepts miners' own templates.
+    let declarator = match (accept_job_declaration, public.as_ref()) {
+        (Some(crate::cli::AcceptJobDeclaration::Coinbase), Some(public)) => {
+            Some(Arc::new(super::jd::server::Declarator::new(
+                super::jd::AcceptJd::CoinbaseOnly,
+                config.network,
+                public.clone(),
+                donation.clone(),
+            )))
+        }
+        (Some(_), None) => {
+            return Err("accepting Job Declaration needs a public pool (--public)".into())
+        }
+        (None, _) => None,
+    };
     // #### PR #40
     // At a pool the donation is the setting's share of mining time under the
     // donation address, on a second channel at the same pool.
@@ -273,6 +289,7 @@ pub fn run(
                 )
             })
         }),
+        job_declaration: declarator.is_some(),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
@@ -304,6 +321,7 @@ pub fn run(
                 donation: donation.clone(),
                 tokens: tokens.clone(),
                 relay_journal_path: Some(config_path.with_extension("sv2-relay-blocks.json")),
+                declarator: declarator.clone(),
                 #[cfg(test)]
                 allocation_phase: None,
             };
@@ -473,7 +491,7 @@ pub fn run(
                     )
                 } else {
                     format!(
-                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}\n{}{}",
+                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}\n{}{}{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
@@ -485,6 +503,7 @@ pub fn run(
                     setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", authority.as_deref().unwrap_or("—"))),
                     records_line(&snapshot),
                     templates_line(&snapshot),
+                    jd_line(&snapshot),
                     )
                 };
                 let online = devices.iter().filter(|device| device.connected).count();
@@ -852,6 +871,8 @@ struct Started {
     custom_user: bool,
     /// A public pool's fee, and whether it goes to the payout address.
     fee: Option<(crate::donation::bch::PoolFee, bool)>,
+    /// #### PR #42: the pool accepts miners' own templates.
+    job_declaration: bool,
 }
 
 /// #### PR #42
@@ -919,6 +940,12 @@ fn started_text(started: &Started) -> String {
                 "another address"
             }
         ));
+    }
+    if started.job_declaration {
+        text.push_str(
+            "Miners' own templates  Coinbase-only Job Declaration on the SV2 port; their \
+             coinbase pays your fee and the donation in full\n",
+        );
     }
     text
 }
@@ -1576,6 +1603,16 @@ fn status_json(
                 "seconds_ago": win.found.elapsed().as_secs(),
             })).collect::<Vec<_>>(),
         }),
+        // #### PR #42: the Job Declaration server's counts, with no identity,
+        // token or address.
+        "jd_server": snapshot.jd_server.as_ref().map(|jd| serde_json::json!({
+            "clients": jd.clients,
+            "tokens": jd.tokens,
+            "custom_jobs": jd.custom_jobs,
+            "refused": jd.refused,
+            "last_refusal": jd.last_refusal,
+            "blocks": jd.blocks,
+        })),
         // #### PR #42: the template server's counts, with no address.
         "template_server": snapshot.template_server.as_ref().map(|templates| serde_json::json!({
             "clients": templates.clients,
@@ -2000,6 +2037,26 @@ fn difficulty_target(difficulty: u64) -> Result<super::template::Hash, String> {
 /// #### PR #40
 /// The overview's records: the best share since start and the latest blocks
 /// found, newest first, as "#327035 rig1 accepted 2m ago".
+/// #### PR #42: the Job Declaration server's line on the overview, when the
+/// pool accepts miners' own templates.
+fn jd_line(stats: &ServerStats) -> String {
+    let Some(jd) = &stats.jd_server else {
+        return String::new();
+    };
+    format!(
+        "\nJob Declaration clients {} · {} tokens · {} custom jobs · {} refused{} · {} blocks \
+         (their nodes submit them)",
+        jd.clients,
+        jd.tokens,
+        jd.custom_jobs,
+        jd.refused,
+        jd.last_refusal
+            .map(|code| format!(" (last: {code})"))
+            .unwrap_or_default(),
+        jd.blocks,
+    )
+}
+
 /// #### PR #42: the template server's line on the overview, while it serves
 /// templates or holds relayed blocks.
 fn templates_line(stats: &ServerStats) -> String {
@@ -2227,6 +2284,23 @@ mod tests {
         assert_eq!(templates_line(&stats), "");
         let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
         assert!(status["template_server"].is_null());
+        assert!(status["jd_server"].is_null());
+        assert_eq!(jd_line(&stats), "");
+        stats.jd_server = Some(server::JdServerStats {
+            clients: 1,
+            tokens: 3,
+            custom_jobs: 2,
+            refused: 1,
+            last_refusal: Some("stale-chain-tip"),
+            blocks: 1,
+        });
+        assert!(jd_line(&stats).contains(
+            "Job Declaration clients 1 · 3 tokens · 2 custom jobs · 1 refused (last: \
+             stale-chain-tip) · 1 blocks"
+        ));
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(status["jd_server"]["custom_jobs"], 2);
+        assert_eq!(status["jd_server"]["last_refusal"], "stale-chain-tip");
         stats.template_server = Some(server::TemplateServerStats {
             clients: 2,
             sent: 341,
@@ -2893,6 +2967,7 @@ mod tests {
                             },
                             false,
                         )),
+                        job_declaration: true,
                     }),
                 )
             })
@@ -2918,6 +2993,7 @@ mod tests {
             "/MyPool/",
             "1.50% from",
             "to another address",
+            "Miners' own templates  Coinbase-only",
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
@@ -2930,6 +3006,7 @@ mod tests {
             pools: Some("pool.example:3336 → b1.example:3336".into()),
             custom_user: true,
             fee: None,
+            job_declaration: false,
         });
         assert!(joined.contains("pool.example:3336 → b1.example:3336 (in failover order)"));
         assert!(joined.contains("username: your own"));

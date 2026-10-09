@@ -30,6 +30,9 @@ pub struct BchTemplate {
     merkle_path: Arc<[Hash]>,
     /// #### PR #42: the merge-mined tokens of jobs built from this template.
     tokens: Option<Arc<TokenSet>>,
+    /// #### PR #42: a custom job's template (Job Declaration), which checks
+    /// headers but has no transactions to build a block with.
+    header_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -160,7 +163,42 @@ impl BchTemplate {
             merkle_path: coinbase_path(&transaction_hashes).into(),
             transactions,
             tokens: None,
+            header_only: false,
         })
+    }
+
+    /// #### PR #42
+    /// A Coinbase-only custom job's template: the pool's parent, bits,
+    /// target, height and limits, with the client's version, start time and
+    /// merkle path. The pool never sees the client's transactions, so it can
+    /// check headers and shares against it but never build its block.
+    pub fn custom(
+        context: &BchTemplate,
+        version: u32,
+        min_ntime: u32,
+        merkle_path: Vec<Hash>,
+    ) -> Self {
+        Self {
+            previous_hash: context.previous_hash,
+            version,
+            bits: context.bits,
+            target: context.target,
+            min_time: min_ntime,
+            current_time: min_ntime,
+            height: context.height,
+            size_limit: context.size_limit,
+            coinbase_value: context.coinbase_value,
+            coinbase_flags: Vec::new(),
+            transactions: Vec::new(),
+            merkle_path: merkle_path.into(),
+            tokens: None,
+            header_only: true,
+        }
+    }
+
+    /// #### PR #42: a custom job's template, without transactions.
+    pub fn is_header_only(&self) -> bool {
+        self.header_only
     }
 
     /// #### PR #40
@@ -399,6 +437,9 @@ impl BchTemplate {
 
     /// Build only a full block; no light-job fallback can truncate its tx list.
     pub fn block(&self, coinbase: &Coinbase, header: [u8; 80]) -> Result<Vec<u8>, String> {
+        if self.header_only {
+            return Err("a custom job's template has no transactions".into());
+        }
         self.check_block_size(coinbase.bytes.len())?;
         if header[4..36] != self.previous_hash
             || header[36..68] != fold(double_sha256(&coinbase.bytes), &self.merkle_path)

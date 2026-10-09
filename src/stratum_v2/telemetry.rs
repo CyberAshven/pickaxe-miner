@@ -279,6 +279,16 @@ impl Devices {
         id
     }
 
+    /// #### PR #42: removes a connection that turned out to be a Job
+    /// Declaration client's, not a device's: it leaves no row, and the
+    /// offline rows it took over on its address come back.
+    pub fn forget(&mut self, id: u64) {
+        if let Some(row) = self.rows.remove(&id) {
+            self.rows.extend(row.replaced);
+        }
+        self.sockets.retain(|_, existing| *existing != id);
+    }
+
     /// #### PR #40: a device's label, for records kept outside the table.
     pub fn label(&self, id: u64) -> Option<String> {
         self.rows.get(&id).map(|row| row.label.clone())

@@ -4,13 +4,14 @@
 
 use super::{
     channel::TokenWin,
+    jd::server::{Declarator, DeclaratorSession},
     journal::{Journal, PendingBlock},
     merge::hub::TokenHub,
     provider::{NodeRpc, SubmissionOutcome, TemplateProvider},
     tdp,
     telemetry::Devices,
     template::{BchTemplate, Hash},
-    transport::Session,
+    transport::{Receiver, Sender, Session},
     wire::MiningSession,
     work_allocation::WorkAllocation,
 };
@@ -56,6 +57,9 @@ pub struct ServerConfig {
     /// #### PR #42: where blocks found on this server's templates by
     /// Template Distribution clients are saved until the node answers.
     pub relay_journal_path: Option<PathBuf>,
+    /// #### PR #42: a public pool's Job Declaration rules, when it accepts
+    /// miners' own templates.
+    pub declarator: Option<Arc<Declarator>>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -98,6 +102,23 @@ pub struct ServerStats {
     /// #### PR #42: the Template Distribution server's counts, when it
     /// serves templates or still holds relayed blocks.
     pub template_server: Option<TemplateServerStats>,
+    /// #### PR #42: the Job Declaration server's counts, when the pool
+    /// accepts miners' own templates.
+    pub jd_server: Option<JdServerStats>,
+}
+
+/// #### PR #42: what the Job Declaration server did. No count names a
+/// client, an identity, a token or an address.
+#[derive(Default, Clone, Debug)]
+pub struct JdServerStats {
+    /// Job Declaration sessions open now.
+    pub clients: usize,
+    pub tokens: u64,
+    pub custom_jobs: u64,
+    pub refused: u64,
+    pub last_refusal: Option<&'static str>,
+    /// Blocks found on custom jobs; the client's node submits them.
+    pub blocks: u64,
 }
 
 /// #### PR #42: what the Template Distribution server did. No count names a
@@ -181,6 +202,13 @@ pub(super) struct Shared {
 }
 
 impl Shared {
+    /// #### PR #42: changes the Job Declaration counts.
+    fn jd_stats(&self, change: impl FnOnce(&mut JdServerStats)) {
+        if let Ok(mut stats) = self.stats.lock() {
+            change(stats.jd_server.get_or_insert_with(Default::default));
+        }
+    }
+
     /// #### PR #42: changes the Template Distribution counts.
     pub(super) fn template_stats(&self, change: impl FnOnce(&mut TemplateServerStats)) {
         if let Ok(mut stats) = self.stats.lock() {
@@ -380,6 +408,9 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
         stats.active_node = 0;
         if relay.is_some() {
             stats.template_server = Some(TemplateServerStats::default());
+        }
+        if config.declarator.is_some() {
+            stats.jd_server = Some(JdServerStats::default());
         }
     }
     let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
@@ -656,8 +687,19 @@ pub fn run_with<R: NodeRpc + Send + 'static>(
                     devices.push((
                         id,
                         thread::spawn(move || {
-                            let result = serve_device(stream, public, &config, &shared, id);
-                            device_ended(&shared, id, result.as_ref().err().map(String::as_str));
+                            let mut served = Served::Device;
+                            let result =
+                                serve_device(stream, public, &config, &shared, id, &mut served);
+                            match served {
+                                Served::Device => device_ended(
+                                    &shared,
+                                    id,
+                                    result.as_ref().err().map(String::as_str),
+                                ),
+                                Served::JobDeclaration => shared.jd_stats(|stats| {
+                                    stats.clients = stats.clients.saturating_sub(1)
+                                }),
+                            }
                         }),
                     ));
                 }
@@ -976,12 +1018,78 @@ pub(super) fn template_reason(error: &str) -> &'static str {
     }
 }
 
+/// #### PR #42: what a connection on the SV2 listener turned out to be.
+enum Served {
+    Device,
+    JobDeclaration,
+}
+
+/// #### PR #42: whether `frame` sets up a Job Declaration session.
+fn job_declaration_setup(frame: &mut stratum_core::codec_sv2::SerializedFrame) -> bool {
+    let header = frame.header();
+    header.msg_type() == stratum_core::common_messages_sv2::MESSAGE_TYPE_SETUP_CONNECTION
+        && !header.channel_msg()
+        && frame.payload().first()
+            == Some(&(stratum_core::common_messages_sv2::Protocol::JobDeclarationProtocol as u8))
+}
+
+// #### PR #42: JD sessions on the SV2 listener
+// What: a connection whose first SetupConnection names Job Declaration is a
+// client's JD session when this pool accepts miners' own templates: it
+// leaves the device table (its row goes, and the rows it took over on its
+// address come back) and is counted as a JD client. Tokens it allocated go
+// when it closes. Without Job Declaration the mining session refuses it with
+// unsupported-protocol, as before.
+// Why: Job Declaration shares the pool's SV2 port and key (D17); the client
+// pins one key for both its sessions.
+// Look here if: a JD client shows up as a device, or its tokens outlive it.
+fn serve_declarator(
+    sender: &mut Sender,
+    receiver: &mut Receiver,
+    first: stratum_core::codec_sv2::SerializedFrame,
+    declarator: &Declarator,
+    shared: &Shared,
+) -> Result<(), String> {
+    let mut session = DeclaratorSession::new(declarator);
+    let result = (|| {
+        let mut next = Some(first);
+        while !shared.stop.load(Ordering::Relaxed) {
+            let frame = match next.take() {
+                Some(frame) => Some(frame),
+                None => receiver.receive(Duration::from_millis(100))?,
+            };
+            let Some(mut frame) = frame else {
+                continue;
+            };
+            let responses = session.receive(&mut frame, declarator, Instant::now())?;
+            if let Some(at) = responses.not_before {
+                while Instant::now() < at && !shared.stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            for frame in responses.frames {
+                sender.send(frame)?;
+            }
+            if responses.allocated > 0 {
+                shared.jd_stats(|stats| stats.tokens += responses.allocated);
+            }
+            if responses.close {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    session.close(declarator);
+    result
+}
+
 fn serve_device(
     stream: TcpStream,
     public: [u8; 32],
     config: &ServerConfig,
     shared: &Shared,
     device: u64,
+    served: &mut Served,
 ) -> Result<(), String> {
     let session = Session::accept(stream, &public, &config.authority_secret)?;
     let (mut sender, mut receiver) = session.split();
@@ -993,6 +1101,7 @@ fn serve_device(
             config.share_target,
         )?;
         mining.set_public(config.public.clone());
+        mining.set_declarator(config.declarator.clone());
         let fee = config.public.as_ref().and_then(|public| public.fee);
         let phase = rand::random();
         #[cfg(test)]
@@ -1027,7 +1136,22 @@ fn serve_device(
             for frame in availability.retarget(&mut mining)? {
                 sender.send(frame)?;
             }
-            if let Some(frame) = receiver.receive(Duration::from_millis(100))? {
+            if let Some(mut frame) = receiver.receive(Duration::from_millis(100))? {
+                // #### PR #42: JD sessions on the SV2 listener (see
+                // `serve_declarator`).
+                if let Some(declarator) = config
+                    .declarator
+                    .as_deref()
+                    .filter(|_| !mining.is_set_up() && job_declaration_setup(&mut frame))
+                {
+                    *served = Served::JobDeclaration;
+                    if let Ok(mut stats) = shared.stats.lock() {
+                        stats.connections = stats.connections.saturating_sub(1);
+                        stats.device_stats.forget(device);
+                        stats.jd_server.get_or_insert_with(Default::default).clients += 1;
+                    }
+                    return serve_declarator(&mut sender, &mut receiver, frame, declarator, shared);
+                }
                 // A node failure or tip change may have occurred while waiting
                 // for a device frame; resample before validating that frame.
                 for update in availability.update(
@@ -1045,10 +1169,51 @@ fn serve_device(
                     .as_secs();
                 let now = u32::try_from(now).map_err(|_| "system time exceeds header range")?;
                 let responses = mining.receive(frame, now)?;
+                // #### PR #42: a custom job's outcome on the dashboard.
+                if let Some(outcome) = responses.custom_job {
+                    shared.jd_stats(|stats| match outcome {
+                        Ok(()) => stats.custom_jobs += 1,
+                        Err(code) => {
+                            stats.refused += 1;
+                            stats.last_refusal = Some(code);
+                        }
+                    });
+                }
                 // Persist the complete solved block before acknowledging it.
                 // Storage failure stops the service rather than acknowledging
                 // work which would disappear on a restart.
                 for block in responses.blocks {
+                    // #### PR #42: a Coinbase-only custom job's block
+                    // What: it is listed on the dashboard as submitted by
+                    // the miner's node, never journaled, and does not mark
+                    // its parent solved.
+                    // Why: the pool never sees a custom job's transactions,
+                    // so only the client's node can build and submit the
+                    // block; the pool's own block on the same parent must
+                    // still be saved in case the client's fails.
+                    // Look here if: the server stops with "cannot persist
+                    // solved block" while JD clients mine.
+                    if block.template.is_header_only() {
+                        if let Ok(mut stats) = shared.stats.lock() {
+                            let mut hash = super::template::double_sha256(&block.header);
+                            hash.reverse();
+                            let worker = stats.device_stats.label(device).unwrap_or_default();
+                            stats.recent_blocks.push_back(FoundBlock {
+                                height: block.template.height,
+                                hash: hex::encode(hash),
+                                worker,
+                                found: Instant::now(),
+                                result: Some("submitted by the miner's node"),
+                            });
+                            while stats.recent_blocks.len() > RECENT_BLOCKS {
+                                stats.recent_blocks.pop_front();
+                            }
+                            if let Some(jd) = stats.jd_server.as_mut() {
+                                jd.blocks += 1;
+                            }
+                        }
+                        continue;
+                    }
                     // The share is still acknowledged and counted; only a
                     // repeat solution on an already solved parent is not saved.
                     let first = shared

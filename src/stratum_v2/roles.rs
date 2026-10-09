@@ -14,6 +14,9 @@ pub enum Role {
     /// #### PR #42: serve this node's templates to SV2 pools, Job
     /// Declaration clients and P2Pool (Template Distribution).
     TemplateProviderServer,
+    /// #### PR #42: accept miners' own templates in a public pool (Job
+    /// Declaration, Coinbase-only).
+    JobDeclaratorServer,
 }
 
 impl Role {
@@ -24,6 +27,7 @@ impl Role {
             Self::MiningServer => "mining_server",
             Self::Sv1Translator => "sv1_translator",
             Self::TemplateProviderServer => "template_provider_server",
+            Self::JobDeclaratorServer => "job_declarator_server",
         }
     }
 
@@ -34,6 +38,7 @@ impl Role {
             Self::MiningServer,
             Self::Sv1Translator,
             Self::TemplateProviderServer,
+            Self::JobDeclaratorServer,
         ]
     }
 }
@@ -58,10 +63,11 @@ mod tests {
     #[test]
     fn planned_roles_are_distinct() {
         let labels: Vec<_> = Role::all().iter().map(|r| r.as_str()).collect();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 5);
         assert!(labels.contains(&"template_provider_client"));
         assert!(labels.contains(&"mining_server"));
         assert!(labels.contains(&"sv1_translator"));
         assert!(labels.contains(&"template_provider_server"));
+        assert!(labels.contains(&"job_declarator_server"));
     }
 }

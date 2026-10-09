@@ -240,7 +240,23 @@ pub enum StratumV2Command {
         /// pool's templates come from its own node.
         #[arg(long, value_name = "ADDRESS", conflicts_with = "upstream")]
         tp_listen: Option<std::net::SocketAddr>,
+        /// #### PR #42
+        /// Accept miners' own templates at this public pool (SV2 Job
+        /// Declaration) on the SV2 port: `coinbase` lets a miner's Job
+        /// Declaration client set its own jobs, whose coinbase must pay your
+        /// fee and the Pickaxe donation in full. Off by default.
+        #[arg(long, value_name = "MODE", requires = "public")]
+        accept_job_declaration: Option<AcceptJobDeclaration>,
     },
+}
+
+/// #### PR #42: the Job Declaration modes a public pool accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum AcceptJobDeclaration {
+    /// Coinbase-only: a miner sets jobs from tokens the pool allocates; the
+    /// pool never sees their transactions, and the miner's node submits
+    /// their blocks.
+    Coinbase,
 }
 
 /// Parses command-line arguments into the supported miner commands.
@@ -566,6 +582,41 @@ mod tests {
             "stratum2+tcp://pool.example:3336/KEY",
             "--sv1-listen",
             "0.0.0.0:3333",
+        ])
+        .is_err());
+    }
+
+    // #### PR #42
+    // What: --accept-job-declaration coinbase needs --public.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn accepting_job_declaration_needs_a_public_pool() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--public",
+            "--accept-job-declaration",
+            "coinbase",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    accept_job_declaration,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(accept_job_declaration, Some(AcceptJobDeclaration::Coinbase));
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--accept-job-declaration",
+            "coinbase",
         ])
         .is_err());
     }

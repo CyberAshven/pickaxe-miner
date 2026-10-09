@@ -81,6 +81,19 @@ pub struct Channel {
     vardiff: VardiffState,
     /// Vardiff's latest hash rate estimate, the baseline for its next check.
     hashrate: f32,
+    /// #### PR #42: a Job Declaration client's channel: it mines only the
+    /// custom jobs the client sets, with 16 rollable extranonce bytes.
+    pub custom_only: bool,
+}
+
+/// #### PR #42: whose job a channel mines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    /// The pool's own, from its template.
+    Own,
+    /// A Job Declaration client's, set with SetCustomMiningJob; shares may
+    /// not be older than its start time.
+    Custom { min_ntime: u32 },
 }
 
 #[derive(Clone)]
@@ -95,6 +108,8 @@ pub struct Job {
     /// #### PR #42: this job's merge-mining (its leaves bind this job's
     /// payout), or `None` while no token is merge-mined.
     pub aux: Option<Arc<AuxJob>>,
+    /// #### PR #42: the pool's job or a client's custom job.
+    pub kind: JobKind,
 }
 
 pub struct Share<'a> {
@@ -228,7 +243,18 @@ impl Channel {
                 .map_err(|_| "invalid system clock")?,
             hashrate: hash_rate_from_target(target.into(), f64::from(SHARES_PER_MINUTE))
                 .map_or(MIN_HASHRATE, |rate| rate as f32),
+            custom_only: false,
         })
+    }
+
+    /// #### PR #42: the rollable extranonce bytes this channel's shares
+    /// carry: 8 from a device, 16 from a Job Declaration client.
+    pub fn rollable(&self) -> usize {
+        if self.custom_only {
+            super::jd::JD_ROLLABLE
+        } else {
+            DEVICE_EXTRANONCE_SIZE
+        }
     }
 
     pub fn install(
@@ -296,10 +322,26 @@ impl Channel {
         )?;
         // #### end PR #42 ####
         parts.prefix.extend(id.to_le_bytes());
-        // #### PR #38
-        // A mempool/time refresh on the same parent does not invalidate work
-        // already in an ASIC pipeline. Retain exact coinbases and tx lists;
-        // a new parent or changed bits still revokes every preceding job.
+        self.retain_previous(&template);
+        self.job = Some(Job {
+            id,
+            generation,
+            template,
+            standard_coinbase,
+            parts,
+            target: self.target,
+            payout,
+            aux,
+            kind: JobKind::Own,
+        });
+        Ok(self.job.as_ref().unwrap())
+    }
+
+    /// #### PR #38
+    /// A mempool/time refresh on the same parent does not invalidate work
+    /// already in an ASIC pipeline. Retain exact coinbases and tx lists;
+    /// a new parent or changed bits still revokes every preceding job.
+    fn retain_previous(&mut self, template: &BchTemplate) {
         if let Some(previous) = self.job.take() {
             if previous.template.previous_hash == template.previous_hash
                 && previous.template.bits == template.bits
@@ -315,15 +357,46 @@ impl Channel {
                 self.seen.clear();
             }
         }
+    }
+
+    /// #### PR #42
+    /// Installs a Job Declaration client's custom job: `template` is the
+    /// header-only template of `BchTemplate::custom`, and `parts` the
+    /// client's coinbase around this channel's extranonce prefix and its 16
+    /// rollable bytes. Older jobs on the same parent stay valid, as for the
+    /// pool's own jobs.
+    pub fn install_custom(
+        &mut self,
+        id: u32,
+        template: Arc<BchTemplate>,
+        parts: CoinbaseParts,
+    ) -> Result<&Job, String> {
+        if !self.custom_only {
+            return Err("only a Job Declaration channel takes custom jobs".into());
+        }
+        if self.job.as_ref().is_some_and(|job| job.id == id)
+            || self.previous.iter().any(|job| job.id == id)
+        {
+            return Err("job identifier already in use".into());
+        }
+        // The coinbase with zeroed rollable bytes, the job's reference build.
+        let mut bytes = parts.prefix.clone();
+        bytes.extend_from_slice(&self.extranonce_prefix);
+        bytes.extend(std::iter::repeat_n(0, self.rollable()));
+        bytes.extend_from_slice(&parts.suffix);
+        let merkle_root = fold(double_sha256(&bytes), &parts.merkle_path);
+        let min_ntime = template.min_time;
+        self.retain_previous(&template);
         self.job = Some(Job {
             id,
-            generation,
+            generation: 0,
             template,
-            standard_coinbase,
+            standard_coinbase: Coinbase { bytes, merkle_root },
             parts,
             target: self.target,
-            payout,
-            aux,
+            payout: BchPayout::default(),
+            aux: None,
+            kind: JobKind::Custom { min_ntime },
         });
         Ok(self.job.as_ref().unwrap())
     }
@@ -496,10 +569,16 @@ impl Channel {
         if (share.version ^ job.template.version) & !VERSION_ROLLING_MASK != 0 {
             return Err("invalid-version");
         }
-        if share.time < job.template.current_time
-            || share.time > now.saturating_add(60)
-            || share.time > job.template.current_time.saturating_add(60)
-        {
+        let late = match job.kind {
+            JobKind::Own => {
+                share.time > now.saturating_add(60)
+                    || share.time > job.template.current_time.saturating_add(60)
+            }
+            // #### PR #42: a custom job's shares follow the client's start
+            // time, up to a minute past it or past now.
+            JobKind::Custom { min_ntime } => share.time > now.max(min_ntime).saturating_add(60),
+        };
+        if share.time < job.template.current_time || late {
             return Err("invalid-ntime");
         }
         let coinbase = match self.kind {
@@ -510,7 +589,7 @@ impl Channel {
                 job.standard_coinbase.clone()
             }
             ChannelKind::Extended => {
-                if share.extranonce.len() != DEVICE_EXTRANONCE_SIZE {
+                if share.extranonce.len() != self.rollable() {
                     return Err("invalid-extranonce-size");
                 }
                 // #### PR #42: extended shares rebuild from the job's parts

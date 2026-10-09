@@ -1701,3 +1701,32 @@ withheld template that follows smaller constraints; a relayed block surviving
 lost replies and a restart without the listener; the 8-client cap; a 70 KB
 client frame closing the session; device frames still capped at 1 MiB. Not
 yet run against a live SRI pool or P2Pool.
+
+## Job Declaration server, Coinbase-only (2026-10-09)
+
+#### PR #42
+
+A public pool started with `--accept-job-declaration coinbase` accepts miners'
+own templates. A client's Job Declaration session shares the pool's SV2 port
+and key; it is set up for Coinbase-only (Full-Template is refused with
+`unsupported-feature-flags` for now) and allocates PX v1 tokens, each bound to
+the miner's payout address, alive 10 minutes and good once, at most 20 a
+minute per connection. The client's mining connection negotiates work
+selection; its extended channels are custom-only with 16 rollable bytes, and
+`SetCustomMiningJob` is checked against the pool's template (parent, bits,
+version, start time, BIP34 prefix, coinbase version and size) and the token's
+payout rule: the whole donation and the whole fee in the coinbase, the miner
+funded, at most one exact commitment at output 0 and no CashTokens outputs.
+Custom job ids carry 0x8000_0000. Shares rebuild the client's coinbase; a
+block on a custom job is listed as submitted by the miner's node and never
+journaled. A JD session leaves the workers table.
+
+Evidence: host tests for the output codec, the PX v1 layout (golden bytes) and
+token book (identity, secret, lifetime, single use, eviction), the payout rule
+at 1.5% and 1% (exact amounts pass, one satoshi less fails; per-script sums; a
+100% donation), the commitment shape, the JD session (setup, allocation, rate,
+unknown users), every SetCustomMiningJob error code, custom-only channels and
+custom-job shares and blocks; and a loopback test where a scripted client
+allocates a token, sets a custom job paying 304,734,375 / 3,078,125 /
+4,687,500 and mines it through the real server. Not yet run against another
+implementation's client.
