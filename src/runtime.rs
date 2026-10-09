@@ -1720,10 +1720,13 @@ fn broadcast_pending_transaction(
     cfg: &RuntimeConfig,
     raw_tx_hex: &str,
 ) -> Result<String, String> {
-    if cfg.network == MiningNetwork::Chipnet {
-        // The active Fulcrum session is bound to the chipnet deployment.
-        return session.broadcast_raw(raw_tx_hex);
-    }
+    // #### PR #42
+    // What: a Chipnet claim is broadcast as a mainnet one: Fulcrum or the
+    // miner's node by the source preference, falling back to the other.
+    // Why: the Chipnet-only shortcut was left from the retired Chipnet
+    // batch-payout preview; Chipnet and mainnet are one code path.
+    // Look here if: a Chipnet claim goes to a different place than a
+    // mainnet one would.
     let node_endpoints = cfg.node_endpoints();
     let node_configured = !node_endpoints.is_empty();
     broadcast_with_preference(
@@ -1772,9 +1775,13 @@ fn preflight_pending_transaction(
     expected_txid: &str,
     raw_tx_hex: &str,
 ) -> Result<(), String> {
-    if cfg.network == MiningNetwork::Chipnet {
-        return Ok(());
-    }
+    // #### PR #42
+    // What: a Chipnet claim takes the same node mempool gate as a mainnet
+    // one when the miner saved a node.
+    // Why: the Chipnet-only skip was left from the retired Chipnet
+    // batch-payout preview; Chipnet and mainnet are one code path.
+    // Look here if: a Chipnet miner with a saved node now waits on
+    // testmempoolaccept.
     // Bootstrap node RPCs stay off this gate. A public node that lacks
     // testmempoolaccept, or rejects a valid PHOTON tx, must not block the
     // Fulcrum broadcast the miner already uses.
@@ -7488,6 +7495,55 @@ mod tests {
         assert!(submission_journal_path(MiningNetwork::Chipnet)
             .ends_with("pending-reward-chipnet.json"));
         assert!(submission_journal_path(MiningNetwork::Mainnet).ends_with("pending-reward.json"));
+    }
+
+    // #### PR #42
+    // What: the node mempool gate runs the same way on Chipnet and mainnet:
+    // skipped without a saved node, and a node's rejection stops the claim
+    // on both.
+    // Look here if: preflight_pending_transaction or node_endpoints changes.
+    #[test]
+    fn preflight_runs_the_same_gate_on_every_network() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let txid = "11".repeat(32);
+        let server = {
+            let txid = txid.clone();
+            thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+                    assert!(String::from_utf8_lossy(&request[..read]).contains("testmempoolaccept"));
+                    let body = format!(
+                        "{{\"result\":[{{\"txid\":\"{txid}\",\"allowed\":false,\"reject-reason\":\"dust\"}}],\"error\":null,\"id\":\"pickaxe\"}}"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+                }
+            })
+        };
+        for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            let mut cfg = RuntimeConfig::default();
+            cfg.set_network(network);
+            assert!(
+                preflight_pending_transaction(&cfg, "PHOTON claim", &txid, "0200").is_ok(),
+                "without a saved node there is no gate"
+            );
+            cfg.set_node_url(&format!("http://{address}")).unwrap();
+            assert_eq!(cfg.node_endpoints(), [format!("http://{address}")]);
+            let error =
+                preflight_pending_transaction(&cfg, "PHOTON claim", &txid, "0200").unwrap_err();
+            assert!(
+                error.contains("rejected by native-node mempool preflight"),
+                "{network:?}: {error}"
+            );
+        }
+        server.join().unwrap();
     }
 
     #[test]

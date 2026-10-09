@@ -22,6 +22,19 @@ pub enum MiningNetwork {
 }
 
 impl MiningNetwork {
+    /// #### PR #42
+    /// What: the curated node RPCs of this network, tried after the miner's
+    /// own (none yet on either network).
+    /// Why: Chipnet and mainnet are one code path; the network chooses data,
+    /// never a different path.
+    /// Look here if: a network gets curated nodes.
+    pub fn node_rpc_bootstrap(self) -> &'static [&'static str] {
+        match self {
+            Self::Mainnet => crate::protocol::NODE_RPC_BOOTSTRAP,
+            Self::Chipnet => crate::protocol::CHIPNET_NODE_RPC_BOOTSTRAP,
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mainnet" => Ok(Self::Mainnet),
@@ -407,16 +420,12 @@ impl RuntimeConfig {
 
     /// Node try-order: custom (if set), then curated NODE_RPC_BOOTSTRAP.
     pub fn node_endpoints(&self) -> Vec<String> {
-        use crate::protocol::NODE_RPC_BOOTSTRAP;
         let mut out = Vec::new();
         for url in self.custom_node_endpoints() {
             out.push(url.to_string());
         }
-        for u in NODE_RPC_BOOTSTRAP
-            .iter()
-            .copied()
-            .filter(|_| self.network == MiningNetwork::Mainnet)
-        {
+        // #### PR #42: the curated list is the network's own data.
+        for u in self.network.node_rpc_bootstrap().iter().copied() {
             if !out.iter().any(|x| x.as_str() == u) {
                 out.push((*u).to_string());
             }

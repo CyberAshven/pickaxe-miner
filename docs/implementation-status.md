@@ -1631,3 +1631,20 @@ one group job feeds both lanes so the device switches to donation work by job
 alone, that `SetGroupChannel` moves a lane while other ids are still refused,
 and that closing the group closes the device's lane. Not yet run against a
 live SRI pool.
+
+## Chipnet claims take the mainnet path (2026-10-09)
+
+#### PR #42
+
+Chipnet and mainnet are now one claim path. Two Chipnet-only shortcuts in the
+GPU miner's claim code, left from the retired Chipnet batch-payout preview,
+are gone: a Chipnet claim is checked with the saved node's
+`testmempoolaccept` and broadcast by the same source preference (Fulcrum or
+the node, falling back to the other) as a mainnet one. The curated node list
+is the network's own data (`MiningNetwork::node_rpc_bootstrap`; empty on both
+networks), as Fulcrum's is.
+
+Evidence: a host test runs the gate on both networks against a loopback node
+that rejects the claim: skipped without a saved node, and stopping the claim
+with the node's reason on both; the existing Chipnet preflight test still
+passes. No Chipnet comparison remains in the runtime outside tests.

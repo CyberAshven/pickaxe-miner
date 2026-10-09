@@ -393,6 +393,9 @@ pub const ELECTRON_CASH_TCP_BOOTSTRAP: &[(&str, u16)] = &[
 /// DNS failure). This list stays empty instead of shipping dead RPC URLs.
 /// A configured node is used when it is healthy and its PHOTON proof is current.
 pub const NODE_RPC_BOOTSTRAP: &[&str] = &[];
+/// #### PR #42: Chipnet's curated node RPCs (none yet), so the node list is
+/// network data, as Fulcrum's is.
+pub const CHIPNET_NODE_RPC_BOOTSTRAP: &[&str] = &[];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotonDerivedState {
