@@ -24,6 +24,8 @@ pub enum SourceKind {
     NodeRpc,
     /// An SV2 Template Provider (Template Distribution).
     TemplateProvider,
+    /// #### PR #42: an ASIC-exclusive token's thread (`merge::source`).
+    Token,
 }
 
 /// #### PR #42: a place templates come from. The server's node thread works

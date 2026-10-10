@@ -4,8 +4,17 @@
 //! exists yet. The Chipnet test token is for tests and the hidden Chipnet
 //! test flag only, and is never in a list.
 
-use super::{super::template::double_sha256, leaf::Mode, tree::MAX_HEIGHT, Hash};
-use crate::config::MiningNetwork;
+use super::{
+    super::template::double_sha256,
+    leaf::Mode,
+    safa::{SafaParams, VersionRule, CANONICAL},
+    tree::MAX_HEIGHT,
+    Hash,
+};
+use crate::{
+    config::MiningNetwork,
+    donation::{TokenDonation, NEW_TOKEN_DONATION},
+};
 use sha2::{Digest, Sha256};
 
 /// At most this many tokens in one token set (+53 coinbase bytes for the
@@ -189,9 +198,76 @@ pub const TEST_TOKEN: MergeToken = MergeToken {
     priority: 0,
 };
 
+/// #### PR #42: a token mined by its own 80-byte header instead of BCH
+/// (ASIC-exclusive), such as SAFA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderToken {
+    pub name: &'static str,
+    /// One code path: rows differ per network, never the logic.
+    pub network: MiningNetwork,
+    /// The token category, in internal byte order.
+    pub category: Hash,
+    /// The token's layout, adjustment and rules, as data.
+    pub params: SafaParams,
+    /// The covenant, once one is deployed.
+    pub deployment: Option<CovenantDeployment>,
+    /// The least share of mining work its donation takes.
+    pub donation_minimum: TokenDonation,
+}
+
+/// The header-shaped tokens registered on `network`: none yet, on either
+/// network.
+pub fn header_tokens(network: MiningNetwork) -> &'static [HeaderToken] {
+    match network {
+        MiningNetwork::Mainnet => &[],
+        MiningNetwork::Chipnet => &[],
+    }
+}
+
+/// SHA-256 of "pickaxe asic test token v1".
+const HEADER_TEST_CATEGORY: Hash = [
+    0x2b, 0x7f, 0xec, 0x11, 0x5c, 0x25, 0xb0, 0x0f, 0xea, 0xa7, 0x69, 0x7c, 0xa3, 0xbf, 0xa4, 0x6f,
+    0x87, 0xda, 0x6c, 0x49, 0xa4, 0x6c, 0xf2, 0xf3, 0xd7, 0xa7, 0xea, 0xd6, 0x0c, 0xbc, 0xec, 0x34,
+];
+
+/// A Chipnet-only header token with SAFA's canonical layout, BIP320
+/// version rolling and no covenant: its simulated thread exercises jobs,
+/// devices, wins and their checks without any real token.
+pub const HEADER_TEST_TOKEN: HeaderToken = HeaderToken {
+    name: "Pickaxe ASIC test token",
+    network: MiningNetwork::Chipnet,
+    category: HEADER_TEST_CATEGORY,
+    params: SafaParams {
+        version: VersionRule::Bip320,
+        ..CANONICAL
+    },
+    deployment: None,
+    donation_minimum: NEW_TOKEN_DONATION,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #42
+    // What: no header token is registered on either network; the ASIC test
+    // token is Chipnet-only, SAFA's canonical layout with BIP320 rolling,
+    // a 1.5% donation minimum and no covenant.
+    // Look here if: the header token registry changes.
+    #[test]
+    fn header_registries_are_empty_and_the_asic_test_token_is_chipnet_only() {
+        assert!(header_tokens(MiningNetwork::Mainnet).is_empty());
+        assert!(header_tokens(MiningNetwork::Chipnet).is_empty());
+        assert_eq!(HEADER_TEST_TOKEN.network, MiningNetwork::Chipnet);
+        assert_eq!(
+            HEADER_TEST_TOKEN.category,
+            super::super::sha256(b"pickaxe asic test token v1")
+        );
+        assert_eq!(HEADER_TEST_TOKEN.params.version, VersionRule::Bip320);
+        assert_eq!(HEADER_TEST_TOKEN.params.daa, CANONICAL.daa);
+        assert_eq!(HEADER_TEST_TOKEN.donation_minimum, NEW_TOKEN_DONATION);
+        assert!(HEADER_TEST_TOKEN.deployment.is_none());
+    }
 
     // #### PR #42
     #[test]

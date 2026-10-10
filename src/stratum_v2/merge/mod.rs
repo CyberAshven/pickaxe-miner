@@ -24,6 +24,7 @@ pub mod proof;
 pub mod registry;
 pub mod safa;
 pub mod set;
+pub mod source;
 pub mod tree;
 pub mod verify;
 

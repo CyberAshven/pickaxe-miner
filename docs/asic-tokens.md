@@ -128,8 +128,42 @@ start time is below the chain's median time.
   Firmware that rolls anyway makes invalid shares, which only hardware tests
   can show.
 
+## The token worker and the Chipnet test token
+
+A server in token mode needs no BCH node: its jobs come from the token's
+thread. No ASIC-exclusive token is registered on either network, so
+`--asic-token NAME` is refused for now, and a hidden Chipnet-only flag runs
+a test token instead:
+
+```text
+pickaxe_miner stratum-v2 serve --config chipnet.json --listen 0.0.0.0:3336 \
+  --sv1-listen 0.0.0.0:3333 --asic-test-token 1000
+```
+
+- **The test token** has SAFA's canonical layout with BIP320 version
+  rolling, a 1.5% donation minimum and no covenant. Its simulated thread
+  starts from a commitment naming no predecessor, keeps age 71 (so its
+  target stays the one the difficulty sets), and starts its jobs two hours
+  behind now, below the chain's median time.
+- **Wins.** A share that wins is handed to the token worker through a
+  bounded queue (64) the device threads never wait on; a full queue drops
+  and counts the win. The worker checks each win as the covenant would (it
+  must follow the thread's commitment, pay one of this server's forwarders,
+  and pass the claim checks), saves it to the owner-only
+  `<config>.sv2-token-proofs.json` (mode `H`, the `HeaderWin` record), and
+  moves the simulated thread to the winning header, so devices get a new job
+  that follows it. A later win on the old thread is counted stale. A win
+  that fails Pickaxe's own check is a bug: proofs turn off and devices keep
+  mining.
+- **The donation** is the token's share of the work, never below its minimum
+  (the profile's token donation, 1.5% by default): donation jobs pay the
+  donation's forwarder.
+- The overview reads "no node: an ASIC-exclusive token instead of BCH" and
+  lists the token's wins (proven, stale, dropped); the status file's
+  `header_token` has the same counts, never a script or an address.
+
 ## What is not done yet
 
-The token worker with a Chipnet test token, setup rows, and real claims and
-sweeps (judged by a local BCHN on regtest) follow in later slices. No
-ASIC-exclusive token is registered on either network.
+Reading real threads from Fulcrum or a node, setup rows, Case A pure-token
+jobs in this mode, and real claims and sweeps (judged by a local BCHN on
+regtest) follow in later slices.

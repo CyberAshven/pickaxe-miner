@@ -292,6 +292,47 @@ pub enum StratumV2Command {
             conflicts_with_all = ["upstream", "public"]
         )]
         fallback_pool: Vec<String>,
+        /// #### PR #42
+        /// Mine an ASIC-exclusive token instead of BCH: devices mine its
+        /// header-shaped jobs, and no node is needed. Refused until a token
+        /// is registered on the network (none is yet).
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = [
+                "upstream",
+                "public",
+                "tp_listen",
+                "job_declaration",
+                "accept_job_declaration",
+                "merge_test_token",
+                "template_provider",
+                "fallback_pool",
+                "asic_test_token"
+            ]
+        )]
+        asic_token: Option<String>,
+        /// #### PR #42
+        /// Mines the Chipnet ASIC test token (SAFA layout, a simulated
+        /// thread) at this share difficulty instead of BCH, to try
+        /// ASIC-exclusive mining before any such token exists; refused on
+        /// mainnet. Hidden: it is for tests.
+        #[arg(
+            long,
+            value_name = "DIFFICULTY",
+            hide = true,
+            conflicts_with_all = [
+                "upstream",
+                "public",
+                "tp_listen",
+                "job_declaration",
+                "accept_job_declaration",
+                "merge_test_token",
+                "template_provider",
+                "fallback_pool"
+            ]
+        )]
+        asic_test_token: Option<u64>,
     },
 }
 
@@ -772,6 +813,36 @@ mod tests {
             ]),
             (None, Some(JobDeclarationMode::Full))
         );
+    }
+
+    // #### PR #42
+    // What: --asic-test-token and --asic-token mine a token instead of BCH,
+    // so they conflict with joining or running a pool, serving templates,
+    // Job Declaration, the merge-mining test token, template providers and
+    // fallback pools.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn asic_tokens_exclude_bch_only_modes() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["pickaxe", "stratum-v2", "serve"]
+                    .iter()
+                    .chain(args)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(parse(&["--asic-test-token", "1000"]).is_ok());
+        assert!(parse(&["--asic-token", "SAFA"]).is_ok());
+        for other in [
+            &["--public"][..],
+            &["--merge-test-token", "1000"][..],
+            &["--tp-listen", "0.0.0.0:48442"][..],
+            &["--asic-token", "SAFA"][..],
+        ] {
+            let mut args = vec!["--asic-test-token", "1000"];
+            args.extend(other);
+            assert!(parse(&args).is_err(), "{other:?}");
+        }
     }
 
     // #### PR #42

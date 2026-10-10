@@ -50,6 +50,7 @@ pub fn status_report() -> String {
          available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates, optional SV1 adapter, templates from SV2 Template Providers with --template-provider, optional template server for SV2 pools with --tp-listen, Job Declaration (Full-Template and Coinbase-only) at a public pool with --accept-job-declaration, and at a Pickaxe pool with --job-declaration)\n\
          validation: local TCP/CPU experiments; live Chipnet and ASIC validation pending\n\
          merge mining: commitment v1 (draft), both cases in one coinbase; no token registered (Chipnet test token for tests)\n\
+         asic-exclusive tokens: SAFA layout v1 (draft), none registered (Chipnet ASIC test token for tests)\n\
          pending: physical ASIC validation, vardiff/device rates, merge-mined tokens under Job Declaration, distributed rigs and pool routing\n\
          evidence: docs/implementation-status.md\n",
         feature = status.feature,

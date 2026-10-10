@@ -73,6 +73,10 @@ pub struct ServerConfig {
     /// #### PR #42: marked while this server has work to give, so devices
     /// on a fallback pool come back to it.
     pub preferred: Option<Arc<super::sv1::Preferred>>,
+    /// #### PR #42: an ASIC-exclusive token mined instead of BCH: its wins
+    /// go to the token worker, and its donation is a share of the work.
+    pub header_work: Option<Arc<super::merge::source::HeaderWork>>,
+    pub token_donation: Option<crate::donation::TokenDonation>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -123,6 +127,8 @@ pub struct ServerStats {
     /// #### PR #42: what kind of source the active one is (`active_node` is
     /// its place in failover order).
     pub template_source: Option<SourceKind>,
+    /// #### PR #42: an ASIC-exclusive token's wins, when one is mined.
+    pub header_token: Option<super::merge::source::HeaderSummary>,
 }
 
 /// #### PR #42: what the Job Declaration server did. No count names a
@@ -588,6 +594,7 @@ pub fn run_with(
     update_relay_stats(&shared)?;
     update_declared_stats(&shared)?;
     let node_shared = shared.clone();
+    let node_header_work = config.header_work.clone();
     let tag = config.pool_tag.clone();
     let node_tokens = config.tokens.clone();
     let node_uplink = config.uplink.clone();
@@ -724,6 +731,12 @@ pub fn run_with(
             // win revokes work.
             // #### PR #42: a Job Declaration plan that came or went re-offers
             // the current template (see `offer`).
+            // #### PR #42: the token worker's counts, for the dashboard.
+            if let Some(work) = node_header_work.as_ref() {
+                if let Ok(mut stats) = node_shared.stats.lock() {
+                    stats.header_token = Some(work.summary());
+                }
+            }
             let plan_changed = node_uplink.as_ref().is_some_and(|uplink| {
                 if let Ok(mut stats) = node_shared.stats.lock() {
                     stats.jd_client = uplink.status.summary.lock().ok().map(|s| s.clone());
@@ -1324,6 +1337,14 @@ fn publish(shared: &Shared, job: Option<PublishedJob>) {
 // immediately, reject submissions while unavailable, then cleanly activate a
 // fresh job on the same channel. The grace is bounded; never extend a job's
 // original freshness lease just to keep a connection alive.
+/// #### PR #42: the donation a session's jobs rotate to: the BCH donation,
+/// or on an ASIC-exclusive token that token's share of the work.
+#[derive(Clone, Copy, Debug)]
+enum JobDonation {
+    Bch(BchDonation),
+    Token(crate::donation::TokenDonation),
+}
+
 struct JobAvailability {
     generation: Option<u64>,
     /// #### PR #42: the token set's serial of the job issued last (and the
@@ -1356,13 +1377,21 @@ impl JobAvailability {
         mining: &mut MiningSession,
         current: Option<PublishedJob>,
         now: Instant,
-        donation: BchDonation,
+        donation: JobDonation,
         fee: Option<crate::donation::bch::PoolFee>,
         acknowledged: Option<u64>,
     ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
         if let Some(job) = current.filter(|job| now < job.valid_until) {
             self.allocation.update(now, !mining.channels.is_empty());
-            let donation_work = self.allocation.donation_work(donation);
+            // #### PR #42: a token's donation is all work (see
+            // `WorkAllocation::token_donation_work`).
+            let (donation, donation_work) = match donation {
+                JobDonation::Bch(rate) => (rate, self.allocation.donation_work(rate)),
+                JobDonation::Token(rate) => (
+                    BchDonation::try_from(0)?,
+                    self.allocation.token_donation_work(rate),
+                ),
+            };
             let payout = BchPayout {
                 donation,
                 donation_work,
@@ -1607,6 +1636,11 @@ fn serve_device(
         )?;
         mining.set_public(config.public.clone());
         mining.set_declarator(config.declarator.clone());
+        // #### PR #42: a token that fixes its version slot (see
+        // `MiningSession::set_fixed_version`).
+        mining.set_fixed_version(config.header_work.as_ref().is_some_and(|work| {
+            work.token().params.version == super::merge::safa::VersionRule::Fixed
+        }));
         mining.set_lanes(config.uplink.as_ref().map(|_| shared.lanes.clone()));
         let fee = config.public.as_ref().and_then(|public| public.fee);
         let phase = rand::random();
@@ -1624,15 +1658,19 @@ fn serve_device(
                     .map_err(|_| "template state unavailable")
             };
             // #### PR #42: under Job Declaration the custom job's coinbase
-            // pays the donation, so no local job is donation work.
-            let donation = || {
+            // pays the donation, so no local job is donation work; on an
+            // ASIC-exclusive token the donation is that token's share of work.
+            let donation = || -> Result<JobDonation, String> {
+                if let Some(rate) = config.token_donation {
+                    return Ok(JobDonation::Token(rate));
+                }
                 if config.uplink.is_some() {
-                    return BchDonation::try_from(0);
+                    return BchDonation::try_from(0).map(JobDonation::Bch);
                 }
                 config
                     .donation
                     .read()
-                    .map(|value| *value)
+                    .map(|value| JobDonation::Bch(*value))
                     .map_err(|_| "donation setting unavailable".to_owned())
             };
             let acknowledged = || {
@@ -1693,6 +1731,17 @@ fn serve_device(
                 if let Some(uplink) = config.uplink.as_ref() {
                     for share in &responses.forward {
                         let _ = uplink.events.try_send(UplinkEvent::Share(share.clone()));
+                    }
+                }
+                // #### PR #42: header-token wins go to the token worker,
+                // which checks and saves them on its own thread; a full
+                // queue drops (and counts) a win instead of waiting.
+                if let Some(work) = config.header_work.as_ref() {
+                    for share in &responses.header_wins {
+                        work.submit(super::merge::source::HeaderShare {
+                            header: share.header,
+                            script: share.coinbase.bytes.clone(),
+                        });
                     }
                 }
                 // #### PR #42: a custom job's outcome on the dashboard.
@@ -1944,7 +1993,7 @@ mod retry_tests {
                     &mut mining,
                     Some(job.clone()),
                     start + Duration::from_secs(seconds),
-                    rate.parse().unwrap(),
+                    JobDonation::Bch(rate.parse().unwrap()),
                     None,
                     None,
                 )
@@ -1960,7 +2009,7 @@ mod retry_tests {
                 &mut mining,
                 Some(job),
                 start + Duration::from_secs(6),
-                "2".parse().unwrap(),
+                JobDonation::Bch("2".parse().unwrap()),
                 None,
                 None,
             )
@@ -1992,7 +2041,7 @@ mod retry_tests {
                 &mut mining,
                 Some(job.clone()),
                 start,
-                BchDonation::default(),
+                JobDonation::Bch(BchDonation::default()),
                 None,
                 None,
             )
@@ -2003,7 +2052,7 @@ mod retry_tests {
                 &mut mining,
                 Some(job.clone()),
                 job.valid_until,
-                BchDonation::default(),
+                JobDonation::Bch(BchDonation::default()),
                 None,
                 None,
             )
@@ -2014,7 +2063,7 @@ mod retry_tests {
                 &mut mining,
                 None,
                 job.valid_until + Duration::from_secs(2),
-                BchDonation::default(),
+                JobDonation::Bch(BchDonation::default()),
                 None,
                 None,
             )
@@ -2024,7 +2073,7 @@ mod retry_tests {
                 &mut mining,
                 Some(job.clone()),
                 job.valid_until + TEMPLATE_RECOVERY_GRACE,
-                BchDonation::default(),
+                JobDonation::Bch(BchDonation::default()),
                 None,
                 None,
             )
@@ -2087,7 +2136,14 @@ mod retry_tests {
                      job: PublishedJob,
                      acknowledged: Option<u64>| {
             availability
-                .update(mining, Some(job), start, none, None, acknowledged)
+                .update(
+                    mining,
+                    Some(job),
+                    start,
+                    JobDonation::Bch(none),
+                    None,
+                    acknowledged,
+                )
                 .unwrap();
             mining.channels[&1].job().unwrap().generation
         };

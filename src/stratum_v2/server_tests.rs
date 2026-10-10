@@ -458,6 +458,29 @@ impl Running {
             None,
             Vec::new(),
             Some(preferred),
+            None,
+        )
+    }
+
+    /// #### PR #42: a server mining `work`'s ASIC-exclusive token instead
+    /// of BCH.
+    pub(super) fn token(
+        work: Arc<super::merge::source::HeaderWork>,
+        state_directory: Arc<TestDirectory>,
+    ) -> Self {
+        Self::start_preferred(
+            vec![pool_node()],
+            state_directory,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![Box::new(super::merge::source::TokenSource::new(
+                work.clone(),
+            ))],
+            None,
+            Some(work),
         )
     }
 
@@ -484,6 +507,7 @@ impl Running {
             uplink,
             sources,
             None,
+            None,
         )
     }
 
@@ -498,6 +522,7 @@ impl Running {
         uplink: Option<super::jd::client::JdTarget>,
         mut sources: Vec<Box<dyn super::provider::TemplateSource>>,
         preferred: Option<Arc<super::sv1::Preferred>>,
+        header_work: Option<Arc<super::merge::source::HeaderWork>>,
     ) -> Self {
         let node = nodes[0].clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -549,6 +574,10 @@ impl Running {
             declarator,
             uplink: uplink.as_ref().map(|(handle, _)| handle.clone()),
             preferred,
+            token_donation: header_work
+                .as_ref()
+                .map(|work| work.token().donation_minimum),
+            header_work,
         };
         let thread = {
             let stop = stop.clone();
@@ -1633,6 +1662,55 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         (2, 0, "SV1")
     );
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+// #### PR #42
+// What: the Chipnet ASIC test token on the real server, with no node: a
+// device's share on its job is a win, the token worker proves and saves it,
+// the simulated thread moves to the winning header, and the device's next
+// job follows it; nothing is a block.
+// Look here if: the token worker, its queue or the re-issued jobs change.
+#[test]
+fn the_simulated_test_token_advances_after_each_proven_win() {
+    let directory = Arc::new(TestDirectory::new());
+    let work = Arc::new(
+        super::merge::source::HeaderWork::test_token(
+            MiningNetwork::Chipnet,
+            directory.0.join("token-proofs.json"),
+            0x207f_ffff,
+            &payout(),
+        )
+        .unwrap(),
+    );
+    let server = Running::token(work.clone(), directory.clone());
+    assert_eq!(
+        server.stats.lock().unwrap().template_source,
+        Some(super::provider::SourceKind::Token)
+    );
+    let mut device = Device::connect(&server, false);
+    let first = device.solve_and_submit(1);
+    server.wait(|stats| {
+        stats
+            .header_token
+            .as_ref()
+            .is_some_and(|token| token.proven == 1)
+    });
+    let next = loop {
+        let mut frame = device.receive();
+        if frame.header().msg_type() == MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH {
+            let previous: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
+            let mut display = previous.prev_hash.as_ref().to_vec();
+            display.reverse();
+            break hex::encode(display);
+        }
+    };
+    assert_eq!(next, first, "the next job follows the win");
+    let saved = std::fs::read(directory.0.join("token-proofs.json")).unwrap();
+    assert!(String::from_utf8(saved).unwrap().contains("\"mode\":\"H\""));
+    let stats = server.stats.lock().unwrap().clone();
+    assert_eq!((stats.blocks_pending, stats.blocks_accepted), (0, 0));
+    assert_eq!(server.node.lock().unwrap().submissions, 0);
+    device.sender.close();
 }
 
 // #### PR #42

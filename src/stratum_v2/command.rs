@@ -147,12 +147,41 @@ pub fn run(
         )?)),
         None => None,
     };
+    // #### PR #42: an ASIC-exclusive token instead of BCH
+    // What: `--asic-test-token` mines the Chipnet ASIC test token's simulated
+    // thread with no node; `--asic-token` is refused while no token is
+    // registered. The server then serves the token's jobs alone.
+    // Why: ASIC-exclusive mining needs no BCH node; its jobs come from the
+    // token's thread.
+    // Look here if: token mode asks for a node, or starts on mainnet.
+    let header_work = match &action {
+        StratumV2Command::Serve {
+            asic_token: Some(name),
+            ..
+        } => {
+            return Err(format!(
+                "no ASIC-exclusive token named {name} is registered on {} (none is yet)",
+                config.network.as_str()
+            ))
+        }
+        StratumV2Command::Serve {
+            asic_test_token: Some(difficulty),
+            ..
+        } => Some(Arc::new(super::merge::source::HeaderWork::test_token(
+            config.network,
+            config_path.with_extension("sv2-token-proofs.json"),
+            super::merge::hub::bits_for_difficulty(*difficulty)?,
+            &config.payout_address,
+        )?)),
+        _ => None,
+    };
     let reserve = super::tdp::reserve(tokens.as_ref().and_then(|hub| hub.current()).as_deref());
-    let node = if pools.is_empty() || declaring {
+    let node = if (pools.is_empty() || declaring) && header_work.is_none() {
         Some(preflight_sources(config, &providers, reserve)?)
     } else {
         None
     };
+    let serving = node.is_some() || header_work.is_some();
     // #### PR #40
     // The node's client and version, such as "Bitcoin Cash Node 29.1.0",
     // for check-node, the dashboard and the saved status.
@@ -261,8 +290,7 @@ pub fn run(
     };
     let pools = at_pools(pools);
     let fallbacks = at_pools(fallbacks);
-    let listener = node
-        .is_some()
+    let listener = serving
         .then(|| TcpListener::bind(listen))
         .transpose()
         .map_err(|_| "cannot bind mining listener")?;
@@ -292,8 +320,7 @@ pub fn run(
         .map(TcpListener::local_addr)
         .transpose()
         .map_err(|_| "cannot read template listener")?;
-    let authority_secret = node
-        .is_some()
+    let authority_secret = serving
         .then(|| load_authority(&config_path.with_extension("sv2-key")))
         .transpose()?;
     let public_key = authority_secret
@@ -321,7 +348,11 @@ pub fn run(
                 super::sv1::Upstream::local_public(local, public)
             } else {
                 super::sv1::Upstream::local(local, public)
-            }];
+            }
+            // #### PR #42: a token that fixes its version slot.
+            .with_fixed_version(header_work.as_ref().is_some_and(|work| {
+                work.token().params.version == super::merge::safa::VersionRule::Fixed
+            }))];
             // #### PR #42: under Job Declaration the pools' own jobs follow;
             // in solo mining, the fallback pools.
             if declaring {
@@ -399,8 +430,27 @@ pub fn run(
         )
     });
     let uplink_handle = uplink.as_ref().map(|(handle, _)| handle.clone());
-    let worker = match (node, listener, authority_secret) {
-        (Some((nodes, sources, _)), Some(listener), Some(authority_secret)) => {
+    // #### PR #42: the server's work: the nodes' (or providers') templates,
+    // or an ASIC-exclusive token's thread.
+    let work = match (node, header_work.as_ref()) {
+        (Some((nodes, sources, _)), _) => Some((
+            nodes
+                .iter()
+                .map(NativeNodeRpc::source_identity)
+                .collect::<Result<Vec<_>, _>>()?,
+            sources,
+        )),
+        (None, Some(work)) => Some((
+            Vec::new(),
+            vec![
+                Box::new(super::merge::source::TokenSource::new(work.clone()))
+                    as Box<dyn super::provider::TemplateSource>,
+            ],
+        )),
+        (None, None) => None,
+    };
+    let worker = match (work, listener, authority_secret) {
+        (Some((legacy_sources, sources)), Some(listener), Some(authority_secret)) => {
             // Difficulty 4096 is each device's starting target; vardiff then
             // moves it toward 20 shares a minute. No nominal device rate is
             // shown as measured.
@@ -415,10 +465,7 @@ pub fn run(
                     "sv2-blocks.json"
                 }),
                 pool_tag: pool_tag.clone(),
-                legacy_sources: nodes
-                    .iter()
-                    .map(NativeNodeRpc::source_identity)
-                    .collect::<Result<_, _>>()?,
+                legacy_sources,
                 public: public.clone(),
                 donation: donation.clone(),
                 tokens: tokens.clone(),
@@ -431,6 +478,15 @@ pub fn run(
                 declarator: declarator.clone(),
                 uplink: uplink_handle.clone(),
                 preferred: preferred.clone(),
+                // #### PR #42: the token's donation, never below its
+                // minimum.
+                token_donation: header_work.as_ref().map(|work| {
+                    config
+                        .token_donation
+                        .unwrap_or(work.token().donation_minimum)
+                        .at_least(work.token().donation_minimum)
+                }),
+                header_work: header_work.clone(),
                 #[cfg(test)]
                 allocation_phase: None,
             };
@@ -1791,6 +1847,7 @@ fn status_json(
             "kind": match kind {
                 super::provider::SourceKind::NodeRpc => "rpc",
                 super::provider::SourceKind::TemplateProvider => "tdp",
+                super::provider::SourceKind::Token => "token",
             },
             "index": snapshot.active_node,
             "count": snapshot.nodes,
@@ -1824,6 +1881,17 @@ fn status_json(
         // server's, with no identity, token or address.
         "jd_client": snapshot.jd_client.as_ref().map(jd_client_json),
         "jd_server": snapshot.jd_server.as_ref().map(jd_server_json),
+        // #### PR #42: an ASIC-exclusive token's wins, never a script or an
+        // address.
+        "header_token": snapshot.header_token.as_ref().map(|token| serde_json::json!({
+            "token": token.token,
+            "bits": format!("{:08x}", token.bits),
+            "wins": token.wins,
+            "proven": token.proven,
+            "stale": token.stale,
+            "dropped": token.dropped,
+            "off": token.off,
+        })),
         // #### PR #42: the template server's counts, with no address.
         "template_server": snapshot.template_server.as_ref().map(|templates| serde_json::json!({
             "clients": templates.clients,
@@ -2383,8 +2451,20 @@ fn records_line(stats: &ServerStats) -> String {
         ),
         (None, None) => String::new(),
     };
+    // #### PR #42: an ASIC-exclusive token's wins.
+    let header = stats
+        .header_token
+        .as_ref()
+        .map(|token| match &token.off {
+            Some(off) => format!(" · {} off: {off}", token.token),
+            None => format!(
+                " · {} wins {} ({} proven, {} stale, {} dropped)",
+                token.token, token.wins, token.proven, token.stale, token.dropped
+            ),
+        })
+        .unwrap_or_default();
     format!(
-        "Best share {best} · Recent blocks {}{tokens}",
+        "Best share {best} · Recent blocks {}{tokens}{header}",
         if blocks.is_empty() {
             "none yet".into()
         } else {
@@ -2398,6 +2478,10 @@ fn records_line(stats: &ServerStats) -> String {
 /// it was read from (the first in failover order), and which node of
 /// several, such as " (Bitcoin Cash Node 29.1.0) · node 1 of 2".
 fn node_label(client: Option<&str>, stats: &ServerStats) -> String {
+    // #### PR #42: an ASIC-exclusive token needs no node.
+    if stats.template_source == Some(super::provider::SourceKind::Token) {
+        return " · no node: an ASIC-exclusive token instead of BCH".into();
+    }
     // #### PR #42: templates from a template provider say so.
     if stats.template_source == Some(super::provider::SourceKind::TemplateProvider) {
         return format!(
@@ -2646,6 +2730,42 @@ mod tests {
         stats.tokens_off = Some("token proofs cannot be saved: disk full".into());
         assert!(records_line(&stats).contains("Tokens off: token proofs cannot be saved"));
         assert!(super::super::status_report().contains("merge mining: commitment v1 (draft)"));
+    }
+
+    // #### PR #42
+    // What: an ASIC-exclusive token's counts show on the overview and in the
+    // status file (kind "token"), with no script or address, and the
+    // overview says no node is needed.
+    // Look here if: the token's dashboard or status lines change.
+    #[test]
+    fn status_json_reports_token_mode_without_scripts_or_addresses() {
+        let mut stats = ServerStats {
+            template_source: Some(super::super::provider::SourceKind::Token),
+            header_token: Some(super::super::merge::source::HeaderSummary {
+                token: "Pickaxe ASIC test token",
+                bits: 0x207f_ffff,
+                wins: 3,
+                proven: 2,
+                stale: 1,
+                dropped: 0,
+                off: None,
+            }),
+            ..ServerStats::default()
+        };
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(status["header_token"]["proven"], 2);
+        assert_eq!(status["header_token"]["bits"], "207fffff");
+        assert_eq!(status["template_source"]["kind"], "token");
+        let text = status.to_string();
+        assert!(!text.contains("bchtest") && !text.contains("76a914"));
+        assert!(records_line(&stats)
+            .contains("Pickaxe ASIC test token wins 3 (2 proven, 1 stale, 0 dropped)"));
+        assert!(node_label(None, &stats).contains("an ASIC-exclusive token instead of BCH"));
+        if let Some(token) = stats.header_token.as_mut() {
+            token.off = Some("a token win failed its own check".into());
+        }
+        assert!(records_line(&stats)
+            .contains("Pickaxe ASIC test token off: a token win failed its own check"));
     }
 
     // #### PR #42

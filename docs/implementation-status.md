@@ -1912,3 +1912,27 @@ version rules, the script coinbase and its parts, the fixed-version setup and
 jobs, the adapter's fixed version, and a loopback run where an SV2 standard
 device, an SV2 extended device and SV1 firmware through the adapter mine a
 SAFA job: every share accepted, none journaled, nothing at the node.
+
+## Token worker and the Chipnet ASIC test token (2026-10-10)
+
+#### PR #42
+
+A server can mine an ASIC-exclusive token instead of BCH with no node: its
+only template source is the token worker (`merge::source`), which builds
+each job from the token's thread. `--asic-token NAME` is refused while the
+header-token registry is empty (it is on both networks); the hidden
+Chipnet-only `--asic-test-token DIFFICULTY` runs the ASIC test token (SAFA's
+canonical layout with BIP320 rolling, a 1.5% donation minimum, no covenant)
+on a simulated thread. Device threads hand wins to the worker through a
+bounded queue; the worker checks each as the covenant would, saves it
+(owner-only, mode H), and moves the thread to the winning header, which
+re-issues jobs. The token's donation is a share of the work, at least its
+minimum. The overview and the status file show the token's wins.
+
+Evidence: host tests for the registry rows, the token donation rotation,
+the worker (a proven win moves the thread and is saved once; a second win
+on the old thread is stale; a win paying another script turns proofs off; a
+full queue drops and counts), the flags' conflicts, the status file, and a
+loopback run where a device's share on the test token is proven and its
+next job follows the win, with nothing at the node. Not yet run with
+hardware.
