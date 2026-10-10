@@ -2,28 +2,7 @@
 
 ![Pickaxe Miner](docs/assets/pickaxe-miner-logo.png)
 
-Rust-first miner for Bitcoin Cash: CashTokens on GPUs and BCH on ASICs, solo,
-in farms and in pools.
-
-## What do you want to do?
-
-Run `pickaxe` for the setup, or use the command line.
-
-| You want to | In the setup | Command line | More |
-|---|---|---|---|
-| Mine PHOTON on your GPUs | GPU mining | `pickaxe mine --address <yours>` | [Quick start](#quick-start-mainnet-tui) |
-| Mine with GPUs on many machines | GPU mining; rigs: Join a GPU pool or farm | coordinator `--rigs-listen 0.0.0.0:3340`, rigs `--coordinator HOST:3340 --coordinator-key KEY` | [docs/farm.md](docs/farm.md) |
-| Join someone's GPU pool | GPU mining, Join a GPU pool or farm | `pickaxe mine --coordinator HOST:3340 --coordinator-key KEY --address <yours>` | [docs/farm.md](docs/farm.md) |
-| Run a GPU pool | Run a pool, GPU pool | `pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --rigs-public --rigs-fee 2 --address <yours>` | [docs/pool.md](docs/pool.md#a-public-gpu-pool) |
-| Mine BCH solo with your ASICs | ASIC mining, Solo | `pickaxe stratum-v2 serve` (your BCH node) | [docs/stratum-v2.md](docs/stratum-v2.md) |
-| Point your ASICs at a pool | ASIC mining, Join a pool | `pickaxe stratum-v2 serve --sv1-listen 0.0.0.0:3333 --upstream stratum2+tcp://HOST:PORT/KEY` | [docs/stratum-v2.md](docs/stratum-v2.md) |
-| Run a BCH pool for others | Run a pool, ASIC pool | `pickaxe stratum-v2 serve --public --pool-fee 2 --pool-tag /MyPool/` | [docs/pool.md](docs/pool.md) |
-
-A server or coordinator shows where devices and rigs connect on its
-dashboard (`i` or `I`, Connection info), ready to copy, for your network and,
-with [Tailscale](https://tailscale.com), from anywhere. Mining BCH needs a
-BCH node (Fulcrum cannot build blocks); PHOTON uses yours when you have one
-and public Fulcrum servers when you do not.
+Rust-first, GPU-only miner for CashTokens on Bitcoin Cash.
 
 ## Scope
 
@@ -50,6 +29,14 @@ With `--upstream`, it sends SV1 devices to a remote Stratum V2 pool instead of
 your own node, with backup pools in order; there the pool builds the blocks,
 so the donation is that share of mining time at the pool. See [docs/stratum-v2.md](docs/stratum-v2.md).
 
+In ASIC mode, devices mine BCH together with every merge-mined token: each
+share is also checked against each token's lower target, so a token can be
+won without a BCH block, or with one for a token that needs it, and BCH loses
+no hashrate ([docs/merge-mining.md](docs/merge-mining.md)). An ASIC-exclusive
+token (SAFA-style) can be mined instead of BCH
+([docs/asic-tokens.md](docs/asic-tokens.md)). Both lists fill as tokens are
+registered; Chipnet has test tokens for trying them with real devices.
+
 ### For pool operators
 
 Run a public BCH pool with Pickaxe: SV1 and SV2 miners connect with their own
@@ -63,22 +50,44 @@ your fee is a share of mining time. Press `i` on the dashboard for Connection
 info: the addresses (and, for rigs, the command) miners copy, for your network
 and, with [Tailscale](https://tailscale.com), from anywhere.
 
+## How to start
+
+Run `pickaxe` for the setup, or use the command line.
+
+| To | In the setup (`pickaxe`) | On the command line | Guide |
+|---|---|---|---|
+| Mine PHOTON on your GPUs | GPU mining | `pickaxe mine --address <yours>` | [Quick start](#quick-start-mainnet-tui) |
+| Mine with GPUs on many machines | GPU mining; rigs: Join a GPU pool or farm | coordinator `--rigs-listen 0.0.0.0:3340`, rigs `--coordinator HOST:3340 --coordinator-key KEY` | [docs/farm.md](docs/farm.md) |
+| Join someone's GPU pool | GPU mining, Join a GPU pool or farm | `pickaxe mine --coordinator HOST:3340 --coordinator-key KEY --address <yours>` | [docs/farm.md](docs/farm.md) |
+| Run a GPU pool | Run a pool, GPU pool | `pickaxe mine --rigs-listen 0.0.0.0:3340 --rigs-only --rigs-public --rigs-fee 2 --address <yours>` | [docs/pool.md](docs/pool.md#a-public-gpu-pool) |
+| Mine BCH solo with your ASICs | ASIC mining, Solo | `pickaxe stratum-v2 serve` (your BCH node) | [docs/stratum-v2.md](docs/stratum-v2.md) |
+| Point your ASICs at a pool | ASIC mining, Join a pool | `pickaxe stratum-v2 serve --sv1-listen 0.0.0.0:3333 --upstream stratum2+tcp://HOST:PORT/KEY` | [docs/stratum-v2.md](docs/stratum-v2.md) |
+| Run a BCH pool for others | Run a pool, ASIC pool | `pickaxe stratum-v2 serve --public --pool-fee 2 --pool-tag /MyPool/` | [docs/pool.md](docs/pool.md) |
+| Mine at a pool with your own node's templates | ASIC mining, Join a pool; Advanced: Job Declaration | `pickaxe stratum-v2 serve --sv1-listen 0.0.0.0:3333 --upstream stratum2+tcp://HOST:PORT/KEY --job-declaration` | [docs/job-declaration.md](docs/job-declaration.md) |
+| Serve your node's templates to SV2 pools and P2Pool | ASIC mining, Solo; Advanced: Serve templates | `pickaxe stratum-v2 serve --tp-listen 0.0.0.0:8442` | [docs/stratum-v2.md](docs/stratum-v2.md#serving-templates-to-a-pool-template-distribution) |
+
+A server or coordinator shows where devices and rigs connect on its
+dashboard (`i` or `I`, Connection info), ready to copy, for your network and,
+with [Tailscale](https://tailscale.com), from anywhere. Mining BCH needs a
+BCH node (Fulcrum cannot build blocks); PHOTON uses yours when you have one
+and public Fulcrum servers when you do not.
+
 ## Supported platforms
 
 Windows x86_64, Linux x86_64 and Apple Silicon macOS, plus a browser miner (WebAssembly on browser WebGPU).
 
-Linux and Windows ARM64 (for example Raspberry Pi 5, Ampere servers and Snapdragon laptops) build and pass the tests on GitHub's ARM64 runners; each CI run uploads the ARM64 binaries. They mine through the portable engine (Vulkan, or DirectX 12 on Windows) and have not yet been run on ARM hardware.
+Linux and Windows ARM64 (for example Raspberry Pi 5, Ampere servers and Snapdragon laptops) build and pass the tests on GitHub's ARM64 runners; each CI run uploads the ARM64 binaries. They mine through the portable engine (Vulkan, or DirectX 12 on Windows).
 
-| GPU | Engine | Tested |
-| --- | --- | --- |
-| NVIDIA GeForce RTX 50 series (`sm_120`) | CUDA | RTX 5070 Ti Laptop: about 1.48 GH/s |
-| AMD Radeon RX 6000, 7000 and 9000 (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) | Native HIP T2 | Code objects verified; no discrete card measured yet |
-| AMD integrated (Ryzen) and other AMD GPUs | Portable engine on Vulkan | Ryzen 9 9955HX3D integrated Radeon: about 20 MH/s |
-| Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails | Not yet |
-| Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) | Not yet |
-| Apple Silicon (M1 and later) | Portable engine on Metal | Built by CI; not yet run on a Mac |
-| GPUs no other engine finds: older integrated GPUs without Vulkan or DirectX 12, ARM GPUs (Mali, Adreno) with only an OpenCL driver | OpenCL engine, used only when no other engine finds a GPU, or with `--backend opencl` | Integrated Radeon over OpenCL: about 30 MH/s, level with the portable engine on the same GPU |
-| Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU | Chrome, on the integrated Radeon and the RTX 5070 Ti |
+| GPU | Engine |
+| --- | --- |
+| NVIDIA GeForce RTX 50 series (`sm_120`) | CUDA |
+| AMD Radeon RX 6000, 7000 and 9000 (`gfx1030`-`gfx1034`, `gfx1100`-`gfx1102`, `gfx1200`-`gfx1201`) | Native HIP T2 |
+| AMD integrated (Ryzen) and other AMD GPUs | Portable engine on Vulkan |
+| Intel GPUs | Portable engine on Vulkan, or on DirectX 12 when the Vulkan driver fails |
+| Other NVIDIA GPUs | Portable engine on Vulkan, chosen automatically (the CUDA kernels target `sm_120` only) |
+| Apple Silicon (M1 and later) | Portable engine on Metal |
+| GPUs no other engine finds: older integrated GPUs without Vulkan or DirectX 12, ARM GPUs (Mali, Adreno) with only an OpenCL driver | OpenCL engine, used only when no other engine finds a GPU, or with `--backend opencl` |
+| Browser miner: browsers with WebGPU (Chrome, Edge, Firefox, Safari) | Portable engine in WebAssembly on browser WebGPU |
 
 The engine is selected automatically, and one miner mines on every discrete GPU of the machine, each on its best engine ([several GPUs](#several-gpus)). An integrated GPU mines automatically only when no discrete GPU is present. `devices` lists every GPU with its engine. HIP runs C++ kernels by default; `PICKAXE_HIP_KERNELS=rust` selects the kernels built from the shared Rust engine. Which kernels each GPU runs, how they are built and how to switch: [GPU code map](docs/gpu-sources.md). All documentation: [docs](docs/README.md).
 
@@ -294,7 +303,6 @@ cargo run --release -- benchmark
 
 - There is no CPU mining fallback.
 - CUDA performance was measured on the local NVIDIA GPU; HIP artifacts are build-verified, without a physical AMD performance claim.
-- The portable engine (`wgpu` on Vulkan and DirectX 12, and the browser miner on browser WebGPU) was verified on an integrated Radeon and an RTX 5070 Ti. Intel GPUs, Linux GPUs and Apple Silicon have not run it yet.
 
 ## Features
 
