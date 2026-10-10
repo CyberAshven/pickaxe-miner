@@ -2293,3 +2293,25 @@ Evidence: a host test for the configuration and a refused server name, and
 an opt-in live test against the built-in Fulcrum servers: on 2026-10-10
 every server that answered accepted the rustls handshake (18 of 21; the
 other three refused the connection itself).
+
+## HiveOS, mmpOS and RaveOS packages (2026-10-10)
+
+#### PR #42
+
+Each release gains `pickaxe-hiveos-VERSION.tar.gz`, `pickaxe-mmpos-VERSION.tar.gz`
+and `pickaxe-raveos-VERSION.zip` (`packaging/farm-os/`, made by
+`tools/farm-os/build.sh` from the Linux x86_64 archive). Their scripts call
+`pickaxe farm-os mine` and `pickaxe farm-os stats`; HiveOS keeps the flight
+sheet's fields owner-only, RaveOS refuses values with spaces, and mmpOS's
+"solo:1" now means no pool. The release builds the Linux x86_64 binary a
+second time inside `manylinux_2_28`, checks that it needs no glibc newer
+than 2.28 and no OpenSSL, and ships it in the Linux archive and the three
+packages, so it runs on Ubuntu 20.04. `docs/farm-os.md` gives each system's
+fields.
+
+Evidence: `tools/test_farm_os_packages.py` (asset names and HiveOS's naming
+rule, file modes, line endings, the exact command HiveOS's and mmpOS's
+scripts run, HiveOS's and mmpOS's statistics, RaveOS's command and its
+statistics by PCI bus with a fake `ravinos`), shellcheck on every script,
+and a host test for "solo:1". Still to check on the systems themselves:
+each package uploaded to an account there, and a rig mining.

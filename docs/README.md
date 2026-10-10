@@ -12,6 +12,7 @@
 - [Incremental-k search](incremental-k.md) (optional CUDA build feature)
 - [Running a pool](pool.md): an ASIC or GPU pool for other miners, as a service
 - [GPU farms](farm.md): rigs on many machines mining as one
+- [HiveOS, mmpOS and RaveOS](farm-os.md): the custom-miner packages for farm systems
 - [Merge-mining BCH tokens](merge-mining.md): the v1 draft specification for token authors
 - [ASIC-exclusive tokens](asic-tokens.md): header-shaped token jobs (SAFA layout v1, draft), the forwarder convention and findings for token authors
 - [Job Declaration](job-declaration.md): miners' own templates at a Pickaxe pool (Full-Template and Coinbase-only)

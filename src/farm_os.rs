@@ -242,7 +242,12 @@ pub fn mine_argv(raw: &[String]) -> Result<Vec<String>, String> {
     let mut rig = false;
     for pool in &pools {
         let lower = pool.to_ascii_lowercase();
-        if matches!(lower.as_str(), "" | "solo" | "auto" | "fulcrum") {
+        // #### PR #42: mmpOS sends "solo:1" for a coin without a pool.
+        let host = match lower.split_once(':') {
+            Some((host, _)) if !lower.contains("://") => host,
+            _ => lower.as_str(),
+        };
+        if matches!(host, "" | "solo" | "auto" | "fulcrum") {
             continue;
         }
         if lower.starts_with("stratum+tcp://") || lower.starts_with("stratum+ssl://") {
@@ -446,6 +451,11 @@ mod tests {
             "{error}"
         );
         assert!(mine_argv(&strings(&["--pool"])).is_err());
+        // mmpOS's way of saying no pool.
+        assert_eq!(
+            mine_argv(&strings(&["--pool", "solo:1", "--user", "a.rig"])).unwrap(),
+            strings(&["pickaxe", "mine", "--no-tui", "--address", "a"])
+        );
     }
 
     /// A status with two GPUs on buses 1 and 101, 5 winners and 1 rejected.

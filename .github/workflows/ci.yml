@@ -295,6 +295,15 @@ jobs:
         shell: bash
         run: python -m unittest discover -s tools -p 'test_release_channel.py' -v
 
+      # #### PR #42: the HiveOS, mmpOS and RaveOS package scripts.
+      - name: Test farm OS packages
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck packaging/farm-os/*/*.sh tools/farm-os/build.sh
+          python -m unittest discover -s tools -p 'test_farm_os_packages.py' -v
+
       - name: Format
         run: cargo fmt --all -- --check
 

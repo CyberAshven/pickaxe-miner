@@ -159,8 +159,8 @@ rig reports itself. The status file now also names the role (`miner`,
 and rejected winners. A headless or `farm-os` run never reopens itself in a
 terminal on a Linux desktop.
 
-The package scripts each system installs (HiveOS's `h-*.sh`, mmpOS's,
-RaveOS's) come in a later change; these two commands are what they call.
+The packages each system installs, and what to put in their fields, are in
+[farm-os.md](farm-os.md); their scripts call these two commands.
 
 ## Running rigs as a service
 
