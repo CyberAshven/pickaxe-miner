@@ -376,6 +376,13 @@ What this means for Pickaxe, and what step 1 did:
   computer logs in with BCHN's bitcoin.conf (its rpcport and rpcuser and
   rpcpassword, or that network's cookie), read for each call and never kept
   (done in #42).
+- On a connection list, F searches another computer by name, `.local` name
+  or address (a public address only after yes) and T one of the Tailscale
+  network's online computers, on the same ports; Enter adds a node or
+  Fulcrum server found. C gives a saved node its cookie file (Knuth's, a
+  custom data folder's), kept owner-only in `<config>.node-cookies.json`
+  (at most 16, regular files only) and used before the environment's
+  cookie file.
 - A node's chain is proven by its fork block (BCH's UAHF block 478,559 on
   mainnet, Chipnet's block 115,252), since a Bitcoin (BTC) node reports the
   same chain name and testnet4 shares Chipnet's genesis: the ASIC server and

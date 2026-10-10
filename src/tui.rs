@@ -440,6 +440,9 @@ enum SetupStep {
     Connections,
     /// The GPU list, opened from the Settings page.
     Gpus,
+    /// #### PR #42: the Tailscale network's computers, opened from a
+    /// connection list.
+    TailscalePeers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +548,10 @@ enum TextField {
     FallbackPools,
     RigPort,
     RigName,
+    /// #### PR #42: another computer to search, and a saved node's cookie
+    /// file.
+    Computer,
+    CookieFile,
 }
 
 /// What an ASIC can mine: BCH (merge-mined tokens as they appear), or an
@@ -652,6 +659,57 @@ struct SetupFlow {
     found: Option<(MiningNetwork, Vec<crate::node_find::Found>)>,
     finder: Option<(MiningNetwork, mpsc::Receiver<Vec<crate::node_find::Found>>)>,
     find_here: fn(MiningNetwork) -> Vec<crate::node_find::Found>,
+    /// #### PR #42: another computer's search: what was found there (with
+    /// the computer as shown), the search under way, a public address
+    /// awaiting [Y] (as shown, and its host), and how a computer is
+    /// searched (tests replace it).
+    found_there: Option<(MiningNetwork, String, Vec<crate::node_find::Found>)>,
+    finder_there: Option<ThereSearch>,
+    public_question: Option<(String, String)>,
+    find_there: fn(&str, MiningNetwork, bool) -> Search,
+    /// #### PR #42: the Tailscale network's computers, the list while it
+    /// is asked for, the one under the cursor, and how it is asked for
+    /// (tests replace it).
+    tailscale: Option<PeerList>,
+    tailscale_rx: Option<mpsc::Receiver<PeerList>>,
+    tailscale_selected: usize,
+    list_tailscale: fn() -> PeerList,
+    /// #### PR #42: the cookie files saved for nodes (or why they cannot be
+    /// read), where they are kept, and how node logins get them (tests
+    /// replace it).
+    cookies: Result<crate::config::NodeCookies, String>,
+    cookies_path: Option<PathBuf>,
+    apply_cookies: fn(Vec<(String, u16, PathBuf)>),
+}
+
+/// #### PR #42: what a search of another computer gives, and the Tailscale
+/// network's computers.
+type Search = Result<Vec<crate::node_find::Found>, crate::node_find::NotSearched>;
+type PeerList = Result<Vec<crate::node_find::TailscalePeer>, String>;
+
+/// #### PR #42: a search of another computer under way.
+struct ThereSearch {
+    network: MiningNetwork,
+    /// The computer as shown, and as searched.
+    label: String,
+    host: String,
+    receive: mpsc::Receiver<Search>,
+}
+
+/// #### PR #42: whether two connection URLs name the same endpoint, logins
+/// aside.
+fn same_endpoint(a: &str, b: &str) -> bool {
+    fn bare(url: &str) -> String {
+        let url = url.trim().trim_end_matches('/').to_ascii_lowercase();
+        match url.split_once("://") {
+            Some((scheme, rest)) => {
+                let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+                format!("{scheme}://{host}")
+            }
+            None => url,
+        }
+    }
+    bare(a) == bare(b)
 }
 
 /// #### PR #40
@@ -769,6 +827,26 @@ impl SetupFlow {
             find_here: crate::node_find::find_on_this_computer,
             #[cfg(test)]
             find_here: |_| Vec::new(),
+            found_there: None,
+            finder_there: None,
+            public_question: None,
+            #[cfg(not(test))]
+            find_there: crate::node_find::find_on_host,
+            #[cfg(test)]
+            find_there: |_, _, _| Ok(Vec::new()),
+            tailscale: None,
+            tailscale_rx: None,
+            tailscale_selected: 0,
+            #[cfg(not(test))]
+            list_tailscale: crate::node_find::tailscale_peers,
+            #[cfg(test)]
+            list_tailscale: || Err("Tailscale is not asked in tests".into()),
+            cookies: Ok(crate::config::NodeCookies::default()),
+            cookies_path: None,
+            #[cfg(not(test))]
+            apply_cookies: crate::node::set_cookie_files,
+            #[cfg(test)]
+            apply_cookies: |_| {},
         })
     }
 
@@ -835,6 +913,220 @@ impl SetupFlow {
         }
     }
 
+    // #### PR #42: another computer
+    // What: F names a computer (a name, `.local` name or address) and T
+    // picks one of the Tailscale network's; its usual ports are searched on
+    // a thread, as on this PC, and a public address only after [Y]. What
+    // answered is listed, and Enter adds a node or Fulcrum server found.
+    // Why: a node on another computer was typed in full, port included.
+    // Look here if: a search of another computer never ends, or lists
+    // nothing although its node answers.
+    fn find_there_start(&mut self, label: String, host: String, public_ok: bool) {
+        let network = self.config.network;
+        let (send, receive) = mpsc::channel();
+        let find = self.find_there;
+        let searched = host.clone();
+        thread::spawn(move || {
+            let _ = send.send(find(&searched, network, public_ok));
+        });
+        self.public_question = None;
+        self.finder_there = Some(ThereSearch {
+            network,
+            label,
+            host,
+            receive,
+        });
+    }
+
+    /// Takes what the search of another computer found, once it is done;
+    /// a public address asks for [Y].
+    fn poll_finder_there(&mut self) {
+        let Some(search) = &self.finder_there else {
+            return;
+        };
+        let result = match search.receive.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err(crate::node_find::NotSearched::Bad(
+                "the search stopped".into(),
+            )),
+        };
+        let Some(search) = self.finder_there.take() else {
+            return;
+        };
+        match result {
+            Ok(found) => {
+                self.found_there = Some((search.network, search.label.clone(), found));
+                // The cursor moves to the first thing found there that the
+                // list can add, if it rests on "+ add".
+                let count = self
+                    .sources
+                    .list(self.config.network, self.connection_kind)
+                    .len();
+                let before = count + 1 + usize::from(self.local_node_offer().is_some());
+                let position = self
+                    .found_offers()
+                    .iter()
+                    .position(|(place, _)| *place == search.label);
+                if let Some(position) = position {
+                    if self.step == SetupStep::Connections
+                        && self.editing.is_none()
+                        && self.connection_selected == count
+                    {
+                        self.connection_selected = before + position;
+                    }
+                }
+            }
+            Err(crate::node_find::NotSearched::NeedsYes(question)) => {
+                self.status_line = format!("{question} [Y] yes");
+                self.public_question = Some((search.label, search.host));
+            }
+            Err(crate::node_find::NotSearched::Bad(error)) => self.status_line = error,
+        }
+    }
+
+    /// Everything found on this PC (besides BCHN on its default port) and
+    /// on another computer, with where.
+    fn found_everywhere(&self) -> Vec<(String, &crate::node_find::Found)> {
+        let network = self.config.network;
+        let mut found: Vec<(String, &crate::node_find::Found)> = self
+            .found_here()
+            .into_iter()
+            .map(|found| ("this PC".to_owned(), found))
+            .collect();
+        if let Some((at, label, there)) = &self.found_there {
+            if *at == network {
+                found.extend(there.iter().map(|item| (label.clone(), item)));
+            }
+        }
+        found
+    }
+
+    /// What the searches found that this list can add with Enter, with
+    /// where: on the BCH node list a node that answered or wants its login,
+    /// on the Fulcrum list a Fulcrum server that answered; none saved yet.
+    fn found_offers(&self) -> Vec<(String, &crate::node_find::Found)> {
+        use crate::node_find::Found;
+        let saved = self.sources.list(self.config.network, self.connection_kind);
+        self.found_everywhere()
+            .into_iter()
+            .filter(|(_, found)| match (self.connection_kind, found) {
+                (ConnectionKind::Node, Found::Node { check, .. }) => matches!(
+                    check,
+                    crate::node::NodeCheck::Ready { .. } | crate::node::NodeCheck::NeedsLogin
+                ),
+                (ConnectionKind::Fulcrum, Found::Fulcrum { report, .. }) => report.is_ok(),
+                _ => false,
+            })
+            .filter(|(_, found)| !saved.iter().any(|url| same_endpoint(url, found.url())))
+            .collect()
+    }
+
+    /// Saves a node or Fulcrum server found, for every profile on the
+    /// network.
+    fn add_found(&mut self, url: String) {
+        let network = self.config.network;
+        let count = self.sources.list(network, self.connection_kind).len();
+        let mut updated = self.sources.clone();
+        match updated.put(network, self.connection_kind, None, &url) {
+            Ok(()) => {
+                self.sources = updated;
+                self.status_line = match self.save_sources() {
+                    Ok(()) => format!(
+                        "Added {} for every profile on {}.",
+                        crate::node::redact_url(&url),
+                        network_label(network)
+                    ),
+                    Err(error) => error,
+                };
+                self.connection_selected = count;
+                if self.connection_kind == ConnectionKind::Node {
+                    self.check_saved_nodes();
+                }
+            }
+            Err(error) => self.status_line = error,
+        }
+    }
+
+    // #### PR #42: the Tailscale network's computers
+    // What: T lists the computers of the Tailscale network that are online
+    // (asked of `tailscale status --json` on a thread), and Enter searches
+    // the one chosen, as F does.
+    // Why: a node on another computer of the tailnet is easier to pick than
+    // to type.
+    // Look here if: the list stays empty while Tailscale shows computers.
+    fn open_tailscale(&mut self) {
+        self.step = SetupStep::TailscalePeers;
+        self.tailscale_selected = 0;
+        if self.tailscale_rx.is_none() {
+            let (send, receive) = mpsc::channel();
+            let list = self.list_tailscale;
+            thread::spawn(move || {
+                let _ = send.send(list());
+            });
+            self.tailscale = None;
+            self.tailscale_rx = Some(receive);
+        }
+    }
+
+    fn poll_tailscale(&mut self) {
+        let Some(receive) = &self.tailscale_rx else {
+            return;
+        };
+        let result = match receive.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("Tailscale did not answer".into()),
+        };
+        self.tailscale = Some(result);
+        self.tailscale_rx = None;
+    }
+
+    /// The Tailscale list: Enter searches the computer chosen.
+    fn handle_tailscale_key(&mut self, key: KeyEvent) -> SetupAction {
+        self.status_line.clear();
+        let peers = match &self.tailscale {
+            Some(Ok(peers)) => peers.clone(),
+            _ => Vec::new(),
+        };
+        let count = peers.len().max(1);
+        match key.code {
+            KeyCode::Esc => self.step = SetupStep::Connections,
+            KeyCode::Up => self.tailscale_selected = (self.tailscale_selected + count - 1) % count,
+            KeyCode::Down => self.tailscale_selected = (self.tailscale_selected + 1) % count,
+            KeyCode::Enter => {
+                if let Some(peer) = peers.get(self.tailscale_selected) {
+                    let label = if peer.name == peer.address {
+                        peer.address.clone()
+                    } else {
+                        format!("{} ({})", peer.name, peer.address)
+                    };
+                    self.find_there_start(label, peer.address.clone(), false);
+                    self.step = SetupStep::Connections;
+                }
+            }
+            _ => {}
+        }
+        SetupAction::Continue
+    }
+
+    // #### PR #42: saved cookie files
+    // What: C on a saved node gives the cookie file Pickaxe logs in to it
+    // with (Knuth's, a custom data folder's, a shared folder's); an empty
+    // field removes it. The list is kept owner-only beside the
+    // configuration and used at once.
+    // Why: such a node wanted its password typed into its URL.
+    // Look here if: a node still wants its login after its cookie file
+    // was given.
+    fn selected_node_endpoint(&self) -> Option<(String, u16)> {
+        let url = self
+            .sources
+            .list(self.config.network, ConnectionKind::Node)
+            .get(self.connection_selected)?
+            .clone();
+        crate::node::node_host_port(&url).ok()
+    }
+
     /// #### PR #42: checks each saved node of the network on its own thread
     /// (at most 16); the list shows "checking…" until each reports.
     fn check_saved_nodes(&mut self) {
@@ -883,6 +1175,8 @@ impl SetupFlow {
         // #### PR #42: the saved nodes' checks and the search too.
         self.poll_node_checks();
         self.poll_finder();
+        self.poll_finder_there();
+        self.poll_tailscale();
         let LocalNodeCheck::Running(network, receive) = &self.local_node else {
             return;
         };
@@ -1747,6 +2041,7 @@ impl SetupFlow {
             SetupStep::Settings => self.handle_settings_key(key),
             SetupStep::Connections => self.handle_connections_key(key),
             SetupStep::Gpus => self.handle_gpus_key(key),
+            SetupStep::TailscalePeers => self.handle_tailscale_key(key),
         }
     }
 
@@ -2339,9 +2634,18 @@ impl SetupFlow {
         // #### PR #40
         // The node found on this computer is one more row, after "+ add".
         let offer = self.local_node_offer().is_some();
-        let rows = count + 1 + usize::from(offer);
+        // #### PR #42: then what the searches found.
+        let found: Vec<String> = self
+            .found_offers()
+            .iter()
+            .map(|(_, found)| found.url().to_owned())
+            .collect();
+        let first_found = count + 1 + usize::from(offer);
+        let rows = first_found + found.len();
         self.connection_selected = self.connection_selected.min(rows - 1);
         self.status_line.clear();
+        // A public address waits for [Y] until the next key.
+        let question = self.public_question.take();
         match key.code {
             KeyCode::Esc => {
                 let row = match self.connection_kind {
@@ -2354,6 +2658,10 @@ impl SetupFlow {
             KeyCode::Down => self.connection_selected = (self.connection_selected + 1) % rows,
             KeyCode::Enter if offer && self.connection_selected == count + 1 => {
                 self.add_local_node()
+            }
+            // #### PR #42: something a search found.
+            KeyCode::Enter if self.connection_selected >= first_found => {
+                self.add_found(found[self.connection_selected - first_found].clone())
             }
             KeyCode::Enter => {
                 let value = self
@@ -2374,6 +2682,37 @@ impl SetupFlow {
                     Err(error) => error,
                 };
                 self.connection_selected = self.connection_selected.min(count - 1);
+            }
+            // #### PR #42: yes to a public address, another computer, a
+            // Tailscale computer, and the selected node's cookie file.
+            KeyCode::Char('y') | KeyCode::Char('Y') if question.is_some() => {
+                if let Some((label, host)) = question {
+                    self.find_there_start(label, host, true);
+                }
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                self.begin_edit(TextField::Computer, String::new())
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => self.open_tailscale(),
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if self.connection_kind == ConnectionKind::Node =>
+            {
+                let start = match (&self.cookies, self.selected_node_endpoint()) {
+                    (Err(error), _) => Err(format!(
+                        "The saved cookie files cannot be read ({error}); fix or delete that file first."
+                    )),
+                    (Ok(_), None) => {
+                        Err("Choose a saved node, then press C for its cookie file.".to_owned())
+                    }
+                    (Ok(cookies), Some((host, port))) => Ok(cookies
+                        .get(&host, port)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()),
+                };
+                match start {
+                    Ok(value) => self.begin_edit(TextField::CookieFile, value),
+                    Err(message) => self.status_line = message,
+                }
             }
             _ => {}
         }
@@ -2545,6 +2884,37 @@ impl SetupFlow {
                 }
                 self.pool_user = value;
                 Ok(String::new())
+            }
+            // #### PR #42: another computer, searched on a thread.
+            TextField::Computer => {
+                if !value.is_empty() {
+                    self.find_there_start(value.clone(), value, false);
+                }
+                Ok(String::new())
+            }
+            // #### PR #42: the selected node's cookie file; empty removes it.
+            TextField::CookieFile => {
+                let (host, port) = self
+                    .selected_node_endpoint()
+                    .ok_or("choose a saved node first")?;
+                let mut cookies = self.cookies.clone()?;
+                let path = value.trim_matches('"').trim();
+                if path.is_empty() {
+                    cookies.remove(&host, port);
+                } else {
+                    cookies.put(&host, port, std::path::Path::new(path))?;
+                }
+                if let Some(saved) = self.cookies_path.as_deref() {
+                    cookies.save(saved)?;
+                }
+                (self.apply_cookies)(cookies.entries());
+                self.cookies = Ok(cookies);
+                self.check_saved_nodes();
+                Ok(if path.is_empty() {
+                    format!("{host}:{port} no longer logs in with a saved cookie file.")
+                } else {
+                    format!("Pickaxe logs in to {host}:{port} with that cookie file.")
+                })
             }
             TextField::Connection => {
                 let network = self.config.network;
@@ -3024,6 +3394,7 @@ pub fn run_setup(
     profiles: MiningProfiles,
     sources_path: &Path,
     sources: SharedSources,
+    cookies_path: &Path,
     overrides: SetupOverrides,
 ) -> Result<Option<SetupResult>, String> {
     let mut state = SetupFlow::new(config, devices, prefer, default_gpus)?;
@@ -3034,6 +3405,10 @@ pub fn run_setup(
     state.profile_path = Some(profile_path.to_path_buf());
     state.sources = sources;
     state.sources_path = Some(sources_path.to_path_buf());
+    // #### PR #42: the cookie files saved for nodes, read again each time
+    // (the setup may have changed them).
+    state.cookies = crate::config::NodeCookies::load_optional(cookies_path);
+    state.cookies_path = Some(cookies_path.to_path_buf());
     state.overrides = overrides;
     state.apply_connections()?;
     run_setup_terminal(state)
@@ -3856,7 +4231,10 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         SetupStep::Hardware => "Setup   1/4 Hardware".to_string(),
         SetupStep::Network => "Setup   2/4 Network".to_string(),
         SetupStep::Token => "Setup   3/4 Token".to_string(),
-        SetupStep::Settings | SetupStep::Connections | SetupStep::Gpus => {
+        SetupStep::Settings
+        | SetupStep::Connections
+        | SetupStep::Gpus
+        | SetupStep::TailscalePeers => {
             let what = match state.mode {
                 MiningMode::Gpu => format!("GPU · {network} · {}", state.config.token.as_str()),
                 MiningMode::Asic => {
@@ -3887,6 +4265,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         SetupStep::Settings => render_setup_settings(frame, rows[1], state),
         SetupStep::Connections => render_setup_connections(frame, rows[1], state),
         SetupStep::Gpus => render_setup_gpus(frame, rows[1], state),
+        SetupStep::TailscalePeers => render_setup_tailscale(frame, rows[1], state),
     }
     let keys = if state.editing.is_some() {
         "[Type] edit   [Enter] save   [Esc] cancel"
@@ -3908,9 +4287,14 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
             SetupStep::Settings => {
                 "[Up/Down] row   [Left/Right] change   [Enter] edit / start   [Esc] back"
             }
-            SetupStep::Connections => {
-                "[Up/Down] choose   [Enter] add / edit   [Del] remove   [Esc] done"
+            // #### PR #42: another computer, Tailscale, cookie files.
+            SetupStep::Connections if state.connection_kind == ConnectionKind::Node => {
+                "[Up/Down] choose  [Enter] add/edit  [Del] remove  [F] other PC  [T] Tailscale  [C] cookie file  [Esc] done"
             }
+            SetupStep::Connections => {
+                "[Up/Down] choose  [Enter] add/edit  [Del] remove  [F] other PC  [T] Tailscale  [Esc] done"
+            }
+            SetupStep::TailscalePeers => "[Up/Down] choose   [Enter] look there   [Esc] back",
             SetupStep::Gpus => {
                 "[Up/Down] choose   [Space] mine on it or not   [A] all   [Enter/Esc] done"
             }
@@ -4716,6 +5100,31 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
             info.summary()
         )));
     }
+    // #### PR #42: what the searches found that Enter adds, then the field
+    // F or C opened.
+    let first_offer = saved.len() + 1 + usize::from(state.local_node_offer().is_some());
+    for (position, (place, found)) in state.found_offers().iter().enumerate() {
+        lines.push(Line::from(format!(
+            "{} Add from {place}: {}",
+            selection_marker(state.connection_selected == first_offer + position),
+            found.summary()
+        )));
+    }
+    match state.editing {
+        Some(TextField::Computer) => lines.push(Line::from(format!(
+            "Computer (name, .local name or address): {}_",
+            state.text_input
+        ))),
+        Some(TextField::CookieFile) => {
+            if let Some((host, port)) = state.selected_node_endpoint() {
+                lines.push(Line::from(format!(
+                    "Cookie file for {host}:{port} (empty: none): {}_",
+                    state.text_input
+                )));
+            }
+        }
+        _ => {}
+    }
     lines.push(Line::from(""));
     match state.connection_kind {
         ConnectionKind::Fulcrum => {
@@ -4730,12 +5139,8 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
             for endpoint in builtin {
                 lines.push(Line::from(dim(format!("  {endpoint}"))));
             }
-            // #### PR #42: Fulcrum servers found on this computer.
-            for found in state.found_here() {
-                if matches!(found, crate::node_find::Found::Fulcrum { .. }) {
-                    lines.push(Line::from(dim(format!("On this PC: {}", found.summary()))));
-                }
-            }
+            // #### PR #42: the searches.
+            found_lines(state, &mut lines);
         }
         // #### PR #40
         // What the check for a node on this computer found, then how to make
@@ -4778,14 +5183,7 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
             }
             // #### PR #42: the rest of this computer: nodes on other ports,
             // Fulcrum servers and ZMQ block notices.
-            if state.finder.is_some() {
-                lines.push(Line::from(dim(
-                    "Looking for other nodes and Fulcrum servers on this PC...",
-                )));
-            }
-            for found in state.found_here() {
-                lines.push(Line::from(dim(format!("On this PC: {}", found.summary()))));
-            }
+            found_lines(state, &mut lines);
             lines.push(Line::from(dim(
                 "There are no public nodes: node RPC is private.",
             )));
@@ -4809,6 +5207,101 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
             ConnectionKind::Node => "BCH nodes",
         },
         network_label(network)
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// #### PR #42: the searches under way, and what they found that the list
+/// cannot add: on the BCH node list everything else (a Fulcrum server, ZMQ,
+/// a node on another chain or not answering), on the Fulcrum list a server
+/// that is not a Fulcrum Pickaxe can use; nothing saved already.
+fn found_lines(state: &SetupFlow, lines: &mut Vec<Line<'static>>) {
+    use crate::node_find::Found;
+    let node_list = state.connection_kind == ConnectionKind::Node;
+    if state.finder.is_some() {
+        lines.push(Line::from(dim(
+            "Looking for other nodes and Fulcrum servers on this PC...",
+        )));
+    }
+    if let Some(search) = &state.finder_there {
+        lines.push(Line::from(dim(format!(
+            "Looking for nodes and Fulcrum servers on {}...",
+            search.label
+        ))));
+    }
+    let saved = state
+        .sources
+        .list(state.config.network, state.connection_kind);
+    let offers = state.found_offers();
+    for (place, found) in state.found_everywhere() {
+        let offered = offers.iter().any(|(_, offer)| std::ptr::eq(*offer, found));
+        if offered || saved.iter().any(|url| same_endpoint(url, found.url())) {
+            continue;
+        }
+        let shown = match (found, node_list) {
+            (Found::Fulcrum { report: Ok(_), .. }, true) => {
+                format!("{} (add it under Fulcrum servers)", found.summary())
+            }
+            (Found::Fulcrum { report: Err(_), .. }, _) | (_, true) => found.summary(),
+            (_, false) => continue,
+        };
+        lines.push(Line::from(dim(format!("On {place}: {shown}"))));
+    }
+    if let Some((at, label, there)) = &state.found_there {
+        let nothing = if node_list {
+            there.is_empty()
+        } else {
+            !there
+                .iter()
+                .any(|found| matches!(found, Found::Fulcrum { .. }))
+        };
+        if *at == state.config.network && nothing {
+            lines.push(Line::from(dim(format!(
+                "Nothing answers on {label} at the usual ports."
+            ))));
+        }
+    }
+}
+
+/// #### PR #42: the Tailscale network's computers that are online.
+fn render_setup_tailscale(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let mut lines = Vec::new();
+    match &state.tailscale {
+        _ if state.tailscale_rx.is_some() => {
+            lines.push(Line::from(dim("Asking Tailscale for its computers...")))
+        }
+        None => {}
+        Some(Err(error)) => {
+            lines.push(Line::from(format!("{error}.")));
+            lines.push(Line::from(dim(
+                "Sign in to Tailscale, or press [F] on the list to type a computer's name or address.",
+            )));
+        }
+        Some(Ok(peers)) if peers.is_empty() => lines.push(Line::from(dim(
+            "No other computer of your Tailscale network is online.",
+        ))),
+        Some(Ok(peers)) => {
+            lines.push(Line::from(dim(
+                "Online computers of your Tailscale network:",
+            )));
+            for (index, peer) in peers.iter().enumerate() {
+                lines.push(Line::from(format!(
+                    "{} {}  {}",
+                    selection_marker(index == state.tailscale_selected),
+                    peer.name,
+                    peer.address
+                )));
+            }
+        }
+    }
+    let title = format!(
+        " Tailscale computers · {} ",
+        network_label(state.config.network)
     );
     frame.render_widget(
         Paragraph::new(lines)
@@ -7902,10 +8395,210 @@ mod tests {
         setup.connection_kind = ConnectionKind::Fulcrum;
         let screen = setup_text(&setup);
         assert!(
-            screen.contains("On this PC: Fulcrum 1.12.0 at ws://127.0.0.1:64003"),
+            screen.contains("Add from this PC: Fulcrum 1.12.0 at ws://127.0.0.1:64003"),
             "{screen}"
         );
         assert!(!screen.contains("ZMQ"), "{screen}");
+    }
+
+    // #### PR #42
+    // What: F searches a computer by name; a public address waits for [Y];
+    // what answers there is listed, and Enter adds the node found, which
+    // the list then checks.
+    // Look here if: find_there_start, found_offers or add_found change.
+    #[test]
+    fn another_computer_is_searched_and_its_node_added() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.find_there = |host, _, public_ok| {
+            use crate::node_find::{Found, NotSearched};
+            match (host, public_ok) {
+                ("203.0.113.9", false) => Err(NotSearched::NeedsYes(
+                    "203.0.113.9 is on the internet, not this computer or your network; try it anyway?"
+                        .into(),
+                )),
+                ("203.0.113.9", true) => Ok(Vec::new()),
+                _ => Ok(vec![
+                    Found::Node {
+                        url: format!("http://{host}:48332"),
+                        who: "Bitcoin Cash Node",
+                        check: crate::node::NodeCheck::NeedsLogin,
+                    },
+                    Found::Zmq {
+                        url: format!("tcp://{host}:28332"),
+                    },
+                ]),
+            }
+        };
+        setup.connection_kind = ConnectionKind::Node;
+        setup.step = SetupStep::Connections;
+        let wait = |setup: &mut SetupFlow| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while setup.finder_there.is_some() && std::time::Instant::now() < deadline {
+                setup.poll_local_node();
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        setup.handle_key(key(KeyCode::Char('f')));
+        assert_eq!(setup.editing, Some(TextField::Computer));
+        type_text(&mut setup, "203.0.113.9");
+        assert!(
+            setup_text(&setup).contains("Computer (name, .local name or address): 203.0.113.9_")
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        wait(&mut setup);
+        assert!(
+            setup.status_line.ends_with("try it anyway? [Y] yes"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Char('y')));
+        wait(&mut setup);
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains("Nothing answers on 203.0.113.9 at the usual ports."),
+            "{screen}"
+        );
+        setup.handle_key(key(KeyCode::Char('F')));
+        type_text(&mut setup, "cypherpunkdeb.local");
+        setup.handle_key(key(KeyCode::Enter));
+        wait(&mut setup);
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains("Add from cypherpunkdeb.local: Bitcoin Cash Node at http://cypherpunkdeb.local:48332"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains(
+                "On cypherpunkdeb.local: ZMQ block notices at tcp://cypherpunkdeb.local:28332"
+            ),
+            "{screen}"
+        );
+        // The cursor rested on "+ add", so it moved to the node found.
+        assert_eq!(setup.connection_selected, 1);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            setup
+                .sources
+                .list(MiningNetwork::Chipnet, ConnectionKind::Node),
+            ["http://cypherpunkdeb.local:48332"]
+        );
+        assert!(setup.found_offers().is_empty());
+        assert!(setup.node_checks_rx.is_some());
+    }
+
+    // #### PR #42
+    // What: T lists the Tailscale network's computers; Enter searches the
+    // one chosen and goes back to the list; Tailscale's errors are shown.
+    // Look here if: open_tailscale or handle_tailscale_key change.
+    #[test]
+    fn tailscale_computers_are_listed_and_searched() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.list_tailscale = || {
+            Ok(vec![
+                crate::node_find::TailscalePeer {
+                    name: "cypherpunkdeb".into(),
+                    address: "100.101.102.103".into(),
+                },
+                crate::node_find::TailscalePeer {
+                    name: "laptop".into(),
+                    address: "100.101.102.104".into(),
+                },
+            ])
+        };
+        setup.connection_kind = ConnectionKind::Fulcrum;
+        setup.step = SetupStep::Connections;
+        setup.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(setup.step, SetupStep::TailscalePeers);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while setup.tailscale.is_none() && std::time::Instant::now() < deadline {
+            setup.poll_local_node();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains("> cypherpunkdeb  100.101.102.103"),
+            "{screen}"
+        );
+        setup.handle_key(key(KeyCode::Down));
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Connections);
+        assert_eq!(
+            setup
+                .finder_there
+                .as_ref()
+                .map(|search| search.host.as_str()),
+            Some("100.101.102.104")
+        );
+        assert!(setup_text(&setup).contains("on laptop (100.101.102.104)..."));
+        setup.list_tailscale = || Err("Tailscale is not installed or not on the PATH".into());
+        setup.handle_key(key(KeyCode::Char('T')));
+        while setup.tailscale_rx.is_some() {
+            setup.poll_local_node();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(setup_text(&setup).contains("Tailscale is not installed or not on the PATH."));
+        setup.handle_key(key(KeyCode::Esc));
+        assert_eq!(setup.step, SetupStep::Connections);
+    }
+
+    // #### PR #42
+    // What: C on a saved node opens its cookie file's field; the file is
+    // saved owner-only for that node's host and port and used at once; an
+    // empty field removes it; C off a saved node explains itself.
+    // Look here if: the CookieFile field changes.
+    #[test]
+    fn a_saved_node_gets_its_cookie_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-tui-cookie-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join(".cookie");
+        std::fs::write(&cookie, "__cookie__:77").unwrap();
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.cookies_path = Some(dir.join("pickaxe.node-cookies.json"));
+        setup
+            .sources
+            .put(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Node,
+                None,
+                "http://192.0.2.10:8332",
+            )
+            .unwrap();
+        setup.connection_kind = ConnectionKind::Node;
+        setup.step = SetupStep::Connections;
+        setup.connection_selected = 1;
+        setup.handle_key(key(KeyCode::Char('c')));
+        assert!(
+            setup.status_line.contains("Choose a saved node"),
+            "{}",
+            setup.status_line
+        );
+        setup.connection_selected = 0;
+        setup.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(setup.editing, Some(TextField::CookieFile));
+        type_text(&mut setup, &format!("\"{}\"", cookie.display()));
+        assert!(setup_text(&setup).contains("Cookie file for 192.0.2.10:8332"));
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.editing, None);
+        assert!(
+            setup.status_line.contains("logs in to 192.0.2.10:8332"),
+            "{}",
+            setup.status_line
+        );
+        let saved =
+            crate::config::NodeCookies::load_optional(setup.cookies_path.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(saved.get("192.0.2.10", 8332), Some(cookie.as_path()));
+        // The field opens with the saved file; emptied, it removes it.
+        setup.handle_key(key(KeyCode::Char('C')));
+        assert_eq!(setup.text_input, cookie.display().to_string());
+        setup.text_input.clear();
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.cookies.as_ref().unwrap().cookies.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // #### PR #42

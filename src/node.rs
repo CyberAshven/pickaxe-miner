@@ -1032,9 +1032,49 @@ fn node_rpc_basic_auth(target: &NodeRpcTarget) -> Result<Option<String>, String>
         target,
         env_user.as_deref(),
         env_password.as_deref(),
-        std::env::var_os(NODE_RPC_COOKIE_ENV).map(PathBuf::from),
+        // #### PR #42: a cookie file saved for this host and port comes
+        // before the one the environment names for every node.
+        saved_cookie(&target.host, target.port)
+            .or_else(|| std::env::var_os(NODE_RPC_COOKIE_ENV).map(PathBuf::from)),
         &bchn_data_dirs(),
     )
+}
+
+// #### PR #42: saved cookie files
+// What: the cookie files saved for nodes (`config::NodeCookies`), by host
+// and port, set at start and whenever the setup changes them; a saved file
+// that is no longer a regular file is skipped.
+// Why: Knuth's cookie or one in a custom data folder was not found.
+// Look here if: a node with a saved cookie file still wants its login.
+static COOKIE_FILES: std::sync::RwLock<Vec<(String, u16, PathBuf)>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Uses these saved cookie files from now on.
+pub fn set_cookie_files(files: Vec<(String, u16, PathBuf)>) {
+    *COOKIE_FILES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = files;
+}
+
+fn saved_cookie(host: &str, port: u16) -> Option<PathBuf> {
+    let files = COOKIE_FILES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cookie_for(&files, host, port)
+}
+
+/// `host:port`'s file among `files`, if it is still a regular file.
+fn cookie_for(files: &[(String, u16, PathBuf)], host: &str, port: u16) -> Option<PathBuf> {
+    files
+        .iter()
+        .find(|(saved, saved_port, _)| saved.eq_ignore_ascii_case(host) && *saved_port == port)
+        .map(|(_, _, path)| path.clone())
+        .filter(|path| crate::config::is_regular_file(path))
+}
+
+/// The host and port a node URL names, for its saved cookie file.
+pub fn node_host_port(url: &str) -> Result<(String, u16), String> {
+    parse_node_rpc_target(url).map(|target| (target.host, target.port))
 }
 
 /// The login for a node: URL credentials, then the environment pair, then
@@ -2166,6 +2206,48 @@ mod gbt_tests {
             login("http://localhost:48600").as_deref(),
             Some("__cookie__:22cc")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // #### PR #42
+    // What: a saved cookie file logs in only at its own host and port (the
+    // host in any case), after a login in the URL, and not once it is a
+    // folder.
+    // Look here if: cookie_for or node_host_port changes.
+    #[test]
+    fn a_saved_cookie_file_logs_in_only_at_its_host_and_port() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-saved-cookie-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join(".cookie");
+        std::fs::write(&cookie, "__cookie__:5a5a").unwrap();
+        let (host, port) = node_host_port("http://Knuth-Box.local:8332").unwrap();
+        let files = vec![(host, port, cookie.clone())];
+        assert_eq!(
+            cookie_for(&files, "knuth-box.local", 8332),
+            Some(cookie.clone())
+        );
+        assert_eq!(cookie_for(&files, "knuth-box.local", 8333), None);
+        assert_eq!(cookie_for(&files, "192.168.0.55", 8332), None);
+        let login = |url: &str| {
+            let target = parse_node_rpc_target(url).unwrap();
+            let cookie = cookie_for(&files, &target.host, target.port);
+            node_rpc_login(&target, None, None, cookie, &[]).unwrap()
+        };
+        assert_eq!(
+            login("http://knuth-box.local:8332").as_deref(),
+            Some("__cookie__:5a5a")
+        );
+        assert_eq!(
+            login("http://u:p@knuth-box.local:8332").as_deref(),
+            Some("u:p")
+        );
+        assert_eq!(login("http://knuth-box.local:8333"), None);
+        let folder = vec![("knuth-box.local".to_owned(), 8332, dir.clone())];
+        assert_eq!(cookie_for(&folder, "knuth-box.local", 8332), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

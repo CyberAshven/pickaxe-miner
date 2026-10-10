@@ -1188,6 +1188,116 @@ pub fn sources_path(config_path: &Path) -> PathBuf {
     config_path.with_extension("sources.json")
 }
 
+// #### PR #42: saved cookie files
+// What: a node whose cookie file Pickaxe does not find by itself (Knuth, a
+// custom data folder, another computer's shared folder) can be given its
+// cookie file for its host and port; the list is kept owner-only beside the
+// configuration, at most 16 entries, regular files only (no links).
+// Why: such a node wanted its password typed into its URL.
+// Look here if: a saved cookie file is not used, or a file is refused.
+/// Where the saved cookie files are kept.
+pub fn node_cookies_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("node-cookies.json")
+}
+
+/// The most cookie files kept.
+const MAX_NODE_COOKIES: usize = 16;
+
+/// A node's cookie file, for its host and port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCookie {
+    pub host: String,
+    pub port: u16,
+    pub path: PathBuf,
+}
+
+/// The saved cookie files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCookies {
+    #[serde(default)]
+    pub cookies: Vec<NodeCookie>,
+}
+
+impl NodeCookies {
+    /// The saved list, or none when the file does not exist.
+    pub fn load_optional(path: &Path) -> Result<Self, String> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(format!("read {}: {error}", path.display())),
+        };
+        let cookies: Self = serde_json::from_str(&text)
+            .map_err(|_| format!("{} is not a list of cookie files", path.display()))?;
+        if cookies.cookies.len() > MAX_NODE_COOKIES {
+            return Err(format!(
+                "{} holds over {MAX_NODE_COOKIES} cookie files",
+                path.display()
+            ));
+        }
+        Ok(cookies)
+    }
+
+    /// Keeps the list owner-only.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
+        write_private_atomic(path, &bytes)
+    }
+
+    /// Adds `host:port`'s cookie file, or replaces it: the file must be a
+    /// regular file (not a link or a folder).
+    pub fn put(&mut self, host: &str, port: u16, path: &Path) -> Result<(), String> {
+        let host = host.trim();
+        if host.is_empty() || host.contains(['/', ' ', '@']) || port == 0 {
+            return Err("give the node as HOST:PORT".into());
+        }
+        if !is_regular_file(path) {
+            return Err("the cookie file must be a regular file (not a link or a folder)".into());
+        }
+        self.remove(host, port);
+        if self.cookies.len() >= MAX_NODE_COOKIES {
+            return Err(format!("at most {MAX_NODE_COOKIES} cookie files are kept"));
+        }
+        self.cookies.push(NodeCookie {
+            host: host.to_owned(),
+            port,
+            path: path.to_path_buf(),
+        });
+        Ok(())
+    }
+
+    /// Forgets `host:port`'s cookie file.
+    pub fn remove(&mut self, host: &str, port: u16) {
+        let host = host.trim();
+        self.cookies
+            .retain(|cookie| !(cookie.host.eq_ignore_ascii_case(host) && cookie.port == port));
+    }
+
+    /// `host:port`'s cookie file.
+    pub fn get(&self, host: &str, port: u16) -> Option<&Path> {
+        self.cookies
+            .iter()
+            .find(|cookie| cookie.host.eq_ignore_ascii_case(host) && cookie.port == port)
+            .map(|cookie| cookie.path.as_path())
+    }
+
+    /// The list as node logins use it.
+    pub fn entries(&self) -> Vec<(String, u16, PathBuf)> {
+        self.cookies
+            .iter()
+            .map(|cookie| (cookie.host.clone(), cookie.port, cookie.path.clone()))
+            .collect()
+    }
+}
+
+/// Whether `path` is a regular file, not a link.
+pub fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
 /// Most user-added connections kept per network and kind.
 const MAX_SHARED_SOURCES: usize = 16;
 
@@ -1539,7 +1649,6 @@ impl MiningProfiles {
 /// while the server runs.
 /// Look here if: a private file is readable by other users, or a crash
 /// leaves a half-written one.
-#[cfg(feature = "stratum-v2")]
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut temp = path.as_os_str().to_owned();
     temp.push(format!(".tmp-{:016x}", rand::random::<u64>()));
@@ -2542,6 +2651,55 @@ mod tests {
             saved.save(&path).unwrap();
             assert_config_file_is_owner_only(&path);
             assert!(fs::read_to_string(&path).unwrap().contains("secret-pass"));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // #### PR #42
+    // What: the saved cookie files are kept owner-only, at most 16, without
+    // unknown fields, and only regular files are taken: a folder or a link
+    // is refused.
+    // Look here if: NodeCookies changes.
+    #[test]
+    fn node_cookie_file_is_owner_only_and_refuses_symlinks() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-node-cookies-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        expose_config_directory(&dir);
+        let cookie = dir.join("knuth.cookie");
+        fs::write(&cookie, "__cookie__:00").unwrap();
+        let path = node_cookies_path(&dir.join("pickaxe.json"));
+        assert!(path.ends_with("pickaxe.node-cookies.json"));
+        let mut cookies = NodeCookies::load_optional(&path).unwrap();
+        assert!(cookies.cookies.is_empty());
+        cookies.put("192.168.0.55", 8332, &cookie).unwrap();
+        cookies.put("192.168.0.55", 8332, &cookie).unwrap();
+        assert_eq!(cookies.cookies.len(), 1);
+        assert!(cookies.put("192.168.0.55", 8333, &dir).is_err());
+        assert!(cookies.put("http://x", 1, &cookie).is_err());
+        cookies.save(&path).unwrap();
+        assert_config_file_is_owner_only(&path);
+        assert_eq!(NodeCookies::load_optional(&path).unwrap(), cookies);
+        assert_eq!(cookies.get("192.168.0.55", 8332), Some(cookie.as_path()));
+        cookies.remove("192.168.0.55", 8332);
+        assert!(cookies.cookies.is_empty());
+        for port in 1..=16 {
+            cookies.put("10.0.0.1", port, &cookie).unwrap();
+        }
+        assert!(cookies.put("10.0.0.1", 17, &cookie).is_err());
+        fs::write(&path, r#"{"cookies":[],"extra":1}"#).unwrap();
+        assert!(NodeCookies::load_optional(&path).is_err());
+        // A link is refused where the system lets a test make one.
+        let link = dir.join("link.cookie");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&cookie, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&cookie, &link).is_ok();
+        if made {
+            assert!(cookies.put("10.0.0.2", 8332, &link).is_err());
         }
         let _ = fs::remove_dir_all(&dir);
     }

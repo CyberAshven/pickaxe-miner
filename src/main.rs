@@ -1452,6 +1452,13 @@ fn main() {
             exit_after_error(2);
         }
     };
+    // #### PR #42: the cookie files saved for nodes (Knuth's, a custom data
+    // folder's), for every command that logs in to a node.
+    let node_cookies_path = config::node_cookies_path(&config_path);
+    match config::NodeCookies::load_optional(&node_cookies_path) {
+        Ok(cookies) => node::set_cookie_files(cookies.entries()),
+        Err(error) => eprintln!("warning: {error}; the saved cookie files are not used"),
+    }
     let mut effective_backend = "auto".to_string();
     let mut effective_device = backend::DeviceSelection::Default;
     let mut include_integrated = args.include_integrated;
@@ -1832,6 +1839,7 @@ fn main() {
                         profiles,
                         &sources_path,
                         sources,
+                        &node_cookies_path,
                         overrides,
                     ) {
                         Ok(Some(setup)) => setup,

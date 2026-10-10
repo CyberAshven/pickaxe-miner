@@ -2208,11 +2208,40 @@ with BCHN's bitcoin.conf in its data folders: each network's RPC port
 rpcuser and rpcpassword, or else that network's cookie; for loopback
 addresses only, read for each call, never kept or shown.
 
-Not yet: searching another computer, Tailscale peers and saved cookie
-files (S31).
+Searching another computer, Tailscale computers and saved cookie files
+followed (next entry).
 
 Evidence: host tests for the candidate ports, a Fulcrum server over TCP and
 a ZMQ publisher recognised (and a closed port not), a public host refused
 with a question, the bitcoin.conf logins (custom port, top-level selection,
 cookie fallback, never another computer), and the setup's lists showing
 what was found.
+
+## Another computer, Tailscale computers and saved cookie files (2026-10-10)
+
+#### PR #42 follow-up
+
+The setup's BCH node and Fulcrum lists now search another computer: F takes
+a name, `.local` name or address, T lists the Tailscale network's online
+computers (`tailscale status --json`, 3 s at most). The computer's usual
+ports are tried side by side with a 1.5 s connect, each of a name's
+addresses in turn; a public address is searched only after [Y]. What
+answered is listed under the computer's name, and a node that answered or
+wants its login (on the node list) or a Fulcrum server that answered (on
+the Fulcrum list) is a row Enter adds. This PC's search uses the same
+side-by-side probes now.
+
+C on a saved node gives its cookie file. The list is kept owner-only beside
+the configuration (`<config>.node-cookies.json`, unknown fields refused, at
+most 16, regular files only, no links), loaded at start for every command
+and used at once when the setup changes it. A node's saved cookie file
+comes after a login in its URL and the environment's user and password, and
+before the environment's cookie file.
+
+Evidence: host tests for a named computer (a home name at once, a public
+address only after yes, what answers listed under the name), Tailscale's
+JSON (online computers with IPv4 only), the cookie list (owner-only, the
+limit, unknown fields, folders and links refused), a saved cookie file
+logging in only at its host and port, and the setup: F with the question
+and the node found added, T listed and searched, C saved, reused and
+removed.
