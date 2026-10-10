@@ -75,6 +75,65 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         .and_then(|rigs| rigs.get("rate"))
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    // #### PR #42: a rig's own status: its coordinator and its GPUs.
+    if status.get("role").and_then(Value::as_str) == Some("rig") {
+        let header = format!(
+            "Rig of {}{} · {} · {} · winners sent {} · {freshness}",
+            status
+                .get("coordinator")
+                .and_then(Value::as_str)
+                .unwrap_or("no coordinator yet"),
+            if status.get("backup").and_then(Value::as_bool) == Some(true) {
+                " (backup)"
+            } else {
+                ""
+            },
+            status
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("waiting"),
+            rate(status.get("current_rate")),
+            number(status, "verified_winners"),
+        );
+        let rows = status
+            .get("gpus")
+            .and_then(Value::as_array)
+            .map(|gpus| {
+                gpus.iter()
+                    .map(|gpu| {
+                        let telemetry = gpu.get("gpu_telemetry").unwrap_or(&Value::Null);
+                        let reading = |key: &str| telemetry.get(key).and_then(Value::as_f64);
+                        let health = crate::rigs::RigGpu {
+                            temperature_c: reading("temperature_c"),
+                            fan_percent: reading("fan_percent"),
+                            power_watts: reading("power_watts"),
+                            ..Default::default()
+                        };
+                        [
+                            gpu.get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("GPU")
+                                .to_owned(),
+                            gpu.get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("—")
+                                .to_owned(),
+                            rate(gpu.get("active_rate")),
+                            number(gpu, "winners").to_string(),
+                            gpu.get("last_error")
+                                .and_then(Value::as_str)
+                                .map_or_else(|| health.health(), str::to_owned),
+                        ]
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (
+            header,
+            rows,
+            ["GPU", "Status", "Rate", "Winners", "Health / error"],
+        );
+    }
     let mut header = format!(
         "PHOTON · {} · Height {} · {} · Winners {} (rejected {}) · Source {} · {freshness}",
         status
@@ -335,6 +394,33 @@ mod tests {
             (titles[0], rows[0][0].as_str(), rows[0][3].as_str()),
             ("GPU", "RTX", "3")
         );
+        // #### PR #42: a rig's own status names its coordinator and lists
+        // its GPUs.
+        let rig = crate::rigs::rig_status_json(
+            Some(("192.0.2.1:3340", false)),
+            true,
+            1.52e9,
+            12,
+            now - 600,
+            &[crate::rigs::RigGpu {
+                name: "RTX 3080".into(),
+                status: "mining".into(),
+                rate: 1.52e9,
+                temperature_c: Some(61.0),
+                winners: 12,
+                ..Default::default()
+            }],
+        );
+        let mut rig = rig;
+        rig["updated"] = now.into();
+        let (header, rows, titles) = view(&rig, now);
+        assert!(
+            header.starts_with("Rig of 192.0.2.1:3340 · mining · 1.52 GH/s · winners sent 12"),
+            "{header}"
+        );
+        assert_eq!(titles[0], "GPU");
+        assert_eq!(rows[0][0], "RTX 3080");
+        assert_eq!(rows[0][4], "61°C");
         // #### PR #42: the job source's label, rather than its endpoint.
         let (header, _, _) = view(
             &json!({"state": "mining", "updated": now, "endpoint": "wss://f.example",

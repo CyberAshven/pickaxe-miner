@@ -3040,6 +3040,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         gpu_telemetry: Default::default(),
         rigs: None,
         job_source: Default::default(),
+        started_at: 0,
         token_donation: crate::donation::TokenDonation::from_bps(400),
         donation_minimum: crate::donation::TokenDonation::from_bps(400),
     };
@@ -5841,6 +5842,7 @@ mod tests {
             gpu_telemetry: Default::default(),
             rigs: None,
             job_source: Default::default(),
+            started_at: 0,
             token_donation: crate::donation::TokenDonation::from_bps(400),
             donation_minimum: crate::donation::TokenDonation::from_bps(400),
         }
@@ -7810,6 +7812,7 @@ mod tests {
             name: "RTX 3080".into(),
             backend: "cuda".into(),
             device: 0,
+            pci_bus: Some(1),
             rate: 1.0e9,
             temperature_c: Some(60.0),
             fan_percent: Some(50.0),
@@ -7930,6 +7933,7 @@ mod tests {
                 temperature_c: Some(temperature),
                 ..Default::default()
             },
+            pci: None,
         };
         snapshot.gpus = vec![
             gpu(BackendKind::Cuda, 0, "RTX 5070 Ti", 71.0),
@@ -8578,6 +8582,7 @@ mod tests {
             gpu_telemetry: Default::default(),
             rigs: None,
             job_source: Default::default(),
+            started_at: 0,
             token_donation: crate::donation::TokenDonation::from_bps(400),
             donation_minimum: crate::donation::TokenDonation::from_bps(400),
         };

@@ -69,12 +69,13 @@ pub struct Cli {
     pub rigs_listen: Option<std::net::SocketAddr>,
 
     /// Mine as a rig of the coordinator at this address; it claims every win.
-    /// Repeat for backup coordinators, tried in order.
+    /// Repeat for backup coordinators, tried in order. #### PR #42: the
+    /// coordinator's one-line address, stratum2+tcp://HOST:PORT/KEY, carries
+    /// its key; a bare HOST:PORT takes the next --coordinator-key.
     #[arg(
         long,
         global = true,
         value_name = "HOST:PORT",
-        requires = "coordinator_key",
         conflicts_with = "rigs_listen",
         action = clap::ArgAction::Append
     )]
@@ -145,6 +146,14 @@ pub enum Commands {
     StratumV2 {
         #[command(subcommand)]
         command: StratumV2Command,
+    },
+    /// #### PR #42
+    /// For farm operating systems (HiveOS, mmpOS, RaveOS): their scripts run
+    /// `farm-os mine` with the flight sheet's fields and read
+    /// `farm-os stats` (see docs/farm.md).
+    FarmOs {
+        #[command(subcommand)]
+        command: FarmOsCommand,
     },
     #[command(hide = true)]
     Repl,
@@ -361,8 +370,43 @@ pub enum AcceptJobDeclaration {
     Both,
 }
 
-/// Parses command-line arguments into the supported miner commands.
+/// #### PR #42: what a farm operating system's scripts run.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum FarmOsCommand {
+    /// Print the running miner's statistics in the system's format (from
+    /// the status file beside --config).
+    Stats {
+        #[arg(long)]
+        os: crate::farm_os::FarmOs,
+    },
+    /// Mine with the flight sheet's --pool, --user and --password (and
+    /// --coin, --api-port, --pool-protocol, which are ignored); other flags
+    /// pass through to `mine`.
+    Mine {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+/// Parses command-line arguments into the supported miner commands;
+/// #### PR #42: `farm-os mine ...` becomes Pickaxe's own `mine` first (see
+/// `farm_os::mine_argv`).
 pub fn parse() -> Cli {
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw.get(1).is_some_and(|arg| arg == "farm-os") && raw.get(2).is_some_and(|arg| arg == "mine")
+    {
+        let rest: Vec<String> = raw[3..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        match crate::farm_os::mine_argv(&rest) {
+            Ok(argv) => return Cli::parse_from(argv),
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
     Cli::parse()
 }
 
@@ -410,6 +454,38 @@ mod tests {
             })
         ));
         assert_eq!(save.config, Some(PathBuf::from("pickaxe.json")));
+    }
+
+    // #### PR #42
+    // What: the argv `farm-os mine` rewrites to parses as `mine`, headless,
+    // with the rig's coordinator and name; `farm-os stats --os` parses.
+    // Look here if: farm_os::mine_argv or the farm-os subcommand changes.
+    #[test]
+    fn the_rewritten_farm_command_parses_as_mine() {
+        let argv = crate::farm_os::mine_argv(&[
+            "--pool".into(),
+            "stratum2+tcp://192.0.2.1:3340/KEY".into(),
+            "--user".into(),
+            "bitcoincash:qp.rack-1".into(),
+            "--intensity".into(),
+            "90".into(),
+        ])
+        .unwrap();
+        let cli = Cli::try_parse_from(argv).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Mine)));
+        assert!(cli.no_tui);
+        assert_eq!(cli.coordinator, ["stratum2+tcp://192.0.2.1:3340/KEY"]);
+        assert_eq!(cli.rig_name.as_deref(), Some("rack-1"));
+        assert_eq!(cli.intensity, Some(90));
+        let stats = Cli::try_parse_from(["pickaxe", "farm-os", "stats", "--os", "hiveos"]).unwrap();
+        assert!(matches!(
+            stats.command,
+            Some(Commands::FarmOs {
+                command: FarmOsCommand::Stats {
+                    os: crate::farm_os::FarmOs::Hiveos
+                }
+            })
+        ));
     }
 
     #[test]
@@ -587,8 +663,10 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--rigs-only", "--address", "payout"]).is_err()
         );
+        // #### PR #42: a bare address parses; the pairing with its key is
+        // checked when the rig starts (`coordinators` in main.rs).
         assert!(
-            Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_err()
+            Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_ok()
         );
         let cli =
             Cli::try_parse_from(["pickaxe", "mine", "--rigs-listen", "0.0.0.0:3340"]).unwrap();

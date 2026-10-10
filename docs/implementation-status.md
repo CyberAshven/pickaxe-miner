@@ -2145,3 +2145,28 @@ Evidence: host tests for the checks against scripted nodes (BCH following
 PHOTON, BTC, the other network, testnet4's fork block, no gettxout and no
 getnetworkinfo, an unreachable node without its login in the text) and the
 setup's list showing each saved node's result.
+
+## Status contract for farm systems (2026-10-10)
+
+#### PR #42
+
+The runtime half of farm-system support: `pickaxe farm-os mine` maps a
+flight sheet's pool, user and password onto Pickaxe's flags (Fulcrum, a node,
+a coordinator by its one-line address or HOST:PORT with the key as password,
+backups in order; SV1 pools refused; extras passed through), and
+`pickaxe farm-os stats --os hiveos|mmpos|raveos` prints the running miner's
+status in each system's format (stale or missing statuses report zero; a
+GPU without a PCI bus never takes another's). The status file gains the
+role, version, start time, and each GPU's PCI bus and rejected winners; a
+rig now writes its own status file (no key, no payout), which `mine watch`
+shows; `--coordinator` takes the one-line address with its key; a headless
+or `farm-os` run never reopens itself in a Linux terminal.
+
+Not yet: the packages each system installs (S30, waiting on the Linux
+build question).
+
+Evidence: host tests for every pool form and refusal, the rewritten command
+parsing as `mine`, the three formats from one fixture for a miner, a
+coordinator and a rig, stale and missing statuses, GPUs without a bus, the
+coordinator pairing, the relaunch guard, the status fields, the rig's status
+and the watch's rig view. Not yet run on a farm system.

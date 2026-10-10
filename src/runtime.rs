@@ -2476,6 +2476,8 @@ pub struct RuntimeGpu {
     pub device: u32,
     pub name: String,
     pub telemetry: GpuTelemetry,
+    /// #### PR #42: the GPU's PCI location, which farm systems match by.
+    pub pci: Option<crate::backend::PciAddress>,
 }
 
 #[derive(Debug, Clone)]
@@ -2520,6 +2522,8 @@ pub struct RuntimeSnapshot {
     /// #### PR #42: where jobs come from now: the miner's node, Fulcrum,
     /// or Fulcrum while the node is down.
     pub job_source: crate::job_source::JobSourceStatus,
+    /// #### PR #42: when mining started, in unix seconds.
+    pub started_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2720,6 +2724,7 @@ impl RuntimeSupervisor {
                     device: gpu.index,
                     name: gpu.name.clone(),
                     telemetry: GpuTelemetry::default(),
+                    pci: gpu.pci,
                 })
                 .collect(),
             generation_id: cfg.generation_id,
@@ -2751,6 +2756,9 @@ impl RuntimeSupervisor {
             } else {
                 crate::job_source::JobSourceStatus::Fulcrum
             },
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
         };
 
         let snapshot = Arc::new(Mutex::new(initial_snapshot));
