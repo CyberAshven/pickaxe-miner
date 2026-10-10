@@ -369,6 +369,13 @@ What this means for Pickaxe, and what step 1 did:
   answer, another network or chain, or a node that answers but cannot follow
   PHOTON (no gettxout, such as Knuth), whose BCH ASIC templates still work
   (done in #42). A node without getnetworkinfo is "BCH node".
+- The setup also searches this computer when a list opens: a node on
+  another usual port (such as Knuth's 8332 on Chipnet), Fulcrum servers
+  over TCP, WS or WSS (with their version and height) and ZMQ block notices,
+  at most ten ports, each tried once with a short timeout. A node on this
+  computer logs in with BCHN's bitcoin.conf (its rpcport and rpcuser and
+  rpcpassword, or that network's cookie), read for each call and never kept
+  (done in #42).
 - A node's chain is proven by its fork block (BCH's UAHF block 478,559 on
   mainnet, Chipnet's block 115,252), since a Bitcoin (BTC) node reports the
   same chain name and testnet4 shares Chipnet's genesis: the ASIC server and

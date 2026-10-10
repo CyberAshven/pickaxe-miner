@@ -647,6 +647,11 @@ struct SetupFlow {
         mpsc::Receiver<(String, crate::node::NodeCheck)>,
     )>,
     check_node: fn(&str, MiningNetwork) -> crate::node::NodeCheck,
+    /// #### PR #42: what was found on this computer (nodes on other ports,
+    /// Fulcrum servers, ZMQ), and how it is looked for (tests replace it).
+    found: Option<(MiningNetwork, Vec<crate::node_find::Found>)>,
+    finder: Option<(MiningNetwork, mpsc::Receiver<Vec<crate::node_find::Found>>)>,
+    find_here: fn(MiningNetwork) -> Vec<crate::node_find::Found>,
 }
 
 /// #### PR #40
@@ -758,6 +763,12 @@ impl SetupFlow {
             check_node: crate::node::check_node,
             #[cfg(test)]
             check_node: |_, _| crate::node::NodeCheck::NoAnswer("not checked in tests".into()),
+            found: None,
+            finder: None,
+            #[cfg(not(test))]
+            find_here: crate::node_find::find_on_this_computer,
+            #[cfg(test)]
+            find_here: |_| Vec::new(),
         })
     }
 
@@ -771,8 +782,57 @@ impl SetupFlow {
             let _ = send.send(probe(network));
         });
         self.local_node = LocalNodeCheck::Running(network, receive);
-        // #### PR #42: and every saved node of the network.
+        // #### PR #42: and every saved node of the network, and the rest of
+        // this computer.
         self.check_saved_nodes();
+        self.find_here_start();
+    }
+
+    /// #### PR #42: looks for nodes on other ports, Fulcrum servers and ZMQ
+    /// on this computer, on its own thread.
+    fn find_here_start(&mut self) {
+        let network = self.config.network;
+        if self.finder.is_some() || self.found.as_ref().is_some_and(|(at, _)| *at == network) {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        let find = self.find_here;
+        thread::spawn(move || {
+            let _ = send.send(find(network));
+        });
+        self.finder = Some((network, receive));
+    }
+
+    /// Takes what the search found, once it is done.
+    fn poll_finder(&mut self) {
+        let Some((network, receive)) = &self.finder else {
+            return;
+        };
+        let network = *network;
+        match receive.try_recv() {
+            Ok(found) => {
+                self.found = Some((network, found));
+                self.finder = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.finder = None,
+        }
+    }
+
+    /// What the search found on the selected network, besides the BCH node
+    /// on its default port (which the list offers apart).
+    fn found_here(&self) -> Vec<&crate::node_find::Found> {
+        let network = self.config.network;
+        match &self.found {
+            Some((at, found)) if *at == network => found
+                .iter()
+                .filter(|found| {
+                    !matches!(found, crate::node_find::Found::Node { url, .. }
+                        if crate::node::is_local_node_url(url, network))
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// #### PR #42: checks each saved node of the network on its own thread
@@ -820,8 +880,9 @@ impl SetupFlow {
     /// Takes the check's result once it is in. The cursor moves to the
     /// offered node if it still rests on "+ add node", so Enter adds it.
     fn poll_local_node(&mut self) {
-        // #### PR #42: the saved nodes' checks too.
+        // #### PR #42: the saved nodes' checks and the search too.
         self.poll_node_checks();
+        self.poll_finder();
         let LocalNodeCheck::Running(network, receive) = &self.local_node else {
             return;
         };
@@ -2044,6 +2105,9 @@ impl SetupFlow {
                     self.step = SetupStep::Connections;
                     if row == SettingsRow::Node {
                         self.check_local_node();
+                    } else {
+                        // #### PR #42: a Fulcrum server on this computer.
+                        self.find_here_start();
                     }
                 }
                 // #### PR #40
@@ -4666,6 +4730,12 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
             for endpoint in builtin {
                 lines.push(Line::from(dim(format!("  {endpoint}"))));
             }
+            // #### PR #42: Fulcrum servers found on this computer.
+            for found in state.found_here() {
+                if matches!(found, crate::node_find::Found::Fulcrum { .. }) {
+                    lines.push(Line::from(dim(format!("On this PC: {}", found.summary()))));
+                }
+            }
         }
         // #### PR #40
         // What the check for a node on this computer found, then how to make
@@ -4705,6 +4775,16 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
                     )))),
                 },
                 _ => {}
+            }
+            // #### PR #42: the rest of this computer: nodes on other ports,
+            // Fulcrum servers and ZMQ block notices.
+            if state.finder.is_some() {
+                lines.push(Line::from(dim(
+                    "Looking for other nodes and Fulcrum servers on this PC...",
+                )));
+            }
+            for found in state.found_here() {
+                lines.push(Line::from(dim(format!("On this PC: {}", found.summary()))));
             }
             lines.push(Line::from(dim(
                 "There are no public nodes: node RPC is private.",
@@ -7765,6 +7845,67 @@ mod tests {
         setup.config.node_url = Some("http://user:pass@127.0.0.1:8332".into());
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+    }
+
+    // #### PR #42
+    // What: the BCH node list shows what the search found on this computer
+    // besides BCHN on its default port (a node on another port, a Fulcrum
+    // server, ZMQ), and the Fulcrum list the Fulcrum servers it found.
+    // Look here if: find_here_start, found_here or their lines change.
+    #[test]
+    fn found_items_on_this_pc_are_shown() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.find_here = |network| {
+            use crate::node_find::{Found, FulcrumReport};
+            vec![
+                Found::Node {
+                    url: crate::node::local_node_url(network).into(),
+                    who: "Bitcoin Cash Node",
+                    check: crate::node::NodeCheck::NeedsLogin,
+                },
+                Found::Node {
+                    url: "http://127.0.0.1:8332".into(),
+                    who: "Knuth (its default on every network)",
+                    check: crate::node::NodeCheck::NoAnswer("timed out".into()),
+                },
+                Found::Fulcrum {
+                    url: "ws://127.0.0.1:64003".into(),
+                    report: Ok(FulcrumReport {
+                        server: "Fulcrum 1.12.0".into(),
+                        height: 320_000,
+                    }),
+                },
+                Found::Zmq {
+                    url: "tcp://127.0.0.1:28332".into(),
+                },
+            ]
+        };
+        setup.connection_kind = ConnectionKind::Node;
+        setup.step = SetupStep::Connections;
+        setup.check_local_node();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while setup.found.is_none() && std::time::Instant::now() < deadline {
+            setup.poll_local_node();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(setup.found_here().len(), 3);
+        let screen = setup_text(&setup);
+        assert!(screen.contains("On this PC: Knuth"), "{screen}");
+        assert!(
+            screen.contains("Fulcrum 1.12.0 at ws://127.0.0.1:64003"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("ZMQ block notices at tcp://127.0.0.1:28332"),
+            "{screen}"
+        );
+        setup.connection_kind = ConnectionKind::Fulcrum;
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains("On this PC: Fulcrum 1.12.0 at ws://127.0.0.1:64003"),
+            "{screen}"
+        );
+        assert!(!screen.contains("ZMQ"), "{screen}");
     }
 
     // #### PR #42

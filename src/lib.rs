@@ -42,6 +42,7 @@ pub mod job_source;
 // #### PR #42: HiveOS, mmpOS and RaveOS.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod farm_os;
+// #### PR #42: nodes, Fulcrum servers and ZMQ found on a computer.
 #[allow(dead_code)]
 pub mod m29_table;
 #[cfg(not(target_arch = "wasm32"))]
@@ -51,6 +52,8 @@ pub mod mining_lock;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod node;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod node_find;
 #[cfg(all(feature = "opencl", not(target_arch = "wasm32")))]
 pub mod opencl_photon;
 pub mod proof;

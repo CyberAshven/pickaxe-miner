@@ -1047,13 +1047,119 @@ fn node_rpc_login(
     data_dirs: &[PathBuf],
 ) -> Result<Option<String>, String> {
     let auth = select_node_rpc_basic_auth(target.url_auth.as_deref(), env_user, env_password)?;
-    Ok(auth.or_else(|| {
-        let paths = match cookie_file {
-            Some(path) => vec![path],
-            None => bchn_cookie_paths(&target.host, target.port, data_dirs),
-        };
-        paths.iter().find_map(|path| read_cookie(path))
+    Ok(auth.or_else(|| match cookie_file {
+        Some(path) => read_cookie(&path),
+        // #### PR #42: then BCHN's bitcoin.conf on this computer.
+        None => conf_login(&target.host, target.port, data_dirs).or_else(|| {
+            bchn_cookie_paths(&target.host, target.port, data_dirs)
+                .iter()
+                .find_map(|path| read_cookie(path))
+        }),
     }))
+}
+
+// #### PR #42: bitcoin.conf logins on this computer
+// What: for a node on this computer, BCHN's bitcoin.conf in its data folders
+// gives the RPC port of each network (a `[main]` or `[chip]` section, or
+// the top level for the network it selects, `chipnet=1` included) and, for
+// that port, its rpcuser and rpcpassword or else the cookie BCHN writes for
+// that network. Passwords are read for each call, never kept or shown;
+// `rpcauth` lines (hashed) cannot be used.
+// Why: a node with a custom RPC port or a password in bitcoin.conf needed
+// its login typed into a URL.
+// Look here if: a node on this computer wants its login although
+// bitcoin.conf has it, or a login reaches another computer.
+/// BCHN's bitcoin.conf, by section; never printed, as it holds passwords.
+#[derive(Default)]
+struct BchnConf {
+    top: std::collections::HashMap<String, String>,
+    main: std::collections::HashMap<String, String>,
+    chip: std::collections::HashMap<String, String>,
+    chipnet: bool,
+}
+
+impl BchnConf {
+    fn parse(text: &str) -> Self {
+        let mut conf = Self::default();
+        let mut section = None;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if let Some(name) = line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+            {
+                section = Some(name.trim().to_ascii_lowercase());
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim().to_ascii_lowercase(), value.trim().to_owned());
+            let map = match section.as_deref() {
+                None => &mut conf.top,
+                Some("main") => &mut conf.main,
+                Some("chip") => &mut conf.chip,
+                Some(_) => continue,
+            };
+            map.insert(key, value);
+        }
+        conf.chipnet = conf.top.get("chipnet").is_some_and(|value| value == "1");
+        conf
+    }
+
+    /// A key for `chipnet` or mainnet: its section first, then the top
+    /// level; network-specific keys come from the top level only for the
+    /// network the file selects.
+    fn get(&self, chipnet: bool, key: &str) -> Option<&str> {
+        let own = if chipnet { &self.chip } else { &self.main };
+        own.get(key)
+            .or_else(|| {
+                let network_specific = matches!(key, "rpcport" | "rpcbind" | "port" | "bind");
+                (!network_specific || chipnet == self.chipnet)
+                    .then(|| self.top.get(key))
+                    .flatten()
+            })
+            .map(String::as_str)
+    }
+}
+
+/// The login bitcoin.conf gives a node at `host:port` on this computer.
+fn conf_login(host: &str, port: u16, data_dirs: &[PathBuf]) -> Option<String> {
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        return None;
+    }
+    for dir in data_dirs {
+        let Ok(text) = std::fs::read_to_string(dir.join("bitcoin.conf")) else {
+            continue;
+        };
+        let conf = BchnConf::parse(&text);
+        for (chipnet, default_port, folder) in [(false, 8332, None), (true, 48332, Some("chipnet"))]
+        {
+            let rpcport = conf
+                .get(chipnet, "rpcport")
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            if rpcport != port {
+                continue;
+            }
+            if let (Some(user), Some(password)) = (
+                conf.get(chipnet, "rpcuser"),
+                conf.get(chipnet, "rpcpassword"),
+            ) {
+                return Some(format!("{user}:{password}"));
+            }
+            let cookie = match folder {
+                Some(folder) => dir.join(folder).join(".cookie"),
+                None => dir.join(".cookie"),
+            };
+            if let Some(cookie) = read_cookie(&cookie) {
+                return Some(cookie);
+            }
+        }
+    }
+    None
 }
 
 // #### PR #40
@@ -2011,6 +2117,56 @@ mod gbt_tests {
         let result = rpc_call(&endpoint, "getblockchaininfo", json!([])).unwrap();
         server.join().unwrap();
         assert_eq!(result.get("chain").and_then(Value::as_str), Some("main"));
+    }
+
+    // #### PR #42
+    // What: bitcoin.conf on this computer gives each network's RPC port and
+    // its rpcuser/rpcpassword (or else that network's cookie), for loopback
+    // targets only; a selected network's top-level rpcport applies to it.
+    // Look here if: conf_login or BchnConf changes.
+    #[test]
+    fn bitcoin_conf_gives_the_port_and_login_for_loopback_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-conf-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(dir.join("chipnet")).unwrap();
+        std::fs::write(
+            dir.join("bitcoin.conf"),
+            "server=1\nrpcuser=alice # the owner\nrpcpassword=secret\n[chip]\nrpcport=48555\n",
+        )
+        .unwrap();
+        let dirs = [dir.clone()];
+        let login = |url: &str| {
+            node_rpc_login(
+                &parse_node_rpc_target(url).unwrap(),
+                None,
+                None,
+                None,
+                &dirs,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            login("http://127.0.0.1:48555").as_deref(),
+            Some("alice:secret")
+        );
+        assert_eq!(
+            login("http://127.0.0.1:8332").as_deref(),
+            Some("alice:secret")
+        );
+        assert_eq!(login("http://192.168.0.5:48555"), None);
+        assert_eq!(login("http://127.0.0.1:48332"), None);
+        // chipnet=1 at the top level: its rpcport is Chipnet's, and without
+        // a password the Chipnet cookie answers.
+        std::fs::write(dir.join("bitcoin.conf"), "chipnet=1\nrpcport=48600\n").unwrap();
+        std::fs::write(dir.join("chipnet").join(".cookie"), "__cookie__:22cc").unwrap();
+        assert_eq!(
+            login("http://localhost:48600").as_deref(),
+            Some("__cookie__:22cc")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // #### PR #40

@@ -2191,3 +2191,28 @@ Evidence: host tests for the rows per mode, the port and rigs-only rows,
 the rig name and backup coordinators, the profiles (farm, rig, pool) kept
 and reopened and refused outside their mode, the launch each setup makes,
 the token donation row's minimum and steps, and the Advanced page's lines.
+
+## What else is on this computer, and bitcoin.conf logins (2026-10-10)
+
+#### PR #42
+
+Opening the setup's BCH node or Fulcrum list now also searches this computer
+(`src/node_find.rs`): each network's usual ports, at most ten (node RPC with
+who usually listens there, Electrum over TCP, WS and WSS, ZMQ), each tried
+once with a 300 ms connect. The node list shows what answered besides BCHN
+on its default port (a node on another port with its check, a Fulcrum
+server with its version and height, ZMQ block notices, not used yet); the
+Fulcrum list shows the Fulcrum servers. A node on this computer now logs in
+with BCHN's bitcoin.conf in its data folders: each network's RPC port
+(`[main]`, `[chip]`, or the top level for the network it selects) and its
+rpcuser and rpcpassword, or else that network's cookie; for loopback
+addresses only, read for each call, never kept or shown.
+
+Not yet: searching another computer, Tailscale peers and saved cookie
+files (S31).
+
+Evidence: host tests for the candidate ports, a Fulcrum server over TCP and
+a ZMQ publisher recognised (and a closed port not), a public host refused
+with a question, the bitcoin.conf logins (custom port, top-level selection,
+cookie fallback, never another computer), and the setup's lists showing
+what was found.
