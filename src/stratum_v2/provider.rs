@@ -17,7 +17,57 @@ pub trait NodeRpc {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String>;
 }
 
+/// #### PR #42: what kind of place templates come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A node over JSON-RPC (getblocktemplate).
+    NodeRpc,
+    /// An SV2 Template Provider (Template Distribution).
+    TemplateProvider,
+    /// #### PR #42: an ASIC-exclusive token's thread (`merge::source`).
+    Token,
+}
+
+/// #### PR #42: a place templates come from. The server's node thread works
+/// with the first and fails over across the rest in order.
+pub trait TemplateSource: Send {
+    fn kind(&self) -> SourceKind;
+    /// The template last refreshed, with this source's generation.
+    fn current(&self) -> Option<(u64, &BchTemplate)>;
+    /// Whether the current template still builds on the chain tip.
+    fn tip_is_current(&mut self) -> Result<bool, String>;
+    /// A fresh template; its generation changes when the template does.
+    fn refresh(&mut self) -> Result<(u64, &BchTemplate), String>;
+    /// Sends a saved whole block; `Accepted` only on an exact answer.
+    fn submit_saved(&mut self, pending: &PendingBlock) -> SubmissionOutcome;
+    /// Forgets its templates, as when the server moves to another source.
+    fn reset(&mut self);
+}
+
+impl<R: NodeRpc + Send> TemplateSource for TemplateProvider<R> {
+    fn kind(&self) -> SourceKind {
+        SourceKind::NodeRpc
+    }
+    fn current(&self) -> Option<(u64, &BchTemplate)> {
+        TemplateProvider::current(self)
+    }
+    fn tip_is_current(&mut self) -> Result<bool, String> {
+        TemplateProvider::tip_is_current(self)
+    }
+    fn refresh(&mut self) -> Result<(u64, &BchTemplate), String> {
+        TemplateProvider::refresh(self)
+    }
+    fn submit_saved(&mut self, pending: &PendingBlock) -> SubmissionOutcome {
+        TemplateProvider::submit_saved(self, pending)
+    }
+    fn reset(&mut self) {
+        self.current = None;
+        self.previous.clear();
+    }
+}
+
 // Deliberately no Debug: endpoints may contain locally supplied credentials.
+#[derive(Clone)]
 pub struct NativeNodeRpc {
     endpoint: String,
 }
@@ -57,6 +107,8 @@ pub struct TemplateProvider<R> {
     generation: u64,
     current: Option<BchTemplate>,
     previous: VecDeque<(u64, BchTemplate)>,
+    /// #### PR #42: the node's fork block was checked (once per node).
+    chain_proven: bool,
 }
 
 impl<R: NodeRpc> TemplateProvider<R> {
@@ -67,6 +119,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
             generation: 0,
             current: None,
             previous: VecDeque::new(),
+            chain_proven: false,
         }
     }
 
@@ -79,6 +132,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
         std::mem::swap(&mut self.rpc, node);
         self.current = None;
         self.previous.clear();
+        self.chain_proven = false;
     }
 
     pub fn current(&self) -> Option<(u64, &BchTemplate)> {
@@ -251,7 +305,22 @@ impl<R: NodeRpc> TemplateProvider<R> {
         if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("node returned an invalid tip hash".into());
         }
-        Ok((height, hash.to_ascii_lowercase()))
+        let hash = hash.to_ascii_lowercase();
+        // #### PR #42: a BTC or testnet4 node reports the same chain name;
+        // its block at the fork height is another (checked once per node; a
+        // node below that height cannot be told yet).
+        let (fork, expected) = self.network.fork_block();
+        if !self.chain_proven && height >= u64::from(fork) {
+            let block = self.rpc.call("getblockhash", json!([fork]))?;
+            if !block
+                .as_str()
+                .is_some_and(|block| block.eq_ignore_ascii_case(expected))
+            {
+                return Err(format!("node is on {}", self.network.foreign_chain()));
+            }
+            self.chain_proven = true;
+        }
+        Ok((height, hash))
     }
 }
 
@@ -286,6 +355,47 @@ mod durable_tests {
     }
     fn tip() -> Value {
         json!({"chain":"chip","blocks":42,"headers":42,"bestblockhash":"ab".repeat(32),"initialblockdownload":false})
+    }
+
+    // #### PR #42
+    // What: a node past the fork height whose block there is not the
+    // network's fork block is refused ("testnet4, not Chipnet"; on mainnet
+    // "Bitcoin (BTC), not Bitcoin Cash"); the right block is asked once per
+    // node, and again after the node is replaced.
+    // Look here if: the fork-block check changes.
+    #[test]
+    fn a_node_with_another_fork_block_is_refused() {
+        let synced = json!({"chain":"chip","blocks":325_908,"headers":325_908,
+            "bestblockhash":"ab".repeat(32),"initialblockdownload":false});
+        let (_, chipnet) = MiningNetwork::Chipnet.fork_block();
+        let calls = VecDeque::from([
+            ("getblockchaininfo", Ok(synced.clone())),
+            (
+                "getblockhash",
+                Ok(json!("00000000ae25e85d".to_owned() + &"0".repeat(48))),
+            ),
+        ]);
+        let mut provider = TemplateProvider::new(Rpc(calls), MiningNetwork::Chipnet);
+        let error = provider.refresh().unwrap_err();
+        assert!(error.contains("testnet4, not Chipnet"), "{error}");
+        let calls = VecDeque::from([
+            ("getblockchaininfo", Ok(synced.clone())),
+            ("getblockhash", Ok(json!(chipnet))),
+            (
+                "getblocktemplate",
+                Ok(super::super::template_tests::rpc_template()),
+            ),
+            ("getblockchaininfo", Ok(synced.clone())),
+        ]);
+        let mut provider = TemplateProvider::new(Rpc(calls), MiningNetwork::Chipnet);
+        provider.refresh().unwrap();
+        assert!(provider.chain_proven);
+        let mut other = Rpc(VecDeque::new());
+        provider.replace_node(&mut other);
+        assert!(!provider.chain_proven);
+        assert!(MiningNetwork::Mainnet
+            .foreign_chain()
+            .starts_with("Bitcoin (BTC)"));
     }
 
     #[test]

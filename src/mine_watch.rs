@@ -75,6 +75,65 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         .and_then(|rigs| rigs.get("rate"))
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    // #### PR #42: a rig's own status: its coordinator and its GPUs.
+    if status.get("role").and_then(Value::as_str) == Some("rig") {
+        let header = format!(
+            "Rig of {}{} · {} · {} · winners sent {} · {freshness}",
+            status
+                .get("coordinator")
+                .and_then(Value::as_str)
+                .unwrap_or("no coordinator yet"),
+            if status.get("backup").and_then(Value::as_bool) == Some(true) {
+                " (backup)"
+            } else {
+                ""
+            },
+            status
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("waiting"),
+            rate(status.get("current_rate")),
+            number(status, "verified_winners"),
+        );
+        let rows = status
+            .get("gpus")
+            .and_then(Value::as_array)
+            .map(|gpus| {
+                gpus.iter()
+                    .map(|gpu| {
+                        let telemetry = gpu.get("gpu_telemetry").unwrap_or(&Value::Null);
+                        let reading = |key: &str| telemetry.get(key).and_then(Value::as_f64);
+                        let health = crate::rigs::RigGpu {
+                            temperature_c: reading("temperature_c"),
+                            fan_percent: reading("fan_percent"),
+                            power_watts: reading("power_watts"),
+                            ..Default::default()
+                        };
+                        [
+                            gpu.get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("GPU")
+                                .to_owned(),
+                            gpu.get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("—")
+                                .to_owned(),
+                            rate(gpu.get("active_rate")),
+                            number(gpu, "winners").to_string(),
+                            gpu.get("last_error")
+                                .and_then(Value::as_str)
+                                .map_or_else(|| health.health(), str::to_owned),
+                        ]
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (
+            header,
+            rows,
+            ["GPU", "Status", "Rate", "Winners", "Health / error"],
+        );
+    }
     let mut header = format!(
         "PHOTON · {} · Height {} · {} · Winners {} (rejected {}) · Source {} · {freshness}",
         status
@@ -85,9 +144,14 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         crate::telemetry::format_hash_rate(own + farm),
         number(status, "verified_winners"),
         number(status, "rejected_winners"),
+        // #### PR #42: the job source's label (your node, Fulcrum, or
+        // Fulcrum while the node is down); older status files name the
+        // endpoint.
         status
-            .get("endpoint")
+            .get("job_source")
+            .and_then(|source| source.get("label"))
             .and_then(Value::as_str)
+            .or_else(|| status.get("endpoint").and_then(Value::as_str))
             .unwrap_or("—"),
     );
     let Some(rigs) = rigs else {
@@ -135,14 +199,16 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         number(rigs, "rejected"),
         rigs.get("listen").and_then(Value::as_str).unwrap_or("—"),
     ));
+    // #### PR #42: each rig, then its GPUs: status, rate, winners and
+    // health (or the error).
     let rows = rigs
         .get("rigs")
         .and_then(Value::as_array)
         .map(|each| {
             each.iter()
-                .map(|rig| {
+                .flat_map(|rig| {
                     let connected = number(rig, "connected_secs") + age;
-                    [
+                    let row = [
                         rig.get("name")
                             .and_then(Value::as_str)
                             .unwrap_or("rig")
@@ -151,7 +217,30 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
                         rate(rig.get("rate")),
                         number(rig, "winners").to_string(),
                         format!("{}m", connected / 60),
-                    ]
+                    ];
+                    let gpus = rig
+                        .get("devices")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|gpu| {
+                            let health = serde_json::from_value::<crate::rigs::RigGpu>(gpu)
+                                .map(crate::rigs::RigGpu::cleaned)
+                                .unwrap_or_default();
+                            let mut winners = health.winners.to_string();
+                            if health.rejected > 0 {
+                                winners.push_str(&format!(" ({} rejected)", health.rejected));
+                            }
+                            [
+                                format!("  {}", health.name),
+                                health.status.clone(),
+                                crate::telemetry::format_hash_rate(health.rate),
+                                winners,
+                                health.error.clone().unwrap_or_else(|| health.health()),
+                            ]
+                        });
+                    std::iter::once(row).chain(gpus).collect::<Vec<_>>()
                 })
                 .collect()
         })
@@ -159,7 +248,13 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
     (
         header,
         rows,
-        ["Rig", "GPUs", "Rate", "Winners", "Connected"],
+        [
+            "Rig / GPU",
+            "GPUs / status",
+            "Rate",
+            "Winners",
+            "Connected / health",
+        ],
     )
 }
 
@@ -257,7 +352,9 @@ mod tests {
                 "rigs": {"listen": "0.0.0.0:3340", "connected": 2, "gpus": 2,
                     "rate": 1.55e9, "winners": 95, "rejected": 0,
                     "rigs": [{"name": "pool-test-nvidia", "gpus": 1, "rate": 1.52e9,
-                        "winners": 94, "connected_secs": 600}]},
+                        "winners": 94, "connected_secs": 600,
+                        "devices": [{"name": "RTX 3080", "status": "mining", "rate": 1.52e9,
+                            "temperature_c": 61.0, "fan_percent": 40.0, "winners": 94}]}]},
             }),
         );
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -275,10 +372,14 @@ mod tests {
         ] {
             assert!(header.contains(part), "{part}: {header}");
         }
-        assert_eq!(titles[0], "Rig");
+        assert_eq!(titles[0], "Rig / GPU");
         assert_eq!(rows[0][0], "pool-test-nvidia");
         assert_eq!(rows[0][3], "94");
         assert_eq!(rows[0][4], "10m");
+        // #### PR #42: the rig's GPU under it, with its health.
+        assert_eq!(rows[1][0], "  RTX 3080");
+        assert_eq!(rows[1][1], "mining");
+        assert_eq!(rows[1][4], "61°C · fan 40%");
         // A stale status says so, and connected times count on.
         let (header, rows, _) = view(&saved, now + 60);
         assert!(header.contains("Miner not updating"), "{header}");
@@ -292,6 +393,44 @@ mod tests {
         assert_eq!(
             (titles[0], rows[0][0].as_str(), rows[0][3].as_str()),
             ("GPU", "RTX", "3")
+        );
+        // #### PR #42: a rig's own status names its coordinator and lists
+        // its GPUs.
+        let rig = crate::rigs::rig_status_json(
+            Some(("192.0.2.1:3340", false)),
+            true,
+            1.52e9,
+            12,
+            now - 600,
+            &[crate::rigs::RigGpu {
+                name: "RTX 3080".into(),
+                status: "mining".into(),
+                rate: 1.52e9,
+                temperature_c: Some(61.0),
+                winners: 12,
+                ..Default::default()
+            }],
+        );
+        let mut rig = rig;
+        rig["updated"] = now.into();
+        let (header, rows, titles) = view(&rig, now);
+        assert!(
+            header.starts_with("Rig of 192.0.2.1:3340 · mining · 1.52 GH/s · winners sent 12"),
+            "{header}"
+        );
+        assert_eq!(titles[0], "GPU");
+        assert_eq!(rows[0][0], "RTX 3080");
+        assert_eq!(rows[0][4], "61°C");
+        // #### PR #42: the job source's label, rather than its endpoint.
+        let (header, _, _) = view(
+            &json!({"state": "mining", "updated": now, "endpoint": "wss://f.example",
+                "job_source": {"kind": "fulcrum-node-down",
+                    "label": "Fulcrum (node down 4m, next try in 25s)"}}),
+            now,
+        );
+        assert!(
+            header.contains("Source Fulcrum (node down 4m, next try in 25s)"),
+            "{header}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

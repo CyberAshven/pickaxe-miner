@@ -744,6 +744,9 @@ fn runtime_config_from_cli_with_base(
     if let Some(url) = &args.node_rpc {
         cfg.set_node_url(url)?;
     }
+    if let Some(value) = &args.node_zmq {
+        cfg.set_node_zmq(value)?;
+    }
     if let Some(source) = &args.source {
         cfg.set_source(source)?;
     }
@@ -840,6 +843,13 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             runtime::RuntimeEvent::Error(error) => {
                 serde_json::json!({"event": "error", "error": error})
             }
+            // #### PR #42: the node down and back, its address redacted.
+            runtime::RuntimeEvent::NodeDown { reason } => {
+                serde_json::json!({"event": "node_down", "reason": reason})
+            }
+            runtime::RuntimeEvent::NodeBack { endpoint } => {
+                serde_json::json!({"event": "node_back", "endpoint": redact_url(&endpoint)})
+            }
         };
         println!("{value}");
         return;
@@ -897,6 +907,13 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             println!("direct reward accepted: tx={txid}")
         }
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
+        // #### PR #42
+        runtime::RuntimeEvent::NodeDown { reason } => {
+            eprintln!("your node is not the PHOTON source; mining from Fulcrum: {reason}")
+        }
+        runtime::RuntimeEvent::NodeBack { endpoint } => {
+            eprintln!("back on your node: {}", redact_url(&endpoint))
+        }
     }
 }
 
@@ -913,6 +930,9 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
             serde_json::json!({
                 "backend": gpu.backend.as_str(),
                 "device": gpu.device,
+                // #### PR #42: for farm systems, which match GPUs by bus.
+                "pci_bus": gpu.pci.map(|pci| pci.bus),
+                "rejected": search.rejected_winners,
                 "name": gpu.name,
                 "status": gpu_status_name(search.status),
                 "candidates": search.candidates,
@@ -937,6 +957,11 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
                     "rate": rig.rate,
                     "winners": rig.winners,
                     "connected_secs": rig.connected_secs,
+                    // #### PR #42: when it was last heard, its version and
+                    // each GPU's health.
+                    "last_seen_secs": rig.last_seen_secs,
+                    "version": rig.version,
+                    "devices": rig.devices,
                 })
             })
             .collect();
@@ -951,7 +976,7 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
             "rigs": each,
         })
     });
-    serde_json::json!({
+    let mut status = serde_json::json!({
         "event": "status",
         "state": format!("{:?}", snapshot.state).to_ascii_lowercase(),
         "waiting_for_job": snapshot.search.waiting_for_job,
@@ -959,6 +984,8 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "device": snapshot.gpu_device,
         "generation_id": snapshot.generation_id,
         "endpoint": redact_url(&snapshot.endpoint),
+        // #### PR #42: where jobs come from, and why the node is skipped.
+        "job_source": job_source_json(&snapshot.job_source),
         "height": snapshot.height,
         "baton_txid": snapshot.baton_txid,
         "baton_vout": snapshot.baton_vout,
@@ -991,7 +1018,37 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "gpu_efficiency_candidates_per_watt": efficiency,
         "gpus": gpus,
         "rigs": rigs,
-    })
+    });
+    // #### PR #42: the status contract farm systems read (set apart from
+    // the macro above, which is at its recursion limit).
+    status["role"] = if snapshot.rigs.is_some() {
+        "coordinator"
+    } else {
+        "miner"
+    }
+    .into();
+    status["version"] = env!("CARGO_PKG_VERSION").into();
+    status["started"] = snapshot.started_at.into();
+    status
+}
+
+/// #### PR #42: the job source for the status file: its kind, its label,
+/// and while the node is down how long, the next try and why.
+fn job_source_json(source: &pickaxe_miner::job_source::JobSourceStatus) -> serde_json::Value {
+    let mut value = serde_json::json!({"kind": source.kind(), "label": source.label()});
+    if let pickaxe_miner::job_source::JobSourceStatus::FulcrumNodeDown {
+        down_secs,
+        next_try_secs,
+        trouble,
+        reason,
+    } = source
+    {
+        value["down_secs"] = (*down_secs).into();
+        value["next_try_secs"] = (*next_try_secs).into();
+        value["trouble"] = trouble.label().into();
+        value["reason"] = reason.clone().into();
+    }
+    value
 }
 
 /// Lower-case name of one GPU's mining status.
@@ -1237,6 +1294,7 @@ fn run_as_rig(
     gpus: &[backend::GpuDevice],
     intensity: u8,
     json: bool,
+    status: Option<&std::path::Path>,
 ) {
     let result = (|| {
         let _gpu_lock = mining_lock::acquire_gpu_lock()?;
@@ -1252,12 +1310,57 @@ fn run_as_rig(
             intensity,
             json,
             stop,
+            status,
         )
     })();
     if let Err(error) = result {
         eprintln!("error: {error}");
         exit_after_error(1);
     }
+}
+
+// #### PR #42: the one-line coordinator
+// What: a rig's coordinator is `HOST:PORT` with the next --coordinator-key,
+// or the one line `stratum2+tcp://HOST:PORT/KEY` with its key in it (as
+// Connection info shows and farm systems pass it).
+// Why: one argument is easier for farm systems and copy-paste.
+// Look here if: a rig refuses a coordinator's address.
+/// Each coordinator with its key, in order.
+fn coordinators(addresses: &[String], keys: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut keys = keys.iter();
+    let mut paired = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let (address, key) = stratum_v2::split_pool_address(address)?;
+        let key = match key {
+            Some(key) => key,
+            None => keys.next().cloned().ok_or(
+                "give one --coordinator-key for each --coordinator, in the same order (or \
+                 stratum2+tcp://HOST:PORT/KEY)",
+            )?,
+        };
+        paired.push((address, key));
+    }
+    if keys.next().is_some() {
+        return Err("give one --coordinator-key for each --coordinator, in the same order".into());
+    }
+    Ok(paired)
+}
+
+/// #### PR #42: whether a start from a Linux desktop without a terminal
+/// reopens in one: never for a headless run (`--no-tui`, `--json`) or a
+/// farm system's (`farm-os`), which may run without a terminal while the
+/// desktop is up.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn should_relaunch(
+    args: &[std::ffi::OsString],
+    stdin_tty: bool,
+    stdout_tty: bool,
+    desktop: bool,
+) -> bool {
+    let headless = args
+        .iter()
+        .any(|arg| arg == "--no-tui" || arg == "--json" || arg == "farm-os");
+    !stdin_tty && !stdout_tty && desktop && !headless
 }
 
 /// Exits after an error, keeping a console opened just for the miner open.
@@ -1296,17 +1399,19 @@ fn relaunch_in_terminal() {
     use std::io::IsTerminal;
     let desktop =
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
-    if std::io::stdin().is_terminal()
-        || std::io::stdout().is_terminal()
-        || std::env::var_os(TERMINAL_RELAUNCH_ENV).is_some()
-        || !desktop
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if !should_relaunch(
+        &args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        desktop,
+    ) || std::env::var_os(TERMINAL_RELAUNCH_ENV).is_some()
     {
         return;
     }
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     // Each terminal with the arguments that precede the command it runs.
     const TERMINALS: [(&str, &[&str]); 9] = [
         ("x-terminal-emulator", &["-e"]),
@@ -1350,6 +1455,13 @@ fn main() {
             exit_after_error(2);
         }
     };
+    // #### PR #42: the cookie files saved for nodes (Knuth's, a custom data
+    // folder's), for every command that logs in to a node.
+    let node_cookies_path = config::node_cookies_path(&config_path);
+    match config::NodeCookies::load_optional(&node_cookies_path) {
+        Ok(cookies) => node::set_cookie_files(cookies.entries()),
+        Err(error) => eprintln!("warning: {error}; the saved cookie files are not used"),
+    }
     let mut effective_backend = "auto".to_string();
     let mut effective_device = backend::DeviceSelection::Default;
     let mut include_integrated = args.include_integrated;
@@ -1398,6 +1510,29 @@ fn main() {
                 eprintln!("error: {error}");
                 exit_after_error(1);
             }
+        }
+        // #### PR #42: a farm system's statistics, from the status file.
+        cli::Commands::FarmOs {
+            command: cli::FarmOsCommand::Stats { os },
+        } => {
+            let status = std::fs::read_to_string(mine_watch::status_path(&config_path))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            println!(
+                "{}",
+                pickaxe_miner::farm_os::stats(os, status.as_ref(), now)
+            );
+        }
+        cli::Commands::FarmOs {
+            command: cli::FarmOsCommand::Mine { .. },
+        } => {
+            eprintln!(
+                "error: run it first on the line: pickaxe farm-os mine --pool ... --user ..."
+            );
+            exit_after_error(2);
         }
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {
@@ -1520,8 +1655,14 @@ fn main() {
             }
             action => {
                 #[cfg(feature = "stratum-v2")]
-                let result =
-                    stratum_v2::command::run(action, &cfg, &config_path, args.no_tui, args.json);
+                let result = stratum_v2::command::run(
+                    action,
+                    &cfg,
+                    &config_path,
+                    args.no_tui,
+                    args.json,
+                    None,
+                );
                 #[cfg(not(feature = "stratum-v2"))]
                 let result: Result<(), String> = {
                     let _ = action;
@@ -1610,18 +1751,14 @@ fn main() {
             // A rig mines its coordinator's jobs: no setup, payout, Fulcrum or
             // node of its own, and it never claims; the coordinator does.
             if !args.coordinator.is_empty() {
-                if args.coordinator.len() != args.coordinator_key.len() {
-                    eprintln!(
-                        "error: give one --coordinator-key for each --coordinator, in the same order"
-                    );
-                    exit_after_error(2);
-                }
-                let coordinators: Vec<(String, String)> = args
-                    .coordinator
-                    .iter()
-                    .cloned()
-                    .zip(args.coordinator_key.iter().cloned())
-                    .collect();
+                // #### PR #42: one-line addresses carry their key.
+                let coordinators = match coordinators(&args.coordinator, &args.coordinator_key) {
+                    Ok(coordinators) => coordinators,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        exit_after_error(2);
+                    }
+                };
                 run_as_rig(
                     &coordinators,
                     args.rig_name.as_deref(),
@@ -1629,6 +1766,7 @@ fn main() {
                     &selected_gpus,
                     cfg.intensity,
                     args.json,
+                    Some(&mine_watch::status_path(&config_path)),
                 );
                 return;
             }
@@ -1704,6 +1842,7 @@ fn main() {
                         profiles,
                         &sources_path,
                         sources,
+                        &node_cookies_path,
                         overrides,
                     ) {
                         Ok(Some(setup)) => setup,
@@ -1720,29 +1859,41 @@ fn main() {
                     // --rigs-public` would.
                     // #### PR #40: Join a GPU pool or farm: these GPUs mine as a
                     // rig of its coordinator, as `--coordinator` does.
-                    if let Some(tui::ServerSetup::JoinGpuPool { address, key }) =
-                        setup.server.clone()
-                    {
+                    // #### PR #42: the backup coordinators, the rig's name and
+                    // the rigs' port from the Advanced section
+                    // (`tui::gpu_launch`).
+                    let launch = tui::gpu_launch(setup.server.as_ref(), &setup.options);
+                    if let Some(tui::GpuLaunch::Rig { coordinators, name }) = &launch {
                         println!(
-                            "Mining as a rig of {address} on {} GPU(s); Ctrl+C stops.",
+                            "Mining as a rig of {} on {} GPU(s); Ctrl+C stops.",
+                            coordinators[0].0,
                             setup.gpus.len()
                         );
                         run_as_rig(
-                            &[(address, key)],
-                            None,
+                            coordinators,
+                            name.as_deref(),
                             &setup.config.payout_address,
                             &setup.gpus,
                             setup.config.intensity,
                             false,
+                            Some(&mine_watch::status_path(&config_path)),
                         );
                         return;
                     }
-                    if let Some(tui::ServerSetup::GpuPool { fee, address }) = setup.server.clone() {
-                        rigs_listen = Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3340)));
-                        rigs_public = true;
-                        rigs_fee = Some(fee);
-                        rigs_fee_address = address;
-                        (setup.config, Vec::new(), Some(setup.profile_name))
+                    if let Some(tui::GpuLaunch::Rigs {
+                        port,
+                        public,
+                        rigs_only,
+                    }) = launch
+                    {
+                        rigs_listen = Some(std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+                        if let Some((fee, address)) = public {
+                            rigs_public = true;
+                            rigs_fee = Some(fee);
+                            rigs_fee_address = address;
+                        }
+                        let gpus = if rigs_only { Vec::new() } else { setup.gpus };
+                        (setup.config, gpus, Some(setup.profile_name))
                     } else {
                         // #### PR #40
                         // ASIC mode from setup runs the BCH ASIC server for devices
@@ -1750,55 +1901,31 @@ fn main() {
                         // on the miner's node, at someone's pool, or as a public
                         // pool for other miners.
                         if let Some(server) = setup.server.clone() {
-                            let mut pool_tag = None;
-                            let (
-                                upstream,
-                                upstream_key,
-                                public,
-                                pool_fee,
-                                pool_fee_mode,
-                                pool_fee_address,
-                            ) = match server {
-                                tui::ServerSetup::Solo => {
-                                    (Vec::new(), Vec::new(), false, None, None, None)
-                                }
-                                tui::ServerSetup::JoinPool { address, key } => {
-                                    (vec![address], vec![key], false, None, None, None)
-                                }
-                                tui::ServerSetup::Public {
-                                    fee,
-                                    mode,
-                                    address,
-                                    tag,
-                                } => {
-                                    pool_tag = tag;
-                                    (Vec::new(), Vec::new(), true, Some(fee), Some(mode), address)
-                                }
+                            // #### PR #42: the command the setup's rows
+                            // make, with the Advanced section's values
+                            // (see `tui::asic_serve_command`).
+                            let Some(action) = tui::asic_serve_command(&server, &setup.options)
+                            else {
                                 // Started above, as a GPU coordinator or rig.
-                                tui::ServerSetup::GpuPool { .. }
-                                | tui::ServerSetup::JoinGpuPool { .. } => unreachable!(),
+                                unreachable!()
                             };
-                            let action = cli::StratumV2Command::Serve {
-                                listen: std::net::SocketAddr::from(([0, 0, 0, 0], 3336)),
-                                sv1_listen: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3333))),
-                                donation: None,
-                                upstream,
-                                upstream_key,
-                                upstream_user: None,
-                                public,
-                                pool_fee,
-                                pool_fee_mode,
-                                pool_fee_address,
-                                pool_tag,
-                                start_difficulty: None,
-                            };
+                            // #### PR #42: the profile's ZMQ block notices,
+                            // unless the command line names its own.
+                            let mut run_config = setup.config.clone();
+                            if let (None, Some(value)) = (&args.node_zmq, &setup.options.node_zmq) {
+                                if let Err(error) = run_config.set_node_zmq(value) {
+                                    eprintln!("error: {error}");
+                                    exit_after_error(2);
+                                }
+                            }
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(
                                 action,
-                                &setup.config,
+                                &run_config,
                                 &config_path,
                                 false,
                                 false,
+                                Some(&setup.profile_name),
                             );
                             #[cfg(not(feature = "stratum-v2"))]
                             let result: Result<(), String> = {
@@ -2107,6 +2234,66 @@ mod tests {
         assert!(workflow.contains("--repo \"${GH_REPO}\""));
     }
 
+    // #### PR #42
+    // What: a coordinator's one-line address carries its key; a bare
+    // HOST:PORT takes the next --coordinator-key, in order; a missing or
+    // leftover key is refused.
+    // Look here if: coordinators changes.
+    #[test]
+    fn coordinators_pair_one_line_and_separate_keys() {
+        let strings = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            coordinators(
+                &strings(&["stratum2+tcp://192.0.2.1:3340/KEY1", "192.0.2.2:3340"]),
+                &strings(&["KEY2"])
+            )
+            .unwrap(),
+            vec![
+                ("192.0.2.1:3340".to_owned(), "KEY1".to_owned()),
+                ("192.0.2.2:3340".to_owned(), "KEY2".to_owned())
+            ]
+        );
+        assert!(coordinators(&strings(&["192.0.2.2:3340"]), &[]).is_err());
+        assert!(coordinators(
+            &strings(&["stratum2+tcp://192.0.2.1:3340/KEY1"]),
+            &strings(&["LEFT"])
+        )
+        .is_err());
+        assert!(coordinators(&strings(&["stratum+tcp://pool:3333"]), &[]).is_err());
+    }
+
+    // #### PR #42
+    // What: only a start from a desktop with neither stdin nor stdout a
+    // terminal reopens in one, and never a headless or farm system's run.
+    // Look here if: should_relaunch changes.
+    #[test]
+    fn headless_runs_never_relaunch_in_a_terminal() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(should_relaunch(&args(&["mine"]), false, false, true));
+        assert!(!should_relaunch(&args(&["mine"]), true, false, true));
+        assert!(!should_relaunch(&args(&["mine"]), false, false, false));
+        for headless in [
+            &["mine", "--no-tui"][..],
+            &["mine", "--json"][..],
+            &["farm-os", "mine", "--pool", "x"][..],
+        ] {
+            assert!(
+                !should_relaunch(&args(headless), false, false, true),
+                "{headless:?}"
+            );
+        }
+    }
+
     #[test]
     fn startup_enters_setup_by_default() {
         let args = cli::Cli::try_parse_from(["pickaxe", "mine"]).unwrap();
@@ -2131,12 +2318,14 @@ mod tests {
                     device: 0,
                     name: "NVIDIA GeForce RTX 5070 Ti Laptop GPU".into(),
                     telemetry: telemetry::GpuTelemetry::default(),
+                    pci: None,
                 },
                 runtime::RuntimeGpu {
                     backend: backend::BackendKind::Wgpu,
                     device: 1,
                     name: "AMD Radeon(TM) 610M".into(),
                     telemetry: telemetry::GpuTelemetry::default(),
+                    pci: None,
                 },
             ],
             generation_id: 2,
@@ -2188,6 +2377,7 @@ mod tests {
                         rate: 60_000.0,
                         active_rate: 2_400_000_000.0,
                         winners: 0,
+                        rejected_winners: 0,
                         status: search::GpuStatus::Mining,
                         last_error: None,
                     },
@@ -2198,6 +2388,7 @@ mod tests {
                         rate: 5_536.0,
                         active_rate: 30_000_000.0,
                         winners: 0,
+                        rejected_winners: 0,
                         status: search::GpuStatus::Recovering,
                         last_error: Some("device lost".into()),
                     },
@@ -2214,6 +2405,8 @@ mod tests {
                 fan_percent: None,
             },
             rigs: None,
+            job_source: Default::default(),
+            started_at: 0,
             token_donation: pickaxe_miner::donation::TokenDonation::from_bps(400),
             donation_minimum: pickaxe_miner::donation::TokenDonation::from_bps(400),
         };
@@ -2248,6 +2441,56 @@ mod tests {
             runtime_gpus_text(&snapshot),
             "cuda:0 2.40 GH/s mining; wgpu:1 30.00 MH/s recovering"
         );
+        // #### PR #42: the job source, with the node's trouble while it is
+        // down and never its address.
+        assert_eq!(status["job_source"]["kind"], "fulcrum");
+        // #### PR #42: the farm contract: role, version, start, and each
+        // GPU's bus (none known here) and rejected winners.
+        assert_eq!(status["role"], "miner");
+        assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(status["started"], 0);
+        assert!(status["gpus"][0]["pci_bus"].is_null());
+        assert_eq!(status["gpus"][1]["rejected"], 0);
+        let mut snapshot = snapshot;
+        snapshot.job_source = pickaxe_miner::job_source::JobSourceStatus::FulcrumNodeDown {
+            down_secs: 61,
+            next_try_secs: 29,
+            trouble: pickaxe_miner::job_source::NodeTrouble::Syncing,
+            reason: "the node is syncing".into(),
+        };
+        let status = runtime_snapshot_json(&snapshot);
+        assert_eq!(status["job_source"]["kind"], "fulcrum-node-down");
+        assert_eq!(
+            status["job_source"]["label"],
+            "Fulcrum (node syncing 1m, next try in 29s)"
+        );
+        assert_eq!(status["job_source"]["down_secs"], 61);
+        assert_eq!(status["job_source"]["trouble"], "syncing");
+        // #### PR #42: each rig's GPUs, when it was last heard and its
+        // version; no payout anywhere in the rigs.
+        snapshot.rigs = Some(pickaxe_miner::rigs::RigSummary {
+            rigs: vec![pickaxe_miner::rigs::RigLine {
+                name: "rack-1".into(),
+                last_seen_secs: 4,
+                version: "0.0.4".into(),
+                devices: vec![pickaxe_miner::rigs::RigGpu {
+                    name: "RTX 3080".into(),
+                    temperature_c: Some(61.0),
+                    status: "mining".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let status = runtime_snapshot_json(&snapshot);
+        assert_eq!(status["role"], "coordinator");
+        let rig = &status["rigs"]["rigs"][0];
+        assert_eq!(rig["last_seen_secs"], 4);
+        assert_eq!(rig["version"], "0.0.4");
+        assert_eq!(rig["devices"][0]["name"], "RTX 3080");
+        assert_eq!(rig["devices"][0]["temperature_c"], 61.0);
+        assert!(!status["rigs"].to_string().contains("payout"));
     }
 
     #[test]

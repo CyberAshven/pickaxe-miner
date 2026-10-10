@@ -44,6 +44,17 @@ pub struct Cli {
     #[arg(long = "node-rpc", alias = "node", global = true)]
     pub node_rpc: Option<String>,
 
+    /// #### PR #42: the node's ZMQ block notices for the ASIC server:
+    /// tcp://HOST:PORT (its zmqpubhashblock) on this computer or the home
+    /// network, `auto` (bitcoin.conf's, for a node on this computer; the
+    /// default) or `off`. A new block then reaches devices at once.
+    #[arg(long = "node-zmq", global = true, value_name = "URL")]
+    pub node_zmq: Option<String>,
+
+    /// Fulcrum servers for PHOTON jobs, comma-separated: wss:// or ws://,
+    /// or #### PR #42: a home server over plain TCP (tcp://HOST:PORT, such
+    /// as tcp://umbrel.local:50001), taken only on this computer or the home
+    /// network.
     #[arg(long, global = true)]
     pub fulcrum: Option<String>,
 
@@ -65,12 +76,13 @@ pub struct Cli {
     pub rigs_listen: Option<std::net::SocketAddr>,
 
     /// Mine as a rig of the coordinator at this address; it claims every win.
-    /// Repeat for backup coordinators, tried in order.
+    /// Repeat for backup coordinators, tried in order. #### PR #42: the
+    /// coordinator's one-line address, stratum2+tcp://HOST:PORT/KEY, carries
+    /// its key; a bare HOST:PORT takes the next --coordinator-key.
     #[arg(
         long,
         global = true,
         value_name = "HOST:PORT",
-        requires = "coordinator_key",
         conflicts_with = "rigs_listen",
         action = clap::ArgAction::Append
     )]
@@ -141,6 +153,14 @@ pub enum Commands {
     StratumV2 {
         #[command(subcommand)]
         command: StratumV2Command,
+    },
+    /// #### PR #42
+    /// For farm operating systems (HiveOS, mmpOS, RaveOS): their scripts run
+    /// `farm-os mine` with the flight sheet's fields and read
+    /// `farm-os stats` (see docs/farm.md).
+    FarmOs {
+        #[command(subcommand)]
+        command: FarmOsCommand,
     },
     #[command(hide = true)]
     Repl,
@@ -221,11 +241,179 @@ pub enum StratumV2Command {
         /// farms of fast ASICs; vardiff moves each device from there.
         #[arg(long, value_name = "DIFFICULTY", conflicts_with = "upstream")]
         start_difficulty: Option<u64>,
+        /// #### PR #42
+        /// Merge-mines the Chipnet test token at this share difficulty, to
+        /// try merge mining with real devices before any token exists;
+        /// refused on mainnet. With --upstream it needs --job-declaration
+        /// (the pool builds the blocks otherwise). Hidden: it is for tests.
+        #[arg(long, value_name = "DIFFICULTY", hide = true)]
+        merge_test_token: Option<u64>,
+        /// #### PR #42
+        /// Serve this node's block templates to SV2 pools, Job Declaration
+        /// clients and P2Pool (SV2 Template Distribution) at this address,
+        /// such as 0.0.0.0:8442 (mainnet) or 0.0.0.0:48442 (Chipnet), with
+        /// the mining listener's key. Off by default. Not with --upstream: a
+        /// pool's templates come from its own node.
+        #[arg(long, value_name = "ADDRESS", conflicts_with = "upstream")]
+        tp_listen: Option<std::net::SocketAddr>,
+        /// #### PR #42
+        /// Accept miners' own templates at this public pool (SV2 Job
+        /// Declaration) on the SV2 port: `full` checks each declared
+        /// template with your node and sends its blocks to your node too,
+        /// `coinbase` lets a miner set its own jobs without showing their
+        /// transactions, `both` (the flag alone) takes either. A miner's
+        /// coinbase must pay your fee and the Pickaxe donation in full. Off
+        /// by default.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            default_missing_value = "both",
+            requires = "public"
+        )]
+        accept_job_declaration: Option<AcceptJobDeclaration>,
+        /// #### PR #42
+        /// Mine at the first --upstream pool with your own node's templates
+        /// (SV2 Job Declaration), at a Pickaxe pool that accepts it: `full`
+        /// (the flag alone) declares each template with its transactions,
+        /// so the pool checks it and sends its blocks to its node too;
+        /// `coinbase` declares the coinbase only, and your node alone
+        /// submits the blocks. While the pool refuses them, devices mine the
+        /// pool's own jobs. Needs your node, like solo mining.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            default_missing_value = "full",
+            requires = "upstream"
+        )]
+        job_declaration: Option<JobDeclarationMode>,
+        /// #### PR #42
+        /// Take templates from an SV2 Template Provider, tried before your
+        /// node: sv2tp://HOST:PORT/KEY, such as another Pickaxe's
+        /// --tp-listen. Repeat for more, tried in order. The key may be left
+        /// out only for a provider on this computer.
+        #[arg(long, value_name = "URL")]
+        template_provider: Vec<String>,
+        /// #### PR #42
+        /// Solo mining with a pool to fall back on: SV1 devices mine at this
+        /// pool (stratum2+tcp://HOST:PORT/KEY) while your node gives no work,
+        /// and come back once it has served for 30 seconds. Repeat for more,
+        /// tried in order; the donation works there as at any pool. Needs
+        /// --sv1-listen; not with --upstream or --public.
+        #[arg(
+            long,
+            value_name = "ADDRESS",
+            requires = "sv1_listen",
+            conflicts_with_all = ["upstream", "public"]
+        )]
+        fallback_pool: Vec<String>,
+        /// #### PR #42
+        /// Mine an ASIC-exclusive token instead of BCH: devices mine its
+        /// header-shaped jobs, and no node is needed. Refused until a token
+        /// is registered on the network (none is yet).
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = [
+                "upstream",
+                "public",
+                "tp_listen",
+                "job_declaration",
+                "accept_job_declaration",
+                "merge_test_token",
+                "template_provider",
+                "fallback_pool",
+                "asic_test_token"
+            ]
+        )]
+        asic_token: Option<String>,
+        /// #### PR #42
+        /// Mines the Chipnet ASIC test token (SAFA layout, a simulated
+        /// thread) at this share difficulty instead of BCH, to try
+        /// ASIC-exclusive mining before any such token exists; refused on
+        /// mainnet. Hidden: it is for tests.
+        #[arg(
+            long,
+            value_name = "DIFFICULTY",
+            hide = true,
+            conflicts_with_all = [
+                "upstream",
+                "public",
+                "tp_listen",
+                "job_declaration",
+                "accept_job_declaration",
+                "merge_test_token",
+                "template_provider",
+                "fallback_pool"
+            ]
+        )]
+        asic_test_token: Option<u64>,
     },
 }
 
-/// Parses command-line arguments into the supported miner commands.
+/// #### PR #42: how a miner declares its templates to a pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum JobDeclarationMode {
+    /// Full-Template: each template with its transactions; the pool checks
+    /// it and sends its blocks to its node too.
+    Full,
+    /// Coinbase-only: custom jobs from tokens; the pool never sees the
+    /// transactions, and this node submits the blocks.
+    Coinbase,
+}
+
+/// #### PR #42: the Job Declaration modes a public pool accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum AcceptJobDeclaration {
+    /// Full-Template: a miner declares each template with its
+    /// transactions; the pool's node checks it and gets its blocks too.
+    Full,
+    /// Coinbase-only: a miner sets jobs from tokens the pool allocates; the
+    /// pool never sees their transactions, and the miner's node submits
+    /// their blocks.
+    Coinbase,
+    /// Either, as each miner asks.
+    Both,
+}
+
+/// #### PR #42: what a farm operating system's scripts run.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum FarmOsCommand {
+    /// Print the running miner's statistics in the system's format (from
+    /// the status file beside --config).
+    Stats {
+        #[arg(long)]
+        os: crate::farm_os::FarmOs,
+    },
+    /// Mine with the flight sheet's --pool, --user and --password (and
+    /// --coin, --api-port, --pool-protocol, which are ignored); other flags
+    /// pass through to `mine`.
+    Mine {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+/// Parses command-line arguments into the supported miner commands;
+/// #### PR #42: `farm-os mine ...` becomes Pickaxe's own `mine` first (see
+/// `farm_os::mine_argv`).
 pub fn parse() -> Cli {
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw.get(1).is_some_and(|arg| arg == "farm-os") && raw.get(2).is_some_and(|arg| arg == "mine")
+    {
+        let rest: Vec<String> = raw[3..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        match crate::farm_os::mine_argv(&rest) {
+            Ok(argv) => return Cli::parse_from(argv),
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
     Cli::parse()
 }
 
@@ -273,6 +461,38 @@ mod tests {
             })
         ));
         assert_eq!(save.config, Some(PathBuf::from("pickaxe.json")));
+    }
+
+    // #### PR #42
+    // What: the argv `farm-os mine` rewrites to parses as `mine`, headless,
+    // with the rig's coordinator and name; `farm-os stats --os` parses.
+    // Look here if: farm_os::mine_argv or the farm-os subcommand changes.
+    #[test]
+    fn the_rewritten_farm_command_parses_as_mine() {
+        let argv = crate::farm_os::mine_argv(&[
+            "--pool".into(),
+            "stratum2+tcp://192.0.2.1:3340/KEY".into(),
+            "--user".into(),
+            "bitcoincash:qp.rack-1".into(),
+            "--intensity".into(),
+            "90".into(),
+        ])
+        .unwrap();
+        let cli = Cli::try_parse_from(argv).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Mine)));
+        assert!(cli.no_tui);
+        assert_eq!(cli.coordinator, ["stratum2+tcp://192.0.2.1:3340/KEY"]);
+        assert_eq!(cli.rig_name.as_deref(), Some("rack-1"));
+        assert_eq!(cli.intensity, Some(90));
+        let stats = Cli::try_parse_from(["pickaxe", "farm-os", "stats", "--os", "hiveos"]).unwrap();
+        assert!(matches!(
+            stats.command,
+            Some(Commands::FarmOs {
+                command: FarmOsCommand::Stats {
+                    os: crate::farm_os::FarmOs::Hiveos
+                }
+            })
+        ));
     }
 
     #[test]
@@ -450,8 +670,10 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pickaxe", "mine", "--rigs-only", "--address", "payout"]).is_err()
         );
+        // #### PR #42: a bare address parses; the pairing with its key is
+        // checked when the rig starts (`coordinators` in main.rs).
         assert!(
-            Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_err()
+            Cli::try_parse_from(["pickaxe", "mine", "--coordinator", "192.0.2.1:3340"]).is_ok()
         );
         let cli =
             Cli::try_parse_from(["pickaxe", "mine", "--rigs-listen", "0.0.0.0:3340"]).unwrap();
@@ -514,6 +736,287 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    // #### PR #42
+    // What: --template-provider repeats, in order.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn template_providers_parse_in_order() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--template-provider",
+            "sv2tp://127.0.0.1:48442",
+            "--template-provider",
+            "sv2tp://tp.example:8442/KEY",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command: StratumV2Command::Serve {
+                template_provider, ..
+            },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(
+            template_provider,
+            ["sv2tp://127.0.0.1:48442", "sv2tp://tp.example:8442/KEY"]
+        );
+    }
+
+    // #### PR #42
+    // What: --tp-listen takes an address and cannot be used with --upstream,
+    // where the pool's templates come from its own node.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn tp_listen_serves_templates_and_conflicts_with_upstream() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--tp-listen",
+            "0.0.0.0:48442",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command: StratumV2Command::Serve { tp_listen, .. },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(tp_listen, Some("0.0.0.0:48442".parse().unwrap()));
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--tp-listen",
+            "0.0.0.0:48442",
+            "--upstream",
+            "stratum2+tcp://pool.example:3336/KEY",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+        ])
+        .is_err());
+    }
+
+    // #### PR #42
+    // What: --accept-job-declaration needs --public and alone means both;
+    // --job-declaration needs --upstream and alone means full.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn accepting_job_declaration_needs_a_public_pool() {
+        let cli = Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--public",
+            "--accept-job-declaration",
+            "coinbase",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command:
+                StratumV2Command::Serve {
+                    accept_job_declaration,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(accept_job_declaration, Some(AcceptJobDeclaration::Coinbase));
+        assert!(
+            Cli::try_parse_from([
+                "pickaxe",
+                "stratum-v2",
+                "serve",
+                "--job-declaration",
+                "coinbase",
+            ])
+            .is_err(),
+            "declaring templates needs a pool"
+        );
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--upstream",
+            "stratum2+tcp://pool.example:3336/KEY",
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--job-declaration",
+            "coinbase",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--accept-job-declaration",
+            "coinbase",
+        ])
+        .is_err());
+        let modes = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["pickaxe", "stratum-v2", "serve"]
+                    .iter()
+                    .chain(args)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let Some(Commands::StratumV2 {
+                command:
+                    StratumV2Command::Serve {
+                        accept_job_declaration,
+                        job_declaration,
+                        ..
+                    },
+            }) = cli.command
+            else {
+                panic!("serve options missing")
+            };
+            (accept_job_declaration, job_declaration)
+        };
+        assert_eq!(
+            modes(&["--public", "--accept-job-declaration"]),
+            (Some(AcceptJobDeclaration::Both), None)
+        );
+        assert_eq!(
+            modes(&["--public", "--accept-job-declaration", "full"]),
+            (Some(AcceptJobDeclaration::Full), None)
+        );
+        assert_eq!(
+            modes(&[
+                "--upstream",
+                "stratum2+tcp://pool.example:3336/KEY",
+                "--sv1-listen",
+                "0.0.0.0:3333",
+                "--job-declaration",
+            ]),
+            (None, Some(JobDeclarationMode::Full))
+        );
+    }
+
+    // #### PR #42
+    // What: --asic-test-token and --asic-token mine a token instead of BCH,
+    // so they conflict with joining or running a pool, serving templates,
+    // Job Declaration, the merge-mining test token, template providers and
+    // fallback pools.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn asic_tokens_exclude_bch_only_modes() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["pickaxe", "stratum-v2", "serve"]
+                    .iter()
+                    .chain(args)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(parse(&["--asic-test-token", "1000"]).is_ok());
+        assert!(parse(&["--asic-token", "SAFA"]).is_ok());
+        for other in [
+            &["--public"][..],
+            &["--merge-test-token", "1000"][..],
+            &["--tp-listen", "0.0.0.0:48442"][..],
+            &["--asic-token", "SAFA"][..],
+        ] {
+            let mut args = vec!["--asic-test-token", "1000"];
+            args.extend(other);
+            assert!(parse(&args).is_err(), "{other:?}");
+        }
+    }
+
+    // #### PR #42
+    // What: --merge-test-token parses with --upstream (the server refuses it
+    // there without --job-declaration) and with --upstream and
+    // --job-declaration together.
+    // Look here if: the merge-mining flags change.
+    #[test]
+    fn the_merge_test_token_may_ride_job_declaration() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "pickaxe",
+                    "stratum-v2",
+                    "serve",
+                    "--sv1-listen",
+                    "0.0.0.0:3333",
+                ]
+                .iter()
+                .chain(args)
+                .collect::<Vec<_>>(),
+            )
+        };
+        let upstream = ["--upstream", "stratum2+tcp://pool.example:3336/KEY"];
+        let mut args = upstream.to_vec();
+        args.extend(["--merge-test-token", "1000"]);
+        assert!(parse(&args).is_ok());
+        args.push("--job-declaration");
+        let cli = parse(&args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve {
+                    merge_test_token: Some(1000),
+                    job_declaration: Some(JobDeclarationMode::Full),
+                    ..
+                }
+            })
+        ));
+    }
+
+    // #### PR #42
+    // What: --fallback-pool needs --sv1-listen, repeats in order, and
+    // conflicts with --upstream and --public.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn fallback_pools_need_sv1_listen_and_conflict_with_upstream_and_public() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["pickaxe", "stratum-v2", "serve"]
+                    .iter()
+                    .chain(args)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let cli = parse(&[
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+            "--fallback-pool",
+            "stratum2+tcp://b.example:3336/KEY",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command: StratumV2Command::Serve { fallback_pool, .. },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(fallback_pool.len(), 2);
+        assert!(parse(&["--fallback-pool", "stratum2+tcp://a.example:3336/KEY"]).is_err());
+        assert!(parse(&[
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--upstream",
+            "stratum2+tcp://pool.example:3336/KEY",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--public",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+        ])
+        .is_err());
     }
 
     // #### PR #40

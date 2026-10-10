@@ -47,9 +47,11 @@ pub fn status_report() -> String {
          bch: CTOR={ctor} no_segwit={no_segwit} ASERT={asert} CashAddr={cashaddr} adaptive_size={adaptive}\n\
          first_network: {network}\n\
          design: {design}\n\
-         available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates, optional SV1 adapter)\n\
+         available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates, optional SV1 adapter, templates from SV2 Template Providers with --template-provider, optional template server for SV2 pools with --tp-listen, Job Declaration (Full-Template and Coinbase-only) at a public pool with --accept-job-declaration, and at a Pickaxe pool with --job-declaration)\n\
          validation: local TCP/CPU experiments; live Chipnet and ASIC validation pending\n\
-         pending: physical ASIC validation, vardiff/device rates, Knuth TP, distributed rigs and pool routing\n\
+         merge mining: commitment v1 (draft), both cases in one coinbase; no token registered (Chipnet test token for tests)\n\
+         asic-exclusive tokens: SAFA layout v1 (draft), none registered (Chipnet ASIC test token for tests)\n\
+         pending: physical ASIC validation, vardiff/device rates, merge-mined tokens under Job Declaration, distributed rigs and pool routing\n\
          evidence: docs/implementation-status.md\n",
         feature = status.feature,
         crates = if status.reference_crates_linked {
@@ -89,8 +91,10 @@ mod tests {
     }
 
     #[test]
-    fn default_status_lists_three_roles() {
-        assert_eq!(StratumV2Status::default().roles.len(), 3);
+    fn default_status_lists_six_roles() {
+        assert_eq!(StratumV2Status::default().roles.len(), 6);
+        assert!(status_report().contains("template_provider_server"));
+        assert!(status_report().contains("job_declarator_server"));
     }
 
     #[test]

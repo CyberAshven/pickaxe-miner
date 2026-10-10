@@ -28,6 +28,9 @@ pub struct RigSummary {
     pub rigs: Vec<RigLine>,
     /// #### PR #40: a public GPU pool, where each rig names its payout.
     pub public: bool,
+    /// #### PR #42: a public pool's fee in hundredths of a percent of each
+    /// rig's mining time.
+    pub fee_bps: Option<u16>,
 }
 
 /// #### PR #40
@@ -79,7 +82,180 @@ pub struct RigLine {
     pub rate: f64,
     pub winners: u64,
     pub connected_secs: u64,
+    /// #### PR #42: how long since the rig was last heard, its Pickaxe
+    /// version, and each of its GPUs as its last report gave them.
+    pub last_seen_secs: u64,
+    pub version: String,
+    pub devices: Vec<RigGpu>,
 }
+
+// #### PR #42: per-rig GPU health
+// What: each rig's report carries its GPUs: name, engine and device, rate,
+// temperature, fan, power, status, winners, rejected winners and the last
+// error. The coordinator keeps at most 64 per rig, cleaned, and shows them
+// under the rig with when it was last heard.
+// Why: a farm's operator saw one line per rig and could not tell a hot,
+// stopped or failing GPU from a healthy one.
+// Look here if: a rig's GPUs are missing or wrong on the coordinator, or a
+// rig report is refused as too large.
+/// The most GPUs a coordinator keeps for one rig.
+pub const MAX_RIG_GPUS: usize = 64;
+
+/// #### PR #42: whether `text` is a coordinator key a rig can pin (a farm
+/// system passes it as the pool's password).
+pub fn is_coordinator_key(text: &str) -> bool {
+    #[cfg(feature = "stratum-v2")]
+    {
+        net::decode_key(text).is_ok()
+    }
+    #[cfg(not(feature = "stratum-v2"))]
+    {
+        let _ = text;
+        false
+    }
+}
+
+/// #### PR #42: a rig's status file, every two seconds, for `mine watch`
+/// and the farm systems: its role, version and start, whether it mines,
+/// its coordinator, its rate and winners sent, and each GPU; never a key or
+/// a payout.
+pub fn rig_status_json(
+    coordinator: Option<(&str, bool)>,
+    mining: bool,
+    rate: f64,
+    winners_sent: u64,
+    started: u64,
+    gpus: &[RigGpu],
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "status",
+        "role": "rig",
+        "version": env!("CARGO_PKG_VERSION"),
+        "started": started,
+        "state": match (coordinator, mining) {
+            (None, _) => "waiting",
+            (Some(_), true) => "mining",
+            (Some(_), false) => "paused",
+        },
+        "coordinator": coordinator.map(|(address, _)| address),
+        "backup": coordinator.is_some_and(|(_, backup)| backup),
+        "current_rate": rate,
+        "verified_winners": winners_sent,
+        "rejected_winners": 0,
+        "gpus": gpus
+            .iter()
+            .map(|gpu| serde_json::json!({
+                "backend": gpu.backend,
+                "device": gpu.device,
+                "pci_bus": gpu.pci_bus,
+                "name": gpu.name,
+                "status": gpu.status,
+                "active_rate": gpu.rate,
+                "winners": gpu.winners,
+                "rejected": gpu.rejected,
+                "last_error": gpu.error,
+                "gpu_telemetry": {
+                    "temperature_c": gpu.temperature_c,
+                    "fan_percent": gpu.fan_percent,
+                    "power_watts": gpu.power_watts,
+                },
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+/// A GPU at or above this temperature is shown first.
+pub const HOT_GPU_C: f64 = 85.0;
+
+/// One GPU of a rig, as its report gives it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RigGpu {
+    pub name: String,
+    pub backend: String,
+    pub device: u32,
+    /// #### PR #42: the GPU's PCI bus, which farm systems match GPUs by.
+    pub pci_bus: Option<u32>,
+    pub rate: f64,
+    pub temperature_c: Option<f64>,
+    pub fan_percent: Option<f64>,
+    pub power_watts: Option<f64>,
+    /// "mining", "recovering" or "stopped".
+    pub status: String,
+    pub winners: u64,
+    pub rejected: u64,
+    pub error: Option<String>,
+}
+
+impl RigGpu {
+    /// The report as a coordinator keeps it: text without control
+    /// characters and capped (the name at 64, the engine at 16, the status at
+    /// 16, the error at 120), readings finite and within their range.
+    pub fn cleaned(self) -> Self {
+        let text = |value: &str, limit: usize| -> String {
+            value
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(limit)
+                .collect()
+        };
+        let reading = |value: Option<f64>, top: f64| {
+            value.filter(|value| value.is_finite() && (0.0..=top).contains(value))
+        };
+        Self {
+            name: text(&self.name, 64),
+            backend: text(&self.backend, 16),
+            device: self.device,
+            pci_bus: self.pci_bus.filter(|bus| *bus <= 0xff),
+            rate: if self.rate.is_finite() {
+                self.rate.max(0.0)
+            } else {
+                0.0
+            },
+            temperature_c: reading(self.temperature_c, 200.0),
+            fan_percent: reading(self.fan_percent, 100.0),
+            power_watts: reading(self.power_watts, 10_000.0),
+            status: text(&self.status, 16),
+            winners: self.winners,
+            rejected: self.rejected,
+            error: self
+                .error
+                .as_deref()
+                .map(|error| text(error, 120))
+                .filter(|error| !error.is_empty()),
+        }
+    }
+
+    /// Whether the GPU needs a look: not mining, hot, with rejected winners
+    /// or an error.
+    pub fn troubled(&self) -> bool {
+        self.status != "mining"
+            || self
+                .temperature_c
+                .is_some_and(|degrees| degrees >= HOT_GPU_C)
+            || self.rejected > 0
+            || self.error.is_some()
+    }
+
+    /// Its health on one line, such as "61°C · fan 40% · 120 W".
+    pub fn health(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(degrees) = self.temperature_c {
+            parts.push(format!("{degrees:.0}°C"));
+        }
+        if let Some(fan) = self.fan_percent {
+            parts.push(format!("fan {fan:.0}%"));
+        }
+        if let Some(watts) = self.power_watts {
+            parts.push(format!("{watts:.0} W"));
+        }
+        if parts.is_empty() {
+            "no readings".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+// #### end PR #42 ####
 
 /// #### PR #32
 /// A rig's rate since its previous report, from the candidates its GPUs have
@@ -255,6 +431,9 @@ struct RigHello {
     /// #### PR #32: the rig's own payout, which a public GPU pool pays.
     #[serde(default)]
     payout: Option<String>,
+    /// #### PR #42: the rig's Pickaxe version.
+    #[serde(default)]
+    version: Option<String>,
 }
 
 /// #### PR #32
@@ -324,6 +503,9 @@ struct RigStats {
     rate: f64,
     gpus: usize,
     winners: u64,
+    /// #### PR #42: each GPU's health; older rigs send none, and older
+    /// coordinators ignore it.
+    devices: Vec<RigGpu>,
 }
 
 #[cfg(feature = "stratum-v2")]
@@ -437,6 +619,10 @@ mod net {
         rate: f64,
         winners: u64,
         since: Instant,
+        /// #### PR #42: when the rig was last heard, its version and GPUs.
+        heard: Instant,
+        version: String,
+        devices: Vec<RigGpu>,
     }
 
     fn lock(state: &Mutex<HubState>) -> MutexGuard<'_, HubState> {
@@ -586,9 +772,13 @@ mod net {
                         rate: rig.rate,
                         winners: rig.winners,
                         connected_secs: rig.since.elapsed().as_secs(),
+                        last_seen_secs: rig.heard.elapsed().as_secs(),
+                        version: rig.version.clone(),
+                        devices: rig.devices.clone(),
                     })
                     .collect(),
                 public: state.public.is_some(),
+                fee_bps: state.public.as_ref().map(|public| public.fee_bps),
             }
         }
     }
@@ -625,6 +815,9 @@ mod net {
                     rate: 0.0,
                     winners: 0,
                     since: Instant::now(),
+                    heard: Instant::now(),
+                    version: String::new(),
+                    devices: Vec::new(),
                 },
             );
             id
@@ -674,6 +867,9 @@ mod net {
                     continue;
                 };
                 heard = Instant::now();
+                if let Some(row) = lock(&state).rigs.get_mut(&id) {
+                    row.heard = heard;
+                }
                 let (kind, bytes) = read(message)?;
                 match kind {
                     HELLO => {
@@ -703,6 +899,14 @@ mod net {
                         if let Some(row) = state.rigs.get_mut(&id) {
                             row.name = clean_name(&hello.name);
                             row.gpus = hello.gpus.min(64);
+                            row.version = hello
+                                .version
+                                .as_deref()
+                                .unwrap_or_default()
+                                .chars()
+                                .filter(|ch| !ch.is_control())
+                                .take(32)
+                                .collect();
                         }
                     }
                     STATS => {
@@ -715,6 +919,12 @@ mod net {
                             } else {
                                 0.0
                             };
+                            row.devices = stats
+                                .devices
+                                .into_iter()
+                                .take(MAX_RIG_GPUS)
+                                .map(RigGpu::cleaned)
+                                .collect();
                         }
                     }
                     WINNER => {
@@ -808,6 +1018,7 @@ mod net {
 
     /// The rig side: mines the coordinator's jobs on every local GPU and sends
     /// winners back. A rig never talks to the chain and never claims.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_rig(
         coordinators: &[(String, String)],
         name: Option<&str>,
@@ -816,6 +1027,7 @@ mod net {
         intensity: u8,
         json: bool,
         stop: Arc<AtomicBool>,
+        status: Option<&Path>,
     ) -> Result<(), String> {
         let coordinators = coordinators
             .iter()
@@ -859,6 +1071,27 @@ mod net {
         let mut search: Option<SearchHandle> = None;
         let mut backoff = Duration::from_secs(1);
         let mut winners_sent = 0u64;
+        // #### PR #42: each GPU's temperature, fan and power for the reports.
+        let mut telemetry = crate::telemetry::LiveTelemetrySampler::start(
+            crate::telemetry::telemetry_sources(gpus),
+        );
+        // #### PR #42: the rig's status file, for `mine watch` and farm
+        // systems, every two seconds and while it waits.
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let save_status = |coordinator: Option<(&str, bool)>,
+                           mining: bool,
+                           rate: f64,
+                           winners: u64,
+                           devices: &[RigGpu]| {
+            if let Some(path) = status {
+                crate::mine_watch::save(
+                    path,
+                    &rig_status_json(coordinator, mining, rate, winners, started, devices),
+                );
+            }
+        };
         while !stop.load(Ordering::Relaxed) {
             match connect_first(&coordinators) {
                 Ok((index, (mut sender, mut receiver))) => {
@@ -878,10 +1111,12 @@ mod net {
                                 name: name.clone(),
                                 gpus: devices.len(),
                                 payout: payout.map(str::to_owned),
+                                version: Some(env!("CARGO_PKG_VERSION").into()),
                             },
                         )?)?;
                         let mut last_stats = Instant::now() - STATS_EVERY;
                         let mut last_status = Instant::now();
+                        let mut last_saved = Instant::now() - Duration::from_secs(2);
                         let mut rate_window = None;
                         let mut rate = 0.0;
                         let mut paused_since: Option<Instant> = None;
@@ -926,8 +1161,29 @@ mod net {
                                 );
                             }
                             let Some(handle) = search.as_ref() else {
+                                if last_saved.elapsed() >= Duration::from_secs(2) {
+                                    save_status(
+                                        Some((coordinators[index].0.as_str(), index > 0)),
+                                        false,
+                                        0.0,
+                                        winners_sent,
+                                        &rig_gpus(gpus, &[], &telemetry.snapshot_each()),
+                                    );
+                                    last_saved = Instant::now();
+                                }
                                 continue;
                             };
+                            if last_saved.elapsed() >= Duration::from_secs(2) {
+                                let snapshot = handle.snapshot();
+                                save_status(
+                                    Some((coordinators[index].0.as_str(), index > 0)),
+                                    paused_since.is_none(),
+                                    rate,
+                                    winners_sent,
+                                    &rig_gpus(gpus, &snapshot.gpus, &telemetry.snapshot_each()),
+                                );
+                                last_saved = Instant::now();
+                            }
                             for winner in handle.drain_winners() {
                                 sender.send(frame(WINNER, &WireWinner::from(&winner))?)?;
                                 winners_sent = winners_sent.saturating_add(1);
@@ -945,13 +1201,19 @@ mod net {
                                 paused_since = None;
                             }
                             if last_stats.elapsed() >= STATS_EVERY {
-                                rate = window_rate(&mut rate_window, handle.snapshot().candidates);
+                                let snapshot = handle.snapshot();
+                                rate = window_rate(&mut rate_window, snapshot.candidates);
                                 sender.send(frame(
                                     STATS,
                                     &RigStats {
                                         rate,
                                         gpus: devices.len(),
                                         winners: winners_sent,
+                                        devices: rig_gpus(
+                                            gpus,
+                                            &snapshot.gpus,
+                                            &telemetry.snapshot_each(),
+                                        ),
                                     },
                                 )?)?;
                                 last_stats = Instant::now();
@@ -983,6 +1245,13 @@ mod net {
                 }
                 Err(error) => report(json, "waiting", serde_json::json!({"reason": error})),
             }
+            save_status(
+                None,
+                false,
+                0.0,
+                winners_sent,
+                &rig_gpus(gpus, &[], &telemetry.snapshot_each()),
+            );
             let until = Instant::now() + backoff;
             while !stop.load(Ordering::Relaxed) && Instant::now() < until {
                 thread::sleep(Duration::from_millis(100));
@@ -992,7 +1261,46 @@ mod net {
         if let Some(handle) = search {
             handle.stop();
         }
+        telemetry.stop();
         Ok(())
+    }
+
+    /// #### PR #42: each GPU's report: the search's stats matched by engine
+    /// and device, the telemetry in `gpus`' order.
+    pub(super) fn rig_gpus(
+        gpus: &[GpuDevice],
+        stats: &[crate::search::GpuSearchStats],
+        telemetry: &[crate::telemetry::GpuTelemetry],
+    ) -> Vec<RigGpu> {
+        gpus.iter()
+            .enumerate()
+            .map(|(index, gpu)| {
+                let search = stats
+                    .iter()
+                    .find(|stats| stats.backend == gpu.backend && stats.device == gpu.index);
+                let sample = telemetry.get(index);
+                RigGpu {
+                    name: gpu.name.clone(),
+                    backend: gpu.backend.as_str().into(),
+                    device: gpu.index,
+                    pci_bus: gpu.pci.map(|pci| u32::from(pci.bus)),
+                    rate: search.map_or(0.0, |stats| stats.active_rate),
+                    temperature_c: sample.and_then(|sample| sample.temperature_c),
+                    fan_percent: sample.and_then(|sample| sample.fan_percent),
+                    power_watts: sample.and_then(|sample| sample.power_watts),
+                    status: match search.map(|stats| stats.status) {
+                        Some(crate::search::GpuStatus::Mining) => "mining",
+                        Some(crate::search::GpuStatus::Recovering) => "recovering",
+                        _ => "stopped",
+                    }
+                    .into(),
+                    winners: search.map_or(0, |stats| stats.winners),
+                    rejected: search.map_or(0, |stats| stats.rejected_winners),
+                    error: search.and_then(|stats| stats.last_error.clone()),
+                }
+                .cleaned()
+            })
+            .collect()
     }
 }
 
@@ -1040,6 +1348,7 @@ mod stub {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_rig(
         _coordinators: &[(String, String)],
         _name: Option<&str>,
@@ -1048,6 +1357,7 @@ mod stub {
         _intensity: u8,
         _json: bool,
         _stop: Arc<AtomicBool>,
+        _status: Option<&std::path::Path>,
     ) -> Result<(), String> {
         Err(UNAVAILABLE.into())
     }
@@ -1115,6 +1425,7 @@ mod tests {
                         name: "test".into(),
                         gpus: 2,
                         payout: None,
+                        version: Some("0.0.4".into()),
                     },
                 )
                 .unwrap(),
@@ -1183,6 +1494,276 @@ mod tests {
         assert_eq!(index, 1);
         assert!(net::connect_first(&[(down, authority)]).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #### PR #42: a GPU report with every field set.
+    fn healthy_gpu(name: &str) -> RigGpu {
+        RigGpu {
+            name: name.into(),
+            backend: "cuda".into(),
+            device: 0,
+            pci_bus: Some(1),
+            rate: 1.5e9,
+            temperature_c: Some(61.0),
+            fan_percent: Some(40.0),
+            power_watts: Some(120.0),
+            status: "mining".into(),
+            winners: 3,
+            rejected: 0,
+            error: None,
+        }
+    }
+
+    // #### PR #42
+    // What: a rig's report carries each GPU and reads back unchanged; a
+    // report from an older rig (no devices) still parses, and an older
+    // coordinator's reading of a new report ignores the devices.
+    // Look here if: RigStats or RigGpu changes.
+    #[test]
+    fn rig_stats_carry_each_gpu_and_old_reports_still_parse() {
+        let stats = RigStats {
+            rate: 1.5e9,
+            gpus: 1,
+            winners: 3,
+            devices: vec![healthy_gpu("RTX 5070 Ti")],
+        };
+        let bytes = serde_json::to_vec(&stats).unwrap();
+        let back: RigStats = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, stats);
+        let old: RigStats =
+            serde_json::from_slice(br#"{"rate":1.0,"gpus":2,"winners":0}"#).unwrap();
+        assert!(old.devices.is_empty());
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OlderCoordinator {
+            rate: f64,
+            gpus: usize,
+            winners: u64,
+        }
+        let older: OlderCoordinator = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(older.gpus, 1);
+    }
+
+    // #### PR #42
+    // What: a report from 64 GPUs with the longest names and errors still
+    // fits one rig frame (B064K), and cleaning caps text, drops control
+    // characters and out-of-range readings.
+    // Look here if: RigGpu's limits or the frame size change.
+    #[cfg(feature = "stratum-v2")]
+    #[test]
+    fn a_worst_case_report_fits_one_frame() {
+        let worst = RigGpu {
+            name: "\u{1b}[2J".repeat(40) + &"N".repeat(200),
+            backend: "b".repeat(100),
+            device: u32::MAX,
+            pci_bus: Some(u32::MAX),
+            rate: f64::MAX,
+            temperature_c: Some(199.9),
+            fan_percent: Some(100.0),
+            power_watts: Some(9_999.9),
+            status: "s".repeat(100),
+            winners: u64::MAX,
+            rejected: u64::MAX,
+            error: Some("e".repeat(500)),
+        }
+        .cleaned();
+        assert_eq!(worst.name.chars().count(), 64);
+        assert!(!worst.name.contains('\u{1b}'));
+        assert_eq!(worst.error.as_deref().map(str::len), Some(120));
+        let stats = RigStats {
+            rate: f64::MAX,
+            gpus: MAX_RIG_GPUS,
+            winners: u64::MAX,
+            devices: vec![worst; MAX_RIG_GPUS],
+        };
+        assert!(net::frame(4, &stats).is_ok());
+        let odd = RigGpu {
+            temperature_c: Some(f64::NAN),
+            fan_percent: Some(140.0),
+            power_watts: Some(-3.0),
+            rate: f64::INFINITY,
+            error: Some(String::new()),
+            ..healthy_gpu("x")
+        }
+        .cleaned();
+        assert_eq!(
+            (
+                odd.temperature_c,
+                odd.fan_percent,
+                odd.power_watts,
+                odd.rate,
+                odd.error
+            ),
+            (None, None, None, 0.0, None)
+        );
+    }
+
+    // #### PR #42
+    // What: each GPU's report takes the search's stats of the same engine
+    // and device (in any order) and the telemetry at its own position; a GPU
+    // the search does not list reads as stopped; a hot GPU, one with
+    // rejected winners or an error, or one not mining needs a look.
+    // Look here if: rig_gpus or RigGpu::troubled changes.
+    #[cfg(feature = "stratum-v2")]
+    #[test]
+    fn rig_gpus_matches_search_and_telemetry_by_device() {
+        use crate::backend::{BackendKind, GpuDevice};
+        use crate::search::{GpuSearchStats, GpuStatus};
+        let device = |backend, index, name: &str| GpuDevice {
+            index,
+            name: name.into(),
+            vendor: "v".into(),
+            vram_bytes: None,
+            backend,
+            detail: String::new(),
+            integrated: false,
+            ready: true,
+            pci: None,
+        };
+        let gpus = [
+            device(BackendKind::Cuda, 0, "RTX"),
+            device(BackendKind::Wgpu, 1, "Radeon"),
+            device(BackendKind::Wgpu, 2, "Gone"),
+        ];
+        let stats = |backend, device, winners, rejected, status| GpuSearchStats {
+            backend,
+            device,
+            candidates: 1,
+            rate: 1.0,
+            active_rate: f64::from(device) + 1.0,
+            winners,
+            rejected_winners: rejected,
+            status,
+            last_error: (rejected > 0).then(|| "rejected by the host".into()),
+        };
+        let search = [
+            stats(BackendKind::Wgpu, 1, 2, 1, GpuStatus::Recovering),
+            stats(BackendKind::Cuda, 0, 5, 0, GpuStatus::Mining),
+        ];
+        let telemetry = [
+            crate::telemetry::GpuTelemetry {
+                temperature_c: Some(88.0),
+                ..Default::default()
+            },
+            crate::telemetry::GpuTelemetry {
+                fan_percent: Some(30.0),
+                ..Default::default()
+            },
+        ];
+        let report = net::rig_gpus(&gpus, &search, &telemetry);
+        assert_eq!(report.len(), 3);
+        assert_eq!(
+            (report[0].name.as_str(), report[0].winners, report[0].rate),
+            ("RTX", 5, 1.0)
+        );
+        assert_eq!(report[0].temperature_c, Some(88.0));
+        assert_eq!(report[1].status, "recovering");
+        assert_eq!((report[1].rejected, report[1].fan_percent), (1, Some(30.0)));
+        assert_eq!(report[2].status, "stopped");
+        assert!(
+            report.iter().all(RigGpu::troubled),
+            "hot, rejected, stopped"
+        );
+        assert!(!healthy_gpu("ok").troubled());
+        assert_eq!(healthy_gpu("ok").health(), "61°C · fan 40% · 120 W");
+    }
+
+    // #### PR #42
+    // What: the coordinator keeps a rig's version and the GPUs of its last
+    // report, at most 64, cleaned, and when it was last heard.
+    // Look here if: the coordinator's STATS or HELLO handling changes.
+    #[cfg(feature = "stratum-v2")]
+    #[test]
+    fn the_coordinator_keeps_each_rigs_gpus_and_last_seen() {
+        use crate::stratum_v2::transport::Session;
+        use std::{net::TcpStream, time::Duration};
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-rigs-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = RigHub::start("127.0.0.1:0".parse().unwrap(), &dir.join("rigs-key")).unwrap();
+        let authority = net::decode_key(hub.key()).unwrap();
+        hub.publish(sample_job());
+        let stream = TcpStream::connect(hub.listen()).unwrap();
+        let (mut sender, _receiver) = Session::initiate(stream, authority).unwrap().split();
+        sender
+            .send(
+                net::frame(
+                    1,
+                    &RigHello {
+                        name: "rack".into(),
+                        gpus: 70,
+                        payout: None,
+                        version: Some("0.0.4\u{7}".into()),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut devices = vec![healthy_gpu("RTX"); 70];
+        devices[0].name = "\u{1b}]0;owned\u{7}RTX".into();
+        sender
+            .send(
+                net::frame(
+                    4,
+                    &RigStats {
+                        rate: 1.0e9,
+                        gpus: 70,
+                        winners: 0,
+                        devices,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while hub
+            .summary()
+            .rigs
+            .first()
+            .is_none_or(|rig| rig.devices.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let rig = hub.summary().rigs[0].clone();
+        assert_eq!(rig.devices.len(), MAX_RIG_GPUS);
+        assert_eq!(rig.devices[0].name, "]0;ownedRTX");
+        assert_eq!(rig.version, "0.0.4");
+        assert!(rig.last_seen_secs <= 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // #### PR #42
+    // What: a rig's status names its role, version, start, state,
+    // coordinator (and whether it is the backup), rate, winners sent and
+    // each GPU with its bus and readings; it never holds a key or a payout.
+    // Look here if: rig_status_json changes.
+    #[test]
+    fn rig_status_json_has_no_key_or_payout() {
+        let status = rig_status_json(
+            Some(("192.0.2.1:3340", true)),
+            true,
+            1.5e9,
+            4,
+            1_700_000_000,
+            &[healthy_gpu("RTX 3080")],
+        );
+        assert_eq!(status["role"], "rig");
+        assert_eq!(status["state"], "mining");
+        assert_eq!(status["coordinator"], "192.0.2.1:3340");
+        assert_eq!(status["backup"], true);
+        assert_eq!(status["verified_winners"], 4);
+        assert_eq!(status["gpus"][0]["pci_bus"], 1);
+        assert_eq!(status["gpus"][0]["gpu_telemetry"]["temperature_c"], 61.0);
+        let text = status.to_string();
+        assert!(!text.contains("key") && !text.contains("payout"), "{text}");
+        assert_eq!(
+            rig_status_json(None, false, 0.0, 0, 0, &[])["state"],
+            "waiting"
+        );
     }
 
     // #### PR #32
@@ -1270,6 +1851,7 @@ mod tests {
                             name: "public".into(),
                             gpus: 1,
                             payout,
+                            version: None,
                         },
                     )
                     .unwrap(),

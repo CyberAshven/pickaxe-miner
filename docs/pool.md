@@ -10,8 +10,12 @@ same way for GPU rigs; see [A public GPU pool](#a-public-gpu-pool).
 
 The pool builds blocks from your own BCH node, as solo mining does (see
 [stratum-v2.md](stratum-v2.md)). In the setup choose **Run a pool**, then
-**ASIC pool**, and set the pool fee, where it comes from and its address on the
-settings page; or from a terminal:
+**ASIC pool**, and set the pool fee on the settings page. The rest is under
+**Advanced** on the same page (Enter opens it): where the fee comes from and
+its address, the pool's name, the start difficulty, the SV1 and SV2 ports,
+serving templates, whether miners may use their own templates, and the
+donation. A saved profile keeps them all and reopens as a pool. From a
+terminal:
 
 ```text
 pickaxe_miner stratum-v2 serve --config pool.json \
@@ -61,7 +65,9 @@ WantedBy=multi-user.target
 Then `sudo systemctl enable --now pickaxe-pool`; `journalctl -u pickaxe-pool -f`
 shows its JSON lines, the first of which lists the addresses miners use under
 `connect`, and `sudo -u pickaxe /opt/pickaxe/pickaxe stratum-v2 watch --config
-/var/lib/pickaxe/mainnet.json` shows the workers table read-only. On
+/var/lib/pickaxe/mainnet.json` shows the workers table, where Enter opens a
+device's Device panel (run it as the service's user, which alone can read the
+device addresses the server keeps). On
 Windows, a task that starts the pool at logon:
 
 ```text
@@ -133,6 +139,34 @@ part is separate mining time), your fee address 0.061875 BCH, and the miner
 The dashboard header shows `Public pool, fee 2.00% from coinbase`. With SV2,
 miners see every coinbase output in the jobs they receive, so nobody can hide
 a fee; with SV1 they can decode the coinbase parts of each job.
+
+## Miners' own templates
+
+#### PR #42
+
+`--accept-job-declaration` lets miners mine their own node's templates at
+your pool (SV2 Job Declaration), on the pool's SV2 port, in both of the
+spec's modes (or one, with `full` or `coinbase`). Their coinbase must pay your
+fee and the Pickaxe donation in full, whatever your fee mode, because their
+jobs cannot rotate work; the pool checks every custom job's outputs before
+accepting it. With Full-Template, a miner declares the transactions too: your
+node checks the template (`validateblocktemplate`) and gets the miner's blocks
+as well as the miner's own node. With Coinbase-only, only their nodes submit
+their blocks. In the setup it is the **Miner templates** row under Advanced
+(off by default). Details, the error codes and the token format are in
+[job-declaration.md](job-declaration.md).
+
+## Templates for other pools and P2Pool
+
+#### PR #42
+
+Your node's templates can also serve other pools: the **Serve templates** row
+under Advanced (or `--tp-listen 0.0.0.0:8442`, 48442 on Chipnet) lets an SV2
+pool, a Job Declaration client or P2Pool take them over SV2 Template
+Distribution, pinned to your server's key. Their blocks pay their own
+coinbase; Pickaxe saves each one before sending it to your node and retries
+until the node answers. Details and SRI's configuration lines are in
+[stratum-v2.md](stratum-v2.md#serving-templates-to-a-pool-template-distribution).
 
 ## A public GPU pool
 

@@ -46,6 +46,19 @@ impl WorkAllocation {
         self.position < rate.pool_work_units(PERIOD_NS)
     }
 
+    // #### PR #42: the token donation rotation
+    // What: on an ASIC-exclusive token the whole donation is mining work:
+    // the first `bps` ten-thousandths of each 10-minute cycle mine donation
+    // jobs, whose claims the donation's forwarder receives.
+    // Why: such a token pays the whole claim to one output, so the BCH
+    // split (two thirds from rewards) is impossible; the token's minimum
+    // (1.5% unless its row says more) applies.
+    // Look here if: token donation jobs take more or less than the setting.
+    /// Whether the job now is donation work for a token at `rate`.
+    pub fn token_donation_work(&self, rate: crate::donation::TokenDonation) -> bool {
+        self.position < u64::from(rate.bps()) * (PERIOD_NS / 10_000)
+    }
+
     /// #### PR #40: a public pool operator's work share, right after the
     /// donation's and a share of what it leaves.
     pub fn fee_work(&self, rate: BchDonation, fee: crate::donation::bch::PoolFee) -> bool {
@@ -79,6 +92,20 @@ mod tests {
         assert_eq!(allocation.position, position);
         allocation.update(now + Duration::from_secs(4200), true);
         assert_eq!(allocation.position, 0);
+    }
+
+    // #### PR #42
+    // What: a token donation of 1.5% is the first 9 seconds of each
+    // 10-minute cycle, all of it work.
+    // Look here if: token_donation_work changes.
+    #[test]
+    fn token_donation_is_the_whole_share_of_work() {
+        let rate = crate::donation::NEW_TOKEN_DONATION;
+        let boundary = 9_000_000_000;
+        assert!(WorkAllocation::new(boundary - 1).token_donation_work(rate));
+        assert!(!WorkAllocation::new(boundary).token_donation_work(rate));
+        assert!(!WorkAllocation::new(0)
+            .token_donation_work(crate::donation::TokenDonation::from_bps(0)));
     }
 
     #[test]

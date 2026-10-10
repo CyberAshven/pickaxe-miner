@@ -52,6 +52,8 @@ day each fact was checked.
     one-line `stratum2+tcp://HOST:PORT/KEY`;
   - PHOTON jobs from the miner's own BCH node when one is configured (Fulcrum
     as the fallback), live on a pruned Chipnet BCHN with no transaction index;
+    after a fall back to Fulcrum, mining goes back to the node by itself once
+    it answers again (#42), and the dashboard names the source;
   - Run a pool for GPUs (the public GPU pool, live with two rigs on Chipnet)
     and joining a GPU pool or farm from the setup;
   - workers named by their owners (never by an address), and a pool's name
@@ -337,8 +339,12 @@ What this means for Pickaxe, and what step 1 did:
 - Standard (header-only) channels fit naturally: the upstream sends the merkle
   root and the device hashes the header as given.
 - SV1 firmware builds the merkle root from a coinbase and extranonces, which
-  cannot produce a fixed payout hash, so how SV1 ASICs would mine such a token
-  is an open question.
+  cannot produce a fixed payout hash. Answered in #42: the coinbase devices
+  hash is a keyless forwarder script that is itself the token's payout
+  script, so the merkle root (its HASH256, with an empty path) is fixed
+  whatever the extranonces; SV1 firmware through the adapter and SV2
+  extended devices mine it as standard devices do (a loopback run with all
+  three).
 - Claims are covenant transactions built by the coordinator, as for PHOTON.
 
 ### BCH plus every merge-minable token
@@ -360,7 +366,40 @@ What this means for Pickaxe, and what step 1 did:
   connection, and show node name, version, network and sync height; warn when
   the node is behind or on the wrong network.
 - When the node stops answering, keep mining from the Fulcrum list, show it on
-  the dashboard, and switch back when the node returns.
+  the dashboard, and switch back when the node returns (done in #42).
+- The setup's BCH node list checks every saved node when it opens (and after
+  a node is saved), each on its own thread, and says what it found: the
+  client and sync height and whether it follows PHOTON, a refused login, no
+  answer, another network or chain, or a node that answers but cannot follow
+  PHOTON (no gettxout, such as Knuth), whose BCH ASIC templates still work
+  (done in #42). A node without getnetworkinfo is "BCH node".
+- The setup also searches this computer when a list opens: a node on
+  another usual port (such as Knuth's 8332 on Chipnet), Fulcrum servers
+  over TCP, WS or WSS (with their version and height) and ZMQ block notices,
+  at most ten ports, each tried once with a short timeout. A node on this
+  computer logs in with BCHN's bitcoin.conf (its rpcport and rpcuser and
+  rpcpassword, or that network's cookie), read for each call and never kept
+  (done in #42).
+- On a connection list, F searches another computer by name, `.local` name
+  or address (a public address only after yes) and T one of the Tailscale
+  network's online computers, on the same ports; Enter adds a node or
+  Fulcrum server found. C gives a saved node its cookie file (Knuth's, a
+  custom data folder's), kept owner-only in `<config>.node-cookies.json`
+  (at most 16, regular files only) and used before the environment's
+  cookie file.
+- The ASIC server hears of new blocks from its node over ZMQ
+  (`zmqpubhashblock`, from bitcoin.conf for a node on this computer or
+  `--node-zmq`): a minimal ZMTP 3.0 subscriber with no dependency wakes the
+  node worker at once; polling stays as the safety net (every 2 s while
+  notices flow).
+- A node's chain is proven by its fork block (BCH's UAHF block 478,559 on
+  mainnet, Chipnet's block 115,252), since a Bitcoin (BTC) node reports the
+  same chain name and testnet4 shares Chipnet's genesis: the ASIC server and
+  GPU mining's return to the node refuse a BTC or testnet4 node (done in #42).
+- A home Fulcrum server (Umbrel, StartOS) is taken over plain TCP,
+  `tcp://HOST:PORT` such as `tcp://umbrel.local:50001`, on this computer or
+  the home network only (done in #42); servers on the internet need `wss://`,
+  since plain TCP could be impersonated to feed a false baton.
 - ASIC BCH and merge mining need a node (or a pool), and setup says so only in
   that mode.
 
@@ -384,14 +423,42 @@ What this means for Pickaxe, and what step 1 did:
    [Mining destinations](#mining-destinations)). The BCH P2Pool itself is a
    separate project.
 
+   Progress in #42 and its follow-up #43 (details in
+   [implementation-status.md](implementation-status.md)):
+   - ASIC-exclusive tokens: the SAFA reference core, the token worker and
+     the Chipnet ASIC test token; the registry stays empty until a token
+     exists.
+   - Merge-mined tokens: the coinbase commitment, proofs, the claim worker
+     and the Chipnet test token, also under Job Declaration; Case A (a share
+     wins a token at its lower difficulty) and Case B (a token that needs a
+     BCH block) both, with no hashrate taken from BCH.
+   - Pool connectors: Template Distribution both ways, Job Declaration in
+     both modes (server and client), fallback pools and group channels.
+   - Own node: chain checks, saved nodes checked, this computer and another
+     one searched (Tailscale too), saved cookie files, bitcoin.conf logins
+     and ZMQ block notices.
+   - Remaining: the merge-minable covenant standard with token authors,
+     the live runs listed per entry, and P2Pool (separate project).
+
 ## Open questions
 
-- Whether Bitaxe's Stratum V2 client opens standard (header-only) channels,
-  which SAFA-style tokens need.
 - When to start the merge-minable covenant design with token authors, and
   whether SAFA could align with it.
-- Knuth: its C API in-process, or its RPC from a separate process.
-- Which pools to list once any supports Stratum V2 Job Declaration for BCH.
+
+Answered (2026-10-10):
+
+- Bitaxe's Stratum V2 client opens standard (header-only) channels: ESP-Miner
+  master has a `stratumV2ChannelType` setting, `standard` or `extended`
+  (extended by default; `components/stratum_v2`, `main/system.c`). SAFA-style
+  tokens no longer need standard channels anyway (see
+  [ASIC-exclusive token](#asic-exclusive-token-safa-style)).
+- Knuth: reached over its JSON-RPC from a separate process, like BCHN; the
+  setup finds it on its port and logs in with a saved cookie file (#43). Its
+  C API in-process is not planned.
+- Pools with Stratum V2 Job Declaration for BCH: none to list yet. CashStratum
+  (behind SoloFury's BCH endpoint) has Job Declaration code, but its Noise
+  certificate version keeps SV2 clients out (cashstratum/cashstratum#3); a
+  Pickaxe public pool accepts it with `--accept-job-declaration` (#42).
 
 ## Sources and how they were checked
 

@@ -11,6 +11,15 @@ pub enum Role {
     MiningServer,
     /// Translate SV1 firmware onto the same mining server.
     Sv1Translator,
+    /// #### PR #42: serve this node's templates to SV2 pools, Job
+    /// Declaration clients and P2Pool (Template Distribution).
+    TemplateProviderServer,
+    /// #### PR #42: accept miners' own templates in a public pool (Job
+    /// Declaration, Coinbase-only).
+    JobDeclaratorServer,
+    /// #### PR #42: mine at a pool with this node's own templates (Job
+    /// Declaration, Coinbase-only).
+    JobDeclaratorClient,
 }
 
 impl Role {
@@ -20,6 +29,9 @@ impl Role {
             Self::TemplateProviderClient => "template_provider_client",
             Self::MiningServer => "mining_server",
             Self::Sv1Translator => "sv1_translator",
+            Self::TemplateProviderServer => "template_provider_server",
+            Self::JobDeclaratorServer => "job_declarator_server",
+            Self::JobDeclaratorClient => "job_declarator_client",
         }
     }
 
@@ -29,6 +41,9 @@ impl Role {
             Self::TemplateProviderClient,
             Self::MiningServer,
             Self::Sv1Translator,
+            Self::TemplateProviderServer,
+            Self::JobDeclaratorServer,
+            Self::JobDeclaratorClient,
         ]
     }
 }
@@ -53,9 +68,12 @@ mod tests {
     #[test]
     fn planned_roles_are_distinct() {
         let labels: Vec<_> = Role::all().iter().map(|r| r.as_str()).collect();
-        assert_eq!(labels.len(), 3);
+        assert_eq!(labels.len(), 6);
         assert!(labels.contains(&"template_provider_client"));
         assert!(labels.contains(&"mining_server"));
         assert!(labels.contains(&"sv1_translator"));
+        assert!(labels.contains(&"template_provider_server"));
+        assert!(labels.contains(&"job_declarator_server"));
+        assert!(labels.contains(&"job_declarator_client"));
     }
 }

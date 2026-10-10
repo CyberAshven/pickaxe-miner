@@ -150,6 +150,12 @@ impl SourceEntry {
     /// Creates a user-configured endpoint entry.
     pub(crate) fn user(kind: SourceKind, endpoint: &str, label: String) -> Self {
         let transport = match kind {
+            // #### PR #42: a home server over plain TCP.
+            SourceKind::Fulcrum
+                if endpoint.len() > 6 && endpoint[..6].eq_ignore_ascii_case("tcp://") =>
+            {
+                SourceTransport::ElectrumTcp
+            }
             SourceKind::Fulcrum => SourceTransport::Wss,
             SourceKind::NativeNode => SourceTransport::NodeHttp,
         };
@@ -249,6 +255,13 @@ impl SourceEntry {
             (self.kind, self.transport),
             (SourceKind::Fulcrum, SourceTransport::Wss)
                 | (SourceKind::NativeNode, SourceTransport::NodeHttp)
+        ) || (
+            // #### PR #42: plain TCP only to a server the miner entered,
+            // which the configuration takes only at home; the published
+            // public TCP servers stay unused.
+            self.kind == SourceKind::Fulcrum
+                && self.transport == SourceTransport::ElectrumTcp
+                && self.provenance == SourceProvenance::User
         )
     }
 }
@@ -1111,6 +1124,31 @@ mod tests {
             .find(|entry| entry.endpoint == "tcp://cashnode.bch.ninja:50001")
             .expect("Electron Cash TCP endpoint is cataloged");
         assert_eq!(tcp.transport, SourceTransport::ElectrumTcp);
+    }
+
+    // #### PR #42
+    // What: a plain-TCP Fulcrum server the miner entered (the configuration
+    // takes it only at home) is a probe candidate; the published public TCP
+    // servers still are not.
+    // Look here if: SourceEntry::user or supported_by_current_client changes.
+    #[test]
+    fn a_home_tcp_fulcrum_is_used_and_public_tcp_servers_are_not() {
+        let mut cfg = crate::config::RuntimeConfig::default();
+        cfg.set_fulcrum_url("tcp://192.168.1.5:50001").unwrap();
+        let catalog = SourceCatalog::configured(&cfg).unwrap();
+        let home = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.endpoint == "tcp://192.168.1.5:50001")
+            .unwrap();
+        assert_eq!(home.transport, SourceTransport::ElectrumTcp);
+        let candidates = catalog.probe_candidates(SourceKind::Fulcrum, 0, MAX_SOURCES, 0);
+        assert!(candidates
+            .iter()
+            .any(|entry| entry.endpoint == "tcp://192.168.1.5:50001"));
+        assert!(!candidates
+            .iter()
+            .any(|entry| entry.endpoint == "tcp://cashnode.bch.ninja:50001"));
     }
 
     #[test]

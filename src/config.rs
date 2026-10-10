@@ -22,6 +22,57 @@ pub enum MiningNetwork {
 }
 
 impl MiningNetwork {
+    /// #### PR #42
+    /// What: the curated node RPCs of this network, tried after the miner's
+    /// own (none yet on either network).
+    /// Why: Chipnet and mainnet are one code path; the network chooses data,
+    /// never a different path.
+    /// Look here if: a network gets curated nodes.
+    pub fn node_rpc_bootstrap(self) -> &'static [&'static str] {
+        match self {
+            Self::Mainnet => crate::protocol::NODE_RPC_BOOTSTRAP,
+            Self::Chipnet => crate::protocol::CHIPNET_NODE_RPC_BOOTSTRAP,
+        }
+    }
+
+    /// #### PR #42: the SV2 Template Distribution port a server listens on
+    /// by default on this network.
+    pub fn template_port(self) -> u16 {
+        match self {
+            Self::Mainnet => crate::protocol::TEMPLATE_PORT,
+            Self::Chipnet => crate::protocol::CHIPNET_TEMPLATE_PORT,
+        }
+    }
+
+    // #### PR #42: the fork block proves the chain
+    // What: a node's block at this height must be this one: BCH's UAHF block
+    // on mainnet, Chipnet's fork block on Chipnet.
+    // Why: a Bitcoin (BTC) node reports the same chain name ("main") as a
+    // BCH one, and testnet4 shares Chipnet's genesis.
+    // Look here if: a node that worked before is now refused as BTC or
+    // testnet4.
+    /// The height and hash (display order) of a block only this chain has.
+    pub fn fork_block(self) -> (u32, &'static str) {
+        match self {
+            Self::Mainnet => (
+                478_559,
+                "000000000000000000651ef99cb9fcbe0dadde1d424bd9f15ff20136191a5eec",
+            ),
+            Self::Chipnet => (
+                115_252,
+                "00000000040ba9641ba98a37b2e5ceead38e4e2930ac8f145c8094f94c708727",
+            ),
+        }
+    }
+
+    /// The chain a node is on when its fork block is another's.
+    pub fn foreign_chain(self) -> &'static str {
+        match self {
+            Self::Mainnet => "Bitcoin (BTC), not Bitcoin Cash",
+            Self::Chipnet => "testnet4, not Chipnet",
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mainnet" => Ok(Self::Mainnet),
@@ -208,6 +259,8 @@ pub struct RuntimeConfig {
     /// `PICKAXE_NODE_RPC_USER` + `PICKAXE_NODE_RPC_PASSWORD` so secrets never
     /// need to appear in command history or runtime endpoint identity.
     pub node_url: Option<String>,
+    /// #### PR #42: the node's ZMQ block notices, for the ASIC server.
+    pub node_zmq: NodeZmq,
     /// Preferred network transport for submission/diagnostics.
     pub source: JobSource,
     /// When true, the GPU mining loop is running.
@@ -228,11 +281,58 @@ impl Default for RuntimeConfig {
             payout_address: String::new(),
             fulcrum_url: None,
             node_url: None,
+            node_zmq: NodeZmq::Auto,
             source: JobSource::Fulcrum,
             mining: false,
             generation_id: 0,
         }
     }
+}
+
+// #### PR #42: ZMQ block notices
+// What: where the ASIC server hears of new blocks from its node: bitcoin.conf's
+// zmqpubhashblock for a node on this computer (the default), a tcp:// endpoint
+// on this computer or the home network, or off.
+// Why: a new block reached devices up to a poll late.
+// Look here if: --node-zmq is refused, or the server never connects.
+/// Where the node publishes its new blocks over ZMQ.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NodeZmq {
+    /// bitcoin.conf's, for a node on this computer.
+    #[default]
+    Auto,
+    Off,
+    At(String),
+}
+
+/// #### PR #42: `auto` (or empty), `off`, or tcp://HOST:PORT on this
+/// computer or the home network.
+pub fn parse_node_zmq(value: &str) -> Result<NodeZmq, String> {
+    let value = value.trim();
+    Ok(match value.to_ascii_lowercase().as_str() {
+        "off" => NodeZmq::Off,
+        "auto" | "" => NodeZmq::Auto,
+        _ => {
+            let address = value
+                .strip_prefix("tcp://")
+                .ok_or("ZMQ block notices take tcp://HOST:PORT, auto or off")?
+                .trim_end_matches('/');
+            let (host, port) = address
+                .rsplit_once(':')
+                .ok_or("ZMQ block notices need the port, such as tcp://127.0.0.1:28332")?;
+            if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+                return Err(
+                    "ZMQ block notices need the port, such as tcp://127.0.0.1:28332".into(),
+                );
+            }
+            if !private_host(host.trim_start_matches('[').trim_end_matches(']')) {
+                return Err(
+                    "ZMQ block notices must come from this computer or your home network".into(),
+                );
+            }
+            NodeZmq::At(value.to_owned())
+        }
+    })
 }
 
 impl RuntimeConfig {
@@ -302,10 +402,19 @@ impl RuntimeConfig {
 
     /// Set custom Fulcrum/Electrum endpoint (`ws://` or `wss://`). Empty clears.
     pub fn set_fulcrum_url(&mut self, url: &str) -> Result<(), String> {
-        let Some(endpoints) = normalize_endpoint_list(url, "fulcrum", &["wss://", "ws://"])? else {
+        let Some(endpoints) =
+            normalize_endpoint_list(url, "fulcrum", &["wss://", "ws://", "tcp://"])?
+        else {
             self.clear_fulcrum_url();
             return Ok(());
         };
+        // #### PR #42: plain-TCP Fulcrum servers (tcp://HOST:PORT), such as
+        // Umbrel's or StartOS's, only on this computer or the home network.
+        for endpoint in endpoints.split(',').map(str::trim) {
+            if endpoint.len() > 6 && endpoint[..6].eq_ignore_ascii_case("tcp://") {
+                check_tcp_electrum(&endpoint[6..])?;
+            }
+        }
         if endpoints.split(',').any(|endpoint| {
             !self
                 .network
@@ -372,6 +481,13 @@ impl RuntimeConfig {
         Ok(())
     }
 
+    /// #### PR #42: `auto`, `off`, or tcp://HOST:PORT on this computer or
+    /// the home network.
+    pub fn set_node_zmq(&mut self, value: &str) -> Result<(), String> {
+        self.node_zmq = parse_node_zmq(value)?;
+        Ok(())
+    }
+
     pub fn custom_node_endpoints(&self) -> Vec<&str> {
         self.node_url
             .as_deref()
@@ -407,16 +523,12 @@ impl RuntimeConfig {
 
     /// Node try-order: custom (if set), then curated NODE_RPC_BOOTSTRAP.
     pub fn node_endpoints(&self) -> Vec<String> {
-        use crate::protocol::NODE_RPC_BOOTSTRAP;
         let mut out = Vec::new();
         for url in self.custom_node_endpoints() {
             out.push(url.to_string());
         }
-        for u in NODE_RPC_BOOTSTRAP
-            .iter()
-            .copied()
-            .filter(|_| self.network == MiningNetwork::Mainnet)
-        {
+        // #### PR #42: the curated list is the network's own data.
+        for u in self.network.node_rpc_bootstrap().iter().copied() {
             if !out.iter().any(|x| x.as_str() == u) {
                 out.push((*u).to_string());
             }
@@ -523,6 +635,62 @@ pub(crate) fn reprefix_p2pkh_payout(
     }
 }
 
+// #### PR #42: plain TCP only at home
+// What: a Fulcrum server over plain TCP (tcp://HOST:PORT, as Umbrel and
+// StartOS publish theirs) is taken only on this computer or the home
+// network: loopback, private, link-local and Tailscale's shared range, IPv6
+// unique-local and link-local, `localhost` or a `.local` name.
+// Why: plain TCP has no encryption, so a server reached over the internet
+// could be impersonated to feed a false baton; servers there use wss://.
+// Look here if: a home Fulcrum server is refused, or a public one accepted
+// over tcp://.
+/// Checks a plain-TCP Electrum endpoint's `HOST:PORT`.
+fn check_tcp_electrum(address: &str) -> Result<(), String> {
+    let authority = address.split('/').next().unwrap_or(address);
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => match bracketed.split_once("]:") {
+            Some((host, port)) => (host, port),
+            None => (bracketed.trim_end_matches(']'), ""),
+        },
+        None => authority.rsplit_once(':').unwrap_or((authority, "")),
+    };
+    if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+        return Err(
+            "a plain-TCP Fulcrum server needs its port, such as tcp://umbrel.local:50001".into(),
+        );
+    }
+    if !private_host(host) {
+        return Err(
+            "a plain-TCP Fulcrum server (tcp://) must be on this computer or your home network; \
+             servers on the internet need wss://"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether `host` is this computer or on the home network.
+fn private_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || (lower.len() > 6 && lower.ends_with(".local")) {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>().map(|ip| ip.to_canonical()) {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let [first, second, ..] = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || (first == 100 && second & 0xc0 == 0x40)
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+        Err(_) => false,
+    }
+}
+// #### end PR #42 ####
+
 fn normalize_endpoint_list(
     input: &str,
     kind: &str,
@@ -610,7 +778,329 @@ pub struct SavedConfig {
     pub fulcrum: Option<String>,
     pub node_rpc: Option<String>,
     pub source: Option<String>,
+    /// #### PR #42: what the profile starts besides plain GPU mining. Plain
+    /// GPU profiles leave it out, so their saved bytes do not change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<SavedServer>,
 }
+
+// #### PR #42: profiles keep their mode
+// What: a profile saves the setup's mode (a rig joining a GPU pool or farm,
+// ASIC solo, ASIC at a pool, an ASIC pool or a GPU pool) and its pool values,
+// and reopens in that mode.
+// Why: every profile reopened as GPU mining, so a saved pool or ASIC profile
+// lost its pool rows and settings.
+// Look here if: an older Pickaxe refuses the profiles file; it does not know
+// the `server` field (`deny_unknown_fields`).
+/// The kind of miner a profile starts, besides plain GPU mining.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedMode {
+    /// This computer's GPUs join a GPU pool or farm as a rig.
+    GpuRig,
+    /// ASICs mine BCH on the miner's own node.
+    AsicSolo,
+    /// ASICs mine at a remote pool.
+    AsicJoin,
+    /// A public ASIC pool for other miners.
+    AsicPool,
+    /// A public GPU pool for other miners' rigs.
+    GpuPool,
+    /// #### PR #42: this computer's GPUs coordinate the operator's own rigs
+    /// (a farm), and may mine too.
+    GpuFarm,
+}
+
+impl SavedMode {
+    /// Whether the mode joins someone else's pool or coordinator.
+    pub fn joins(self) -> bool {
+        matches!(self, Self::GpuRig | Self::AsicJoin)
+    }
+
+    /// Whether the mode runs a pool with a fee.
+    pub fn runs_a_pool(self) -> bool {
+        matches!(self, Self::AsicPool | Self::GpuPool)
+    }
+}
+
+/// #### PR #42: how a profile that joins a pool declares its node's
+/// templates there (SV2 Job Declaration).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedDeclaration {
+    /// Full-Template: each template with its transactions.
+    Full,
+    /// Coinbase-only: the coinbase alone; this node submits the blocks.
+    Coinbase,
+}
+
+/// #### PR #42: the Job Declaration modes a profile's ASIC pool accepts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedAccept {
+    Full,
+    Coinbase,
+    Both,
+}
+
+/// A profile's mode and the pool values the setup asked for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SavedServer {
+    pub mode: SavedMode,
+    /// The pool or coordinator to join: `HOST:PORT`, or a one-line SV2
+    /// address with its key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+    /// The pool's or coordinator's key, when `join` does not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_fee: Option<crate::donation::bch::BchDonation>,
+    /// Where an ASIC pool's fee comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_mode: Option<crate::donation::bch::FeeMode>,
+    /// Where the pool fee goes; left out, it goes to the payout address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_address: Option<String>,
+    /// An ASIC pool's name in its blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_tag: Option<String>,
+    /// #### PR #42: an ASIC server's Advanced values; left out at their
+    /// defaults (3333, 3336, the server's start difficulty, no backup pools,
+    /// the payout address at the pool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sv1_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sv2_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_difficulty: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_user: Option<String>,
+    /// #### PR #42: the port an ASIC server with its own node serves its
+    /// templates on (SV2 Template Distribution); left out, it serves none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tp_port: Option<u16>,
+    /// #### PR #42: Join a pool declares this node's templates to the pool
+    /// (SV2 Job Declaration); left out, devices mine the pool's own jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_declaration: Option<SavedDeclaration>,
+    /// #### PR #42: the Job Declaration modes an ASIC pool accepts from its
+    /// miners; left out, it accepts none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_job_declaration: Option<SavedAccept>,
+    /// #### PR #42: the pools ASIC solo mining falls back on while its node
+    /// gives no work, each a one-line SV2 address with its key, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_pools: Vec<String>,
+    /// #### PR #42: ASIC solo mines this ASIC-exclusive token instead of BCH,
+    /// by its registry name; left out, BCH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asic_token: Option<String>,
+    /// #### PR #42: a GPU rig's name on its coordinator's dashboard; left
+    /// out, the computer's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig_name: Option<String>,
+    /// The port a GPU farm's or GPU pool's rigs join on; left out, 3340 for
+    /// a pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig_port: Option<u16>,
+    /// A GPU farm's coordinator mines with its rigs only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rigs_only: bool,
+    /// #### PR #42: an ASIC server's ZMQ block notices: `off` or
+    /// tcp://HOST:PORT; left out, bitcoin.conf's for a node on this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_zmq: Option<String>,
+}
+
+impl SavedServer {
+    /// Rejects values the setup would refuse for this mode on `network`.
+    pub fn validate(&self, network: MiningNetwork) -> Result<(), String> {
+        // #### PR #42: block notices only where the server has a node.
+        if let Some(value) = &self.node_zmq {
+            parse_node_zmq(value)?;
+            if !matches!(
+                self.mode,
+                SavedMode::AsicSolo | SavedMode::AsicJoin | SavedMode::AsicPool
+            ) {
+                return Err("only an ASIC profile saves ZMQ block notices".into());
+            }
+        }
+        let join = self.join.as_deref().map(str::trim).unwrap_or("");
+        if self.mode.joins() {
+            if join.is_empty() {
+                return Err("a profile that joins a pool needs the pool's address".into());
+            }
+        } else if self.join.is_some() || self.join_key.is_some() {
+            return Err("only a profile that joins a pool saves a pool address".into());
+        }
+        for value in [join, self.join_key.as_deref().unwrap_or("")] {
+            if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err("a pool address or key has no spaces".into());
+            }
+        }
+        if !self.mode.runs_a_pool()
+            && (self.pool_fee.is_some() || self.fee_mode.is_some() || self.fee_address.is_some())
+        {
+            return Err("only a profile that runs a pool saves a pool fee".into());
+        }
+        if self.mode != SavedMode::AsicPool && (self.fee_mode.is_some() || self.pool_tag.is_some())
+        {
+            return Err("only an ASIC pool saves where its fee comes from and its name".into());
+        }
+        if let Some(address) = &self.fee_address {
+            match self.mode {
+                // A GPU pool's fee is a token claim, which pays a q address.
+                SavedMode::GpuPool => validate_payout_address(network, address),
+                _ => validate_coinbase_address(network, address),
+            }
+            .map_err(|error| format!("pool fee address: {error}"))?;
+        }
+        // #### PR #42: the Advanced values, checked as the setup checks them.
+        let asic = matches!(
+            self.mode,
+            SavedMode::AsicSolo | SavedMode::AsicJoin | SavedMode::AsicPool
+        );
+        let advanced = self.sv1_port.is_some()
+            || self.sv2_port.is_some()
+            || self.start_difficulty.is_some()
+            || !self.backups.is_empty()
+            || self.pool_user.is_some()
+            || self.tp_port.is_some();
+        // #### PR #42: a GPU rig keeps backup coordinators.
+        let rig_backups = self.mode == SavedMode::GpuRig
+            && self.sv1_port.is_none()
+            && self.sv2_port.is_none()
+            && self.start_difficulty.is_none()
+            && self.pool_user.is_none()
+            && self.tp_port.is_none();
+        if advanced && !asic && !rig_backups {
+            return Err(
+                "only an ASIC server saves ports, a start difficulty or backup pools".into(),
+            );
+        }
+        if self.sv1_port == Some(0) || self.sv2_port == Some(0) {
+            return Err("a port is 1 to 65535".into());
+        }
+        if self.sv1_port.unwrap_or(3333) == self.sv2_port.unwrap_or(3336) {
+            return Err("the SV1 and SV2 ports must differ".into());
+        }
+        // #### PR #42: templates come from this server's own node.
+        if let Some(port) = self.tp_port {
+            if !matches!(self.mode, SavedMode::AsicSolo | SavedMode::AsicPool) {
+                return Err("only an ASIC server with its own node serves templates".into());
+            }
+            if port == 0
+                || port == self.sv1_port.unwrap_or(3333)
+                || port == self.sv2_port.unwrap_or(3336)
+            {
+                return Err(
+                    "the template port is 1 to 65535 and differs from the SV1 and SV2 \
+                            ports"
+                        .into(),
+                );
+            }
+        }
+        if self
+            .start_difficulty
+            .is_some_and(|difficulty| difficulty == 0 || difficulty > 1 << 48)
+        {
+            return Err("a start difficulty is 1 to 2^48".into());
+        }
+        if (!matches!(self.mode, SavedMode::AsicJoin | SavedMode::GpuRig)
+            && !self.backups.is_empty())
+            || (self.mode != SavedMode::AsicJoin && self.pool_user.is_some())
+        {
+            return Err(
+                "only a profile that joins a pool saves backup pools or a pool username".into(),
+            );
+        }
+        // #### PR #42: the GPU farm's, rig's and GPU pool's own values.
+        if self.rig_name.is_some() && self.mode != SavedMode::GpuRig {
+            return Err("only a GPU rig saves a rig name".into());
+        }
+        if self.rig_name.as_deref().is_some_and(|name| {
+            name.trim().is_empty()
+                || name.chars().count() > 64
+                || name.chars().any(char::is_control)
+        }) {
+            return Err("a rig name is 1 to 64 printable characters".into());
+        }
+        if self.rig_port.is_some() && !matches!(self.mode, SavedMode::GpuFarm | SavedMode::GpuPool)
+        {
+            return Err("only a GPU farm or GPU pool saves the port rigs join on".into());
+        }
+        if self.rig_port == Some(0) {
+            return Err("the rigs' port is 1 to 65535".into());
+        }
+        if self.mode == SavedMode::GpuFarm && self.rig_port.is_none() {
+            return Err("a GPU farm saves the port its rigs join on".into());
+        }
+        if self.rigs_only && self.mode != SavedMode::GpuFarm {
+            return Err("only a GPU farm mines with its rigs only".into());
+        }
+        if self.backups.len() > 8
+            || self.backups.iter().any(|pool| {
+                pool.is_empty() || pool.chars().any(|c| c.is_whitespace() || c.is_control())
+            })
+        {
+            return Err("at most 8 backup pools, each without spaces".into());
+        }
+        // #### PR #42: Job Declaration and fallback pools, each in its mode.
+        if self.job_declaration.is_some() && self.mode != SavedMode::AsicJoin {
+            return Err("only ASICs joining a pool declare their node's templates".into());
+        }
+        if self.accept_job_declaration.is_some() && self.mode != SavedMode::AsicPool {
+            return Err("only an ASIC pool accepts miners' own templates".into());
+        }
+        if !self.fallback_pools.is_empty() && self.mode != SavedMode::AsicSolo {
+            return Err("only ASIC solo mining saves fallback pools".into());
+        }
+        if self.fallback_pools.len() > 8
+            || self.fallback_pools.iter().any(|pool| {
+                pool.is_empty() || pool.chars().any(|c| c.is_whitespace() || c.is_control())
+            })
+        {
+            return Err("at most 8 fallback pools, each without spaces".into());
+        }
+        // #### PR #42: an ASIC-exclusive token instead of BCH, mined solo
+        // with no templates to serve and no fallback pools.
+        if let Some(name) = &self.asic_token {
+            if self.mode != SavedMode::AsicSolo {
+                return Err("only ASIC solo mining saves an ASIC-exclusive token".into());
+            }
+            if self.tp_port.is_some() || !self.fallback_pools.is_empty() {
+                return Err(
+                    "an ASIC-exclusive token serves no templates and has no fallback pools".into(),
+                );
+            }
+            if name.trim().is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+                return Err(
+                    "an ASIC-exclusive token's name is 1 to 64 printable characters".into(),
+                );
+            }
+        }
+        if self.pool_user.as_deref().is_some_and(|user| {
+            user.is_empty() || user.len() > 255 || user.chars().any(char::is_control)
+        }) {
+            return Err("a pool username is 1 to 255 printable characters".into());
+        }
+        if let Some(tag) = &self.pool_tag {
+            let tag = tag.trim();
+            if tag.is_empty()
+                || tag.len() > 20
+                || !tag.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+            {
+                return Err("a pool's name is 1 to 20 printable characters".into());
+            }
+        }
+        Ok(())
+    }
+}
+// #### end PR #42 ####
 
 impl SavedConfig {
     /// Applies saved configuration values to a running miner.
@@ -664,6 +1154,11 @@ impl SavedConfig {
         }
         let mut runtime = RuntimeConfig::default();
         self.apply_to_runtime(&mut runtime)?;
+        // #### PR #42: a saved mode's pool values are checked as the setup
+        // checks them.
+        if let Some(server) = &self.server {
+            server.validate(runtime.network)?;
+        }
         runtime.validate_payout_network()
     }
 
@@ -737,6 +1232,7 @@ impl SavedConfig {
             fulcrum: runtime.fulcrum_url.clone(),
             node_rpc: runtime.node_url.clone(),
             source: Some(runtime.source.as_str().to_string()),
+            server: None,
         }
     }
 }
@@ -760,6 +1256,116 @@ pub fn profiles_path(config_path: &Path) -> PathBuf {
 
 pub fn sources_path(config_path: &Path) -> PathBuf {
     config_path.with_extension("sources.json")
+}
+
+// #### PR #42: saved cookie files
+// What: a node whose cookie file Pickaxe does not find by itself (Knuth, a
+// custom data folder, another computer's shared folder) can be given its
+// cookie file for its host and port; the list is kept owner-only beside the
+// configuration, at most 16 entries, regular files only (no links).
+// Why: such a node wanted its password typed into its URL.
+// Look here if: a saved cookie file is not used, or a file is refused.
+/// Where the saved cookie files are kept.
+pub fn node_cookies_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("node-cookies.json")
+}
+
+/// The most cookie files kept.
+const MAX_NODE_COOKIES: usize = 16;
+
+/// A node's cookie file, for its host and port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCookie {
+    pub host: String,
+    pub port: u16,
+    pub path: PathBuf,
+}
+
+/// The saved cookie files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCookies {
+    #[serde(default)]
+    pub cookies: Vec<NodeCookie>,
+}
+
+impl NodeCookies {
+    /// The saved list, or none when the file does not exist.
+    pub fn load_optional(path: &Path) -> Result<Self, String> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(format!("read {}: {error}", path.display())),
+        };
+        let cookies: Self = serde_json::from_str(&text)
+            .map_err(|_| format!("{} is not a list of cookie files", path.display()))?;
+        if cookies.cookies.len() > MAX_NODE_COOKIES {
+            return Err(format!(
+                "{} holds over {MAX_NODE_COOKIES} cookie files",
+                path.display()
+            ));
+        }
+        Ok(cookies)
+    }
+
+    /// Keeps the list owner-only.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
+        write_private_atomic(path, &bytes)
+    }
+
+    /// Adds `host:port`'s cookie file, or replaces it: the file must be a
+    /// regular file (not a link or a folder).
+    pub fn put(&mut self, host: &str, port: u16, path: &Path) -> Result<(), String> {
+        let host = host.trim();
+        if host.is_empty() || host.contains(['/', ' ', '@']) || port == 0 {
+            return Err("give the node as HOST:PORT".into());
+        }
+        if !is_regular_file(path) {
+            return Err("the cookie file must be a regular file (not a link or a folder)".into());
+        }
+        self.remove(host, port);
+        if self.cookies.len() >= MAX_NODE_COOKIES {
+            return Err(format!("at most {MAX_NODE_COOKIES} cookie files are kept"));
+        }
+        self.cookies.push(NodeCookie {
+            host: host.to_owned(),
+            port,
+            path: path.to_path_buf(),
+        });
+        Ok(())
+    }
+
+    /// Forgets `host:port`'s cookie file.
+    pub fn remove(&mut self, host: &str, port: u16) {
+        let host = host.trim();
+        self.cookies
+            .retain(|cookie| !(cookie.host.eq_ignore_ascii_case(host) && cookie.port == port));
+    }
+
+    /// `host:port`'s cookie file.
+    pub fn get(&self, host: &str, port: u16) -> Option<&Path> {
+        self.cookies
+            .iter()
+            .find(|cookie| cookie.host.eq_ignore_ascii_case(host) && cookie.port == port)
+            .map(|cookie| cookie.path.as_path())
+    }
+
+    /// The list as node logins use it.
+    pub fn entries(&self) -> Vec<(String, u16, PathBuf)> {
+        self.cookies
+            .iter()
+            .map(|cookie| (cookie.host.clone(), cookie.port, cookie.path.clone()))
+            .collect()
+    }
+}
+
+/// Whether `path` is a regular file, not a link.
+pub fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 /// Most user-added connections kept per network and kind.
@@ -1103,6 +1709,27 @@ impl MiningProfiles {
         }
         Ok(name)
     }
+}
+
+/// #### PR #42
+/// What: a private file written whole: a temporary file beside it is made
+/// owner-only before anything is written, synced, then renamed over the old
+/// one, so a crash leaves the old file or the new one, never half of one.
+/// Why: device logins (and later other private server files) are rewritten
+/// while the server runs.
+/// Look here if: a private file is readable by other users, or a crash
+/// leaves a half-written one.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".tmp-{:016x}", rand::random::<u64>()));
+    let temp = PathBuf::from(temp);
+    let written = write_private_config(&temp, bytes).and_then(|()| {
+        fs::rename(&temp, path).map_err(|error| format!("write {}: {error}", path.display()))
+    });
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 fn write_private_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1669,6 +2296,378 @@ mod tests {
         }
     }
 
+    // #### PR #42
+    #[cfg(feature = "stratum-v2")]
+    #[test]
+    fn private_atomic_write_replaces_whole_and_leaves_no_temporary_file() {
+        let dir =
+            std::env::temp_dir().join(format!("pickaxe-private-{:016x}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logins.json");
+        write_private_atomic(&path, b"first").unwrap();
+        write_private_atomic(&path, b"second, longer").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second, longer");
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // #### PR #42
+    #[test]
+    fn a_plain_gpu_profile_saves_no_server_and_bad_pool_values_are_refused() {
+        let plain = SavedConfig {
+            network: Some("chipnet".into()),
+            ..SavedConfig::default()
+        };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("server"));
+        let with = |server: SavedServer| SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(server),
+            ..SavedConfig::default()
+        };
+        let pool = SavedServer {
+            mode: SavedMode::AsicPool,
+            join: None,
+            join_key: None,
+            pool_fee: Some("2".parse().unwrap()),
+            fee_mode: Some(crate::donation::bch::FeeMode::Both),
+            fee_address: None,
+            pool_tag: Some("/MyPool/".into()),
+            sv1_port: Some(3338),
+            sv2_port: None,
+            start_difficulty: Some(65_536),
+            backups: Vec::new(),
+            pool_user: None,
+            tp_port: Some(48442),
+            job_declaration: None,
+            accept_job_declaration: Some(SavedAccept::Both),
+            fallback_pools: Vec::new(),
+            asic_token: None,
+            rig_name: None,
+            rig_port: None,
+            rigs_only: false,
+            node_zmq: None,
+        };
+        with(pool.clone()).validate().unwrap();
+        let text = serde_json::to_string(&with(pool.clone())).unwrap();
+        assert!(text.contains("\"mode\":\"asic-pool\""), "{text}");
+        let back: SavedConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.server, Some(pool.clone()));
+        let joining = SavedServer {
+            mode: SavedMode::AsicJoin,
+            join: Some("stratum2+tcp://pool.example:3336/KEY".into()),
+            join_key: None,
+            pool_fee: None,
+            fee_mode: None,
+            fee_address: None,
+            pool_tag: None,
+            sv1_port: None,
+            sv2_port: None,
+            start_difficulty: None,
+            backups: vec!["stratum2+tcp://backup.example:3336/KEY".into()],
+            pool_user: Some("rig-owner".into()),
+            tp_port: None,
+            job_declaration: Some(SavedDeclaration::Full),
+            accept_job_declaration: None,
+            fallback_pools: Vec::new(),
+            asic_token: None,
+            rig_name: None,
+            rig_port: None,
+            rigs_only: false,
+            node_zmq: None,
+        };
+        with(joining.clone()).validate().unwrap();
+        // #### PR #42: Job Declaration and fallback pools round trip.
+        let text = serde_json::to_string(&with(joining.clone())).unwrap();
+        assert!(text.contains("\"job_declaration\":\"full\""), "{text}");
+        let back: SavedConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.server, Some(joining.clone()));
+        let solo = SavedServer {
+            mode: SavedMode::AsicSolo,
+            join: None,
+            backups: Vec::new(),
+            pool_user: None,
+            job_declaration: None,
+            fallback_pools: vec!["stratum2+tcp://fallback.example:3336/KEY".into()],
+            ..joining.clone()
+        };
+        with(solo.clone()).validate().unwrap();
+        let text = serde_json::to_string(&with(solo.clone())).unwrap();
+        let back: SavedConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.server, Some(solo.clone()));
+        // #### PR #42: an ASIC-exclusive token round trips too.
+        let token = SavedServer {
+            fallback_pools: Vec::new(),
+            asic_token: Some("Pickaxe ASIC test token".into()),
+            ..solo.clone()
+        };
+        with(token.clone()).validate().unwrap();
+        let text = serde_json::to_string(&with(token.clone())).unwrap();
+        assert!(
+            text.contains("\"asic_token\":\"Pickaxe ASIC test token\""),
+            "{text}"
+        );
+        let back: SavedConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.server, Some(token.clone()));
+        for (bad, why) in [
+            (
+                SavedServer {
+                    pool_tag: Some("x".repeat(21)),
+                    ..pool.clone()
+                },
+                "a 21-character pool name",
+            ),
+            (
+                SavedServer {
+                    join: None,
+                    ..joining.clone()
+                },
+                "joining without an address",
+            ),
+            (
+                SavedServer {
+                    join: Some("pool.example 3336".into()),
+                    ..joining.clone()
+                },
+                "a space in the address",
+            ),
+            (
+                SavedServer {
+                    mode: SavedMode::AsicSolo,
+                    ..pool.clone()
+                },
+                "a fee on solo mining",
+            ),
+            (
+                SavedServer {
+                    fee_address: Some("not-an-address".into()),
+                    ..pool.clone()
+                },
+                "a bad fee address",
+            ),
+            (
+                SavedServer {
+                    mode: SavedMode::GpuPool,
+                    ..pool.clone()
+                },
+                "a GPU pool with an ASIC pool's name and fee source",
+            ),
+            (
+                SavedServer {
+                    sv1_port: Some(3336),
+                    ..pool.clone()
+                },
+                "the SV1 port on the SV2 port",
+            ),
+            (
+                SavedServer {
+                    start_difficulty: Some(0),
+                    ..pool.clone()
+                },
+                "a start difficulty of 0",
+            ),
+            (
+                SavedServer {
+                    backups: vec!["a b".into()],
+                    ..joining.clone()
+                },
+                "a backup pool with a space",
+            ),
+            (
+                SavedServer {
+                    pool_user: Some("rig".into()),
+                    ..pool.clone()
+                },
+                "a pool username on an ASIC pool",
+            ),
+            // #### PR #42
+            (
+                SavedServer {
+                    tp_port: Some(48442),
+                    ..joining.clone()
+                },
+                "templates served while joining a pool",
+            ),
+            (
+                SavedServer {
+                    tp_port: Some(3338),
+                    ..pool.clone()
+                },
+                "the template port on the SV1 port",
+            ),
+            (
+                SavedServer {
+                    tp_port: Some(0),
+                    ..pool.clone()
+                },
+                "template port 0",
+            ),
+            (
+                SavedServer {
+                    job_declaration: Some(SavedDeclaration::Coinbase),
+                    ..solo.clone()
+                },
+                "Job Declaration without a pool to join",
+            ),
+            (
+                SavedServer {
+                    accept_job_declaration: Some(SavedAccept::Full),
+                    ..joining.clone()
+                },
+                "accepting miners' templates while joining a pool",
+            ),
+            (
+                SavedServer {
+                    fallback_pools: vec!["stratum2+tcp://fallback.example:3336/KEY".into()],
+                    ..joining.clone()
+                },
+                "fallback pools while joining a pool",
+            ),
+            (
+                SavedServer {
+                    fallback_pools: vec!["a b".into()],
+                    ..solo.clone()
+                },
+                "a fallback pool with a space",
+            ),
+            (
+                SavedServer {
+                    fallback_pools: vec!["stratum2+tcp://f.example:3336/KEY".into(); 9],
+                    ..solo.clone()
+                },
+                "nine fallback pools",
+            ),
+            (
+                SavedServer {
+                    asic_token: Some("Pickaxe ASIC test token".into()),
+                    ..joining.clone()
+                },
+                "an ASIC-exclusive token while joining a pool",
+            ),
+            (
+                SavedServer {
+                    tp_port: Some(48442),
+                    ..token.clone()
+                },
+                "an ASIC-exclusive token serving templates",
+            ),
+            (
+                SavedServer {
+                    fallback_pools: vec!["stratum2+tcp://f.example:3336/KEY".into()],
+                    ..token.clone()
+                },
+                "an ASIC-exclusive token with fallback pools",
+            ),
+            (
+                SavedServer {
+                    asic_token: Some(" ".into()),
+                    ..token.clone()
+                },
+                "a blank token name",
+            ),
+            (
+                SavedServer {
+                    rig_name: Some("rack".into()),
+                    ..joining.clone()
+                },
+                "a rig name on ASICs joining a pool",
+            ),
+            (
+                SavedServer {
+                    rig_port: Some(3340),
+                    ..joining.clone()
+                },
+                "a rigs' port on ASICs joining a pool",
+            ),
+            (
+                SavedServer {
+                    mode: SavedMode::GpuFarm,
+                    join: None,
+                    backups: Vec::new(),
+                    pool_user: None,
+                    job_declaration: None,
+                    rig_port: None,
+                    ..joining.clone()
+                },
+                "a GPU farm without its port",
+            ),
+            (
+                SavedServer {
+                    mode: SavedMode::GpuPool,
+                    join: None,
+                    backups: Vec::new(),
+                    pool_user: None,
+                    job_declaration: None,
+                    pool_fee: Some("1".parse().unwrap()),
+                    rigs_only: true,
+                    ..joining.clone()
+                },
+                "rigs only on a GPU pool",
+            ),
+        ] {
+            assert!(with(bad).validate().is_err(), "{why}");
+        }
+    }
+
+    // #### PR #42
+    // What: a plain-TCP Fulcrum server is taken on this computer, the home
+    // network, Tailscale or a .local name, with its port; a public host or a
+    // missing port is refused, in the runtime and in the shared sources.
+    // Look here if: check_tcp_electrum or private_host changes.
+    #[test]
+    fn tcp_fulcrum_is_refused_for_public_hosts() {
+        for home in [
+            "tcp://192.168.1.5:50001",
+            "tcp://10.0.0.2:50001",
+            "tcp://127.0.0.1:50001",
+            "tcp://localhost:50001",
+            "tcp://umbrel.local:50001",
+            "tcp://100.101.102.103:50001",
+            "tcp://[fd00::5]:50001",
+            "TCP://192.168.1.5:50002",
+        ] {
+            let mut cfg = RuntimeConfig::default();
+            cfg.set_fulcrum_url(home)
+                .unwrap_or_else(|error| panic!("{home}: {error}"));
+        }
+        for (public, why) in [
+            ("tcp://fulcrum.example.com:50001", "home network"),
+            ("tcp://8.8.8.8:50001", "home network"),
+            ("tcp://[2001:db8::1]:50001", "home network"),
+            ("tcp://100.200.1.1:50001", "home network"),
+            ("tcp://192.168.1.5", "needs its port"),
+            ("tcp://192.168.1.5:0", "needs its port"),
+        ] {
+            let mut cfg = RuntimeConfig::default();
+            let error = cfg.set_fulcrum_url(public).unwrap_err();
+            assert!(error.contains(why), "{public}: {error}");
+        }
+        assert!(SharedSources::validate_entry(
+            MiningNetwork::Mainnet,
+            ConnectionKind::Fulcrum,
+            "tcp://fulcrum.example.com:50001"
+        )
+        .is_err());
+        assert_eq!(
+            SharedSources::validate_entry(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Fulcrum,
+                "tcp://umbrel.local:50001"
+            )
+            .unwrap(),
+            "tcp://umbrel.local:50001"
+        );
+    }
+
     #[test]
     fn payout_validation_rechecks_checksum_case_and_type() {
         for address in [
@@ -1724,6 +2723,85 @@ mod tests {
             saved.save(&path).unwrap();
             assert_config_file_is_owner_only(&path);
             assert!(fs::read_to_string(&path).unwrap().contains("secret-pass"));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // #### PR #42
+    // What: --node-zmq takes auto, off, or a tcp:// endpoint with its port
+    // on this computer or the home network; a public one is refused.
+    // Look here if: set_node_zmq changes.
+    #[test]
+    fn node_zmq_is_local_or_off() {
+        let mut cfg = RuntimeConfig::default();
+        assert_eq!(cfg.node_zmq, NodeZmq::Auto);
+        cfg.set_node_zmq("tcp://127.0.0.1:28332").unwrap();
+        assert_eq!(cfg.node_zmq, NodeZmq::At("tcp://127.0.0.1:28332".into()));
+        cfg.set_node_zmq("tcp://cypherpunkdeb.local:28332").unwrap();
+        cfg.set_node_zmq("OFF").unwrap();
+        assert_eq!(cfg.node_zmq, NodeZmq::Off);
+        assert!(cfg.set_node_zmq("tcp://8.8.8.8:28332").is_err());
+        assert!(cfg.set_node_zmq("tcp://127.0.0.1").is_err());
+        assert!(cfg.set_node_zmq("http://127.0.0.1:28332").is_err());
+        assert_eq!(cfg.node_zmq, NodeZmq::Off);
+        cfg.set_node_zmq("auto").unwrap();
+        assert_eq!(cfg.node_zmq, NodeZmq::Auto);
+        // A profile saves them only for an ASIC server.
+        let mut server: SavedServer =
+            serde_json::from_str(r#"{"mode": "asic-solo", "node_zmq": "off"}"#).unwrap();
+        server.validate(MiningNetwork::Chipnet).unwrap();
+        server.node_zmq = Some("tcp://8.8.8.8:28332".into());
+        assert!(server.validate(MiningNetwork::Chipnet).is_err());
+        server.node_zmq = Some("off".into());
+        server.mode = SavedMode::GpuFarm;
+        assert!(server.validate(MiningNetwork::Chipnet).is_err());
+    }
+
+    // #### PR #42
+    // What: the saved cookie files are kept owner-only, at most 16, without
+    // unknown fields, and only regular files are taken: a folder or a link
+    // is refused.
+    // Look here if: NodeCookies changes.
+    #[test]
+    fn node_cookie_file_is_owner_only_and_refuses_symlinks() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-node-cookies-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        expose_config_directory(&dir);
+        let cookie = dir.join("knuth.cookie");
+        fs::write(&cookie, "__cookie__:00").unwrap();
+        let path = node_cookies_path(&dir.join("pickaxe.json"));
+        assert!(path.ends_with("pickaxe.node-cookies.json"));
+        let mut cookies = NodeCookies::load_optional(&path).unwrap();
+        assert!(cookies.cookies.is_empty());
+        cookies.put("192.168.0.55", 8332, &cookie).unwrap();
+        cookies.put("192.168.0.55", 8332, &cookie).unwrap();
+        assert_eq!(cookies.cookies.len(), 1);
+        assert!(cookies.put("192.168.0.55", 8333, &dir).is_err());
+        assert!(cookies.put("http://x", 1, &cookie).is_err());
+        cookies.save(&path).unwrap();
+        assert_config_file_is_owner_only(&path);
+        assert_eq!(NodeCookies::load_optional(&path).unwrap(), cookies);
+        assert_eq!(cookies.get("192.168.0.55", 8332), Some(cookie.as_path()));
+        cookies.remove("192.168.0.55", 8332);
+        assert!(cookies.cookies.is_empty());
+        for port in 1..=16 {
+            cookies.put("10.0.0.1", port, &cookie).unwrap();
+        }
+        assert!(cookies.put("10.0.0.1", 17, &cookie).is_err());
+        fs::write(&path, r#"{"cookies":[],"extra":1}"#).unwrap();
+        assert!(NodeCookies::load_optional(&path).is_err());
+        // A link is refused where the system lets a test make one.
+        let link = dir.join("link.cookie");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&cookie, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&cookie, &link).is_ok();
+        if made {
+            assert!(cookies.put("10.0.0.2", 8332, &link).is_err());
         }
         let _ = fs::remove_dir_all(&dir);
     }

@@ -62,14 +62,7 @@ pub fn scripts(
 pub fn outputs(value: u64, scripts: &[Vec<u8>], policy: BchPayout) -> Vec<(u64, Vec<u8>)> {
     let amounts = policy.amounts(value);
     if value == 0 {
-        let index = if policy.donation_work {
-            1
-        } else if policy.fee_work && scripts.len() > 2 {
-            2
-        } else {
-            0
-        };
-        return vec![(0, scripts[index].clone())];
+        return vec![(0, beneficiary(scripts, policy).to_vec())];
     }
     let mut outputs: Vec<(u64, Vec<u8>)> = Vec::new();
     for (amount, script) in amounts.into_iter().zip(scripts) {
@@ -82,6 +75,36 @@ pub fn outputs(value: u64, scripts: &[Vec<u8>], policy: BchPayout) -> Vec<(u64, 
         }
     }
     outputs
+}
+
+/// #### PR #42
+/// Who a job pays as a whole: the donation in its work jobs, a public
+/// pool's operator in its fee-work jobs, the miner otherwise; the same
+/// rule as `BchPayout::amounts`. A merge-mined token's leaf binds this
+/// script, so token work is shared out as BCH work is.
+pub fn beneficiary(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
+    if policy.donation_work {
+        &scripts[1]
+    } else if policy.fee_work && scripts.len() > 2 {
+        &scripts[2]
+    } else {
+        &scripts[0]
+    }
+}
+
+/// #### PR #42
+/// The donation's share of a merge-mined token's claim: two thirds of the
+/// BCH donation setting (the block-reward share, in hundredths of a percent,
+/// rounded down so any fraction stays with the miner), paid to `donation`,
+/// in miner jobs. Donation-work and fee-work jobs, and a setting below
+/// 0.02%, carry no split; the other third is the same work rotation as BCH.
+/// A public pool's coinbase-mode fee has no token counterpart in v1.
+pub fn token_split(policy: BchPayout, donation: &[u8]) -> Option<(u16, &[u8])> {
+    if policy.donation_work || policy.fee_work {
+        return None;
+    }
+    let bps = (u32::from(u16::from(policy.donation)) * 2 / 3) as u16;
+    (bps > 0).then_some((bps, donation))
 }
 
 #[cfg(test)]
@@ -137,5 +160,75 @@ mod tests {
         assert!(config::validate_payout_address(network, &p2sh).is_err());
         assert!(config::validate_coinbase_address(MiningNetwork::Mainnet, &p2sh).is_err());
         assert!(cashaddr_to_coinbase_locking("bchtest:qqqq").is_err());
+    }
+
+    // #### PR #42
+    #[test]
+    fn token_split_follows_the_bch_setting_down_to_zero() {
+        use crate::donation::bch::{BchDonation, FeeMode};
+        let network = MiningNetwork::Chipnet;
+        let operator = crate::tx::cashaddr_with_version(1 << 3, &[0x33; 20], network);
+        let scripts = scripts(
+            network,
+            &super::super::template_tests::payout(),
+            Some(&operator),
+        )
+        .unwrap();
+        let donation = &scripts[1];
+        // Not the GPU token minimum: the one BCH setting, 0% to 100%.
+        for bps in (0..=10_000).step_by(50) {
+            let policy = BchPayout {
+                donation: BchDonation::try_from(bps).unwrap(),
+                ..BchPayout::default()
+            };
+            let split = token_split(policy, donation);
+            if bps == 0 {
+                assert_eq!(split, None);
+                continue;
+            }
+            let (share, to) = split.unwrap();
+            assert_eq!(to, &donation[..]);
+            // Two thirds of the setting, rounded down: the same share the
+            // donation takes of each block reward.
+            assert!(u32::from(share) * 3 <= u32::from(bps) * 2);
+            assert!(u32::from(share) * 3 + 3 > u32::from(bps) * 2);
+            assert_eq!(beneficiary(&scripts, policy), &scripts[0][..]);
+        }
+        let default = BchPayout::default();
+        assert_eq!(token_split(default, donation), Some((100, &donation[..])));
+        assert_eq!(
+            token_split(
+                BchPayout {
+                    donation: BchDonation::try_from(1).unwrap(),
+                    ..default
+                },
+                donation
+            ),
+            None
+        );
+        // Donation-work and fee-work jobs pay their own script, unsplit.
+        let donation_job = BchPayout {
+            donation_work: true,
+            ..default
+        };
+        assert_eq!(token_split(donation_job, donation), None);
+        assert_eq!(beneficiary(&scripts, donation_job), &scripts[1][..]);
+        let fee_job = BchPayout {
+            fee: Some(PoolFee {
+                rate: "2".parse().unwrap(),
+                mode: FeeMode::Work,
+            }),
+            fee_work: true,
+            ..default
+        };
+        assert_eq!(token_split(fee_job, donation), None);
+        assert_eq!(beneficiary(&scripts, fee_job), &scripts[2][..]);
+        // A zero-value coinbase pays the beneficiary, as before.
+        for policy in [default, donation_job, fee_job] {
+            assert_eq!(
+                outputs(0, &scripts, policy),
+                vec![(0, beneficiary(&scripts, policy).to_vec())]
+            );
+        }
     }
 }

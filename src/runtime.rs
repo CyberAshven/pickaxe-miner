@@ -1720,10 +1720,13 @@ fn broadcast_pending_transaction(
     cfg: &RuntimeConfig,
     raw_tx_hex: &str,
 ) -> Result<String, String> {
-    if cfg.network == MiningNetwork::Chipnet {
-        // The active Fulcrum session is bound to the chipnet deployment.
-        return session.broadcast_raw(raw_tx_hex);
-    }
+    // #### PR #42
+    // What: a Chipnet claim is broadcast as a mainnet one: Fulcrum or the
+    // miner's node by the source preference, falling back to the other.
+    // Why: the Chipnet-only shortcut was left from the retired Chipnet
+    // batch-payout preview; Chipnet and mainnet are one code path.
+    // Look here if: a Chipnet claim goes to a different place than a
+    // mainnet one would.
     let node_endpoints = cfg.node_endpoints();
     let node_configured = !node_endpoints.is_empty();
     broadcast_with_preference(
@@ -1772,9 +1775,13 @@ fn preflight_pending_transaction(
     expected_txid: &str,
     raw_tx_hex: &str,
 ) -> Result<(), String> {
-    if cfg.network == MiningNetwork::Chipnet {
-        return Ok(());
-    }
+    // #### PR #42
+    // What: a Chipnet claim takes the same node mempool gate as a mainnet
+    // one when the miner saved a node.
+    // Why: the Chipnet-only skip was left from the retired Chipnet
+    // batch-payout preview; Chipnet and mainnet are one code path.
+    // Look here if: a Chipnet miner with a saved node now waits on
+    // testmempoolaccept.
     // Bootstrap node RPCs stay off this gate. A public node that lacks
     // testmempoolaccept, or rejects a valid PHOTON tx, must not block the
     // Fulcrum broadcast the miner already uses.
@@ -2469,6 +2476,8 @@ pub struct RuntimeGpu {
     pub device: u32,
     pub name: String,
     pub telemetry: GpuTelemetry,
+    /// #### PR #42: the GPU's PCI location, which farm systems match by.
+    pub pci: Option<crate::backend::PciAddress>,
 }
 
 #[derive(Debug, Clone)]
@@ -2510,6 +2519,11 @@ pub struct RuntimeSnapshot {
     pub gpu_telemetry: GpuTelemetry,
     /// The rigs this miner coordinates, when it runs with --rigs-listen.
     pub rigs: Option<RigSummary>,
+    /// #### PR #42: where jobs come from now: the miner's node, Fulcrum,
+    /// or Fulcrum while the node is down.
+    pub job_source: crate::job_source::JobSourceStatus,
+    /// #### PR #42: when mining started, in unix seconds.
+    pub started_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2544,6 +2558,15 @@ pub enum RuntimeEvent {
         recipient: String,
     },
     Error(String),
+    /// #### PR #42: the job source fell back to Fulcrum while a node is
+    /// configured, and why.
+    NodeDown {
+        reason: String,
+    },
+    /// The miner's node is the job source again (its address redacted).
+    NodeBack {
+        endpoint: String,
+    },
 }
 
 #[allow(dead_code)]
@@ -2638,7 +2661,10 @@ impl RuntimeSupervisor {
             None,
             ReconnectPreference::RotateAway,
         );
-        let mut session = connect_job_source(&cfg, &endpoints, None)?;
+        let JobSourceConnection {
+            mut session,
+            node_error,
+        } = connect_job_source(&cfg, &endpoints, None)?;
         let journal_path = submission_journal_path(cfg.network);
         resolve_pending_before_search(&mut session, &cfg, &journal_path)?;
         let mut initial = session.fetch_live_job()?;
@@ -2698,6 +2724,7 @@ impl RuntimeSupervisor {
                     device: gpu.index,
                     name: gpu.name.clone(),
                     telemetry: GpuTelemetry::default(),
+                    pci: gpu.pci,
                 })
                 .collect(),
             generation_id: cfg.generation_id,
@@ -2724,6 +2751,14 @@ impl RuntimeSupervisor {
             rigs: rigs.as_ref().map(RigHub::summary),
             token_donation: cfg.token_donation(),
             donation_minimum: cfg.token.donation_minimum(),
+            job_source: if session.is_node() {
+                crate::job_source::JobSourceStatus::Node
+            } else {
+                crate::job_source::JobSourceStatus::Fulcrum
+            },
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
         };
 
         let snapshot = Arc::new(Mutex::new(initial_snapshot));
@@ -2741,6 +2776,7 @@ impl RuntimeSupervisor {
                     sources,
                     initial,
                     session,
+                    node_error,
                     None,
                     Instant::now(),
                     search,
@@ -2882,6 +2918,7 @@ fn run_supervisor(
     mut sources: SourceCatalog,
     mut live: LiveJob,
     initial_session: ElectrumSession,
+    initial_node_error: Option<String>,
     mut native_photon_session: Option<crate::node::NativePhotonSession>,
     source_capability_epoch: Instant,
     search: SearchHandle,
@@ -2895,6 +2932,27 @@ fn run_supervisor(
     rigs: Option<RigHub>,
 ) {
     let mut active_fulcrum_endpoint = initial_session.url.clone();
+    // #### PR #42: back to the miner's own node
+    // What: when the job source falls back to Fulcrum while a node is
+    // configured, a watch asks the node again on its own thread (15 s, then
+    // doubling to 300 s; a syncing node 2 min, a setting to fix 30 min) and,
+    // once the node follows the mined baton, hands it over at a moment with
+    // no winner, claim or winner refresh in flight; the reconnect path
+    // installs it as it installs any source. While the node is down, no node
+    // call runs on this thread (`skip_native`).
+    // Why: the session never went back to the node, and probing it here (an
+    // 8 s connect, a scan of up to 180 s) blocked refreshes and claims.
+    // Look here if: a miner never returns to its node, or a refresh stalls
+    // while the node is down.
+    let has_node = !cfg.custom_node_endpoints().is_empty();
+    let mut node_watch = crate::job_source::NodeWatch::<(ElectrumSession, LiveJob)>::default();
+    let mut node_ready: Option<(ElectrumSession, LiveJob)> = None;
+    if has_node && !initial_session.is_node() {
+        let reason =
+            initial_node_error.unwrap_or_else(|| "the node gave no PHOTON state".to_owned());
+        node_watch.down(Instant::now(), &reason);
+        emit(&event_tx, RuntimeEvent::NodeDown { reason });
+    }
     let mut session = Some(initial_session);
     let mut state = if pending_submission.is_some() {
         SupervisorState::Paused
@@ -3086,6 +3144,7 @@ fn run_supervisor(
                         last_error = None;
                         reconnect_backoff = RECONNECT_MIN;
                         next_reconnect = Instant::now();
+                        node_watch.try_now(Instant::now());
                         emit(
                             &event_tx,
                             RuntimeEvent::Reconnecting("manual Fulcrum reconnect requested".into()),
@@ -3144,6 +3203,35 @@ fn run_supervisor(
             // immediately rather than waiting for the next 500 ms deadline.
             next_state_refresh = Instant::now();
         }
+        // #### PR #42: a ready node takes over through the reconnect path.
+        let safe = session.is_some()
+            && pending_winners == 0
+            && pending_winner.is_none()
+            && pending_submission.is_none()
+            && !winner_refresh_pending;
+        if let crate::job_source::Poll::Ready(ready) = node_watch.poll(Instant::now(), safe, || {
+            let nodes: Vec<String> = cfg
+                .custom_node_endpoints()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let deployment = cfg.token.photon_deployment(cfg.network);
+            let network = cfg.network;
+            let mined = live.clone();
+            let (send, receive) = mpsc::sync_channel(1);
+            let _ = thread::Builder::new()
+                .name("pickaxe-node-return".into())
+                .spawn(move || {
+                    let _ = send.send(crate::job_source::try_node_return(
+                        &nodes, deployment, network, &mined,
+                    ));
+                });
+            receive
+        }) {
+            node_ready = Some(ready);
+            session = None;
+            next_reconnect = Instant::now();
+        }
         if session.is_none() {
             if Instant::now() >= next_reconnect {
                 let now_ms = source_capability_now_ms(source_capability_epoch);
@@ -3160,18 +3248,42 @@ fn run_supervisor(
                     Some(&active_fulcrum_endpoint),
                     reconnect_preference,
                 );
-                let reconnect_result =
-                    if endpoints.is_empty() && cfg.custom_node_endpoints().is_empty() {
-                        Err(
-                            "no eligible Fulcrum source is currently available under source policy"
-                                .to_string(),
-                        )
-                    } else {
-                        connect_job_source(&cfg, &endpoints, Some(&live))
-                            .and_then(|mut next| next.fetch_live_job().map(|job| (next, job)))
-                    };
+                let mut node_error = None;
+                let reconnect_result = if let Some(ready) = node_ready.take() {
+                    Ok(ready)
+                } else if endpoints.is_empty() && cfg.custom_node_endpoints().is_empty() {
+                    Err(
+                        "no eligible Fulcrum source is currently available under source policy"
+                            .to_string(),
+                    )
+                } else {
+                    connect_job_source(&cfg, &endpoints, Some(&live)).and_then(|connection| {
+                        node_error = connection.node_error;
+                        let mut next = connection.session;
+                        next.fetch_live_job().map(|job| (next, job))
+                    })
+                };
                 match reconnect_result {
                     Ok((next_session, next_job)) => {
+                        // #### PR #42: the watch follows the installed source.
+                        if next_session.is_node() {
+                            if node_watch.is_down() {
+                                emit(
+                                    &event_tx,
+                                    RuntimeEvent::NodeBack {
+                                        endpoint: next_session.url.clone(),
+                                    },
+                                );
+                            }
+                            node_watch.up();
+                        } else if has_node {
+                            let reason = node_error
+                                .take()
+                                .unwrap_or_else(|| "the node gave no PHOTON state".to_owned());
+                            if node_watch.down(Instant::now(), &reason) {
+                                emit(&event_tx, RuntimeEvent::NodeDown { reason });
+                            }
+                        }
                         let connected_endpoint = next_session.url.clone();
                         let rotated =
                             !connected_endpoint.eq_ignore_ascii_case(&active_fulcrum_endpoint);
@@ -3542,6 +3654,7 @@ fn run_supervisor(
                     &mut sources,
                     &mut native_photon_session,
                     source_capability_epoch,
+                    node_watch.is_down(),
                 )
             };
             next_state_refresh = next_periodic_deadline(
@@ -3776,6 +3889,10 @@ fn run_supervisor(
             pending_winners,
             last_error.clone(),
             &mut throughput,
+            node_watch.status(
+                Instant::now(),
+                session.as_ref().is_some_and(ElectrumSession::is_node),
+            ),
         );
         if let Some(rigs) = rigs.as_ref() {
             shared_snapshot
@@ -3968,7 +4085,7 @@ fn connect_job_source(
     cfg: &RuntimeConfig,
     fulcrum: &[String],
     mining: Option<&LiveJob>,
-) -> Result<ElectrumSession, String> {
+) -> Result<JobSourceConnection, String> {
     let deployment = cfg.token.photon_deployment(cfg.network);
     let nodes: Vec<String> = cfg
         .custom_node_endpoints()
@@ -3976,7 +4093,12 @@ fn connect_job_source(
         .map(str::to_owned)
         .collect();
     if nodes.is_empty() {
-        return ElectrumSession::connect_failover_for_deployment(fulcrum, deployment);
+        return ElectrumSession::connect_failover_for_deployment(fulcrum, deployment).map(
+            |session| JobSourceConnection {
+                session,
+                node_error: None,
+            },
+        );
     }
     // A baton to start from: the job being mined on a reconnect, or at start
     // a Fulcrum server's answer, which the node checks for itself; without
@@ -3995,22 +4117,41 @@ fn connect_job_source(
         },
     };
     match ElectrumSession::connect_node_failover(&nodes, deployment, known.as_ref()) {
-        Ok(session) => Ok(session),
+        Ok(session) => Ok(JobSourceConnection {
+            session,
+            node_error: None,
+        }),
         Err(node_error) => match fallback {
-            Some(session) => Ok(session),
+            Some(session) => Ok(JobSourceConnection {
+                session,
+                node_error: Some(node_error),
+            }),
             None => ElectrumSession::connect_failover_for_deployment(fulcrum, deployment)
+                .map(|session| JobSourceConnection {
+                    session,
+                    node_error: Some(node_error.clone()),
+                })
                 .map_err(|error| format!("{node_error}\n{error}")),
         },
     }
 }
 
-/// Refreshes the PHOTON job on the periodic source cadence.
+/// #### PR #42: the job source connected, and why the node was skipped
+/// when a node is configured and the source is Fulcrum.
+struct JobSourceConnection {
+    session: ElectrumSession,
+    node_error: Option<String>,
+}
+
+/// Refreshes the PHOTON job on the periodic source cadence; #### PR #42:
+/// with `skip_native` (the node is down) no node call runs.
 fn refresh_photon_job_on_cadence(
     cfg: &RuntimeConfig,
     canonical: &mut ElectrumSession,
     sources: &mut SourceCatalog,
     native_session: &mut Option<crate::node::NativePhotonSession>,
     epoch: Instant,
+    skip_native: bool,
 ) -> Result<PhotonBoundaryRefresh, String> {
     // #### PR #40: on the miner's own node, its state is the job.
     if canonical.is_node() {
@@ -4021,6 +4162,25 @@ fn refresh_photon_job_on_cadence(
                 job: snapshot.job,
                 route_warning: None,
             });
+    }
+    // #### PR #42: skip_native
+    // What: while the node is down, the refresh asks Fulcrum alone: no node
+    // connect, scan or proof runs on the loop thread; the node watch asks
+    // the node on its own thread.
+    // Why: an 8 s connect or a scan of up to 180 s here blocked claims.
+    // Look here if: a miner never returns to its node, or Fulcrum refreshes
+    // stall while the node is down.
+    if skip_native {
+        *native_session = None;
+        let now_ms = source_capability_now_ms(epoch);
+        let started = Instant::now();
+        let snapshot = canonical.fetch_live_snapshot()?;
+        let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+        record_canonical_fulcrum_probe(sources, &snapshot, now_ms, latency_ms)?;
+        return Ok(PhotonBoundaryRefresh {
+            job: snapshot.job,
+            route_warning: None,
+        });
     }
     let now_ms = source_capability_now_ms(epoch);
     let canonical_started = Instant::now();
@@ -4485,6 +4645,7 @@ fn write_snapshot(
     pending_winners: u64,
     last_error: Option<String>,
     throughput: &mut ThroughputTracker,
+    job_source: crate::job_source::JobSourceStatus,
 ) {
     let mut search_stats = search.snapshot();
     throughput.observe(&mut search_stats, Instant::now());
@@ -4521,6 +4682,7 @@ fn write_snapshot(
     snapshot.pending_winners = pending_winners;
     snapshot.last_error = last_error;
     snapshot.search = search_stats;
+    snapshot.job_source = job_source;
 }
 
 fn present_runtime_status(
@@ -5241,6 +5403,81 @@ mod tests {
         if let Ok(path) = std::env::var("PICKAXE_DIRECT_REWARD_PROOF") {
             fs::write(path, serde_json::to_vec(&samples).unwrap()).unwrap();
         }
+    }
+
+    // #### PR #42
+    // What: while the node is down (`skip_native`), a cadence refresh on
+    // Fulcrum asks Fulcrum alone: the configured node, a listener that never
+    // accepts, sees no connection, and the refresh returns Fulcrum's job.
+    // Look here if: skip_native or the cadence refresh changes.
+    #[test]
+    fn a_fulcrum_refresh_never_calls_the_node_while_it_is_down() {
+        use std::net::TcpListener;
+        use tungstenite::Message;
+        let node = TcpListener::bind("127.0.0.1:0").unwrap();
+        node.set_nonblocking(true).unwrap();
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_node_url(&format!("http://user:pass@{}", node.local_addr().unwrap()))
+            .unwrap();
+        let header = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+        let baton = serde_json::json!({
+            "tx_hash": "11".repeat(32),
+            "tx_pos": 0,
+            "height": 9,
+            "value": 1000,
+            "token_data": {
+                "category": crate::protocol::MAINNET_CATEGORY_HEX,
+                "amount": "840001",
+                "nft": {"capability": "mutable", "commitment": format!("00000000{}", "01".repeat(32))}
+            }
+        });
+        let fulcrum = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", fulcrum.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = fulcrum.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            for _ in 0..4 {
+                let message = ws.read().unwrap();
+                let request: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap().trim()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "server.version" => serde_json::json!(["Fulcrum 1.12.0", "1.5"]),
+                    "blockchain.headers.subscribe" => {
+                        serde_json::json!({"height": 10, "hex": header})
+                    }
+                    "blockchain.scripthash.listunspent" => serde_json::json!([baton]),
+                    other => panic!("unexpected {other}"),
+                };
+                let reply =
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                ws.send(Message::Text(format!("{reply}\n").into())).unwrap();
+            }
+        });
+        let mut session = ElectrumSession::connect_failover_for_deployment(
+            &[url],
+            cfg.token.photon_deployment(cfg.network),
+        )
+        .unwrap();
+        let mut sources = SourceCatalog::configured(&cfg).unwrap();
+        let mut native = None;
+        let refreshed = refresh_photon_job_on_cadence(
+            &cfg,
+            &mut session,
+            &mut sources,
+            &mut native,
+            Instant::now(),
+            true,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(refreshed.job.height, 10);
+        assert!(refreshed.route_warning.is_none());
+        assert!(native.is_none());
+        assert_eq!(
+            node.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no node call ran"
+        );
     }
 
     #[test]
@@ -7488,6 +7725,55 @@ mod tests {
         assert!(submission_journal_path(MiningNetwork::Chipnet)
             .ends_with("pending-reward-chipnet.json"));
         assert!(submission_journal_path(MiningNetwork::Mainnet).ends_with("pending-reward.json"));
+    }
+
+    // #### PR #42
+    // What: the node mempool gate runs the same way on Chipnet and mainnet:
+    // skipped without a saved node, and a node's rejection stops the claim
+    // on both.
+    // Look here if: preflight_pending_transaction or node_endpoints changes.
+    #[test]
+    fn preflight_runs_the_same_gate_on_every_network() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let txid = "11".repeat(32);
+        let server = {
+            let txid = txid.clone();
+            thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+                    assert!(String::from_utf8_lossy(&request[..read]).contains("testmempoolaccept"));
+                    let body = format!(
+                        "{{\"result\":[{{\"txid\":\"{txid}\",\"allowed\":false,\"reject-reason\":\"dust\"}}],\"error\":null,\"id\":\"pickaxe\"}}"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+                }
+            })
+        };
+        for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            let mut cfg = RuntimeConfig::default();
+            cfg.set_network(network);
+            assert!(
+                preflight_pending_transaction(&cfg, "PHOTON claim", &txid, "0200").is_ok(),
+                "without a saved node there is no gate"
+            );
+            cfg.set_node_url(&format!("http://{address}")).unwrap();
+            assert_eq!(cfg.node_endpoints(), [format!("http://{address}")]);
+            let error =
+                preflight_pending_transaction(&cfg, "PHOTON claim", &txid, "0200").unwrap_err();
+            assert!(
+                error.contains("rejected by native-node mempool preflight"),
+                "{network:?}: {error}"
+            );
+        }
+        server.join().unwrap();
     }
 
     #[test]

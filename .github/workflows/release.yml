@@ -32,6 +32,9 @@ on:
       - "tools/build_hip.py"
       - "tools/build-rust-kernels.ps1"
       - "tools/test_release_channel.py"
+      - "packaging/farm-os/**"
+      - "tools/farm-os/**"
+      - "tools/test_farm_os_packages.py"
       - "rust-engine/**"
       - "src/**"
       - "web/**"
@@ -696,11 +699,150 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # #### PR #42: the Linux x86_64 binary for older Linux
+  # What: `pickaxe` built inside manylinux_2_28 (glibc 2.28; TLS is rustls,
+  # so no libssl). The farm-os job checks it and puts it in the Linux x86_64
+  # archive in place of the one built on ubuntu-latest.
+  # Why: HiveOS is Ubuntu 20.04 (glibc 2.31); the ubuntu-latest build needs
+  # a newer glibc.
+  # Look here if: this build fails in the container, or the Linux archive or
+  # a farm package will not start on an older system.
+  linux-compat:
+    name: Build Linux x86_64 for older systems
+    needs:
+      - validate
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install Rust stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+
+      - name: Build release
+        shell: bash
+        run: cargo build --locked --release
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: compat-linux-x86_64
+          path: target/release/pickaxe_miner
+          if-no-files-found: error
+          retention-days: 14
+
+  # #### PR #42: the HiveOS, mmpOS and RaveOS packages
+  # What: checks the older-Linux binary (no glibc newer than 2.28, no
+  # libssl or libcrypto), puts it in the Linux x86_64 archive, tests the
+  # package scripts, and makes pickaxe-hiveos, pickaxe-mmpos and
+  # pickaxe-raveos from that archive (tools/farm-os/build.sh).
+  # Why: farm systems install custom miners from release assets.
+  # Look here if: a farm system refuses a package, or its miner will not
+  # start.
+  farm-os:
+    name: Farm OS packages
+    needs:
+      - validate
+      - build
+      - linux-compat
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Download the Linux x86_64 archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-linux-x86_64
+          path: dist
+
+      - name: Download the older-Linux binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: compat-linux-x86_64
+          path: compat
+
+      - name: Check the binary and put it in the archive
+        shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          bin=compat/pickaxe_miner
+          chmod 0755 "${bin}"
+          newest="$(readelf -V "${bin}" | grep -o 'GLIBC_2\.[0-9]*' | sort -u -t. -k2,2n | tail -n 1)"
+          echo "Newest glibc symbol: ${newest}"
+          if (( ${newest#GLIBC_2.} > 28 )); then
+            echo "${bin} needs ${newest}; older Linux cannot run it" >&2
+            exit 1
+          fi
+          if readelf -d "${bin}" | grep -E 'NEEDED.*(libssl|libcrypto)'; then
+            echo "${bin} links OpenSSL" >&2
+            exit 1
+          fi
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          test "$("${bin}" --version)" = "pickaxe ${version}"
+          package="${TAG}-linux-x86_64"
+          tar -C dist -xzf "dist/${package}.tar.gz"
+          install -m 0755 "${bin}" "dist/${package}/pickaxe"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          rm -rf "dist/${package}"
+
+      - name: Test the package scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck packaging/farm-os/*/*.sh tools/farm-os/build.sh
+          python3 -m unittest discover -s tools -p 'test_farm_os_packages.py' -v
+
+      - name: Build the packages
+        shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: tools/farm-os/build.sh "dist/${TAG}-linux-x86_64.tar.gz" farm
+
+      - name: Upload the Linux x86_64 archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-farm-os
+          path: farm/*
+          if-no-files-found: error
+          retention-days: 14
+
   checksums:
     name: Checksum release assets
     needs:
       - validate
       - build
+      - farm-os
       - portable
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -756,10 +898,13 @@ jobs:
             echo "Refusing to checksum unexpected tag ${TAG}" >&2
             exit 1
           fi
+          farm="${version//-/_}"
           cd dist
           sha256sum "${TAG}-linux-x86_64.tar.gz" "${TAG}-windows-x86_64.zip" \
             "${TAG}-linux-arm64.tar.gz" "${TAG}-windows-arm64.zip" \
-            "${TAG}-macos-arm64.tar.gz" "${TAG}-browser.tar.gz" > SHA256SUMS.txt
+            "${TAG}-macos-arm64.tar.gz" "${TAG}-browser.tar.gz" \
+            "pickaxe-hiveos-${farm}.tar.gz" "pickaxe-mmpos-${farm}.tar.gz" \
+            "pickaxe-raveos-${farm}.zip" > SHA256SUMS.txt
           cat SHA256SUMS.txt
           {
             echo "Pickaxe Miner v${version}"
@@ -772,6 +917,8 @@ jobs:
             echo "Other AMD and Intel GPUs, and integrated GPUs, mine through the bundled Vulkan (wgpu) T2 engine."
             echo "GPUs no other engine finds mine through the bundled OpenCL engine."
             echo "The ARM64 packages carry the portable and OpenCL engines only, and have not yet been run on ARM hardware."
+            echo "Farm systems: pickaxe-hiveos, pickaxe-mmpos and pickaxe-raveos are custom-miner packages (docs/farm-os.md)."
+            echo "The Linux x86_64 binary runs on Linux with glibc 2.28 or newer, such as Ubuntu 20.04."
             echo "The default interface is the interactive TUI. Headless mode is --no-tui."
             echo "There is no CPU mining fallback."
             echo "Source commit: ${SHA}"
@@ -861,7 +1008,11 @@ jobs:
             fi
           fi
 
+          farm="${version//-/_}"
           assets=(
+            "dist/pickaxe-hiveos-${farm}.tar.gz"
+            "dist/pickaxe-mmpos-${farm}.tar.gz"
+            "dist/pickaxe-raveos-${farm}.zip"
             "dist/${TAG}-linux-x86_64.tar.gz"
             "dist/${TAG}-windows-x86_64.zip"
             "dist/${TAG}-macos-arm64.tar.gz"

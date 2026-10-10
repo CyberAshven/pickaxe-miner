@@ -23,7 +23,7 @@ fn tip() -> Value {
         "headers":325908,"bestblockhash":"ab".repeat(32)})
 }
 
-fn transaction(nonce: u32) -> Value {
+pub(super) fn transaction(nonce: u32) -> Value {
     let mut bytes = 2u32.to_le_bytes().to_vec();
     bytes.push(1);
     bytes.extend([1; 32]);
@@ -37,6 +37,115 @@ fn transaction(nonce: u32) -> Value {
     let mut txid = double_sha256(&bytes);
     txid.reverse();
     json!({"data":hex::encode(bytes),"txid":hex::encode(txid)})
+}
+
+/// #### PR #42: a CTOR-ordered template with `count` transactions, and
+/// their hashes in internal byte order.
+fn template_with(count: u32) -> (BchTemplate, Vec<Hash>) {
+    let mut raw = rpc_template();
+    let mut txs: Vec<Value> = (1..=count).map(transaction).collect();
+    txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+    let hashes = txs
+        .iter()
+        .map(|tx| {
+            let mut hash: Hash = hex::decode(tx["txid"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            hash.reverse();
+            hash
+        })
+        .collect();
+    raw["transactions"] = json!(txs);
+    (BchTemplate::from_rpc(&raw).unwrap(), hashes)
+}
+
+// #### PR #42
+// What: folding a coinbase's hash up the branch computed once per template
+// gives the whole tree's root, for every transaction count from 0 to 17
+// (odd levels duplicate their last hash).
+// Look here if: coinbase_path or fold changes.
+#[test]
+fn merkle_root_by_path_equals_the_full_tree() {
+    for count in 0..=17u32 {
+        let (_, txids) = template_with(count);
+        let leaf = double_sha256(&count.to_le_bytes());
+        let mut all = vec![leaf];
+        all.extend_from_slice(&txids);
+        let path = coinbase_path(&txids);
+        assert_eq!(fold(leaf, &path), merkle_root(all), "{count} transactions");
+        let depth = if count == 0 {
+            0
+        } else {
+            (u32::BITS - count.leading_zeros()) as usize
+        };
+        assert_eq!(path.len(), depth, "{count} transactions");
+    }
+}
+
+// #### PR #42
+// What: a coinbase rebuilt from a job's parts (prefix, extranonce, suffix)
+// is byte for byte the full build, and folding its hash up the parts'
+// merkle path gives the full build's root, for 0 to 17 transactions and
+// for miner, donation-work and fee-work payouts.
+// Look here if: coinbase_parts_with_aux, coinbase_with_aux or the extended
+// share rebuild in channel.rs changes.
+#[test]
+fn coinbases_rebuilt_from_parts_equal_the_full_build() {
+    use crate::donation::bch::{BchPayout, FeeMode, PoolFee};
+    let operator = p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], MiningNetwork::Chipnet).unwrap();
+    let fee = Some(PoolFee {
+        rate: "2".parse().unwrap(),
+        mode: FeeMode::Both,
+    });
+    let policies = [
+        BchPayout::default(),
+        BchPayout {
+            donation_work: true,
+            ..BchPayout::default()
+        },
+        BchPayout {
+            fee,
+            fee_work: true,
+            ..BchPayout::default()
+        },
+    ];
+    for count in 0..=17u32 {
+        let (template, txids) = template_with(count);
+        for policy in policies {
+            let operator = policy.fee.map(|_| operator.as_str());
+            let extranonce: Vec<u8> = (0..28u8).collect();
+            let full = template
+                .coinbase_with_payout(
+                    MiningNetwork::Chipnet,
+                    &payout(),
+                    operator,
+                    &extranonce,
+                    policy,
+                )
+                .unwrap();
+            let parts = template
+                .coinbase_parts_with_payout(
+                    MiningNetwork::Chipnet,
+                    &payout(),
+                    operator,
+                    extranonce.len(),
+                    policy,
+                )
+                .unwrap();
+            let mut rebuilt = parts.prefix.clone();
+            rebuilt.extend_from_slice(&extranonce);
+            rebuilt.extend_from_slice(&parts.suffix);
+            assert_eq!(rebuilt, full.bytes, "{count} transactions");
+            assert_eq!(
+                fold(double_sha256(&rebuilt), &parts.merkle_path),
+                full.merkle_root
+            );
+            let mut all = vec![double_sha256(&full.bytes)];
+            all.extend_from_slice(&txids);
+            assert_eq!(full.merkle_root, merkle_root(all));
+        }
+    }
 }
 
 #[test]
@@ -125,6 +234,272 @@ fn a_pool_name_is_written_into_the_coinbase_and_the_parts_still_fit() {
     assert!(template
         .coinbase(MiningNetwork::Chipnet, &payout(), &extra)
         .is_err());
+}
+
+/// #### PR #42: a coinbase's hex with the Pickaxe donation's locking script
+/// shown as `{donation}`, as the golden coinbases write it.
+fn golden_hex(coinbase: &[u8]) -> String {
+    let address = crate::donation::bch::address(MiningNetwork::Chipnet);
+    let donation = hex::encode(crate::tx::cashaddr_to_p2pkh_locking(address).unwrap());
+    hex::encode(coinbase).replace(&donation, "{donation}")
+}
+
+/// #### PR #42: an extended-channel coinbase head (version, the null
+/// prevout, the 32-byte script with height 325909 and extranonce `[7; 28]`,
+/// the sequence) before the output count.
+const GOLDEN_HEAD: &str = concat!(
+    "02000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "ffffffff",
+    "20",
+    "0315f904",
+    "07070707070707070707070707070707070707070707070707070707",
+    "ffffffff"
+);
+/// The miner's 99% and the donation's 1% of 3.125 BCH.
+const GOLDEN_PAYOUTS: &str = concat!(
+    "18b0701200000000",
+    "19",
+    "76a914121212121212121212121212121212121212121288ac",
+    "08af2f0000000000",
+    "19",
+    "{donation}"
+);
+
+// #### PR #42
+#[test]
+fn no_tokens_keeps_coinbase_bytes_identical() {
+    use crate::donation::bch::BchPayout;
+    let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+    let network = MiningNetwork::Chipnet;
+    let policy = BchPayout::default();
+    let today = template
+        .coinbase_with_payout(network, &payout(), None, &[7; 28], policy)
+        .unwrap();
+    assert_eq!(today.bytes.len(), 151);
+    assert_eq!(
+        golden_hex(&today.bytes),
+        format!("{GOLDEN_HEAD}02{GOLDEN_PAYOUTS}00000000")
+    );
+    let none = template
+        .coinbase_with_aux(network, &payout(), None, &[7; 28], policy, None)
+        .unwrap();
+    assert_eq!(none.bytes, today.bytes);
+    assert_eq!(none.merkle_root, today.merkle_root);
+    let parts = template
+        .coinbase_parts_with_aux(network, &payout(), None, 28, policy, None)
+        .unwrap();
+    let mut bytes = parts.prefix.clone();
+    bytes.extend([7; 28]);
+    bytes.extend(&parts.suffix);
+    assert_eq!(bytes, today.bytes);
+    // No token set, no merge-mining work.
+    assert!(template.tokens().is_none());
+    assert!(template
+        .aux_job(network, &payout(), None, policy)
+        .unwrap()
+        .is_none());
+}
+
+// #### PR #42
+#[test]
+fn the_commitment_is_output_zero_and_the_parts_still_fit() {
+    use super::merge::{
+        commitment::AuxCommitment, leaf::Mode, registry::is_ticket_script, set::tests::test_set,
+        tree::fold,
+    };
+    use crate::donation::bch::BchPayout;
+    use std::sync::Arc;
+    let network = MiningNetwork::Chipnet;
+    let policy = BchPayout::default();
+    let mut raw = rpc_template();
+    let mut txs = vec![transaction(4), transaction(5)];
+    txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+    raw["transactions"] = json!(txs);
+    let plain = BchTemplate::from_rpc(&raw).unwrap();
+    let mut template = plain.clone();
+    template.commit(Arc::new(test_set(&[
+        Mode::ShareTarget,
+        Mode::BlockRequired,
+    ])));
+    assert_eq!(template.tokens().unwrap().serial(), 1);
+    let job = template
+        .aux_job(network, &payout(), None, policy)
+        .unwrap()
+        .unwrap();
+    let extra = [7u8; 28];
+    let coinbase = template
+        .coinbase_with_aux(network, &payout(), None, &extra, policy, Some(&job.outputs))
+        .unwrap();
+    let parts = template
+        .coinbase_parts_with_aux(
+            network,
+            &payout(),
+            None,
+            extra.len(),
+            policy,
+            Some(&job.outputs),
+        )
+        .unwrap();
+    let mut bytes = parts.prefix.clone();
+    bytes.extend(extra);
+    bytes.extend(&parts.suffix);
+    assert_eq!(bytes, coinbase.bytes);
+    // The prefix (up to the extranonce) and the merkle path are unchanged.
+    let plain_parts = plain
+        .coinbase_parts(network, &payout(), extra.len())
+        .unwrap();
+    assert_eq!(parts.prefix, plain_parts.prefix);
+    assert_eq!(parts.merkle_path, plain_parts.merkle_path);
+    // Output 0 sits right after the one-byte output count, found from the
+    // input alone, and the ticket right before the locktime.
+    let script_len = usize::from(coinbase.bytes[41]);
+    assert_eq!(coinbase.bytes[46 + script_len], 4);
+    assert_eq!(
+        coinbase.bytes[47 + script_len..100 + script_len],
+        job.outputs.commitment
+    );
+    let end = coinbase.bytes.len() - 4;
+    assert_eq!(coinbase.bytes[end - 46..end], job.outputs.tickets[0]);
+    let commitment =
+        AuxCommitment::parse(&coinbase.bytes[47 + script_len..100 + script_len]).unwrap();
+    assert_eq!(commitment, job.commitment);
+    for (index, entry) in job.entries.iter().enumerate() {
+        let branch = job.branch(index).unwrap();
+        assert_eq!(
+            fold(entry.leaf.hash(), entry.slot, &branch),
+            commitment.root
+        );
+    }
+    // The block decodes, its merkle root checks, and the coinbase pays the
+    // same amounts: the commitment and the ticket are worth 0.
+    let header = template
+        .header(&coinbase, template.version, template.current_time, 0)
+        .unwrap();
+    let block: Block = consensus::deserialize(&template.block(&coinbase, header).unwrap()).unwrap();
+    assert!(block.check_merkle_root());
+    let outputs = &block.txdata[0].output;
+    assert_eq!(outputs.len(), 4);
+    assert_eq!(outputs[0].value.to_sat(), 0);
+    assert_eq!(outputs[0].script_pubkey.as_bytes(), job.commitment.script());
+    let vout = job.entries[1].ticket_vout.unwrap() as usize;
+    assert_eq!(vout, 3);
+    assert_eq!(outputs[vout].value.to_sat(), 0);
+    assert!(is_ticket_script(outputs[vout].script_pubkey.as_bytes()));
+    assert_eq!(
+        outputs.iter().map(|o| o.value.to_sat()).sum::<u64>(),
+        template.coinbase_value
+    );
+    // Tickets must follow the payouts, or the B leaves would name the
+    // wrong vouts.
+    let mut wrong = job.outputs.clone();
+    wrong.first_ticket_vout += 1;
+    assert!(template
+        .coinbase_with_aux(network, &payout(), None, &extra, policy, Some(&wrong))
+        .is_err());
+}
+
+// #### PR #42
+#[test]
+fn golden_extended_coinbase_with_an_a_token_and_a_b_ticket() {
+    use super::merge::{leaf::Mode, set::tests::test_set};
+    use crate::donation::bch::{BchPayout, FeeMode, PoolFee};
+    use std::sync::Arc;
+    let network = MiningNetwork::Chipnet;
+    let policy = BchPayout::default();
+    let build = |modes: &[Mode], extranonce: &[u8], operator: Option<&str>, policy| {
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        template.commit(Arc::new(test_set(modes)));
+        let job = template
+            .aux_job(network, &payout(), operator, policy)
+            .unwrap()
+            .unwrap();
+        template
+            .coinbase_with_aux(
+                network,
+                &payout(),
+                operator,
+                extranonce,
+                policy,
+                Some(&job.outputs),
+            )
+            .unwrap()
+            .bytes
+    };
+    let commitment = |root: &str, height: &str, nonce: &str| {
+        format!("00000000000000002c6a2a43544d4d01{root}{height}{nonce}")
+    };
+    // One Case A token: the 53-byte commitment as output 0.
+    let a = build(&[Mode::ShareTarget], &[7; 28], None, policy);
+    assert_eq!(a.len(), 204);
+    let golden_a = format!(
+        "{GOLDEN_HEAD}03{}{GOLDEN_PAYOUTS}00000000",
+        commitment(
+            "bbcfbf16c81f6c441f43cb1eedb2eeabfa563ba0bd9765c4bb9265d2f96c3a5d",
+            "00",
+            "00000000"
+        )
+    );
+    assert_eq!(golden_hex(&a), golden_a);
+    // The test token in both modes: one commitment and one ticket.
+    let both = build(
+        &[Mode::ShareTarget, Mode::BlockRequired],
+        &[7; 28],
+        None,
+        policy,
+    );
+    assert_eq!(both.len(), 250);
+    let golden_both = format!(
+        "{GOLDEN_HEAD}04{}{GOLDEN_PAYOUTS}{}00000000",
+        commitment(
+            "5b7d3f2722c00b21e28af132bda1a61f157ba2ab94941635f53ad20dc6de0909",
+            "01",
+            "00000000"
+        ),
+        concat!(
+            "0000000000000000",
+            "25",
+            "00ce21",
+            "feab4bcd324f722033f5a1d67432f45caeba0e505b5ccaaf665555769425ad93",
+            "02",
+            "87"
+        )
+    );
+    assert_eq!(golden_hex(&both), golden_both);
+    // A standard channel's coinbase (20-byte extranonce): 143, 196, 242.
+    let plain = BchTemplate::from_rpc(&rpc_template()).unwrap();
+    let standard = plain
+        .coinbase_with_payout(network, &payout(), None, &[7; 20], policy)
+        .unwrap();
+    assert_eq!(standard.bytes.len(), 143);
+    assert_eq!(
+        build(&[Mode::ShareTarget], &[7; 20], None, policy).len(),
+        196
+    );
+    assert_eq!(
+        build(
+            &[Mode::ShareTarget, Mode::BlockRequired],
+            &[7; 20],
+            None,
+            policy
+        )
+        .len(),
+        242
+    );
+    // A public pool with a coinbase fee, with the commitment: 238.
+    let operator = crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], network).unwrap();
+    let fee = BchPayout {
+        fee: Some(PoolFee {
+            rate: "2".parse().unwrap(),
+            mode: FeeMode::Coinbase,
+        }),
+        ..policy
+    };
+    assert_eq!(
+        build(&[Mode::ShareTarget], &[7; 28], Some(&operator), fee).len(),
+        238
+    );
 }
 
 #[test]
@@ -299,6 +674,11 @@ impl NodeRpc for RpcFixture {
 fn initial_calls() -> VecDeque<(&'static str, Result<Value, String>)> {
     VecDeque::from([
         ("getblockchaininfo", Ok(tip())),
+        // #### PR #42: the fork block, once per node.
+        (
+            "getblockhash",
+            Ok(json!(MiningNetwork::Chipnet.fork_block().1)),
+        ),
         ("getblocktemplate", Ok(rpc_template())),
         ("getblockchaininfo", Ok(tip())),
     ])
@@ -356,4 +736,148 @@ fn provider_revokes_work_on_failure_wrong_network_sync_or_tip_race() {
     *calls.back_mut().unwrap() = ("getblockchaininfo", Ok(changed));
     let mut provider = TemplateProvider::new(RpcFixture(calls), MiningNetwork::Chipnet);
     assert!(provider.refresh().is_err());
+}
+
+// #### PR #42
+// What: a provider's template is built from what it announced: the height
+// from its push, its flags kept, the size limit from its transactions and
+// the reserve; a prefix over 8 bytes, a non-minimal or missing push, a
+// value over the money supply, a target easier than the bits, transactions
+// out of CTOR order and a merkle path that disagrees are refused.
+// Look here if: BchTemplate::from_provided changes.
+#[test]
+fn provided_templates_are_checked_like_a_nodes() {
+    let (_, txids) = template_with(3);
+    let mut txs: Vec<Value> = (1..=3).map(transaction).collect();
+    txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+    let bytes: Vec<Vec<u8>> = txs
+        .iter()
+        .map(|tx| hex::decode(tx["data"].as_str().unwrap()).unwrap())
+        .collect();
+    let path = coinbase_path(&txids);
+    let base = |prefix: &'static [u8]| Provided {
+        previous_hash: [0xab; 32],
+        version: 0x2000_0000,
+        bits: 0x207f_ffff,
+        target: compact_target(0x207f_ffff).unwrap(),
+        ntime: 1_700_000_010,
+        prefix,
+        value: 312_500_000,
+        transactions: bytes.clone(),
+        merkle_path: &path,
+        reserve: 122,
+    };
+    let template = BchTemplate::from_provided(base(&[3, 0x15, 0xf9, 0x04, 0xaa])).unwrap();
+    assert_eq!(template.height, 325_909);
+    assert_eq!(template.script_head(), [3, 0x15, 0xf9, 0x04, 0xaa]);
+    let size: u64 = bytes.iter().map(|tx| tx.len() as u64).sum();
+    assert_eq!(template.size_limit, 80 + 1 + size + 153 + 122);
+    assert_eq!(template.merkle_path(), path.as_slice());
+    for (prefix, why) in [
+        (&[3, 0x15, 0xf9, 0x04, 1, 2, 3, 4, 5][..], "over 8 bytes"),
+        (&[4, 0x15, 0xf9, 0x04, 0x00][..], "a non-minimal push"),
+        (&[0x00][..], "no height"),
+    ] {
+        assert!(BchTemplate::from_provided(base(prefix)).is_err(), "{why}");
+    }
+    let mut rich = base(&[3, 0x15, 0xf9, 0x04]);
+    rich.value = 21_000_000 * 100_000_000 + 1;
+    assert!(BchTemplate::from_provided(rich).is_err());
+    let mut easy = base(&[3, 0x15, 0xf9, 0x04]);
+    easy.bits = 0x1d00_ffff;
+    assert!(
+        BchTemplate::from_provided(easy).is_err(),
+        "a target easier than the bits"
+    );
+    let mut shuffled = base(&[3, 0x15, 0xf9, 0x04]);
+    shuffled.transactions.reverse();
+    assert!(BchTemplate::from_provided(shuffled).is_err());
+    let wrong_path = vec![[0; 32]; path.len()];
+    let mut wrong = base(&[3, 0x15, 0xf9, 0x04]);
+    wrong.merkle_path = &wrong_path;
+    assert!(BchTemplate::from_provided(wrong).is_err());
+}
+
+// #### PR #42
+// What: under a Job Declaration plan with a token set, the declared
+// coinbase, every local job's coinbase and the custom job's outputs carry
+// the commitment as output 0 and the ticket (worth 0) after the pool's
+// outputs; the leaves bind the miner's script (the pool's first output) with
+// the pool's whole donation rate as the split, and the pool's rule accepts
+// the outputs. Without tokens they are the plan's outputs alone.
+// Look here if: declared_aux, declared_parts or declared_outputs change.
+#[test]
+fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
+    use super::jd::{plan::JdPlan, policy::PayoutRule, token::PoolRates};
+    use super::merge::{
+        commitment::AuxCommitment,
+        leaf::Mode,
+        registry::is_ticket_script,
+        set::{tests::test_set, AuxJob},
+    };
+    use std::sync::Arc;
+    let network = MiningNetwork::Chipnet;
+    let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+    let plan = JdPlan {
+        serial: 1,
+        upstream_prefix: vec![0xee; 16],
+        pad: Vec::new(),
+        scripts: vec![vec![0x51], vec![0x52], vec![0x53]],
+        rates: PoolRates {
+            donation_bps: 150,
+            fee_bps: 100,
+            donation_output: Some(2),
+            fee_output: Some(1),
+        },
+        pool_target: [0xff; 32],
+    };
+    template.declare(Arc::new(plan.clone()));
+    let pool_outputs = plan.outputs(template.coinbase_value);
+    assert!(template.declared_aux().unwrap().is_none());
+    assert_eq!(template.declared_outputs().unwrap(), pool_outputs);
+    let set = Arc::new(test_set(&[Mode::ShareTarget, Mode::BlockRequired]));
+    template.commit(set.clone());
+    let aux = template.declared_aux().unwrap().unwrap();
+    let expected = AuxJob::build(&set, &[0x51], Some((150, &[0x53][..])), 4).unwrap();
+    assert_eq!(aux.outputs.commitment, expected.outputs.commitment);
+    assert_eq!(aux.outputs.tickets, expected.outputs.tickets);
+    assert_eq!(aux.outputs.first_ticket_vout, 4);
+    // Every local job on the plan shares it, whatever its own payout says.
+    let local = template
+        .aux_job(network, &payout(), None, Default::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(local.outputs.commitment, aux.outputs.commitment);
+    let outputs = template.declared_outputs().unwrap();
+    assert_eq!(outputs.len(), 5);
+    assert_eq!(outputs[0].0, 0);
+    assert!(AuxCommitment::parse_script(&outputs[0].1).is_some());
+    assert_eq!(&outputs[1..4], pool_outputs.as_slice());
+    assert_eq!(outputs[4].0, 0);
+    assert!(is_ticket_script(&outputs[4].1));
+    let rule = PayoutRule {
+        miner: vec![0x51],
+        donation: Some((vec![0x53], 150)),
+        fee: Some((vec![0x52], 100)),
+    };
+    assert_eq!(rule.check(&outputs), Ok(template.coinbase_value));
+    // The declared coinbase is a local coinbase with the whole extranonce.
+    let parts = template.declared_parts().unwrap();
+    let serialized = super::jd::codec::serialize_outputs(&outputs);
+    assert!(parts.suffix[4..].starts_with(&serialized));
+    let extranonce = [0x33; 32];
+    let local = template
+        .coinbase_with_aux(
+            network,
+            &payout(),
+            None,
+            &extranonce,
+            Default::default(),
+            Some(&local.outputs),
+        )
+        .unwrap();
+    let mut declared = parts.prefix.clone();
+    declared.extend(extranonce);
+    declared.extend(&parts.suffix);
+    assert_eq!(local.bytes, declared);
 }

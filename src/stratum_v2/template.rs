@@ -2,9 +2,19 @@
 //! Validated BCH full templates. Preserve the node's complete CTOR transaction
 //! list and target; do not inherit Bitcoin witness or fixed block-size rules.
 
+use super::jd::plan::JdPlan;
+use super::merge::{
+    header::{forwarder_body, MAX_P2S, TAG},
+    set::{AuxJob, AuxOutputs, TokenSet},
+    OutPoint,
+};
 use crate::config::MiningNetwork;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use stratum_core::bitcoin::{consensus, Transaction};
 
 /// Hash bytes in serialized/internal order, not RPC display order.
@@ -22,8 +32,90 @@ pub struct BchTemplate {
     pub size_limit: u64,
     pub coinbase_value: u64,
     coinbase_flags: Vec<u8>,
-    transactions: Vec<Vec<u8>>,
-    transaction_hashes: Vec<Hash>,
+    /// #### PR #42: shared, so a template's copies (with tokens, a plan or a
+    /// pool's name) and the jobs a pool checks for Job Declaration clients
+    /// hold the same bytes.
+    transactions: Arc<[Arc<[u8]>]>,
+    /// #### PR #42: the transactions' ids (internal byte order), and an
+    /// index of them built on first use.
+    txids: Arc<[Hash]>,
+    index: Arc<OnceLock<HashMap<Hash, u32>>>,
+    /// #### PR #42: the coinbase's merkle branch (index 0), computed once
+    /// from the transactions' hashes, which nothing else needs.
+    merkle_path: Arc<[Hash]>,
+    /// #### PR #42: the merge-mined tokens of jobs built from this template.
+    tokens: Option<Arc<TokenSet>>,
+    /// #### PR #42: where the template's jobs come from.
+    origin: Origin,
+    /// #### PR #42: the Job Declaration plan of a client's local server:
+    /// jobs built from this template pay the pool's outputs and nest their
+    /// extranonce inside the pool channel's.
+    jd: Option<Arc<JdPlan>>,
+    /// #### PR #42: a BCH block, or an ASIC-exclusive token's header.
+    work: Work,
+}
+
+// #### PR #42: Work::Token
+// What: a template is BCH block work (the default; merge-mined tokens may
+// ride along) or an ASIC-exclusive token's job, mined instead of BCH: a
+// header-shaped token (SAFA layout v1) whose header is the token's
+// commitment and whose coinbase is the keyless forwarder, or a Case A
+// pure-token job (a coinbase-only "block" whose commitment names the token).
+// Token work has no transactions, is never a block, and carries its own
+// version rule.
+// Why: one job pipeline: vardiff, the SV1 adapter, SV2 standard and
+// extended channels, telemetry and donation rotation run unchanged on token
+// jobs; with BCH selected nothing changes.
+// Look here if: a token job reaches the block journal, or a BCH job's
+// version rule changes.
+/// What a template's jobs are worth.
+#[derive(Clone, Debug, Default)]
+pub enum Work {
+    #[default]
+    Block,
+    Token(Arc<TokenJob>),
+}
+
+/// How a token's job is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// SAFA v1: the header is the token's commitment, and the coinbase is
+    /// the forwarder that receives the claim.
+    Safa,
+    /// Case A pure-token: a coinbase-only "block" whose output 0 commits to
+    /// the token.
+    CaseA,
+}
+
+/// An ASIC-exclusive token's job, mined instead of BCH.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenJob {
+    /// The token's name, for the dashboard.
+    pub token: &'static str,
+    pub layout: Layout,
+    /// The version bits a device may roll; 0 keeps the version fixed.
+    pub version_mask: u32,
+    /// What the work answers: HASH256 of the thread's commitment (SAFA), or
+    /// the Case A anchor.
+    pub anchor: Hash,
+    /// The thread (or baton) the job was issued for.
+    pub thread: OutPoint,
+    pub age: u16,
+    /// The chain's median time past when the job was built.
+    pub mtp: u32,
+}
+
+/// #### PR #42: where a template's jobs come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// This server's own source: a node or a template provider.
+    Own,
+    /// A Coinbase-only custom job (Job Declaration): it checks headers but
+    /// has no transactions to build a block with.
+    HeaderOnly,
+    /// A Full-Template declaration a pool checked: the client's
+    /// transactions, so its blocks are whole.
+    Declared,
 }
 
 #[derive(Clone, Debug)]
@@ -93,19 +185,7 @@ impl BchTemplate {
             if total_size > size_limit {
                 return Err("template transactions exceed block size limit".into());
             }
-            // Bitcoin's decoder treats CashTokens prefixes as opaque output
-            // script bytes. Reject witness serialization explicitly: BCH txids
-            // commit to all bytes. No Bitcoin consensus validation is used.
-            let tx: Transaction =
-                consensus::deserialize(&bytes).map_err(|_| "malformed template transaction")?;
-            if tx.is_coinbase()
-                || tx.input.is_empty()
-                || tx.input.iter().any(|input| !input.witness.is_empty())
-                || bytes.get(4) == Some(&0)
-            {
-                return Err("template contains coinbase, empty inputs or witness encoding".into());
-            }
-            let hash = double_sha256(&bytes);
+            let hash = checked_transaction(&bytes)?;
             if display_hash(text(entry, "txid")?)? != hash {
                 return Err("transaction bytes disagree with template txid".into());
             }
@@ -115,7 +195,7 @@ impl BchTemplate {
                 return Err("template transactions are duplicated or not in CTOR order".into());
             }
             previous_display = Some(display);
-            transactions.push(bytes);
+            transactions.push(Arc::<[u8]>::from(bytes));
             transaction_hashes.push(hash);
         }
         let min_time = word(value, "mintime")?;
@@ -151,10 +231,367 @@ impl BchTemplate {
             size_limit,
             coinbase_value,
             coinbase_flags,
-            transactions,
-            transaction_hashes,
+            merkle_path: coinbase_path(&transaction_hashes).into(),
+            transactions: transactions.into(),
+            txids: transaction_hashes.into(),
+            index: Default::default(),
+            tokens: None,
+            origin: Origin::Own,
+            jd: None,
+            work: Work::Block,
         })
     }
+
+    /// #### PR #42: a Template Distribution provider's template
+    /// What: built from what a provider announced, checked as a node's are:
+    /// the prefix a minimal BIP34 height push (at most 8 bytes, its rest the
+    /// node's flags), the value within the money supply, the provider's
+    /// target no easier than `nBits`'s (the block target is `nBits`'s), the
+    /// transactions full, witness-free and in CTOR order (at most 65,535),
+    /// and their coinbase merkle path the one announced. Its size limit is
+    /// the transactions, the header and the largest coinbase the reserve
+    /// allows, which `coinbase_with_aux` then keeps to.
+    /// Why: TDP carries no size limit and no chain; a provider must not make
+    /// this server mine an invalid or oversized block.
+    /// Look here if: a provider's templates are refused, or a block from one
+    /// is too large.
+    pub fn from_provided(provided: Provided<'_>) -> Result<Self, String> {
+        let prefix = provided.prefix;
+        if prefix.len() > 8 {
+            return Err("template provider sent a coinbase prefix over 8 bytes".into());
+        }
+        let height = match prefix.first() {
+            Some(&op) if (0x51..=0x60).contains(&op) => u32::from(op - 0x50),
+            Some(&length @ 1..=4) => {
+                let bytes = prefix
+                    .get(1..1 + usize::from(length))
+                    .ok_or("template provider sent a truncated height push")?;
+                let mut word = [0; 4];
+                word[..bytes.len()].copy_from_slice(bytes);
+                u32::from_le_bytes(word)
+            }
+            _ => return Err("template provider's coinbase prefix is not a height push".into()),
+        };
+        let push = height_script(height);
+        if height == 0 || height >= 1 << 31 || !prefix.starts_with(&push) {
+            return Err("template provider's height push is not minimal".into());
+        }
+        if provided.value > 21_000_000 * 100_000_000 {
+            return Err("coinbase value exceeds BCH monetary range".into());
+        }
+        let target = compact_target(provided.bits)?;
+        if !meets_target(&provided.target, &target) {
+            return Err("template provider's target is easier than its bits".into());
+        }
+        if provided.transactions.len() > 65_535 {
+            return Err("template too large for SV2".into());
+        }
+        let mut hashes = Vec::with_capacity(provided.transactions.len());
+        let mut previous_display: Option<Hash> = None;
+        let mut size = 0u64;
+        for bytes in &provided.transactions {
+            let hash = checked_transaction(bytes)?;
+            let mut display = hash;
+            display.reverse();
+            if previous_display.is_some_and(|previous| previous >= display) {
+                return Err("template transactions are duplicated or not in CTOR order".into());
+            }
+            previous_display = Some(display);
+            size += bytes.len() as u64;
+            hashes.push(hash);
+        }
+        let merkle_path = coinbase_path(&hashes);
+        if merkle_path != provided.merkle_path {
+            return Err("template provider's merkle path disagrees with its transactions".into());
+        }
+        let mut count = Vec::new();
+        compact_size(provided.transactions.len() + 1, &mut count);
+        Ok(Self {
+            previous_hash: provided.previous_hash,
+            version: provided.version,
+            bits: provided.bits,
+            target,
+            min_time: provided.ntime,
+            current_time: provided.ntime,
+            height,
+            size_limit: 80
+                + count.len() as u64
+                + size
+                + super::tdp::COINBASE_FIXED
+                + u64::from(provided.reserve),
+            coinbase_value: provided.value,
+            coinbase_flags: prefix[push.len()..].to_vec(),
+            transactions: provided.transactions.into_iter().map(Arc::from).collect(),
+            txids: hashes.into(),
+            index: Default::default(),
+            merkle_path: merkle_path.into(),
+            tokens: None,
+            origin: Origin::Own,
+            jd: None,
+            work: Work::Block,
+        })
+    }
+
+    /// #### PR #42
+    /// A Coinbase-only custom job's template: the pool's parent, bits,
+    /// target, height and limits, with the client's version, start time and
+    /// merkle path. The pool never sees the client's transactions, so it can
+    /// check headers and shares against it but never build its block.
+    pub fn custom(
+        context: &BchTemplate,
+        version: u32,
+        min_ntime: u32,
+        merkle_path: Vec<Hash>,
+    ) -> Self {
+        Self {
+            previous_hash: context.previous_hash,
+            version,
+            bits: context.bits,
+            target: context.target,
+            min_time: min_ntime,
+            current_time: min_ntime,
+            height: context.height,
+            size_limit: context.size_limit,
+            coinbase_value: context.coinbase_value,
+            coinbase_flags: Vec::new(),
+            transactions: Vec::new().into(),
+            txids: Vec::new().into(),
+            index: Default::default(),
+            merkle_path: merkle_path.into(),
+            tokens: None,
+            origin: Origin::HeaderOnly,
+            jd: None,
+            work: Work::Block,
+        }
+    }
+
+    /// #### PR #42
+    /// A Full-Template declaration's template, once a pool holds every one
+    /// of its transactions: the pool's parent, bits, target, height, size
+    /// limit and times (`context`) with the client's version and
+    /// transactions, in the declared order (`txids` their ids). Its blocks
+    /// are whole, built around the client's coinbase.
+    pub fn declared(
+        context: &BchTemplate,
+        version: u32,
+        transactions: Vec<Arc<[u8]>>,
+        txids: Vec<Hash>,
+    ) -> Self {
+        Self {
+            previous_hash: context.previous_hash,
+            version,
+            bits: context.bits,
+            target: context.target,
+            min_time: context.min_time,
+            current_time: context.current_time,
+            height: context.height,
+            size_limit: context.size_limit,
+            coinbase_value: context.coinbase_value,
+            coinbase_flags: Vec::new(),
+            merkle_path: coinbase_path(&txids).into(),
+            transactions: transactions.into(),
+            txids: txids.into(),
+            index: Default::default(),
+            tokens: None,
+            origin: Origin::Declared,
+            jd: None,
+            work: Work::Block,
+        }
+    }
+
+    /// #### PR #42
+    /// An ASIC-exclusive token's job: no transactions and no BCH value; the
+    /// previous hash, bits and target (at full precision) are the token's,
+    /// and devices start at `ntime_start`. `height` only shapes a Case A
+    /// coinbase's script.
+    pub fn token_only(
+        job: Arc<TokenJob>,
+        previous_hash: Hash,
+        version: u32,
+        bits: u32,
+        target: Hash,
+        ntime_start: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            previous_hash,
+            version,
+            bits,
+            target,
+            min_time: ntime_start,
+            current_time: ntime_start,
+            height,
+            // No block: a size that keeps the coinbase checks inert.
+            size_limit: 1_000_000,
+            coinbase_value: 0,
+            coinbase_flags: Vec::new(),
+            transactions: Vec::new().into(),
+            txids: Vec::new().into(),
+            index: Default::default(),
+            merkle_path: Vec::new().into(),
+            tokens: None,
+            origin: Origin::Own,
+            jd: None,
+            work: Work::Token(job),
+        }
+    }
+
+    /// #### PR #42: the token job, for token work.
+    pub fn token_job(&self) -> Option<&Arc<TokenJob>> {
+        match &self.work {
+            Work::Block => None,
+            Work::Token(job) => Some(job),
+        }
+    }
+
+    /// #### PR #42: whether this is BCH block work.
+    pub fn is_block(&self) -> bool {
+        matches!(self.work, Work::Block)
+    }
+
+    // #### PR #42: the per-template version rule
+    // What: the version bits a device may roll: BIP320's for BCH blocks and
+    // Case A token jobs, the token's own rule for a header-shaped token (none
+    // when the token fixes its version slot).
+    // Why: a header-shaped token's covenant checks the version slot.
+    // Look here if: shares are refused with invalid-version on token work.
+    /// The version bits a device may roll.
+    pub fn version_mask(&self) -> u32 {
+        match &self.work {
+            Work::Block => super::channel::VERSION_ROLLING_MASK,
+            Work::Token(job) => job.version_mask,
+        }
+    }
+
+    /// Whether this template's coinbase is the forwarder.
+    fn is_safa(&self) -> bool {
+        self.token_job()
+            .is_some_and(|job| job.layout == Layout::Safa)
+    }
+
+    /// #### PR #42: this template for a custom job set on it: the job's
+    /// version and start time, the same transactions.
+    pub fn with_header(&self, version: u32, min_ntime: u32) -> Self {
+        Self {
+            version,
+            min_time: min_ntime,
+            current_time: min_ntime,
+            ..self.clone()
+        }
+    }
+
+    /// #### PR #42: builds this template's jobs for a pool through Job
+    /// Declaration: they pay `plan`'s outputs, nest their extranonce inside
+    /// the pool channel's, and carry its token set's merge-mining (see
+    /// `declared_aux`).
+    pub fn declare(&mut self, plan: Arc<JdPlan>) {
+        self.jd = Some(plan);
+    }
+
+    pub fn jd_plan(&self) -> Option<&Arc<JdPlan>> {
+        self.jd.as_ref()
+    }
+
+    /// #### PR #42: the coinbase script's head: the BIP34 height push, the
+    /// node's flags and the pool's name; a custom job's `coinbase_prefix`.
+    pub fn script_head(&self) -> Vec<u8> {
+        let mut head = height_script(self.height);
+        head.extend_from_slice(&self.coinbase_flags);
+        head
+    }
+
+    /// #### PR #42: a custom job's template, without transactions.
+    pub fn is_header_only(&self) -> bool {
+        self.origin == Origin::HeaderOnly
+    }
+
+    /// #### PR #42: a Full-Template declaration's template.
+    pub fn is_declared(&self) -> bool {
+        self.origin == Origin::Declared
+    }
+
+    /// #### PR #42: the transactions' ids, in block order.
+    pub fn transaction_ids(&self) -> &[Hash] {
+        &self.txids
+    }
+
+    /// #### PR #42: the transaction with id `txid`, from an index built on
+    /// the first call.
+    pub fn transaction(&self, txid: &Hash) -> Option<&Arc<[u8]>> {
+        let index = self.index.get_or_init(|| {
+            self.txids
+                .iter()
+                .enumerate()
+                .map(|(position, txid)| (*txid, position as u32))
+                .collect()
+        });
+        index
+            .get(txid)
+            .map(|position| &self.transactions[*position as usize])
+    }
+
+    /// #### PR #42: a Job Declaration job's coinbase split around its whole
+    /// extranonce (the pool channel's prefix and the bytes the pool lets the
+    /// client roll), as DeclareMiningJob carries it: the same bytes as the
+    /// local channels' coinbases, merge-mining outputs included.
+    pub fn declared_parts(&self) -> Result<CoinbaseParts, String> {
+        let plan = self.jd.as_ref().ok_or("not a Job Declaration template")?;
+        let extranonce = plan.upstream_prefix.len() + plan.rollable();
+        let aux = self.declared_aux()?;
+        let coinbase = self.coinbase_with_outputs(
+            &vec![0; extranonce],
+            plan.outputs(self.coinbase_value),
+            aux.as_ref().map(|aux| &aux.outputs),
+        )?;
+        Ok(self.split(coinbase, extranonce))
+    }
+
+    // #### PR #42: merge-mined tokens under Job Declaration
+    // What: a Job Declaration job with a token set carries the commitment as
+    // output 0 and the tickets (worth 0) after the pool's outputs, in every
+    // local coinbase, the declared one and the custom job's outputs alike.
+    // Its leaves bind the miner's own script (the pool's first output), and
+    // the donation's split is the pool's whole donation rate, since no
+    // donation work runs under Job Declaration; a pool with no donation has
+    // no split.
+    // Why: the miner's node builds the blocks there, so merge-mined tokens
+    // keep earning at a pool with no hashrate taken from BCH; the pool's
+    // rule allows exactly this shape (output 0, zero-value tickets).
+    // Look here if: a pool refuses declarations with a commitment, the local
+    // coinbases differ from the declared one, or token wins under Job
+    // Declaration name another payout.
+    /// The merge-mining of this template's Job Declaration jobs, or `None`
+    /// without a plan or a token set. Every job on the plan shares it.
+    pub fn declared_aux(&self) -> Result<Option<AuxJob>, String> {
+        let (Some(plan), Some(set)) = (self.jd.as_ref(), self.tokens.as_ref()) else {
+            return Ok(None);
+        };
+        let (miner, split) = plan.token_terms().ok_or("the pool's plan has no outputs")?;
+        let first_ticket_vout =
+            u32::try_from(plan.scripts.len() + 1).map_err(|_| "too many coinbase outputs")?;
+        AuxJob::build(set, miner, split, first_ticket_vout).map(Some)
+    }
+
+    /// The outputs a custom job carries for this Job Declaration template:
+    /// the commitment first when tokens are merge-mined, the pool's outputs,
+    /// then the tickets.
+    pub fn declared_outputs(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        let plan = self.jd.as_ref().ok_or("not a Job Declaration template")?;
+        let mut outputs = plan.outputs(self.coinbase_value);
+        if let Some(aux) = self.declared_aux()? {
+            // Each is a whole output: 8 value bytes, the script's length
+            // and the script.
+            let split = |output: &[u8]| -> (u64, Vec<u8>) {
+                let mut value = [0; 8];
+                value.copy_from_slice(&output[..8]);
+                (u64::from_le_bytes(value), output[9..].to_vec())
+            };
+            outputs.insert(0, split(&aux.outputs.commitment));
+            outputs.extend(aux.outputs.tickets.iter().map(|ticket| split(ticket)));
+        }
+        Ok(outputs)
+    }
+    // #### end PR #42 ####
 
     /// #### PR #40
     /// Writes the pool's name (`--pool-tag`) into the coinbase script of every
@@ -163,6 +600,55 @@ impl BchTemplate {
     /// `coinbase_with_payout` checks.
     pub fn tag(&mut self, tag: &[u8]) {
         self.coinbase_flags.extend_from_slice(tag);
+    }
+
+    /// #### PR #42
+    /// Attaches the token set to merge-mine in jobs built from this template.
+    /// It only feeds `aux_job`: a coinbase carries the commitment and tickets
+    /// only when the caller passes that job's `outputs` to
+    /// `coinbase_with_aux` or `coinbase_parts_with_aux`, which do not check
+    /// them against this set. `coinbase_with_payout` and
+    /// `coinbase_parts_with_payout` always build token-free coinbases.
+    /// Without a call (no token registered) jobs and coinbases stay as they
+    /// were.
+    pub fn commit(&mut self, set: Arc<TokenSet>) {
+        self.tokens = Some(set);
+    }
+
+    pub fn tokens(&self) -> Option<&Arc<TokenSet>> {
+        self.tokens.as_ref()
+    }
+
+    /// #### PR #42
+    /// One job's merge-mining for this template's token set, or `None`
+    /// without one. Its leaves bind the job's beneficiary (the miner, or
+    /// the donation or operator in their work jobs) and the donation's
+    /// split, and its tickets follow the job's payout outputs.
+    pub fn aux_job(
+        &self,
+        network: MiningNetwork,
+        payout: &str,
+        operator: Option<&str>,
+        policy: crate::donation::bch::BchPayout,
+    ) -> Result<Option<AuxJob>, String> {
+        // #### PR #42: under Job Declaration, the declared coinbase's.
+        if self.jd.is_some() {
+            return self.declared_aux();
+        }
+        let Some(set) = self.tokens.as_ref() else {
+            return Ok(None);
+        };
+        let scripts = super::payout::scripts(network, payout, operator)?;
+        let outputs = super::payout::outputs(self.coinbase_value, &scripts, policy);
+        let first_ticket_vout =
+            u32::try_from(outputs.len() + 1).map_err(|_| "too many coinbase outputs")?;
+        AuxJob::build(
+            set,
+            super::payout::beneficiary(&scripts, policy),
+            super::payout::token_split(policy, &scripts[1]),
+            first_ticket_vout,
+        )
+        .map(Some)
     }
 
     /// Build one channel's coinbase. The caller assigns a unique extranonce;
@@ -184,8 +670,51 @@ impl BchTemplate {
         extranonce: &[u8],
         policy: crate::donation::bch::BchPayout,
     ) -> Result<Coinbase, String> {
-        let scripts = super::payout::scripts(network, payout, operator)?;
-        let outputs = super::payout::outputs(self.coinbase_value, &scripts, policy);
+        self.coinbase_with_aux(network, payout, operator, extranonce, policy, None)
+    }
+
+    /// The coinbase with a job's merge-mining outputs, if any.
+    pub fn coinbase_with_aux(
+        &self,
+        network: MiningNetwork,
+        payout: &str,
+        operator: Option<&str>,
+        extranonce: &[u8],
+        policy: crate::donation::bch::BchPayout,
+        aux: Option<&AuxOutputs>,
+    ) -> Result<Coinbase, String> {
+        // #### PR #42: the script coinbase
+        // What: on a SAFA job the coinbase is the forwarder: a push of the
+        // tag and the extranonce, OP_DROP, and the rule that forwards the
+        // claim to the job's beneficiary (the miner, or the donation in its
+        // work jobs). With no transactions the merkle root is its HASH256,
+        // the payout field the token checks.
+        // Why: devices hash a coinbase they never parse, so any SV1 or SV2
+        // device mines the token unchanged.
+        // Look here if: a SAFA win names another payout than its job's.
+        if self.is_safa() {
+            let scripts = super::payout::scripts(network, payout, operator)?;
+            return forwarder_coinbase(extranonce, super::payout::beneficiary(&scripts, policy));
+        }
+        // #### PR #42: Job Declaration jobs pay the pool's outputs.
+        let outputs = match &self.jd {
+            Some(plan) => plan.outputs(self.coinbase_value),
+            None => {
+                let scripts = super::payout::scripts(network, payout, operator)?;
+                super::payout::outputs(self.coinbase_value, &scripts, policy)
+            }
+        };
+        self.coinbase_with_outputs(extranonce, outputs, aux)
+    }
+
+    /// #### PR #42: the coinbase paying `outputs`, with a job's merge-mining
+    /// outputs, if any.
+    fn coinbase_with_outputs(
+        &self,
+        extranonce: &[u8],
+        outputs: Vec<(u64, Vec<u8>)>,
+        aux: Option<&AuxOutputs>,
+    ) -> Result<Coinbase, String> {
         if extranonce.len() > 64 {
             return Err("extranonce exceeds coinbase budget".into());
         }
@@ -205,21 +734,59 @@ impl BchTemplate {
         compact_size(script.len(), &mut bytes);
         bytes.extend(script);
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-        compact_size(outputs.len(), &mut bytes);
+        // #### PR #42: merge-mining commitment in output 0
+        // What: with tokens, output 0 is the 53-byte commitment (value 0) and
+        // each Case B token's 46-byte ticket (value 0) follows the payouts.
+        // Without tokens (`aux` is `None`, the default on both networks) the
+        // coinbase is byte for byte what it was.
+        // Why: a covenant finds output 0 from the single input alone, with no
+        // search, and output 0 does not compete with P2Pool's last-output
+        // share commitment. Case B tickets do come last here; a P2Pool
+        // coinbase would put its commitment after them, which the journal's
+        // trailing-ticket strip does not accept yet.
+        // The payouts, the script, the extranonce offset and the parts are
+        // unchanged, so devices and SV1 firmware see only a longer suffix.
+        // Look here if: a token-enabled block is refused by the node, the
+        // B leaves name the wrong ticket vouts, or the output count reaches
+        // 0xfd.
+        let (commitment, tickets) = match aux {
+            Some(aux) => {
+                if !aux.tickets.is_empty()
+                    && usize::try_from(aux.first_ticket_vout).ok() != Some(outputs.len() + 1)
+                {
+                    return Err("token tickets do not follow the payout outputs".into());
+                }
+                (Some(&aux.commitment), aux.tickets.as_slice())
+            }
+            None => (None, &[][..]),
+        };
+        let count = outputs.len() + usize::from(commitment.is_some()) + tickets.len();
+        if commitment.is_some() && count >= 0xfd {
+            return Err("a merge-mined coinbase needs fewer than 253 outputs".into());
+        }
+        compact_size(count, &mut bytes);
+        if let Some(commitment) = commitment {
+            bytes.extend_from_slice(commitment);
+        }
         for (amount, script) in outputs {
             bytes.extend_from_slice(&amount.to_le_bytes());
             compact_size(script.len(), &mut bytes);
             bytes.extend(script);
         }
+        for ticket in tickets {
+            bytes.extend_from_slice(ticket);
+        }
+        // #### end PR #42 ####
         bytes.extend_from_slice(&0u32.to_le_bytes());
         self.check_block_size(bytes.len())?;
-        let mut hashes = Vec::with_capacity(self.transaction_hashes.len() + 1);
-        hashes.push(double_sha256(&bytes));
-        hashes.extend_from_slice(&self.transaction_hashes);
-        Ok(Coinbase {
-            bytes,
-            merkle_root: merkle_root(hashes),
-        })
+        // #### PR #42: the coinbase path is computed once per template
+        // What: the merkle root folds the coinbase's hash up the branch
+        // computed when the template arrived, instead of building the whole
+        // tree for every coinbase.
+        // Why: log2(n) hashes instead of n for each job and share.
+        // Look here if: a block's merkle root mismatches.
+        let merkle_root = fold(double_sha256(&bytes), &self.merkle_path);
+        Ok(Coinbase { bytes, merkle_root })
     }
 
     pub fn coinbase_parts(
@@ -239,39 +806,49 @@ impl BchTemplate {
         extranonce_len: usize,
         policy: crate::donation::bch::BchPayout,
     ) -> Result<CoinbaseParts, String> {
+        self.coinbase_parts_with_aux(network, payout, operator, extranonce_len, policy, None)
+    }
+
+    /// #### PR #42: the parts with a job's merge-mining outputs, which sit
+    /// in the suffix; the prefix and the merkle path are unchanged.
+    pub fn coinbase_parts_with_aux(
+        &self,
+        network: MiningNetwork,
+        payout: &str,
+        operator: Option<&str>,
+        extranonce_len: usize,
+        policy: crate::donation::bch::BchPayout,
+        aux: Option<&AuxOutputs>,
+    ) -> Result<CoinbaseParts, String> {
         if extranonce_len > 64 {
             return Err("extranonce exceeds coinbase budget".into());
         }
-        let coinbase =
-            self.coinbase_with_payout(network, payout, operator, &vec![0; extranonce_len], policy)?;
-        // The coinbase script is at most 100 bytes, so its CompactSize is one byte.
-        let offset =
-            4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len();
-        let mut hashes = vec![[0; 32]];
-        hashes.extend_from_slice(&self.transaction_hashes);
-        let mut path = Vec::new();
-        while hashes.len() > 1 {
-            if hashes.len() % 2 == 1 {
-                hashes.push(*hashes.last().unwrap());
-            }
-            path.push(hashes[1]);
-            hashes = hashes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| {
-                    let mut bytes = [0; 64];
-                    bytes[..32].copy_from_slice(&pair[0]);
-                    bytes[32..].copy_from_slice(&pair[1]);
-                    double_sha256(&bytes)
-                })
-                .collect();
-        }
-        Ok(CoinbaseParts {
+        let coinbase = self.coinbase_with_aux(
+            network,
+            payout,
+            operator,
+            &vec![0; extranonce_len],
+            policy,
+            aux,
+        )?;
+        Ok(self.split(coinbase, extranonce_len))
+    }
+
+    /// The parts of `coinbase`, whose extranonce is `extranonce_len` bytes.
+    fn split(&self, coinbase: Coinbase, extranonce_len: usize) -> CoinbaseParts {
+        // The coinbase script is at most 100 bytes, so its CompactSize is one
+        // byte; #### PR #42: a forwarder's extranonce follows its push and
+        // tag.
+        let offset = if self.is_safa() {
+            1 + TAG.len()
+        } else {
+            4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len()
+        };
+        CoinbaseParts {
             prefix: coinbase.bytes[..offset].to_vec(),
             suffix: coinbase.bytes[offset + extranonce_len..].to_vec(),
-            merkle_path: path,
-        })
+            merkle_path: self.merkle_path.to_vec(),
+        }
     }
 
     pub fn header(
@@ -296,44 +873,143 @@ impl BchTemplate {
 
     /// Build only a full block; no light-job fallback can truncate its tx list.
     pub fn block(&self, coinbase: &Coinbase, header: [u8; 80]) -> Result<Vec<u8>, String> {
+        if self.origin == Origin::HeaderOnly {
+            return Err("a custom job's template has no transactions".into());
+        }
+        // #### PR #42: block suppression: token work never becomes a block.
+        if !self.is_block() {
+            return Err("token work is not a BCH block".into());
+        }
         self.check_block_size(coinbase.bytes.len())?;
-        let mut hashes = vec![double_sha256(&coinbase.bytes)];
-        hashes.extend_from_slice(&self.transaction_hashes);
         if header[4..36] != self.previous_hash
-            || header[36..68] != merkle_root(hashes)
+            || header[36..68] != fold(double_sha256(&coinbase.bytes), &self.merkle_path)
             || header[72..76] != self.bits.to_le_bytes()
         {
             return Err("block header does not belong to this template".into());
         }
+        Ok(self.assemble(&coinbase.bytes, &header))
+    }
+
+    /// #### PR #42: the block's bytes, unchecked: the header, the count,
+    /// the coinbase and the template's transactions. A Template
+    /// Distribution client's solution is assembled with it before its
+    /// checks, so even a refused one can still reach the node (D24).
+    pub fn assemble(&self, coinbase: &[u8], header: &[u8; 80]) -> Vec<u8> {
         let mut block = header.to_vec();
         compact_size(self.transactions.len() + 1, &mut block);
-        block.extend_from_slice(&coinbase.bytes);
-        for tx in &self.transactions {
+        block.extend_from_slice(coinbase);
+        for tx in self.transactions.iter() {
             block.extend_from_slice(tx);
         }
-        Ok(block)
+        block
     }
 
     pub fn transaction_count(&self) -> usize {
         self.transactions.len() + 1
     }
 
-    fn check_block_size(&self, coinbase_size: usize) -> Result<(), String> {
+    /// #### PR #42: the BIP34 height push that begins every coinbase
+    /// script; a Template Distribution client's coinbase prefix.
+    pub fn height_push(&self) -> Vec<u8> {
+        height_script(self.height)
+    }
+
+    /// #### PR #42: the coinbase's merkle branch, deepest sibling first.
+    pub fn merkle_path(&self) -> &[Hash] {
+        &self.merkle_path
+    }
+
+    /// #### PR #42: the block's other transactions, in block (CTOR) order.
+    pub fn transactions(&self) -> &[Arc<[u8]>] {
+        &self.transactions
+    }
+
+    /// #### PR #42: the bytes a coinbase may take in a block of this
+    /// template: the size limit less the header, the transaction count and
+    /// every other transaction.
+    pub fn coinbase_budget(&self) -> u64 {
         let mut count = Vec::new();
         compact_size(self.transaction_count(), &mut count);
-        let size = 80u64
-            + count.len() as u64
-            + coinbase_size as u64
-            + self
-                .transactions
-                .iter()
-                .map(|tx| tx.len() as u64)
-                .sum::<u64>();
-        if size > self.size_limit {
+        let others = self
+            .transactions
+            .iter()
+            .map(|tx| tx.len() as u64)
+            .sum::<u64>();
+        self.size_limit
+            .saturating_sub(80 + count.len() as u64 + others)
+    }
+
+    /// #### PR #42: the template with other transactions, unchecked (its
+    /// merkle path is not recomputed), for transaction-data size tests.
+    #[cfg(test)]
+    pub(super) fn with_transactions(mut self, transactions: Vec<Vec<u8>>) -> Self {
+        self.txids = transactions.iter().map(|tx| double_sha256(tx)).collect();
+        self.index = Default::default();
+        self.transactions = transactions.into_iter().map(Arc::from).collect();
+        self
+    }
+
+    fn check_block_size(&self, coinbase_size: usize) -> Result<(), String> {
+        if coinbase_size as u64 > self.coinbase_budget() {
             return Err("coinbase exceeds template block size budget".into());
         }
         Ok(())
     }
+}
+
+/// #### PR #42: a SAFA job's coinbase: the forwarder to `destination`
+/// around `extranonce`, whose HASH256 is the merkle root.
+fn forwarder_coinbase(extranonce: &[u8], destination: &[u8]) -> Result<Coinbase, String> {
+    let pushed = TAG.len() + extranonce.len();
+    if pushed > 75 {
+        return Err("extranonce exceeds the forwarder's salt".into());
+    }
+    let mut bytes = vec![pushed as u8];
+    bytes.extend_from_slice(&TAG);
+    bytes.extend_from_slice(extranonce);
+    bytes.push(0x75);
+    bytes.extend(forwarder_body(destination)?);
+    if bytes.len() > MAX_P2S {
+        return Err("the forwarder exceeds 201 bytes".into());
+    }
+    let merkle_root = double_sha256(&bytes);
+    Ok(Coinbase { bytes, merkle_root })
+}
+
+/// #### PR #42: what a Template Distribution provider announced for one
+/// template, with its transactions.
+pub struct Provided<'a> {
+    pub previous_hash: Hash,
+    pub version: u32,
+    pub bits: u32,
+    /// The provider's target, which may be harder than `bits`'s.
+    pub target: Hash,
+    pub ntime: u32,
+    /// The coinbase prefix: the height push, then any flags.
+    pub prefix: &'a [u8],
+    pub value: u64,
+    pub transactions: Vec<Vec<u8>>,
+    pub merkle_path: &'a [Hash],
+    /// The coinbase output bytes this server declared it may add.
+    pub reserve: u32,
+}
+
+/// A template transaction's hash after the BCH checks: it decodes, is no
+/// coinbase, has inputs and no witness encoding. Bitcoin's decoder treats
+/// CashTokens prefixes as opaque output script bytes; BCH txids commit to
+/// every byte. No Bitcoin consensus validation is used.
+/// #### PR #42: also a Job Declaration client's provided transactions.
+pub fn checked_transaction(bytes: &[u8]) -> Result<Hash, String> {
+    let tx: Transaction =
+        consensus::deserialize(bytes).map_err(|_| "malformed template transaction")?;
+    if tx.is_coinbase()
+        || tx.input.is_empty()
+        || tx.input.iter().any(|input| !input.witness.is_empty())
+        || bytes.get(4) == Some(&0)
+    {
+        return Err("template contains coinbase, empty inputs or witness encoding".into());
+    }
+    Ok(double_sha256(bytes))
 }
 
 pub fn double_sha256(bytes: &[u8]) -> Hash {
@@ -371,7 +1047,46 @@ pub fn meets_target(hash: &Hash, target: &Hash) -> bool {
     hash.iter().rev().cmp(target.iter().rev()).is_le()
 }
 
-fn merkle_root(mut hashes: Vec<Hash>) -> Hash {
+/// #### PR #42: the merkle branch of the coinbase (index 0) over the
+/// block's other transactions: one sibling per level.
+pub fn coinbase_path(txids: &[Hash]) -> Vec<Hash> {
+    let mut hashes = vec![[0; 32]];
+    hashes.extend_from_slice(txids);
+    let mut path = Vec::new();
+    while hashes.len() > 1 {
+        if hashes.len() % 2 == 1 {
+            hashes.push(*hashes.last().unwrap());
+        }
+        path.push(hashes[1]);
+        hashes = hashes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let mut bytes = [0; 64];
+                bytes[..32].copy_from_slice(&pair[0]);
+                bytes[32..].copy_from_slice(&pair[1]);
+                double_sha256(&bytes)
+            })
+            .collect();
+    }
+    path
+}
+
+/// #### PR #42: folds the coinbase's hash up its branch at index 0 to the
+/// merkle root.
+pub fn fold(leaf: Hash, path: &[Hash]) -> Hash {
+    path.iter().fold(leaf, |current, sibling| {
+        let mut joined = [0; 64];
+        joined[..32].copy_from_slice(&current);
+        joined[32..].copy_from_slice(sibling);
+        double_sha256(&joined)
+    })
+}
+
+/// The whole tree's root, the reference the branch is checked against.
+#[cfg(test)]
+pub(super) fn merkle_root(mut hashes: Vec<Hash>) -> Hash {
     while hashes.len() > 1 {
         if hashes.len() % 2 == 1 {
             hashes.push(*hashes.last().unwrap());
@@ -431,7 +1146,8 @@ fn compact_size(value: usize, out: &mut Vec<u8>) {
         }
     }
 }
-fn height_script(height: u32) -> Vec<u8> {
+/// The minimal BIP34 push of `height`.
+pub fn height_script(height: u32) -> Vec<u8> {
     if height == 0 {
         return vec![0];
     }

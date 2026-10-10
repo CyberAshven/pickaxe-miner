@@ -15,20 +15,32 @@
 //! Pool settings (their worker names are often payout addresses), MAC
 //! addresses, serial numbers and host names are never collected.
 
-use super::device_api::{self, DeviceAction, DeviceReport};
+use super::{
+    device_api::{self, DeviceAction, DeviceReport, OwnApi, PoolEntry, PoolPlan, PowerMode},
+    logins::Logins,
+};
 use asic_rs::{
     core::{
-        data::{
-            board::BoardData, collector::DataField, fan::FanData, hashrate::HashRateUnit,
-            miner::MinerData,
+        config::{
+            fan::FanConfig,
+            pools::{PoolConfig, PoolGroupConfig},
+            tuning::TuningConfig,
         },
-        traits::miner::Miner,
+        data::{
+            board::BoardData,
+            collector::DataField,
+            fan::FanData,
+            hashrate::HashRateUnit,
+            miner::{MinerData, MiningMode, TuningTarget},
+        },
+        traits::miner::{ExposeSecret, Miner, MinerAuth},
     },
     MinerFactory,
 };
 use std::{
     collections::HashMap,
     net::IpAddr,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -69,6 +81,35 @@ pub struct Fleet {
 struct Shared {
     factory: MinerFactory,
     known: Mutex<HashMap<IpAddr, Known>>,
+    /// #### PR #42
+    /// What: the address of the device the Device panel opened last; the
+    /// poller's passes keep what is known about it.
+    /// Why: each pass forgets every device that is not connected, and the
+    /// panel opens on offline rows too. A confirmed action then found no
+    /// identified device: Pause or Blink failed, and Restart on a make only
+    /// asic-rs speaks to took Pickaxe's own Canaan and Bitaxe commands.
+    /// Look here if: an action on an offline row fails or takes another path
+    /// than the panel listed, or a farm's churn grows the cache.
+    held: Mutex<Option<IpAddr>>,
+    /// #### PR #42: what each Avalon listed in its `ascset 0,help` reply,
+    /// read when its Device panel identifies it; `None` when it listed
+    /// nothing readable.
+    avalon_help: Mutex<HashMap<IpAddr, Option<Vec<String>>>>,
+    /// #### PR #42: the device logins in use: the owner's saved ones, and
+    /// one entered on the Device panel until the device accepts or refuses
+    /// it.
+    logins: Mutex<HashMap<IpAddr, DeviceLogin>>,
+    /// The saved logins file, when this server keeps one.
+    store: Mutex<Option<Logins>>,
+}
+
+/// #### PR #42: a login for one device, for the firmware it was saved for;
+/// one without a firmware lets whichever firmware answers use it (a device
+/// that cannot be identified without its login).
+#[derive(Clone)]
+struct DeviceLogin {
+    firmware: Option<String>,
+    auth: MinerAuth,
 }
 
 #[derive(Clone)]
@@ -96,6 +137,10 @@ impl Fleet {
             shared: Arc::new(Shared {
                 factory: MinerFactory::new().with_identification_timeout(IDENTIFY),
                 known: Mutex::new(HashMap::new()),
+                held: Mutex::new(None),
+                avalon_help: Mutex::new(HashMap::new()),
+                logins: Mutex::new(HashMap::new()),
+                store: Mutex::new(None),
             }),
         }
     }
@@ -142,29 +187,270 @@ impl Fleet {
         })
     }
 
-    /// What this device offers on its controls page: what asic-rs supports
-    /// for its make and firmware, plus Avalon work levels; Pickaxe's own
-    /// actions for a device asic-rs has not identified.
-    pub fn actions(&self, ip: IpAddr) -> Vec<DeviceAction> {
-        let Some(miner) = self.shared.miner(ip) else {
-            return DeviceAction::OWN.to_vec();
-        };
-        let mut actions = vec![DeviceAction::Restart];
-        actions.extend(
-            [
-                DeviceAction::Pause,
-                DeviceAction::Resume,
-                DeviceAction::LocateOn,
-                DeviceAction::LocateOff,
-            ]
-            .into_iter()
-            .filter(|action| supports(&*miner, *action)),
-        );
-        if is_avalon(&*miner) {
-            actions.extend([DeviceAction::LowerPower, DeviceAction::RaisePower]);
+    /// #### PR #42
+    /// What: what this device offers on its Device panel, from what is
+    /// already known about it; no device is asked. Nothing for an address
+    /// that is not on the local network.
+    /// Why: the panel is drawn every half second and must never wait on a
+    /// device; `identify_now` asks it, on a background thread.
+    /// Look here if: the panel lists the wrong actions for a device.
+    pub fn controls(&self, ip: IpAddr) -> DeviceControls {
+        if !device_api::queryable(ip) {
+            return DeviceControls::default();
         }
-        actions
+        let help = self.shared.avalon_help(ip);
+        controls_of(self.shared.miner(ip).as_deref(), help.as_deref())
     }
+
+    /// #### PR #42
+    /// What: identifies the device for its Device panel, within `IDENTIFY`
+    /// (10 seconds), and returns what it offers, from that identification
+    /// itself. `fresh` asks the device again even if asic-rs knows it (or
+    /// could not identify it lately). The address is held, so the poller
+    /// keeps what was found for the panel's actions. It blocks, so call it
+    /// from a background thread, never the screen's.
+    /// Why: the panel opens on offline rows too, which the poller no longer
+    /// asks; their make may not be known, and their address may since have
+    /// passed to another device, which only a fresh look shows.
+    /// Look here if: the panel stays at "Identifying the device", the screen
+    /// freezes when the panel opens, or an offline row's panel shows the
+    /// make the device had before.
+    pub fn identify_now(&self, ip: IpAddr, fresh: bool) -> DeviceControls {
+        if !device_api::queryable(ip) {
+            return DeviceControls::default();
+        }
+        self.shared.hold(ip);
+        let miner = self.runtime.as_ref().and_then(|runtime| {
+            // The time limit is made inside the runtime (see `control`).
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(IDENTIFY, self.shared.identify(ip, fresh)).await
+                })
+                .ok()
+                .flatten()
+        });
+        // #### PR #42: an Avalon lists the settings it accepts (read-only).
+        let help = miner
+            .as_deref()
+            .filter(|miner| is_avalon(*miner))
+            .and_then(|_| {
+                let help = device_api::avalon_options(ip);
+                self.shared.remember_help(ip, help.clone());
+                help
+            });
+        controls_of(miner.as_deref(), help.as_deref())
+    }
+
+    // #### PR #42: device logins
+    // What: the owner's saved logins (`<config>.sv2-logins.json`) are loaded
+    // at start, and a login entered on the Device panel is used at once and
+    // saved once the device accepts it. Identification uses the login: for
+    // the firmware it was saved for, or for any firmware while it has none.
+    // Why: stock Antminer, Elphapex, VolcMiner and SealMiner log in even to
+    // be identified, so a changed password left them unidentified; others
+    // refuse actions without the owner's login.
+    // Look here if: a device with a changed password stays unidentified, or
+    // a login is used for another device.
+    /// Loads the saved device logins beside this config.
+    pub fn load_logins(&self, config_path: &Path) -> Result<(), String> {
+        let logins = Logins::load(config_path)?;
+        if let Ok(mut known) = self.shared.logins.lock() {
+            for (ip, login) in logins.all() {
+                known.insert(
+                    ip,
+                    DeviceLogin {
+                        firmware: Some(login.firmware.clone()),
+                        auth: login.auth(),
+                    },
+                );
+            }
+        }
+        if let Ok(mut store) = self.shared.store.lock() {
+            *store = Some(logins);
+        }
+        Ok(())
+    }
+
+    /// Uses this login for the device from now on, or none, and forgets what
+    /// was identified there, so the next look logs in with it. `firmware`
+    /// limits it to that firmware; `None` lets any firmware use it.
+    pub fn set_login(&self, ip: IpAddr, login: Option<(Option<String>, MinerAuth)>) {
+        if let Ok(mut logins) = self.shared.logins.lock() {
+            match login {
+                Some((firmware, auth)) => {
+                    logins.insert(ip, DeviceLogin { firmware, auth });
+                }
+                None => {
+                    logins.remove(&ip);
+                }
+            }
+        }
+        if let Ok(mut known) = self.shared.known.lock() {
+            known.remove(&ip);
+        }
+    }
+
+    /// Saves a login the device accepted, for its firmware, and keeps using
+    /// it for that firmware only.
+    pub fn save_login(
+        &self,
+        ip: IpAddr,
+        firmware: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        {
+            let mut store = self
+                .shared
+                .store
+                .lock()
+                .map_err(|_| "device logins are unavailable".to_owned())?;
+            store
+                .as_mut()
+                .ok_or_else(|| "this server keeps no device logins file".to_owned())?
+                .save(ip, firmware, username, password)?;
+        }
+        if let Ok(mut logins) = self.shared.logins.lock() {
+            if let Some(login) = logins.get_mut(&ip) {
+                login.firmware = Some(firmware.to_owned());
+            }
+        }
+        Ok(())
+    }
+    // #### end PR #42 ####
+
+    // #### PR #42: a device's pools
+    // What: reads a device's pools when its Device panel asks (never while
+    // polling), and writes a confirmed plan: through asic-rs where it sets
+    // pools for the firmware, otherwise Pickaxe's own Avalon (`setpool`, with
+    // its web login) and AxeOS commands.
+    // Why: the owner can point a device at another pool, or back at this
+    // server, from the panel.
+    // Look here if: a device's pools read or change wrongly.
+    /// The device's pools, read now; it blocks, so call it from a background
+    /// thread.
+    pub fn pools(&self, ip: IpAddr) -> Result<DevicePools, String> {
+        if !device_api::queryable(ip) {
+            return Err("only devices on the local network can be controlled".into());
+        }
+        let miner = self.shared.miner(ip);
+        let firmware = miner
+            .as_deref()
+            .map(|miner| miner.get_device_info().firmware)
+            .unwrap_or_default();
+        match miner.as_deref().and_then(own_api) {
+            Some(OwnApi::Avalon) => Ok(DevicePools {
+                entries: device_api::avalon_pools(ip)?,
+                slots: 3,
+                notes: vec![
+                    "Avalons do not report pool passwords; the kept pools get password x.",
+                    "The device restarts to use them.",
+                ],
+            }),
+            Some(OwnApi::AxeOs) => Ok(DevicePools {
+                entries: device_api::axeos_pools(ip)?,
+                slots: 2,
+                notes: vec![
+                    "A Bitaxe holds a pool and a fallback pool.",
+                    "Bitaxes do not report pool passwords; the kept pool gets password x.",
+                    "The device restarts to use them.",
+                ],
+            }),
+            None => {
+                let (Some(miner), Some(runtime)) = (miner, &self.runtime) else {
+                    return Err("this device does not offer its pools".into());
+                };
+                if !miner.supports_pools_config() {
+                    return Err("this device does not offer its pools".into());
+                }
+                let keeps = KEEPS_POOL_PASSWORDS.contains(&firmware.as_str());
+                let (status, config) = runtime
+                    .block_on(async {
+                        tokio::time::timeout(ANSWER, async {
+                            let status = miner.get_pools().await;
+                            let config = if keeps {
+                                miner.get_pools_config().await.ok()
+                            } else {
+                                None
+                            };
+                            (status, config)
+                        })
+                        .await
+                    })
+                    .map_err(|_| "the device did not answer in time".to_owned())?;
+                let entries = asic_rs_pools(&status, config.as_deref());
+                let mut notes = Vec::new();
+                if !keeps {
+                    notes.push("This firmware does not report pool passwords; the kept pools get password x.");
+                }
+                notes.extend(pool_notes(&firmware));
+                Ok(DevicePools {
+                    entries,
+                    slots: 3,
+                    notes,
+                })
+            }
+        }
+    }
+
+    /// Writes a confirmed pool plan and describes the device's answer.
+    pub fn set_pools(&self, ip: IpAddr, plan: &PoolPlan) -> Result<String, String> {
+        if !device_api::queryable(ip) {
+            return Err("only devices on the local network can be controlled".into());
+        }
+        for pool in &plan.pools {
+            device_api::check_pool_url(&pool.url)?;
+        }
+        let miner = self.shared.miner(ip);
+        match miner.as_deref().and_then(own_api) {
+            Some(OwnApi::Avalon) => {
+                let login = self
+                    .shared
+                    .logins
+                    .lock()
+                    .ok()
+                    .and_then(|logins| logins.get(&ip).map(|login| login.auth.clone()));
+                let Some(MinerAuth::UserAndPass(login)) = login else {
+                    return Err(device_api::WEB_LOGIN_NEEDED.into());
+                };
+                device_api::avalon_set_pools(
+                    ip,
+                    (&login.username, login.password.expose_secret()),
+                    &plan.pools,
+                )
+            }
+            Some(OwnApi::AxeOs) => device_api::axeos_set_pools(ip, &plan.pools),
+            None => {
+                let (Some(miner), Some(runtime)) = (miner, &self.runtime) else {
+                    return Err("this device does not offer its pools".into());
+                };
+                let group = PoolGroupConfig {
+                    name: "default".into(),
+                    quota: 1,
+                    pools: plan
+                        .pools
+                        .iter()
+                        .map(|pool| PoolConfig {
+                            url: pool.url.clone().into(),
+                            username: pool.user.clone(),
+                            password: pool.password.clone(),
+                        })
+                        .collect(),
+                };
+                let accepted = runtime
+                    .block_on(async {
+                        tokio::time::timeout(ANSWER, miner.set_pools_config(vec![group])).await
+                    })
+                    .map_err(|_| "the device did not answer in time".to_owned())?;
+                match accepted {
+                    Ok(true) => Ok("the device accepted the pools".into()),
+                    Ok(false) => Err("the device did not accept the pools".into()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        }
+    }
+    // #### end PR #42 ####
 
     /// Runs one confirmed action and describes the device's answer: through
     /// asic-rs where it supports the action, otherwise Pickaxe's own code.
@@ -172,17 +458,28 @@ impl Fleet {
         if !device_api::queryable(ip) {
             return Err("only devices on the local network can be controlled".into());
         }
-        let miner = self
-            .shared
-            .miner(ip)
-            .filter(|miner| supports(&**miner, action));
-        match (miner, &self.runtime) {
-            (Some(miner), Some(runtime)) => runtime
-                .block_on(tokio::time::timeout(ANSWER, run(&*miner, action)))
-                .map_err(|_| "the device did not answer in time".to_owned())?,
-            _ => device_api::control(ip, action)
-                .map(|reply| format!("the device replied \"{reply}\"")),
+        match (self.through_asic_rs(ip, action), &self.runtime) {
+            (Some(miner), Some(runtime)) => run_within_answer(runtime, &*miner, action),
+            // #### PR #42: fan and power settings asic-rs does not send for
+            // this device go to Pickaxe's own Avalon or AxeOS commands.
+            _ => match (
+                is_setting(action),
+                self.shared.miner(ip).as_deref().and_then(own_api),
+            ) {
+                (true, Some(api)) => device_api::setting(ip, api, action),
+                (true, None) => Err("this device does not offer that action".into()),
+                (false, _) => device_api::control(ip, action),
+            }
+            .map(|reply| format!("the device replied \"{reply}\"")),
         }
+    }
+
+    /// The identified device an action goes to through asic-rs, when asic-rs
+    /// supports that action for it; Pickaxe's own code sends the rest.
+    fn through_asic_rs(&self, ip: IpAddr, action: DeviceAction) -> Option<Arc<dyn Miner>> {
+        self.shared
+            .miner(ip)
+            .filter(|miner| supports(&**miner, action))
     }
 }
 
@@ -196,10 +493,38 @@ impl Drop for Fleet {
 }
 
 impl Shared {
-    /// Forgets devices that left, so a farm's churn cannot grow the cache.
+    /// Forgets devices that left, so a farm's churn cannot grow the cache;
+    /// the device the Device panel holds is kept (PR #42, see `held`).
     fn keep_only(&self, devices: &[(u64, IpAddr)]) {
+        let held = self.held.lock().ok().and_then(|held| *held);
         if let Ok(mut known) = self.known.lock() {
-            known.retain(|ip, _| devices.iter().any(|(_, device)| device == ip));
+            known.retain(|ip, _| {
+                held == Some(*ip) || devices.iter().any(|(_, device)| device == ip)
+            });
+        }
+        if let Ok(mut help) = self.avalon_help.lock() {
+            help.retain(|ip, _| {
+                held == Some(*ip) || devices.iter().any(|(_, device)| device == ip)
+            });
+        }
+    }
+
+    /// #### PR #42: what an Avalon listed in its `ascset 0,help` reply;
+    /// `None` when it has not been asked or listed nothing readable.
+    fn avalon_help(&self, ip: IpAddr) -> Option<Vec<String>> {
+        self.avalon_help.lock().ok()?.get(&ip).cloned().flatten()
+    }
+
+    fn remember_help(&self, ip: IpAddr, help: Option<Vec<String>>) {
+        if let Ok(mut known) = self.avalon_help.lock() {
+            known.insert(ip, help);
+        }
+    }
+
+    /// #### PR #42: the Device panel's device, kept through polls.
+    fn hold(&self, ip: IpAddr) {
+        if let Ok(mut held) = self.held.lock() {
+            *held = Some(ip);
         }
     }
 
@@ -212,15 +537,35 @@ impl Shared {
     }
 
     /// Identifies the device once; one asic-rs could not identify is asked
-    /// again only after `RETRY`.
-    async fn identify(&self, ip: IpAddr) -> Option<Arc<dyn Miner>> {
-        let known = self.known.lock().ok()?.get(&ip).cloned();
+    /// again only after `RETRY`. (PR #42: `fresh` forgets what is known and
+    /// asks now, so nothing older is used if this look times out.)
+    async fn identify(&self, ip: IpAddr, fresh: bool) -> Option<Arc<dyn Miner>> {
+        let known = {
+            let mut known = self.known.lock().ok()?;
+            if fresh {
+                known.remove(&ip)
+            } else {
+                known.get(&ip).cloned()
+            }
+        };
         match known {
-            Some(Known::Miner(miner)) => return Some(miner),
-            Some(Known::Unknown(since)) if since.elapsed() < RETRY => return None,
+            Some(Known::Miner(miner)) if !fresh => return Some(miner),
+            Some(Known::Unknown(since)) if !fresh && since.elapsed() < RETRY => return None,
             _ => (),
         }
-        let found = tokio::time::timeout(IDENTIFY, self.factory.get_miner(ip)).await;
+        // #### PR #42: with the owner's login when there is one.
+        let login = self
+            .logins
+            .lock()
+            .ok()
+            .and_then(|logins| logins.get(&ip).cloned());
+        let found = match login {
+            Some(login) => {
+                let factory = factory_with(login.firmware.as_deref(), &login.auth);
+                tokio::time::timeout(IDENTIFY, factory.get_miner(ip)).await
+            }
+            None => tokio::time::timeout(IDENTIFY, self.factory.get_miner(ip)).await,
+        };
         let entry = match found {
             Ok(Ok(Some(miner))) => Known::Miner(Arc::from(miner)),
             _ => Known::Unknown(Instant::now()),
@@ -242,7 +587,7 @@ impl Shared {
         }
         let own = tokio::task::spawn_blocking(move || device_api::poll(ip));
         let data = async {
-            let miner = self.identify(ip).await?;
+            let miner = self.identify(ip, false).await?;
             tokio::time::timeout(ANSWER, miner.get_data_filtered(NOT_COLLECTED.to_vec()))
                 .await
                 .ok()
@@ -252,14 +597,339 @@ impl Shared {
     }
 }
 
+/// #### PR #42
+/// What a device offers on its Device panel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceControls {
+    /// The firmware asic-rs identified, such as "AvalonMiner Stock"; none
+    /// when it has not identified the device.
+    pub firmware: Option<String>,
+    /// The make and model asic-rs identified, written as a device report's
+    /// model is ("Avalonminer AvalonNano3s"), so an offline row's panel can
+    /// check that the device answering is the row's; none when asic-rs has
+    /// not identified the device.
+    pub model: Option<String>,
+    /// The one-shot actions, each sent only after the user confirms it.
+    pub actions: Vec<DeviceAction>,
+    /// #### PR #42: the fan setting offered: automatic, or a percentage in
+    /// this range; none when the device offers no fan setting.
+    pub fan: Option<FanRange>,
+    /// #### PR #42: how power is set, beyond Avalon work-level steps.
+    pub power: Option<PowerSetting>,
+    /// #### PR #42: how many pools the device holds, when its pools can be
+    /// read and changed; none otherwise.
+    pub pools: Option<usize>,
+}
+
+/// #### PR #42: a device's pools, read on the Device panel's request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DevicePools {
+    /// In the device's order; the first is its main pool.
+    pub entries: Vec<PoolEntry>,
+    /// How many pools the device holds.
+    pub slots: usize,
+    /// What a change does beyond the list, for the confirmation.
+    pub notes: Vec<&'static str>,
+}
+
+/// Firmwares whose pool settings asic-rs reads with their passwords; the
+/// others come back with password "x".
+const KEEPS_POOL_PASSWORDS: [&str; 6] = [
+    "AntMiner Stock",
+    "LuxOS",
+    "Marathon",
+    "Elphapex Stock",
+    "VolcMiner Stock",
+    "SealMiner Stock",
+];
+
+/// #### PR #42: the fan percentages a device accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FanRange {
+    pub min: u8,
+    pub max: u8,
+}
+
+/// #### PR #42: how a device's power is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerSetting {
+    /// Named modes: Low, Normal and High.
+    Modes,
+    /// A limit in watts.
+    Watts,
+}
+
+/// The firmware asic-rs names ePIC's ("UMC OS"): its power limit is set
+/// through its tuning.
+const EPIC: &str = "UMC OS";
+/// Firmwares whose power is set by named modes through asic-rs.
+const NAMED_MODES: [&str; 2] = ["AntMiner Stock", "WhatsMiner Stock"];
+/// The target temperature an automatic fan keeps when the device reports
+/// none (ePIC and Proto need one).
+const AUTO_FAN_TARGET_C: f64 = 65.0;
+
+/// #### PR #42: what decides a device's fan and power settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Capabilities {
+    own: Option<OwnApi>,
+    firmware: String,
+    fan_config: bool,
+    power_limit: bool,
+    tuning_config: bool,
+}
+
+impl Capabilities {
+    fn of(miner: &dyn Miner) -> Self {
+        Self {
+            own: own_api(miner),
+            firmware: miner.get_device_info().firmware,
+            fan_config: miner.supports_fan_config(),
+            power_limit: miner.supports_set_power_limit(),
+            tuning_config: miner.supports_tuning_config(),
+        }
+    }
+}
+
+// #### PR #42: fan and power settings on the Device panel
+// What: the settings a device offers. Avalons: Canaan's fan (15% to 100%)
+// and work modes, each when the device's `ascset 0,help` lists it (`fan-spd`,
+// `workmode`) or lists nothing readable, so the device has the last word;
+// their power otherwise stays in work-level steps. Bitaxe and NerdAxe:
+// AxeOS's fan. Others: what asic-rs sets for the firmware: a fan (stock
+// Antminer, ePIC, Proto), a power limit in watts (where asic-rs sets one,
+// and ePIC through its tuning), or named modes (stock Antminer, WhatsMiner).
+// Why: the panel offers only what will be sent. asic-rs sends an Avalon's
+// "power limit" as watts text in place of a work level, so Avalon power never
+// goes through it.
+// Look here if: a panel misses a fan or power setting the device has, or
+// offers one it refuses.
+fn settings_offered(
+    caps: &Capabilities,
+    help: Option<&[String]>,
+) -> (Option<FanRange>, Option<PowerSetting>) {
+    let lists = |option: &str| help.is_none_or(|help| help.iter().any(|word| word == option));
+    let any_fan = FanRange { min: 0, max: 100 };
+    match caps.own {
+        Some(OwnApi::Avalon) => (
+            lists("fan-spd").then_some(FanRange {
+                min: device_api::AVALON_FAN.0,
+                max: device_api::AVALON_FAN.1,
+            }),
+            lists("workmode").then_some(PowerSetting::Modes),
+        ),
+        Some(OwnApi::AxeOs) => (Some(any_fan), None),
+        None => {
+            let power = if caps.power_limit || (caps.firmware == EPIC && caps.tuning_config) {
+                Some(PowerSetting::Watts)
+            } else if caps.tuning_config && NAMED_MODES.contains(&caps.firmware.as_str()) {
+                Some(PowerSetting::Modes)
+            } else {
+                None
+            };
+            (caps.fan_config.then_some(any_fan), power)
+        }
+    }
+}
+
+/// #### PR #42
+/// What: a factory that logs in with the owner's login: for the firmware it
+/// was saved for, or for every firmware while it has none.
+/// Why: asic-rs hands an identified miner its login only through the
+/// factory; `set_auth` needs the miner to itself, which a shared one is not.
+/// Look here if: a device whose login was entered stays unidentified.
+fn factory_with(firmware: Option<&str>, auth: &MinerAuth) -> MinerFactory {
+    asic_rs::factory::default_firmware_registry()
+        .iter()
+        .filter(|entry| firmware.is_none_or(|firmware| entry.to_string() == firmware))
+        .fold(
+            MinerFactory::new().with_identification_timeout(IDENTIFY),
+            |factory, entry| factory.with_firmware_discovery_auth(entry.as_ref(), auth.clone()),
+        )
+}
+
+/// #### PR #42: asic-rs's pools as the panel shows them: the first group, in
+/// order, with the passwords its pool settings hold where the firmware
+/// reports them, else "x".
+fn asic_rs_pools(
+    status: &[asic_rs::core::data::pool::PoolGroupData],
+    config: Option<&[PoolGroupConfig]>,
+) -> Vec<PoolEntry> {
+    let Some(group) = status.first() else {
+        return Vec::new();
+    };
+    let saved = config.and_then(|config| config.first());
+    group
+        .pools
+        .iter()
+        .filter_map(|pool| {
+            let url = pool.url.as_ref()?.to_string();
+            let user = pool.user.clone().unwrap_or_default();
+            let password = saved
+                .and_then(|saved| {
+                    saved.pools.iter().find(|kept| {
+                        device_api::host_port(&kept.url.to_string()) == device_api::host_port(&url)
+                            && kept.username == user
+                    })
+                })
+                .map_or_else(|| "x".to_owned(), |kept| kept.password.clone());
+            Some(PoolEntry {
+                url,
+                user,
+                password,
+                active: pool.active.unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// #### PR #42: what a pool change does on this firmware beyond the list.
+fn pool_notes(firmware: &str) -> Vec<&'static str> {
+    match firmware {
+        "LuxOS" => vec!["LuxOS removes all its pool groups, then adds this one."],
+        "VNish" => vec!["VNish keeps only host and port: no SV2 key, no SSL."],
+        "WhatsMiner Stock" => vec!["WhatsMiner changes its first pool group only."],
+        "Braiins" | "SealMiner Stock" => vec!["The device may restart to use them."],
+        _ => Vec::new(),
+    }
+}
+
+/// #### PR #42: what a firmware's login asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginShape {
+    /// The firmware has no login Pickaxe uses.
+    None,
+    /// A password alone (the firmware sets the username itself).
+    Password,
+    /// A username, offered with the firmware's default, and a password.
+    UserAndPassword(&'static str),
+}
+
+/// The login a firmware asks for, by the name asic-rs gives it; a device
+/// asic-rs has not identified is offered the most common one (`root`).
+pub fn login_shape(firmware: Option<&str>) -> LoginShape {
+    match firmware {
+        None => LoginShape::UserAndPassword("root"),
+        Some("AntMiner Stock" | "Elphapex Stock" | "VolcMiner Stock" | "Marathon" | "Braiins") => {
+            LoginShape::UserAndPassword("root")
+        }
+        Some("Auradine Stock") => LoginShape::UserAndPassword("admin"),
+        Some("SealMiner Stock") => LoginShape::UserAndPassword("seal"),
+        Some("FutureBit Stock") => LoginShape::UserAndPassword("futurebit"),
+        Some("Proto Stock") => LoginShape::UserAndPassword(""),
+        Some("VNish" | "UMC OS" | "WhatsMiner Stock") => LoginShape::Password,
+        // Only an Avalon's pools need its web login.
+        Some("AvalonMiner Stock") => LoginShape::UserAndPassword("admin"),
+        Some(_) => LoginShape::None,
+    }
+}
+
+/// Firmwares asic-rs identifies only after logging in: a device that
+/// identifies as one with a login entered has accepted that login.
+pub const IDENTIFIES_WITH_LOGIN: [&str; 4] = [
+    "AntMiner Stock",
+    "Elphapex Stock",
+    "VolcMiner Stock",
+    "SealMiner Stock",
+];
+
+/// Pickaxe's own API for a device's fan and power, if any.
+fn own_api(miner: &dyn Miner) -> Option<OwnApi> {
+    if is_avalon(miner) {
+        return Some(OwnApi::Avalon);
+    }
+    let firmware = miner.get_device_info().firmware;
+    (firmware == "Bitaxe Stock" || firmware == "Nerdaxe Stock").then_some(OwnApi::AxeOs)
+}
+
+/// Whether the action is a fan or power setting rather than a one-shot.
+fn is_setting(action: DeviceAction) -> bool {
+    matches!(
+        action,
+        DeviceAction::FanAuto
+            | DeviceAction::FanPercent(_)
+            | DeviceAction::PowerWatts(_)
+            | DeviceAction::PowerMode(_)
+    )
+}
+// #### end PR #42 ####
+
+/// What a device offers: what asic-rs supports for its make and firmware,
+/// plus Avalon work levels; Pickaxe's own actions for a device asic-rs has
+/// not identified.
+fn controls_of(miner: Option<&dyn Miner>, help: Option<&[String]>) -> DeviceControls {
+    let Some(miner) = miner else {
+        return DeviceControls {
+            actions: DeviceAction::OWN.to_vec(),
+            ..DeviceControls::default()
+        };
+    };
+    let mut actions = vec![DeviceAction::Restart];
+    actions.extend(
+        [
+            DeviceAction::Pause,
+            DeviceAction::Resume,
+            DeviceAction::LocateOn,
+            DeviceAction::LocateOff,
+        ]
+        .into_iter()
+        .filter(|action| supports(miner, *action)),
+    );
+    if is_avalon(miner) {
+        actions.extend([DeviceAction::LowerPower, DeviceAction::RaisePower]);
+    }
+    let info = miner.get_device_info();
+    let (fan, power) = settings_offered(&Capabilities::of(miner), help);
+    // #### PR #42: pools, through asic-rs or Pickaxe's own Avalon and AxeOS
+    // commands.
+    let pools = match own_api(miner) {
+        Some(OwnApi::Avalon) => Some(3),
+        Some(OwnApi::AxeOs) => Some(2),
+        None => miner.supports_pools_config().then_some(3),
+    };
+    DeviceControls {
+        // The same text `from_asic_rs` gives a report's model.
+        model: Some(format!("{} {}", info.make, info.model)),
+        firmware: Some(info.firmware),
+        actions,
+        fan,
+        power,
+        pools,
+    }
+}
+
 fn supports(miner: &dyn Miner, action: DeviceAction) -> bool {
     match action {
-        DeviceAction::Restart => miner.supports_restart(),
+        // #### PR #42
+        // What: Restart on any Avalon goes to Pickaxe's own Canaan reboot
+        // (`ascset 0,reboot,0`, see `device_api::control`), not to asic-rs.
+        // Why: asic-rs's Avalon restart sends cgminer's `restart`, which
+        // restarts the mining program, not the device, and asic-rs's Avalon
+        // Home Q does not offer it at all; Canaan documents
+        // `ascset 0,reboot,N` as the device reboot.
+        // Look here if: Restart on an Avalon does not reboot it, or a newer
+        // asic-rs reboots Avalons itself.
+        DeviceAction::Restart => !is_avalon(miner) && miner.supports_restart(),
         DeviceAction::Pause => miner.supports_pause(),
         DeviceAction::Resume => miner.supports_resume(),
         DeviceAction::LocateOn | DeviceAction::LocateOff => miner.supports_set_fault_light(),
         // Work levels are Pickaxe's own Canaan commands.
         DeviceAction::LowerPower | DeviceAction::RaisePower => false,
+        // #### PR #42: fan and power settings asic-rs sets for this firmware
+        // (see `settings_offered`); Avalons, Bitaxes and NerdAxes use
+        // Pickaxe's own commands.
+        DeviceAction::FanAuto | DeviceAction::FanPercent(_) => {
+            own_api(miner).is_none() && miner.supports_fan_config()
+        }
+        DeviceAction::PowerWatts(_) => {
+            own_api(miner).is_none()
+                && (miner.supports_set_power_limit()
+                    || (miner.get_device_info().firmware == EPIC && miner.supports_tuning_config()))
+        }
+        DeviceAction::PowerMode(_) => {
+            own_api(miner).is_none()
+                && miner.supports_tuning_config()
+                && NAMED_MODES.contains(&miner.get_device_info().firmware.as_str())
+        }
     }
 }
 
@@ -271,6 +941,24 @@ fn is_avalon(miner: &dyn Miner) -> bool {
         .starts_with("avalon")
 }
 
+/// #### PR #42
+/// What: runs one action through asic-rs within `ANSWER`, with the time
+/// limit made inside the runtime, in the async block it runs.
+/// Why: tokio's timer panics when it is made outside a runtime ("there is no
+/// reactor running"), as `block_on(timeout(..))` in `control` did: every
+/// action sent through asic-rs ended the panel's background thread, and the
+/// panel kept showing "Sending".
+/// Look here if: an action sent through asic-rs never finishes.
+fn run_within_answer(
+    runtime: &tokio::runtime::Runtime,
+    miner: &dyn Miner,
+    action: DeviceAction,
+) -> Result<String, String> {
+    runtime
+        .block_on(async { tokio::time::timeout(ANSWER, run(miner, action)).await })
+        .map_err(|_| "the device did not answer in time".to_owned())?
+}
+
 async fn run(miner: &dyn Miner, action: DeviceAction) -> Result<String, String> {
     let accepted = match action {
         DeviceAction::Restart => miner.restart().await,
@@ -280,6 +968,43 @@ async fn run(miner: &dyn Miner, action: DeviceAction) -> Result<String, String> 
         DeviceAction::LocateOff => miner.set_fault_light(false).await,
         DeviceAction::LowerPower | DeviceAction::RaisePower => {
             return Err("this action is not sent through asic-rs".into())
+        }
+        // #### PR #42: fan and power settings through asic-rs.
+        DeviceAction::FanAuto => {
+            // Keep the device's own target temperature when it has one.
+            let target = match miner.get_fan_config().await {
+                Ok(FanConfig::Auto { target_temp, .. }) => target_temp,
+                _ => AUTO_FAN_TARGET_C,
+            };
+            miner.set_fan_config(FanConfig::auto(target, None)).await
+        }
+        DeviceAction::FanPercent(percent) => {
+            miner
+                .set_fan_config(FanConfig::manual(u64::from(percent)))
+                .await
+        }
+        DeviceAction::PowerWatts(watts) => {
+            let target = TuningTarget::from_watts(f64::from(watts));
+            if miner.get_device_info().firmware == EPIC {
+                miner
+                    .set_tuning_config(TuningConfig::new(target), None)
+                    .await
+            } else {
+                let TuningTarget::Power(limit) = target else {
+                    return Err("this action is not sent through asic-rs".into());
+                };
+                miner.set_power_limit(limit).await
+            }
+        }
+        DeviceAction::PowerMode(mode) => {
+            let mode = match mode {
+                PowerMode::Low => MiningMode::Low,
+                PowerMode::Normal => MiningMode::Normal,
+                PowerMode::High => MiningMode::High,
+            };
+            miner
+                .set_tuning_config(TuningConfig::new(TuningTarget::MiningMode(mode)), None)
+                .await
         }
     };
     match accepted {
@@ -443,7 +1168,7 @@ mod tests {
         let fleet = Fleet::new();
         let reports = fleet.poll(&[(1, ip)], &AtomicBool::new(false));
         println!("report: {:?}", reports[0].1);
-        println!("actions: {:?}", fleet.actions(ip));
+        println!("controls: {:?}", fleet.controls(ip));
         let report = reports[0].1.as_ref().expect("the device answered");
         assert!(report.model.is_some(), "asic-rs identified the device");
         assert!(report.hashrate.is_some());
@@ -453,7 +1178,18 @@ mod tests {
     fn unidentified_devices_offer_pickaxes_own_actions_and_public_ones_none() {
         let fleet = Fleet::new();
         let ip: IpAddr = "192.168.7.9".parse().unwrap();
-        assert_eq!(fleet.actions(ip), DeviceAction::OWN.to_vec());
+        // #### PR #42: `controls` (no device is asked) replaces `actions`.
+        assert_eq!(
+            fleet.controls(ip),
+            DeviceControls {
+                firmware: None,
+                model: None,
+                actions: DeviceAction::OWN.to_vec(),
+                fan: None,
+                power: None,
+                pools: None,
+            }
+        );
         assert!(fleet
             .control("8.8.8.8".parse().unwrap(), DeviceAction::Restart)
             .is_err());
@@ -461,5 +1197,292 @@ mod tests {
         let stop = AtomicBool::new(false);
         let reports = fleet.poll(&[(1, "8.8.8.8".parse().unwrap())], &stop);
         assert_eq!(reports, vec![(1, None)]);
+        // #### PR #42: nor identified, even freshly, and they offer nothing.
+        for other in ["8.8.8.8", "127.0.0.1"] {
+            let started = Instant::now();
+            let ip: IpAddr = other.parse().unwrap();
+            for fresh in [false, true] {
+                assert_eq!(fleet.identify_now(ip, fresh), DeviceControls::default());
+            }
+            assert_eq!(fleet.controls(ip), DeviceControls::default());
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    // #### PR #42
+    // What: the device the Device panel identified stays known through the
+    // poller's passes, which ask only connected devices, so a confirmed
+    // action on an offline row goes the way the panel listed; a device no
+    // panel holds is still forgotten. Identifying and acting do not panic
+    // on tokio's timer.
+    // Why: each pass forgot every device that was not connected, and Pause,
+    // Blink or Restart on an offline row then failed or took Pickaxe's own
+    // path; a time limit made outside the runtime panicked.
+    // Look here if: keep_only(), hold(), identify_now(), control() or
+    // run_within_answer() changes.
+    #[test]
+    fn the_panels_device_stays_identified_through_polls() {
+        use asic_rs::{
+            avalonminer::{backends::AvalonMiner, firmware::AvalonStockFirmware},
+            core::traits::{firmware::MinerFirmware, miner::MinerConstructor},
+        };
+        type AvalonModel = <AvalonStockFirmware as MinerFirmware>::Model;
+        let fleet = Fleet::new();
+        let held: IpAddr = "192.168.7.9".parse().unwrap();
+        let other: IpAddr = "192.168.7.10".parse().unwrap();
+        // Building asic-rs's miners sends nothing to these addresses.
+        for ip in [held, other] {
+            let model: AvalonModel = "1566".parse().unwrap();
+            let miner = AvalonMiner::new(ip, model, None);
+            fleet
+                .shared
+                .known
+                .lock()
+                .unwrap()
+                .insert(ip, Known::Miner(Arc::from(miner)));
+        }
+        // The panel opens on the row: asic-rs knows the device, so nothing
+        // is sent.
+        let controls = fleet.identify_now(held, false);
+        assert_eq!(controls.firmware.as_deref(), Some("AvalonMiner Stock"));
+        assert!(controls.actions.contains(&DeviceAction::Pause));
+        // A pass with no device connected.
+        assert!(fleet.poll(&[], &AtomicBool::new(false)).is_empty());
+        assert_eq!(fleet.controls(held), controls);
+        assert!(fleet.through_asic_rs(held, DeviceAction::Pause).is_some());
+        assert!(fleet
+            .through_asic_rs(held, DeviceAction::LocateOn)
+            .is_some());
+        assert!(
+            fleet.through_asic_rs(held, DeviceAction::Restart).is_none(),
+            "an Avalon restart is Canaan's own reboot"
+        );
+        assert!(
+            fleet.through_asic_rs(other, DeviceAction::Pause).is_none(),
+            "a device no panel holds is forgotten"
+        );
+        assert_eq!(fleet.controls(other).firmware, None);
+        // The time limit around an asic-rs action is made inside the runtime
+        // (made outside, tokio panicked). An action asic-rs does not send
+        // returns at once, so nothing reaches the device.
+        let miner = fleet.through_asic_rs(held, DeviceAction::Pause).unwrap();
+        assert_eq!(
+            run_within_answer(
+                fleet.runtime.as_ref().unwrap(),
+                &*miner,
+                DeviceAction::LowerPower
+            ),
+            Err("this action is not sent through asic-rs".to_owned())
+        );
+    }
+
+    // #### PR #42
+    // What: a login is used for its own firmware only (or for every firmware
+    // while it has none), a firmware asks for the login it uses, and
+    // set_login forgets what was identified at the address.
+    // Look here if: factory_with, login_shape or set_login changes.
+    #[test]
+    fn logins_follow_their_firmware() {
+        assert_eq!(login_shape(None), LoginShape::UserAndPassword("root"));
+        assert_eq!(
+            login_shape(Some("Auradine Stock")),
+            LoginShape::UserAndPassword("admin")
+        );
+        assert_eq!(login_shape(Some("WhatsMiner Stock")), LoginShape::Password);
+        assert_eq!(login_shape(Some("LuxOS")), LoginShape::None);
+        assert_eq!(
+            login_shape(Some("AvalonMiner Stock")),
+            LoginShape::UserAndPassword("admin")
+        );
+        let names: Vec<String> = asic_rs::factory::default_firmware_registry()
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        for firmware in IDENTIFIES_WITH_LOGIN {
+            assert!(
+                names.iter().any(|name| name == firmware),
+                "{firmware}: {names:?}"
+            );
+        }
+        let fleet = Fleet::new();
+        let ip: IpAddr = "192.168.7.9".parse().unwrap();
+        fleet
+            .shared
+            .known
+            .lock()
+            .unwrap()
+            .insert(ip, Known::Unknown(Instant::now()));
+        fleet.set_login(
+            ip,
+            Some((Some("AntMiner Stock".into()), MinerAuth::new("root", "x"))),
+        );
+        assert!(fleet.shared.known.lock().unwrap().get(&ip).is_none());
+        assert!(fleet.shared.logins.lock().unwrap().contains_key(&ip));
+        // Without a logins file nothing is saved, and the login stays in
+        // memory only.
+        assert!(fleet
+            .save_login(ip, "AntMiner Stock", "root", "x")
+            .unwrap_err()
+            .contains("no device logins file"));
+        fleet.set_login(ip, None);
+        assert!(fleet.shared.logins.lock().unwrap().is_empty());
+    }
+
+    // #### PR #42
+    // What: the fan and power settings each kind of device offers, and that
+    // an Avalon's go to Pickaxe's own commands, never through asic-rs.
+    // Look here if: settings_offered, supports or own_api changes.
+    #[test]
+    fn fan_and_power_settings_follow_the_firmware_and_avalon_help() {
+        use asic_rs::{
+            avalonminer::{backends::AvalonMiner, firmware::AvalonStockFirmware},
+            core::traits::{firmware::MinerFirmware, miner::MinerConstructor},
+        };
+        let caps = |own, firmware: &str, fan_config, power_limit, tuning_config| Capabilities {
+            own,
+            firmware: firmware.into(),
+            fan_config,
+            power_limit,
+            tuning_config,
+        };
+        let avalon_fan = Some(FanRange { min: 15, max: 100 });
+        let any_fan = Some(FanRange { min: 0, max: 100 });
+        // asic-rs says it sets an Avalon's power limit; it is never offered.
+        let avalon = caps(
+            Some(OwnApi::Avalon),
+            "AvalonMiner Stock",
+            false,
+            true,
+            false,
+        );
+        let listed = ["fan-spd".to_owned(), "worklevel".to_owned()];
+        assert_eq!(settings_offered(&avalon, Some(&listed)), (avalon_fan, None));
+        assert_eq!(
+            settings_offered(&avalon, None),
+            (avalon_fan, Some(PowerSetting::Modes)),
+            "an Avalon that lists nothing readable has the last word"
+        );
+        assert_eq!(
+            settings_offered(&avalon, Some(&["reboot".to_owned()])),
+            (None, None)
+        );
+        let bitaxe = caps(Some(OwnApi::AxeOs), "Bitaxe Stock", false, false, false);
+        assert_eq!(settings_offered(&bitaxe, None), (any_fan, None));
+        for (firmware, fan, power, tuning, offered) in [
+            (
+                "AntMiner Stock",
+                true,
+                false,
+                true,
+                (any_fan, Some(PowerSetting::Modes)),
+            ),
+            (
+                "WhatsMiner Stock",
+                false,
+                true,
+                true,
+                (None, Some(PowerSetting::Watts)),
+            ),
+            (
+                "Braiins",
+                false,
+                true,
+                false,
+                (None, Some(PowerSetting::Watts)),
+            ),
+            (
+                "UMC OS",
+                true,
+                false,
+                true,
+                (any_fan, Some(PowerSetting::Watts)),
+            ),
+            ("LuxOS", false, false, false, (None, None)),
+            (
+                "Proto Stock",
+                true,
+                true,
+                true,
+                (any_fan, Some(PowerSetting::Watts)),
+            ),
+        ] {
+            assert_eq!(
+                settings_offered(&caps(None, firmware, fan, power, tuning), None),
+                offered,
+                "{firmware}"
+            );
+        }
+        // A real Avalon object: everything goes to Pickaxe's own commands.
+        type AvalonModel = <AvalonStockFirmware as MinerFirmware>::Model;
+        let model: AvalonModel = "NANO3S".parse().unwrap();
+        let miner = AvalonMiner::new("192.168.7.9".parse().unwrap(), model, None);
+        assert_eq!(own_api(&*miner), Some(OwnApi::Avalon));
+        for action in [
+            DeviceAction::FanAuto,
+            DeviceAction::FanPercent(60),
+            DeviceAction::PowerWatts(140),
+            DeviceAction::PowerMode(PowerMode::Low),
+        ] {
+            assert!(!supports(&*miner, action), "{action:?}");
+            assert!(is_setting(action));
+        }
+        assert!(!is_setting(DeviceAction::Restart));
+        let controls = controls_of(Some(&*miner), Some(&listed));
+        assert_eq!((controls.fan, controls.power), (avalon_fan, None));
+    }
+
+    // #### PR #42
+    // What: Restart on an Avalon (A-series, Nano and Home Q) is never sent
+    // through asic-rs, but is still offered, and Pickaxe's own Restart sends
+    // Canaan's reboot, byte for byte.
+    // Why: asic-rs's Avalon restart only restarts cgminer, and its Home Q
+    // has none.
+    // Look here if: supports(), controls_of() or device_api::control()
+    // changes.
+    #[test]
+    fn avalon_restart_uses_canaans_reboot() {
+        use asic_rs::{
+            avalonminer::{backends::AvalonMiner, firmware::AvalonStockFirmware},
+            core::traits::{firmware::MinerFirmware, miner::MinerConstructor},
+        };
+        type AvalonModel = <AvalonStockFirmware as MinerFirmware>::Model;
+        // Building asic-rs's miner sends nothing to this address.
+        let ip: IpAddr = "192.168.7.9".parse().unwrap();
+        for (model, asic_rs_restarts) in [("NANO3S", true), ("1566", true), ("Q", false)] {
+            let model: AvalonModel = model.parse().unwrap();
+            let miner = AvalonMiner::new(ip, model, None);
+            assert!(is_avalon(&*miner));
+            assert_eq!(miner.supports_restart(), asic_rs_restarts);
+            assert!(!supports(&*miner, DeviceAction::Restart));
+            let controls = controls_of(Some(&*miner), None);
+            assert_eq!(controls.actions[0], DeviceAction::Restart);
+            assert!(controls.actions.contains(&DeviceAction::RaisePower));
+            assert_eq!(controls.firmware.as_deref(), Some("AvalonMiner Stock"));
+            // #### PR #42: make and model as a report names them.
+            let info = miner.get_device_info();
+            assert_eq!(
+                controls.model,
+                Some(format!("{} {}", info.make, info.model))
+            );
+        }
+        let nano: AvalonModel = "NANO3S".parse().unwrap();
+        assert_eq!(
+            controls_of(Some(&*AvalonMiner::new(ip, nano, None)), None)
+                .model
+                .as_deref(),
+            Some("Avalonminer AvalonNano3s")
+        );
+        let (avalon, requests) = device_api::tests::recording_device(vec![
+            br#"{"STATUS":[{"STATUS":"I","Msg":"ASC 0 set info: reboot"}],"id":1}"#,
+        ]);
+        let unused_web = std::net::SocketAddr::from(([127, 0, 0, 1], 9));
+        assert_eq!(
+            device_api::control_at(avalon, unused_web, DeviceAction::Restart).unwrap(),
+            "ASC 0 set info: reboot"
+        );
+        assert_eq!(
+            requests.recv().unwrap(),
+            r#"{"command":"ascset","parameter":"0,reboot,0"}"#
+        );
     }
 }

@@ -8,9 +8,12 @@ shares the same code path with a network switch.
 
 | Role | Purpose |
 |---|---|
-| **Template Provider client** | Pull full block templates from the miner's own node (BCHN or Knuth) and keep them fresh. |
+| **Template Provider client** | Pull full block templates from the miner's own node (BCHN over JSON-RPC) or, from PR #42, from an SV2 Template Provider (`--template-provider`), and keep them fresh. |
 | **Mining server** | Serve SV2 mining channels to devices (Bitaxe native SV2 and SV1 via translator). Check shares, submit blocks. |
 | **SV1 translator** | Accept Stratum V1 firmware (Avalon Nano and most home ASICs) and translate to the SV2 mining server. Required in this implementation scope. |
+| **Job Declaration client** (PR #42) | Mine at a Pickaxe pool with your own node's templates (`--job-declaration`: Full-Template, or `coinbase`); devices fall back to the pool's own jobs when the pool refuses them. See [job-declaration.md](job-declaration.md). |
+| **Job Declaration server** (PR #42) | Accept miners' own templates at a public pool (`--accept-job-declaration`: both modes, or `full` or `coinbase`), checking each custom job's coinbase pays the pool's fee and the donation; Full-Template templates are checked by the pool's node, which gets their blocks too. See [job-declaration.md](job-declaration.md). |
+| **Template Provider server** (PR #42) | Serve this node's templates to SV2 pools, Job Declaration clients and P2Pool over SV2 Template Distribution (`--tp-listen`), and relay the blocks they find. See [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
 
 GPU CashToken mining stays on its existing path. This work adds an ASIC-facing
 SV2 surface; it does not replace the portable GPU product bar.
@@ -57,11 +60,16 @@ assumptions baked into some SV2 examples:
 | **bchn-sv2-bridge** | External AGPL TP for unmodified BCHN over JSON-RPC; tested on mainnet; keeps JD off because unordered JD breaks CTOR. |
 | **Own JSON-RPC template client** | Current implementation feeds the mining server from BCHN full `getblocktemplate` / `submitblock`. GBT-light remains pending. |
 | **Knuth native TP (future integration)** | Upstream has merged SV2 framing and message building blocks. Those changes do not establish a complete, interoperable template provider. |
+| **SV2 Template Providers** (PR #42) | `--template-provider sv2tp://HOST:PORT/KEY` takes templates from another Pickaxe's template server, a node bridge with a Noise shim, or a node with a provider built in (Knuth has the codecs but no listener yet); see [Templates from a provider](#templates-from-a-provider-template-distribution-client). |
+| **Pickaxe's own template server** (PR #42) | `serve --tp-listen` hands this node's full templates to SV2 pools and P2Pool, the other direction; see [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
+
+**New blocks over ZMQ** (PR #42 follow-up): the server subscribes to the node's `zmqpubhashblock` and refreshes its template as soon as a block is announced, instead of at its next 250 ms tip check; while notices flow it asks the node's tip every 2 s as a safety net. For a node on this computer the endpoint comes from bitcoin.conf (`zmqpubhashblock=tcp://127.0.0.1:28332`, the network's section first); `--node-zmq tcp://HOST:PORT` names one on this computer or the home network, and `--node-zmq off` turns it off; the setup's Advanced section has the same choice as its "Block notices" row. The dashboard shows `ZMQ connected · N blocks`, or why it is not connected while the server keeps polling.
 
 ## Open decision: AGPL bridge vs own TP client
 
 **Initial implementation:** an in-tree full JSON-RPC template provider, pinned
-to the source node. GBT-light and native Template Distribution remain pending.
+to the source node. GBT-light remains pending; PR #42 adds the Template
+Distribution client and server.
 
 **Chipnet test baseline:** use BCHN through the in-tree full-template client.
 This keeps deployment to Pickaxe plus the node, without an external bridge.
@@ -120,16 +128,38 @@ pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json --sv1-listen 127.
 `check-node` is read-only and prints a redacted template summary. `serve`
 binds to `127.0.0.1:3336` unless `--listen IP:PORT` selects a LAN interface.
 The dashboard opens on a workers table, laid out like a pool's worker list: one
-row per session with its generated label, status, rate over 5 minutes and over
+row per device with its label, status, rate over 5 minutes and over
 1 hour, the device's own report, accepted and rejected shares, reject rate, last
 share, current share difficulty, protocol and latest issue. Tab switches to the
-overview, Arrow/Page keys scroll, and `a` opens Advanced settings. An
-address-only worker still gets its own row and unique work; reconnecting creates
-a new session label. Both rates come from validated shares after a 30-second
-warm-up; they are statistical estimates, so compare the 1-hour rate with the
-device's own figure. Up to 64 closed sessions remain visible. JSON
-`device_details` contains the same rows, including last-share age and SV1-local
-reject counts.
+overview, the arrow keys, PgUp/PgDn, Home and End move the highlighted row
+(PR #42; the overview scrolls), Enter opens its Device panel, and `a` opens
+Advanced settings. An
+address-only worker still gets its own row and unique work. Both rates come
+from validated shares after a 30-second warm-up; they are statistical
+estimates, so compare the 1-hour rate with the device's own figure. Up to 64
+closed sessions remain visible. JSON `device_details` contains the same rows,
+including last-share age and SV1-local reject counts.
+
+#### PR #42
+
+A device on the local network keeps one row and one label through
+reconnects. When it connects again from the same local address, it takes over
+its offline row and the number in its label (`rig1 #12` stays `rig1 #12`).
+This also works when the device comes back before Pickaxe sees its old
+connection drop, as after a power cut: until then the new connection shows a
+new number beside the old row, and when the old connection closes, the new one
+takes its number. A short extra connection that a firmware opens
+beside its mining one, closed within a minute, leaves no row. A device
+connecting from this computer or from a public address gets a new row and label
+on each reconnect. The address itself is never shown or written to the JSON
+status.
+
+Behind a Tailscale subnet router, a VPN gateway or carrier-grade NAT, many
+devices share one address. A device there that goes offline stays as an
+offline row while the others mine. But when one of them reconnects, it takes
+over every offline row on that address and the number of the one that went
+offline last, so another device's offline row can disappear and a number can
+move to a different device.
 
 "Device says", Temp and Fan are the device's own report. Every 15 seconds
 Pickaxe asks each connected device on the local network (private, link-local,
@@ -190,16 +220,113 @@ journal belongs to the network and payout, not to one node, so the server
 also starts when its first node is down; a journal written by an older
 build opens while its node is still configured.
 
-On the workers page, `c` opens controls for the top row's device, with its
-model, firmware and power. It lists what that make and firmware support
-through asic-rs (Restart, Pause and Resume mining, blink or stop blinking its
-light to find it) plus one work level down or up on Avalon (Pickaxe's own
-Canaan `ascset worklevel` commands, within the device's own range; asic-rs's
-power limit is in watts, which Avalon work levels are not). A device asic-rs
-has not identified offers Pickaxe's own Restart (Canaan's `ascset` reboot or
-Bitaxe's restart endpoint) and work levels. Each action needs a confirmation,
-goes only to a device on the local network, and shows the device's reply. The
-read-only `watch` view has no controls.
+#### PR #42
+
+On the workers page, the arrow keys, PgUp/PgDn, Home and End move a
+highlighted row. Enter (or `c`) opens the Device panel for it, online or
+offline, so a device that stopped mining can be restarted from its offline
+row. The highlight stays on its device when rows re-sort (online rows come
+first) and when the device reconnects. The table scrolls to keep it in view.
+
+The panel shows the device's model, firmware and power, and how it is reached:
+"local network", "Tailscale/CGNAT" or "IPv6 local". It never shows the
+device's address, not even inside a device's reply or error. An offline row
+shows how long it has been offline and uses the address its device last
+connected from.
+
+While the panel opens, Pickaxe identifies the device in the background, for at
+most ten seconds. It then lists what that make and firmware support through
+asic-rs: Restart, Pause and Resume mining, and blink or stop blinking its
+light to find it. Avalons also get one work level down or up, through
+Pickaxe's own Canaan `ascset worklevel` commands, within the device's own
+range (asic-rs sets power in watts, which Avalon work levels are not). Restart
+on any Avalon is Canaan's own reboot (`ascset 0,reboot,0`). asic-rs's Avalon
+restart only restarts the mining program, and its Avalon Home Q has none. A
+device asic-rs does not identify offers Pickaxe's own Restart (Canaan's
+`ascset` reboot or Bitaxe's restart endpoint) and work levels.
+
+The panel also sets the fan and the power where the device allows it:
+
+- **Fan speed:** `a` for automatic (the device follows its temperature), or a
+  speed typed in percent. Through asic-rs on stock Antminer, ePIC and Proto
+  firmware. On an Avalon through Canaan's `ascset 0,fan-spd` (15% to 100%), and
+  on a Bitaxe or NerdAxe through AxeOS's settings.
+- **Power:** a limit in watts where asic-rs sets one (Braiins, VNish,
+  WhatsMiner, Auradine, Proto, SealMiner, and ePIC through its tuning), or the
+  Low, Normal and High modes (stock Antminer). An Avalon gets Canaan's work
+  modes when it lists `workmode`, beside its work levels.
+
+An Avalon lists the settings it accepts in its `ascset 0,help` reply, which
+the panel reads once when it opens. A setting it does not list is not offered.
+When the list cannot be read, the setting is offered and the device decides. A
+Bitaxe accepts changes only from its own local network: through Tailscale or a
+VPN it answers that it refuses, and the panel says so.
+
+**Pools.** "Pools…" reads the device's pools when you ask, marks the one that
+is this server and which one it mines on now, and shows each pool's worker
+name, never a payout address. `n` puts a new pool first: type its address with
+its port (as in `stratum+tcp://pool.example:3333`), the worker and, if the pool
+wants one, a password. `h` puts this server first again, with the worker the
+device already used here. The device's other pools stay as backups, as many as
+it holds (three on most, two on a Bitaxe). Before anything is sent, the panel
+shows the list the device will hold, what is dropped, and what the change
+means: while pool 1 works, the device stops mining on this server, so its
+shares, any block it finds, merge-mined token wins and the donation from its
+work go to that pool. Pools are written through asic-rs on most makes, with
+Canaan's `setpool` on Avalons (it needs the Avalon's web login, entered with
+`l`, and the device reboots), and through AxeOS on a Bitaxe (it restarts).
+Firmwares that do not report pool passwords keep the backups with password
+`x`; the confirmation says so.
+
+**Device logins.** Most firmwares answer Pickaxe with their default login.
+When a device refuses an action because its owner changed the login, the panel
+says so: press `l`, type the device's login (the username comes filled in with
+the firmware's default; the password shows as dots), and the action is sent
+again with it. `l` works at any time, for example for a stock Antminer whose
+password was changed, which cannot even be identified without it. The login is
+saved only after the device accepts it, in `<config>.sv2-logins.json` beside
+the server's config, readable by this computer's owner alone. It is used only
+for that device and only for the firmware it was saved for, since another
+device may get the address later. It is never shown, logged or written to the
+status file.
+
+Each action and setting needs a confirmation, goes only to a device on the
+local network or Tailscale, and shows the device's reply. The panel takes
+every key, so `q` there never stops the server. Esc goes back.
+
+An offline row's address may since belong to another device, for example
+after its DHCP lease passed on. So for an offline row Pickaxe looks at the
+device there afresh, and offers actions only if it identifies as the same make
+and model the row reported while online. When that cannot be compared (the
+device is not one asic-rs identifies), actions are offered only within ten
+minutes of the row going offline. Two devices of the same model cannot be
+told apart this way.
+
+The panel refuses to control a worker in these cases, and says why:
+
+- Its address is not known: it connected from this computer or from a public
+  address.
+- Its address is shared. Behind a Tailscale subnet router, a VPN gateway or
+  carrier-grade NAT, every device has the gateway's address, and commands
+  would reach the gateway, not the device. An address counts as shared when
+  two connections from it are each a minute old, or once two devices there
+  each kept mining for a minute after the other connected. That second mark
+  stays, even after one of them goes offline, until no row from the address
+  remains. A firmware's short extra connection beside its device does not
+  count. Control such devices from their own network.
+- Several connections from its address are all under a minute old, for
+  example right after the server starts. Pickaxe cannot tell yet whether they
+  are one device. Open the panel again a minute later.
+
+`stratum-v2 watch` has the same highlight and Device panel. It acts on the
+devices itself, never through the server: it takes each worker's address from
+`<config>.sv2-devices.json`, which the server keeps beside its config,
+readable by the server's user alone, and uses the server's saved device
+logins. So run watch as the server's user (for example `sudo -u pickaxe
+pickaxe stratum-v2 watch --config …`); otherwise the panel says it cannot read
+the list. Every address in that file is checked again before use, so an edited
+file cannot point Pickaxe at a public address. Device addresses never go into
+the status file, which everyone can read and which service logs print.
 
 A server running without a screen, for example as a service with
 `--no-tui --json`, saves the same status once a second beside its config
@@ -298,6 +425,171 @@ versions, so Pickaxe reports "upstream certificate version is not SV2's" there
 until CashStratum fixes it
 ([cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3)).
 
+### Fallback pools and coming back
+
+#### PR #42
+
+Solo mining can name pools to fall back on while the node gives no work:
+
+```text
+pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
+  --fallback-pool stratum2+tcp://POOL:3336/KEY [--fallback-pool ...]
+```
+
+- While the node answers, SV1 devices mine on it as usual. When it stops, the
+  server stops giving work, the devices' sessions end after the 3-second
+  grace, and the SV1 adapter opens their next sessions at the first fallback
+  pool that takes them (each pool's key travels in its address; the identity
+  there is the payout address; the donation works as at any pool).
+- Once the node has given work for 30 seconds without a break, the sessions
+  at a fallback pool end, and the adapter takes the devices back to the node.
+  The 30 seconds keep a flapping node from bouncing devices.
+- The same rule brings devices back to Job Declaration (`--job-declaration`):
+  while the pool refuses the miner's templates they mine the pool's own jobs,
+  and they come back once Job Declaration has been active for 30 seconds.
+- Native SV2 devices such as a Bitaxe use their own backup pool, which the
+  Device panel's Pools page can set.
+- In the setup, ASIC solo mining has a **Fallback pools** row under
+  Advanced: paste up to 8 pools, each with its key, separated by spaces or
+  commas. A saved profile keeps them; the server's Advanced page lists them.
+
+### Group channels (proxies such as SRI's translator)
+
+#### PR #42
+
+A proxy carries many miners on one SV2 connection, one extended channel
+each. Pickaxe's server groups them:
+
+- The extended channels of one payout identity on a connection form a group
+  (one per miner at a public pool, one for the whole connection in solo
+  mining), announced in each channel's `OpenExtendedMiningChannel.Success`
+  (`group_channel_id`); channels never move between groups.
+- On each new template a group of two or more gets one job frame addressed to
+  the group, instead of one per channel. A channel's first job, its vardiff
+  jobs, its targets and its share answers stay its own.
+- A grouped connection carries up to 256 channels, against 32 otherwise, so a
+  farm behind a translator fits on one connection.
+- `CloseChannel` on a group closes every member; a share or `UpdateChannel`
+  naming a group is `invalid-channel-id`.
+- No groups form on a connection that asks for standard jobs, for a Job
+  Declaration client's custom-only channels, or for a Pickaxe SV1 adapter from
+  before group support (its firmware field was empty); those get one frame
+  per channel, as before.
+
+### Templates from a provider (Template Distribution client)
+
+#### PR #42
+
+A server can take its templates from SV2 Template Providers before (or
+instead of) its nodes:
+
+```text
+pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json \
+  --template-provider sv2tp://192.168.0.160:48442/KEY [--template-provider ...]
+```
+
+The key is the provider's authority key; it may be left out only for a
+provider on this computer. Providers are tried in order, then the configured
+nodes, and the first that gives a verified template goes first; the server
+fails over across all of them as it does across nodes, with job ids that
+never repeat. The overview names the active one ("templates from template
+provider 1 of 2"), and the status file's `template_source` gives its kind
+(`tdp` or `rpc`), place and count, never its address.
+
+- The client declares the coinbase bytes it may add
+  (`CoinbaseOutputConstraints`): 122 for the payouts, plus 53 for a
+  merge-mining commitment and 46 per Case B ticket while tokens are mined
+  (221 with the Chipnet test token). The template's size limit is the
+  provider's transactions, the header and that reserve.
+- A template is checked as a node's is: the prefix a minimal BIP34 height
+  push of at most 8 bytes, no required coinbase outputs and no excess data
+  (either means a Bitcoin provider), the value within the money supply, the
+  provider's target no easier than its bits, the transactions full,
+  witness-free and in CTOR order, and their merkle path the one announced.
+- Template ids must rise, a SetNewPrevHash must name a template announced as
+  future (at most 8 wait), and a current template needs an earlier
+  SetNewPrevHash; a provider that breaks this, or sends no transaction data
+  within 2 seconds, is left for the next source.
+- A provider's new parent is confirmed on the selected network before its
+  template is mined: by the first configured node, or by the network's
+  Fulcrum servers without one.
+- A block on a provider's template is saved in the block journal, sent back as
+  SubmitSolution, and counted accepted once the provider names it as a later
+  parent; meanwhile the first configured node gets the whole block too.
+
+### Serving templates to a pool (Template Distribution)
+
+#### PR #42
+
+A server with its own node can also hand that node's block templates to SV2
+pools, Job Declaration clients and P2Pool over SV2 Template Distribution, so
+they mine on this node's templates without its RPC login. It is off by
+default:
+
+```text
+pickaxe_miner stratum-v2 serve --chipnet --config chipnet.json --tp-listen 0.0.0.0:48442
+```
+
+In the setup it is the **Serve templates** row under Advanced, for solo mining
+and an ASIC pool, on the network's template port: 8442 on mainnet, 48442 on
+Chipnet. Joining a pool cannot serve templates: that pool's come from its own
+node. The listener uses the mining listener's key, so a client pins the same
+authority. Connection info (`i`) lists its addresses, numbered for copying,
+and SRI's configuration lines:
+
+```toml
+[template_provider_type.Sv2Tp]
+address = "192.168.0.160:48442"
+public_key = "<the server's authority key>"
+```
+
+What a client gets:
+
+- `SetupConnection` for protocol 2, version 2 and no flags. Anything else is
+  refused with its error code, echoing unsupported flags, and the session
+  closes.
+- After its `CoinbaseOutputConstraints` (within 10 seconds): on a new parent,
+  a future `NewTemplate` and at once its `SetNewPrevHash` (the node's current
+  time, `nBits`, and the target `compact(nBits)`); on the same parent, a
+  current `NewTemplate` only. A lease renewal or a merge-mined token's change
+  sends nothing. A change of constraints sends the template again, at most
+  once a second.
+- The coinbase prefix is the BIP34 height push alone. A BCH template asks for
+  no coinbase outputs and has no witness commitment, so the client's outputs
+  take the whole `coinbase_tx_value_remaining`.
+- Template ids are `max(last + 1, Unix milliseconds)`, rising across restarts.
+- A template is withheld, and counted, when 153 bytes plus the client's
+  reserve do not fit beside its transactions within the block size limit.
+- `RequestTransactionData` returns the transactions in block (CTOR) order. A
+  template whose parent was replaced answers `stale-template-id`, an unknown
+  one `template-id-not-found`, and one beyond SV2's single frame (16,777,215
+  bytes or 65,535 transactions, possible under ABLA) `template-too-large`.
+- A client can name its 16 latest templates; those on a replaced parent
+  answer for 10 seconds more. At most 8 clients connect at once. A client
+  frame over 64 KiB, or more than four transaction-data requests a second,
+  closes the session.
+
+A solution (`SubmitSolution`) is assembled into the template's block. SRI's
+pools submit a coinbase with BIP141's marker, flag and one 32-byte witness
+item; Pickaxe strips exactly those and refuses any other witness, since BCH has
+no witnesses and the block carries the plain coinbase. The coinbase script
+must begin with the height push sent, the version may differ only in the
+version-rolling bits, and the header must meet the target. A block that passes
+is saved in `<config>.sv2-relay-blocks.json`, owner-only beside the block
+journal and never mixed with it, and then submitted and retried like this
+server's own blocks until the node answers. A restart, even without
+`--tp-listen`, still submits what that file holds. One block per parent is
+kept. A solution that fails Pickaxe's checks still goes to the node, at most
+one every 10 seconds, and is never saved: a bug in those checks must not drop
+a pool's only submission. The overview shows the template clients, the
+templates sent and withheld, and the relayed blocks; the status file's
+`template_server` has the same counts and never an address.
+
+Sigops are not counted on BCH, which counts SigChecks while scripts run, so
+the client's sigops reserve is ignored. Pickaxe's own Template Distribution
+client, for templates from another Pickaxe or a native template provider, is
+the next step.
+
 The full-template provider checks network, synchronization, tip identity,
 CTOR, transaction bytes/IDs, header target and adaptive block size. It revokes
 work on an unavailable source. A block is counted accepted only when the
@@ -352,17 +644,36 @@ valid Chipnet blocks, and returns on the next normal template (Chipnet allows
 difficulty-1 blocks after a 20-minute gap). A device target limit that cannot
 accommodate easier block work is rejected. Older jobs accept shares at the
 easier of their own target and the current one, and each share is credited at
-the target it met. Only the first solved block on each parent is saved; later
+the target it met. While merge-mined tokens are mined (none is registered
+yet), a device's target is made easier, up to the easiest token target that
+needs no block. It is never more than 15 times easier than vardiff's (about 5
+shares a second), and never easier than the device allows. Within that range
+firmware sends every hash that wins a token. A token target easier than that
+is mined best effort. Vardiff counts and estimates only at its own target.
+Only the first solved block on each parent is saved; later
 solutions on the same parent count as shares. SV1 adapter rejects count in the
 shared dashboard totals; separate adapter/native connection error fields can
-both describe the same disconnected session. Knuth TP, distributed rigs and
-pool routing are still pending.
+both describe the same disconnected session. A Template Distribution client,
+distributed rigs and pool routing are still pending.
 BCH uses an adjustable donation, defaulting to 1.5%: one third of it is mining
 work and two thirds is the block reward (0.5% and 1% at the default). The
 dashboard shows the total and both parts, each rounded up to two decimals; the
 combined effect of the two parts is slightly below the total (1.495% at 1.5%).
+In the setup, ASIC mining and Join a pool keep their server options under
+**Advanced** on the settings page (Enter on its header opens it): the
+donation, the start difficulty, the SV1 and SV2 ports, for solo mining the
+fallback pools (see [Fallback pools and coming back](#fallback-pools-and-coming-back)),
+and for Join a pool the backup pools (each `stratum2+tcp://HOST:PORT/KEY`,
+used in order when the pool fails), the username at the pool (your payout
+address by default) and **Your templates** (Job Declaration: off, full
+template or coinbase only; see [job-declaration.md](job-declaration.md)). A
+saved profile keeps them. ASIC mining can also mine an ASIC-exclusive token
+instead of BCH, once one is registered (see [asic-tokens.md](asic-tokens.md#in-the-setup)).
+
 `--donation 2` selects 2%; the dashboard's Advanced settings (`a`) change the
-saved setting in 0.5% steps from 0% to 100%. Token policies remain separate.
+saved setting in 0.5% steps from 0% to 100%. Merge-mined tokens share this
+setting: two thirds as a split in each token claim, and one third through the
+same donation work. GPU token policies remain separate.
 Mainnet and Chipnet each donate to their own built-in address
 (`src/donation/bch.rs`), checked by the same payout validation as the miner's.
 The BCH policy is attached to each job; changing the setting never changes an

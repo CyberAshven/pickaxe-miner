@@ -26,7 +26,20 @@ fn solved_share_for(
     miner: &str,
     operator: Option<&str>,
 ) -> ValidatedShare {
-    let template = Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap());
+    let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+    solved_share_on(template, salt, payout_policy, miner, operator)
+}
+
+/// #### PR #42: the same on any template (one with merge-mined tokens too),
+/// through a channel's share path.
+fn solved_share_on(
+    template: BchTemplate,
+    salt: u8,
+    payout_policy: crate::donation::bch::BchPayout,
+    miner: &str,
+    operator: Option<&str>,
+) -> ValidatedShare {
+    let template = Arc::new(template);
     let mut channel = Channel::new(
         1,
         ChannelKind::Standard,
@@ -78,6 +91,186 @@ fn open(dir: &TestDirectory) -> Journal {
         &[[42; 32]],
     )
     .unwrap()
+}
+
+/// #### PR #42: a block solved with the test token merge-mined in both
+/// modes: a commitment as output 0 and a ticket after the payouts. It comes
+/// from a channel's share path, which names the ticket's entry as won.
+fn solved_token_share(salt: u8) -> ValidatedShare {
+    use super::merge::{leaf::Mode, set::tests::test_set};
+    let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+    template.commit(Arc::new(test_set(&[
+        Mode::ShareTarget,
+        Mode::BlockRequired,
+    ])));
+    let share = solved_share_on(template, salt, Default::default(), &payout(), None);
+    assert!(share.block && share.token_wins.contains(&1));
+    share
+}
+
+/// #### PR #42: journals a token block, rewrites its coinbase with
+/// `change` (keeping the proof of work and merkle root valid), and reports
+/// whether the journal still opens.
+fn opens_after(change: impl FnOnce(&mut Vec<stratum_core::bitcoin::TxOut>)) -> bool {
+    use stratum_core::bitcoin::Block;
+    let dir = TestDirectory::new();
+    let mut journal = open(&dir);
+    assert!(journal.enqueue(&solved_token_share(3)).unwrap());
+    drop(journal);
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.journal()).unwrap()).unwrap();
+    let raw = hex::decode(state["pending"][0]["block"].as_str().unwrap()).unwrap();
+    let mut block: Block = consensus::deserialize(&raw).unwrap();
+    change(&mut block.txdata[0].output);
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    block.header.nonce = (0..10_000)
+        .find(|nonce| {
+            block.header.nonce = *nonce;
+            block.header.validate_pow(block.header.target()).is_ok()
+        })
+        .unwrap();
+    state["pending"][0]["hash"] = serde_json::json!(block.block_hash().to_string());
+    state["pending"][0]["block"] = serde_json::json!(hex::encode(consensus::serialize(&block)));
+    fs::write(dir.journal(), serde_json::to_vec(&state).unwrap()).unwrap();
+    Journal::open(
+        &dir.journal(),
+        MiningNetwork::Chipnet,
+        &payout(),
+        &[[42; 32]],
+    )
+    .is_ok()
+}
+
+fn sats(value: u64) -> stratum_core::bitcoin::Amount {
+    stratum_core::bitcoin::Amount::from_sat(value)
+}
+
+/// Moves one satoshi from the miner's output (output 1) to `index`.
+fn move_a_satoshi(outputs: &mut [stratum_core::bitcoin::TxOut], index: usize) {
+    outputs[1].value = sats(outputs[1].value.to_sat() - 1);
+    outputs[index].value = sats(outputs[index].value.to_sat() + 1);
+}
+
+fn edit_script(output: &mut stratum_core::bitcoin::TxOut, change: impl FnOnce(&mut Vec<u8>)) {
+    let mut script = output.script_pubkey.to_bytes();
+    change(&mut script);
+    output.script_pubkey = stratum_core::bitcoin::ScriptBuf::from_bytes(script);
+}
+
+// #### PR #42
+#[test]
+fn a_block_with_a_commitment_and_tickets_enqueues_and_survives_reopen() {
+    let dir = TestDirectory::new();
+    let share = solved_token_share(1);
+    let mut journal = open(&dir);
+    assert!(journal.enqueue(&share).unwrap());
+    assert!(!journal.enqueue(&share).unwrap());
+    let hash = journal.pending_hashes()[0].clone();
+    let bytes = journal.pending(&hash).unwrap().block;
+    drop(journal);
+    let mut journal = open(&dir);
+    assert_eq!(journal.counts(), (1, 0, 0));
+    assert_eq!(journal.pending(&hash).unwrap().block, bytes);
+    journal.finish(&hash, true).unwrap();
+    drop(journal);
+    assert_eq!(open(&dir).counts(), (0, 1, 0));
+    // The rewrite helper itself keeps a valid block valid.
+    assert!(opens_after(|_| {}));
+}
+
+// #### PR #42
+#[test]
+fn a_leading_output_that_is_not_an_exact_commitment_is_refused() {
+    // A valued output 0 (the satoshi taken from the miner).
+    assert!(!opens_after(|outputs| move_a_satoshi(outputs, 0)));
+    // The wrong magic, version or height, and the wrong length.
+    for (index, value) in [(2, b'X'), (6, 2), (39, 17)] {
+        assert!(
+            !opens_after(|outputs| edit_script(&mut outputs[0], |s| s[index] = value)),
+            "byte {index}"
+        );
+    }
+    assert!(!opens_after(
+        |outputs| edit_script(&mut outputs[0], |s| s.push(0))
+    ));
+    assert!(!opens_after(|outputs| edit_script(&mut outputs[0], |s| {
+        s.pop();
+    })));
+    // The commitment anywhere but output 0.
+    assert!(!opens_after(|outputs| outputs.swap(0, 1)));
+}
+
+// #### PR #42
+#[test]
+fn a_valued_or_unknown_trailing_output_is_refused() {
+    // A valued ticket (the satoshi taken from the miner).
+    assert!(!opens_after(|outputs| move_a_satoshi(outputs, 3)));
+    // A ticket with another script: no capability, another opcode, longer.
+    for (index, value) in [(35, 0), (1, 0xcf), (36, 0x88)] {
+        assert!(
+            !opens_after(|outputs| edit_script(&mut outputs[3], |s| s[index] = value)),
+            "byte {index}"
+        );
+    }
+    assert!(!opens_after(
+        |outputs| edit_script(&mut outputs[3], |s| s.push(0x87))
+    ));
+    // A zero-value output after the tickets that is not a ticket.
+    assert!(!opens_after(|outputs| {
+        let mut extra = outputs[3].clone();
+        edit_script(&mut extra, |s| *s = vec![0x6a]);
+        outputs.push(extra);
+    }));
+    // Tickets without a commitment.
+    assert!(!opens_after(|outputs| {
+        outputs.remove(0);
+    }));
+}
+
+// #### PR #42
+#[test]
+fn legacy_pending_blocks_still_open() {
+    use stratum_core::bitcoin::Block;
+    let dir = TestDirectory::new();
+    let mut journal = open(&dir);
+    journal.enqueue(&solved_share(50)).unwrap();
+    journal.enqueue(&solved_share(51)).unwrap();
+    drop(journal);
+    // Turn the first block into a pre-donation one (one output, no policy),
+    // as journals held before PR #38.
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.journal()).unwrap()).unwrap();
+    let raw = hex::decode(state["pending"][0]["block"].as_str().unwrap()).unwrap();
+    let mut block: Block = consensus::deserialize(&raw).unwrap();
+    block.txdata[0].output.truncate(1);
+    block.txdata[0].output[0].value = sats(312_500_000);
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    block.header.nonce = (0..10_000)
+        .find(|nonce| {
+            block.header.nonce = *nonce;
+            block.header.validate_pow(block.header.target()).is_ok()
+        })
+        .unwrap();
+    let legacy_hash = block.block_hash().to_string();
+    state["pending"][0] = serde_json::json!({
+        "hash": legacy_hash,
+        "block": hex::encode(consensus::serialize(&block)),
+    });
+    fs::write(dir.journal(), serde_json::to_vec(&state).unwrap()).unwrap();
+    // A token block joins the legacy and the current one.
+    let mut journal = open(&dir);
+    assert!(journal.enqueue(&solved_token_share(52)).unwrap());
+    let snapshot = fs::read(dir.journal()).unwrap();
+    drop(journal);
+    let mut journal = open(&dir);
+    assert_eq!(fs::read(dir.journal()).unwrap(), snapshot);
+    assert_eq!(journal.counts(), (3, 0, 0));
+    assert_eq!(journal.pending(&legacy_hash).unwrap().payout, None);
+    for hash in journal.pending_hashes() {
+        journal.finish(&hash, true).unwrap();
+    }
+    drop(journal);
+    assert_eq!(open(&dir).counts(), (0, 3, 0));
 }
 
 // #### PR #40
@@ -428,4 +621,73 @@ fn pending_block_and_receipt_survive_process_exit_without_destructors() {
         assert_eq!(journal.counts(), expected);
         assert!(!journal.enqueue(&solved_share(77)).unwrap());
     }
+}
+
+// #### PR #42
+// What: the relay journal keeps a block that pays someone else (a pool's
+// coinbase), once, across a reopen, owner-only; it refuses blocks without a
+// valid merkle root, takes no payout-bound share, and never opens as (or
+// in place of) the block journal or another network's relay journal.
+// Look here if: open_relay, enqueue_relayed or the relay binding changes.
+#[test]
+fn relay_journal_is_owner_only_and_never_mixes_with_the_block_journal() {
+    let dir = TestDirectory::new();
+    let path = dir.0.join("relay-blocks.json");
+    let pool =
+        crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x56; 20], MiningNetwork::Chipnet).unwrap();
+    let share = solved_share_for(5, Default::default(), &pool, None);
+    let bytes = share.template.block(&share.coinbase, share.header).unwrap();
+    let mut relay = Journal::open_relay(&path, MiningNetwork::Chipnet).unwrap();
+    assert!(relay.enqueue(&share).is_err(), "no payout-bound shares");
+    let mut broken = bytes.clone();
+    // A byte of the coinbase's script: the merkle root no longer matches.
+    broken[80 + 1 + 4 + 1 + 32 + 4 + 1 + 2] ^= 1;
+    assert!(relay.enqueue_relayed(&broken).is_err());
+    assert!(relay.enqueue_relayed(&bytes).unwrap());
+    assert!(!relay.enqueue_relayed(&bytes).unwrap(), "saved once");
+    assert_eq!(relay.counts(), (1, 0, 0));
+    drop(relay);
+    let relay = Journal::open_relay(&path, MiningNetwork::Chipnet).unwrap();
+    assert_eq!(relay.counts(), (1, 0, 0));
+    let pending = relay.pending(&relay.pending_hashes()[0]).unwrap();
+    assert_eq!(hex::decode(&pending.block).unwrap(), bytes);
+    assert!(pending.payout.is_none() && pending.miner.is_none() && pending.operator.is_none());
+    drop(relay);
+    assert!(Journal::open(&path, MiningNetwork::Chipnet, &payout(), &[]).is_err());
+    assert!(Journal::open_relay(&path, MiningNetwork::Mainnet).is_err());
+    let mut own = open(&dir);
+    assert!(own.enqueue_relayed(&bytes).is_err(), "no relayed blocks");
+    drop(own);
+    assert!(Journal::open_relay(&dir.journal(), MiningNetwork::Chipnet).is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+// #### PR #42
+// What: the JD journal keeps a Job Declaration client's block, which pays
+// the pool's outputs rather than this server's payout, across a reopen; it
+// never opens as the block or relay journal, or they as it.
+// Look here if: open_declared or the Declared binding changes.
+#[test]
+fn declared_blocks_enqueue_and_reopen_and_never_mix_with_other_journals() {
+    let dir = TestDirectory::new();
+    let path = dir.0.join("jd-blocks.json");
+    let pool =
+        crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x56; 20], MiningNetwork::Chipnet).unwrap();
+    let share = solved_share_for(6, Default::default(), &pool, None);
+    let mut declared = Journal::open_declared(&path, MiningNetwork::Chipnet).unwrap();
+    assert!(declared.enqueue(&share).unwrap());
+    assert!(!declared.enqueue(&share).unwrap());
+    drop(declared);
+    let declared = Journal::open_declared(&path, MiningNetwork::Chipnet).unwrap();
+    assert_eq!(declared.counts(), (1, 0, 0));
+    drop(declared);
+    assert!(Journal::open_relay(&path, MiningNetwork::Chipnet).is_err());
+    assert!(Journal::open(&path, MiningNetwork::Chipnet, &payout(), &[]).is_err());
+    drop(open(&dir));
+    assert!(Journal::open_declared(&dir.journal(), MiningNetwork::Chipnet).is_err());
 }

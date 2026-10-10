@@ -89,6 +89,58 @@ impl DonationRoute {
     }
 }
 
+/// #### PR #42: how long the preferred source must serve devices before
+/// sessions on a fallback pool end, so devices come back to it.
+pub const RETURN_AFTER: Duration = Duration::from_secs(30);
+
+/// #### PR #42
+/// The source devices should mine on whenever it can serve them: this
+/// server's own listener, on the miner's node or under its Job Declaration
+/// plan. The server marks it; sessions at a fallback pool watch it.
+#[derive(Debug)]
+pub struct Preferred {
+    healthy_since: Mutex<Option<Instant>>,
+    return_after: Duration,
+}
+
+impl Default for Preferred {
+    fn default() -> Self {
+        Self::with_return_after(RETURN_AFTER)
+    }
+}
+
+impl Preferred {
+    /// A preferred source that devices return to once it has served for
+    /// `return_after` (shorter in tests).
+    pub fn with_return_after(return_after: Duration) -> Self {
+        Self {
+            healthy_since: Mutex::new(None),
+            return_after,
+        }
+    }
+
+    /// Marks whether the source can serve devices now.
+    pub fn set(&self, healthy: bool, now: Instant) {
+        if let Ok(mut since) = self.healthy_since.lock() {
+            match (healthy, *since) {
+                (true, None) => *since = Some(now),
+                (false, Some(_)) => *since = None,
+                _ => (),
+            }
+        }
+    }
+
+    /// Whether devices on a fallback pool should come back: the source has
+    /// served without a break for `return_after`.
+    pub fn should_return(&self, now: Instant) -> bool {
+        self.healthy_since
+            .lock()
+            .ok()
+            .and_then(|since| *since)
+            .is_some_and(|since| now.saturating_duration_since(since) >= self.return_after)
+    }
+}
+
 /// #### PR #40
 /// Where the adapter takes its work from.
 #[derive(Clone, Debug)]
@@ -107,6 +159,11 @@ pub struct Upstream {
     /// #### PR #40: this server's own listener running a public pool, where
     /// a device's channel opens at authorize under the device's username.
     pub public: bool,
+    /// #### PR #42: a fallback pool's preferred source: sessions here end
+    /// once it can serve devices again (`Preferred::should_return`).
+    pub prefer: Option<Arc<Preferred>>,
+    /// #### PR #42: this server mines a token that fixes the version slot.
+    pub fixed_version: bool,
 }
 
 /// #### PR #40: the identity the adapter's channels open with at this
@@ -123,6 +180,8 @@ impl Upstream {
             remote: false,
             donation: None,
             public: false,
+            prefer: None,
+            fixed_version: false,
         }
     }
 
@@ -131,6 +190,15 @@ impl Upstream {
         Self {
             public: true,
             ..Self::local(address, authority)
+        }
+    }
+
+    /// #### PR #42: the same upstream, mining a token that fixes the
+    /// version slot when `fixed`.
+    pub fn with_fixed_version(self, fixed: bool) -> Self {
+        Self {
+            fixed_version: fixed,
+            ..self
         }
     }
 
@@ -314,25 +382,38 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
-            flags: 4,
+            // #### PR #42: the adapter's fixed version
+            // What: for a token that fixes the version slot, the adapter
+            // does not require version rolling, accepts the server's fixed
+            // version, answers mining.configure without version rolling,
+            // and takes jobs that do not allow it.
+            // Why: SV1 firmware that cannot roll would otherwise get no
+            // job; firmware that rolls anyway makes invalid shares, which
+            // only hardware can show.
+            // Look here if: SV1 devices get no job in token mode.
+            flags: if upstream.fixed_version { 0 } else { 4 },
             endpoint_host: host.try_into().map_err(|_| "invalid host")?,
             endpoint_port: peer.port(),
             vendor: "Pickaxe SV1 adapter"
                 .try_into()
                 .map_err(|_| "invalid vendor")?,
             hardware_version: "".try_into().map_err(|_| "invalid version")?,
-            firmware: "".try_into().map_err(|_| "invalid firmware")?,
+            // #### PR #42: names this adapter's version, so a Pickaxe pool
+            // can tell adapters that follow group channels.
+            firmware: concat!("pickaxe ", env!("CARGO_PKG_VERSION"))
+                .try_into()
+                .map_err(|_| "invalid firmware")?,
             device_id: "".try_into().map_err(|_| "invalid device")?,
         },
         0,
         false,
     )?)?;
     let reply = receive.receive(DEADLINE)?.ok_or("SV2 setup timed out")?;
-    validate_setup_reply(reply)?;
+    validate_setup_reply(reply, upstream.fixed_version)?;
     // #### PR #40: a public pool opens the device's channel at authorize.
     if upstream.public {
         return Ok(Opened {
-            bridge: Bridge::public(),
+            bridge: Bridge::public().with_fixed_version(upstream.fixed_version),
             send,
             receive,
             local,
@@ -362,7 +443,8 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
     Ok(Opened {
-        bridge: Bridge::new(opened, upstream.remote, upstream.donation.clone())?,
+        bridge: Bridge::new(opened, upstream.remote, upstream.donation.clone())?
+            .with_fixed_version(upstream.fixed_version),
         send,
         receive,
         local,
@@ -389,6 +471,24 @@ fn serve_session(
     while !stop.load(Ordering::Relaxed) {
         if !bridge.ready() && started.elapsed() >= DEADLINE {
             return Err("SV1 setup timed out".into());
+        }
+        // #### PR #42: back to the preferred source
+        // What: a session on a fallback pool ends once the preferred source
+        // (this server's own node, or its Job Declaration plan) has served
+        // devices for 30 seconds without a break; the firmware reconnects,
+        // and the adapter tries the preferred source first again.
+        // Why: a pool is the fallback while the miner's node or Job
+        // Declaration is down; devices must not stay there once it is back.
+        // The 30 seconds keep a flapping source from bouncing devices.
+        // Look here if: devices bounce between the node and a pool, or stay
+        // at the pool after the node answers again.
+        if upstream
+            .prefer
+            .as_ref()
+            .is_some_and(|prefer| prefer.should_return(Instant::now()))
+        {
+            send.close();
+            return Ok(());
         }
         if upstream.remote {
             // Firmware already has its reply; a verdict that never comes is
@@ -492,6 +592,9 @@ fn serve_session(
 /// remote pool the donation's.
 struct Lane {
     channel: u32,
+    /// #### PR #42: the group channel the pool put this channel in (0 for
+    /// none); messages addressed to it reach this lane too.
+    group: u32,
     prefix: Vec<u8>,
     /// The channel's miner extranonce size.
     extra_size: usize,
@@ -508,6 +611,7 @@ impl Lane {
     fn new(open: &OpenExtendedMiningChannelSuccess<'_>) -> Result<Self, String> {
         Ok(Self {
             channel: open.channel_id,
+            group: open.group_channel_id,
             prefix: open.extranonce_prefix.as_ref().to_vec(),
             extra_size: open.extranonce_size as usize,
             target: open
@@ -526,11 +630,14 @@ impl Lane {
 
     /// A job for this channel: kept for its parent, or with the same parent
     /// returned for activation.
+    /// `fixed`: the server mines a token that fixes the version slot, so
+    /// its jobs do not allow rolling.
     fn job(
         &mut self,
         job: NewExtendedMiningJob<'_>,
+        fixed: bool,
     ) -> Result<Option<(SetNewPrevHashOwned, NewExtendedMiningJobOwned)>, String> {
-        if !job.version_rolling_allowed {
+        if !job.version_rolling_allowed && !fixed {
             return Err("unexpected firmware job".into());
         }
         if self.future.contains_key(&job.job_id) || self.active.contains_key(&job.job_id) {
@@ -615,6 +722,8 @@ struct Bridge {
     owned: bool,
     /// A public pool's channel, opened under the device's username.
     public: Public,
+    /// #### PR #42: see `Upstream::fixed_version`.
+    fixed: bool,
 }
 
 /// #### PR #40
@@ -683,7 +792,14 @@ impl Bridge {
             donation_issue: None,
             owned: remote,
             public: Public::Off,
+            fixed: false,
         })
+    }
+
+    /// #### PR #42: see `Upstream::fixed_version`.
+    fn with_fixed_version(mut self, fixed: bool) -> Self {
+        self.fixed = fixed;
+        self
     }
 
     /// #### PR #40
@@ -692,6 +808,7 @@ impl Bridge {
         Self {
             user: Lane {
                 channel: 0,
+                group: 0,
                 prefix: Vec::new(),
                 extra_size: POOL_EXTRANONCE1 + POOL_EXTRANONCE2,
                 target: [255; 32],
@@ -717,6 +834,7 @@ impl Bridge {
             donation_issue: None,
             owned: true,
             public: Public::Waiting,
+            fixed: false,
         }
     }
 
@@ -770,6 +888,34 @@ impl Bridge {
             _ => None,
         };
         std::iter::once(&mut self.user).chain(donation)
+    }
+
+    // #### PR #42: the SV1 adapter follows the pool's group channel
+    // What: jobs, parents, targets and closes addressed to a lane's group
+    // channel reach every lane in that group (the device's own and the
+    // donation's); `SetGroupChannel` moves lanes between groups. Share
+    // verdicts stay per channel.
+    // Why: SRI-based pools put every extended channel in its connection's
+    // group and send every refresh to the group once standard jobs are not
+    // required. The adapter took only its own channel ids, so a device at
+    // such a pool got one job and then dropped with "unexpected firmware
+    // job".
+    // Look here if: a device at a pool gets one job, then drops with
+    // "unexpected firmware job" or "wrong mining channel".
+    /// The lanes a message for `channel` reaches: false is the device's own,
+    /// true the donation's; none is an error.
+    fn lanes_for(&self, channel: u32, error: &'static str) -> Result<Vec<bool>, String> {
+        let lanes: Vec<bool> = [false, true]
+            .into_iter()
+            .filter(|donation| {
+                self.lane(*donation)
+                    .is_some_and(|lane| addressed_to(channel, lane.channel, lane.group))
+            })
+            .collect();
+        if lanes.is_empty() {
+            return Err(error.into());
+        }
+        Ok(lanes)
     }
 
     /// Whether a channel-specific message is the donation channel's; an
@@ -910,7 +1056,7 @@ impl Bridge {
                         json!(false),
                     );
                 }
-                if names.iter().any(|name| name == "version-rolling") {
+                if names.iter().any(|name| name == "version-rolling") && !self.fixed {
                     let mask = match value.pointer("/params/1/version-rolling.mask") {
                         Some(Value::String(s)) => {
                             u32::from_str_radix(s, 16).map_err(|_| "invalid version mask")?
@@ -1185,19 +1331,23 @@ impl Bridge {
                 }
                 out.extend(self.drop_donation("the pool refused the donation channel")?);
             }
+            // #### PR #42: a job, parent or target may be addressed to the
+            // lanes' group channel, and then reaches each lane in it.
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
                 let job: NewExtendedMiningJob =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid mining job")?;
-                let donation = self.on_lane(job.channel_id, "unexpected firmware job")?;
-                if donation && job.job_id & DONATION_JOBS != 0 {
-                    out.extend(
-                        self.drop_donation(
+                for donation in self.lanes_for(job.channel_id, "unexpected firmware job")? {
+                    if donation && job.job_id & DONATION_JOBS != 0 {
+                        out.extend(self.drop_donation(
                             "the pool's job numbers do not fit the donation channel",
-                        )?,
-                    );
-                } else {
-                    let lane = self.lane_mut(donation).ok_or("unexpected firmware job")?;
-                    if let Some((prev, job)) = lane.job(job)? {
+                        )?);
+                        continue;
+                    }
+                    let fixed = self.fixed;
+                    let Some(lane) = self.lane_mut(donation) else {
+                        continue;
+                    };
+                    if let Some((prev, job)) = lane.job(job.clone(), fixed)? {
                         out.extend(self.activate(donation, prev, job, false)?);
                     }
                 }
@@ -1205,21 +1355,27 @@ impl Bridge {
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
                 let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload())
                     .map_err(|_| "invalid job activation")?;
-                let donation = self.on_lane(prev.channel_id, "wrong mining channel")?;
-                let lane = self.lane_mut(donation).ok_or("wrong mining channel")?;
-                let (prev, job) = lane.parent(prev)?;
-                out.extend(self.activate(donation, prev, job, true)?);
+                for donation in self.lanes_for(prev.channel_id, "wrong mining channel")? {
+                    let Some(lane) = self.lane_mut(donation) else {
+                        continue;
+                    };
+                    let (prev, job) = lane.parent(prev.clone())?;
+                    out.extend(self.activate(donation, prev, job, true)?);
+                }
             }
             MESSAGE_TYPE_SET_TARGET => {
                 let target: SetTarget =
                     binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid target")?;
-                let donation = self.on_lane(target.channel_id, "wrong mining channel")?;
-                let lane = self.lane_mut(donation).ok_or("wrong mining channel")?;
-                lane.target = target
+                let maximum: [u8; 32] = target
                     .maximum_target
                     .as_ref()
                     .try_into()
                     .map_err(|_| "invalid target")?;
+                for donation in self.lanes_for(target.channel_id, "wrong mining channel")? {
+                    if let Some(lane) = self.lane_mut(donation) {
+                        lane.target = maximum;
+                    }
+                }
             }
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS => {
                 let ack: SubmitSharesSuccess = binary_sv2::from_bytes(frame.payload())
@@ -1289,19 +1445,30 @@ impl Bridge {
                 }
                 out.extend(self.drop_donation("the pool changed the donation channel")?);
             }
+            // #### PR #42: closing the lanes' group closes each lane in it:
+            // the device's own lane reconnects, the donation's stops.
             MESSAGE_TYPE_CLOSE_CHANNEL => {
                 let closed: CloseChannel = binary_sv2::from_bytes(frame.payload())
                     .map_err(|_| "SV2 upstream closed the channel")?;
-                if self
-                    .lane(true)
-                    .is_none_or(|lane| lane.channel != closed.channel_id)
-                {
+                let lanes = self.lanes_for(closed.channel_id, "SV2 upstream closed the channel")?;
+                if lanes.contains(&false) {
                     return Err("SV2 upstream closed the channel".into());
                 }
                 out.extend(self.drop_donation("the pool closed the donation channel")?);
             }
-            // Group channels only matter for standard channels.
-            MESSAGE_TYPE_SET_GROUP_CHANNEL if self.remote => (),
+            // #### PR #42: the pool moves channels between group channels.
+            MESSAGE_TYPE_SET_GROUP_CHANNEL if self.remote => {
+                let moved: SetGroupChannel =
+                    binary_sv2::from_bytes(frame.payload()).map_err(|_| "invalid group channel")?;
+                let channels = moved.channel_ids.into_inner();
+                for donation in [false, true] {
+                    if let Some(lane) = self.lane_mut(donation) {
+                        if channels.contains(&lane.channel) {
+                            lane.group = moved.group_channel_id;
+                        }
+                    }
+                }
+            }
             _ => return Err("unexpected upstream firmware message".into()),
         }
         Ok((out, verdicts))
@@ -1354,7 +1521,9 @@ impl Bridge {
 // extended channels. The adapter requires version rolling and opens an extended
 // channel, so only the latter requirement is compatible. Fail closed on unknown
 // requirements; see Mining Protocol section 5.3.1.
-fn validate_setup_reply(mut reply: SerializedFrame) -> Result<(), String> {
+/// #### PR #42: `fixed`: the adapter mines a token that fixes the version,
+/// so the server's fixed-version bit is expected.
+fn validate_setup_reply(mut reply: SerializedFrame, fixed: bool) -> Result<(), String> {
     let header = reply.header();
     if header.msg_type() != 1 || header.channel_msg() || header.ext_type_without_channel_msg() != 0
     {
@@ -1362,7 +1531,8 @@ fn validate_setup_reply(mut reply: SerializedFrame) -> Result<(), String> {
     }
     let setup: SetupConnectionSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid setup reply")?;
-    if setup.used_version != 2 || setup.flags & !0b10 != 0 {
+    let allowed = if fixed { 0b11 } else { 0b10 };
+    if setup.used_version != 2 || setup.flags & !allowed != 0 {
         return Err("SV2 setup incompatible".into());
     }
     Ok(())
@@ -1453,9 +1623,37 @@ impl Lines {
     }
 }
 
+/// #### PR #42: whether a message for `id` reaches the channel `channel`
+/// in group `group` (0 is no group).
+pub(super) fn addressed_to(id: u32, channel: u32, group: u32) -> bool {
+    id == channel || (group != 0 && id == group)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #42
+    // What: a preferred source brings devices back only after serving for
+    // 30 seconds without a break; a break starts the count again, and being
+    // marked healthy again while healthy does not.
+    // Look here if: Preferred changes.
+    #[test]
+    fn preferred_sources_bring_devices_back_after_30_seconds_of_service() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let preferred = Preferred::default();
+        assert!(!preferred.should_return(start));
+        preferred.set(true, start);
+        preferred.set(true, at(10));
+        assert!(!preferred.should_return(at(29)));
+        assert!(preferred.should_return(at(30)));
+        preferred.set(false, at(31));
+        assert!(!preferred.should_return(at(40)));
+        preferred.set(true, at(41));
+        assert!(!preferred.should_return(at(70)));
+        assert!(preferred.should_return(at(71)));
+    }
 
     #[test]
     fn setup_reply_accepts_extended_channels_but_rejects_fixed_version() {
@@ -1484,7 +1682,7 @@ mod tests {
             let mut bytes = vec![0; frame.encoded_length()];
             frame.encode_into(&mut bytes).unwrap();
             let frame = SerializedFrame::from_bytes(bytes).unwrap();
-            assert_eq!(validate_setup_reply(frame).is_ok(), expected, "version={version}, flags={flags}, type={message_type}, channel={channel}, extension={extension}");
+            assert_eq!(validate_setup_reply(frame, false).is_ok(), expected, "version={version}, flags={flags}, type={message_type}, channel={channel}, extension={extension}");
         }
     }
 
@@ -1528,6 +1726,197 @@ mod tests {
     /// #### PR #40: at a remote pool the device rolls four extranonce2 bytes.
     fn remote_submit(id: u64) -> Value {
         json!({"id":id,"method":"mining.submit","params":["worker","4","00000000","00000001","00000002"]})
+    }
+
+    /// #### PR #42: an extended job and its parent, for a channel or group.
+    fn group_job(channel_id: u32, job_id: u32) -> SerializedFrame {
+        encoded(
+            NewExtendedMiningJob {
+                channel_id,
+                job_id,
+                min_ntime: binary_sv2::Sv2Option::new(None),
+                version: 0x20000000,
+                version_rolling_allowed: true,
+                merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+                coinbase_tx_prefix: [1u8; 32].as_slice().try_into().unwrap(),
+                coinbase_tx_suffix: [2u8; 32].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            true,
+        )
+        .unwrap()
+    }
+
+    fn group_parent(channel_id: u32, job_id: u32) -> SerializedFrame {
+        encoded(
+            SetNewPrevHash {
+                channel_id,
+                job_id,
+                prev_hash: (&[0u8; 32]).into(),
+                min_ntime: 1700000000,
+                nbits: 0x1d00ffff,
+            },
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// A pool bridge whose device channel 3 sits in group 9, as SRI pools
+    /// put every extended channel in its connection's group.
+    fn grouped_bridge(donation: Option<DonationRoute>) -> Bridge {
+        let mut bridge = Bridge::new(
+            OpenExtendedMiningChannelSuccess {
+                request_id: 1,
+                channel_id: 3,
+                group_channel_id: 9,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 8,
+                extranonce_prefix: [7u8; 4].as_slice().try_into().unwrap(),
+            },
+            true,
+            donation,
+        )
+        .unwrap();
+        bridge
+            .request(json!({"id":1,"method":"mining.subscribe","params":[]}))
+            .unwrap();
+        bridge
+            .request(json!({"id":2,"method":"mining.authorize","params":["worker", ""]}))
+            .unwrap();
+        bridge
+    }
+
+    // #### PR #42
+    // What: jobs and parents addressed to the group reach the device as
+    // clean notifies, and a same-parent group refresh follows without
+    // reconnecting; an unknown id is still refused.
+    // Look here if: lanes_for or the job and parent arms change.
+    #[test]
+    fn a_group_job_and_activation_reach_firmware() {
+        let mut bridge = grouped_bridge(None);
+        bridge.upstream(group_job(9, 5)).unwrap();
+        let notified = bridge.upstream(group_parent(9, 5)).unwrap().0;
+        let notify = notified
+            .iter()
+            .find(|message| message["method"] == "mining.notify")
+            .expect("a notify");
+        assert_eq!(notify["params"][0], "5");
+        assert_eq!(notify["params"][8], true);
+        // A same-parent refresh to the group (a job with a time is
+        // immediate): kept work, clean false.
+        let immediate = encoded(
+            NewExtendedMiningJob {
+                channel_id: 9,
+                job_id: 6,
+                min_ntime: binary_sv2::Sv2Option::new(Some(1700000000)),
+                version: 0x20000000,
+                version_rolling_allowed: true,
+                merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+                coinbase_tx_prefix: [1u8; 32].as_slice().try_into().unwrap(),
+                coinbase_tx_suffix: [2u8; 32].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            true,
+        )
+        .unwrap();
+        let refreshed = bridge.upstream(immediate).unwrap().0;
+        let notify = refreshed
+            .iter()
+            .find(|message| message["method"] == "mining.notify")
+            .expect("a refresh");
+        assert_eq!(notify["params"][0], "6");
+        assert_eq!(notify["params"][8], false);
+        assert_eq!(
+            bridge.upstream(group_job(99, 7)).err().as_deref(),
+            Some("unexpected firmware job")
+        );
+    }
+
+    // #### PR #42
+    // What: a group job feeds the device's lane and the donation's when both
+    // are in the group, so the work clock can switch the device by job alone.
+    #[test]
+    fn a_group_job_feeds_both_lanes_and_the_device_switches_by_job_alone() {
+        let rate = Arc::new(RwLock::new("100".parse::<BchDonation>().unwrap()));
+        let mut bridge = grouped_bridge(Some(DonationRoute {
+            identity: "donation".into(),
+            rate: rate.clone(),
+        }));
+        bridge.upstream(group_job(9, 5)).unwrap();
+        bridge.upstream(group_parent(9, 5)).unwrap();
+        bridge
+            .donation_request()
+            .unwrap()
+            .expect("donation channel");
+        let opened = encoded(
+            OpenExtendedMiningChannelSuccess {
+                request_id: DONATION_REQUEST,
+                channel_id: 11,
+                group_channel_id: 9,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 10,
+                extranonce_prefix: [9u8; 2].as_slice().try_into().unwrap(),
+            },
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            false,
+        )
+        .unwrap();
+        bridge.upstream(opened).unwrap();
+        // One group job and parent: both lanes get them.
+        bridge.upstream(group_job(9, 6)).unwrap();
+        bridge.upstream(group_parent(9, 6)).unwrap();
+        assert!(bridge.lane(true).unwrap().active.contains_key(&6));
+        assert!(bridge.user.active.contains_key(&6));
+        let switched = bridge.tick(Instant::now()).unwrap();
+        assert_eq!(switched[1]["params"][0], (6 | DONATION_JOBS).to_string());
+    }
+
+    // #### PR #42
+    // What: SetGroupChannel moves the device's lane to another group, whose
+    // jobs it then takes; ids of neither its channel nor its group are still
+    // refused.
+    #[test]
+    fn set_group_channel_moves_a_lane_and_other_ids_are_still_refused() {
+        let mut bridge = grouped_bridge(None);
+        let moved = encoded(
+            SetGroupChannel {
+                group_channel_id: 12,
+                channel_ids: vec![3u32].try_into().unwrap(),
+            },
+            MESSAGE_TYPE_SET_GROUP_CHANNEL,
+            false,
+        )
+        .unwrap();
+        assert!(bridge.upstream(moved).unwrap().0.is_empty());
+        assert_eq!(bridge.user.group, 12);
+        bridge.upstream(group_job(12, 5)).unwrap();
+        assert!(bridge.upstream(group_parent(12, 5)).is_ok());
+        assert!(bridge.upstream(group_job(9, 6)).is_err(), "the old group");
+        assert!(bridge.upstream(group_job(3, 6)).is_ok(), "its own channel");
+    }
+
+    // #### PR #42
+    // What: closing the group closes the device's lane: the adapter ends the
+    // connection so the device reconnects for a new channel.
+    #[test]
+    fn closing_the_group_closes_its_lanes() {
+        let mut bridge = grouped_bridge(None);
+        let close = encoded(
+            CloseChannel {
+                channel_id: 9,
+                reason_code: "bye".try_into().unwrap(),
+            },
+            MESSAGE_TYPE_CLOSE_CHANNEL,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            bridge.upstream(close).err().as_deref(),
+            Some("SV2 upstream closed the channel")
+        );
+        assert!(addressed_to(9, 3, 9) && addressed_to(3, 3, 9));
+        assert!(!addressed_to(0, 3, 0) && !addressed_to(9, 3, 0));
     }
 
     // #### PR #40
@@ -2018,5 +2407,51 @@ mod tests {
         lines.bytes.clear();
         lines.started = Some(Instant::now() - DEADLINE);
         assert!(lines.read().is_err());
+    }
+
+    // #### PR #42
+    // What: an adapter for a token that fixes the version answers
+    // mining.configure without version rolling, accepts the server's
+    // fixed-version setup (which another adapter refuses), and takes jobs
+    // that disallow rolling.
+    // Look here if: the adapter's fixed version changes.
+    #[test]
+    fn fixed_version_adapter_answers_configure_without_rolling_and_accepts_fixed_jobs() {
+        let mut bridge = bridge_for(false).with_fixed_version(true);
+        let request = json!({"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":2}]});
+        let replies = bridge.request(request).unwrap().0;
+        assert_eq!(replies[0]["result"]["version-rolling"], false);
+        assert!(replies[0]["result"].get("version-rolling.mask").is_none());
+        let job = NewExtendedMiningJob {
+            channel_id: 3,
+            job_id: 1,
+            min_ntime: binary_sv2::Sv2Option::new(None),
+            version: 0x2000_0000,
+            version_rolling_allowed: false,
+            merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+            coinbase_tx_prefix: [0x20u8, b'P', b'X', b'H', b'1', 1, 0, 0, 0]
+                .as_slice()
+                .try_into()
+                .unwrap(),
+            coinbase_tx_suffix: [0x75u8].as_slice().try_into().unwrap(),
+        };
+        assert!(bridge.user.job(job.clone(), true).is_ok());
+        assert_eq!(
+            bridge_for(false).user.job(job, false).err().as_deref(),
+            Some("unexpected firmware job")
+        );
+        let success = |flags| {
+            encoded(
+                SetupConnectionSuccess {
+                    used_version: 2,
+                    flags,
+                },
+                1,
+                false,
+            )
+            .unwrap()
+        };
+        assert!(validate_setup_reply(success(1), true).is_ok());
+        assert!(validate_setup_reply(success(1), false).is_err());
     }
 }

@@ -13,12 +13,23 @@ pub mod command;
 pub mod device_api;
 #[cfg(feature = "stratum-v2")]
 pub mod fleet;
+// #### PR #42: Job Declaration: miners' own templates at a public pool.
+#[cfg(feature = "stratum-v2")]
+pub mod jd;
 #[cfg(feature = "stratum-v2")]
 pub mod journal;
 #[cfg(all(test, feature = "stratum-v2"))]
 mod journal_tests;
 #[cfg(all(test, feature = "stratum-v2"))]
 mod live_tests;
+// #### PR #42: the Device panel (row selection and one device's controls).
+#[cfg(feature = "stratum-v2")]
+mod logins;
+#[cfg(feature = "stratum-v2")]
+mod panel;
+// #### PR #42: merge mining for BCH covenant tokens (no token registered yet).
+#[cfg(feature = "stratum-v2")]
+pub mod merge;
 #[cfg(feature = "stratum-v2")]
 mod payout;
 #[cfg(feature = "stratum-v2")]
@@ -32,6 +43,9 @@ mod server_tests;
 mod status;
 #[cfg(feature = "stratum-v2")]
 pub mod sv1;
+// #### PR #42: Template Distribution: this server's templates for SV2 pools.
+#[cfg(feature = "stratum-v2")]
+pub mod tdp;
 #[cfg(feature = "stratum-v2")]
 pub mod telemetry;
 #[cfg(feature = "stratum-v2")]
@@ -44,6 +58,8 @@ pub mod transport;
 pub mod wire;
 #[cfg(feature = "stratum-v2")]
 mod work_allocation;
+#[cfg(feature = "stratum-v2")]
+pub mod zmq;
 
 pub use bch::{
     asert_target_required, cashaddr_payouts_required, ctor_full_templates_required,

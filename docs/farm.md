@@ -34,9 +34,18 @@ same across restarts. Keep that file private: it is the coordinator's identity.
 
 Without `--no-tui`, the dashboard shows a Rigs row (rigs connected, their GPUs,
 the farm's rate, winners and rejected winners, the listen address) and one row
-per rig (name, GPUs, rate, winners, minutes connected). Its Hashrate row adds
-the rigs' rate to the coordinator's own. `--json` status lines carry the same
-under `rigs`.
+per rig (name, GPUs, rate, winners, minutes connected, seconds since it was
+last heard). Under each rig, one row per GPU (#42): its name, status, rate,
+temperature, fan and power, winners, rejected winners and last error. A GPU
+that is not mining, is at 85°C or above, has rejected winners or reports an
+error keeps its row when the screen is short. Its Hashrate row adds the rigs'
+rate to the coordinator's own. `--json` status lines carry the same under
+`rigs` (each rig's `last_seen_secs`, `version` and `devices`, never a payout),
+and `mine watch` lists each rig's GPUs under it.
+
+Rigs send their GPUs with each report (every 5 seconds); a coordinator keeps
+at most 64 per rig. An older rig sends none and still works, and an older
+coordinator ignores them.
 
 Press `I` for Connection info: the exact command a rig runs, once for each
 address other computers reach the coordinator at (its address on your network
@@ -50,6 +59,12 @@ as a `rigs join` line.
 ```text
 pickaxe mine --coordinator <coordinator address>:3340 --coordinator-key <key> --rig-name rack1-07 --no-tui
 ```
+
+The coordinator's one-line address carries its key, so this works too (#42):
+`pickaxe mine --coordinator stratum2+tcp://HOST:3340/KEY --no-tui`. A rig
+writes its status file beside its configuration every two seconds (its
+coordinator, state, rate, winners sent and each GPU, never a key or a payout),
+which `mine watch` shows as "Rig of HOST:3340 · mining · ...".
 
 In the setup, choose GPU mining and set Mining to "Join a GPU pool or farm"
 with the coordinator's address and key (the one-line
@@ -83,6 +98,69 @@ and its winners are checked against exactly the job it was given. Because
 anyone can broadcast a PHOTON claim, a modified rig could keep its fee time
 for itself; the fee, like the donation, relies on rigs running Pickaxe as
 published.
+
+## In the setup
+
+#### PR #42
+
+GPU mining keeps its farm values under **Advanced** on the settings page:
+- **GPU mining alone**: **Rig port** turns this computer into your farm's
+  coordinator (off by default; Left/Right turns port 3340 on, Enter types
+  another), **This PC** (shown while the port is on) chooses whether it mines
+  with its own GPUs too or only coordinates (`--rigs-only`), and the token
+  **Donation** (never below the token's minimum, 4% for PHOTON).
+- **Join a GPU pool or farm** (a rig): **Backups** takes backup coordinators,
+  each `stratum2+tcp://HOST:3340/KEY`, tried in order after the main one,
+  and **Rig name** names the rig on the coordinator's dashboard (the
+  computer's name by default).
+- **Run a pool → GPU pool**: the fee address, the **Rig port** (3340 unless
+  changed) and the donation.
+
+A saved profile keeps them and reopens as a farm ("GPU farm · Chipnet ·
+PHOTON · rigs :3340"), a rig or a pool. A running coordinator's Advanced
+page (`a`) shows where rigs join, a public pool's fee and whether this PC
+only coordinates.
+
+## Farm operating systems (HiveOS, mmpOS, RaveOS)
+
+#### PR #42
+
+Farm systems run a miner through small scripts that pass the flight sheet's
+fields and read statistics back. Pickaxe has one command for each side:
+
+```text
+pickaxe farm-os mine --pool <pool> --user <ADDRESS[.WORKER]> --password <key> [extras]
+pickaxe farm-os stats --os hiveos|mmpos|raveos
+```
+
+`farm-os mine` becomes `pickaxe mine --no-tui` with the matching flags:
+
+| Pool field | Mines |
+|---|---|
+| empty, `solo`, `auto`, `fulcrum` | from the Fulcrum list (or `--node-rpc` among the extras) |
+| `stratum2+tcp://HOST:3340/KEY` | as a rig of that coordinator; several pools, space-separated, are backups in order |
+| `HOST:3340` (mmpOS drops the scheme) | as a rig, with the coordinator's key as the password |
+| `http://...` | from that node (`--node-rpc`) |
+| `ws://...`, `wss://...`, `tcp://...` | from that Fulcrum server |
+| `stratum+tcp://...` | refused: an SV1 pool cannot give PHOTON work |
+
+The user's address is the payout (`--address`), and its worker names a rig
+(`--rig-name`); `--coin`, `--api-port` and `--pool-protocol` are ignored;
+anything else (such as `--intensity 90`) passes through as given.
+
+`farm-os stats` reads the running miner's status file (beside `--config`)
+and prints HiveOS's two lines (total kH/s, then `hs`, `temp`, `fan`,
+`uptime`, `ver`, `ar` and `bus_numbers`), mmpOS's line (`busid`, `hash`,
+`units`, `air`, per-GPU `shares`) or RaveOS's line (GPUs by PCI bus). A
+status older than 30 seconds reports no rate; a GPU without a PCI bus is
+never given another's. A coordinator reports its own GPUs only, since each
+rig reports itself. The status file now also names the role (`miner`,
+`coordinator` or `rig`), the version, the start time, and each GPU's PCI bus
+and rejected winners. A headless or `farm-os` run never reopens itself in a
+terminal on a Linux desktop.
+
+The packages each system installs, and what to put in their fields, are in
+[farm-os.md](farm-os.md); their scripts call these two commands.
 
 ## Running rigs as a service
 
