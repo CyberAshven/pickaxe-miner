@@ -272,10 +272,20 @@ only.
   `PushSolution`, so the pool's node gets it too.
 - A refusal for a race at a new block (`stale-chain-tip`) only drops that
   template. The fourth other refusal in a row on one parent, a refused custom
-  job, a failed link or a change in the pool's fee or donation makes the
-  local server stop offering work, and devices move to the pool's own jobs;
-  the uplink tries again after 30 seconds. Devices come back once they
-  reconnect.
+  job, 5 rejected shares among the last 20 sent (not counting races at a new
+  block), a failed link or a change in the pool's fee or donation makes the
+  local server stop offering work, and devices move to the pool's own jobs.
+- The uplink then tries the next pool in `--upstream` order (wrapping),
+  after 30 seconds, then 60, 120 and 300 while failures follow each other; a
+  session whose pool accepted custom jobs starts the count again. Devices come
+  back by themselves once Job Declaration has been active for 30 seconds:
+  their sessions at the pool end and the adapter takes them to the local
+  server first.
+- A new template on the same parent reaches devices only once the pool has
+  accepted its custom job, so devices never mine work the pool may refuse; a
+  new parent goes at once. Templates on one parent go to the pool at most once
+  every 5 seconds, so refreshes do not spend the pool's limit of 30
+  declarations a minute.
 - The overview shows a line such as "Job Declaration at pool.example:3336
   (full-template): active · 12 custom jobs · 0 refused · 12 declared · 0
   dropped · 1 blocks pushed · 340 shares sent (338 accepted, 2 rejected) · 0
@@ -287,7 +297,7 @@ only.
 
 - Merge-mined tokens under Job Declaration: the commitment and tickets in the
   declared coinbase.
-- Devices returning to Job Declaration without reconnecting, backup Job
-  Declaration servers, and the setup rows.
+- Job Declaration servers apart from the pools (`--jd-server`), the client's
+  own jobs when every pool is down, and the setup rows.
 - A live run against BCHN on Chipnet, and SRI's Job Declaration client against
   a Pickaxe pool.

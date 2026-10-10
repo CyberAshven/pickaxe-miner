@@ -1823,3 +1823,31 @@ refusals), and a loopback run: the pool's node has 2 of the client's 3
 transactions, one round fetches the third, `validateblocktemplate` runs once,
 and a CPU device's block reaches both nodes with the same hash. Not yet run
 against BCHN on Chipnet, nor with SRI's client.
+
+## Fallback pools and coming back (2026-10-10)
+
+#### PR #42
+
+Solo mining takes `--fallback-pool stratum2+tcp://HOST:PORT/KEY` (repeatable,
+with `--sv1-listen`, not with `--upstream` or `--public`): while the node
+gives no work, the server stops offering it, device sessions end after the
+3-second grace, and the SV1 adapter opens their next sessions at the first
+fallback pool that takes them, with the donation as at any pool. The server
+marks its preferred source while it publishes work (the node, or under Job
+Declaration its plan); a session at a fallback pool ends once that source has
+served for 30 seconds without a break, so devices come back to the node or
+to Job Declaration by themselves.
+
+The Job Declaration client tries the pools in `--upstream` order after a
+failure, waiting 30, 60, 120, then 300 seconds as failures follow each other
+(a session with accepted custom jobs starts again), and falls back when the
+pool rejects 5 of the last 20 shares sent (races at a new block not counted).
+Under Job Declaration a newer template on the same parent and plan reaches
+devices only once the pool accepted its custom job, and templates on one
+parent go to the pool at most once every 5 seconds.
+
+Evidence: host tests for the return rule (30 seconds without a break), the
+retry waits, the rejection window, same-parent gating, the `--fallback-pool`
+flags, and a loopback run: an SV1 device on the node's server moves to a
+fallback pool when the node stops answering and back once it answers (the
+return time shortened to 100 ms). Not yet run live with a stopped Chipnet node.

@@ -279,6 +279,19 @@ pub enum StratumV2Command {
         /// out only for a provider on this computer.
         #[arg(long, value_name = "URL")]
         template_provider: Vec<String>,
+        /// #### PR #42
+        /// Solo mining with a pool to fall back on: SV1 devices mine at this
+        /// pool (stratum2+tcp://HOST:PORT/KEY) while your node gives no work,
+        /// and come back once it has served for 30 seconds. Repeat for more,
+        /// tried in order; the donation works there as at any pool. Needs
+        /// --sv1-listen; not with --upstream or --public.
+        #[arg(
+            long,
+            value_name = "ADDRESS",
+            requires = "sv1_listen",
+            conflicts_with_all = ["upstream", "public"]
+        )]
+        fallback_pool: Vec<String>,
     },
 }
 
@@ -759,6 +772,56 @@ mod tests {
             ]),
             (None, Some(JobDeclarationMode::Full))
         );
+    }
+
+    // #### PR #42
+    // What: --fallback-pool needs --sv1-listen, repeats in order, and
+    // conflicts with --upstream and --public.
+    // Look here if: the Serve flags change.
+    #[test]
+    fn fallback_pools_need_sv1_listen_and_conflict_with_upstream_and_public() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["pickaxe", "stratum-v2", "serve"]
+                    .iter()
+                    .chain(args)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let cli = parse(&[
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+            "--fallback-pool",
+            "stratum2+tcp://b.example:3336/KEY",
+        ])
+        .unwrap();
+        let Some(Commands::StratumV2 {
+            command: StratumV2Command::Serve { fallback_pool, .. },
+        }) = cli.command
+        else {
+            panic!("serve options missing")
+        };
+        assert_eq!(fallback_pool.len(), 2);
+        assert!(parse(&["--fallback-pool", "stratum2+tcp://a.example:3336/KEY"]).is_err());
+        assert!(parse(&[
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--upstream",
+            "stratum2+tcp://pool.example:3336/KEY",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--sv1-listen",
+            "0.0.0.0:3333",
+            "--public",
+            "--fallback-pool",
+            "stratum2+tcp://a.example:3336/KEY",
+        ])
+        .is_err());
     }
 
     // #### PR #40

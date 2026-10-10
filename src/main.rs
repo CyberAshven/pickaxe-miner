@@ -1826,6 +1826,7 @@ fn main() {
                                 accept_job_declaration: None,
                                 job_declaration: None,
                                 template_provider: Vec::new(),
+                                fallback_pool: Vec::new(),
                             };
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(

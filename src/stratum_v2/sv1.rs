@@ -89,6 +89,58 @@ impl DonationRoute {
     }
 }
 
+/// #### PR #42: how long the preferred source must serve devices before
+/// sessions on a fallback pool end, so devices come back to it.
+pub const RETURN_AFTER: Duration = Duration::from_secs(30);
+
+/// #### PR #42
+/// The source devices should mine on whenever it can serve them: this
+/// server's own listener, on the miner's node or under its Job Declaration
+/// plan. The server marks it; sessions at a fallback pool watch it.
+#[derive(Debug)]
+pub struct Preferred {
+    healthy_since: Mutex<Option<Instant>>,
+    return_after: Duration,
+}
+
+impl Default for Preferred {
+    fn default() -> Self {
+        Self::with_return_after(RETURN_AFTER)
+    }
+}
+
+impl Preferred {
+    /// A preferred source that devices return to once it has served for
+    /// `return_after` (shorter in tests).
+    pub fn with_return_after(return_after: Duration) -> Self {
+        Self {
+            healthy_since: Mutex::new(None),
+            return_after,
+        }
+    }
+
+    /// Marks whether the source can serve devices now.
+    pub fn set(&self, healthy: bool, now: Instant) {
+        if let Ok(mut since) = self.healthy_since.lock() {
+            match (healthy, *since) {
+                (true, None) => *since = Some(now),
+                (false, Some(_)) => *since = None,
+                _ => (),
+            }
+        }
+    }
+
+    /// Whether devices on a fallback pool should come back: the source has
+    /// served without a break for `return_after`.
+    pub fn should_return(&self, now: Instant) -> bool {
+        self.healthy_since
+            .lock()
+            .ok()
+            .and_then(|since| *since)
+            .is_some_and(|since| now.saturating_duration_since(since) >= self.return_after)
+    }
+}
+
 /// #### PR #40
 /// Where the adapter takes its work from.
 #[derive(Clone, Debug)]
@@ -107,6 +159,9 @@ pub struct Upstream {
     /// #### PR #40: this server's own listener running a public pool, where
     /// a device's channel opens at authorize under the device's username.
     pub public: bool,
+    /// #### PR #42: a fallback pool's preferred source: sessions here end
+    /// once it can serve devices again (`Preferred::should_return`).
+    pub prefer: Option<Arc<Preferred>>,
 }
 
 /// #### PR #40: the identity the adapter's channels open with at this
@@ -123,6 +178,7 @@ impl Upstream {
             remote: false,
             donation: None,
             public: false,
+            prefer: None,
         }
     }
 
@@ -393,6 +449,24 @@ fn serve_session(
     while !stop.load(Ordering::Relaxed) {
         if !bridge.ready() && started.elapsed() >= DEADLINE {
             return Err("SV1 setup timed out".into());
+        }
+        // #### PR #42: back to the preferred source
+        // What: a session on a fallback pool ends once the preferred source
+        // (this server's own node, or its Job Declaration plan) has served
+        // devices for 30 seconds without a break; the firmware reconnects,
+        // and the adapter tries the preferred source first again.
+        // Why: a pool is the fallback while the miner's node or Job
+        // Declaration is down; devices must not stay there once it is back.
+        // The 30 seconds keep a flapping source from bouncing devices.
+        // Look here if: devices bounce between the node and a pool, or stay
+        // at the pool after the node answers again.
+        if upstream
+            .prefer
+            .as_ref()
+            .is_some_and(|prefer| prefer.should_return(Instant::now()))
+        {
+            send.close();
+            return Ok(());
         }
         if upstream.remote {
             // Firmware already has its reply; a verdict that never comes is
@@ -1519,6 +1593,28 @@ pub(super) fn addressed_to(id: u32, channel: u32, group: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### PR #42
+    // What: a preferred source brings devices back only after serving for
+    // 30 seconds without a break; a break starts the count again, and being
+    // marked healthy again while healthy does not.
+    // Look here if: Preferred changes.
+    #[test]
+    fn preferred_sources_bring_devices_back_after_30_seconds_of_service() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let preferred = Preferred::default();
+        assert!(!preferred.should_return(start));
+        preferred.set(true, start);
+        preferred.set(true, at(10));
+        assert!(!preferred.should_return(at(29)));
+        assert!(preferred.should_return(at(30)));
+        preferred.set(false, at(31));
+        assert!(!preferred.should_return(at(40)));
+        preferred.set(true, at(41));
+        assert!(!preferred.should_return(at(70)));
+        assert!(preferred.should_return(at(71)));
+    }
 
     #[test]
     fn setup_reply_accepts_extended_channels_but_rejects_fixed_version() {

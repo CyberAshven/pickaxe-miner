@@ -423,6 +423,31 @@ versions, so Pickaxe reports "upstream certificate version is not SV2's" there
 until CashStratum fixes it
 ([cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3)).
 
+### Fallback pools and coming back
+
+#### PR #42
+
+Solo mining can name pools to fall back on while the node gives no work:
+
+```text
+pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
+  --fallback-pool stratum2+tcp://POOL:3336/KEY [--fallback-pool ...]
+```
+
+- While the node answers, SV1 devices mine on it as usual. When it stops, the
+  server stops giving work, the devices' sessions end after the 3-second
+  grace, and the SV1 adapter opens their next sessions at the first fallback
+  pool that takes them (each pool's key travels in its address; the identity
+  there is the payout address; the donation works as at any pool).
+- Once the node has given work for 30 seconds without a break, the sessions
+  at a fallback pool end, and the adapter takes the devices back to the node.
+  The 30 seconds keep a flapping node from bouncing devices.
+- The same rule brings devices back to Job Declaration (`--job-declaration`):
+  while the pool refuses the miner's templates they mine the pool's own jobs,
+  and they come back once Job Declaration has been active for 30 seconds.
+- Native SV2 devices such as a Bitaxe use their own backup pool, which the
+  Device panel's Pools page can set.
+
 ### Templates from a provider (Template Distribution client)
 
 #### PR #42

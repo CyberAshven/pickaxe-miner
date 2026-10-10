@@ -442,6 +442,25 @@ impl Running {
         self.state_directory.0.join("relay-blocks.json")
     }
 
+    /// #### PR #42: a solo server on `node` that marks `preferred` while it
+    /// has work.
+    pub(super) fn solo_preferred(
+        node: Arc<Mutex<Node>>,
+        preferred: Arc<super::sv1::Preferred>,
+    ) -> Self {
+        Self::start_preferred(
+            vec![node],
+            Arc::new(TestDirectory::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some(preferred),
+        )
+    }
+
     /// `templates`: none, a relay journal only, or a relay journal and a
     /// template listener.
     #[allow(clippy::too_many_arguments)]
@@ -453,7 +472,32 @@ impl Running {
         templates: Option<bool>,
         job_declaration: Option<super::jd::AcceptJd>,
         uplink: Option<super::jd::client::JdTarget>,
+        sources: Vec<Box<dyn super::provider::TemplateSource>>,
+    ) -> Self {
+        Self::start_preferred(
+            nodes,
+            state_directory,
+            public,
+            tokens,
+            templates,
+            job_declaration,
+            uplink,
+            sources,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_preferred(
+        nodes: Vec<Arc<Mutex<Node>>>,
+        state_directory: Arc<TestDirectory>,
+        public: Option<super::payout::PublicPool>,
+        tokens: Option<Arc<super::merge::hub::TokenHub>>,
+        templates: Option<bool>,
+        job_declaration: Option<super::jd::AcceptJd>,
+        uplink: Option<super::jd::client::JdTarget>,
         mut sources: Vec<Box<dyn super::provider::TemplateSource>>,
+        preferred: Option<Arc<super::sv1::Preferred>>,
     ) -> Self {
         let node = nodes[0].clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -483,7 +527,7 @@ impl Running {
         });
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(ServerStats::default()));
-        let uplink = uplink.map(|target| super::jd::client::spawn(target, stop.clone()));
+        let uplink = uplink.map(|target| super::jd::client::spawn(vec![target], stop.clone()));
         let secret = [17; 32];
         let authority = server::authority_public(&secret).unwrap();
         let config = ServerConfig {
@@ -504,6 +548,7 @@ impl Running {
                 .map(|_| state_directory.0.join("jd-blocks.json")),
             declarator,
             uplink: uplink.as_ref().map(|(handle, _)| handle.clone()),
+            preferred,
         };
         let thread = {
             let stop = stop.clone();
@@ -1257,6 +1302,26 @@ impl FirmwareDevice {
         }
         device
     }
+    /// #### PR #42: waits until the adapter ends this connection.
+    fn closed(mut self) {
+        use std::io::BufRead;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(Instant::now() < deadline, "the connection stayed open");
+            let mut line = String::new();
+            match self.read.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => (),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
     fn send(&mut self, value: Value) {
         use std::io::Write;
         let mut bytes = serde_json::to_vec(&value).unwrap();
@@ -1528,6 +1593,7 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         remote: true,
         donation: None,
         public: false,
+        prefer: None,
     };
     let upstreams = vec![pool_with([3; 32]), pool_with(pool.authority)];
     let thread = {
@@ -1568,6 +1634,65 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
+// #### PR #42
+// What: solo mining with a fallback pool, on loopback: an SV1 device mines
+// on the miner's node; when the node stops answering, the local server ends
+// its session and the adapter takes the device to the fallback pool
+// (another server standing in for a pool); once the node answers again and
+// has served for the return time (100 ms here, 30 s in use), the session at
+// the pool ends and the device comes back to the node.
+// Look here if: sv1::Preferred, the adapter's return or publish's marking
+// change.
+#[test]
+fn solo_devices_move_to_the_fallback_pool_when_the_node_stops_and_return_when_it_answers() {
+    let preferred = Arc::new(super::sv1::Preferred::with_return_after(
+        Duration::from_millis(100),
+    ));
+    let node = pool_node();
+    let local = Running::solo_preferred(node.clone(), preferred.clone());
+    let pool = Running::new(false);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let upstreams = vec![
+        super::sv1::Upstream::local(local.address, local.authority),
+        super::sv1::Upstream {
+            address: pool.address.to_string(),
+            authority: pool.authority,
+            identity: payout(),
+            remote: true,
+            donation: None,
+            public: false,
+            prefer: Some(preferred),
+        },
+    ];
+    let thread = {
+        let stop = stop.clone();
+        let stats = Arc::new(Mutex::new(ServerStats::default()));
+        thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
+    };
+    let adapter = FirmwareAdapter {
+        stop,
+        thread: Some(thread),
+        address,
+    };
+    // The node's server gives 16 prefix bytes and 8 to roll; a remote
+    // pool, through the adapter, 4 and 4.
+    let device = FirmwareDevice::connect(&adapter, true, false);
+    assert_eq!(device.prefix.len(), 16, "on the node");
+    node.lock().unwrap().unavailable = true;
+    device.closed();
+    let device = FirmwareDevice::connect(&adapter, true, false);
+    assert_eq!(device.prefix.len(), 4, "at the fallback pool");
+    node.lock().unwrap().unavailable = false;
+    device.closed();
+    let device = FirmwareDevice::connect(&adapter, true, false);
+    assert_eq!(device.prefix.len(), 16, "back on the node");
+    drop(device);
+    drop(adapter);
+    drop(local);
+}
+
 // #### PR #40
 #[test]
 fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_it() {
@@ -1589,6 +1714,7 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
             rate: Arc::new(std::sync::RwLock::new("100".parse().unwrap())),
         }),
         public: false,
+        prefer: None,
     }];
     let thread = {
         let stop = stop.clone();
@@ -1750,6 +1876,7 @@ fn real_sv2_pool_sends_work_to_sv1_firmware() {
         remote: true,
         donation: None,
         public: false,
+        prefer: None,
     };
     let thread = {
         let stop = stop.clone();
@@ -1834,6 +1961,7 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             remote: true,
             donation: None,
             public: false,
+            prefer: None,
         },
         super::sv1::Upstream {
             address: pool.address.to_string(),
@@ -1842,6 +1970,7 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             remote: true,
             donation: None,
             public: false,
+            prefer: None,
         },
     ];
     let thread = {
@@ -2300,13 +2429,13 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
     let miner_node = pool_node();
     let stop = Arc::new(AtomicBool::new(false));
     let (handle, thread) = super::jd::client::spawn(
-        super::jd::client::JdTarget {
+        vec![super::jd::client::JdTarget {
             address: pool.address.to_string(),
             authority: pool.authority,
             identity: payout(),
             retry: Duration::from_millis(200),
             mode: super::jd::JdMode::FullTemplate,
-        },
+        }],
         stop.clone(),
     );
     let deadline = Instant::now() + Duration::from_secs(5);

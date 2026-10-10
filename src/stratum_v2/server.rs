@@ -70,6 +70,9 @@ pub struct ServerConfig {
     /// #### PR #42: a Job Declaration client's uplink, when this server is
     /// the local server that mines its own templates at a pool.
     pub uplink: Option<UplinkHandle>,
+    /// #### PR #42: marked while this server has work to give, so devices
+    /// on a fallback pool come back to it.
+    pub preferred: Option<Arc<super::sv1::Preferred>>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -234,6 +237,8 @@ pub(super) struct Shared {
     /// #### PR #42: the latest published templates with different
     /// transactions, newest first, whose transactions a declaration may name.
     recent: Option<Mutex<VecDeque<Arc<BchTemplate>>>>,
+    /// #### PR #42: see `ServerConfig::preferred`.
+    preferred: Option<Arc<super::sv1::Preferred>>,
 }
 
 /// #### PR #42: the JD journal and one block per parent.
@@ -577,6 +582,7 @@ pub fn run_with(
         lanes: Arc::new(AtomicU32::new(0)),
         declared,
         recent: full_template.then(|| Mutex::new(VecDeque::new())),
+        preferred: config.preferred.clone(),
     });
     update_journal_stats(&shared)?;
     update_relay_stats(&shared)?;
@@ -586,8 +592,8 @@ pub fn run_with(
     let node_tokens = config.tokens.clone();
     let node_uplink = config.uplink.clone();
     let node = thread::spawn(move || -> Result<(), String> {
-        // #### PR #42: the plan serial jobs were last published with.
-        let mut published_plan: Option<u64> = None;
+        // #### PR #42: what was last offered under Job Declaration.
+        let mut offered = Offered::default();
         // #### PR #42: server-owned generations
         // What: the server counts its own template generations: a new one
         // whenever the active source or its generation changes, the same one
@@ -722,7 +728,7 @@ pub fn run_with(
                 if let Ok(mut stats) = node_shared.stats.lock() {
                     stats.jd_client = uplink.status.summary.lock().ok().map(|s| s.clone());
                 }
-                current_plan(uplink).map(|plan| plan.serial) != published_plan
+                current_plan(uplink).map(|plan| plan.serial) != offered.plan
             });
             if node_tokens.as_ref().is_some_and(|hub| hub.take_changed()) || plan_changed {
                 let slot = sources[0].0;
@@ -733,7 +739,7 @@ pub fn run_with(
                     offer(
                         &node_shared,
                         node_uplink.as_ref(),
-                        &mut published_plan,
+                        &mut offered,
                         generation,
                         serial,
                         template,
@@ -751,7 +757,7 @@ pub fn run_with(
                         offer(
                             &node_shared,
                             node_uplink.as_ref(),
-                            &mut published_plan,
+                            &mut offered,
                             generation,
                             serial,
                             template,
@@ -1204,11 +1210,25 @@ fn current_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
 // Why: a custom job the pool has not accepted earns the miner nothing.
 // Look here if: devices get no work while Job Declaration is active, or keep
 // mining local jobs after a fallback.
+/// #### PR #42: what the node thread last offered under Job Declaration.
+#[derive(Default)]
+struct Offered {
+    /// The plan serial jobs were last published with.
+    plan: Option<u64>,
+    /// The parent and plan of the last template sent to the uplink, and
+    /// when.
+    last: Option<(Hash, u64, Instant)>,
+}
+
+/// Under Job Declaration, templates on one parent and plan go to the
+/// uplink at most once in this long.
+const COALESCE: Duration = Duration::from_secs(5);
+
 /// Publishes a refreshed template, or under Job Declaration offers it.
 fn offer(
     shared: &Shared,
     uplink: Option<&UplinkHandle>,
-    published_plan: &mut Option<u64>,
+    offered: &mut Offered,
     generation: u64,
     serial: u64,
     mut template: BchTemplate,
@@ -1227,12 +1247,30 @@ fn offer(
         return;
     };
     let plan = current_plan(uplink);
-    *published_plan = plan.as_ref().map(|plan| plan.serial);
+    offered.plan = plan.as_ref().map(|plan| plan.serial);
     let Some(plan) = plan else {
         publish(shared, None);
         return;
     };
     let plan_serial = plan.serial;
+    // #### PR #42: coalescing
+    // What: under Job Declaration a template on the same parent and plan as
+    // one offered less than 5 seconds ago is skipped; a new parent or plan
+    // goes at once, and the next refresh catches up.
+    // Why: each offer is a declaration and a custom job at the pool, which
+    // limits a client to 30 declarations a minute; token changes and
+    // refreshes must not spend them.
+    // Look here if: a pool refuses declarations for their rate, or devices
+    // keep a template's job for over 15 seconds.
+    let now = Instant::now();
+    if offered.last.is_some_and(|(parent, plan, at)| {
+        parent == template.previous_hash
+            && plan == plan_serial
+            && now.saturating_duration_since(at) < COALESCE
+    }) {
+        return;
+    }
+    offered.last = Some((template.previous_hash, plan_serial, now));
     template.declare(plan);
     let template = Arc::new(template);
     let _ = uplink.events.try_send(UplinkEvent::Published {
@@ -1252,6 +1290,11 @@ fn offer(
 // #### end PR #42 ####
 
 fn publish(shared: &Shared, job: Option<PublishedJob>) {
+    // #### PR #42: devices on a fallback pool come back while this server
+    // has work (see `sv1::Preferred`).
+    if let Some(preferred) = shared.preferred.as_ref() {
+        preferred.set(job.is_some(), Instant::now());
+    }
     // #### PR #42: the latest templates with other transactions, for
     // Full-Template declarations.
     if let (Some(job), Some(recent)) = (job.as_ref(), shared.recent.as_ref()) {
@@ -1283,8 +1326,10 @@ fn publish(shared: &Shared, job: Option<PublishedJob>) {
 // original freshness lease just to keep a connection alive.
 struct JobAvailability {
     generation: Option<u64>,
-    /// #### PR #42: the token set's serial of the job issued last.
+    /// #### PR #42: the token set's serial of the job issued last (and the
+    /// plan's, under Job Declaration), and its parent.
     serial: Option<u64>,
+    parent: Option<Hash>,
     unavailable_since: Option<Instant>,
     payout: Option<BchPayout>,
     next_id: u32,
@@ -1296,6 +1341,7 @@ impl JobAvailability {
         Self {
             generation: None,
             serial: None,
+            parent: None,
             unavailable_since: None,
             payout: None,
             next_id: 0,
@@ -1303,6 +1349,8 @@ impl JobAvailability {
         }
     }
 
+    /// `acknowledged`: under Job Declaration, the newest generation whose
+    /// custom job the pool accepted.
     fn update(
         &mut self,
         mining: &mut MiningSession,
@@ -1310,6 +1358,7 @@ impl JobAvailability {
         now: Instant,
         donation: BchDonation,
         fee: Option<crate::donation::bch::PoolFee>,
+        acknowledged: Option<u64>,
     ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
         if let Some(job) = current.filter(|job| now < job.valid_until) {
             self.allocation.update(now, !mining.channels.is_empty());
@@ -1329,6 +1378,23 @@ impl JobAvailability {
             {
                 return Ok(Vec::new());
             }
+            // #### PR #42: same-parent gating (Job Declaration)
+            // What: under Job Declaration a new template on the parent and
+            // plan of the job devices have reaches them only once the pool
+            // accepted its custom job; a new parent or plan goes at once.
+            // Why: shares on a custom job the pool has not accepted wait in
+            // the uplink and are lost if it refuses the job, while the job
+            // devices have stays valid on its parent.
+            // Look here if: devices keep one job on a parent while the pool
+            // accepts newer ones, or shares wait in the uplink's cache.
+            if acknowledged.is_some_and(|acknowledged| {
+                self.generation.is_some()
+                    && self.parent == Some(job.template.previous_hash)
+                    && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
+                    && job.generation > acknowledged
+            }) {
+                return Ok(Vec::new());
+            }
             // Policy rotations need unique search space even with the same
             // template generation. The provider still receives its original
             // generation, while the wire ID commits a distinct coinbase.
@@ -1336,10 +1402,12 @@ impl JobAvailability {
                 .next_id
                 .checked_add(1)
                 .ok_or("job identifiers exhausted")?;
+            let parent = job.template.previous_hash;
             let frames =
                 mining.set_job_with_payout(self.next_id, job.generation, job.template, payout)?;
             self.generation = Some(job.generation);
             self.serial = Some(job.serial);
+            self.parent = Some(parent);
             self.payout = Some(payout);
             return Ok(frames);
         }
@@ -1567,12 +1635,19 @@ fn serve_device(
                     .map(|value| *value)
                     .map_err(|_| "donation setting unavailable".to_owned())
             };
+            let acknowledged = || {
+                config
+                    .uplink
+                    .as_ref()
+                    .map(|uplink| uplink.status.acknowledged.load(Ordering::Relaxed))
+            };
             for frame in availability.update(
                 &mut mining,
                 current_job()?,
                 Instant::now(),
                 donation()?,
                 fee,
+                acknowledged(),
             )? {
                 sender.send(frame)?;
             }
@@ -1603,6 +1678,7 @@ fn serve_device(
                     Instant::now(),
                     donation()?,
                     fee,
+                    acknowledged(),
                 )? {
                     sender.send(update)?;
                 }
@@ -1870,6 +1946,7 @@ mod retry_tests {
                     start + Duration::from_secs(seconds),
                     rate.parse().unwrap(),
                     None,
+                    None,
                 )
                 .unwrap();
             let current = mining.channels[&1].job().unwrap();
@@ -1884,6 +1961,7 @@ mod retry_tests {
                 Some(job),
                 start + Duration::from_secs(6),
                 "2".parse().unwrap(),
+                None,
                 None,
             )
             .unwrap()
@@ -1916,6 +1994,7 @@ mod retry_tests {
                 start,
                 BchDonation::default(),
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(availability.generation, Some(1));
@@ -1925,6 +2004,7 @@ mod retry_tests {
                 Some(job.clone()),
                 job.valid_until,
                 BchDonation::default(),
+                None,
                 None,
             )
             .unwrap();
@@ -1936,6 +2016,7 @@ mod retry_tests {
                 job.valid_until + Duration::from_secs(2),
                 BchDonation::default(),
                 None,
+                None,
             )
             .unwrap();
         assert!(availability
@@ -1944,6 +2025,7 @@ mod retry_tests {
                 Some(job.clone()),
                 job.valid_until + TEMPLATE_RECOVERY_GRACE,
                 BchDonation::default(),
+                None,
                 None,
             )
             .is_err());
@@ -1955,6 +2037,83 @@ mod retry_tests {
             template_reason("node tip changed while fetching the template"),
             "tip changed during refresh"
         );
+    }
+
+    // #### PR #42
+    // What: under Job Declaration a newer template on the same parent and
+    // plan reaches the channel only once the pool accepted its generation's
+    // custom job; a new parent goes at once, and without Job Declaration
+    // nothing waits.
+    // Look here if: the same-parent gating in JobAvailability changes.
+    #[test]
+    fn same_parent_publishes_wait_for_the_pool_and_new_parents_go_at_once() {
+        use super::super::channel::{Channel, ChannelKind};
+        let start = Instant::now();
+        let payout = super::super::template_tests::payout();
+        let session = || {
+            let mut mining =
+                MiningSession::new(MiningNetwork::Chipnet, payout.clone(), [17; 12], [255; 32])
+                    .unwrap();
+            mining.insert_channel(
+                Channel::new(
+                    1,
+                    ChannelKind::Standard,
+                    [255; 32],
+                    [17; 12],
+                    MiningNetwork::Chipnet,
+                    &payout,
+                )
+                .unwrap(),
+                [255; 32],
+            );
+            mining
+        };
+        let template =
+            Arc::new(BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap());
+        let mut next = super::super::template_tests::rpc_template();
+        next["previousblockhash"] = serde_json::json!("cd".repeat(32));
+        let moved = Arc::new(BchTemplate::from_rpc(&next).unwrap());
+        let job = |generation: u64, template: &Arc<BchTemplate>| PublishedJob {
+            generation,
+            serial: 1 << 32,
+            template: template.clone(),
+            valid_until: start + Duration::from_secs(30),
+        };
+        let none = BchDonation::try_from(0).unwrap();
+        let mut mining = session();
+        let mut availability = JobAvailability::new(0);
+        let offer = |availability: &mut JobAvailability,
+                     mining: &mut MiningSession,
+                     job: PublishedJob,
+                     acknowledged: Option<u64>| {
+            availability
+                .update(mining, Some(job), start, none, None, acknowledged)
+                .unwrap();
+            mining.channels[&1].job().unwrap().generation
+        };
+        assert_eq!(
+            offer(&mut availability, &mut mining, job(1, &template), Some(0)),
+            1,
+            "the first job goes at once"
+        );
+        assert_eq!(
+            offer(&mut availability, &mut mining, job(2, &template), Some(1)),
+            1,
+            "a newer template on the parent waits for the pool"
+        );
+        assert_eq!(
+            offer(&mut availability, &mut mining, job(2, &template), Some(2)),
+            2
+        );
+        assert_eq!(
+            offer(&mut availability, &mut mining, job(3, &moved), Some(2)),
+            3,
+            "a new parent goes at once"
+        );
+        let mut plain = session();
+        let mut alone = JobAvailability::new(0);
+        offer(&mut alone, &mut plain, job(1, &template), None);
+        assert_eq!(offer(&mut alone, &mut plain, job(2, &template), None), 2);
     }
 
     #[test]

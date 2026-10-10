@@ -26,7 +26,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{TcpStream, ToSocketAddrs},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver as Events, RecvTimeoutError, SyncSender},
         Arc, Mutex, RwLock,
     },
@@ -67,6 +67,13 @@ const DECLARE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Declarations refused in a row on one parent before the client falls
 /// back.
 const DECLARE_ATTEMPTS: u8 = 4;
+/// The waits before trying again after failures in a row, as multiples of
+/// the target's `retry` (30 s in use: 30, 60, 120, then 300 s).
+const RETRY_STEPS: [u32; 4] = [1, 2, 4, 10];
+/// The forwarded shares whose verdicts are watched, and how many of them the
+/// pool may reject before the client falls back.
+const REJECT_WINDOW: usize = 20;
+const REJECT_LIMIT: usize = 5;
 
 /// The pool a client declares its templates to.
 #[derive(Clone)]
@@ -109,6 +116,9 @@ pub struct JdClientSummary {
 pub struct JdStatus {
     pub plan: RwLock<Option<Arc<JdPlan>>>,
     pub summary: Mutex<JdClientSummary>,
+    /// The newest local template generation whose custom job the pool
+    /// accepted in this session (0 for none yet).
+    pub acknowledged: AtomicU64,
 }
 
 impl JdStatus {
@@ -142,27 +152,63 @@ pub struct UplinkHandle {
     pub status: Arc<JdStatus>,
 }
 
-/// Starts the uplink; it runs until `stop`.
-pub fn spawn(target: JdTarget, stop: Arc<AtomicBool>) -> (UplinkHandle, thread::JoinHandle<()>) {
+/// Starts the uplink to the first of `targets` (the pools in order); it
+/// runs until `stop`.
+pub fn spawn(
+    targets: Vec<JdTarget>,
+    stop: Arc<AtomicBool>,
+) -> (UplinkHandle, thread::JoinHandle<()>) {
     let (events, receive) = mpsc::sync_channel(EVENTS);
     let status = Arc::new(JdStatus {
         plan: RwLock::new(None),
         summary: Mutex::new(JdClientSummary {
             state: "connecting",
-            mode: target.mode.as_str(),
+            mode: targets
+                .first()
+                .map_or(JdMode::FullTemplate, |target| target.mode)
+                .as_str(),
             ..JdClientSummary::default()
         }),
+        acknowledged: AtomicU64::new(0),
     });
     let shared = status.clone();
     let worker = thread::spawn(move || {
         let mut serial = 0u64;
+        let mut failures = 0u32;
+        let mut next = 0usize;
         while !stop.load(Ordering::Relaxed) {
+            let Some(target) = targets.get(next) else {
+                return;
+            };
             serial += 1;
-            let result = uplink(&target, &shared, &receive, &stop, serial);
+            let custom_jobs = || {
+                shared
+                    .summary
+                    .lock()
+                    .map_or(0, |summary| summary.custom_jobs)
+            };
+            let before = custom_jobs();
+            let result = uplink(target, &shared, &receive, &stop, serial);
             shared.set_plan(None);
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            // #### PR #42: retries back off across the pools
+            // What: after a failure the uplink tries the next pool in order
+            // (wrapping), waiting 30, 60, 120, then 300 seconds as failures
+            // follow each other; a session whose pool accepted custom jobs
+            // starts the count again.
+            // Why: a pool that keeps refusing must not be hammered, and a
+            // second Pickaxe pool can take the templates while the first is
+            // down.
+            // Look here if: the uplink retries too often, or never moves to
+            // the next pool.
+            failures = if custom_jobs() > before {
+                1
+            } else {
+                failures.saturating_add(1)
+            };
+            next = (next + 1) % targets.len();
             // #### PR #42: fallback
             // What: when the pool refuses a custom job (other than for a tip
             // race), the link fails or the pool's terms change, the plan goes:
@@ -176,7 +222,7 @@ pub fn spawn(target: JdTarget, stop: Arc<AtomicBool>) -> (UplinkHandle, thread::
                 summary.fallbacks += 1;
                 summary.last_error = result.err();
             });
-            let until = Instant::now() + target.retry;
+            let until = Instant::now() + retry_after(target.retry, failures);
             while Instant::now() < until && !stop.load(Ordering::Relaxed) {
                 if let Err(RecvTimeoutError::Disconnected) =
                     receive.recv_timeout(Duration::from_millis(100))
@@ -188,6 +234,37 @@ pub fn spawn(target: JdTarget, stop: Arc<AtomicBool>) -> (UplinkHandle, thread::
         }
     });
     (UplinkHandle { events, status }, worker)
+}
+
+/// The wait before the next try after `failures` failures in a row.
+fn retry_after(base: Duration, failures: u32) -> Duration {
+    base * RETRY_STEPS[(failures.max(1) - 1).min(3) as usize]
+}
+
+/// The pool's verdicts on the latest forwarded shares.
+#[derive(Default)]
+struct Verdicts(VecDeque<bool>);
+
+impl Verdicts {
+    // #### PR #42: rejected shares fall back
+    // What: when the pool rejects 5 of the last 20 shares forwarded on
+    // active custom jobs (stale-share and invalid-job-id, races at a new
+    // block, not counted), the client falls back to the pool's own jobs.
+    // Why: shares the pool rejects earn the miner nothing; the pool's own
+    // jobs do.
+    // Look here if: the client falls back while the pool accepts its
+    // shares, or keeps sending shares the pool rejects.
+    /// Records `count` verdicts of one kind; true once 5 of the last 20 are
+    /// rejections.
+    fn record(&mut self, accepted: bool, count: u32) -> bool {
+        for _ in 0..count.min(REJECT_WINDOW as u32) {
+            self.0.push_back(accepted);
+        }
+        while self.0.len() > REJECT_WINDOW {
+            self.0.pop_front();
+        }
+        self.0.iter().filter(|accepted| !**accepted).count() >= REJECT_LIMIT
+    }
 }
 
 /// A template declared to the pool, waiting for its answer.
@@ -272,6 +349,7 @@ fn uplink(
         return Err("the pool's token names outputs it does not list".into());
     }
     tokens.push_back(first.0);
+    status.acknowledged.store(0, Ordering::Relaxed);
     status.set_plan(Some(plan.clone()));
     status.update(|summary| {
         summary.state = "active";
@@ -282,6 +360,7 @@ fn uplink(
     let mut published: VecDeque<(u64, Arc<BchTemplate>)> = VecDeque::new();
     let mut refusals = Refusals::default();
     let mut jobs: VecDeque<(u64, u32)> = VecDeque::new();
+    let mut verdicts = Verdicts::default();
     let mut cache: HashMap<u64, Vec<ForwardShare>> = HashMap::new();
     let mut sequence = 0u32;
     let mut next_request = 1u32;
@@ -399,6 +478,7 @@ fn uplink(
                     while jobs.len() > KEPT_JOBS {
                         jobs.pop_front();
                     }
+                    status.acknowledged.fetch_max(serial, Ordering::Relaxed);
                     status.update(|summary| summary.custom_jobs += 1);
                     for share in cache.remove(&serial).unwrap_or_default() {
                         forward(
@@ -424,10 +504,24 @@ fn uplink(
                         return Err(format!("the pool refused a custom job: {code}"));
                     }
                 }
-                Mining::SubmitSharesSuccess(success) => status.update(|summary| {
-                    summary.accepted += u64::from(success.new_submits_accepted_count)
-                }),
-                Mining::SubmitSharesError(_) => status.update(|summary| summary.rejected += 1),
+                Mining::SubmitSharesSuccess(success) => {
+                    status.update(|summary| {
+                        summary.accepted += u64::from(success.new_submits_accepted_count)
+                    });
+                    verdicts.record(true, success.new_submits_accepted_count);
+                }
+                Mining::SubmitSharesError(error) => {
+                    status.update(|summary| summary.rejected += 1);
+                    let code = String::from_utf8_lossy(error.error_code.as_ref()).into_owned();
+                    if !matches!(code.as_str(), "stale-share" | "invalid-job-id")
+                        && verdicts.record(false, 1)
+                    {
+                        return Err(format!(
+                            "the pool rejected {REJECT_LIMIT} of the last {REJECT_WINDOW} \
+                             shares ({code})"
+                        ));
+                    }
+                }
                 Mining::SetTarget(set) if addressed_to(set.channel_id, channel, group) => {
                     pool_target = <Hash>::try_from(set.maximum_target.as_ref())
                         .map_err(|_| "malformed target")?;
@@ -901,6 +995,43 @@ mod tests {
         assert_eq!(reply.transaction_list[0].as_ref()[0], 2);
         assert_eq!(provide(3, &big, &[0, 1]).err(), Some(Unprovided::TooLarge));
         assert_eq!(provide(3, &big, &[2]).err(), Some(Unprovided::Unknown));
+    }
+
+    // #### PR #42
+    // What: retries wait 30, 60, 120, then 300 seconds as failures follow
+    // each other.
+    // Look here if: retry_after or RETRY_STEPS changes.
+    #[test]
+    fn retries_back_off_across_pools() {
+        let base = Duration::from_secs(30);
+        let waits: Vec<u64> = (1..=6)
+            .map(|failures| retry_after(base, failures).as_secs())
+            .collect();
+        assert_eq!(waits, [30, 60, 120, 300, 300, 300]);
+    }
+
+    // #### PR #42
+    // What: the fifth rejection among the last 20 verdicts falls back;
+    // accepted shares push old rejections out of the window.
+    // Look here if: Verdicts changes.
+    #[test]
+    fn rejections_on_active_jobs_fall_back_after_5_of_20() {
+        let mut verdicts = Verdicts::default();
+        for _ in 0..4 {
+            assert!(!verdicts.record(false, 1));
+        }
+        assert!(verdicts.record(false, 1), "the fifth of 5");
+        let mut spread = Verdicts::default();
+        for _ in 0..4 {
+            assert!(!spread.record(false, 1));
+            assert!(!spread.record(true, 4));
+        }
+        assert!(
+            !spread.record(true, 1),
+            "the oldest rejection left the window"
+        );
+        assert!(!spread.record(false, 1), "4 of the last 20");
+        assert!(spread.record(false, 1), "5 of the last 20");
     }
 
     // #### PR #42

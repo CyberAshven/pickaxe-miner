@@ -69,6 +69,13 @@ pub fn run(
         }
         _ => Vec::new(),
     };
+    // #### PR #42: solo mining's fallback pools.
+    let fallbacks = match &action {
+        StratumV2Command::Serve { fallback_pool, .. } if !fallback_pool.is_empty() => {
+            fallback_upstreams(config, fallback_pool)?
+        }
+        _ => Vec::new(),
+    };
     // #### PR #40
     // A public pool: each miner is paid at the address they connect with,
     // and the operator's fee comes off what the donation leaves.
@@ -232,19 +239,28 @@ pub fn run(
         }
         (None, _) => None,
     };
+    // #### PR #42: the source devices come back to from a pool: the node,
+    // or Job Declaration (see `sv1::Preferred`).
+    let preferred =
+        (declaring || !fallbacks.is_empty()).then(|| Arc::new(super::sv1::Preferred::default()));
     // #### PR #40
     // At a pool the donation is the setting's share of mining time under the
     // donation address, on a second channel at the same pool.
-    let pools: Vec<super::sv1::Upstream> = pools
-        .into_iter()
-        .map(|pool| super::sv1::Upstream {
-            donation: Some(super::sv1::DonationRoute {
-                identity: crate::donation::bch::address(config.network).to_owned(),
-                rate: donation.clone(),
-            }),
-            ..pool
-        })
-        .collect();
+    let at_pools = |pools: Vec<super::sv1::Upstream>| -> Vec<super::sv1::Upstream> {
+        pools
+            .into_iter()
+            .map(|pool| super::sv1::Upstream {
+                donation: Some(super::sv1::DonationRoute {
+                    identity: crate::donation::bch::address(config.network).to_owned(),
+                    rate: donation.clone(),
+                }),
+                prefer: preferred.clone(),
+                ..pool
+            })
+            .collect()
+    };
+    let pools = at_pools(pools);
+    let fallbacks = at_pools(fallbacks);
     let listener = node
         .is_some()
         .then(|| TcpListener::bind(listen))
@@ -306,10 +322,12 @@ pub fn run(
             } else {
                 super::sv1::Upstream::local(local, public)
             }];
-            // #### PR #42: under Job Declaration the pools' own jobs follow.
+            // #### PR #42: under Job Declaration the pools' own jobs follow;
+            // in solo mining, the fallback pools.
             if declaring {
                 list.extend(pools.iter().cloned());
             }
+            list.extend(fallbacks.iter().cloned());
             list
         }
         _ => return Err("mining server unavailable".into()),
@@ -342,6 +360,13 @@ pub fn run(
             })
         }),
         job_declaration: declarator.as_ref().map(|declarator| declarator.accept),
+        fallbacks: (!fallbacks.is_empty()).then(|| {
+            fallbacks
+                .iter()
+                .map(|pool| pool.address.as_str())
+                .collect::<Vec<_>>()
+                .join(" → ")
+        }),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
@@ -353,21 +378,23 @@ pub fn run(
         Some(TerminalSession::enter()?)
     };
     let stats = Arc::new(Mutex::new(ServerStats::default()));
-    // #### PR #42: the Job Declaration uplink to the first pool.
-    let uplink = pools.first().filter(|_| declaring).map(|pool| {
+    // #### PR #42: the Job Declaration uplink, to the pools in order.
+    let mode = match job_declaration {
+        Some(crate::cli::JobDeclarationMode::Coinbase) => super::jd::JdMode::CoinbaseOnly,
+        _ => super::jd::JdMode::FullTemplate,
+    };
+    let uplink = (declaring && !pools.is_empty()).then(|| {
         super::jd::client::spawn(
-            super::jd::client::JdTarget {
-                address: pool.address.clone(),
-                authority: pool.authority,
-                identity: pool.identity.clone(),
-                retry: Duration::from_secs(30),
-                mode: match job_declaration {
-                    Some(crate::cli::JobDeclarationMode::Coinbase) => {
-                        super::jd::JdMode::CoinbaseOnly
-                    }
-                    _ => super::jd::JdMode::FullTemplate,
-                },
-            },
+            pools
+                .iter()
+                .map(|pool| super::jd::client::JdTarget {
+                    address: pool.address.clone(),
+                    authority: pool.authority,
+                    identity: pool.identity.clone(),
+                    retry: Duration::from_secs(30),
+                    mode,
+                })
+                .collect(),
             stop.clone(),
         )
     });
@@ -403,6 +430,7 @@ pub fn run(
                     .map(|_| config_path.with_extension("sv2-jd-blocks.json")),
                 declarator: declarator.clone(),
                 uplink: uplink_handle.clone(),
+                preferred: preferred.clone(),
                 #[cfg(test)]
                 allocation_phase: None,
             };
@@ -895,13 +923,8 @@ fn pool_upstreams(
                     )
                 }
             };
-            let invalid_key = "--upstream-key is not an SV2 authority public key";
-            let decoded =
-                stratum_core::bitcoin::base58::decode_check(&key).map_err(|_| invalid_key)?;
-            let authority: [u8; 32] = match decoded.as_slice() {
-                [1, 0, key @ ..] => key.try_into().map_err(|_| invalid_key)?,
-                _ => return Err(invalid_key.into()),
-            };
+            let authority = authority_key(&key)
+                .map_err(|_| "--upstream-key is not an SV2 authority public key")?;
             Ok(super::sv1::Upstream {
                 address,
                 authority,
@@ -909,6 +932,45 @@ fn pool_upstreams(
                 remote: true,
                 donation: None,
                 public: false,
+                prefer: None,
+            })
+        })
+        .collect()
+}
+
+/// A pool's SV2 authority key from its published base58 form.
+fn authority_key(key: &str) -> Result<[u8; 32], ()> {
+    let decoded = stratum_core::bitcoin::base58::decode_check(key).map_err(|_| ())?;
+    match decoded.as_slice() {
+        [1, 0, key @ ..] => key.try_into().map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+/// #### PR #42: solo mining's fallback pools, each with its key in its
+/// address; devices open their channels there with the payout address.
+fn fallback_upstreams(
+    config: &RuntimeConfig,
+    addresses: &[String],
+) -> Result<Vec<super::sv1::Upstream>, String> {
+    config::validate_payout_address(config.network, &config.payout_address)
+        .map_err(|_| "--fallback-pool needs a valid payout address for the selected network")?;
+    addresses
+        .iter()
+        .map(|address| {
+            let (address, key) = super::split_pool_address(address)
+                .map_err(|error| format!("--fallback-pool: {error}"))?;
+            let key =
+                key.ok_or("give each --fallback-pool with its key: stratum2+tcp://HOST:PORT/KEY")?;
+            Ok(super::sv1::Upstream {
+                address,
+                authority: authority_key(&key)
+                    .map_err(|_| "a --fallback-pool key is not an SV2 authority public key")?,
+                identity: config.payout_address.clone(),
+                remote: true,
+                donation: None,
+                public: false,
+                prefer: None,
             })
         })
         .collect()
@@ -959,6 +1021,8 @@ struct Started {
     fee: Option<(crate::donation::bch::PoolFee, bool)>,
     /// #### PR #42: the Job Declaration modes the pool accepts, if any.
     job_declaration: Option<super::jd::AcceptJd>,
+    /// #### PR #42: solo mining's fallback pools, in order.
+    fallbacks: Option<String>,
 }
 
 /// #### PR #42
@@ -1011,6 +1075,12 @@ fn started_text(started: &Started) -> String {
                  minute\n"
             ));
         }
+    }
+    if let Some(fallbacks) = &started.fallbacks {
+        text.push_str(&format!(
+            "Fallback pools  {fallbacks} (in order), while your node gives no work; devices \
+             come back 30 seconds after it answers again\n"
+        ));
     }
     if !started.pool_tag.is_empty() {
         text.push_str(&format!("Pool name  {}\n", started.pool_tag));
@@ -3298,6 +3368,7 @@ mod tests {
                             false,
                         )),
                         job_declaration: Some(crate::stratum_v2::jd::AcceptJd::Both),
+                        fallbacks: None,
                     }),
                 )
             })
@@ -3337,10 +3408,28 @@ mod tests {
             custom_user: true,
             fee: None,
             job_declaration: None,
+            fallbacks: None,
         });
         assert!(joined.contains("pool.example:3336 → b1.example:3336 (in failover order)"));
         assert!(joined.contains("username: your own"));
         assert!(!joined.contains("Start difficulty"));
+        // #### PR #42: solo mining names its fallback pools.
+        let solo = started_text(&Started {
+            sv2: Some("0.0.0.0:3336".parse().unwrap()),
+            sv1: Some("0.0.0.0:3333".parse().unwrap()),
+            templates: None,
+            start_difficulty: 4096,
+            pool_tag: String::new(),
+            pools: None,
+            custom_user: false,
+            fee: None,
+            job_declaration: None,
+            fallbacks: Some("a.example:3336 → b.example:3336".into()),
+        });
+        assert!(solo.contains(
+            "Fallback pools  a.example:3336 → b.example:3336 (in order), while your node gives \
+             no work"
+        ));
     }
 
     // #### PR #42
