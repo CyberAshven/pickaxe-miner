@@ -259,6 +259,8 @@ pub struct RuntimeConfig {
     /// `PICKAXE_NODE_RPC_USER` + `PICKAXE_NODE_RPC_PASSWORD` so secrets never
     /// need to appear in command history or runtime endpoint identity.
     pub node_url: Option<String>,
+    /// #### PR #42: the node's ZMQ block notices, for the ASIC server.
+    pub node_zmq: NodeZmq,
     /// Preferred network transport for submission/diagnostics.
     pub source: JobSource,
     /// When true, the GPU mining loop is running.
@@ -279,11 +281,28 @@ impl Default for RuntimeConfig {
             payout_address: String::new(),
             fulcrum_url: None,
             node_url: None,
+            node_zmq: NodeZmq::Auto,
             source: JobSource::Fulcrum,
             mining: false,
             generation_id: 0,
         }
     }
+}
+
+// #### PR #42: ZMQ block notices
+// What: where the ASIC server hears of new blocks from its node: bitcoin.conf's
+// zmqpubhashblock for a node on this computer (the default), a tcp:// endpoint
+// on this computer or the home network, or off.
+// Why: a new block reached devices up to a poll late.
+// Look here if: --node-zmq is refused, or the server never connects.
+/// Where the node publishes its new blocks over ZMQ.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NodeZmq {
+    /// bitcoin.conf's, for a node on this computer.
+    #[default]
+    Auto,
+    Off,
+    At(String),
 }
 
 impl RuntimeConfig {
@@ -429,6 +448,33 @@ impl RuntimeConfig {
             self.bump_generation();
             self.node_url = Some(endpoints);
         }
+        Ok(())
+    }
+
+    /// #### PR #42: `auto`, `off`, or tcp://HOST:PORT on this computer or
+    /// the home network.
+    pub fn set_node_zmq(&mut self, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        self.node_zmq = match value.to_ascii_lowercase().as_str() {
+            "off" => NodeZmq::Off,
+            "auto" | "" => NodeZmq::Auto,
+            _ => {
+                let address = value
+                    .strip_prefix("tcp://")
+                    .ok_or("--node-zmq takes tcp://HOST:PORT, auto or off")?
+                    .trim_end_matches('/');
+                let (host, port) = address
+                    .rsplit_once(':')
+                    .ok_or("--node-zmq needs the port, such as tcp://127.0.0.1:28332")?;
+                if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+                    return Err("--node-zmq needs the port, such as tcp://127.0.0.1:28332".into());
+                }
+                if !private_host(host.trim_start_matches('[').trim_end_matches(']')) {
+                    return Err("--node-zmq must be on this computer or your home network".into());
+                }
+                NodeZmq::At(value.to_owned())
+            }
+        };
         Ok(())
     }
 
@@ -2653,6 +2699,27 @@ mod tests {
             assert!(fs::read_to_string(&path).unwrap().contains("secret-pass"));
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // #### PR #42
+    // What: --node-zmq takes auto, off, or a tcp:// endpoint with its port
+    // on this computer or the home network; a public one is refused.
+    // Look here if: set_node_zmq changes.
+    #[test]
+    fn node_zmq_is_local_or_off() {
+        let mut cfg = RuntimeConfig::default();
+        assert_eq!(cfg.node_zmq, NodeZmq::Auto);
+        cfg.set_node_zmq("tcp://127.0.0.1:28332").unwrap();
+        assert_eq!(cfg.node_zmq, NodeZmq::At("tcp://127.0.0.1:28332".into()));
+        cfg.set_node_zmq("tcp://cypherpunkdeb.local:28332").unwrap();
+        cfg.set_node_zmq("OFF").unwrap();
+        assert_eq!(cfg.node_zmq, NodeZmq::Off);
+        assert!(cfg.set_node_zmq("tcp://8.8.8.8:28332").is_err());
+        assert!(cfg.set_node_zmq("tcp://127.0.0.1").is_err());
+        assert!(cfg.set_node_zmq("http://127.0.0.1:28332").is_err());
+        assert_eq!(cfg.node_zmq, NodeZmq::Off);
+        cfg.set_node_zmq("auto").unwrap();
+        assert_eq!(cfg.node_zmq, NodeZmq::Auto);
     }
 
     // #### PR #42

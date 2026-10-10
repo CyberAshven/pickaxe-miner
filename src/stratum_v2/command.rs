@@ -458,6 +458,16 @@ pub fn run(
     let uplink_handle = uplink.as_ref().map(|(handle, _)| handle.clone());
     // #### PR #42: the server's work: the nodes' (or providers') templates,
     // or an ASIC-exclusive token's thread.
+    // #### PR #42: the node's block notices: --node-zmq, or bitcoin.conf's
+    // zmqpubhashblock for a node on this computer.
+    let node_zmq = match (&config.node_zmq, node.is_some()) {
+        (_, false) | (crate::config::NodeZmq::Off, _) => None,
+        (crate::config::NodeZmq::At(url), true) => Some(url.clone()),
+        (crate::config::NodeZmq::Auto, true) => config
+            .custom_node_endpoints()
+            .into_iter()
+            .find_map(crate::node::zmq_block_url),
+    };
     let work = match (node, header_work.as_ref()) {
         (Some((nodes, sources, _)), _) => Some((
             nodes
@@ -513,6 +523,7 @@ pub fn run(
                         .at_least(work.token().donation_minimum)
                 }),
                 header_work: header_work.clone(),
+                node_zmq: node_zmq.clone(),
                 #[cfg(test)]
                 allocation_phase: None,
             };
@@ -693,13 +704,13 @@ pub fn run(
                     )
                 } else {
                     format!(
-                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
+                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}{}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
                     snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
                     snapshot.connection_errors, snapshot.sv1_connection_errors,
-                    snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"),
+                    snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), notices_suffix(&snapshot),
                     bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
                     sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
                     setting_error.map(str::to_owned).unwrap_or_else(|| format!("Authority {}", authority.as_deref().unwrap_or("—"))),
@@ -1944,7 +1955,7 @@ fn status_json(
     donation: BchDonation,
     devices: &[DeviceSnapshot],
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut status = serde_json::json!({
         "network": network,
         // #### PR #42: what devices mine: BCH, or an ASIC-exclusive token.
         "mode": if snapshot.header_token.is_some() { "asic-token" } else { "bch" },
@@ -2024,7 +2035,19 @@ fn status_json(
         "sv1_local_rejected": snapshot.sv1_local_rejected,
         "sessions_started": snapshot.sessions_started,
         "device_details": devices,
-    })
+    });
+    // #### PR #42: the node's ZMQ block notices.
+    status["block_notices"] = serde_json::json!(snapshot.block_notices);
+    status
+}
+
+/// #### PR #42: the node's ZMQ block notices, on the dashboard.
+fn notices_suffix(snapshot: &ServerStats) -> String {
+    snapshot
+        .block_notices
+        .as_ref()
+        .map(|summary| format!(" · ZMQ {summary}"))
+        .unwrap_or_default()
 }
 
 // #### PR #42: the devices file

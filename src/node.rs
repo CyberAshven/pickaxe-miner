@@ -1202,6 +1202,45 @@ fn conf_login(host: &str, port: u16, data_dirs: &[PathBuf]) -> Option<String> {
     None
 }
 
+/// #### PR #42: where a node on this computer publishes its new blocks over
+/// ZMQ: bitcoin.conf's `zmqpubhashblock` for the network whose RPC port the
+/// node answers on, a bind-all address taken as this computer.
+pub fn zmq_block_url(node_url: &str) -> Option<String> {
+    let target = parse_node_rpc_target(node_url).ok()?;
+    conf_zmq(&target.host, target.port, &bchn_data_dirs())
+}
+
+fn conf_zmq(host: &str, port: u16, data_dirs: &[PathBuf]) -> Option<String> {
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        return None;
+    }
+    for dir in data_dirs {
+        let Ok(text) = std::fs::read_to_string(dir.join("bitcoin.conf")) else {
+            continue;
+        };
+        let conf = BchnConf::parse(&text);
+        for (chipnet, default_port) in [(false, 8332), (true, 48332)] {
+            let rpcport = conf
+                .get(chipnet, "rpcport")
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            if rpcport != port {
+                continue;
+            }
+            if let Some(url) = conf.get(chipnet, "zmqpubhashblock") {
+                return Some(url.replacen("://0.0.0.0:", "://127.0.0.1:", 1).replacen(
+                    "://*:",
+                    "://127.0.0.1:",
+                    1,
+                ));
+            }
+        }
+    }
+    None
+}
+
 // #### PR #40
 // With no RPC password set, BCHN writes a fresh cookie (`__cookie__:<hex>`)
 // to `.cookie` in its network's data folder at every start
@@ -2206,6 +2245,38 @@ mod gbt_tests {
             login("http://localhost:48600").as_deref(),
             Some("__cookie__:22cc")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // #### PR #42
+    // What: bitcoin.conf's zmqpubhashblock is found for the network whose
+    // RPC port a node on this computer answers on, a bind-all address taken
+    // as this computer; never for another computer or another port.
+    // Look here if: conf_zmq changes.
+    #[test]
+    fn bitcoin_conf_names_the_zmq_block_notices() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-conf-zmq-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("bitcoin.conf"),
+            "server=1\nzmqpubhashblock=tcp://0.0.0.0:28332\n[chip]\nrpcport=48555\nzmqpubhashblock=tcp://127.0.0.1:28555\n",
+        )
+        .unwrap();
+        let dirs = [dir.clone()];
+        assert_eq!(
+            conf_zmq("127.0.0.1", 8332, &dirs).as_deref(),
+            Some("tcp://127.0.0.1:28332")
+        );
+        assert_eq!(
+            conf_zmq("localhost", 48555, &dirs).as_deref(),
+            Some("tcp://127.0.0.1:28555")
+        );
+        assert_eq!(conf_zmq("192.168.0.5", 8332, &dirs), None);
+        assert_eq!(conf_zmq("127.0.0.1", 9999, &dirs), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

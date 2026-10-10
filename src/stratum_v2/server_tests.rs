@@ -609,6 +609,7 @@ impl Running {
                 .as_ref()
                 .map(|work| work.token().donation_minimum),
             header_work,
+            node_zmq: None,
         };
         let thread = {
             let stop = stop.clone();

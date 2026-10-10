@@ -77,6 +77,8 @@ pub struct ServerConfig {
     /// go to the token worker, and its donation is a share of the work.
     pub header_work: Option<Arc<super::merge::source::HeaderWork>>,
     pub token_donation: Option<crate::donation::TokenDonation>,
+    /// #### PR #42: the node's ZMQ block notices (tcp://HOST:PORT).
+    pub node_zmq: Option<String>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
 }
@@ -99,6 +101,8 @@ pub struct ServerStats {
     pub template_ready: bool,
     pub template_failures: u64,
     pub last_template_error: Option<&'static str>,
+    /// #### PR #42: the node's ZMQ block notices, for the dashboard.
+    pub block_notices: Option<String>,
     pub height: Option<u32>,
     /// #### PR #40: the node templates come from (0 is the first in failover
     /// order), how many nodes there are, and how often the server moved on.
@@ -527,6 +531,12 @@ pub fn run_with(
         }
     }
     let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
+    // #### PR #42: the node's block notices wake the node worker (see
+    // `zmq`).
+    let notices = match config.node_zmq.as_deref() {
+        Some(url) => Some(super::zmq::subscribe(url, wake.clone(), stop.clone())?),
+        None => None,
+    };
     // #### PR #42: the claim worker
     // What: proves each token win the device threads hand on (through a
     // bounded queue they never wait on), saves the proofs and lists them on
@@ -598,6 +608,7 @@ pub fn run_with(
     let tag = config.pool_tag.clone();
     let node_tokens = config.tokens.clone();
     let node_uplink = config.uplink.clone();
+    let node_notices = notices.clone();
     let node = thread::spawn(move || -> Result<(), String> {
         // #### PR #42: what was last offered under Job Declaration.
         let mut offered = Offered::default();
@@ -612,6 +623,7 @@ pub fn run_with(
         // next source.
         let mut generations = Generations::default();
         let mut refreshed = Instant::now() - Duration::from_secs(60);
+        let mut tip_asked = Instant::now() - Duration::from_secs(60);
         let mut retries = RetrySchedule::default();
         let mut relay_retries = RetrySchedule::default();
         let mut declared_retries = RetrySchedule::default();
@@ -759,7 +771,25 @@ pub fn run_with(
                     );
                 }
             }
-            let current = sources[0].1.tip_is_current().unwrap_or(false);
+            // #### PR #42: a block notice refreshes at once; while notices
+            // flow, the node is asked for its tip every 2 s instead of at
+            // every wake (the safety net).
+            let notified = node_notices
+                .as_ref()
+                .is_some_and(|notices| notices.take_fresh());
+            if let Some(notices) = node_notices.as_ref() {
+                if let Ok(mut stats) = node_shared.stats.lock() {
+                    stats.block_notices = Some(notices.summary());
+                }
+            }
+            let current = if notified {
+                false
+            } else if super::zmq::should_ask_tip(node_notices.as_deref(), tip_asked.elapsed()) {
+                tip_asked = Instant::now();
+                sources[0].1.tip_is_current().unwrap_or(false)
+            } else {
+                true
+            };
             if !current || refreshed.elapsed() >= Duration::from_secs(15) {
                 let slot = sources[0].0;
                 match sources[0].1.refresh() {

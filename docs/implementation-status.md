@@ -2245,3 +2245,28 @@ limit, unknown fields, folders and links refused), a saved cookie file
 logging in only at its host and port, and the setup: F with the question
 and the node found added, T listed and searched, C saved, reused and
 removed.
+
+## New blocks over ZMQ (2026-10-10)
+
+#### PR #42 follow-up
+
+The ASIC server subscribes to its node's ZMQ block notices
+(`src/stratum_v2/zmq.rs`): a minimal ZMTP 3.0 SUB with NULL security and no
+dependency (the greeting, READY as a SUB socket, a subscription to
+`hashblock`, then `[topic, hash, sequence]` messages, frames capped at
+64 KiB). Each notice wakes the node worker, which refreshes its template at
+once; while notices flow, the node's tip is asked every 2 s instead of at
+every 250 ms wake. A lost connection is tried again after 1 s, doubling to
+30 s, and the dashboard and status JSON show the state. The endpoint is
+bitcoin.conf's `zmqpubhashblock` for a node on this computer (the network
+whose RPC port the node answers on; a bind-all address is this computer),
+or `--node-zmq tcp://HOST:PORT` on this computer or the home network, or
+`--node-zmq off`.
+
+Evidence: host tests for a fake publisher waking the worker well before the
+next poll (with the tip asked every 2 s while connected), a bad greeting
+left with its reason while polling continues, bitcoin.conf's endpoint per
+network, and the flag's checks.
+
+Not yet: a live run against a Chipnet BCHN with `zmqpubhashblock` (it needs
+a change to the node's container, which waits for the operator's OK).

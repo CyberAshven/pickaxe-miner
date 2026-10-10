@@ -744,6 +744,9 @@ fn runtime_config_from_cli_with_base(
     if let Some(url) = &args.node_rpc {
         cfg.set_node_url(url)?;
     }
+    if let Some(value) = &args.node_zmq {
+        cfg.set_node_zmq(value)?;
+    }
     if let Some(source) = &args.source {
         cfg.set_source(source)?;
     }

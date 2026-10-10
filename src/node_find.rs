@@ -66,7 +66,9 @@ impl Found {
                 url,
                 report: Err(error),
             } => format!("a server at {url} that is not a Fulcrum Pickaxe can use ({error})"),
-            Self::Zmq { url } => format!("ZMQ block notices at {url} (not used yet)"),
+            Self::Zmq { url } => format!(
+                "ZMQ block notices at {url} (the ASIC server listens when bitcoin.conf names them, or with --node-zmq)"
+            ),
         }
     }
 }
@@ -522,7 +524,9 @@ mod tests {
         publisher.join().unwrap();
         assert_eq!(
             found.summary(),
-            format!("ZMQ block notices at tcp://127.0.0.1:{port} (not used yet)")
+            format!(
+                "ZMQ block notices at tcp://127.0.0.1:{port} (the ASIC server listens when bitcoin.conf names them, or with --node-zmq)"
+            )
         );
         // A closed port is not found.
         let closed = TcpListener::bind("127.0.0.1:0").unwrap();

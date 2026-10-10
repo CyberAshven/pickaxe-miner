@@ -44,6 +44,13 @@ pub struct Cli {
     #[arg(long = "node-rpc", alias = "node", global = true)]
     pub node_rpc: Option<String>,
 
+    /// #### PR #42: the node's ZMQ block notices for the ASIC server:
+    /// tcp://HOST:PORT (its zmqpubhashblock) on this computer or the home
+    /// network, `auto` (bitcoin.conf's, for a node on this computer; the
+    /// default) or `off`. A new block then reaches devices at once.
+    #[arg(long = "node-zmq", global = true, value_name = "URL")]
+    pub node_zmq: Option<String>,
+
     /// Fulcrum servers for PHOTON jobs, comma-separated: wss:// or ws://,
     /// or #### PR #42: a home server over plain TCP (tcp://HOST:PORT, such
     /// as tcp://umbrel.local:50001), taken only on this computer or the home

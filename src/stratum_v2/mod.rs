@@ -58,6 +58,8 @@ pub mod transport;
 pub mod wire;
 #[cfg(feature = "stratum-v2")]
 mod work_allocation;
+#[cfg(feature = "stratum-v2")]
+pub mod zmq;
 
 pub use bch::{
     asert_target_required, cashaddr_payouts_required, ctor_full_templates_required,
