@@ -104,6 +104,9 @@ pub struct ServerOptions {
     pub rig_name: Option<String>,
     pub rig_port: Option<u16>,
     pub rigs_only: bool,
+    /// #### PR #42: the node's ZMQ block notices: `off` or tcp://HOST:PORT;
+    /// `None` is bitcoin.conf's for a node on this computer.
+    pub node_zmq: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -122,6 +125,7 @@ impl Default for ServerOptions {
             rig_name: None,
             rig_port: None,
             rigs_only: false,
+            node_zmq: None,
         }
     }
 }
@@ -500,6 +504,8 @@ enum SettingsRow {
     Sv2Port,
     /// Serving this node's templates to SV2 pools and P2Pool.
     Templates,
+    /// #### PR #42: the node's ZMQ block notices.
+    NodeZmq,
     /// Backup pools for Join a pool, in failover order.
     Backups,
     /// The username at the pool (the payout address by default).
@@ -552,6 +558,8 @@ enum TextField {
     /// file.
     Computer,
     CookieFile,
+    /// #### PR #42: the node's ZMQ block notices.
+    NodeZmq,
 }
 
 /// What an ASIC can mine: BCH (merge-mined tokens as they appear), or an
@@ -622,6 +630,9 @@ struct SetupFlow {
     rig_port: Option<u16>,
     rigs_only: bool,
     rig_name: String,
+    /// #### PR #42: the node's ZMQ block notices: empty for bitcoin.conf's,
+    /// `off`, or tcp://HOST:PORT.
+    node_zmq: String,
     token_input: String,
     token_selected: usize,
     settings_row: usize,
@@ -797,6 +808,7 @@ impl SetupFlow {
             rig_port: None,
             rigs_only: false,
             rig_name: String::new(),
+            node_zmq: String::new(),
             token_input: String::new(),
             token_selected: 0,
             settings_row: 0,
@@ -1416,6 +1428,7 @@ impl SetupFlow {
                     .into_iter()
                     .chain([SettingsRow::JobDeclaration])
                     .chain(self.job_declaration.map(|_| SettingsRow::Node))
+                    .chain(self.job_declaration.map(|_| SettingsRow::NodeZmq))
                     .chain([SettingsRow::Donation, SettingsRow::Sv1Port])
                     .collect(),
             ),
@@ -1432,6 +1445,7 @@ impl SetupFlow {
                     SettingsRow::Sv1Port,
                     SettingsRow::Sv2Port,
                     SettingsRow::Templates,
+                    SettingsRow::NodeZmq,
                     SettingsRow::FallbackPools,
                     SettingsRow::Fulcrum,
                 ],
@@ -1467,6 +1481,7 @@ impl SetupFlow {
                     SettingsRow::Sv1Port,
                     SettingsRow::Sv2Port,
                     SettingsRow::Templates,
+                    SettingsRow::NodeZmq,
                     SettingsRow::AcceptJd,
                     SettingsRow::Donation,
                 ],
@@ -1522,6 +1537,7 @@ impl SetupFlow {
             backups: self.backups.clone(),
             pool_user: Some(self.pool_user.trim().to_owned()).filter(|user| !user.is_empty()),
             template_port: self.template_port,
+            node_zmq: Some(self.node_zmq.trim().to_owned()).filter(|value| !value.is_empty()),
             job_declaration: self.job_declaration,
             accept_job_declaration: self.accept_jd,
             fallback_pools: self.fallback_pools.clone(),
@@ -1690,6 +1706,7 @@ impl SetupFlow {
             rig_name: None,
             rig_port: None,
             rigs_only: false,
+            node_zmq: None,
         };
         // #### PR #42: GPUs coordinating the operator's own rigs.
         if self.mode == MiningMode::Gpu && !self.gpu_join {
@@ -1709,13 +1726,22 @@ impl SetupFlow {
                 rig_name: options.rig_name.clone(),
                 ..joining(SavedMode::GpuRig)
             },
-            ServerSetup::JoinPool { .. } => joining(SavedMode::AsicJoin),
+            // #### PR #42: Job Declaration builds jobs from the node, so its
+            // block notices are kept with it.
+            ServerSetup::JoinPool { .. } => SavedServer {
+                node_zmq: options
+                    .node_zmq
+                    .clone()
+                    .filter(|_| options.job_declaration.is_some()),
+                ..joining(SavedMode::AsicJoin)
+            },
             ServerSetup::Solo => SavedServer {
                 join: None,
                 join_key: None,
                 backups: Vec::new(),
                 pool_user: None,
                 tp_port: options.template_port.filter(|_| bch),
+                node_zmq: options.node_zmq.clone().filter(|_| bch),
                 fallback_pools: if bch {
                     options.fallback_pools.clone()
                 } else {
@@ -1751,6 +1777,7 @@ impl SetupFlow {
                 backups: Vec::new(),
                 pool_user: None,
                 tp_port: options.template_port,
+                node_zmq: options.node_zmq.clone(),
                 accept_job_declaration: options.accept_job_declaration,
                 ..joining(SavedMode::AsicPool)
             },
@@ -1785,6 +1812,7 @@ impl SetupFlow {
         self.rig_port = None;
         self.rigs_only = false;
         self.rig_name.clear();
+        self.node_zmq.clear();
         let Some(server) = server else {
             self.mode = MiningMode::Gpu;
             return;
@@ -1825,6 +1853,7 @@ impl SetupFlow {
         self.job_declaration = server.job_declaration;
         self.accept_jd = server.accept_job_declaration;
         self.fallback_pools = server.fallback_pools.clone();
+        self.node_zmq = server.node_zmq.clone().unwrap_or_default();
         // #### PR #42: a token no longer registered leaves the list empty or
         // on its first token; Start then says so.
         if let Some(name) = &server.asic_token {
@@ -2282,6 +2311,14 @@ impl SetupFlow {
                         self.start_difficulty = step_difficulty(self.start_difficulty, forward)
                     }
                     SettingsRow::Templates => self.toggle_templates(),
+                    // #### PR #42: block notices from bitcoin.conf, or off.
+                    SettingsRow::NodeZmq => {
+                        self.node_zmq = if self.node_zmq.is_empty() {
+                            "off".into()
+                        } else {
+                            String::new()
+                        };
+                    }
                     SettingsRow::JobDeclaration => self.cycle_job_declaration(forward),
                     SettingsRow::AcceptJd => self.cycle_accept_jd(forward),
                     // #### PR #42: the token, and its donation from its
@@ -2317,6 +2354,10 @@ impl SetupFlow {
                 // #### PR #42: the Advanced section.
                 SettingsRow::Advanced => self.toggle_advanced(),
                 SettingsRow::Templates => self.toggle_templates(),
+                SettingsRow::NodeZmq => {
+                    let value = self.node_zmq.clone();
+                    self.begin_edit(TextField::NodeZmq, value);
+                }
                 SettingsRow::JobDeclaration => self.cycle_job_declaration(true),
                 SettingsRow::AcceptJd => self.cycle_accept_jd(true),
                 SettingsRow::FallbackPools => {
@@ -2883,6 +2924,15 @@ impl SetupFlow {
                     return Err("use up to 255 printable characters".into());
                 }
                 self.pool_user = value;
+                Ok(String::new())
+            }
+            // #### PR #42: the node's ZMQ block notices.
+            TextField::NodeZmq => {
+                self.node_zmq = match crate::config::parse_node_zmq(&value)? {
+                    crate::config::NodeZmq::Auto => String::new(),
+                    crate::config::NodeZmq::Off => "off".into(),
+                    crate::config::NodeZmq::At(url) => url,
+                };
                 Ok(String::new())
             }
             // #### PR #42: another computer, searched on a thread.
@@ -4895,6 +4945,19 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     Some(port) => Span::raw(format!(
                         "on, port {port}: SV2 pools and P2Pool take this node's templates"
                     )),
+                },
+                "< > [Enter]",
+            ),
+            // #### PR #42: the node's ZMQ block notices.
+            SettingsRow::NodeZmq => (
+                "Block notices",
+                match state.node_zmq.as_str() {
+                    _ if state.editing == Some(TextField::NodeZmq) => {
+                        Span::raw(format!("{}_", state.text_input))
+                    }
+                    "" => dim("from bitcoin.conf (zmqpubhashblock) for a node on this PC"),
+                    "off" => dim("off; the server asks the node for new blocks"),
+                    url => Span::raw(format!("{url}: new blocks reach devices at once")),
                 },
                 "< > [Enter]",
             ),
@@ -7068,6 +7131,66 @@ mod tests {
         setup.join_key = "KEY".into();
         assert!(!setup.settings_rows().contains(&SettingsRow::Templates));
         assert_eq!(setup.saved_server().unwrap().tp_port, None);
+    }
+
+    // #### PR #42
+    // What: ZMQ block notices are an Advanced row of solo, ASIC-pool and
+    // Job Declaration setups: bitcoin.conf's by default, off with Left/Right,
+    // or a typed tcp:// endpoint on this computer or the home network (a
+    // public one is refused); a profile keeps it, a plain joining profile
+    // never does.
+    // Look here if: the NodeZmq row or its saving changes.
+    #[test]
+    fn block_notices_are_an_advanced_row_saved_with_the_profile() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.open_settings(SettingsRow::NodeZmq);
+        assert!(setup.advanced_open);
+        assert!(setup_text(&setup).contains("from bitcoin.conf (zmqpubhashblock)"));
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.node_zmq, "off");
+        assert_eq!(setup.server_options().node_zmq.as_deref(), Some("off"));
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.server_options().node_zmq, None);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "tcp://8.8.8.8:28332");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("home network"),
+            "{}",
+            setup.status_line
+        );
+        setup.text_input.clear();
+        type_text(&mut setup, "tcp://192.168.0.55:28332");
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.editing, None);
+        assert!(setup_text(&setup)
+            .contains("tcp://192.168.0.55:28332: new blocks reach devices at once"));
+        let saved = setup.saved_server().unwrap();
+        assert_eq!(saved.node_zmq.as_deref(), Some("tcp://192.168.0.55:28332"));
+        SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(saved.clone()),
+            ..SavedConfig::default()
+        }
+        .validate()
+        .unwrap();
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!(reopened.node_zmq, "tcp://192.168.0.55:28332");
+        let mut pool = setup_for(MiningMode::Pool);
+        pool.advanced_open = true;
+        assert!(pool.settings_rows().contains(&SettingsRow::NodeZmq));
+        setup.asic_mining = AsicMining::JoinPool;
+        setup.join_address = "pool.example:3336".into();
+        setup.join_key = "KEY".into();
+        assert!(!setup.settings_rows().contains(&SettingsRow::NodeZmq));
+        assert_eq!(setup.saved_server().unwrap().node_zmq, None);
+        setup.job_declaration = Some(crate::config::SavedDeclaration::Full);
+        assert!(setup.settings_rows().contains(&SettingsRow::NodeZmq));
+        assert_eq!(
+            setup.saved_server().unwrap().node_zmq.as_deref(),
+            Some("tcp://192.168.0.55:28332")
+        );
     }
 
     /// #### PR #42: the serve command's Job Declaration, accepted modes and

@@ -305,6 +305,36 @@ pub enum NodeZmq {
     At(String),
 }
 
+/// #### PR #42: `auto` (or empty), `off`, or tcp://HOST:PORT on this
+/// computer or the home network.
+pub fn parse_node_zmq(value: &str) -> Result<NodeZmq, String> {
+    let value = value.trim();
+    Ok(match value.to_ascii_lowercase().as_str() {
+        "off" => NodeZmq::Off,
+        "auto" | "" => NodeZmq::Auto,
+        _ => {
+            let address = value
+                .strip_prefix("tcp://")
+                .ok_or("ZMQ block notices take tcp://HOST:PORT, auto or off")?
+                .trim_end_matches('/');
+            let (host, port) = address
+                .rsplit_once(':')
+                .ok_or("ZMQ block notices need the port, such as tcp://127.0.0.1:28332")?;
+            if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+                return Err(
+                    "ZMQ block notices need the port, such as tcp://127.0.0.1:28332".into(),
+                );
+            }
+            if !private_host(host.trim_start_matches('[').trim_end_matches(']')) {
+                return Err(
+                    "ZMQ block notices must come from this computer or your home network".into(),
+                );
+            }
+            NodeZmq::At(value.to_owned())
+        }
+    })
+}
+
 impl RuntimeConfig {
     /// #### PR #32: the token donation in effect, never below the minimum.
     pub fn token_donation(&self) -> crate::donation::TokenDonation {
@@ -454,27 +484,7 @@ impl RuntimeConfig {
     /// #### PR #42: `auto`, `off`, or tcp://HOST:PORT on this computer or
     /// the home network.
     pub fn set_node_zmq(&mut self, value: &str) -> Result<(), String> {
-        let value = value.trim();
-        self.node_zmq = match value.to_ascii_lowercase().as_str() {
-            "off" => NodeZmq::Off,
-            "auto" | "" => NodeZmq::Auto,
-            _ => {
-                let address = value
-                    .strip_prefix("tcp://")
-                    .ok_or("--node-zmq takes tcp://HOST:PORT, auto or off")?
-                    .trim_end_matches('/');
-                let (host, port) = address
-                    .rsplit_once(':')
-                    .ok_or("--node-zmq needs the port, such as tcp://127.0.0.1:28332")?;
-                if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
-                    return Err("--node-zmq needs the port, such as tcp://127.0.0.1:28332".into());
-                }
-                if !private_host(host.trim_start_matches('[').trim_end_matches(']')) {
-                    return Err("--node-zmq must be on this computer or your home network".into());
-                }
-                NodeZmq::At(value.to_owned())
-            }
-        };
+        self.node_zmq = parse_node_zmq(value)?;
         Ok(())
     }
 
@@ -900,11 +910,25 @@ pub struct SavedServer {
     /// A GPU farm's coordinator mines with its rigs only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rigs_only: bool,
+    /// #### PR #42: an ASIC server's ZMQ block notices: `off` or
+    /// tcp://HOST:PORT; left out, bitcoin.conf's for a node on this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_zmq: Option<String>,
 }
 
 impl SavedServer {
     /// Rejects values the setup would refuse for this mode on `network`.
     pub fn validate(&self, network: MiningNetwork) -> Result<(), String> {
+        // #### PR #42: block notices only where the server has a node.
+        if let Some(value) = &self.node_zmq {
+            parse_node_zmq(value)?;
+            if !matches!(
+                self.mode,
+                SavedMode::AsicSolo | SavedMode::AsicJoin | SavedMode::AsicPool
+            ) {
+                return Err("only an ASIC profile saves ZMQ block notices".into());
+            }
+        }
         let join = self.join.as_deref().map(str::trim).unwrap_or("");
         if self.mode.joins() {
             if join.is_empty() {
@@ -2331,6 +2355,7 @@ mod tests {
             rig_name: None,
             rig_port: None,
             rigs_only: false,
+            node_zmq: None,
         };
         with(pool.clone()).validate().unwrap();
         let text = serde_json::to_string(&with(pool.clone())).unwrap();
@@ -2358,6 +2383,7 @@ mod tests {
             rig_name: None,
             rig_port: None,
             rigs_only: false,
+            node_zmq: None,
         };
         with(joining.clone()).validate().unwrap();
         // #### PR #42: Job Declaration and fallback pools round trip.
@@ -2720,6 +2746,15 @@ mod tests {
         assert_eq!(cfg.node_zmq, NodeZmq::Off);
         cfg.set_node_zmq("auto").unwrap();
         assert_eq!(cfg.node_zmq, NodeZmq::Auto);
+        // A profile saves them only for an ASIC server.
+        let mut server: SavedServer =
+            serde_json::from_str(r#"{"mode": "asic-solo", "node_zmq": "off"}"#).unwrap();
+        server.validate(MiningNetwork::Chipnet).unwrap();
+        server.node_zmq = Some("tcp://8.8.8.8:28332".into());
+        assert!(server.validate(MiningNetwork::Chipnet).is_err());
+        server.node_zmq = Some("off".into());
+        server.mode = SavedMode::GpuFarm;
+        assert!(server.validate(MiningNetwork::Chipnet).is_err());
     }
 
     // #### PR #42

@@ -2261,12 +2261,15 @@ every 250 ms wake. A lost connection is tried again after 1 s, doubling to
 bitcoin.conf's `zmqpubhashblock` for a node on this computer (the network
 whose RPC port the node answers on; a bind-all address is this computer),
 or `--node-zmq tcp://HOST:PORT` on this computer or the home network, or
-`--node-zmq off`.
+`--node-zmq off`. The setup's ASIC Advanced section has the same choice as
+its "Block notices" row (solo, ASIC pools, and Job Declaration), saved with
+the profile; a `--node-zmq` on the command line wins.
 
 Evidence: host tests for a fake publisher waking the worker well before the
 next poll (with the tip asked every 2 s while connected), a bad greeting
 left with its reason while polling continues, bitcoin.conf's endpoint per
-network, and the flag's checks.
+network, the flag's checks, and the setup row (off, a typed endpoint, a
+public one refused, kept by the profile).
 
 Not yet: a live run against a Chipnet BCHN with `zmqpubhashblock` (it needs
 a change to the node's container, which waits for the operator's OK).

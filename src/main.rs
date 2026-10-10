@@ -1909,10 +1909,19 @@ fn main() {
                                 // Started above, as a GPU coordinator or rig.
                                 unreachable!()
                             };
+                            // #### PR #42: the profile's ZMQ block notices,
+                            // unless the command line names its own.
+                            let mut run_config = setup.config.clone();
+                            if let (None, Some(value)) = (&args.node_zmq, &setup.options.node_zmq) {
+                                if let Err(error) = run_config.set_node_zmq(value) {
+                                    eprintln!("error: {error}");
+                                    exit_after_error(2);
+                                }
+                            }
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(
                                 action,
-                                &setup.config,
+                                &run_config,
                                 &config_path,
                                 false,
                                 false,
