@@ -750,6 +750,9 @@ pub enum SavedMode {
     AsicPool,
     /// A public GPU pool for other miners' rigs.
     GpuPool,
+    /// #### PR #42: this computer's GPUs coordinate the operator's own rigs
+    /// (a farm), and may mine too.
+    GpuFarm,
 }
 
 impl SavedMode {
@@ -840,6 +843,17 @@ pub struct SavedServer {
     /// by its registry name; left out, BCH.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asic_token: Option<String>,
+    /// #### PR #42: a GPU rig's name on its coordinator's dashboard; left
+    /// out, the computer's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig_name: Option<String>,
+    /// The port a GPU farm's or GPU pool's rigs join on; left out, 3340 for
+    /// a pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig_port: Option<u16>,
+    /// A GPU farm's coordinator mines with its rigs only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rigs_only: bool,
 }
 
 impl SavedServer {
@@ -886,7 +900,14 @@ impl SavedServer {
             || !self.backups.is_empty()
             || self.pool_user.is_some()
             || self.tp_port.is_some();
-        if advanced && !asic {
+        // #### PR #42: a GPU rig keeps backup coordinators.
+        let rig_backups = self.mode == SavedMode::GpuRig
+            && self.sv1_port.is_none()
+            && self.sv2_port.is_none()
+            && self.start_difficulty.is_none()
+            && self.pool_user.is_none()
+            && self.tp_port.is_none();
+        if advanced && !asic && !rig_backups {
             return Err(
                 "only an ASIC server saves ports, a start difficulty or backup pools".into(),
             );
@@ -919,12 +940,37 @@ impl SavedServer {
         {
             return Err("a start difficulty is 1 to 2^48".into());
         }
-        if self.mode != SavedMode::AsicJoin
-            && (!self.backups.is_empty() || self.pool_user.is_some())
+        if (!matches!(self.mode, SavedMode::AsicJoin | SavedMode::GpuRig)
+            && !self.backups.is_empty())
+            || (self.mode != SavedMode::AsicJoin && self.pool_user.is_some())
         {
             return Err(
                 "only a profile that joins a pool saves backup pools or a pool username".into(),
             );
+        }
+        // #### PR #42: the GPU farm's, rig's and GPU pool's own values.
+        if self.rig_name.is_some() && self.mode != SavedMode::GpuRig {
+            return Err("only a GPU rig saves a rig name".into());
+        }
+        if self.rig_name.as_deref().is_some_and(|name| {
+            name.trim().is_empty()
+                || name.chars().count() > 64
+                || name.chars().any(char::is_control)
+        }) {
+            return Err("a rig name is 1 to 64 printable characters".into());
+        }
+        if self.rig_port.is_some() && !matches!(self.mode, SavedMode::GpuFarm | SavedMode::GpuPool)
+        {
+            return Err("only a GPU farm or GPU pool saves the port rigs join on".into());
+        }
+        if self.rig_port == Some(0) {
+            return Err("the rigs' port is 1 to 65535".into());
+        }
+        if self.mode == SavedMode::GpuFarm && self.rig_port.is_none() {
+            return Err("a GPU farm saves the port its rigs join on".into());
+        }
+        if self.rigs_only && self.mode != SavedMode::GpuFarm {
+            return Err("only a GPU farm mines with its rigs only".into());
         }
         if self.backups.len() > 8
             || self.backups.iter().any(|pool| {
@@ -2127,6 +2173,9 @@ mod tests {
             accept_job_declaration: Some(SavedAccept::Both),
             fallback_pools: Vec::new(),
             asic_token: None,
+            rig_name: None,
+            rig_port: None,
+            rigs_only: false,
         };
         with(pool.clone()).validate().unwrap();
         let text = serde_json::to_string(&with(pool.clone())).unwrap();
@@ -2151,6 +2200,9 @@ mod tests {
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
             asic_token: None,
+            rig_name: None,
+            rig_port: None,
+            rigs_only: false,
         };
         with(joining.clone()).validate().unwrap();
         // #### PR #42: Job Declaration and fallback pools round trip.
@@ -2340,6 +2392,45 @@ mod tests {
                     ..token.clone()
                 },
                 "a blank token name",
+            ),
+            (
+                SavedServer {
+                    rig_name: Some("rack".into()),
+                    ..joining.clone()
+                },
+                "a rig name on ASICs joining a pool",
+            ),
+            (
+                SavedServer {
+                    rig_port: Some(3340),
+                    ..joining.clone()
+                },
+                "a rigs' port on ASICs joining a pool",
+            ),
+            (
+                SavedServer {
+                    mode: SavedMode::GpuFarm,
+                    join: None,
+                    backups: Vec::new(),
+                    pool_user: None,
+                    job_declaration: None,
+                    rig_port: None,
+                    ..joining.clone()
+                },
+                "a GPU farm without its port",
+            ),
+            (
+                SavedServer {
+                    mode: SavedMode::GpuPool,
+                    join: None,
+                    backups: Vec::new(),
+                    pool_user: None,
+                    job_declaration: None,
+                    pool_fee: Some("1".parse().unwrap()),
+                    rigs_only: true,
+                    ..joining.clone()
+                },
+                "rigs only on a GPU pool",
             ),
         ] {
             assert!(with(bad).validate().is_err(), "{why}");

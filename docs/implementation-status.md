@@ -2170,3 +2170,24 @@ parsing as `mine`, the three formats from one fixture for a miner, a
 coordinator and a rig, stale and missing statuses, GPUs without a bus, the
 coordinator pairing, the relaunch guard, the status fields, the rig's status
 and the watch's rig view. Not yet run on a farm system.
+
+## GPU rows in the setup's Advanced section (2026-10-10)
+
+#### PR #42
+
+The setup's Advanced section now covers the GPU modes: GPU mining alone can
+coordinate the operator's own rigs (a rig port, and "only the rigs mine"),
+a rig takes backup coordinators (each with its key, in order) and its name,
+and a GPU pool its fee address and port; every GPU mode has the token
+donation row (never below the token's minimum). Profiles keep the values
+(a new `gpu-farm` mode; rig name, rig port and rigs only, each refused
+outside its mode) and the profile list names a farm and an ASIC token. What
+a GPU setup starts is now one tested function (`tui::gpu_launch`) instead of
+code in `main.rs` with one coordinator, no name and port 3340 hard-coded.
+A running coordinator's Advanced page shows where rigs join, a public pool's
+fee and whether this PC only coordinates.
+
+Evidence: host tests for the rows per mode, the port and rigs-only rows,
+the rig name and backup coordinators, the profiles (farm, rig, pool) kept
+and reopened and refused outside their mode, the launch each setup makes,
+the token donation row's minimum and steps, and the Advanced page's lines.

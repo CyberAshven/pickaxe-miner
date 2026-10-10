@@ -1848,16 +1848,19 @@ fn main() {
                     // --rigs-public` would.
                     // #### PR #40: Join a GPU pool or farm: these GPUs mine as a
                     // rig of its coordinator, as `--coordinator` does.
-                    if let Some(tui::ServerSetup::JoinGpuPool { address, key }) =
-                        setup.server.clone()
-                    {
+                    // #### PR #42: the backup coordinators, the rig's name and
+                    // the rigs' port from the Advanced section
+                    // (`tui::gpu_launch`).
+                    let launch = tui::gpu_launch(setup.server.as_ref(), &setup.options);
+                    if let Some(tui::GpuLaunch::Rig { coordinators, name }) = &launch {
                         println!(
-                            "Mining as a rig of {address} on {} GPU(s); Ctrl+C stops.",
+                            "Mining as a rig of {} on {} GPU(s); Ctrl+C stops.",
+                            coordinators[0].0,
                             setup.gpus.len()
                         );
                         run_as_rig(
-                            &[(address, key)],
-                            None,
+                            coordinators,
+                            name.as_deref(),
                             &setup.config.payout_address,
                             &setup.gpus,
                             setup.config.intensity,
@@ -1866,12 +1869,20 @@ fn main() {
                         );
                         return;
                     }
-                    if let Some(tui::ServerSetup::GpuPool { fee, address }) = setup.server.clone() {
-                        rigs_listen = Some(std::net::SocketAddr::from(([0, 0, 0, 0], 3340)));
-                        rigs_public = true;
-                        rigs_fee = Some(fee);
-                        rigs_fee_address = address;
-                        (setup.config, Vec::new(), Some(setup.profile_name))
+                    if let Some(tui::GpuLaunch::Rigs {
+                        port,
+                        public,
+                        rigs_only,
+                    }) = launch
+                    {
+                        rigs_listen = Some(std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+                        if let Some((fee, address)) = public {
+                            rigs_public = true;
+                            rigs_fee = Some(fee);
+                            rigs_fee_address = address;
+                        }
+                        let gpus = if rigs_only { Vec::new() } else { setup.gpus };
+                        (setup.config, gpus, Some(setup.profile_name))
                     } else {
                         // #### PR #40
                         // ASIC mode from setup runs the BCH ASIC server for devices

@@ -98,6 +98,12 @@ pub struct ServerOptions {
     pub fallback_pools: Vec<String>,
     /// An ASIC-exclusive token solo mining mines instead of BCH, by name.
     pub asic_token: Option<String>,
+    /// #### PR #42: a GPU rig's name (`None`: the computer's), the port a
+    /// GPU farm's or pool's rigs join on (`None`: no farm, or 3340 for a
+    /// pool), and whether a farm's coordinator mines with its rigs only.
+    pub rig_name: Option<String>,
+    pub rig_port: Option<u16>,
+    pub rigs_only: bool,
 }
 
 impl Default for ServerOptions {
@@ -113,9 +119,77 @@ impl Default for ServerOptions {
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
             asic_token: None,
+            rig_name: None,
+            rig_port: None,
+            rigs_only: false,
         }
     }
 }
+
+// #### PR #42: what a GPU setup starts
+// What: a GPU setup mines as a rig of its coordinator and the backup
+// coordinators (with its rig name), coordinates rigs as a public GPU pool on
+// its port, coordinates the operator's own rigs as a farm (mining here too
+// unless rigs only), or mines alone.
+// Why: main.rs hard-coded one coordinator, no rig name and port 3340, and
+// nothing reached it from the Advanced section.
+// Look here if: a GPU setup row has no effect when mining starts.
+/// The port rigs join a GPU pool or farm on, unless set.
+pub const DEFAULT_RIG_PORT: u16 = 3340;
+
+/// What a GPU setup starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuLaunch {
+    /// Mine as a rig of these coordinators (address and key), in order.
+    Rig {
+        coordinators: Vec<(String, String)>,
+        name: Option<String>,
+    },
+    /// Coordinate rigs on this port: a public pool with its fee and fee
+    /// address, or the operator's farm, mining here too unless rigs only.
+    Rigs {
+        port: u16,
+        public: Option<(crate::donation::bch::BchDonation, Option<String>)>,
+        rigs_only: bool,
+    },
+    /// Mine on this computer's GPUs alone.
+    Alone,
+}
+
+/// The GPU launch a setup's server choice and options make; `None` for an
+/// ASIC setup.
+pub fn gpu_launch(server: Option<&ServerSetup>, options: &ServerOptions) -> Option<GpuLaunch> {
+    Some(match server {
+        Some(ServerSetup::JoinGpuPool { address, key }) => {
+            let mut coordinators = vec![(address.clone(), key.clone())];
+            coordinators.extend(options.backups.iter().filter_map(|backup| {
+                match crate::stratum_v2::split_pool_address(backup) {
+                    Ok((address, Some(key))) => Some((address, key)),
+                    _ => None,
+                }
+            }));
+            GpuLaunch::Rig {
+                coordinators,
+                name: options.rig_name.clone(),
+            }
+        }
+        Some(ServerSetup::GpuPool { fee, address }) => GpuLaunch::Rigs {
+            port: options.rig_port.unwrap_or(DEFAULT_RIG_PORT),
+            public: Some((*fee, address.clone())),
+            rigs_only: true,
+        },
+        Some(_) => return None,
+        None => match options.rig_port {
+            Some(port) => GpuLaunch::Rigs {
+                port,
+                public: None,
+                rigs_only: options.rigs_only,
+            },
+            None => GpuLaunch::Alone,
+        },
+    })
+}
+// #### end PR #42 ####
 
 // #### PR #42: ASIC-exclusive tokens in the setup
 // What: the setup lists the network's ASIC-exclusive tokens (none is
@@ -435,9 +509,14 @@ enum SettingsRow {
     /// An ASIC pool accepting its miners' own templates.
     AcceptJd,
     /// #### PR #42: the ASIC-exclusive token mined instead of BCH, and its
-    /// donation.
+    /// donation (in the GPU modes, the GPU token's).
     AsicToken,
     TokenDonation,
+    /// #### PR #42: the port a GPU farm's or pool's rigs join on, whether a
+    /// farm's coordinator mines with its rigs only, and a rig's name.
+    RigPort,
+    RigsOnly,
+    RigName,
     Address,
     Intensity,
     Fulcrum,
@@ -464,6 +543,8 @@ enum TextField {
     Backups,
     PoolUser,
     FallbackPools,
+    RigPort,
+    RigName,
 }
 
 /// What an ASIC can mine: BCH (merge-mined tokens as they appear), or an
@@ -528,6 +609,12 @@ struct SetupFlow {
     asic_token: usize,
     /// The network's ASIC-exclusive tokens; tests replace the list.
     asic_tokens: fn(MiningNetwork) -> Vec<AsicToken>,
+    /// #### PR #42: the GPU farm's or pool's rigs' port (`None`: no farm,
+    /// or 3340 for a pool), rigs only, and a rig's name (empty: the
+    /// computer's).
+    rig_port: Option<u16>,
+    rigs_only: bool,
+    rig_name: String,
     token_input: String,
     token_selected: usize,
     settings_row: usize,
@@ -644,6 +731,9 @@ impl SetupFlow {
             fallback_pools: Vec::new(),
             asic_token: 0,
             asic_tokens: registered_asic_tokens,
+            rig_port: None,
+            rigs_only: false,
+            rig_name: String::new(),
             token_input: String::new(),
             token_selected: 0,
             settings_row: 0,
@@ -911,26 +1001,35 @@ impl SetupFlow {
     fn settings_rows(&self) -> Vec<SettingsRow> {
         match self.mode {
             // #### PR #40: a rig takes its jobs from its coordinator.
-            MiningMode::Gpu if self.gpu_join => vec![
-                SettingsRow::Gpu,
-                SettingsRow::Mining,
-                SettingsRow::PoolAddress,
-                SettingsRow::PoolKey,
-                SettingsRow::Address,
-                SettingsRow::Intensity,
-                SettingsRow::ProfileName,
-                SettingsRow::Start,
-            ],
-            MiningMode::Gpu => vec![
-                SettingsRow::Gpu,
-                SettingsRow::Mining,
-                SettingsRow::Address,
-                SettingsRow::Intensity,
-                SettingsRow::Fulcrum,
-                SettingsRow::Node,
-                SettingsRow::ProfileName,
-                SettingsRow::Start,
-            ],
+            // #### PR #42: its backup coordinators and name in Advanced.
+            MiningMode::Gpu if self.gpu_join => self.with_advanced(
+                vec![
+                    SettingsRow::Gpu,
+                    SettingsRow::Mining,
+                    SettingsRow::PoolAddress,
+                    SettingsRow::PoolKey,
+                    SettingsRow::Address,
+                    SettingsRow::Intensity,
+                ],
+                vec![SettingsRow::Backups, SettingsRow::RigName],
+            ),
+            // #### PR #42: a farm of the operator's own rigs, and the token
+            // donation, in Advanced.
+            MiningMode::Gpu => self.with_advanced(
+                vec![
+                    SettingsRow::Gpu,
+                    SettingsRow::Mining,
+                    SettingsRow::Address,
+                    SettingsRow::Intensity,
+                    SettingsRow::Fulcrum,
+                    SettingsRow::Node,
+                ],
+                [SettingsRow::RigPort]
+                    .into_iter()
+                    .chain(self.rig_port.map(|_| SettingsRow::RigsOnly))
+                    .chain([SettingsRow::TokenDonation])
+                    .collect(),
+            ),
             // #### PR #42: a token instead of BCH needs no node, serves no
             // templates and has its own donation.
             MiningMode::Asic if self.asic_target == 1 => self.with_advanced(
@@ -983,16 +1082,21 @@ impl SetupFlow {
                 ],
             ),
             // #### PR #40: a GPU pool's fee is always mining time.
-            MiningMode::Pool if self.pool_target == 1 => vec![
-                SettingsRow::PoolKind,
-                SettingsRow::Address,
-                SettingsRow::Fulcrum,
-                SettingsRow::Node,
-                SettingsRow::PoolFee,
-                SettingsRow::FeeAddress,
-                SettingsRow::ProfileName,
-                SettingsRow::Start,
-            ],
+            // #### PR #42: its fee address, port and donation in Advanced.
+            MiningMode::Pool if self.pool_target == 1 => self.with_advanced(
+                vec![
+                    SettingsRow::PoolKind,
+                    SettingsRow::Address,
+                    SettingsRow::Fulcrum,
+                    SettingsRow::Node,
+                    SettingsRow::PoolFee,
+                ],
+                vec![
+                    SettingsRow::FeeAddress,
+                    SettingsRow::RigPort,
+                    SettingsRow::TokenDonation,
+                ],
+            ),
             MiningMode::Pool => self.with_advanced(
                 vec![
                     SettingsRow::PoolKind,
@@ -1070,7 +1174,36 @@ impl SetupFlow {
                 .chosen_asic_token()
                 .filter(|_| self.mode == MiningMode::Asic && self.asic_target == 1)
                 .map(|token| token.name.to_owned()),
+            rig_name: Some(self.rig_name.trim().to_owned()).filter(|name| !name.is_empty()),
+            rig_port: self.rig_port,
+            rigs_only: self.rigs_only && self.rig_port.is_some(),
         }
+    }
+
+    /// #### PR #42: what the TokenDonation row sets: an ASIC-exclusive
+    /// token's donation, or in the GPU modes the GPU token's; its name, the
+    /// donation and its minimum.
+    fn token_donation_terms(
+        &self,
+    ) -> Option<(
+        String,
+        crate::donation::TokenDonation,
+        crate::donation::TokenDonation,
+    )> {
+        if self.mode == MiningMode::Asic {
+            return self.chosen_asic_token().map(|token| {
+                (
+                    token.name.to_owned(),
+                    self.asic_token_donation(token),
+                    token.donation_minimum,
+                )
+            });
+        }
+        Some((
+            self.config.token.as_str().to_owned(),
+            self.config.token_donation(),
+            self.config.token.donation_minimum(),
+        ))
     }
 
     /// #### PR #42: the chosen ASIC-exclusive token, if the network has any.
@@ -1199,11 +1332,28 @@ impl SetupFlow {
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
             asic_token: None,
+            rig_name: None,
+            rig_port: None,
+            rigs_only: false,
         };
+        // #### PR #42: GPUs coordinating the operator's own rigs.
+        if self.mode == MiningMode::Gpu && !self.gpu_join {
+            return options.rig_port.map(|port| SavedServer {
+                join: None,
+                join_key: None,
+                rig_port: Some(port),
+                rigs_only: options.rigs_only,
+                ..joining(SavedMode::GpuFarm)
+            });
+        }
         // #### PR #42: a token serves no templates and has no fallback pools.
         let bch = options.asic_token.is_none();
         Some(match self.server_setup()? {
-            ServerSetup::JoinGpuPool { .. } => joining(SavedMode::GpuRig),
+            ServerSetup::JoinGpuPool { .. } => SavedServer {
+                backups: options.backups.clone(),
+                rig_name: options.rig_name.clone(),
+                ..joining(SavedMode::GpuRig)
+            },
             ServerSetup::JoinPool { .. } => joining(SavedMode::AsicJoin),
             ServerSetup::Solo => SavedServer {
                 join: None,
@@ -1227,6 +1377,7 @@ impl SetupFlow {
                 fee_mode: None,
                 fee_address: address,
                 pool_tag: None,
+                rig_port: options.rig_port.filter(|port| *port != DEFAULT_RIG_PORT),
                 ..joining(SavedMode::GpuPool)
             },
             ServerSetup::Public {
@@ -1276,6 +1427,9 @@ impl SetupFlow {
         self.fallback_pools.clear();
         self.asic_target = 0;
         self.asic_token = 0;
+        self.rig_port = None;
+        self.rigs_only = false;
+        self.rig_name.clear();
         let Some(server) = server else {
             self.mode = MiningMode::Gpu;
             return;
@@ -1295,7 +1449,12 @@ impl SetupFlow {
                 self.pool_target = 1;
                 MiningMode::Pool
             }
+            // #### PR #42
+            SavedMode::GpuFarm => MiningMode::Gpu,
         };
+        self.rig_port = server.rig_port;
+        self.rigs_only = server.rigs_only;
+        self.rig_name = server.rig_name.clone().unwrap_or_default();
         self.join_address = server.join.clone().unwrap_or_default();
         self.join_key = server.join_key.clone().unwrap_or_default();
         self.pool_fee = server.pool_fee.unwrap_or(defaults.0);
@@ -1778,13 +1937,23 @@ impl SetupFlow {
                             % count;
                     }
                     SettingsRow::TokenDonation => {
-                        if let Some(token) = self.chosen_asic_token() {
-                            self.config.token_donation = Some(
-                                self.asic_token_donation(token)
-                                    .adjusted(forward, token.donation_minimum),
-                            );
+                        if let Some((_, donation, minimum)) = self.token_donation_terms() {
+                            self.config.token_donation = Some(donation.adjusted(forward, minimum));
                         }
                     }
+                    // #### PR #42: a farm's rigs on and off; a pool always
+                    // takes rigs.
+                    SettingsRow::RigPort if self.mode == MiningMode::Gpu => {
+                        self.rig_port = match self.rig_port {
+                            Some(_) => None,
+                            None => Some(DEFAULT_RIG_PORT),
+                        };
+                    }
+                    SettingsRow::RigPort => {
+                        self.status_line =
+                            "A GPU pool always takes rigs; press Enter to change its port.".into();
+                    }
+                    SettingsRow::RigsOnly => self.rigs_only = !self.rigs_only,
                     _ => {}
                 }
             }
@@ -1797,6 +1966,16 @@ impl SetupFlow {
                 SettingsRow::FallbackPools => {
                     let value = self.fallback_pools.join(" ");
                     self.begin_edit(TextField::FallbackPools, value);
+                }
+                // #### PR #42: the rigs' port, rigs only, a rig's name.
+                SettingsRow::RigPort => {
+                    let value = self.rig_port.unwrap_or(DEFAULT_RIG_PORT).to_string();
+                    self.begin_edit(TextField::RigPort, value);
+                }
+                SettingsRow::RigsOnly => self.rigs_only = !self.rigs_only,
+                SettingsRow::RigName => {
+                    let value = self.rig_name.clone();
+                    self.begin_edit(TextField::RigName, value);
                 }
                 SettingsRow::StartDifficulty => {
                     let value = self
@@ -2260,7 +2439,35 @@ impl SetupFlow {
                 Ok(String::new())
             }
             TextField::Backups => {
-                self.backups = pool_list(&value, "backup pool")?;
+                // #### PR #42: a GPU rig's backups are coordinators.
+                let what = if self.mode == MiningMode::Gpu {
+                    "backup coordinator"
+                } else {
+                    "backup pool"
+                };
+                self.backups = pool_list(&value, what)?;
+                Ok(String::new())
+            }
+            // #### PR #42: the rigs' port (empty: none for a farm, 3340 for
+            // a pool) and a rig's name (empty: the computer's).
+            TextField::RigPort => {
+                if value.is_empty() {
+                    self.rig_port = None;
+                    return Ok(String::new());
+                }
+                let port = value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .ok_or("use a port from 1 to 65535")?;
+                self.rig_port = Some(port);
+                Ok(String::new())
+            }
+            TextField::RigName => {
+                if value.chars().count() > 64 || value.chars().any(char::is_control) {
+                    return Err("use up to 64 printable characters".into());
+                }
+                self.rig_name = value;
                 Ok(String::new())
             }
             // #### PR #42: solo mining's fallback pools.
@@ -3695,6 +3902,15 @@ fn profile_summary(settings: &SavedConfig, network: MiningNetwork, device: &str)
         .unwrap_or_default();
     match server.mode {
         SavedMode::GpuRig => format!("GPU rig · {network} · {token} · {device}"),
+        // #### PR #42: a farm, and a token instead of BCH.
+        SavedMode::GpuFarm => format!(
+            "GPU farm · {network} · {token} · rigs :{}",
+            server.rig_port.unwrap_or(DEFAULT_RIG_PORT)
+        ),
+        SavedMode::AsicSolo if server.asic_token.is_some() => format!(
+            "ASIC token · {network} · {}",
+            server.asic_token.as_deref().unwrap_or_default()
+        ),
         SavedMode::AsicSolo => format!("ASIC solo · {network} · BCH"),
         SavedMode::AsicJoin => format!("ASIC at a pool · {network} · BCH"),
         SavedMode::AsicPool => format!("ASIC pool · {network} · BCH{fee}"),
@@ -4005,16 +4221,50 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             ),
             SettingsRow::TokenDonation => (
                 "Donation",
-                match state.chosen_asic_token() {
+                match state.token_donation_terms() {
                     None => dim("the token's own, at least its minimum"),
-                    Some(token) => Span::raw(format!(
-                        "{} of {} mining work (at least {})",
-                        state.asic_token_donation(token),
-                        token.name,
-                        token.donation_minimum
+                    Some((name, donation, minimum)) => Span::raw(format!(
+                        "{donation} of {name} mining work (at least {minimum})"
                     )),
                 },
                 "< >  0.5% steps",
+            ),
+            // #### PR #42: the GPU farm's and pool's rigs, and a rig.
+            SettingsRow::RigPort => (
+                "Rig port",
+                match (state.mode, state.rig_port) {
+                    _ if state.editing == Some(TextField::RigPort) => {
+                        Span::raw(format!("{}_", state.text_input))
+                    }
+                    (MiningMode::Gpu, None) => dim("off; only this PC mines"),
+                    (MiningMode::Gpu, Some(port)) => Span::raw(format!(
+                        "on, port {port}: your rigs join this PC (Connection info shows how)"
+                    )),
+                    (_, port) => Span::raw(format!(
+                        "{}: other people's rigs join the pool here",
+                        port.unwrap_or(DEFAULT_RIG_PORT)
+                    )),
+                },
+                "< > [Enter]",
+            ),
+            SettingsRow::RigsOnly => (
+                "This PC",
+                Span::raw(if state.rigs_only {
+                    "only the rigs mine (no GPU used here)"
+                } else {
+                    "mines with its GPUs too"
+                }),
+                "< > [Enter]",
+            ),
+            SettingsRow::RigName => (
+                "Rig name",
+                edit_value(
+                    state,
+                    TextField::RigName,
+                    &state.rig_name,
+                    "this computer's name (default)",
+                ),
+                "[Enter]",
             ),
             // #### PR #40
             SettingsRow::Mining => (
@@ -4201,12 +4451,24 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 "< > [Enter]",
             ),
             SettingsRow::Backups => (
-                "Backup pools",
+                if state.mode == MiningMode::Gpu {
+                    "Backups"
+                } else {
+                    "Backup pools"
+                },
                 match state.backups.len() {
                     _ if state.editing == Some(TextField::Backups) => {
                         Span::raw(format!("{}_", state.text_input))
                     }
+                    // #### PR #42: a GPU rig's backups are coordinators.
+                    0 if state.mode == MiningMode::Gpu => dim(
+                        "no backup coordinators; paste stratum2+tcp://HOST:3340/KEY lines"
+                            .to_owned(),
+                    ),
                     0 => dim("none; paste stratum2+tcp://HOST:PORT/KEY lines".to_owned()),
+                    count if state.mode == MiningMode::Gpu => Span::raw(format!(
+                        "{count} backup coordinators, used in order when the coordinator fails"
+                    )),
                     count => Span::raw(format!("{count}, used in order when the pool fails")),
                 },
                 "[Enter]",
@@ -5519,9 +5781,28 @@ fn render_advanced(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
             snapshot.donation_minimum
         )),
         dim("It applies to every GPU and rig at once and is saved to your profile when you stop.".into()),
-        Line::from(""),
-        Line::from("[A/Esc] close"),
     ];
+    // #### PR #42: a coordinator's start values, read-only.
+    let mut lines = lines;
+    if let Some(rigs) = snapshot.rigs.as_ref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!("Rigs join on {}", rigs.listen)));
+        if let Some(fee) = rigs.fee_bps {
+            lines.push(Line::from(format!(
+                "Public pool, fee {}.{:02}% of each rig's mining time",
+                fee / 100,
+                fee % 100
+            )));
+        }
+        if snapshot.gpus.is_empty() {
+            lines.push(Line::from("This PC: only the rigs mine"));
+        }
+        lines.push(dim(
+            "Set at start (the setup's Advanced section or the command line); applies after a restart."
+                .into(),
+        ));
+    }
+    lines.extend([Line::from(""), Line::from("[A/Esc] close")]);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -6670,6 +6951,270 @@ mod tests {
         assert!(gone
             .status_line
             .contains("No ASIC-exclusive token is deployed"));
+    }
+
+    /// #### PR #42: the rows of the Advanced section, in order.
+    fn advanced_rows(setup: &mut SetupFlow) -> Vec<SettingsRow> {
+        setup.advanced_open = true;
+        let rows = setup.settings_rows();
+        let start = rows
+            .iter()
+            .position(|row| *row == SettingsRow::Advanced)
+            .unwrap()
+            + 1;
+        let end = rows
+            .iter()
+            .position(|row| *row == SettingsRow::ProfileName)
+            .unwrap();
+        rows[start..end].to_vec()
+    }
+
+    // #### PR #42
+    // What: the GPU modes' Advanced rows: GPU alone (a farm coordinator) the
+    // rigs' port, rigs only (once the port is on) and the token donation; a
+    // rig its backup coordinators and name; a GPU pool its fee address, port
+    // and donation.
+    // Look here if: settings_rows' GPU arms change.
+    #[test]
+    fn gpu_fold_rows_follow_the_mode() {
+        let mut alone = setup_for(MiningMode::Gpu);
+        assert_eq!(
+            advanced_rows(&mut alone),
+            [SettingsRow::RigPort, SettingsRow::TokenDonation]
+        );
+        alone.rig_port = Some(3340);
+        assert_eq!(
+            advanced_rows(&mut alone),
+            [
+                SettingsRow::RigPort,
+                SettingsRow::RigsOnly,
+                SettingsRow::TokenDonation
+            ]
+        );
+        let mut rig = setup_for(MiningMode::Gpu);
+        rig.gpu_join = true;
+        assert_eq!(
+            advanced_rows(&mut rig),
+            [SettingsRow::Backups, SettingsRow::RigName]
+        );
+        let mut pool = setup_for(MiningMode::Pool);
+        pool.pool_target = 1;
+        assert_eq!(
+            advanced_rows(&mut pool),
+            [
+                SettingsRow::FeeAddress,
+                SettingsRow::RigPort,
+                SettingsRow::TokenDonation
+            ]
+        );
+    }
+
+    // #### PR #42
+    // What: Left/Right turns a farm's rigs on (3340) and off, and the rigs
+    // only row follows; Enter types another port (0 refused); a GPU pool's
+    // port changes but never turns off.
+    // Look here if: the RigPort or RigsOnly rows change.
+    #[test]
+    fn rig_port_toggles_and_rigs_only_appears_only_with_it() {
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.open_settings(SettingsRow::RigPort);
+        assert!(setup_text(&setup).contains("off; only this PC mines"));
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.rig_port, Some(3340));
+        assert!(setup.settings_rows().contains(&SettingsRow::RigsOnly));
+        assert!(setup_text(&setup).contains("on, port 3340: your rigs join this PC"));
+        setup.handle_key(key(KeyCode::Enter));
+        setup.text_input.clear();
+        type_text(&mut setup, "0");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("1 to 65535"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Esc));
+        setup.handle_key(key(KeyCode::Enter));
+        setup.text_input.clear();
+        type_text(&mut setup, "3350");
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.rig_port, Some(3350));
+        setup.open_settings(SettingsRow::RigsOnly);
+        assert!(setup_text(&setup).contains("mines with its GPUs too"));
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.rigs_only);
+        assert!(setup_text(&setup).contains("only the rigs mine"));
+        assert_eq!(
+            gpu_launch(None, &setup.server_options()),
+            Some(GpuLaunch::Rigs {
+                port: 3350,
+                public: None,
+                rigs_only: true
+            })
+        );
+        setup.open_settings(SettingsRow::RigPort);
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.rig_port, None);
+        assert!(!setup.settings_rows().contains(&SettingsRow::RigsOnly));
+        assert!(!setup.server_options().rigs_only);
+        assert_eq!(
+            gpu_launch(None, &setup.server_options()),
+            Some(GpuLaunch::Alone)
+        );
+        // A GPU pool always takes rigs.
+        let mut pool = setup_for(MiningMode::Pool);
+        pool.pool_target = 1;
+        pool.open_settings(SettingsRow::RigPort);
+        assert!(setup_text(&pool).contains("3340: other people's rigs join the pool here"));
+        pool.handle_key(key(KeyCode::Right));
+        assert_eq!(pool.rig_port, None);
+        assert!(pool.status_line.contains("always takes rigs"));
+    }
+
+    // #### PR #42
+    // What: a rig's name takes up to 64 printable characters; empty is the
+    // computer's name; the backups of a rig are coordinators, each with its
+    // key, and start in order after the main coordinator.
+    // Look here if: the RigName or rig Backups rows, or gpu_launch, change.
+    #[test]
+    fn rig_name_and_backup_coordinators_are_checked() {
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.gpu_join = true;
+        setup.join_address = "192.0.2.1:3340".into();
+        setup.join_key = "KEY".into();
+        setup.open_settings(SettingsRow::RigName);
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, &"r".repeat(65));
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup.status_line.contains("64 printable"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Esc));
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "rack-7");
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.rig_name, "rack-7");
+        setup.open_settings(SettingsRow::Backups);
+        assert!(setup_text(&setup).contains("no backup coordinators"));
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "192.0.2.2:3340");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(
+            setup
+                .status_line
+                .contains("give each backup coordinator as"),
+            "{}",
+            setup.status_line
+        );
+        setup.handle_key(key(KeyCode::Esc));
+        setup.handle_key(key(KeyCode::Enter));
+        type_text(&mut setup, "stratum2+tcp://192.0.2.2:3340/KEY2");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup_text(&setup).contains("1 backup coordinators"));
+        assert_eq!(
+            gpu_launch(setup.server_setup().as_ref(), &setup.server_options()),
+            Some(GpuLaunch::Rig {
+                coordinators: vec![
+                    ("192.0.2.1:3340".into(), "KEY".into()),
+                    ("192.0.2.2:3340".into(), "KEY2".into())
+                ],
+                name: Some("rack-7".into())
+            })
+        );
+    }
+
+    // #### PR #42
+    // What: GPU profiles keep their values: a farm (its port and rigs only),
+    // a rig (backup coordinators and its name), a GPU pool (a port other
+    // than 3340); a plain GPU profile saves no server; each reopens as it
+    // was, and the profile list names a farm.
+    // Look here if: saved_server or apply_saved_server's GPU parts change.
+    #[test]
+    fn gpu_profiles_keep_farm_rig_and_pool_values() {
+        let valid = |saved: &SavedServer| {
+            SavedConfig {
+                network: Some("chipnet".into()),
+                server: Some(saved.clone()),
+                ..SavedConfig::default()
+            }
+            .validate()
+            .unwrap();
+        };
+        let mut farm = setup_for(MiningMode::Gpu);
+        assert_eq!(farm.saved_server(), None);
+        farm.rig_port = Some(3350);
+        farm.rigs_only = true;
+        let saved = farm.saved_server().unwrap();
+        assert_eq!(saved.mode, SavedMode::GpuFarm);
+        assert_eq!((saved.rig_port, saved.rigs_only), (Some(3350), true));
+        valid(&saved);
+        let mut reopened = setup_for(MiningMode::Asic);
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!(reopened.mode, MiningMode::Gpu);
+        assert_eq!((reopened.rig_port, reopened.rigs_only), (Some(3350), true));
+        let summary = profile_summary(
+            &SavedConfig {
+                server: Some(saved),
+                ..SavedConfig::default()
+            },
+            MiningNetwork::Chipnet,
+            "CUDA:0",
+        );
+        assert_eq!(summary, "GPU farm · Chipnet · PHOTON · rigs :3350");
+        let mut rig = setup_for(MiningMode::Gpu);
+        rig.gpu_join = true;
+        rig.join_address = "192.0.2.1:3340".into();
+        rig.join_key = "KEY".into();
+        rig.rig_name = "rack-7".into();
+        rig.backups = vec!["stratum2+tcp://192.0.2.2:3340/KEY2".into()];
+        let saved = rig.saved_server().unwrap();
+        assert_eq!(saved.rig_name.as_deref(), Some("rack-7"));
+        assert_eq!(saved.backups.len(), 1);
+        valid(&saved);
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!(reopened.server_options(), rig.server_options());
+        let mut pool = setup_for(MiningMode::Pool);
+        pool.pool_target = 1;
+        assert_eq!(pool.saved_server().unwrap().rig_port, None);
+        pool.rig_port = Some(3341);
+        let saved = pool.saved_server().unwrap();
+        assert_eq!(saved.rig_port, Some(3341));
+        valid(&saved);
+        assert_eq!(
+            gpu_launch(pool.server_setup().as_ref(), &pool.server_options()),
+            Some(GpuLaunch::Rigs {
+                port: 3341,
+                public: Some((pool.pool_fee, None)),
+                rigs_only: true
+            })
+        );
+    }
+
+    // #### PR #42
+    // What: in the GPU modes the donation row is the GPU token's, from its
+    // minimum up in 0.5% steps and never below it.
+    // Look here if: token_donation_terms changes.
+    #[test]
+    fn gpu_donation_row_never_goes_below_the_token_minimum() {
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.open_settings(SettingsRow::TokenDonation);
+        assert!(
+            setup_text(&setup).contains("4.00% of PHOTON mining work (at least 4.00%)"),
+            "{}",
+            setup_text(&setup)
+        );
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            setup.config.token_donation(),
+            setup.config.token.donation_minimum()
+        );
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            setup.config.token_donation(),
+            crate::donation::TokenDonation::from_bps(450)
+        );
     }
 
     // #### PR #40
@@ -8098,6 +8643,30 @@ mod tests {
         assert!(text.contains("Advanced settings"), "{text}");
         assert!(text.contains("Donation   5.50%"), "{text}");
         assert!(text.contains("minimum is 4.00%"), "{text}");
+        assert!(!text.contains("Rigs join on"), "{text}");
+        // #### PR #42: a coordinator's start values.
+        let mut pool = snapshot.clone();
+        pool.gpus.clear();
+        pool.rigs = Some(crate::rigs::RigSummary {
+            listen: "0.0.0.0:3341".into(),
+            public: true,
+            fee_bps: Some(100),
+            ..crate::rigs::RigSummary::default()
+        });
+        terminal.draw(|frame| render(frame, &pool, &state)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Rigs join on 0.0.0.0:3341"), "{text}");
+        assert!(
+            text.contains("fee 1.00% of each rig's mining time"),
+            "{text}"
+        );
+        assert!(text.contains("This PC: only the rigs mine"), "{text}");
         // The main dashboard does not show the slider.
         state.advanced_mode = false;
         terminal
@@ -8135,6 +8704,7 @@ mod tests {
                 ..crate::rigs::RigLine::default()
             }],
             public: false,
+            fee_bps: None,
         });
         let rows = rendered_rows(&snapshot, 140, 40).join("\n");
         assert!(rows.contains("no GPU here · rigs mine"), "{rows}");

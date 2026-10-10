@@ -99,6 +99,28 @@ anyone can broadcast a PHOTON claim, a modified rig could keep its fee time
 for itself; the fee, like the donation, relies on rigs running Pickaxe as
 published.
 
+## In the setup
+
+#### PR #42
+
+GPU mining keeps its farm values under **Advanced** on the settings page:
+- **GPU mining alone**: **Rig port** turns this computer into your farm's
+  coordinator (off by default; Left/Right turns port 3340 on, Enter types
+  another), **This PC** (shown while the port is on) chooses whether it mines
+  with its own GPUs too or only coordinates (`--rigs-only`), and the token
+  **Donation** (never below the token's minimum, 4% for PHOTON).
+- **Join a GPU pool or farm** (a rig): **Backups** takes backup coordinators,
+  each `stratum2+tcp://HOST:3340/KEY`, tried in order after the main one,
+  and **Rig name** names the rig on the coordinator's dashboard (the
+  computer's name by default).
+- **Run a pool → GPU pool**: the fee address, the **Rig port** (3340 unless
+  changed) and the donation.
+
+A saved profile keeps them and reopens as a farm ("GPU farm · Chipnet ·
+PHOTON · rigs :3340"), a rig or a pool. A running coordinator's Advanced
+page (`a`) shows where rigs join, a public pool's fee and whether this PC
+only coordinates.
+
 ## Farm operating systems (HiveOS, mmpOS, RaveOS)
 
 #### PR #42

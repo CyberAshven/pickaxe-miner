@@ -28,6 +28,9 @@ pub struct RigSummary {
     pub rigs: Vec<RigLine>,
     /// #### PR #40: a public GPU pool, where each rig names its payout.
     pub public: bool,
+    /// #### PR #42: a public pool's fee in hundredths of a percent of each
+    /// rig's mining time.
+    pub fee_bps: Option<u16>,
 }
 
 /// #### PR #40
@@ -775,6 +778,7 @@ mod net {
                     })
                     .collect(),
                 public: state.public.is_some(),
+                fee_bps: state.public.as_ref().map(|public| public.fee_bps),
             }
         }
     }
