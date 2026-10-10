@@ -33,7 +33,7 @@ Work continues on PR #38; this document does not narrow the requested scope.
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check; a coordinator crash during a claim is not exercised live |
 | G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live; backup coordinators host-tested; live failover and rigs on separate machines pending |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | Pending |
-| D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | SV1 devices at SV2 pools with backup pools in order implemented and tested (pool mode below); Job Declaration and coinbase payouts pending |
+| D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | SV1 devices at SV2 pools with backup pools in order implemented and tested (pool mode below); Job Declaration in both modes, Pickaxe client to Pickaxe pool, implemented and loopback-tested (below); live Job Declaration runs and coinbase payouts at other pools pending |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Setup finds a BCHN on this computer and offers it with client, version and sync height; cookie login; unusable nodes named with their reason; live-checked against a throwaway Chipnet BCHN (below). GPU broadcasts already fall back to Fulcrum; ASIC mode has no fallback, since only a node supplies full templates |
 | T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | Pending protocol/deployment evidence |
 | T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Pending author covenant design |
@@ -1783,3 +1783,43 @@ then confirming, and two loopback runs: a Pickaxe mining on another Pickaxe's
 template server (key pinned), whose block reaches both the provider's node
 (relayed) and its own (whole-block fallback), and the same with an unpinned
 provider on this computer. Not yet run against a node bridge or Knuth.
+
+## Job Declaration, Full-Template (2026-10-10)
+
+#### PR #42
+
+Both sides gain Full-Template. A public pool started with
+`--accept-job-declaration` (alone: both modes; or `full`, `coinbase`) checks
+each `DeclareMiningJob`: the token, the coinbase's shape and height, the
+payout rule, canonical transaction order and the version; it asks for the
+transactions its node lacks (from its current and two previous templates and
+the latest 128 MiB clients provided, at most 2,048 per round and 16 rounds),
+and its first node checks the whole block with BCHN's
+`validateblocktemplate` on a connection's first declaration per parent, then
+at most once a minute, and always when the client provided a transaction (4
+checks at once at most). Refusals that are races at a new block are
+`stale-chain-tip` with the node's reason in the details. The declared token
+sets exactly the declared job; its blocks, from a share on the custom job or
+the client's `PushSolution` (matched by proof of work), are saved in the
+pool's JD journal and sent to the pool's node. Full-Template sessions take
+16 MiB frames; Coinbase-only ones keep a device's limit.
+
+The client (`--job-declaration`, Full-Template unless `coinbase`) declares
+each template with its transactions, sends those the pool asks for, sets the
+custom job with the declared token, and pushes its blocks to the pool; a race
+drops one template, and the fourth other refusal in a row on a parent falls
+back to the pool's own jobs. Templates now share their transactions' bytes,
+so a pool's declared jobs and a server's template copies do not copy them.
+
+Evidence: host tests for the declared coinbase (parse, each refusal, and the
+declared path equal to the template's parts for 0 to 17 transactions), the
+token book (declared tokens, `job-not-yet-validated`), the server session
+(setup per mode, one missing-transaction round then a declared token, the
+validator's cadence, the tip-race mapping, each structural refusal,
+`missing-txs` after 30 seconds, PushSolution found by proof of work),
+`SetCustomMiningJob` on a declared token (each mismatch, and a whole block
+from a share), the client (65,535 transactions, one-frame limit, four
+refusals), and a loopback run: the pool's node has 2 of the client's 3
+transactions, one round fetches the third, `validateblocktemplate` runs once,
+and a CPU device's block reaches both nodes with the same hash. Not yet run
+against BCHN on Chipnet, nor with SRI's client.

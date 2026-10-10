@@ -293,6 +293,23 @@ impl Journal {
         })
     }
 
+    /// #### PR #42: saves a block found on a Full-Template declared job
+    /// (a client's share, or its PushSolution); false when it is already
+    /// saved. Only a JD journal takes them.
+    pub fn enqueue_declared(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        if !matches!(self.binding, JournalBinding::Declared) {
+            return Err("declared blocks go to the JD journal".into());
+        }
+        let hash = validate_block(bytes, None)?;
+        self.push(PendingBlock {
+            hash,
+            block: hex::encode(bytes),
+            payout: None,
+            miner: None,
+            operator: None,
+        })
+    }
+
     /// #### PR #42: saves a block a Template Distribution client found;
     /// false when it is already saved. Only the relay journal takes them.
     pub fn enqueue_relayed(&mut self, bytes: &[u8]) -> Result<bool, String> {

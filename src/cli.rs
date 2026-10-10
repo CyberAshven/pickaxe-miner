@@ -242,18 +242,35 @@ pub enum StratumV2Command {
         tp_listen: Option<std::net::SocketAddr>,
         /// #### PR #42
         /// Accept miners' own templates at this public pool (SV2 Job
-        /// Declaration) on the SV2 port: `coinbase` lets a miner's Job
-        /// Declaration client set its own jobs, whose coinbase must pay your
-        /// fee and the Pickaxe donation in full. Off by default.
-        #[arg(long, value_name = "MODE", requires = "public")]
+        /// Declaration) on the SV2 port: `full` checks each declared
+        /// template with your node and sends its blocks to your node too,
+        /// `coinbase` lets a miner set its own jobs without showing their
+        /// transactions, `both` (the flag alone) takes either. A miner's
+        /// coinbase must pay your fee and the Pickaxe donation in full. Off
+        /// by default.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            default_missing_value = "both",
+            requires = "public"
+        )]
         accept_job_declaration: Option<AcceptJobDeclaration>,
         /// #### PR #42
         /// Mine at the first --upstream pool with your own node's templates
-        /// (SV2 Job Declaration): `coinbase` declares each template to a
-        /// Pickaxe pool that accepts Job Declaration, and your node builds
-        /// and submits the blocks. While the pool refuses them, devices mine
-        /// the pool's own jobs. Needs your node, like solo mining.
-        #[arg(long, value_name = "MODE", requires = "upstream")]
+        /// (SV2 Job Declaration), at a Pickaxe pool that accepts it: `full`
+        /// (the flag alone) declares each template with its transactions,
+        /// so the pool checks it and sends its blocks to its node too;
+        /// `coinbase` declares the coinbase only, and your node alone
+        /// submits the blocks. While the pool refuses them, devices mine the
+        /// pool's own jobs. Needs your node, like solo mining.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            default_missing_value = "full",
+            requires = "upstream"
+        )]
         job_declaration: Option<JobDeclarationMode>,
         /// #### PR #42
         /// Take templates from an SV2 Template Provider, tried before your
@@ -268,6 +285,9 @@ pub enum StratumV2Command {
 /// #### PR #42: how a miner declares its templates to a pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum JobDeclarationMode {
+    /// Full-Template: each template with its transactions; the pool checks
+    /// it and sends its blocks to its node too.
+    Full,
     /// Coinbase-only: custom jobs from tokens; the pool never sees the
     /// transactions, and this node submits the blocks.
     Coinbase,
@@ -276,10 +296,15 @@ pub enum JobDeclarationMode {
 /// #### PR #42: the Job Declaration modes a public pool accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum AcceptJobDeclaration {
+    /// Full-Template: a miner declares each template with its
+    /// transactions; the pool's node checks it and gets its blocks too.
+    Full,
     /// Coinbase-only: a miner sets jobs from tokens the pool allocates; the
     /// pool never sees their transactions, and the miner's node submits
     /// their blocks.
     Coinbase,
+    /// Either, as each miner asks.
+    Both,
 }
 
 /// Parses command-line arguments into the supported miner commands.
@@ -639,7 +664,8 @@ mod tests {
     }
 
     // #### PR #42
-    // What: --accept-job-declaration coinbase needs --public.
+    // What: --accept-job-declaration needs --public and alone means both;
+    // --job-declaration needs --upstream and alone means full.
     // Look here if: the Serve flags change.
     #[test]
     fn accepting_job_declaration_needs_a_public_pool() {
@@ -694,6 +720,45 @@ mod tests {
             "coinbase",
         ])
         .is_err());
+        let modes = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["pickaxe", "stratum-v2", "serve"]
+                    .iter()
+                    .chain(args)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let Some(Commands::StratumV2 {
+                command:
+                    StratumV2Command::Serve {
+                        accept_job_declaration,
+                        job_declaration,
+                        ..
+                    },
+            }) = cli.command
+            else {
+                panic!("serve options missing")
+            };
+            (accept_job_declaration, job_declaration)
+        };
+        assert_eq!(
+            modes(&["--public", "--accept-job-declaration"]),
+            (Some(AcceptJobDeclaration::Both), None)
+        );
+        assert_eq!(
+            modes(&["--public", "--accept-job-declaration", "full"]),
+            (Some(AcceptJobDeclaration::Full), None)
+        );
+        assert_eq!(
+            modes(&[
+                "--upstream",
+                "stratum2+tcp://pool.example:3336/KEY",
+                "--sv1-listen",
+                "0.0.0.0:3333",
+                "--job-declaration",
+            ]),
+            (None, Some(JobDeclarationMode::Full))
+        );
     }
 
     // #### PR #40

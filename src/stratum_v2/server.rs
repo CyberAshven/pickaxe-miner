@@ -6,7 +6,7 @@ use super::{
     channel::TokenWin,
     jd::{
         client::{JdClientSummary, UplinkEvent, UplinkHandle},
-        server::{Declarator, DeclaratorSession},
+        server::{Context, Declarator, DeclaratorSession},
     },
     journal::{Journal, PendingBlock},
     merge::hub::TokenHub,
@@ -14,7 +14,7 @@ use super::{
     tdp,
     telemetry::Devices,
     template::{BchTemplate, Hash},
-    transport::{Receiver, Sender, Session},
+    transport::{Limits, Receiver, Sender, Session},
     wire::MiningSession,
     work_allocation::WorkAllocation,
 };
@@ -63,6 +63,10 @@ pub struct ServerConfig {
     /// #### PR #42: a public pool's Job Declaration rules, when it accepts
     /// miners' own templates.
     pub declarator: Option<Arc<Declarator>>,
+    /// #### PR #42: where a pool that accepts Full-Template Job Declaration
+    /// saves the blocks found on miners' declared templates until its node
+    /// answers.
+    pub declared_journal_path: Option<PathBuf>,
     /// #### PR #42: a Job Declaration client's uplink, when this server is
     /// the local server that mines its own templates at a pool.
     pub uplink: Option<UplinkHandle>,
@@ -128,8 +132,21 @@ pub struct JdServerStats {
     pub custom_jobs: u64,
     pub refused: u64,
     pub last_refusal: Option<&'static str>,
-    /// Blocks found on custom jobs; the client's node submits them.
+    /// Blocks found on custom jobs: a Coinbase-only client's node submits
+    /// them; a Full-Template client's the pool's node gets too.
     pub blocks: u64,
+    /// Full-Template: declarations accepted, rounds of missing transactions
+    /// asked for, node checks made and what makes them, solutions pushed and
+    /// those no declared job matched, and the JD journal's counts.
+    pub declared: u64,
+    pub missing_rounds: u64,
+    pub validations: u64,
+    pub validator: Option<&'static str>,
+    pub pushed: u64,
+    pub push_unmatched: u64,
+    pub declared_pending: usize,
+    pub declared_accepted: u64,
+    pub declared_rejected: u64,
 }
 
 /// #### PR #42: what the Template Distribution server did. No count names a
@@ -212,7 +229,21 @@ pub(super) struct Shared {
     pub(super) relay: Option<Relay>,
     /// #### PR #42: the lanes a Job Declaration client's local channels take.
     lanes: Arc<AtomicU32>,
+    /// #### PR #42: blocks found on Full-Template declared jobs.
+    declared: Option<DeclaredBlocks>,
+    /// #### PR #42: the latest published templates with different
+    /// transactions, newest first, whose transactions a declaration may name.
+    recent: Option<Mutex<VecDeque<Arc<BchTemplate>>>>,
 }
+
+/// #### PR #42: the JD journal and one block per parent.
+pub(super) struct DeclaredBlocks {
+    journal: Mutex<Journal>,
+    solved: Mutex<SolvedParents>,
+}
+
+/// Published templates a declaration's transactions are looked up in.
+const RECENT_TEMPLATES: usize = 3;
 
 impl Shared {
     /// #### PR #42: changes the Job Declaration counts.
@@ -444,6 +475,32 @@ pub fn run_with(
             .set_nonblocking(true)
             .map_err(|_| "cannot configure template listener")?;
     }
+    // #### PR #42: the JD journal opens when the pool accepts Full-Template
+    // Job Declaration, and also without it while its file exists, so blocks
+    // found before a restart still reach the node.
+    let full_template = config
+        .declarator
+        .as_ref()
+        .is_some_and(|declarator| declarator.accept.allows(true));
+    let declared = match (
+        full_template,
+        config
+            .declared_journal_path
+            .as_deref()
+            .filter(|_| config.uplink.is_none()),
+    ) {
+        (true, None) => return Err("Full-Template Job Declaration needs a JD journal".into()),
+        (true, Some(path)) => Some(path),
+        (false, Some(path)) if path.exists() => Some(path),
+        _ => None,
+    }
+    .map(|path| -> Result<DeclaredBlocks, String> {
+        Ok(DeclaredBlocks {
+            journal: Mutex::new(Journal::open_declared(path, config.network)?),
+            solved: Mutex::new(SolvedParents::default()),
+        })
+    })
+    .transpose()?;
     if let Ok(mut stats) = stats.lock() {
         stats.nodes = total;
         stats.active_node = 0;
@@ -451,8 +508,11 @@ pub fn run_with(
         if relay.is_some() {
             stats.template_server = Some(TemplateServerStats::default());
         }
-        if config.declarator.is_some() {
-            stats.jd_server = Some(JdServerStats::default());
+        if let Some(declarator) = &config.declarator {
+            stats.jd_server = Some(JdServerStats {
+                validator: full_template.then(|| declarator.validator_kind()),
+                ..JdServerStats::default()
+            });
         }
     }
     let (wake, receive_blocks) = mpsc::sync_channel::<()>(1);
@@ -515,9 +575,12 @@ pub fn run_with(
         claims,
         relay,
         lanes: Arc::new(AtomicU32::new(0)),
+        declared,
+        recent: full_template.then(|| Mutex::new(VecDeque::new())),
     });
     update_journal_stats(&shared)?;
     update_relay_stats(&shared)?;
+    update_declared_stats(&shared)?;
     let node_shared = shared.clone();
     let tag = config.pool_tag.clone();
     let node_tokens = config.tokens.clone();
@@ -538,6 +601,7 @@ pub fn run_with(
         let mut refreshed = Instant::now() - Duration::from_secs(60);
         let mut retries = RetrySchedule::default();
         let mut relay_retries = RetrySchedule::default();
+        let mut declared_retries = RetrySchedule::default();
         while !node_shared.stop.load(Ordering::Relaxed) {
             match receive_blocks.recv_timeout(Duration::from_millis(250)) {
                 Ok(()) => (),
@@ -606,6 +670,39 @@ pub fn run_with(
                 }
                 if submit_next(&relay.journal, &mut relay_retries, &mut sources)?.is_some() {
                     update_relay_stats(&node_shared)?;
+                    refreshed = Instant::now() - Duration::from_secs(60);
+                }
+            }
+            // #### PR #42: a declared job's block is propagated by the pool
+            // What: blocks found on Full-Template declared jobs (a client's
+            // share on its custom job, or its PushSolution) go to the node
+            // from the JD journal, retried with backoff until the node answers
+            // exactly; the dashboard's list shows the answer.
+            // Why: Full-Template lets the pool propagate its miners' blocks as
+            // well as their own nodes; the PR #38 rule applies: saved first,
+            // then submitted.
+            // Look here if: a declared job's block is missing on chain, or its
+            // result on the dashboard never comes.
+            if let Some(declared) = node_shared.declared.as_ref() {
+                if let Some((pending, outcome, _)) =
+                    submit_next(&declared.journal, &mut declared_retries, &mut sources)?
+                {
+                    if let Ok(mut stats) = node_shared.stats.lock() {
+                        let result = match outcome {
+                            SubmissionOutcome::Accepted => Some("accepted"),
+                            SubmissionOutcome::Rejected(_) => Some("rejected"),
+                            SubmissionOutcome::Pending(_) => None,
+                        };
+                        if let Some(found) = stats
+                            .recent_blocks
+                            .iter_mut()
+                            .find(|found| found.hash == pending.hash)
+                            .filter(|_| result.is_some())
+                        {
+                            found.result = result;
+                        }
+                    }
+                    update_declared_stats(&node_shared)?;
                     refreshed = Instant::now() - Duration::from_secs(60);
                 }
             }
@@ -980,6 +1077,82 @@ pub(super) fn update_relay_stats(shared: &Shared) -> Result<(), String> {
     Ok(())
 }
 
+/// #### PR #42: the JD journal's counts, for the dashboard.
+fn update_declared_stats(shared: &Shared) -> Result<(), String> {
+    let Some(declared) = shared.declared.as_ref() else {
+        return Ok(());
+    };
+    let (pending, accepted, rejected) = declared
+        .journal
+        .lock()
+        .map_err(|_| "JD journal unavailable")?
+        .counts();
+    shared.jd_stats(|stats| {
+        stats.declared_pending = pending;
+        stats.declared_accepted = accepted;
+        stats.declared_rejected = rejected;
+    });
+    Ok(())
+}
+
+/// #### PR #42: saves a block found on a declared job, the first on its
+/// parent, in the JD journal and lists it, then wakes the node worker. A
+/// journal that cannot save it stops the server, as for its own blocks.
+fn save_declared(
+    shared: &Shared,
+    parent: &Hash,
+    hash: Hash,
+    block: &[u8],
+    height: u32,
+    worker: String,
+) -> Result<(), String> {
+    let Some(declared) = shared.declared.as_ref() else {
+        return Ok(());
+    };
+    let first = declared
+        .solved
+        .lock()
+        .map_err(|_| "block state unavailable")?
+        .first(parent);
+    if !first {
+        return Ok(());
+    }
+    let saved = declared
+        .journal
+        .lock()
+        .map_err(|_| "JD journal unavailable")?
+        .enqueue_declared(block);
+    let Ok(saved) = saved else {
+        if let Ok(mut fatal) = shared.fatal.lock() {
+            *fatal = Some("cannot persist solved block; mining stopped");
+        }
+        shared.stop.store(true, Ordering::Relaxed);
+        return Err("cannot persist solved block; mining stopped".into());
+    };
+    if saved {
+        if let Ok(mut stats) = shared.stats.lock() {
+            let mut display = hash;
+            display.reverse();
+            stats.recent_blocks.push_back(FoundBlock {
+                height,
+                hash: hex::encode(display),
+                worker,
+                found: Instant::now(),
+                result: None,
+            });
+            while stats.recent_blocks.len() > RECENT_BLOCKS {
+                stats.recent_blocks.pop_front();
+            }
+            if let Some(jd) = stats.jd_server.as_mut() {
+                jd.blocks += 1;
+            }
+        }
+    }
+    update_declared_stats(shared)?;
+    let _ = shared.wake.try_send(());
+    Ok(())
+}
+
 fn update_journal_stats(shared: &Shared) -> Result<(), String> {
     let journal = shared
         .journal
@@ -1079,6 +1252,19 @@ fn offer(
 // #### end PR #42 ####
 
 fn publish(shared: &Shared, job: Option<PublishedJob>) {
+    // #### PR #42: the latest templates with other transactions, for
+    // Full-Template declarations.
+    if let (Some(job), Some(recent)) = (job.as_ref(), shared.recent.as_ref()) {
+        if let Ok(mut recent) = recent.lock() {
+            if recent
+                .front()
+                .is_none_or(|last| last.transaction_ids() != job.template.transaction_ids())
+            {
+                recent.push_front(job.template.clone());
+                recent.truncate(RECENT_TEMPLATES);
+            }
+        }
+    }
     let ready = job.is_some();
     let height = job.as_ref().map(|job| job.template.height);
     if let Ok(mut current) = shared.job.write() {
@@ -1253,15 +1439,46 @@ fn serve_declarator(
     let mut session = DeclaratorSession::new(declarator);
     let result = (|| {
         let mut next = Some(first);
+        let mut raised = false;
         while !shared.stop.load(Ordering::Relaxed) {
             let frame = match next.take() {
                 Some(frame) => Some(frame),
                 None => receiver.receive(Duration::from_millis(100))?,
             };
-            let Some(mut frame) = frame else {
-                continue;
+            let now = Instant::now();
+            let mut responses = match frame {
+                Some(mut frame) => {
+                    // #### PR #42: a declaration is checked against the
+                    // pool's current template and its latest few.
+                    let current = shared
+                        .job
+                        .read()
+                        .map_err(|_| "template state unavailable")?
+                        .as_ref()
+                        .map(|job| job.template.clone());
+                    let recent: Vec<Arc<BchTemplate>> = shared
+                        .recent
+                        .as_ref()
+                        .and_then(|recent| recent.lock().ok().map(|r| r.iter().cloned().collect()))
+                        .unwrap_or_default();
+                    let context = Context {
+                        current: current.as_ref(),
+                        recent: &recent,
+                    };
+                    session.receive(&mut frame, declarator, &context, now)?
+                }
+                None => Default::default(),
             };
-            let responses = session.receive(&mut frame, declarator, Instant::now())?;
+            let expired = session.expire(now)?;
+            responses.frames.extend(expired.frames);
+            responses.refused = expired.refused.or(responses.refused);
+            // #### PR #42: a Full-Template session's frames may take 16 MiB
+            // (`Limits::JD`); a Coinbase-only one keeps a device's limits.
+            if session.full_template() && !raised {
+                sender.set_limits(Limits::JD);
+                receiver.set_limits(Limits::JD);
+                raised = true;
+            }
             if let Some(at) = responses.not_before {
                 while Instant::now() < at && !shared.stop.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
@@ -1270,8 +1487,28 @@ fn serve_declarator(
             for frame in responses.frames {
                 sender.send(frame)?;
             }
-            if responses.allocated > 0 {
-                shared.jd_stats(|stats| stats.tokens += responses.allocated);
+            shared.jd_stats(|stats| {
+                stats.tokens += responses.allocated;
+                stats.declared += responses.declared;
+                stats.missing_rounds += responses.missing_rounds;
+                stats.validations += responses.validations;
+                stats.pushed += responses.blocks.len() as u64 + responses.unmatched;
+                stats.push_unmatched += responses.unmatched;
+                if let Some(code) = responses.refused {
+                    stats.refused += 1;
+                    stats.last_refusal = Some(code);
+                }
+                stats.validator = stats.validator.map(|_| declarator.validator_kind());
+            });
+            for pushed in &responses.blocks {
+                save_declared(
+                    shared,
+                    &pushed.parent,
+                    pushed.hash,
+                    &pushed.block,
+                    pushed.height,
+                    "Job Declaration".to_owned(),
+                )?;
             }
             if responses.close {
                 break;
@@ -1406,6 +1643,26 @@ fn serve_device(
                     // still be saved in case the client's fails.
                     // Look here if: the server stops with "cannot persist
                     // solved block" while JD clients mine.
+                    // #### PR #42: a declared job's block (Full-Template) goes
+                    // to the JD journal, then the pool's node.
+                    if block.template.is_declared() {
+                        let bytes = block.template.block(&block.coinbase, block.header)?;
+                        let worker = shared
+                            .stats
+                            .lock()
+                            .ok()
+                            .and_then(|stats| stats.device_stats.label(device))
+                            .unwrap_or_default();
+                        save_declared(
+                            shared,
+                            &block.template.previous_hash,
+                            block.hash,
+                            &bytes,
+                            block.template.height,
+                            worker,
+                        )?;
+                        continue;
+                    }
                     if block.template.is_header_only() {
                         if let Ok(mut stats) = shared.stats.lock() {
                             let mut hash = super::template::double_sha256(&block.header);

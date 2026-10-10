@@ -1541,11 +1541,15 @@ const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(12);
 const SCAN_TXOUTSET_READ_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// #### PR #42: a pool's node checks a miner's whole declared block
+/// (Job Declaration), which takes longer than a usual call on a large one.
+const VALIDATE_BLOCK_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn rpc_read_timeout(method: &str) -> Duration {
-    if method == "scantxoutset" {
-        SCAN_TXOUTSET_READ_TIMEOUT
-    } else {
-        RPC_READ_TIMEOUT
+    match method {
+        "scantxoutset" => SCAN_TXOUTSET_READ_TIMEOUT,
+        "validateblocktemplate" => VALIDATE_BLOCK_READ_TIMEOUT,
+        _ => RPC_READ_TIMEOUT,
     }
 }
 

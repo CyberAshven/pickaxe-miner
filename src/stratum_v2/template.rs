@@ -7,7 +7,10 @@ use super::merge::set::{AuxJob, AuxOutputs, TokenSet};
 use crate::config::MiningNetwork;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use stratum_core::bitcoin::{consensus, Transaction};
 
 /// Hash bytes in serialized/internal order, not RPC display order.
@@ -25,19 +28,38 @@ pub struct BchTemplate {
     pub size_limit: u64,
     pub coinbase_value: u64,
     coinbase_flags: Vec<u8>,
-    transactions: Vec<Vec<u8>>,
+    /// #### PR #42: shared, so a template's copies (with tokens, a plan or a
+    /// pool's name) and the jobs a pool checks for Job Declaration clients
+    /// hold the same bytes.
+    transactions: Arc<[Arc<[u8]>]>,
+    /// #### PR #42: the transactions' ids (internal byte order), and an
+    /// index of them built on first use.
+    txids: Arc<[Hash]>,
+    index: Arc<OnceLock<HashMap<Hash, u32>>>,
     /// #### PR #42: the coinbase's merkle branch (index 0), computed once
     /// from the transactions' hashes, which nothing else needs.
     merkle_path: Arc<[Hash]>,
     /// #### PR #42: the merge-mined tokens of jobs built from this template.
     tokens: Option<Arc<TokenSet>>,
-    /// #### PR #42: a custom job's template (Job Declaration), which checks
-    /// headers but has no transactions to build a block with.
-    header_only: bool,
+    /// #### PR #42: where the template's jobs come from.
+    origin: Origin,
     /// #### PR #42: the Job Declaration plan of a client's local server:
     /// jobs built from this template pay the pool's outputs and nest their
     /// extranonce inside the pool channel's.
     jd: Option<Arc<JdPlan>>,
+}
+
+/// #### PR #42: where a template's jobs come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// This server's own source: a node or a template provider.
+    Own,
+    /// A Coinbase-only custom job (Job Declaration): it checks headers but
+    /// has no transactions to build a block with.
+    HeaderOnly,
+    /// A Full-Template declaration a pool checked: the client's
+    /// transactions, so its blocks are whole.
+    Declared,
 }
 
 #[derive(Clone, Debug)]
@@ -117,7 +139,7 @@ impl BchTemplate {
                 return Err("template transactions are duplicated or not in CTOR order".into());
             }
             previous_display = Some(display);
-            transactions.push(bytes);
+            transactions.push(Arc::<[u8]>::from(bytes));
             transaction_hashes.push(hash);
         }
         let min_time = word(value, "mintime")?;
@@ -154,9 +176,11 @@ impl BchTemplate {
             coinbase_value,
             coinbase_flags,
             merkle_path: coinbase_path(&transaction_hashes).into(),
-            transactions,
+            transactions: transactions.into(),
+            txids: transaction_hashes.into(),
+            index: Default::default(),
             tokens: None,
-            header_only: false,
+            origin: Origin::Own,
             jd: None,
         })
     }
@@ -240,10 +264,12 @@ impl BchTemplate {
                 + u64::from(provided.reserve),
             coinbase_value: provided.value,
             coinbase_flags: prefix[push.len()..].to_vec(),
-            transactions: provided.transactions,
+            transactions: provided.transactions.into_iter().map(Arc::from).collect(),
+            txids: hashes.into(),
+            index: Default::default(),
             merkle_path: merkle_path.into(),
             tokens: None,
-            header_only: false,
+            origin: Origin::Own,
             jd: None,
         })
     }
@@ -270,11 +296,57 @@ impl BchTemplate {
             size_limit: context.size_limit,
             coinbase_value: context.coinbase_value,
             coinbase_flags: Vec::new(),
-            transactions: Vec::new(),
+            transactions: Vec::new().into(),
+            txids: Vec::new().into(),
+            index: Default::default(),
             merkle_path: merkle_path.into(),
             tokens: None,
-            header_only: true,
+            origin: Origin::HeaderOnly,
             jd: None,
+        }
+    }
+
+    /// #### PR #42
+    /// A Full-Template declaration's template, once a pool holds every one
+    /// of its transactions: the pool's parent, bits, target, height, size
+    /// limit and times (`context`) with the client's version and
+    /// transactions, in the declared order (`txids` their ids). Its blocks
+    /// are whole, built around the client's coinbase.
+    pub fn declared(
+        context: &BchTemplate,
+        version: u32,
+        transactions: Vec<Arc<[u8]>>,
+        txids: Vec<Hash>,
+    ) -> Self {
+        Self {
+            previous_hash: context.previous_hash,
+            version,
+            bits: context.bits,
+            target: context.target,
+            min_time: context.min_time,
+            current_time: context.current_time,
+            height: context.height,
+            size_limit: context.size_limit,
+            coinbase_value: context.coinbase_value,
+            coinbase_flags: Vec::new(),
+            merkle_path: coinbase_path(&txids).into(),
+            transactions: transactions.into(),
+            txids: txids.into(),
+            index: Default::default(),
+            tokens: None,
+            origin: Origin::Declared,
+            jd: None,
+        }
+    }
+
+    /// #### PR #42: this template for a custom job set on it: the job's
+    /// version and start time, the same transactions.
+    pub fn with_header(&self, version: u32, min_ntime: u32) -> Self {
+        Self {
+            version,
+            min_time: min_ntime,
+            current_time: min_ntime,
+            ..self.clone()
         }
     }
 
@@ -299,7 +371,47 @@ impl BchTemplate {
 
     /// #### PR #42: a custom job's template, without transactions.
     pub fn is_header_only(&self) -> bool {
-        self.header_only
+        self.origin == Origin::HeaderOnly
+    }
+
+    /// #### PR #42: a Full-Template declaration's template.
+    pub fn is_declared(&self) -> bool {
+        self.origin == Origin::Declared
+    }
+
+    /// #### PR #42: the transactions' ids, in block order.
+    pub fn transaction_ids(&self) -> &[Hash] {
+        &self.txids
+    }
+
+    /// #### PR #42: the transaction with id `txid`, from an index built on
+    /// the first call.
+    pub fn transaction(&self, txid: &Hash) -> Option<&Arc<[u8]>> {
+        let index = self.index.get_or_init(|| {
+            self.txids
+                .iter()
+                .enumerate()
+                .map(|(position, txid)| (*txid, position as u32))
+                .collect()
+        });
+        index
+            .get(txid)
+            .map(|position| &self.transactions[*position as usize])
+    }
+
+    /// #### PR #42: a Job Declaration job's coinbase split around its whole
+    /// extranonce (the pool channel's prefix and the bytes the pool lets the
+    /// client roll), as DeclareMiningJob carries it: the same bytes as the
+    /// local channels' coinbases.
+    pub fn declared_parts(&self) -> Result<CoinbaseParts, String> {
+        let plan = self.jd.as_ref().ok_or("not a Job Declaration template")?;
+        let extranonce = plan.upstream_prefix.len() + plan.rollable();
+        let coinbase = self.coinbase_with_outputs(
+            &vec![0; extranonce],
+            plan.outputs(self.coinbase_value),
+            None,
+        )?;
+        Ok(self.split(coinbase, extranonce))
     }
 
     /// #### PR #40
@@ -396,6 +508,17 @@ impl BchTemplate {
                 super::payout::outputs(self.coinbase_value, &scripts, policy)
             }
         };
+        self.coinbase_with_outputs(extranonce, outputs, aux)
+    }
+
+    /// #### PR #42: the coinbase paying `outputs`, with a job's merge-mining
+    /// outputs, if any.
+    fn coinbase_with_outputs(
+        &self,
+        extranonce: &[u8],
+        outputs: Vec<(u64, Vec<u8>)>,
+        aux: Option<&AuxOutputs>,
+    ) -> Result<Coinbase, String> {
         if extranonce.len() > 64 {
             return Err("extranonce exceeds coinbase budget".into());
         }
@@ -512,14 +635,19 @@ impl BchTemplate {
             policy,
             aux,
         )?;
+        Ok(self.split(coinbase, extranonce_len))
+    }
+
+    /// The parts of `coinbase`, whose extranonce is `extranonce_len` bytes.
+    fn split(&self, coinbase: Coinbase, extranonce_len: usize) -> CoinbaseParts {
         // The coinbase script is at most 100 bytes, so its CompactSize is one byte.
         let offset =
             4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len();
-        Ok(CoinbaseParts {
+        CoinbaseParts {
             prefix: coinbase.bytes[..offset].to_vec(),
             suffix: coinbase.bytes[offset + extranonce_len..].to_vec(),
             merkle_path: self.merkle_path.to_vec(),
-        })
+        }
     }
 
     pub fn header(
@@ -544,7 +672,7 @@ impl BchTemplate {
 
     /// Build only a full block; no light-job fallback can truncate its tx list.
     pub fn block(&self, coinbase: &Coinbase, header: [u8; 80]) -> Result<Vec<u8>, String> {
-        if self.header_only {
+        if self.origin == Origin::HeaderOnly {
             return Err("a custom job's template has no transactions".into());
         }
         self.check_block_size(coinbase.bytes.len())?;
@@ -565,7 +693,7 @@ impl BchTemplate {
         let mut block = header.to_vec();
         compact_size(self.transactions.len() + 1, &mut block);
         block.extend_from_slice(coinbase);
-        for tx in &self.transactions {
+        for tx in self.transactions.iter() {
             block.extend_from_slice(tx);
         }
         block
@@ -587,7 +715,7 @@ impl BchTemplate {
     }
 
     /// #### PR #42: the block's other transactions, in block (CTOR) order.
-    pub fn transactions(&self) -> &[Vec<u8>] {
+    pub fn transactions(&self) -> &[Arc<[u8]>] {
         &self.transactions
     }
 
@@ -610,7 +738,9 @@ impl BchTemplate {
     /// merkle path is not recomputed), for transaction-data size tests.
     #[cfg(test)]
     pub(super) fn with_transactions(mut self, transactions: Vec<Vec<u8>>) -> Self {
-        self.transactions = transactions;
+        self.txids = transactions.iter().map(|tx| double_sha256(tx)).collect();
+        self.index = Default::default();
+        self.transactions = transactions.into_iter().map(Arc::from).collect();
         self
     }
 
@@ -644,7 +774,8 @@ pub struct Provided<'a> {
 /// coinbase, has inputs and no witness encoding. Bitcoin's decoder treats
 /// CashTokens prefixes as opaque output script bytes; BCH txids commit to
 /// every byte. No Bitcoin consensus validation is used.
-fn checked_transaction(bytes: &[u8]) -> Result<Hash, String> {
+/// #### PR #42: also a Job Declaration client's provided transactions.
+pub fn checked_transaction(bytes: &[u8]) -> Result<Hash, String> {
     let tx: Transaction =
         consensus::deserialize(bytes).map_err(|_| "malformed template transaction")?;
     if tx.is_coinbase()
@@ -791,7 +922,8 @@ fn compact_size(value: usize, out: &mut Vec<u8>) {
         }
     }
 }
-fn height_script(height: u32) -> Vec<u8> {
+/// The minimal BIP34 push of `height`.
+pub fn height_script(height: u32) -> Vec<u8> {
     if height == 0 {
         return vec![0];
     }

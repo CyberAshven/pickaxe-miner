@@ -86,7 +86,7 @@ pub fn transaction_data(id: u64, template: &BchTemplate) -> Result<SerializedFra
     }
     let list = transactions
         .iter()
-        .map(|tx| B016M::try_from(tx.as_slice()))
+        .map(|tx| B016M::try_from(&tx[..]))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "template-too-large")?;
     let list: Seq064K<B016M> = list.try_into().map_err(|_| "template-too-large")?;

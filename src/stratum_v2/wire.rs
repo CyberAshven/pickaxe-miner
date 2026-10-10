@@ -7,7 +7,12 @@ use super::{
         share_work, Channel, ChannelKind, Share, TokenWin, ValidatedShare, DEVICE_EXTRANONCE_SIZE,
         VERSION_ROLLING_MASK,
     },
-    jd::{codec::parse_outputs, server::Declarator, ForwardShare, CUSTOM_JOB_BIT, JD_ROLLABLE},
+    jd::{
+        codec::parse_outputs,
+        server::{Custom, Declarator},
+        token::PxToken,
+        ForwardShare, CUSTOM_JOB_BIT, JD_ROLLABLE,
+    },
     telemetry::ShareEvent,
     template::{meets_target, BchTemplate, CoinbaseParts, Hash},
 };
@@ -519,6 +524,11 @@ impl MiningSession {
             .as_ref()
             .map(|(_, _, template)| template.clone())
             .ok_or("stale-chain-tip")?;
+        // A declared job's token (Full-Template) says so; the token book
+        // checks the flag is the token's own.
+        if PxToken::decode(request.token.as_ref()).is_some_and(|token| token.declared) {
+            return self.declared_job(request, now, &declarator, &payout, &context);
+        }
         if request.prev_hash.as_ref() != context.previous_hash.as_slice() {
             return Err("stale-chain-tip");
         }
@@ -560,16 +570,15 @@ impl MiningSession {
             .map(|hash| Hash::try_from(hash.as_ref()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| "invalid-merkle-path")?;
-        let rule = declarator.redeem(request.token.as_ref(), &payout, std::time::Instant::now())?;
+        let Custom::CoinbaseOnly(rule) =
+            declarator.redeem(request.token.as_ref(), &payout, std::time::Instant::now())?
+        else {
+            return Err("invalid-mining-job-token");
+        };
         let outputs = parse_outputs(outputs).map_err(|_| "invalid-coinbase-tx-outputs")?;
         rule.check(&outputs)
             .map_err(|_| "invalid-coinbase-tx-outputs")?;
-        let count = self
-            .custom_jobs
-            .checked_add(1)
-            .filter(|count| *count < CUSTOM_JOB_BIT);
-        self.custom_jobs = count.ok_or("invalid-coinbase-tx")?;
-        let id = CUSTOM_JOB_BIT | self.custom_jobs;
+        let id = self.next_custom_id()?;
         let template = Arc::new(BchTemplate::custom(
             &context,
             request.version,
@@ -585,6 +594,106 @@ impl MiningSession {
                 CoinbaseParts {
                     prefix: head,
                     suffix,
+                    merkle_path,
+                },
+            )
+            .map_err(|_| "invalid-coinbase-tx")?;
+        Ok(id)
+    }
+
+    /// #### PR #42: the next custom job id, which carries 0x8000_0000.
+    fn next_custom_id(&mut self) -> Result<u32, &'static str> {
+        let count = self
+            .custom_jobs
+            .checked_add(1)
+            .filter(|count| *count < CUSTOM_JOB_BIT);
+        self.custom_jobs = count.ok_or("invalid-coinbase-tx")?;
+        Ok(CUSTOM_JOB_BIT | self.custom_jobs)
+    }
+
+    // #### PR #42: SetCustomMiningJob on a declared job (Full-Template)
+    // What: a declared token sets exactly the job the pool checked: its
+    // parent (still the pool's), its bits, its version within the rolling
+    // bits, a start time from the pool's mintime to 10 minutes ahead, and
+    // the coinbase's version, script head, sequence, outputs, locktime and
+    // merkle path as declared, around this channel's 16-byte prefix and 16
+    // rollable bytes. The job's template holds the declared transactions,
+    // so its blocks are whole.
+    // Why: the declaration is what the pool (and its node) checked; the job
+    // must not differ from it.
+    // Look here if: a Full-Template client's custom jobs are refused after
+    // DeclareMiningJob.Success.
+    fn declared_job(
+        &mut self,
+        request: &SetCustomMiningJob,
+        now: u32,
+        declarator: &Declarator,
+        payout: &str,
+        context: &BchTemplate,
+    ) -> Result<u32, &'static str> {
+        let Custom::Declared(job) =
+            declarator.redeem(request.token.as_ref(), payout, std::time::Instant::now())?
+        else {
+            return Err("invalid-mining-job-token");
+        };
+        let template = &job.template;
+        if request.prev_hash.as_ref() != template.previous_hash.as_slice()
+            || template.previous_hash != context.previous_hash
+        {
+            return Err("stale-chain-tip");
+        }
+        if request.nbits != template.bits {
+            return Err("invalid-nbits");
+        }
+        if (request.version ^ template.version) & !VERSION_ROLLING_MASK != 0 {
+            return Err("invalid-version");
+        }
+        if request.min_ntime < context.min_time || request.min_ntime > now.saturating_add(600) {
+            return Err("invalid-min-ntime");
+        }
+        let shape = &job.shape;
+        if request.coinbase_tx_version != shape.tx_version {
+            return Err("invalid-coinbase-tx-version");
+        }
+        if request.coinbase_prefix.as_ref() != shape.head.as_slice() {
+            return Err("invalid-coinbase-prefix");
+        }
+        if request.coinbase_tx_input_n_sequence != shape.sequence {
+            return Err("invalid-coinbase-tx-input-n-sequence");
+        }
+        if request.coinbase_tx_outputs.as_ref() != shape.outputs_bytes.as_slice() {
+            return Err("invalid-coinbase-tx-outputs");
+        }
+        if request.coinbase_tx_locktime != shape.locktime {
+            return Err("invalid-coinbase-tx-locktime");
+        }
+        let merkle_path = request
+            .merkle_path
+            .iter()
+            .map(|hash| Hash::try_from(hash.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "invalid-merkle-path")?;
+        if merkle_path != template.merkle_path() {
+            return Err("invalid-merkle-path");
+        }
+        let channel = self
+            .channels
+            .get(&request.channel_id)
+            .ok_or("invalid-channel-id")?;
+        if shape.extranonce_len() != channel.extranonce_prefix.len() + channel.rollable() {
+            return Err("invalid-coinbase-tx");
+        }
+        let id = self.next_custom_id()?;
+        let template = Arc::new(template.with_header(request.version, request.min_ntime));
+        self.channels
+            .get_mut(&request.channel_id)
+            .ok_or("invalid-channel-id")?
+            .install_custom(
+                id,
+                template,
+                CoinbaseParts {
+                    prefix: shape.prefix.clone(),
+                    suffix: shape.suffix.clone(),
                     merkle_path,
                 },
             )
@@ -1449,6 +1558,7 @@ mod tests {
         tx_version: u32,
         prefix: Vec<u8>,
         outputs: Vec<u8>,
+        path: Vec<Hash>,
     }
 
     impl CustomJob {
@@ -1466,7 +1576,7 @@ mod tests {
                 .book
                 .lock()
                 .unwrap()
-                .allocate(0, payout(), rates, std::time::Instant::now())
+                .allocate(0, payout(), rates, false, std::time::Instant::now())
                 .unwrap()
                 .encode()
                 .to_vec();
@@ -1487,6 +1597,7 @@ mod tests {
                 tx_version: 2,
                 prefix,
                 outputs: super::super::jd::codec::serialize_outputs(&outputs),
+                path: Vec::new(),
             }
         }
 
@@ -1504,7 +1615,13 @@ mod tests {
                 coinbase_tx_input_n_sequence: u32::MAX,
                 coinbase_tx_outputs: self.outputs.as_slice().try_into().unwrap(),
                 coinbase_tx_locktime: 0,
-                merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+                merkle_path: self
+                    .path
+                    .iter()
+                    .map(Into::into)
+                    .collect::<Vec<binary_sv2::U256>>()
+                    .try_into()
+                    .unwrap(),
             }))
             .unwrap()
         }
@@ -1690,5 +1807,137 @@ mod tests {
         let mut stale = server.receive(share(&extranonce, 3), NOW).unwrap();
         let error: SubmitSharesError = binary_sv2::from_bytes(stale.frames[0].payload()).unwrap();
         assert_eq!(error.error_code.as_ref(), b"stale-share");
+    }
+
+    // #### PR #42
+    // What: a declared token sets exactly its declared job: a parent, bits,
+    // version, start time, coinbase version, prefix, outputs or merkle path
+    // other than declared each has its own error code (and spends the
+    // token); an allocated token whose declared flag was forged is refused;
+    // the job's shares rebuild the declared coinbase, and a block share
+    // comes back on the declared template, whole, with its 3 transactions.
+    // Look here if: MiningSession::declared_job changes.
+    #[test]
+    fn set_custom_mining_job_on_a_declared_job_must_match_the_declaration() {
+        use super::super::jd::declared::{tests::context, CoinbaseShape, DeclaredJob};
+        let (mut server, declarator, channel, prefix) = jd_session(0b110);
+        let pool = Arc::new(context(3));
+        server.set_job(10, 4, pool.clone()).unwrap();
+        let base = CustomJob::valid(&declarator);
+        let mut head = base.tx_version.to_le_bytes().to_vec();
+        head.push(1);
+        head.extend([0; 32]);
+        head.extend(u32::MAX.to_le_bytes());
+        head.push((base.prefix.len() + 32) as u8);
+        head.extend(&base.prefix);
+        let mut suffix = u32::MAX.to_le_bytes().to_vec();
+        suffix.extend(&base.outputs);
+        suffix.extend(0u32.to_le_bytes());
+        let declared = Arc::new(DeclaredJob {
+            shape: CoinbaseShape::parse(&head, &suffix).unwrap(),
+            template: Arc::new(BchTemplate::declared(
+                &pool,
+                pool.version,
+                pool.transactions().to_vec(),
+                pool.transaction_ids().to_vec(),
+            )),
+        });
+        let rates = PxToken::decode(&base.token).unwrap().rates;
+        // The book's lock is released before `valid` takes it again.
+        let job = || {
+            let token = declarator
+                .book
+                .lock()
+                .unwrap()
+                .declared(0, payout(), rates, &declared, std::time::Instant::now())
+                .unwrap()
+                .encode()
+                .to_vec();
+            CustomJob {
+                token,
+                path: pool.merkle_path().to_vec(),
+                ..CustomJob::valid(&declarator)
+            }
+        };
+        type Change = Box<dyn Fn(&mut CustomJob)>;
+        let cases: Vec<(&str, Change)> = vec![
+            ("stale-chain-tip", Box::new(|job| job.prev = [0xcd; 32])),
+            ("invalid-nbits", Box::new(|job| job.bits = 0x207f_fffe)),
+            ("invalid-version", Box::new(|job| job.version ^= 1)),
+            (
+                "invalid-min-ntime",
+                Box::new(|job| job.min_ntime = 1_699_999_999),
+            ),
+            (
+                "invalid-coinbase-tx-version",
+                Box::new(|job| job.tx_version = 1),
+            ),
+            (
+                "invalid-coinbase-prefix",
+                Box::new(|job| job.prefix[1] ^= 1),
+            ),
+            (
+                "invalid-coinbase-tx-outputs",
+                Box::new(|job| job.outputs[1] ^= 1),
+            ),
+            ("invalid-merkle-path", Box::new(|job| job.path.clear())),
+        ];
+        for (code, change) in cases {
+            let mut job = job();
+            change(&mut job);
+            assert_eq!(
+                set_custom(&mut server, channel, &job),
+                Err(code.into()),
+                "{code}"
+            );
+        }
+        let mut forged = CustomJob::valid(&declarator);
+        forged.token[9] |= 1;
+        assert_eq!(
+            set_custom(&mut server, channel, &forged),
+            Err("invalid-mining-job-token".into())
+        );
+        let job = job();
+        let id = set_custom(&mut server, channel, &job).unwrap();
+        let extranonce = [0x42u8; JD_ROLLABLE];
+        let coinbase = job.coinbase(&prefix, &extranonce);
+        let mut header = [0; 80];
+        header[..4].copy_from_slice(&job.version.to_le_bytes());
+        header[4..36].copy_from_slice(&job.prev);
+        header[36..68].copy_from_slice(&super::super::template::fold(
+            double_sha256(&coinbase),
+            pool.merkle_path(),
+        ));
+        header[68..72].copy_from_slice(&NOW.to_le_bytes());
+        header[72..76].copy_from_slice(&job.bits.to_le_bytes());
+        let nonce = (0..10_000u32)
+            .find(|nonce| {
+                header[76..].copy_from_slice(&nonce.to_le_bytes());
+                meets_target(&double_sha256(&header), &compact_target(job.bits).unwrap())
+            })
+            .unwrap();
+        let responses = server
+            .receive(
+                mining(Mining::SubmitSharesExtended(SubmitSharesExtended {
+                    channel_id: channel,
+                    sequence_number: 1,
+                    job_id: id,
+                    nonce,
+                    ntime: NOW,
+                    version: job.version,
+                    extranonce: extranonce.as_slice().try_into().unwrap(),
+                }))
+                .unwrap(),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(responses.blocks.len(), 1);
+        let block = &responses.blocks[0];
+        assert!(block.template.is_declared());
+        assert_eq!(block.coinbase.bytes, coinbase);
+        let bytes = block.template.block(&block.coinbase, block.header).unwrap();
+        let decoded: Block = consensus::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.txdata.len(), 4);
+        assert!(decoded.check_merkle_root());
     }
 }

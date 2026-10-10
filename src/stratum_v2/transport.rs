@@ -59,6 +59,20 @@ impl Limits {
         max_out: 65_557 + 64,
         frame_deadline: Duration::from_secs(60),
     };
+    // #### PR #42: the Job Declaration frame limit
+    // What: a Full-Template Job Declaration session takes and sends frames of
+    // up to 16 MiB each way, with a minute per frame; a Coinbase-only one
+    // keeps a device's limits.
+    // Why: a declaration lists up to 65,535 transaction ids (2 MiB), and
+    // missing transactions come back in one frame of up to 16,777,215
+    // payload bytes; the device limit would cut both off.
+    // Look here if: a Full-Template client is closed while it declares or
+    // provides transactions.
+    pub const JD: Self = Self {
+        max_in: 6 + 16_777_215,
+        max_out: 6 + 16_777_215,
+        frame_deadline: Duration::from_secs(60),
+    };
 
     /// The encrypted bytes one inbound frame may take: the plaintext, a
     /// 16-byte MAC per Noise chunk of at most 65,535 bytes, and the header.
@@ -248,6 +262,12 @@ impl Sender {
         self.state = None;
         let _ = self.stream.shutdown(Shutdown::Both);
     }
+
+    /// #### PR #42: other frame limits from the next frame on, for a
+    /// connection that turned out to be a Job Declaration session.
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
 }
 
 impl Receiver {
@@ -314,6 +334,12 @@ impl Receiver {
     pub fn close(&mut self) {
         self.state = None;
         let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
+    /// #### PR #42: other frame limits from the next frame on (see
+    /// `Sender::set_limits`).
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
     }
 }
 

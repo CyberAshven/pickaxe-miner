@@ -11,8 +11,8 @@ shares the same code path with a network switch.
 | **Template Provider client** | Pull full block templates from the miner's own node (BCHN over JSON-RPC) or, from PR #42, from an SV2 Template Provider (`--template-provider`), and keep them fresh. |
 | **Mining server** | Serve SV2 mining channels to devices (Bitaxe native SV2 and SV1 via translator). Check shares, submit blocks. |
 | **SV1 translator** | Accept Stratum V1 firmware (Avalon Nano and most home ASICs) and translate to the SV2 mining server. Required in this implementation scope. |
-| **Job Declaration client** (PR #42) | Mine at a Pickaxe pool with your own node's templates (`--job-declaration coinbase`); devices fall back to the pool's own jobs when the pool refuses them. See [job-declaration.md](job-declaration.md). |
-| **Job Declaration server** (PR #42) | Accept miners' own templates at a public pool (`--accept-job-declaration coinbase`), checking each custom job's coinbase pays the pool's fee and the donation. See [job-declaration.md](job-declaration.md). |
+| **Job Declaration client** (PR #42) | Mine at a Pickaxe pool with your own node's templates (`--job-declaration`: Full-Template, or `coinbase`); devices fall back to the pool's own jobs when the pool refuses them. See [job-declaration.md](job-declaration.md). |
+| **Job Declaration server** (PR #42) | Accept miners' own templates at a public pool (`--accept-job-declaration`: both modes, or `full` or `coinbase`), checking each custom job's coinbase pays the pool's fee and the donation; Full-Template templates are checked by the pool's node, which gets their blocks too. See [job-declaration.md](job-declaration.md). |
 | **Template Provider server** (PR #42) | Serve this node's templates to SV2 pools, Job Declaration clients and P2Pool over SV2 Template Distribution (`--tp-listen`), and relay the blocks they find. See [Serving templates to a pool](#serving-templates-to-a-pool-template-distribution). |
 
 GPU CashToken mining stays on its existing path. This work adds an ASIC-facing

@@ -11,8 +11,13 @@
 //! 10 8 serial u64le | 18 8 secret (never logged)
 //! ```
 
-use super::{MAX_TOKENS, TOKEN_TTL};
-use std::{collections::BTreeMap, fmt, time::Instant};
+use super::{declared::DeclaredJob, DECLARED_TTL, MAX_TOKENS, TOKEN_TTL};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Weak},
+    time::Instant,
+};
 
 pub const PX_LEN: usize = 26;
 const MAGIC: [u8; 2] = *b"PX";
@@ -93,11 +98,30 @@ struct Entry {
     rates: PoolRates,
     secret: [u8; 8],
     issued: Instant,
+    kind: Kind,
+}
+
+enum Kind {
+    /// From AllocateMiningJobToken, on a Full-Template connection or not.
+    Allocated { full_template: bool },
+    /// From DeclareMiningJob.Success: the job the pool checked, held by its
+    /// connection (the last few it declared), so a token whose job went is
+    /// spent.
+    Declared(Weak<DeclaredJob>),
+}
+
+/// What a redeemed token sets.
+pub enum Redeemed {
+    /// A Coinbase-only custom job, which must pay these rates.
+    Allocated(PoolRates),
+    /// A Full-Template custom job, which must match this declared job.
+    Declared(Arc<DeclaredJob>),
 }
 
 /// The tokens a pool has allocated and not yet redeemed. Each is bound to
 /// the connection that asked for it and to the payout address its
-/// `user_identifier` names, lives 10 minutes and is redeemed once.
+/// `user_identifier` names, lives 10 minutes (60 once declared) and is
+/// redeemed once.
 #[derive(Default)]
 pub struct TokenBook {
     next_serial: u64,
@@ -105,12 +129,25 @@ pub struct TokenBook {
 }
 
 impl TokenBook {
-    /// A new token for `owner` (a connection) whose jobs pay `payout`.
+    /// A new token for `owner` (a connection) whose jobs pay `payout`;
+    /// `full_template` when the connection declares its templates.
     pub fn allocate(
         &mut self,
         owner: u64,
         payout: String,
         rates: PoolRates,
+        full_template: bool,
+        now: Instant,
+    ) -> Result<PxToken, &'static str> {
+        self.insert(owner, payout, rates, Kind::Allocated { full_template }, now)
+    }
+
+    fn insert(
+        &mut self,
+        owner: u64,
+        payout: String,
+        rates: PoolRates,
+        kind: Kind,
         now: Instant,
     ) -> Result<PxToken, &'static str> {
         self.expire(now);
@@ -127,6 +164,10 @@ impl TokenBook {
         }
         self.next_serial = self.next_serial.checked_add(1).ok_or("tokens exhausted")?;
         let secret: [u8; 8] = rand::random();
+        let (declared, full_template) = match &kind {
+            Kind::Allocated { full_template } => (false, *full_template),
+            Kind::Declared(_) => (true, true),
+        };
         self.entries.insert(
             self.next_serial,
             Entry {
@@ -135,26 +176,76 @@ impl TokenBook {
                 rates,
                 secret,
                 issued: now,
+                kind,
             },
         );
         Ok(PxToken {
             rates,
-            declared: false,
-            full_template: false,
+            declared,
+            full_template,
             serial: self.next_serial,
             secret,
         })
     }
 
-    /// The rates a token's job must pay when `payout` (the channel's) is
-    /// the address it was allocated for; the token is spent either way once
-    /// it matched its secret.
+    /// Spends a Full-Template connection's allocated token on a declaration
+    /// by `owner`: the address its jobs pay and its rates.
+    pub fn declare(
+        &mut self,
+        token: &[u8],
+        owner: u64,
+        now: Instant,
+    ) -> Result<(String, PoolRates), &'static str> {
+        const INVALID: &str = "invalid-mining-job-token";
+        self.expire(now);
+        let token = PxToken::decode(token).ok_or(INVALID)?;
+        let entry = self.entries.get(&token.serial).ok_or(INVALID)?;
+        if entry.secret != token.secret
+            || entry.owner != owner
+            || !matches!(
+                entry.kind,
+                Kind::Allocated {
+                    full_template: true
+                }
+            )
+            || token.declared
+            || !token.full_template
+        {
+            return Err(INVALID);
+        }
+        let entry = self.entries.remove(&token.serial).ok_or(INVALID)?;
+        Ok((entry.payout, entry.rates))
+    }
+
+    /// The token of a declaration the pool checked: `job` is held by the
+    /// declaring connection, which keeps its last few.
+    pub fn declared(
+        &mut self,
+        owner: u64,
+        payout: String,
+        rates: PoolRates,
+        job: &Arc<DeclaredJob>,
+        now: Instant,
+    ) -> Result<PxToken, &'static str> {
+        self.insert(
+            owner,
+            payout,
+            rates,
+            Kind::Declared(Arc::downgrade(job)),
+            now,
+        )
+    }
+
+    /// What a token sets when `payout` (the channel's) is the address it was
+    /// allocated for. The token is spent once it matched its secret, unless
+    /// it is a Full-Template connection's token that was not declared yet
+    /// (`job-not-yet-validated`).
     pub fn redeem(
         &mut self,
         token: &[u8],
         payout: &str,
         now: Instant,
-    ) -> Result<PoolRates, &'static str> {
+    ) -> Result<Redeemed, &'static str> {
         const INVALID: &str = "invalid-mining-job-token";
         self.expire(now);
         let token = PxToken::decode(token).ok_or(INVALID)?;
@@ -162,17 +253,34 @@ impl TokenBook {
         if entry.secret != token.secret {
             return Err(INVALID);
         }
+        if matches!(
+            entry.kind,
+            Kind::Allocated {
+                full_template: true
+            }
+        ) && entry.payout == payout
+        {
+            return Err("job-not-yet-validated");
+        }
         let entry = self.entries.remove(&token.serial).ok_or(INVALID)?;
         if entry.payout != payout {
             return Err(INVALID);
         }
-        Ok(entry.rates)
+        match entry.kind {
+            Kind::Allocated { .. } => Ok(Redeemed::Allocated(entry.rates)),
+            Kind::Declared(job) => job.upgrade().map(Redeemed::Declared).ok_or(INVALID),
+        }
     }
 
-    /// Drops tokens older than `TOKEN_TTL`.
+    /// Drops tokens older than `TOKEN_TTL` (`DECLARED_TTL` once declared).
     pub fn expire(&mut self, now: Instant) {
-        self.entries
-            .retain(|_, entry| now.saturating_duration_since(entry.issued) < TOKEN_TTL);
+        self.entries.retain(|_, entry| {
+            let ttl = match entry.kind {
+                Kind::Allocated { .. } => TOKEN_TTL,
+                Kind::Declared(_) => DECLARED_TTL,
+            };
+            now.saturating_duration_since(entry.issued) < ttl
+        });
     }
 
     /// Drops the tokens of a connection that closed.
@@ -241,6 +349,13 @@ mod tests {
         assert!(!format!("{token:?}").contains("5a"));
     }
 
+    fn allocated(result: Result<Redeemed, &'static str>) -> Result<PoolRates, &'static str> {
+        match result? {
+            Redeemed::Allocated(rates) => Ok(rates),
+            Redeemed::Declared(_) => Err("declared"),
+        }
+    }
+
     // #### PR #42
     // What: a token redeems once, for the payout it was allocated to,
     // with its own secret, within 10 minutes; a closed connection's tokens
@@ -250,38 +365,100 @@ mod tests {
     fn book_binds_identity_secret_and_ttl_and_is_single_use() {
         let now = Instant::now();
         let mut book = TokenBook::default();
-        let token = book.allocate(1, "payout-a".into(), rates(), now).unwrap();
+        let token = book
+            .allocate(1, "payout-a".into(), rates(), false, now)
+            .unwrap();
         let bytes = token.encode();
         assert_eq!(
-            book.redeem(&bytes, "payout-b", now),
+            allocated(book.redeem(&bytes, "payout-b", now)),
             Err("invalid-mining-job-token"),
             "another identity spends it"
         );
         assert!(book.redeem(&bytes, "payout-a", now).is_err(), "spent");
-        let token = book.allocate(1, "payout-a".into(), rates(), now).unwrap();
+        let token = book
+            .allocate(1, "payout-a".into(), rates(), false, now)
+            .unwrap();
         let mut forged = token.encode();
         forged[25] ^= 1;
         assert!(book.redeem(&forged, "payout-a", now).is_err());
-        assert_eq!(book.redeem(&token.encode(), "payout-a", now), Ok(rates()));
-        let late = book.allocate(1, "payout-a".into(), rates(), now).unwrap();
+        assert_eq!(
+            allocated(book.redeem(&token.encode(), "payout-a", now)),
+            Ok(rates())
+        );
+        let late = book
+            .allocate(1, "payout-a".into(), rates(), false, now)
+            .unwrap();
         assert!(book
             .redeem(&late.encode(), "payout-a", now + TOKEN_TTL)
             .is_err());
-        book.allocate(2, "payout-c".into(), rates(), now).unwrap();
-        book.allocate(3, "payout-d".into(), rates(), now).unwrap();
+        book.allocate(2, "payout-c".into(), rates(), false, now)
+            .unwrap();
+        book.allocate(3, "payout-d".into(), rates(), false, now)
+            .unwrap();
         book.drop_owner(2);
         assert_eq!(book.len(), 1);
         let mut full = TokenBook::default();
-        let first = full.allocate(9, "x".into(), rates(), now).unwrap();
+        let first = full.allocate(9, "x".into(), rates(), false, now).unwrap();
         for _ in 1..MAX_TOKENS {
-            full.allocate(8, "y".into(), rates(), now).unwrap();
+            full.allocate(8, "y".into(), rates(), false, now).unwrap();
         }
-        assert!(full.allocate(10, "z".into(), rates(), now).is_err());
-        full.allocate(9, "x".into(), rates(), now + Duration::from_secs(1))
+        assert!(full.allocate(10, "z".into(), rates(), false, now).is_err());
+        full.allocate(9, "x".into(), rates(), false, now + Duration::from_secs(1))
             .unwrap();
         assert!(
             full.redeem(&first.encode(), "x", now).is_err(),
             "the owner's oldest gave way"
         );
+    }
+
+    // #### PR #42
+    // What: a Full-Template connection's token is spent by its own
+    // connection's declaration and answers SetCustomMiningJob with
+    // job-not-yet-validated until then; another connection, a declared or
+    // Coinbase-only token cannot declare; the declared token carries the
+    // declared flag, redeems once to its job for the same payout, lives an
+    // hour, and is spent once its connection dropped the job.
+    // Look here if: TokenBook::declare, declared or redeem change.
+    #[test]
+    fn declared_tokens_bind_the_job_and_allocated_full_template_tokens_wait_for_it() {
+        let now = Instant::now();
+        let mut book = TokenBook::default();
+        let token = book.allocate(1, "a".into(), rates(), true, now).unwrap();
+        assert!(token.full_template && !token.declared);
+        assert_eq!(
+            book.redeem(&token.encode(), "a", now).err(),
+            Some("job-not-yet-validated")
+        );
+        assert!(
+            book.declare(&token.encode(), 2, now).is_err(),
+            "another owner"
+        );
+        let coinbase_only = book.allocate(1, "a".into(), rates(), false, now).unwrap();
+        assert!(book.declare(&coinbase_only.encode(), 1, now).is_err());
+        assert_eq!(
+            book.declare(&token.encode(), 1, now),
+            Ok(("a".into(), rates()))
+        );
+        assert!(book.declare(&token.encode(), 1, now).is_err(), "spent");
+        let (prefix, suffix) = super::super::declared::tests::shape_bytes(&[0x51], 32);
+        let job = Arc::new(DeclaredJob {
+            shape: super::super::declared::CoinbaseShape::parse(&prefix, &suffix).unwrap(),
+            template: Arc::new(super::super::declared::tests::context(0)),
+        });
+        let declared = book.declared(1, "a".into(), rates(), &job, now).unwrap();
+        assert!(declared.declared && declared.full_template);
+        assert!(book.declare(&declared.encode(), 1, now).is_err());
+        assert!(book.redeem(&declared.encode(), "b", now).is_err());
+        let declared = book.declared(1, "a".into(), rates(), &job, now).unwrap();
+        let later = now + TOKEN_TTL + Duration::from_secs(1);
+        match book.redeem(&declared.encode(), "a", later) {
+            Ok(Redeemed::Declared(found)) => assert!(Arc::ptr_eq(&found, &job)),
+            _ => panic!("the declared job"),
+        }
+        let gone = book.declared(1, "a".into(), rates(), &job, now).unwrap();
+        drop(job);
+        assert!(book.redeem(&gone.encode(), "a", now).is_err());
+        let old = book.allocate(1, "a".into(), rates(), false, now).unwrap();
+        assert!(book.redeem(&old.encode(), "a", now + DECLARED_TTL).is_err());
     }
 }

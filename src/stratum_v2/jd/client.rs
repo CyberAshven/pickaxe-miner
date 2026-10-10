@@ -1,22 +1,25 @@
 //! #### PR #42
-//! The client side of Job Declaration (Coinbase-only). An uplink thread keeps
-//! a Job Declaration session and one work-selection channel at the pool,
+//! The client side of Job Declaration. An uplink thread keeps a Job
+//! Declaration session and one work-selection channel at the pool,
 //! publishes the plan the local server builds its jobs from, declares each
-//! local template as a custom job with a token, and forwards the local
-//! devices' shares that meet the pool's target. When the pool refuses the
-//! templates or the link fails, the plan goes and the local server stops
-//! offering work, so the SV1 adapter moves devices to the pool's own jobs.
+//! local template (Full-Template: with its transactions, which the pool
+//! checks and may ask for; Coinbase-only: as a custom job with a token), and
+//! forwards the local devices' shares that meet the pool's target; a
+//! Full-Template client also pushes its blocks to the pool. When the pool
+//! refuses the templates or the link fails, the plan goes and the local
+//! server stops offering work, so the SV1 adapter moves devices to the
+//! pool's own jobs.
 
 use super::{
     codec::{parse_outputs, serialize_outputs},
     plan::JdPlan,
     token::PxToken,
-    ForwardShare, JD_ROLLABLE,
+    ForwardShare, JdMode, JD_ROLLABLE, MAX_DECLARED_TXS,
 };
 use crate::stratum_v2::{
     sv1::addressed_to,
     template::{meets_target, BchTemplate, Hash},
-    transport::{Receiver, Sender, Session},
+    transport::{Limits, Receiver, Sender, Session},
     wire::{encoded, mining},
 };
 use std::{
@@ -35,8 +38,13 @@ use stratum_core::{
     codec_sv2::SerializedFrame,
     common_messages_sv2::{self as common, Protocol, SetupConnection, SetupConnectionError},
     job_declaration_sv2::{
-        AllocateMiningJobToken, AllocateMiningJobTokenSuccess,
-        MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN, MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS,
+        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
+        DeclareMiningJobError, DeclareMiningJobSuccess, ProvideMissingTransactions,
+        ProvideMissingTransactionsSuccess, PushSolution, MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN,
+        MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS, MESSAGE_TYPE_DECLARE_MINING_JOB,
+        MESSAGE_TYPE_DECLARE_MINING_JOB_ERROR, MESSAGE_TYPE_DECLARE_MINING_JOB_SUCCESS,
+        MESSAGE_TYPE_PROVIDE_MISSING_TRANSACTIONS,
+        MESSAGE_TYPE_PROVIDE_MISSING_TRANSACTIONS_SUCCESS, MESSAGE_TYPE_PUSH_SOLUTION,
     },
     mining_sv2::*,
     parsers_sv2::Mining,
@@ -48,10 +56,17 @@ const EVENTS: usize = 1_024;
 const TOKENS_AHEAD: usize = 2;
 /// Shares held for a custom job the pool has not confirmed yet.
 const CACHED_SHARES: usize = 256;
-/// Confirmed custom jobs whose shares are still forwarded.
+/// Confirmed custom jobs whose shares are still forwarded, and published
+/// templates kept for PushSolution.
 const KEPT_JOBS: usize = 16;
 /// How long the pool has to answer a setup, a channel, a token or a job.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the pool has to answer a declaration: its node check may wait
+/// for a slot and take a while on a large template.
+const DECLARE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Declarations refused in a row on one parent before the client falls
+/// back.
+const DECLARE_ATTEMPTS: u8 = 4;
 
 /// The pool a client declares its templates to.
 #[derive(Clone)]
@@ -64,6 +79,7 @@ pub struct JdTarget {
     pub identity: String,
     /// The wait before trying again after the pool refused or failed.
     pub retry: Duration,
+    pub mode: JdMode,
 }
 
 /// What the dashboard shows of the client; never an identity or token.
@@ -71,6 +87,8 @@ pub struct JdTarget {
 pub struct JdClientSummary {
     /// "connecting", "active" or "fallback".
     pub state: &'static str,
+    /// "full-template" or "coinbase-only".
+    pub mode: &'static str,
     pub custom_jobs: u64,
     pub refused: u64,
     pub forwarded: u64,
@@ -78,6 +96,14 @@ pub struct JdClientSummary {
     pub rejected: u64,
     pub fallbacks: u64,
     pub last_error: Option<String>,
+    /// Full-Template: declarations the pool accepted, rounds of missing
+    /// transactions provided, declarations dropped (a tip race, a template
+    /// over 65,535 transactions or missing transactions over one frame) and
+    /// blocks pushed to the pool.
+    pub declared: u64,
+    pub provided: u64,
+    pub dropped: u64,
+    pub pushed: u64,
 }
 
 pub struct JdStatus {
@@ -123,6 +149,7 @@ pub fn spawn(target: JdTarget, stop: Arc<AtomicBool>) -> (UplinkHandle, thread::
         plan: RwLock::new(None),
         summary: Mutex::new(JdClientSummary {
             state: "connecting",
+            mode: target.mode.as_str(),
             ..JdClientSummary::default()
         }),
     });
@@ -163,6 +190,14 @@ pub fn spawn(target: JdTarget, stop: Arc<AtomicBool>) -> (UplinkHandle, thread::
     (UplinkHandle { events, status }, worker)
 }
 
+/// A template declared to the pool, waiting for its answer.
+struct Declaring {
+    serial: u64,
+    template: Arc<BchTemplate>,
+    /// When the pool last heard of it (the declaration, or transactions).
+    sent: Instant,
+}
+
 /// One pool session: Ok when the server stops, otherwise why it ended.
 fn uplink(
     target: &JdTarget,
@@ -171,15 +206,16 @@ fn uplink(
     stop: &AtomicBool,
     serial: u64,
 ) -> Result<(), String> {
-    let (mut jd, mut jd_replies) = connect(target)?;
+    let full = target.mode == JdMode::FullTemplate;
+    let (mut jd, mut jd_replies) = connect(target, if full { Limits::JD } else { Limits::DEVICE })?;
     setup(
         target,
         &mut jd,
         &mut jd_replies,
         Protocol::JobDeclarationProtocol,
-        0,
+        u32::from(full),
     )?;
-    let (mut pool, mut replies) = connect(target)?;
+    let (mut pool, mut replies) = connect(target, Limits::DEVICE)?;
     setup(
         target,
         &mut pool,
@@ -242,18 +278,111 @@ fn uplink(
         summary.last_error = None;
     });
     let mut pending: HashMap<u32, (u64, Instant)> = HashMap::new();
+    let mut declaring: HashMap<u32, Declaring> = HashMap::new();
+    let mut published: VecDeque<(u64, Arc<BchTemplate>)> = VecDeque::new();
+    let mut refusals = Refusals::default();
     let mut jobs: VecDeque<(u64, u32)> = VecDeque::new();
     let mut cache: HashMap<u64, Vec<ForwardShare>> = HashMap::new();
     let mut sequence = 0u32;
     let mut next_request = 1u32;
+    let mut next_declaration = 1u32;
     while !stop.load(Ordering::Relaxed) {
         while let Some(mut frame) = jd_replies.receive(Duration::from_millis(5))? {
-            if frame.header().msg_type() == MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS {
-                let ((bytes, rates), scripts) = token(&mut frame)?;
-                if rates != plan.rates || scripts != plan.scripts {
-                    return Err("the pool's fee or donation changed".into());
+            match frame.header().msg_type() {
+                MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS => {
+                    let ((bytes, rates), scripts) = token(&mut frame)?;
+                    if rates != plan.rates || scripts != plan.scripts {
+                        return Err("the pool's fee or donation changed".into());
+                    }
+                    tokens.push_back(bytes);
                 }
-                tokens.push_back(bytes);
+                // #### PR #42: missing transactions
+                // What: the pool names transactions of a declaration it does
+                // not have by their position; the client sends them from the
+                // declared template in one frame. Transactions that cannot
+                // fit one frame (16 MiB) drop that declaration, without a
+                // fallback.
+                // Why: Full-Template lets the pool check and propagate the
+                // block, so it needs every transaction once.
+                // Look here if: the dropped count grows, or a declaration
+                // waits for transactions.
+                MESSAGE_TYPE_PROVIDE_MISSING_TRANSACTIONS if full => {
+                    let ask: ProvideMissingTransactions =
+                        binary_sv2::from_bytes(frame.payload())
+                            .map_err(|_| "malformed missing transactions")?;
+                    let id = ask.request_id;
+                    let positions: Vec<u16> =
+                        ask.unknown_tx_position_list.iter().copied().collect();
+                    let Some(declaration) = declaring.get_mut(&id) else {
+                        continue;
+                    };
+                    match provide(id, &declaration.template, &positions) {
+                        Ok(frame) => {
+                            jd.send(frame)?;
+                            declaration.sent = Instant::now();
+                            status.update(|summary| summary.provided += 1);
+                        }
+                        Err(Unprovided::TooLarge) => {
+                            if let Some(dropped) = declaring.remove(&id) {
+                                cache.remove(&dropped.serial);
+                            }
+                            status.update(|summary| summary.dropped += 1);
+                        }
+                        Err(Unprovided::Unknown) => {
+                            return Err(
+                                "the pool asked for a transaction the template does not have"
+                                    .into(),
+                            )
+                        }
+                    }
+                }
+                MESSAGE_TYPE_DECLARE_MINING_JOB_SUCCESS if full => {
+                    let success: DeclareMiningJobSuccess = binary_sv2::from_bytes(frame.payload())
+                        .map_err(|_| "malformed declaration answer")?;
+                    let Some(declaration) = declaring.remove(&success.request_id) else {
+                        continue;
+                    };
+                    refusals = Refusals::default();
+                    status.update(|summary| summary.declared += 1);
+                    let request = next_request;
+                    next_request = next_request.wrapping_add(1);
+                    declare(
+                        &mut pool,
+                        channel,
+                        request,
+                        success.new_mining_job_token.as_ref(),
+                        &declaration.template,
+                        &plan,
+                    )?;
+                    pending.insert(request, (declaration.serial, Instant::now()));
+                }
+                MESSAGE_TYPE_DECLARE_MINING_JOB_ERROR if full => {
+                    let error: DeclareMiningJobError = binary_sv2::from_bytes(frame.payload())
+                        .map_err(|_| "malformed declaration error")?;
+                    let Some(declaration) = declaring.remove(&error.request_id) else {
+                        continue;
+                    };
+                    cache.remove(&declaration.serial);
+                    let code = String::from_utf8_lossy(error.error_code.as_ref()).into_owned();
+                    let details = String::from_utf8_lossy(error.error_details.as_ref())
+                        .chars()
+                        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                        .take(200)
+                        .collect::<String>();
+                    // A tip race: the next template is declared on the new
+                    // parent, without a fallback.
+                    if code == "stale-chain-tip" {
+                        status.update(|summary| summary.dropped += 1);
+                        continue;
+                    }
+                    status.update(|summary| summary.refused += 1);
+                    if refusals.refuse(declaration.template.previous_hash) {
+                        return Err(format!(
+                            "the pool refused {DECLARE_ATTEMPTS} declarations: {code} ({details})"
+                        ));
+                    }
+                }
+                _ => (),
             }
         }
         while let Some(mut frame) = replies.receive(Duration::from_millis(5))? {
@@ -323,6 +452,12 @@ fn uplink(
         {
             return Err("the pool did not answer a custom job".into());
         }
+        if declaring
+            .values()
+            .any(|declaration| declaration.sent.elapsed() >= DECLARE_TIMEOUT)
+        {
+            return Err("the pool did not answer a declaration".into());
+        }
         let event = match events.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -333,20 +468,62 @@ fn uplink(
                 if template.jd_plan().map(|plan| plan.serial) != Some(plan.serial) {
                     continue;
                 }
+                published.push_back((serial, template.clone()));
+                while published.len() > KEPT_JOBS {
+                    published.pop_front();
+                }
+                // #### PR #42: a template over 65,535 transactions is not
+                // declared: SV2 counts a declaration's transactions in 16
+                // bits. Devices keep the custom job on the previous
+                // template of the same parent, if any.
+                if full && !declarable(&template) {
+                    status.update(|summary| summary.dropped += 1);
+                    continue;
+                }
                 let Some(token) = tokens.pop_front() else {
                     status.update(|summary| summary.refused += 1);
                     continue;
                 };
                 allocate(target, &mut jd, &mut requests)?;
-                let request = next_request;
-                next_request = next_request.wrapping_add(1);
-                declare(&mut pool, channel, request, &token, &template, &plan)?;
-                pending.insert(request, (serial, Instant::now()));
+                if full {
+                    let request = next_declaration;
+                    next_declaration = next_declaration.wrapping_add(1);
+                    jd.send(declaration(request, &token, &template)?)?;
+                    declaring.insert(
+                        request,
+                        Declaring {
+                            serial,
+                            template,
+                            sent: Instant::now(),
+                        },
+                    );
+                } else {
+                    let request = next_request;
+                    next_request = next_request.wrapping_add(1);
+                    declare(&mut pool, channel, request, &token, &template, &plan)?;
+                    pending.insert(request, (serial, Instant::now()));
+                }
                 // Shares of jobs this one replaces on another parent stay
                 // forwardable only while the pool keeps the jobs.
-                cache.retain(|kept, _| pending.values().any(|(serial, _)| serial == kept));
+                cache.retain(|kept, _| {
+                    pending.values().any(|(serial, _)| serial == kept)
+                        || declaring.values().any(|declared| declared.serial == *kept)
+                });
             }
             UplinkEvent::Share(share) => {
+                // #### PR #42: a Full-Template client pushes its blocks to
+                // the pool (PushSolution), whatever the pool's target, so
+                // the pool's node gets them too.
+                if full && share.block {
+                    if let Some((_, template)) = published
+                        .iter()
+                        .rev()
+                        .find(|(serial, _)| *serial == share.serial)
+                    {
+                        jd.send(push_solution(&plan, template, &share)?)?;
+                        status.update(|summary| summary.pushed += 1);
+                    }
+                }
                 if !meets_target(&share.hash, &pool_target) {
                     continue;
                 }
@@ -356,7 +533,11 @@ fn uplink(
                     .find(|(serial, _)| *serial == share.serial)
                 {
                     forward(&mut pool, channel, *job, &mut sequence, share, status)?;
-                } else if pending.values().any(|(serial, _)| *serial == share.serial) {
+                } else if pending.values().any(|(serial, _)| *serial == share.serial)
+                    || declaring
+                        .values()
+                        .any(|declared| declared.serial == share.serial)
+                {
                     let held = cache.entry(share.serial).or_default();
                     if held.len() < CACHED_SHARES {
                         held.push(share);
@@ -368,8 +549,42 @@ fn uplink(
     Ok(())
 }
 
+/// Declarations refused in a row on one parent.
+#[derive(Default)]
+struct Refusals {
+    parent: Option<Hash>,
+    count: u8,
+}
+
+impl Refusals {
+    // #### PR #42: four refusals on one template fall back
+    // What: a declaration the pool refuses (other than stale-chain-tip) is
+    // dropped; the fourth in a row on one parent makes the client fall back
+    // to the pool's own jobs. An accepted declaration or a new parent starts
+    // the count again.
+    // Why: one refusal may be a passing disagreement (a transaction the
+    // pool's node has not seen); four mean the pool will not take this
+    // node's templates, and devices must not mine work nobody pays for.
+    // Look here if: the client falls back after one bad template, or never.
+    /// Counts a refusal on `parent`; true on the fourth in a row.
+    fn refuse(&mut self, parent: Hash) -> bool {
+        if self.parent != Some(parent) {
+            self.parent = Some(parent);
+            self.count = 0;
+        }
+        self.count += 1;
+        self.count >= DECLARE_ATTEMPTS
+    }
+}
+
+/// Whether `template` can be declared: SV2 counts its transactions in 16
+/// bits.
+fn declarable(template: &BchTemplate) -> bool {
+    template.transaction_ids().len() <= MAX_DECLARED_TXS
+}
+
 /// The pinned Noise session to the pool.
-fn connect(target: &JdTarget) -> Result<(Sender, Receiver), String> {
+fn connect(target: &JdTarget, limits: Limits) -> Result<(Sender, Receiver), String> {
     let address = target
         .address
         .to_socket_addrs()
@@ -378,7 +593,7 @@ fn connect(target: &JdTarget) -> Result<(Sender, Receiver), String> {
         .ok_or("cannot resolve the pool's address")?;
     let stream = TcpStream::connect_timeout(&address, ANSWER_TIMEOUT)
         .map_err(|_| "cannot reach the pool")?;
-    Ok(Session::initiate(stream, target.authority)?.split())
+    Ok(Session::initiate_with(stream, target.authority, limits)?.split())
 }
 
 fn setup(
@@ -479,6 +694,107 @@ fn token(
     Ok(((bytes, token.rates), scripts))
 }
 
+/// DeclareMiningJob for `template`: the local jobs' coinbase around the
+/// whole extranonce (the pool channel's prefix and the rolled bytes), and
+/// the transaction ids in block order.
+fn declaration(
+    request: u32,
+    token: &[u8],
+    template: &BchTemplate,
+) -> Result<SerializedFrame, String> {
+    let parts = template.declared_parts()?;
+    let txids: Vec<binary_sv2::U256> = template.transaction_ids().iter().map(Into::into).collect();
+    encoded(
+        DeclareMiningJob {
+            request_id: request,
+            mining_job_token: token.try_into().map_err(|_| "token too long")?,
+            version: template.version,
+            coinbase_tx_prefix: parts
+                .prefix
+                .as_slice()
+                .try_into()
+                .map_err(|_| "coinbase prefix too long")?,
+            coinbase_tx_suffix: parts
+                .suffix
+                .as_slice()
+                .try_into()
+                .map_err(|_| "coinbase suffix too long")?,
+            wtxid_list: txids.try_into().map_err(|_| "too many transactions")?,
+            excess_data: (&[][..]).try_into().map_err(|_| "excess data too long")?,
+        },
+        MESSAGE_TYPE_DECLARE_MINING_JOB,
+        false,
+    )
+}
+
+/// Why missing transactions cannot be provided.
+#[derive(Debug, PartialEq, Eq)]
+enum Unprovided {
+    /// A position the template does not have.
+    Unknown,
+    /// More than one frame takes.
+    TooLarge,
+}
+
+/// ProvideMissingTransactions.Success for `positions` of `template`, in
+/// one frame.
+fn provide(
+    request: u32,
+    template: &BchTemplate,
+    positions: &[u16],
+) -> Result<SerializedFrame, Unprovided> {
+    let transactions = template.transactions();
+    // The header, the request id and the count, then each transaction with
+    // its 3-byte length.
+    let mut size = 6 + 4 + 2;
+    let mut list = Vec::with_capacity(positions.len());
+    for position in positions {
+        let tx = transactions
+            .get(usize::from(*position))
+            .ok_or(Unprovided::Unknown)?;
+        size += 3 + tx.len();
+        if size > Limits::JD.max_out {
+            return Err(Unprovided::TooLarge);
+        }
+        list.push(binary_sv2::B016M::try_from(&tx[..]).map_err(|_| Unprovided::TooLarge)?);
+    }
+    encoded(
+        ProvideMissingTransactionsSuccess {
+            request_id: request,
+            transaction_list: list.try_into().map_err(|_| Unprovided::TooLarge)?,
+        },
+        MESSAGE_TYPE_PROVIDE_MISSING_TRANSACTIONS_SUCCESS,
+        false,
+    )
+    .map_err(|_| Unprovided::TooLarge)
+}
+
+/// PushSolution for a local block on `template`: the whole extranonce is
+/// the pool channel's prefix and the share's rolled bytes.
+fn push_solution(
+    plan: &JdPlan,
+    template: &BchTemplate,
+    share: &ForwardShare,
+) -> Result<SerializedFrame, String> {
+    let mut extranonce = plan.upstream_prefix.clone();
+    extranonce.extend_from_slice(&share.extranonce);
+    encoded(
+        PushSolution {
+            extranonce: extranonce
+                .as_slice()
+                .try_into()
+                .map_err(|_| "extranonce too long")?,
+            prev_hash: (&template.previous_hash).into(),
+            nonce: share.nonce,
+            ntime: share.ntime,
+            nbits: template.bits,
+            version: share.version,
+        },
+        MESSAGE_TYPE_PUSH_SOLUTION,
+        false,
+    )
+}
+
 /// SetCustomMiningJob for `template`: the local jobs' coinbase around the
 /// pool channel's prefix and the 16 rolled bytes.
 fn declare(
@@ -545,4 +861,61 @@ fn forward(
     ))?)?;
     status.update(|summary| summary.forwarded += 1);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stratum_v2::template_tests::rpc_template;
+
+    fn template() -> BchTemplate {
+        BchTemplate::from_rpc(&rpc_template()).unwrap()
+    }
+
+    // #### PR #42
+    // What: a template over 65,535 transactions is not declared; one at
+    // the limit is.
+    // Look here if: declarable or MAX_DECLARED_TXS changes.
+    #[test]
+    fn templates_over_65535_transactions_are_not_declared() {
+        let at_limit = template().with_transactions(vec![vec![0]; MAX_DECLARED_TXS]);
+        assert!(declarable(&at_limit));
+        let over = template().with_transactions(vec![vec![0]; MAX_DECLARED_TXS + 1]);
+        assert!(!declarable(&over));
+    }
+
+    // #### PR #42
+    // What: missing transactions go back in one frame of at most 16 MiB in
+    // the order asked for; more than one frame takes is TooLarge (the
+    // declaration is dropped), and a position the template does not have
+    // is Unknown (the pool is broken).
+    // Look here if: provide or Limits::JD changes.
+    #[test]
+    fn a_missing_transactions_request_that_cannot_fit_one_frame_drops_the_declaration() {
+        let big = template().with_transactions(vec![vec![1; 9_000_000], vec![2; 9_000_000]]);
+        let mut frame = provide(3, &big, &[1]).unwrap();
+        let reply: ProvideMissingTransactionsSuccess =
+            binary_sv2::from_bytes(frame.payload()).unwrap();
+        assert_eq!(reply.request_id, 3);
+        assert_eq!(reply.transaction_list.len(), 1);
+        assert_eq!(reply.transaction_list[0].as_ref()[0], 2);
+        assert_eq!(provide(3, &big, &[0, 1]).err(), Some(Unprovided::TooLarge));
+        assert_eq!(provide(3, &big, &[2]).err(), Some(Unprovided::Unknown));
+    }
+
+    // #### PR #42
+    // What: the fourth refusal in a row on one parent falls back; a new
+    // parent starts the count again.
+    // Look here if: Refusals changes.
+    #[test]
+    fn four_refusals_on_one_template_fall_back() {
+        let mut refusals = Refusals::default();
+        assert!(!refusals.refuse([1; 32]));
+        assert!(!refusals.refuse([1; 32]));
+        assert!(!refusals.refuse([1; 32]));
+        assert!(!refusals.refuse([2; 32]), "a new parent");
+        assert!(!refusals.refuse([2; 32]));
+        assert!(!refusals.refuse([2; 32]));
+        assert!(refusals.refuse([2; 32]));
+    }
 }

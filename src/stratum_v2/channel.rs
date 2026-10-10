@@ -720,6 +720,7 @@ impl Channel {
                 nonce: share.nonce,
                 extranonce: coinbase.bytes[start..start + plan.rollable()].to_vec(),
                 hash,
+                block,
             }
         });
         // Vardiff counts shares at the current target only, so work still

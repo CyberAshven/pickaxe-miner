@@ -49,6 +49,22 @@ pub(super) struct Node {
     public: bool,
     /// #### PR #42: the template's other transactions (none by default).
     pub(super) transactions: Vec<Value>,
+    /// #### PR #42: transactions the node takes in a block but leaves out
+    /// of its templates (another node's mempool had them first), and how
+    /// often validateblocktemplate was called.
+    pub(super) spendable: Vec<Value>,
+    pub(super) validations: usize,
+}
+
+impl Node {
+    /// The transactions a block of this node's may carry, as hex.
+    fn known_transactions(&self) -> std::collections::HashSet<String> {
+        self.transactions
+            .iter()
+            .chain(&self.spendable)
+            .map(|tx| tx["data"].as_str().unwrap().to_owned())
+            .collect()
+    }
 }
 
 /// #### PR #42: a node for blocks that pay someone else (a pool's, built by
@@ -65,6 +81,8 @@ pub(super) fn pool_node() -> Arc<Mutex<Node>> {
         unavailable: false,
         public: true,
         transactions: Vec::new(),
+        spendable: Vec::new(),
+        validations: 0,
     }))
 }
 
@@ -104,7 +122,15 @@ impl NodeRpc for Rpc {
                     };
                 }
                 assert_eq!(block.header.prev_blockhash.to_string(), node.tip);
-                assert_eq!(block.txdata.len(), 1 + node.transactions.len());
+                // #### PR #42: a declared block may carry transactions the
+                // node knows but left out of its template.
+                let known = node.known_transactions();
+                assert!(block.txdata[1..]
+                    .iter()
+                    .all(|tx| known.contains(&hex::encode(consensus::serialize(tx)))));
+                if node.spendable.is_empty() {
+                    assert_eq!(block.txdata.len(), 1 + node.transactions.len());
+                }
                 let coinbase = &block.txdata[0];
                 assert!(coinbase.is_coinbase());
                 let mut expected = vec![0x76, 0xa9, 0x14];
@@ -169,6 +195,34 @@ impl NodeRpc for Rpc {
                     }
                 }
             }
+            // #### PR #42: BCHN's check of a declared template: the parent
+            // must be the tip, the merkle root right and every transaction
+            // known; refusals come as BCHN's "Invalid block: …" errors.
+            "validateblocktemplate" => {
+                let bytes = hex::decode(params[0].as_str().unwrap()).unwrap();
+                let block: Block = consensus::deserialize(&bytes).unwrap();
+                node.validations += 1;
+                let refuse = |reason: &str| {
+                    Err(format!(
+                        "rpc error: {}",
+                        json!({"code": -25, "message": format!("Invalid block: {reason}")})
+                    ))
+                };
+                if block.header.prev_blockhash.to_string() != node.tip {
+                    return refuse("does not build on chain tip");
+                }
+                if !block.check_merkle_root() {
+                    return refuse("bad-txnmrklroot");
+                }
+                let known = node.known_transactions();
+                if !block.txdata[1..]
+                    .iter()
+                    .all(|tx| known.contains(&hex::encode(consensus::serialize(tx))))
+                {
+                    return refuse("bad-txns-inputs-missingorspent");
+                }
+                Ok(json!(true))
+            }
             "getblockheader" => {
                 let hash = params[0].as_str().unwrap();
                 if !node.lose_replies && node.known.contains(hash) {
@@ -209,6 +263,8 @@ impl Running {
             unavailable: false,
             public: false,
             transactions: Vec::new(),
+            spendable: Vec::new(),
+            validations: 0,
         }));
         Self::start(node, Arc::new(TestDirectory::new()))
     }
@@ -226,6 +282,8 @@ impl Running {
             unavailable: false,
             public: true,
             transactions: Vec::new(),
+            spendable: Vec::new(),
+            validations: 0,
         }));
         Self::start_with(node, Arc::new(TestDirectory::new()), Some(public))
     }
@@ -265,27 +323,32 @@ impl Running {
             public,
             tokens,
             None,
-            false,
+            None,
             None,
             Vec::new(),
         )
     }
 
     /// #### PR #42: a Job Declaration client's local server on `node`,
-    /// declaring its templates to `pool`.
-    pub(super) fn jd_client(node: Arc<Mutex<Node>>, pool: &Running) -> Self {
+    /// declaring its templates to `pool` in `mode`.
+    pub(super) fn jd_client(
+        node: Arc<Mutex<Node>>,
+        pool: &Running,
+        mode: super::jd::JdMode,
+    ) -> Self {
         Self::start_config(
             vec![node],
             Arc::new(TestDirectory::new()),
             None,
             None,
             None,
-            false,
+            None,
             Some(super::jd::client::JdTarget {
                 address: pool.address.to_string(),
                 authority: pool.authority,
                 identity: payout(),
                 retry: Duration::from_millis(500),
+                mode,
             }),
             Vec::new(),
         )
@@ -308,13 +371,14 @@ impl Running {
             None,
             None,
             None,
-            false,
+            None,
             None,
             vec![Box::new(source)],
         )
     }
 
-    /// #### PR #42: a public pool that accepts miners' own templates.
+    /// #### PR #42: a public pool that accepts Coinbase-only Job
+    /// Declaration.
     pub(super) fn jd_pool(public: super::payout::PublicPool) -> Self {
         Self::start_config(
             vec![pool_node()],
@@ -322,7 +386,22 @@ impl Running {
             Some(public),
             None,
             None,
-            true,
+            Some(super::jd::AcceptJd::CoinbaseOnly),
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// #### PR #42: a public pool on `node` that accepts both Job
+    /// Declaration modes, whose node checks declared templates.
+    pub(super) fn jd_pool_full(node: Arc<Mutex<Node>>, public: super::payout::PublicPool) -> Self {
+        Self::start_config(
+            vec![node],
+            Arc::new(TestDirectory::new()),
+            Some(public),
+            None,
+            None,
+            Some(super::jd::AcceptJd::Both),
             None,
             Vec::new(),
         )
@@ -337,7 +416,7 @@ impl Running {
             None,
             None,
             Some(true),
-            false,
+            None,
             None,
             Vec::new(),
         )
@@ -352,7 +431,7 @@ impl Running {
             None,
             None,
             Some(false),
-            false,
+            None,
             None,
             Vec::new(),
         )
@@ -372,7 +451,7 @@ impl Running {
         public: Option<super::payout::PublicPool>,
         tokens: Option<Arc<super::merge::hub::TokenHub>>,
         templates: Option<bool>,
-        job_declaration: bool,
+        job_declaration: Option<super::jd::AcceptJd>,
         uplink: Option<super::jd::client::JdTarget>,
         mut sources: Vec<Box<dyn super::provider::TemplateSource>>,
     ) -> Self {
@@ -387,13 +466,20 @@ impl Running {
             .map(|listener| listener.local_addr().unwrap());
         let relay_journal_path = templates.map(|_| state_directory.0.join("relay-blocks.json"));
         let donation = Arc::new(std::sync::RwLock::new(Default::default()));
-        let declarator = public.clone().filter(|_| job_declaration).map(|public| {
-            Arc::new(super::jd::server::Declarator::new(
-                super::jd::AcceptJd::CoinbaseOnly,
+        let declarator = public.clone().zip(job_declaration).map(|(public, accept)| {
+            let declarator = super::jd::server::Declarator::new(
+                accept,
                 MiningNetwork::Chipnet,
                 public,
                 donation.clone(),
-            ))
+            );
+            Arc::new(if accept.allows(true) {
+                declarator.with_validator(Arc::new(super::jd::server::NodeValidator::new(Rpc(
+                    node.clone(),
+                ))))
+            } else {
+                declarator
+            })
         });
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(ServerStats::default()));
@@ -413,6 +499,9 @@ impl Running {
             pool_tag: Vec::new(),
             tokens,
             relay_journal_path,
+            declared_journal_path: declarator
+                .as_ref()
+                .map(|_| state_directory.0.join("jd-blocks.json")),
             declarator,
             uplink: uplink.as_ref().map(|(handle, _)| handle.clone()),
         };
@@ -705,6 +794,8 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
             unavailable: false,
             public: false,
             transactions: Vec::new(),
+            spendable: Vec::new(),
+            validations: 0,
         }));
         let server = Running::start_full(vec![node], directory, None, Some(hub.clone()));
         let mut device = Device::connect(&server, extended);
@@ -1288,6 +1379,8 @@ fn the_server_moves_to_its_next_node_when_its_node_stops_answering() {
             unavailable: false,
             public: false,
             transactions: Vec::new(),
+            spendable: Vec::new(),
+            validations: 0,
         }))
     };
     let (first, second) = (node(), node());
@@ -2048,7 +2141,7 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
         address: address(0x34),
     });
     let miner_node = pool_node();
-    let client = Running::jd_client(miner_node.clone(), &pool);
+    let client = Running::jd_client(miner_node.clone(), &pool, super::jd::JdMode::CoinbaseOnly);
     client.wait(|stats| {
         stats
             .jd_client
@@ -2116,6 +2209,87 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
 }
 
 // #### PR #42
+// What: a Pickaxe Job Declaration client (Full-Template) mines at a Pickaxe
+// pool that accepts both modes, on loopback. The pool's node has 2 of the
+// client's 3 transactions: exactly one ProvideMissingTransactions round
+// runs, validateblocktemplate is called once, the custom job is set on the
+// declared token, and the device's block reaches both nodes with the same
+// hash: the client's node from its own journal, the pool's from the JD
+// journal (the forwarded share or PushSolution).
+// Look here if: the Full-Template flow on either side changes.
+#[test]
+fn full_template_declares_provides_a_missing_transaction_and_both_nodes_get_the_block() {
+    use super::template_tests::transaction;
+    let mut txs: Vec<Value> = (1..=3).map(transaction).collect();
+    txs.sort_by_key(|tx| tx["txid"].as_str().unwrap().to_owned());
+    let third = transaction(3);
+    let pool_node = pool_node();
+    {
+        let mut node = pool_node.lock().unwrap();
+        node.transactions = txs
+            .iter()
+            .filter(|tx| tx["txid"] != third["txid"])
+            .cloned()
+            .collect();
+        node.spendable = vec![third];
+    }
+    let pool = Running::jd_pool_full(
+        pool_node.clone(),
+        super::payout::PublicPool {
+            fee: Some(crate::donation::bch::PoolFee {
+                rate: "1".parse().unwrap(),
+                mode: crate::donation::bch::FeeMode::Work,
+            }),
+            address: address(0x34),
+        },
+    );
+    let miner_node = super::server_tests::pool_node();
+    miner_node.lock().unwrap().transactions = txs;
+    let client = Running::jd_client(miner_node.clone(), &pool, super::jd::JdMode::FullTemplate);
+    pool.wait(|stats| {
+        stats
+            .jd_server
+            .as_ref()
+            .is_some_and(|jd| jd.custom_jobs >= 1)
+    });
+    let jd = pool.stats.lock().unwrap().jd_server.clone().unwrap();
+    assert_eq!((jd.missing_rounds, jd.validations), (1, 1));
+    assert_eq!(jd.validator, Some("validateblocktemplate"));
+    assert_eq!(pool_node.lock().unwrap().validations, 1);
+    let mut device = Device::connect(&client, true);
+    device.solve_and_submit(0);
+    client.wait(|stats| stats.blocks_accepted == 1);
+    pool.wait(|stats| {
+        stats
+            .jd_server
+            .as_ref()
+            .is_some_and(|jd| jd.declared_accepted == 1)
+    });
+    let hash = |node: &Arc<Mutex<Node>>| {
+        let submitted = node.lock().unwrap().submitted[0].clone();
+        let block: Block = consensus::deserialize(&hex::decode(submitted).unwrap()).unwrap();
+        assert_eq!(block.txdata.len(), 4);
+        block.block_hash()
+    };
+    assert_eq!(hash(&miner_node), hash(&pool_node));
+    client.wait(|stats| {
+        stats.jd_client.as_ref().is_some_and(|jd| {
+            jd.mode == "full-template" && jd.provided == 1 && jd.declared >= 1 && jd.pushed == 1
+        })
+    });
+    let found = pool
+        .stats
+        .lock()
+        .unwrap()
+        .recent_blocks
+        .back()
+        .cloned()
+        .unwrap();
+    assert_eq!(found.result, Some("accepted"));
+    device.sender.close();
+}
+
+// #### PR #42
 // What: when the pool refuses Job Declaration (here it does not accept it),
 // the client's local server publishes no work and the uplink counts a
 // fallback with the pool's reason, so devices go to the pool's own jobs.
@@ -2131,6 +2305,7 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
             authority: pool.authority,
             identity: payout(),
             retry: Duration::from_millis(200),
+            mode: super::jd::JdMode::FullTemplate,
         },
         stop.clone(),
     );

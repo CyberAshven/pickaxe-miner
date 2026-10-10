@@ -47,10 +47,10 @@ pub fn status_report() -> String {
          bch: CTOR={ctor} no_segwit={no_segwit} ASERT={asert} CashAddr={cashaddr} adaptive_size={adaptive}\n\
          first_network: {network}\n\
          design: {design}\n\
-         available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates, optional SV1 adapter, templates from SV2 Template Providers with --template-provider, optional template server for SV2 pools with --tp-listen, Coinbase-only Job Declaration at a public pool with --accept-job-declaration, and at a pool with --job-declaration)\n\
+         available with feature: check-node; serve (Noise, standard/extended channels, full BCH templates, optional SV1 adapter, templates from SV2 Template Providers with --template-provider, optional template server for SV2 pools with --tp-listen, Job Declaration (Full-Template and Coinbase-only) at a public pool with --accept-job-declaration, and at a Pickaxe pool with --job-declaration)\n\
          validation: local TCP/CPU experiments; live Chipnet and ASIC validation pending\n\
          merge mining: commitment v1 (draft), both cases in one coinbase; no token registered (Chipnet test token for tests)\n\
-         pending: physical ASIC validation, vardiff/device rates, Job Declaration Full-Template, distributed rigs and pool routing\n\
+         pending: physical ASIC validation, vardiff/device rates, merge-mined tokens under Job Declaration, distributed rigs and pool routing\n\
          evidence: docs/implementation-status.md\n",
         feature = status.feature,
         crates = if status.reference_crates_linked {

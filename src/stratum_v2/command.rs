@@ -171,6 +171,7 @@ pub fn run(
         start_difficulty,
         tp_listen,
         accept_job_declaration,
+        job_declaration,
         ..
     } = action
     else {
@@ -200,15 +201,31 @@ pub fn run(
         Some(_) => return Err("--pool-tag must be 1 to 20 printable characters".into()),
     };
     let donation = Arc::new(RwLock::new(donation.unwrap_or(config.bch_donation)));
-    // #### PR #42: a public pool that accepts miners' own templates.
+    // #### PR #42: a public pool that accepts miners' own templates; with
+    // Full-Template, its first node checks the declared ones
+    // (validateblocktemplate).
     let declarator = match (accept_job_declaration, public.as_ref()) {
-        (Some(crate::cli::AcceptJobDeclaration::Coinbase), Some(public)) => {
-            Some(Arc::new(super::jd::server::Declarator::new(
-                super::jd::AcceptJd::CoinbaseOnly,
+        (Some(mode), Some(public)) => {
+            let accept = match mode {
+                crate::cli::AcceptJobDeclaration::Coinbase => super::jd::AcceptJd::CoinbaseOnly,
+                crate::cli::AcceptJobDeclaration::Full => super::jd::AcceptJd::FullTemplate,
+                crate::cli::AcceptJobDeclaration::Both => super::jd::AcceptJd::Both,
+            };
+            let mut declarator = super::jd::server::Declarator::new(
+                accept,
                 config.network,
                 public.clone(),
                 donation.clone(),
-            )))
+            );
+            if let Some(rpc) = node
+                .as_ref()
+                .and_then(|(nodes, _, _)| nodes.first())
+                .filter(|_| accept.allows(true))
+            {
+                declarator = declarator
+                    .with_validator(Arc::new(super::jd::server::NodeValidator::new(rpc.clone())));
+            }
+            Some(Arc::new(declarator))
         }
         (Some(_), None) => {
             return Err("accepting Job Declaration needs a public pool (--public)".into())
@@ -324,7 +341,7 @@ pub fn run(
                 )
             })
         }),
-        job_declaration: declarator.is_some(),
+        job_declaration: declarator.as_ref().map(|declarator| declarator.accept),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
@@ -344,6 +361,12 @@ pub fn run(
                 authority: pool.authority,
                 identity: pool.identity.clone(),
                 retry: Duration::from_secs(30),
+                mode: match job_declaration {
+                    Some(crate::cli::JobDeclarationMode::Coinbase) => {
+                        super::jd::JdMode::CoinbaseOnly
+                    }
+                    _ => super::jd::JdMode::FullTemplate,
+                },
             },
             stop.clone(),
         )
@@ -373,6 +396,11 @@ pub fn run(
                 donation: donation.clone(),
                 tokens: tokens.clone(),
                 relay_journal_path: Some(config_path.with_extension("sv2-relay-blocks.json")),
+                // #### PR #42: a pool's JD journal, for blocks found on
+                // Full-Template declared jobs.
+                declared_journal_path: declarator
+                    .as_ref()
+                    .map(|_| config_path.with_extension("sv2-jd-blocks.json")),
                 declarator: declarator.clone(),
                 uplink: uplink_handle.clone(),
                 #[cfg(test)]
@@ -929,8 +957,8 @@ struct Started {
     custom_user: bool,
     /// A public pool's fee, and whether it goes to the payout address.
     fee: Option<(crate::donation::bch::PoolFee, bool)>,
-    /// #### PR #42: the pool accepts miners' own templates.
-    job_declaration: bool,
+    /// #### PR #42: the Job Declaration modes the pool accepts, if any.
+    job_declaration: Option<super::jd::AcceptJd>,
 }
 
 /// #### PR #42
@@ -999,11 +1027,16 @@ fn started_text(started: &Started) -> String {
             }
         ));
     }
-    if started.job_declaration {
-        text.push_str(
-            "Miners' own templates  Coinbase-only Job Declaration on the SV2 port; their \
-             coinbase pays your fee and the donation in full\n",
-        );
+    if let Some(accept) = started.job_declaration {
+        let modes = match accept {
+            super::jd::AcceptJd::CoinbaseOnly => "Coinbase-only",
+            super::jd::AcceptJd::FullTemplate => "Full-Template",
+            super::jd::AcceptJd::Both => "Full-Template and Coinbase-only",
+        };
+        text.push_str(&format!(
+            "Miners' own templates  {modes} Job Declaration on the SV2 port; their coinbase \
+             pays your fee and the donation in full\n"
+        ));
     }
     text
 }
@@ -1605,6 +1638,51 @@ fn status_path(config_path: &Path) -> PathBuf {
 
 /// The status published each second: printed in JSON mode and saved for
 /// `stratum-v2 watch`. It never contains payouts or credentials.
+/// #### PR #42: the Job Declaration client's part of the status file.
+fn jd_client_json(jd: &super::jd::client::JdClientSummary) -> serde_json::Value {
+    serde_json::json!({
+        "state": jd.state,
+        "mode": jd.mode,
+        "custom_jobs": jd.custom_jobs,
+        "refused": jd.refused,
+        "forwarded": jd.forwarded,
+        "accepted": jd.accepted,
+        "rejected": jd.rejected,
+        "fallbacks": jd.fallbacks,
+        "last_error": jd.last_error,
+        "declared": jd.declared,
+        "provided": jd.provided,
+        "dropped": jd.dropped,
+        "pushed": jd.pushed,
+    })
+}
+
+/// #### PR #42: the Job Declaration server's part of the status file; its
+/// Full-Template counts while it accepts Full-Template.
+fn jd_server_json(jd: &server::JdServerStats) -> serde_json::Value {
+    serde_json::json!({
+        "clients": jd.clients,
+        "tokens": jd.tokens,
+        "custom_jobs": jd.custom_jobs,
+        "refused": jd.refused,
+        "last_refusal": jd.last_refusal,
+        "blocks": jd.blocks,
+        "full_template": jd.validator.map(|validator| serde_json::json!({
+            "validator": validator,
+            "declared": jd.declared,
+            "missing_rounds": jd.missing_rounds,
+            "validations": jd.validations,
+            "pushed": jd.pushed,
+            "push_unmatched": jd.push_unmatched,
+            "blocks": {
+                "pending": jd.declared_pending,
+                "accepted": jd.declared_accepted,
+                "rejected": jd.declared_rejected,
+            },
+        })),
+    })
+}
+
 fn status_json(
     network: &str,
     upstream: Option<&str>,
@@ -1670,27 +1748,10 @@ fn status_json(
                 "seconds_ago": win.found.elapsed().as_secs(),
             })).collect::<Vec<_>>(),
         }),
-        // #### PR #42: the Job Declaration client's state and counts.
-        "jd_client": snapshot.jd_client.as_ref().map(|jd| serde_json::json!({
-            "state": jd.state,
-            "custom_jobs": jd.custom_jobs,
-            "refused": jd.refused,
-            "forwarded": jd.forwarded,
-            "accepted": jd.accepted,
-            "rejected": jd.rejected,
-            "fallbacks": jd.fallbacks,
-            "last_error": jd.last_error,
-        })),
-        // #### PR #42: the Job Declaration server's counts, with no identity,
-        // token or address.
-        "jd_server": snapshot.jd_server.as_ref().map(|jd| serde_json::json!({
-            "clients": jd.clients,
-            "tokens": jd.tokens,
-            "custom_jobs": jd.custom_jobs,
-            "refused": jd.refused,
-            "last_refusal": jd.last_refusal,
-            "blocks": jd.blocks,
-        })),
+        // #### PR #42: the Job Declaration client's state and counts, and the
+        // server's, with no identity, token or address.
+        "jd_client": snapshot.jd_client.as_ref().map(jd_client_json),
+        "jd_server": snapshot.jd_server.as_ref().map(jd_server_json),
         // #### PR #42: the template server's counts, with no address.
         "template_server": snapshot.template_server.as_ref().map(|templates| serde_json::json!({
             "clients": templates.clients,
@@ -2124,9 +2185,19 @@ fn jd_client_line(stats: &ServerStats, pool: Option<&str>) -> String {
     let pool = pool
         .and_then(|pools| pools.split(" → ").next())
         .unwrap_or("the pool");
+    // Full-Template: the declarations, those dropped and the blocks pushed.
+    let full = if jd.mode == super::jd::JdMode::FullTemplate.as_str() {
+        format!(
+            " · {} declared · {} dropped · {} blocks pushed",
+            jd.declared, jd.dropped, jd.pushed
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "\nJob Declaration at {pool}: {} · {} custom jobs · {} refused · {} shares sent ({} \
-         accepted, {} rejected) · {} fallbacks{}",
+        "\nJob Declaration at {pool} ({}): {} · {} custom jobs · {} refused{full} · {} shares \
+         sent ({} accepted, {} rejected) · {} fallbacks{}",
+        jd.mode,
         jd.state,
         jd.custom_jobs,
         jd.refused,
@@ -2147,9 +2218,27 @@ fn jd_line(stats: &ServerStats) -> String {
     let Some(jd) = &stats.jd_server else {
         return String::new();
     };
+    // Full-Template: the declarations and what checks them, and the pool's
+    // node's answers on their blocks.
+    let (declared, blocks) = match jd.validator {
+        Some(validator) => (
+            format!(
+                " · {} declared ({} missing-transaction rounds, {} checked: {validator})",
+                jd.declared, jd.missing_rounds, jd.validations
+            ),
+            format!(
+                "{} blocks · pool's node: {} accepted / {} pending / {} rejected",
+                jd.blocks, jd.declared_accepted, jd.declared_pending, jd.declared_rejected
+            ),
+        ),
+        None => (
+            String::new(),
+            format!("{} blocks (their nodes submit them)", jd.blocks),
+        ),
+    };
     format!(
-        "\nJob Declaration clients {} · {} tokens · {} custom jobs · {} refused{} · {} blocks \
-         (their nodes submit them)",
+        "\nJob Declaration clients {} · {} tokens{declared} · {} custom jobs · {} refused{} · \
+         {blocks}",
         jd.clients,
         jd.tokens,
         jd.custom_jobs,
@@ -2157,7 +2246,6 @@ fn jd_line(stats: &ServerStats) -> String {
         jd.last_refusal
             .map(|code| format!(" (last: {code})"))
             .unwrap_or_default(),
-        jd.blocks,
     )
 }
 
@@ -2511,14 +2599,38 @@ mod tests {
             refused: 1,
             last_refusal: Some("stale-chain-tip"),
             blocks: 1,
+            ..Default::default()
         });
         assert!(jd_line(&stats).contains(
             "Job Declaration clients 1 · 3 tokens · 2 custom jobs · 1 refused (last: \
-             stale-chain-tip) · 1 blocks"
+             stale-chain-tip) · 1 blocks (their nodes submit them)"
         ));
         let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
         assert_eq!(status["jd_server"]["custom_jobs"], 2);
         assert_eq!(status["jd_server"]["last_refusal"], "stale-chain-tip");
+        assert!(status["jd_server"]["full_template"].is_null());
+        // #### PR #42: a pool that accepts Full-Template shows its
+        // declarations, its node check and its node's answers.
+        if let Some(jd) = stats.jd_server.as_mut() {
+            jd.validator = Some("validateblocktemplate");
+            jd.declared = 4;
+            jd.missing_rounds = 1;
+            jd.validations = 2;
+            jd.declared_accepted = 1;
+        }
+        assert!(jd_line(&stats).contains(
+            "3 tokens · 4 declared (1 missing-transaction rounds, 2 checked: \
+             validateblocktemplate) · 2 custom jobs"
+        ));
+        assert!(
+            jd_line(&stats).contains("1 blocks · pool's node: 1 accepted / 0 pending / 0 rejected")
+        );
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(status["jd_server"]["full_template"]["declared"], 4);
+        assert_eq!(
+            status["jd_server"]["full_template"]["validator"],
+            "validateblocktemplate"
+        );
         stats.template_server = Some(server::TemplateServerStats {
             clients: 2,
             sent: 341,
@@ -3185,7 +3297,7 @@ mod tests {
                             },
                             false,
                         )),
-                        job_declaration: true,
+                        job_declaration: Some(crate::stratum_v2::jd::AcceptJd::Both),
                     }),
                 )
             })
@@ -3211,7 +3323,7 @@ mod tests {
             "/MyPool/",
             "1.50% from",
             "to another address",
-            "Miners' own templates  Coinbase-only",
+            "Miners' own templates  Full-Template and Coinbase-only",
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
@@ -3224,7 +3336,7 @@ mod tests {
             pools: Some("pool.example:3336 → b1.example:3336".into()),
             custom_user: true,
             fee: None,
-            job_declaration: false,
+            job_declaration: None,
         });
         assert!(joined.contains("pool.example:3336 → b1.example:3336 (in failover order)"));
         assert!(joined.contains("username: your own"));
