@@ -44,6 +44,10 @@ pub struct Cli {
     #[arg(long = "node-rpc", alias = "node", global = true)]
     pub node_rpc: Option<String>,
 
+    /// Fulcrum servers for PHOTON jobs, comma-separated: wss:// or ws://,
+    /// or #### PR #42: a home server over plain TCP (tcp://HOST:PORT, such
+    /// as tcp://umbrel.local:50001), taken only on this computer or the home
+    /// network.
     #[arg(long, global = true)]
     pub fulcrum: Option<String>,
 

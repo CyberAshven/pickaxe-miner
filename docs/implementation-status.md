@@ -2085,3 +2085,21 @@ cleaning, matching search stats and telemetry to each GPU, a coordinator
 keeping 64 of 70 cleaned GPUs with the rig's version and last-heard time,
 the dashboard rows and priorities, the status file and the watch rows. Not
 yet run live with two rigs.
+
+## Home Fulcrum servers over plain TCP (2026-10-10)
+
+#### PR #42
+
+GPU mining can take PHOTON jobs from a home Fulcrum server that offers only
+plain TCP (Umbrel, StartOS): `--fulcrum tcp://umbrel.local:50001`, or the
+same in the setup's Fulcrum list. Requests go one JSON-RPC line each way
+(notifications skipped) with the WebSocket path's timeouts. A `tcp://`
+server is taken only on this computer or the home network (loopback,
+private and link-local ranges, Tailscale, IPv6 unique-local and link-local,
+`localhost`, `.local` names), since plain TCP could be impersonated to feed a
+false baton; the public TCP servers in the published catalog stay unused.
+
+Evidence: host tests for the address rules (in the runtime and the shared
+sources), a TCP Fulcrum fixture giving the PHOTON job, and the catalog using
+a home TCP server but never a published public one. Not yet run against an
+Umbrel or StartOS server.

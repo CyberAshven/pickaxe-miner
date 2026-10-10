@@ -85,6 +85,12 @@ enum Link {
         endpoint: String,
         photon: Box<crate::node::NativePhotonSession>,
     },
+    /// #### PR #42: a home Fulcrum server over plain TCP, one JSON-RPC
+    /// request per line (only to private addresses; see the configuration).
+    Tcp {
+        stream: Box<std::io::BufReader<std::net::TcpStream>>,
+        next_id: u64,
+    },
 }
 
 /// #### PR #40
@@ -250,8 +256,45 @@ impl ElectrumSession {
         matches!(self.link, Link::Node { .. })
     }
 
+    /// #### PR #42: connects to a Fulcrum server over plain TCP
+    /// (`tcp://HOST:PORT`), with the same 15 s timeouts as WebSocket.
+    fn connect_tcp(url_str: &str, deployment: &'static PhotonDeployment) -> Result<Self, String> {
+        use std::net::ToSocketAddrs;
+        let address = url_str
+            .get(6..)
+            .ok_or("malformed tcp:// endpoint")?
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let target = address
+            .to_socket_addrs()
+            .map_err(|e| format!("connect: {e}"))?
+            .next()
+            .ok_or("connect: the address does not resolve")?;
+        let stream = std::net::TcpStream::connect_timeout(&target, Duration::from_secs(10))
+            .map_err(|e| format!("connect: {e}"))?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+        let mut session = Self {
+            url: url_str.to_string(),
+            server_version: Value::Null,
+            link: Link::Tcp {
+                stream: Box::new(std::io::BufReader::new(stream)),
+                next_id: 1,
+            },
+            deployment,
+            fee_policy: None,
+        };
+        let ver = session.rpc("server.version", json!(["pickaxe-miner", "1.4.1"]))?;
+        session.server_version = ver;
+        Ok(session)
+    }
+
     /// Connects to one Fulcrum endpoint and verifies its response.
     fn connect_one(url_str: &str, deployment: &'static PhotonDeployment) -> Result<Self, String> {
+        if url_str.len() > 6 && url_str[..6].eq_ignore_ascii_case("tcp://") {
+            return Self::connect_tcp(url_str, deployment);
+        }
         let (ws, _resp) = connect(url_str).map_err(|e| format!("connect: {e}"))?;
 
         match ws.get_ref() {
@@ -289,6 +332,7 @@ impl ElectrumSession {
         let (ws, next_id, buf) = match &mut self.link {
             Link::Fulcrum { ws, next_id, buf } => (ws, next_id, buf),
             Link::Node { endpoint, .. } => return node_rpc(endpoint, method, &params),
+            Link::Tcp { stream, next_id } => return tcp_rpc(stream, next_id, method, params),
         };
         let id = *next_id;
         *next_id += 1;
@@ -401,6 +445,43 @@ impl ElectrumSession {
         }
         job.relay_fee_sats_per_kb = self.fee_policy.map_or(1_000, |(_, fee)| fee);
         Ok(LiveStateSnapshot { tip_hash, job })
+    }
+}
+
+/// #### PR #42: one request over a plain-TCP Electrum link: a line out,
+/// then lines in until the answer with its id (notifications are skipped).
+fn tcp_rpc(
+    stream: &mut std::io::BufReader<std::net::TcpStream>,
+    next_id: &mut u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    use std::io::{BufRead, Write};
+    let id = *next_id;
+    *next_id += 1;
+    let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    stream
+        .get_mut()
+        .write_all(format!("{req}\n").as_bytes())
+        .map_err(|e| format!("transport: send: {e}"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(format!("timeout: rpc waiting for id={id} ({method})"));
+        }
+        let mut line = String::new();
+        let read = stream
+            .read_line(&mut line)
+            .map_err(|e| format!("transport: read: {e}"))?;
+        if read == 0 {
+            return Err("transport: socket closed".into());
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(result) = rpc_value_for_id(&value, id) {
+            return result;
+        }
     }
 }
 
@@ -720,6 +801,65 @@ mod tests {
             }
         });
         (format!("http://{address}"), server)
+    }
+
+    // #### PR #42
+    // What: a Fulcrum server over plain TCP (one JSON-RPC line each way, a
+    // notification skipped) gives the PHOTON job as a WebSocket one does.
+    // Look here if: connect_tcp or tcp_rpc changes.
+    #[test]
+    fn a_tcp_fulcrum_gives_the_photon_job() {
+        use std::io::{BufRead, BufReader, Write};
+        let header = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+        let txid = "11".repeat(32);
+        let baton = json!({
+            "tx_hash": txid,
+            "tx_pos": 0,
+            "height": 9,
+            "value": 1000,
+            "token_data": {
+                "category": crate::protocol::MAINNET_CATEGORY_HEX,
+                "amount": "840001",
+                "nft": {"capability": "mutable", "commitment": format!("00000000{}", "01".repeat(32))}
+            }
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            for _ in 0..4 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(line.trim()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "server.version" => json!(["Fulcrum 1.12.0", "1.5"]),
+                    "blockchain.headers.subscribe" => json!({"height": 10, "hex": header}),
+                    "blockchain.scripthash.listunspent" => json!([baton]),
+                    other => panic!("unexpected {other}"),
+                };
+                // A notification first, which the client skips.
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "method": "blockchain.headers.subscribe", "params": []})
+                )
+                .unwrap();
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                )
+                .unwrap();
+            }
+        });
+        let mut session =
+            ElectrumSession::connect_failover_for_deployment(&[url], &MAINNET_PHOTON).unwrap();
+        assert!(!session.is_node());
+        let job = session.fetch_live_job().unwrap();
+        server.join().unwrap();
+        assert_eq!((job.height, job.baton_txid.as_str()), (10, txid.as_str()));
     }
 
     // #### PR #40

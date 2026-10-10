@@ -362,7 +362,11 @@ What this means for Pickaxe, and what step 1 did:
   connection, and show node name, version, network and sync height; warn when
   the node is behind or on the wrong network.
 - When the node stops answering, keep mining from the Fulcrum list, show it on
-  the dashboard, and switch back when the node returns.
+  the dashboard, and switch back when the node returns (done in #42).
+- A home Fulcrum server (Umbrel, StartOS) is taken over plain TCP,
+  `tcp://HOST:PORT` such as `tcp://umbrel.local:50001`, on this computer or
+  the home network only (done in #42); servers on the internet need `wss://`,
+  since plain TCP could be impersonated to feed a false baton.
 - ASIC BCH and merge mining need a node (or a pool), and setup says so only in
   that mode.
 

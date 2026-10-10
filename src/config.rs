@@ -324,10 +324,19 @@ impl RuntimeConfig {
 
     /// Set custom Fulcrum/Electrum endpoint (`ws://` or `wss://`). Empty clears.
     pub fn set_fulcrum_url(&mut self, url: &str) -> Result<(), String> {
-        let Some(endpoints) = normalize_endpoint_list(url, "fulcrum", &["wss://", "ws://"])? else {
+        let Some(endpoints) =
+            normalize_endpoint_list(url, "fulcrum", &["wss://", "ws://", "tcp://"])?
+        else {
             self.clear_fulcrum_url();
             return Ok(());
         };
+        // #### PR #42: plain-TCP Fulcrum servers (tcp://HOST:PORT), such as
+        // Umbrel's or StartOS's, only on this computer or the home network.
+        for endpoint in endpoints.split(',').map(str::trim) {
+            if endpoint.len() > 6 && endpoint[..6].eq_ignore_ascii_case("tcp://") {
+                check_tcp_electrum(&endpoint[6..])?;
+            }
+        }
         if endpoints.split(',').any(|endpoint| {
             !self
                 .network
@@ -540,6 +549,62 @@ pub(crate) fn reprefix_p2pkh_payout(
         crate::tx::p2pkh_hash_to_cashaddr_for_network(&hash, network)
     }
 }
+
+// #### PR #42: plain TCP only at home
+// What: a Fulcrum server over plain TCP (tcp://HOST:PORT, as Umbrel and
+// StartOS publish theirs) is taken only on this computer or the home
+// network: loopback, private, link-local and Tailscale's shared range, IPv6
+// unique-local and link-local, `localhost` or a `.local` name.
+// Why: plain TCP has no encryption, so a server reached over the internet
+// could be impersonated to feed a false baton; servers there use wss://.
+// Look here if: a home Fulcrum server is refused, or a public one accepted
+// over tcp://.
+/// Checks a plain-TCP Electrum endpoint's `HOST:PORT`.
+fn check_tcp_electrum(address: &str) -> Result<(), String> {
+    let authority = address.split('/').next().unwrap_or(address);
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => match bracketed.split_once("]:") {
+            Some((host, port)) => (host, port),
+            None => (bracketed.trim_end_matches(']'), ""),
+        },
+        None => authority.rsplit_once(':').unwrap_or((authority, "")),
+    };
+    if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+        return Err(
+            "a plain-TCP Fulcrum server needs its port, such as tcp://umbrel.local:50001".into(),
+        );
+    }
+    if !private_host(host) {
+        return Err(
+            "a plain-TCP Fulcrum server (tcp://) must be on this computer or your home network; \
+             servers on the internet need wss://"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether `host` is this computer or on the home network.
+fn private_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || (lower.len() > 6 && lower.ends_with(".local")) {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>().map(|ip| ip.to_canonical()) {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let [first, second, ..] = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || (first == 100 && second & 0xc0 == 0x40)
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+        Err(_) => false,
+    }
+}
+// #### end PR #42 ####
 
 fn normalize_endpoint_list(
     input: &str,
@@ -2250,6 +2315,56 @@ mod tests {
         ] {
             assert!(with(bad).validate().is_err(), "{why}");
         }
+    }
+
+    // #### PR #42
+    // What: a plain-TCP Fulcrum server is taken on this computer, the home
+    // network, Tailscale or a .local name, with its port; a public host or a
+    // missing port is refused, in the runtime and in the shared sources.
+    // Look here if: check_tcp_electrum or private_host changes.
+    #[test]
+    fn tcp_fulcrum_is_refused_for_public_hosts() {
+        for home in [
+            "tcp://192.168.1.5:50001",
+            "tcp://10.0.0.2:50001",
+            "tcp://127.0.0.1:50001",
+            "tcp://localhost:50001",
+            "tcp://umbrel.local:50001",
+            "tcp://100.101.102.103:50001",
+            "tcp://[fd00::5]:50001",
+            "TCP://192.168.1.5:50002",
+        ] {
+            let mut cfg = RuntimeConfig::default();
+            cfg.set_fulcrum_url(home)
+                .unwrap_or_else(|error| panic!("{home}: {error}"));
+        }
+        for (public, why) in [
+            ("tcp://fulcrum.example.com:50001", "home network"),
+            ("tcp://8.8.8.8:50001", "home network"),
+            ("tcp://[2001:db8::1]:50001", "home network"),
+            ("tcp://100.200.1.1:50001", "home network"),
+            ("tcp://192.168.1.5", "needs its port"),
+            ("tcp://192.168.1.5:0", "needs its port"),
+        ] {
+            let mut cfg = RuntimeConfig::default();
+            let error = cfg.set_fulcrum_url(public).unwrap_err();
+            assert!(error.contains(why), "{public}: {error}");
+        }
+        assert!(SharedSources::validate_entry(
+            MiningNetwork::Mainnet,
+            ConnectionKind::Fulcrum,
+            "tcp://fulcrum.example.com:50001"
+        )
+        .is_err());
+        assert_eq!(
+            SharedSources::validate_entry(
+                MiningNetwork::Chipnet,
+                ConnectionKind::Fulcrum,
+                "tcp://umbrel.local:50001"
+            )
+            .unwrap(),
+            "tcp://umbrel.local:50001"
+        );
     }
 
     #[test]
