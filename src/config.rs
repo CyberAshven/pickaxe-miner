@@ -44,6 +44,35 @@ impl MiningNetwork {
         }
     }
 
+    // #### PR #42: the fork block proves the chain
+    // What: a node's block at this height must be this one: BCH's UAHF block
+    // on mainnet, Chipnet's fork block on Chipnet.
+    // Why: a Bitcoin (BTC) node reports the same chain name ("main") as a
+    // BCH one, and testnet4 shares Chipnet's genesis.
+    // Look here if: a node that worked before is now refused as BTC or
+    // testnet4.
+    /// The height and hash (display order) of a block only this chain has.
+    pub fn fork_block(self) -> (u32, &'static str) {
+        match self {
+            Self::Mainnet => (
+                478_559,
+                "000000000000000000651ef99cb9fcbe0dadde1d424bd9f15ff20136191a5eec",
+            ),
+            Self::Chipnet => (
+                115_252,
+                "00000000040ba9641ba98a37b2e5ceead38e4e2930ac8f145c8094f94c708727",
+            ),
+        }
+    }
+
+    /// The chain a node is on when its fork block is another's.
+    pub fn foreign_chain(self) -> &'static str {
+        match self {
+            Self::Mainnet => "Bitcoin (BTC), not Bitcoin Cash",
+            Self::Chipnet => "testnet4, not Chipnet",
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mainnet" => Ok(Self::Mainnet),

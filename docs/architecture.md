@@ -363,6 +363,10 @@ What this means for Pickaxe, and what step 1 did:
   the node is behind or on the wrong network.
 - When the node stops answering, keep mining from the Fulcrum list, show it on
   the dashboard, and switch back when the node returns (done in #42).
+- A node's chain is proven by its fork block (BCH's UAHF block 478,559 on
+  mainnet, Chipnet's block 115,252), since a Bitcoin (BTC) node reports the
+  same chain name and testnet4 shares Chipnet's genesis: the ASIC server and
+  GPU mining's return to the node refuse a BTC or testnet4 node (done in #42).
 - A home Fulcrum server (Umbrel, StartOS) is taken over plain TCP,
   `tcp://HOST:PORT` such as `tcp://umbrel.local:50001`, on this computer or
   the home network only (done in #42); servers on the internet need `wss://`,

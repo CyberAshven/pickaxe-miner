@@ -1177,6 +1177,45 @@ fn client_from_subversion(subversion: &str) -> Option<String> {
     (!name.trim().is_empty() && !version.trim().is_empty()).then_some(client)
 }
 
+/// #### PR #42: whether the node at `url` is on `network`'s chain, by its
+/// fork block (see `MiningNetwork::fork_block`): proven once per node and
+/// network; a node below the fork height is not proven yet and says so.
+pub fn verify_chain(url: &str, network: crate::config::MiningNetwork) -> Result<(), String> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static PROVEN: OnceLock<Mutex<HashSet<(String, &'static str)>>> = OnceLock::new();
+    let proven = PROVEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let key = (redact_url(url), network.as_str());
+    if proven
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&key)
+    {
+        return Ok(());
+    }
+    let (fork, expected) = network.fork_block();
+    let blocks = rpc_call(url, "getblockcount", json!([]))?
+        .as_u64()
+        .ok_or("the node gave no block count")?;
+    if blocks < u64::from(fork) {
+        return Err(format!(
+            "the node is syncing: height {blocks}, below the fork block at {fork}"
+        ));
+    }
+    let block = rpc_call(url, "getblockhash", json!([fork]))?;
+    if !block
+        .as_str()
+        .is_some_and(|block| block.eq_ignore_ascii_case(expected))
+    {
+        return Err(format!("the node is on {}", network.foreign_chain()));
+    }
+    proven
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key);
+    Ok(())
+}
+
 /// Asks a node for its client, chain and sync state.
 pub fn node_info(url: &str) -> Result<NodeInfo, String> {
     node_info_timed(url, RPC_CONNECT_TIMEOUT, RPC_READ_TIMEOUT)
@@ -2083,6 +2122,38 @@ mod gbt_tests {
         server.join().unwrap();
         assert_eq!(reported_endpoint, endpoint);
         assert_eq!(policy.mempool_min_fee_sats_per_kb, 1_234);
+    }
+
+    // #### PR #42
+    // What: a node's fork block proves its chain: the right block passes and
+    // is not asked again; another block is Bitcoin (BTC) on mainnet; a node
+    // below the fork height is still syncing.
+    // Look here if: verify_chain changes.
+    #[test]
+    fn verify_chain_tells_bch_from_btc() {
+        use crate::config::MiningNetwork;
+        let (_, bch) = MiningNetwork::Mainnet.fork_block();
+        let (endpoint, server) = serve_json_rpc_sequence(vec![
+            ("getblockcount", json!(900_000)),
+            ("getblockhash", json!(bch)),
+        ]);
+        verify_chain(&endpoint, MiningNetwork::Mainnet).unwrap();
+        verify_chain(&endpoint, MiningNetwork::Mainnet).unwrap();
+        server.join().unwrap();
+        let (btc, server) = serve_json_rpc_sequence(vec![
+            ("getblockcount", json!(900_000)),
+            (
+                "getblockhash",
+                json!("00000000000000000019f112ec0a9982926f1258cdcc558dd7c3b7e5dc7fa148"),
+            ),
+        ]);
+        let error = verify_chain(&btc, MiningNetwork::Mainnet).unwrap_err();
+        assert!(error.contains("Bitcoin (BTC), not Bitcoin Cash"), "{error}");
+        server.join().unwrap();
+        let (young, server) = serve_json_rpc_sequence(vec![("getblockcount", json!(100))]);
+        let error = verify_chain(&young, MiningNetwork::Chipnet).unwrap_err();
+        assert!(error.contains("syncing"), "{error}");
+        server.join().unwrap();
     }
 
     #[test]

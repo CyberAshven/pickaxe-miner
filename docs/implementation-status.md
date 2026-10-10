@@ -2103,3 +2103,24 @@ Evidence: host tests for the address rules (in the runtime and the shared
 sources), a TCP Fulcrum fixture giving the PHOTON job, and the catalog using
 a home TCP server but never a published public one. Not yet run against an
 Umbrel or StartOS server.
+
+## A node's chain is proven by its fork block (2026-10-10)
+
+#### PR #42
+
+A Bitcoin (BTC) node reports the same chain name ("main") as a BCH node, and
+testnet4 shares Chipnet's genesis, so the chain name alone could let the
+ASIC server build BTC templates. A node's block at the fork height must now
+be the network's fork block: BCH's UAHF block (478,559) on mainnet, Chipnet's
+block 115,252 on Chipnet. The ASIC server's template source checks it once
+per node (again after a switch to another node) and refuses another chain
+("node is on Bitcoin (BTC), not Bitcoin Cash" or "testnet4, not Chipnet");
+GPU mining's return to the node checks it once per node too and reports the
+node as on another network. A node below the fork height cannot be told yet
+and is treated as syncing.
+
+Evidence: host tests for a template source refusing a node with another
+fork block and asking the right one once per node, the node check (BCH
+passes and is not asked again, BTC refused, a young node syncing), and the
+GPU watch classing the refusal as another network. Not yet run against a
+BTC or testnet4 node.

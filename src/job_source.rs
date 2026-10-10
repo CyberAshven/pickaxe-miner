@@ -72,7 +72,13 @@ pub fn classify(error: &str) -> NodeTrouble {
         "loading block",
     ]) {
         NodeTrouble::Syncing
-    } else if any(&["is not on", "another network", "wrong network"]) {
+    } else if any(&[
+        "is not on",
+        "another network",
+        "wrong network",
+        "not bitcoin cash",
+        "not chipnet",
+    ]) {
         NodeTrouble::WrongNetwork
     } else if any(&[
         "connect",
@@ -321,6 +327,8 @@ pub fn try_node_return(
         live.height,
         crate::node::node_info,
         |node| {
+            // #### PR #42: BCH, not BTC; Chipnet, not testnet4.
+            crate::node::verify_chain(node, network)?;
             ElectrumSession::connect_node_failover(&[node.to_owned()], deployment, Some(live))
                 .and_then(|mut session| session.fetch_live_job().map(|job| (session, job)))
         },
@@ -512,6 +520,11 @@ mod tests {
             ),
             ("the node is syncing: height 3", NodeTrouble::Syncing),
             ("the node is not on chipnet", NodeTrouble::WrongNetwork),
+            (
+                "the node is on Bitcoin (BTC), not Bitcoin Cash",
+                NodeTrouble::WrongNetwork,
+            ),
+            ("the node is on testnet4, not Chipnet", NodeTrouble::WrongNetwork),
             (
                 "rpc error: {\"code\":-32601,\"message\":\"Method not found\"}",
                 NodeTrouble::NoPhoton,

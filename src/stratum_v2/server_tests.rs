@@ -97,6 +97,10 @@ impl NodeRpc for Rpc {
         match method {
             "getblockchaininfo" => Ok(json!({"chain":"chip", "initialblockdownload":false,
                 "blocks":node.height,"headers":node.height,"bestblockhash":node.tip})),
+            // #### PR #42: Chipnet's fork block.
+            "getblockhash" if params[0] == MiningNetwork::Chipnet.fork_block().0 => {
+                Ok(json!(MiningNetwork::Chipnet.fork_block().1))
+            }
             "getblocktemplate" => {
                 assert!(params[0].get("rules").is_none());
                 let mut template = rpc_template();

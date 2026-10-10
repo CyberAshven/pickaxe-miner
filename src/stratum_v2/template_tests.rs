@@ -674,6 +674,11 @@ impl NodeRpc for RpcFixture {
 fn initial_calls() -> VecDeque<(&'static str, Result<Value, String>)> {
     VecDeque::from([
         ("getblockchaininfo", Ok(tip())),
+        // #### PR #42: the fork block, once per node.
+        (
+            "getblockhash",
+            Ok(json!(MiningNetwork::Chipnet.fork_block().1)),
+        ),
         ("getblocktemplate", Ok(rpc_template())),
         ("getblockchaininfo", Ok(tip())),
     ])
