@@ -17,10 +17,12 @@
 //! token is registered; the Chipnet test token exists for tests only.
 
 pub mod commitment;
+pub mod header;
 pub mod hub;
 pub mod leaf;
 pub mod proof;
 pub mod registry;
+pub mod safa;
 pub mod set;
 pub mod tree;
 pub mod verify;

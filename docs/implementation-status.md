@@ -1869,3 +1869,25 @@ payout, per-channel vardiff, group close and refused group ids, the 256 and
 32 caps, the legacy adapter, and a loopback run: a scripted proxy with two
 channels mines a block on its own first job and another on the group's job
 after the parent changes. Not yet run with SRI's translator.
+
+## SAFA reference core (2026-10-10)
+
+#### PR #42
+
+No runtime change. `merge/safa.rs` holds the SAFA draft as data (the version
+rule, the target byte order, the adjustment, the fee allowance, the emission
+divisor, the age limit, the time rule), the 80-byte commitment, the
+adjustment in the covenant's integer order, the compact target encoding, and
+the claim checks with two guards: a win's hash must be positive and at or
+below its target (the draft's signed compare also passes negative hashes),
+and a target that would need a 33-byte encoding is refused (it would freeze
+the thread). `merge/header.rs` holds the keyless forwarder that is both a
+SAFA payout script and the coinbase devices hash (73 bytes on extended
+channels and SV1, 65 on standard ones, with a `PXH1` tag that keeps SRI's
+BIP141 check from misfiring), and the `HeaderWin` v1 record.
+
+Evidence: host tests for the canonical template's vectors (the release
+scenario passes only through the sign bug), the adjustment table, the
+compact encoding against Bitcoin's for sizes 3 to 32, the freeze guard, each
+claim mutation, the version rules, the forwarder's golden hashes, SRI's own
+BIP141 check on every prefix, and the win record. No token is deployed.
