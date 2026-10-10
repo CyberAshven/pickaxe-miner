@@ -122,6 +122,23 @@ pub fn run(
         config::validate_payout_address(config.network, &config.payout_address)
             .map_err(|_| "a valid payout for the selected network is required")?;
     }
+    // #### PR #42: at a pool, merge-mined tokens need this node's own
+    // templates (Job Declaration): without it the pool builds the blocks.
+    if matches!(
+        &action,
+        StratumV2Command::Serve {
+            merge_test_token: Some(_),
+            ..
+        }
+    ) && !pools.is_empty()
+        && !declaring
+    {
+        return Err(
+            "--merge-test-token at a pool needs --job-declaration: without it the \
+                    pool builds the blocks, so no token commitment can be added"
+                .into(),
+        );
+    }
     // #### PR #42: template providers, tried before the nodes, told the
     // coinbase bytes this server may add (with the test token's when asked
     // for; its registry row decides the network, so mainnet refuses it).
@@ -1751,8 +1768,8 @@ fn connect_text(page: &ConnectPage) -> String {
             "\nUsername: any name for the device; it names the device on the workers page. \
              This computer mines at the pool for you with your node's templates (Job \
              Declaration), and the pool's own jobs while the pool refuses them.\nMerge-mined \
-             tokens are not added under Job Declaration yet. Mine solo or run your own pool \
-             to merge-mine.\n"
+             tokens: on while your templates are mined; your node builds the blocks, and \
+             token wins pay your payout address.\n"
         }
         ServeMode::JoinPool => {
             "\nUsername: any name for the device; it names the device on the workers page. \
@@ -3436,6 +3453,10 @@ mod tests {
             "{declaring}"
         );
         assert!(
+            declaring.contains("Merge-mined tokens: on while your templates are mined"),
+            "{declaring}"
+        );
+        assert!(
             !declaring.contains("the pool builds the blocks"),
             "{declaring}"
         );
@@ -3473,6 +3494,53 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Only programs on this computer"), "{text}");
+    }
+
+    // #### PR #42
+    // What: at a pool, --merge-test-token is refused without
+    // --job-declaration (the pool builds the blocks there), before anything
+    // is opened.
+    // Look here if: the merge-mining rule at a pool changes.
+    #[test]
+    fn merge_mining_at_a_pool_needs_job_declaration() {
+        let config = RuntimeConfig {
+            network: crate::config::MiningNetwork::Chipnet,
+            payout_address: "bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp".into(),
+            ..RuntimeConfig::default()
+        };
+        let mut encoded = vec![1, 0];
+        encoded.extend([7u8; 32]);
+        let key = stratum_core::bitcoin::base58::encode_check(&encoded);
+        let address = format!("stratum2+tcp://127.0.0.1:9/{key}");
+        let crate::cli::Cli {
+            command: Some(crate::cli::Commands::StratumV2 { command: action }),
+            ..
+        } = <crate::cli::Cli as clap::Parser>::try_parse_from([
+            "pickaxe",
+            "stratum-v2",
+            "serve",
+            "--sv1-listen",
+            "127.0.0.1:0",
+            "--upstream",
+            &address,
+            "--merge-test-token",
+            "1000",
+        ])
+        .unwrap()
+        else {
+            panic!("not a serve command")
+        };
+        let dir = super::super::journal::TestDirectory::new();
+        let error = run(
+            action,
+            &config,
+            &dir.0.join("chipnet.json"),
+            true,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("needs --job-declaration"), "{error}");
     }
 
     #[test]

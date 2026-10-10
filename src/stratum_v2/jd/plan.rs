@@ -6,6 +6,10 @@
 use super::{policy::PayoutRule, token::PoolRates};
 use crate::stratum_v2::template::Hash;
 
+/// #### PR #42: what merge-mined token leaves bind: the payout script, and
+/// the donation's split (its share in hundredths of a percent and script).
+pub type TokenTerms<'a> = (&'a [u8], Option<(u16, &'a [u8])>);
+
 /// One plan per pool session; a new session or token rates make a new one,
 /// with a new serial.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +59,21 @@ impl JdPlan {
             .collect()
     }
 
+    /// #### PR #42: what merge-mined token leaves bind under this plan: the
+    /// miner's own script (the pool's first output) and the donation's
+    /// split, the pool's whole donation rate to its donation output (no
+    /// donation work runs under Job Declaration); `None` without outputs.
+    pub fn token_terms(&self) -> Option<TokenTerms<'_>> {
+        let miner = self.scripts.first()?;
+        let split = self
+            .rates
+            .donation_output
+            .and_then(|index| self.scripts.get(usize::from(index)))
+            .filter(|_| self.rates.donation_bps > 0)
+            .map(|script| (self.rates.donation_bps, script.as_slice()));
+        Some((miner.as_slice(), split))
+    }
+
     /// The rollable bytes the pool takes: the job id, the pad, the lane and
     /// the device's 8.
     pub fn rollable(&self) -> usize {
@@ -62,7 +81,8 @@ impl JdPlan {
     }
 
     /// Whether the pool's outputs name valid indexes: the miner first, the
-    /// donation and fee within the list.
+    /// donation and fee within the list; #### PR #42: and its rates are at
+    /// most 100%, so the payout never underflows and a token split fits.
     pub fn is_valid(&self) -> bool {
         let within = |index: Option<u8>| {
             index.is_none_or(|index| usize::from(index) < self.scripts.len() && index > 0)
@@ -70,6 +90,8 @@ impl JdPlan {
         !self.scripts.is_empty()
             && within(self.rates.donation_output)
             && within(self.rates.fee_output)
+            && self.rates.donation_bps <= 10_000
+            && self.rates.fee_bps <= 10_000
     }
 }
 
@@ -131,8 +153,25 @@ mod tests {
                 donation_output: Some(3),
                 ..plan.rates
             },
-            ..plan
+            ..plan.clone()
         };
         assert!(!broken.is_valid());
+        // #### PR #42: rates over 100% are refused.
+        for rates in [
+            PoolRates {
+                donation_bps: 10_001,
+                ..plan.rates
+            },
+            PoolRates {
+                fee_bps: 10_001,
+                ..plan.rates
+            },
+        ] {
+            assert!(!JdPlan {
+                rates,
+                ..plan.clone()
+            }
+            .is_valid());
+        }
     }
 }

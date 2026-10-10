@@ -172,6 +172,7 @@ impl ValidatedShare {
             payout: self.payout,
             miner: self.miner.clone(),
             operator: self.operator.clone(),
+            declared: self.template.jd_plan().cloned(),
         })
     }
 }
@@ -199,6 +200,9 @@ pub struct TokenWin {
     pub payout: BchPayout,
     pub miner: String,
     pub operator: Option<String>,
+    /// #### PR #42: a Job Declaration job's plan, whose terms the leaves
+    /// bind instead (`JdPlan::token_terms`).
+    pub declared: Option<Arc<super::jd::plan::JdPlan>>,
 }
 
 impl TokenWin {

@@ -224,13 +224,9 @@ pub enum StratumV2Command {
         /// #### PR #42
         /// Merge-mines the Chipnet test token at this share difficulty, to
         /// try merge mining with real devices before any token exists;
-        /// refused on mainnet. Hidden: it is for tests.
-        #[arg(
-            long,
-            value_name = "DIFFICULTY",
-            hide = true,
-            conflicts_with = "upstream"
-        )]
+        /// refused on mainnet. With --upstream it needs --job-declaration
+        /// (the pool builds the blocks otherwise). Hidden: it is for tests.
+        #[arg(long, value_name = "DIFFICULTY", hide = true)]
         merge_test_token: Option<u64>,
         /// #### PR #42
         /// Serve this node's block templates to SV2 pools, Job Declaration
@@ -843,6 +839,45 @@ mod tests {
             args.extend(other);
             assert!(parse(&args).is_err(), "{other:?}");
         }
+    }
+
+    // #### PR #42
+    // What: --merge-test-token parses with --upstream (the server refuses it
+    // there without --job-declaration) and with --upstream and
+    // --job-declaration together.
+    // Look here if: the merge-mining flags change.
+    #[test]
+    fn the_merge_test_token_may_ride_job_declaration() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "pickaxe",
+                    "stratum-v2",
+                    "serve",
+                    "--sv1-listen",
+                    "0.0.0.0:3333",
+                ]
+                .iter()
+                .chain(args)
+                .collect::<Vec<_>>(),
+            )
+        };
+        let upstream = ["--upstream", "stratum2+tcp://pool.example:3336/KEY"];
+        let mut args = upstream.to_vec();
+        args.extend(["--merge-test-token", "1000"]);
+        assert!(parse(&args).is_ok());
+        args.push("--job-declaration");
+        let cli = parse(&args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve {
+                    merge_test_token: Some(1000),
+                    job_declaration: Some(JobDeclarationMode::Full),
+                    ..
+                }
+            })
+        ));
     }
 
     // #### PR #42

@@ -482,7 +482,8 @@ impl BchTemplate {
 
     /// #### PR #42: builds this template's jobs for a pool through Job
     /// Declaration: they pay `plan`'s outputs, nest their extranonce inside
-    /// the pool channel's, and carry no merge-mined tokens yet.
+    /// the pool channel's, and carry its token set's merge-mining (see
+    /// `declared_aux`).
     pub fn declare(&mut self, plan: Arc<JdPlan>) {
         self.jd = Some(plan);
     }
@@ -532,17 +533,65 @@ impl BchTemplate {
     /// #### PR #42: a Job Declaration job's coinbase split around its whole
     /// extranonce (the pool channel's prefix and the bytes the pool lets the
     /// client roll), as DeclareMiningJob carries it: the same bytes as the
-    /// local channels' coinbases.
+    /// local channels' coinbases, merge-mining outputs included.
     pub fn declared_parts(&self) -> Result<CoinbaseParts, String> {
         let plan = self.jd.as_ref().ok_or("not a Job Declaration template")?;
         let extranonce = plan.upstream_prefix.len() + plan.rollable();
+        let aux = self.declared_aux()?;
         let coinbase = self.coinbase_with_outputs(
             &vec![0; extranonce],
             plan.outputs(self.coinbase_value),
-            None,
+            aux.as_ref().map(|aux| &aux.outputs),
         )?;
         Ok(self.split(coinbase, extranonce))
     }
+
+    // #### PR #42: merge-mined tokens under Job Declaration
+    // What: a Job Declaration job with a token set carries the commitment as
+    // output 0 and the tickets (worth 0) after the pool's outputs, in every
+    // local coinbase, the declared one and the custom job's outputs alike.
+    // Its leaves bind the miner's own script (the pool's first output), and
+    // the donation's split is the pool's whole donation rate, since no
+    // donation work runs under Job Declaration; a pool with no donation has
+    // no split.
+    // Why: the miner's node builds the blocks there, so merge-mined tokens
+    // keep earning at a pool with no hashrate taken from BCH; the pool's
+    // rule allows exactly this shape (output 0, zero-value tickets).
+    // Look here if: a pool refuses declarations with a commitment, the local
+    // coinbases differ from the declared one, or token wins under Job
+    // Declaration name another payout.
+    /// The merge-mining of this template's Job Declaration jobs, or `None`
+    /// without a plan or a token set. Every job on the plan shares it.
+    pub fn declared_aux(&self) -> Result<Option<AuxJob>, String> {
+        let (Some(plan), Some(set)) = (self.jd.as_ref(), self.tokens.as_ref()) else {
+            return Ok(None);
+        };
+        let (miner, split) = plan.token_terms().ok_or("the pool's plan has no outputs")?;
+        let first_ticket_vout =
+            u32::try_from(plan.scripts.len() + 1).map_err(|_| "too many coinbase outputs")?;
+        AuxJob::build(set, miner, split, first_ticket_vout).map(Some)
+    }
+
+    /// The outputs a custom job carries for this Job Declaration template:
+    /// the commitment first when tokens are merge-mined, the pool's outputs,
+    /// then the tickets.
+    pub fn declared_outputs(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        let plan = self.jd.as_ref().ok_or("not a Job Declaration template")?;
+        let mut outputs = plan.outputs(self.coinbase_value);
+        if let Some(aux) = self.declared_aux()? {
+            // Each is a whole output: 8 value bytes, the script's length
+            // and the script.
+            let split = |output: &[u8]| -> (u64, Vec<u8>) {
+                let mut value = [0; 8];
+                value.copy_from_slice(&output[..8]);
+                (u64::from_le_bytes(value), output[9..].to_vec())
+            };
+            outputs.insert(0, split(&aux.outputs.commitment));
+            outputs.extend(aux.outputs.tickets.iter().map(|ticket| split(ticket)));
+        }
+        Ok(outputs)
+    }
+    // #### end PR #42 ####
 
     /// #### PR #40
     /// Writes the pool's name (`--pool-tag`) into the coinbase script of every
@@ -582,7 +631,11 @@ impl BchTemplate {
         operator: Option<&str>,
         policy: crate::donation::bch::BchPayout,
     ) -> Result<Option<AuxJob>, String> {
-        let Some(set) = self.tokens.as_ref().filter(|_| self.jd.is_none()) else {
+        // #### PR #42: under Job Declaration, the declared coinbase's.
+        if self.jd.is_some() {
+            return self.declared_aux();
+        }
+        let Some(set) = self.tokens.as_ref() else {
             return Ok(None);
         };
         let scripts = super::payout::scripts(network, payout, operator)?;

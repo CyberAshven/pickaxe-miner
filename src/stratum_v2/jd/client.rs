@@ -346,7 +346,7 @@ fn uplink(
         pool_target,
     });
     if !plan.is_valid() {
-        return Err("the pool's token names outputs it does not list".into());
+        return Err("the pool's token names outputs it does not list, or rates over 100%".into());
     }
     tokens.push_back(first.0);
     status.acknowledged.store(0, Ordering::Relaxed);
@@ -431,7 +431,6 @@ fn uplink(
                         request,
                         success.new_mining_job_token.as_ref(),
                         &declaration.template,
-                        &plan,
                     )?;
                     pending.insert(request, (declaration.serial, Instant::now()));
                 }
@@ -594,7 +593,7 @@ fn uplink(
                 } else {
                     let request = next_request;
                     next_request = next_request.wrapping_add(1);
-                    declare(&mut pool, channel, request, &token, &template, &plan)?;
+                    declare(&mut pool, channel, request, &token, &template)?;
                     pending.insert(request, (serial, Instant::now()));
                 }
                 // Shares of jobs this one replaces on another parent stay
@@ -890,17 +889,20 @@ fn push_solution(
 }
 
 /// SetCustomMiningJob for `template`: the local jobs' coinbase around the
-/// pool channel's prefix and the 16 rolled bytes.
+/// pool channel's prefix and the 16 rolled bytes, with the merge-mining
+/// outputs when tokens are merge-mined.
 fn declare(
     pool: &mut Sender,
     channel: u32,
     request: u32,
     token: &[u8],
     template: &BchTemplate,
-    plan: &JdPlan,
 ) -> Result<(), String> {
     let head = template.script_head();
-    let outputs = serialize_outputs(&plan.outputs(template.coinbase_value));
+    // #### PR #42: the outputs of the template's own plan (the session's:
+    // templates on another plan are never declared), commitment and tickets
+    // included (`BchTemplate::declared_outputs`).
+    let outputs = serialize_outputs(&template.declared_outputs()?);
     let path: Vec<binary_sv2::U256> = template.merkle_path().iter().map(Into::into).collect();
     pool.send(mining(Mining::SetCustomMiningJob(SetCustomMiningJob {
         channel_id: channel,

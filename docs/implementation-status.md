@@ -1989,3 +1989,28 @@ serve command dropping templates and fallback pools in token mode, profiles
 keeping and refusing the token, the difficulty shown from compact bits, and
 the dashboard and status texts. Not yet run with hardware; no token is
 registered.
+
+## Merge-mined tokens under Job Declaration (2026-10-10)
+
+#### PR #42
+
+A Job Declaration client now merge-mines: every local job on the pool's
+plan, the declared coinbase and the custom job's outputs carry the
+commitment as output 0 and the tickets (worth 0) after the pool's outputs,
+which the pool's rule already allowed. The leaves bind the miner's own
+script (the pool's first output) and the pool's whole donation rate as the
+split, since no donation work runs under Job Declaration; the claim worker
+checks a win against those terms (the win now carries its job's plan).
+`--merge-test-token` is accepted at a pool with `--job-declaration` and
+refused without it. A pool token whose rates exceed 100% is refused, so the
+payout math cannot underflow.
+
+Evidence: a template test (the declared coinbase equals a local coinbase,
+the custom job's outputs pass the pool's rule, the leaves bind the plan's
+terms, no change without tokens), a plan test for the rate guard, flag and
+refusal tests, and a loopback run in both modes where a device's share at a
+Pickaxe pool wins the test token's Case A and Case B, both are proven at
+the client, the pool accepts the custom job (and, Full-Template, its node's
+`validateblocktemplate` passes the declaration), and the block with the
+commitment reaches the client's node and, Full-Template, the pool's. Not yet
+run live.

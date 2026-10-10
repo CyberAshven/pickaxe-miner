@@ -348,12 +348,29 @@ impl View {
 /// Each won entry with the claim view its proof is checked against: the
 /// job's beneficiary and split, the Case A baton or the Case B ticket.
 fn claim_views(network: MiningNetwork, win: &TokenWin) -> Vec<(u16, View)> {
-    let Ok(scripts) = payout::scripts(network, &win.miner, win.operator.as_deref()) else {
-        return Vec::new();
+    // #### PR #42: a Job Declaration job's leaves bind its plan's terms: the
+    // miner's own script and the pool's whole donation rate.
+    let (beneficiary, split) = match win.declared.as_deref() {
+        Some(plan) => {
+            let Some((miner, split)) = plan.token_terms() else {
+                return Vec::new();
+            };
+            (
+                miner.to_vec(),
+                split.map(|(bps, script)| (bps, script.to_vec())),
+            )
+        }
+        None => {
+            let Ok(scripts) = payout::scripts(network, &win.miner, win.operator.as_deref()) else {
+                return Vec::new();
+            };
+            (
+                payout::beneficiary(&scripts, win.payout).to_vec(),
+                payout::token_split(win.payout, &scripts[1])
+                    .map(|(bps, script)| (bps, script.to_vec())),
+            )
+        }
     };
-    let beneficiary = payout::beneficiary(&scripts, win.payout).to_vec();
-    let split =
-        payout::token_split(win.payout, &scripts[1]).map(|(bps, script)| (bps, script.to_vec()));
     let txid = double_sha256(&win.coinbase);
     win.entries
         .iter()

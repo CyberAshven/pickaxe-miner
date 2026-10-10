@@ -792,3 +792,87 @@ fn provided_templates_are_checked_like_a_nodes() {
     wrong.merkle_path = &wrong_path;
     assert!(BchTemplate::from_provided(wrong).is_err());
 }
+
+// #### PR #42
+// What: under a Job Declaration plan with a token set, the declared
+// coinbase, every local job's coinbase and the custom job's outputs carry
+// the commitment as output 0 and the ticket (worth 0) after the pool's
+// outputs; the leaves bind the miner's script (the pool's first output) with
+// the pool's whole donation rate as the split, and the pool's rule accepts
+// the outputs. Without tokens they are the plan's outputs alone.
+// Look here if: declared_aux, declared_parts or declared_outputs change.
+#[test]
+fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
+    use super::jd::{plan::JdPlan, policy::PayoutRule, token::PoolRates};
+    use super::merge::{
+        commitment::AuxCommitment,
+        leaf::Mode,
+        registry::is_ticket_script,
+        set::{tests::test_set, AuxJob},
+    };
+    use std::sync::Arc;
+    let network = MiningNetwork::Chipnet;
+    let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+    let plan = JdPlan {
+        serial: 1,
+        upstream_prefix: vec![0xee; 16],
+        pad: Vec::new(),
+        scripts: vec![vec![0x51], vec![0x52], vec![0x53]],
+        rates: PoolRates {
+            donation_bps: 150,
+            fee_bps: 100,
+            donation_output: Some(2),
+            fee_output: Some(1),
+        },
+        pool_target: [0xff; 32],
+    };
+    template.declare(Arc::new(plan.clone()));
+    let pool_outputs = plan.outputs(template.coinbase_value);
+    assert!(template.declared_aux().unwrap().is_none());
+    assert_eq!(template.declared_outputs().unwrap(), pool_outputs);
+    let set = Arc::new(test_set(&[Mode::ShareTarget, Mode::BlockRequired]));
+    template.commit(set.clone());
+    let aux = template.declared_aux().unwrap().unwrap();
+    let expected = AuxJob::build(&set, &[0x51], Some((150, &[0x53][..])), 4).unwrap();
+    assert_eq!(aux.outputs.commitment, expected.outputs.commitment);
+    assert_eq!(aux.outputs.tickets, expected.outputs.tickets);
+    assert_eq!(aux.outputs.first_ticket_vout, 4);
+    // Every local job on the plan shares it, whatever its own payout says.
+    let local = template
+        .aux_job(network, &payout(), None, Default::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(local.outputs.commitment, aux.outputs.commitment);
+    let outputs = template.declared_outputs().unwrap();
+    assert_eq!(outputs.len(), 5);
+    assert_eq!(outputs[0].0, 0);
+    assert!(AuxCommitment::parse_script(&outputs[0].1).is_some());
+    assert_eq!(&outputs[1..4], pool_outputs.as_slice());
+    assert_eq!(outputs[4].0, 0);
+    assert!(is_ticket_script(&outputs[4].1));
+    let rule = PayoutRule {
+        miner: vec![0x51],
+        donation: Some((vec![0x53], 150)),
+        fee: Some((vec![0x52], 100)),
+    };
+    assert_eq!(rule.check(&outputs), Ok(template.coinbase_value));
+    // The declared coinbase is a local coinbase with the whole extranonce.
+    let parts = template.declared_parts().unwrap();
+    let serialized = super::jd::codec::serialize_outputs(&outputs);
+    assert!(parts.suffix[4..].starts_with(&serialized));
+    let extranonce = [0x33; 32];
+    let local = template
+        .coinbase_with_aux(
+            network,
+            &payout(),
+            None,
+            &extranonce,
+            Default::default(),
+            Some(&local.outputs),
+        )
+        .unwrap();
+    let mut declared = parts.prefix.clone();
+    declared.extend(extranonce);
+    declared.extend(&parts.suffix);
+    assert_eq!(local.bytes, declared);
+}

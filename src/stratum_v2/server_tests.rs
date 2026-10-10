@@ -354,6 +354,33 @@ impl Running {
         )
     }
 
+    /// #### PR #42: a Job Declaration client merge-mining `hub`'s tokens,
+    /// with its proofs in `state_directory`.
+    pub(super) fn jd_client_merged(
+        node: Arc<Mutex<Node>>,
+        pool: &Running,
+        mode: super::jd::JdMode,
+        hub: Arc<super::merge::hub::TokenHub>,
+        state_directory: Arc<TestDirectory>,
+    ) -> Self {
+        Self::start_config(
+            vec![node],
+            state_directory,
+            None,
+            Some(hub),
+            None,
+            None,
+            Some(super::jd::client::JdTarget {
+                address: pool.address.to_string(),
+                authority: pool.authority,
+                identity: payout(),
+                retry: Duration::from_millis(500),
+                mode,
+            }),
+            Vec::new(),
+        )
+    }
+
     /// #### PR #42: a server whose templates come first from `provider`'s
     /// template server, then from its own `node`.
     pub(super) fn tdp_client(
@@ -2790,6 +2817,100 @@ fn full_template_declares_provides_a_missing_transaction_and_both_nodes_get_the_
         .unwrap();
     assert_eq!(found.result, Some("accepted"));
     device.sender.close();
+}
+
+// #### PR #42
+// What: a Job Declaration client merge-mines the Chipnet test token at a
+// Pickaxe pool, in both modes: the pool accepts the custom job (and the
+// declaration) with the commitment as output 0 and the ticket after its
+// outputs; the device's share wins the token in both cases at the client,
+// which proves them; the block carries the commitment and reaches the
+// client's node and, Full-Template, the pool's.
+// Look here if: declared_aux, the custom job's outputs or the pool's
+// commitment rule change.
+#[test]
+fn merge_mined_tokens_ride_job_declaration_to_a_pickaxe_pool() {
+    use super::merge::{commitment::AuxCommitment, hub::TokenHub, registry::is_ticket_script};
+    for mode in [
+        super::jd::JdMode::CoinbaseOnly,
+        super::jd::JdMode::FullTemplate,
+    ] {
+        let public = super::payout::PublicPool {
+            fee: Some(crate::donation::bch::PoolFee {
+                rate: "1".parse().unwrap(),
+                mode: crate::donation::bch::FeeMode::Work,
+            }),
+            address: address(0x34),
+        };
+        let pool_side = pool_node();
+        let pool = match mode {
+            super::jd::JdMode::CoinbaseOnly => Running::jd_pool(public),
+            super::jd::JdMode::FullTemplate => Running::jd_pool_full(pool_side.clone(), public),
+        };
+        let directory = Arc::new(TestDirectory::new());
+        // The node's own target, so every share wins the Case A state.
+        let hub = Arc::new(
+            TokenHub::test_token(
+                MiningNetwork::Chipnet,
+                directory.0.join("token-proofs.json"),
+                0x207f_ffff,
+            )
+            .unwrap(),
+        );
+        let miner_node = pool_node();
+        let client = Running::jd_client_merged(miner_node.clone(), &pool, mode, hub, directory);
+        pool.wait(|stats| {
+            stats
+                .jd_server
+                .as_ref()
+                .is_some_and(|jd| jd.custom_jobs >= 1)
+        });
+        let mut device = Device::connect(&client, true);
+        device.solve_and_submit(0);
+        client.wait(|stats| stats.blocks_accepted == 1);
+        client.wait(|stats| stats.recent_token_wins.len() >= 2);
+        let stats = client.stats.lock().unwrap().clone();
+        assert!(
+            stats.tokens_off.is_none(),
+            "{mode:?}: {:?}",
+            stats.tokens_off
+        );
+        let mut modes: Vec<char> = stats.recent_token_wins.iter().map(|win| win.mode).collect();
+        modes.sort_unstable();
+        assert_eq!(modes, ['A', 'B'], "{mode:?}");
+        let submitted = miner_node.lock().unwrap().submitted[0].clone();
+        let block: Block = consensus::deserialize(&hex::decode(&submitted).unwrap()).unwrap();
+        let outputs: Vec<(u64, Vec<u8>)> = block.txdata[0]
+            .output
+            .iter()
+            .map(|output| (output.value.to_sat(), output.script_pubkey.to_bytes()))
+            .collect();
+        assert_eq!(outputs.len(), 5, "{mode:?}");
+        assert_eq!(outputs[0].0, 0);
+        assert!(AuxCommitment::parse_script(&outputs[0].1).is_some());
+        assert_eq!(
+            outputs[1..4]
+                .iter()
+                .map(|(value, _)| *value)
+                .collect::<Vec<_>>(),
+            [304_734_375, 3_078_125, 4_687_500]
+        );
+        assert_eq!(outputs[4].0, 0);
+        assert!(is_ticket_script(&outputs[4].1));
+        pool.wait(|stats| {
+            stats.shares_accepted >= 1 && stats.jd_server.as_ref().is_some_and(|jd| jd.blocks >= 1)
+        });
+        if mode == super::jd::JdMode::FullTemplate {
+            pool.wait(|stats| {
+                stats
+                    .jd_server
+                    .as_ref()
+                    .is_some_and(|jd| jd.declared_accepted == 1)
+            });
+            assert_eq!(pool_side.lock().unwrap().submitted[0], submitted);
+        }
+        device.sender.close();
+    }
 }
 
 // #### PR #42

@@ -299,11 +299,28 @@ counts as the overview line below.
   fallbacks", and the status file's `jd_client` the same counts.
 - The donation is paid in the coinbase, as the pool's rule requires, so there
   is no donation work under Job Declaration.
+- A pool token whose rates add to over 100% is refused (the client falls back
+  to the pool's own jobs), so a bad token cannot break the payout math.
+
+## Merge-mined tokens under Job Declaration
+
+#### PR #42
+
+While tokens are merge-mined, every local job on the pool's plan, the
+declared coinbase (Full-Template) and the custom job's outputs carry the
+commitment as output 0 and each Case B ticket (worth 0) after the pool's
+outputs. The pool's rule allows exactly that shape (R5-R8 above); the
+pool cannot see the leaves, which bind the miner's own script (the pool's
+first output) with the pool's whole donation rate as the donation's split,
+since no donation work runs here. Wins are proven by the client, as in solo
+mining, and need nothing from the pool. On Chipnet the hidden test token
+rides it with `--merge-test-token 1000` beside `--job-declaration`; at a
+pool without `--job-declaration` the server refuses the flag, as the pool
+builds the blocks there. Connection info then reads "Merge-mined tokens: on
+while your templates are mined".
 
 ## Not yet
 
-- Merge-mined tokens under Job Declaration: the commitment and tickets in the
-  declared coinbase.
 - Job Declaration servers apart from the pools (`--jd-server`), and the
   client's own jobs when every pool is down.
 - A live run against BCHN on Chipnet, and SRI's Job Declaration client against

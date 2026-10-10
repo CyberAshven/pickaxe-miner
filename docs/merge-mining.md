@@ -39,8 +39,13 @@ is checked against all of them at once.
 ## Where merge mining works
 
 - **Solo and your own public pool:** yes. Pickaxe builds the coinbase.
-- **Join a pool:** no. The pool builds the coinbase, so Pickaxe cannot add the
-  commitment (that needs Job Declaration, not yet available for BCH pools).
+- **Join a pool with your own templates (Job Declaration):** yes, at a
+  Pickaxe pool that accepts Job Declaration. Your node builds the coinbase,
+  so the commitment goes in as output 0 and the tickets (worth 0) after the
+  pool's outputs; the pool's rule allows exactly that shape. See
+  [Under Job Declaration](#under-job-declaration).
+- **Join a pool without it:** no. The pool builds the coinbase, so Pickaxe
+  cannot add the commitment.
 - **GPU mining:** not applicable. PHOTON's work is over its own transaction,
   not a block header.
 
@@ -51,6 +56,21 @@ anything from 0% to 100% in Advanced settings). As for BCH, two thirds is a
 split of each claim, bound in the leaf of miner jobs, and one third is mining
 work: a share of jobs whose leaves pay the Pickaxe donation address. A public
 pool's fee reaches tokens through its fee-work jobs only.
+
+### Under Job Declaration
+
+#### PR #42
+
+At a pool, no donation work runs (the pool's rule takes the donation from
+the coinbase), so each leaf binds your own script (the pool's first output)
+and the donation's split is the pool's whole donation rate to its donation
+output; a pool with no donation has no split. Every local job on the pool's
+plan shares one commitment, which the declared coinbase and the custom job's
+outputs carry too. Token wins are proven on your computer as in solo mining.
+The pool cannot see the leaves and takes no share of token wins. The hidden
+Chipnet test token can ride it: `serve --upstream ... --job-declaration
+--merge-test-token 1000`; without `--job-declaration` the server refuses it at
+a pool.
 
 ## Byte layouts (normative)
 
@@ -172,6 +192,10 @@ steps and checks every proof before keeping it.
   address.
 - A hidden `stratum-v2 serve --merge-test-token <DIFFICULTY>` merge-mines a
   Chipnet test token to try all of this with real devices; mainnet refuses it.
+- Merge-mines through Job Declaration at a Pickaxe pool, in both modes
+  (loopback-tested: the pool accepts the commitment, a Full-Template
+  declaration passes the pool node's `validateblocktemplate`, and both cases'
+  wins are proven).
 
 ## Still open
 
