@@ -1851,3 +1851,21 @@ retry waits, the rejection window, same-parent gating, the `--fallback-pool`
 flags, and a loopback run: an SV1 device on the node's server moves to a
 fallback pool when the node stops answering and back once it answers (the
 return time shortened to 100 ms). Not yet run live with a stopped Chipnet node.
+
+## Group channels in the mining server (2026-10-10)
+
+#### PR #42
+
+The server groups the extended channels of one payout identity on a
+connection and sends each new template as one job frame to a group of two or
+more; first jobs, vardiff jobs, targets and share answers stay per channel.
+A grouped connection takes up to 256 channels. No groups form for standard
+jobs, custom-only channels or a Pickaxe adapter from before group support.
+
+Evidence: host tests for one frame per refresh, each member rebuilding the
+same block header from the group's job and its own prefix, standard and
+single-member connections keeping their own frames, public-pool groups by
+payout, per-channel vardiff, group close and refused group ids, the 256 and
+32 caps, the legacy adapter, and a loopback run: a scripted proxy with two
+channels mines a block on its own first job and another on the group's job
+after the parent changes. Not yet run with SRI's translator.

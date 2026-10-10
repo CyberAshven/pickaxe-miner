@@ -448,6 +448,29 @@ pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
 - Native SV2 devices such as a Bitaxe use their own backup pool, which the
   Device panel's Pools page can set.
 
+### Group channels (proxies such as SRI's translator)
+
+#### PR #42
+
+A proxy carries many miners on one SV2 connection, one extended channel
+each. Pickaxe's server groups them:
+
+- The extended channels of one payout identity on a connection form a group
+  (one per miner at a public pool, one for the whole connection in solo
+  mining), announced in each channel's `OpenExtendedMiningChannel.Success`
+  (`group_channel_id`); channels never move between groups.
+- On each new template a group of two or more gets one job frame addressed to
+  the group, instead of one per channel. A channel's first job, its vardiff
+  jobs, its targets and its share answers stay its own.
+- A grouped connection carries up to 256 channels, against 32 otherwise, so a
+  farm behind a translator fits on one connection.
+- `CloseChannel` on a group closes every member; a share or `UpdateChannel`
+  naming a group is `invalid-channel-id`.
+- No groups form on a connection that asks for standard jobs, for a Job
+  Declaration client's custom-only channels, or for a Pickaxe SV1 adapter from
+  before group support (its firmware field was empty); those get one frame
+  per channel, as before.
+
 ### Templates from a provider (Template Distribution client)
 
 #### PR #42

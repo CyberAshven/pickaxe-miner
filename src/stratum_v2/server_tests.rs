@@ -1635,6 +1635,205 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
 }
 
 // #### PR #42
+// What: a proxy (one SV2 connection, two extended channels of one identity,
+// as SRI's translator opens them) mines through group jobs on a real
+// server: both channels are announced in one group and get their own first
+// jobs; after a block the next template comes as one job addressed to the
+// group, and a block on it from the second channel is accepted.
+// Look here if: group channels change on the server.
+#[test]
+fn a_proxy_mines_through_a_grouped_connection() {
+    struct Work {
+        job: u32,
+        version: u32,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+        path: Vec<[u8; 32]>,
+    }
+    /// One frame: its type and the channel or group it addresses, with
+    /// the jobs and the parent recorded.
+    fn read(
+        receiver: &mut Receiver,
+        work: &mut std::collections::HashMap<u32, Work>,
+        parent: &mut Option<([u8; 32], u32, u32)>,
+    ) -> (u8, u32) {
+        let mut frame = receiver
+            .receive(Duration::from_secs(3))
+            .unwrap()
+            .expect("a frame from the server");
+        let kind = frame.header().msg_type();
+        match kind {
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
+                let job: NewExtendedMiningJob = binary_sv2::from_bytes(frame.payload()).unwrap();
+                work.insert(
+                    job.channel_id,
+                    Work {
+                        job: job.job_id,
+                        version: job.version,
+                        head: job.coinbase_tx_prefix.as_ref().to_vec(),
+                        tail: job.coinbase_tx_suffix.as_ref().to_vec(),
+                        path: job
+                            .merkle_path
+                            .iter()
+                            .map(|hash| hash.as_ref().try_into().unwrap())
+                            .collect(),
+                    },
+                );
+                (kind, job.channel_id)
+            }
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+                let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
+                *parent = Some((
+                    prev.prev_hash.as_ref().try_into().unwrap(),
+                    prev.min_ntime,
+                    prev.nbits,
+                ));
+                (kind, prev.channel_id)
+            }
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS => {
+                let opened: OpenExtendedMiningChannelSuccess =
+                    binary_sv2::from_bytes(frame.payload()).unwrap();
+                (kind, opened.channel_id)
+            }
+            MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS => {
+                let success: SubmitSharesSuccess = binary_sv2::from_bytes(frame.payload()).unwrap();
+                (kind, success.channel_id)
+            }
+            _ => (kind, 0),
+        }
+    }
+    /// A nonce that makes a block of `work` on `channel`'s prefix.
+    fn solve(work: &Work, prefix: &[u8], parent: ([u8; 32], u32, u32)) -> u32 {
+        let mut coinbase = work.head.clone();
+        coinbase.extend(prefix);
+        coinbase.extend([0x42; 8]);
+        coinbase.extend(&work.tail);
+        let root = super::template::fold(super::template::double_sha256(&coinbase), &work.path);
+        let mut header = work.version.to_le_bytes().to_vec();
+        header.extend(parent.0);
+        header.extend(root);
+        header.extend(parent.1.to_le_bytes());
+        header.extend(parent.2.to_le_bytes());
+        let target = super::template::compact_target(parent.2).unwrap();
+        (0..10_000u32)
+            .find(|nonce| {
+                header.truncate(76);
+                header.extend(nonce.to_le_bytes());
+                super::template::meets_target(&super::template::double_sha256(&header), &target)
+            })
+            .unwrap()
+    }
+    let server = Running::new(false);
+    let (mut sender, mut receiver) = Session::initiate(
+        TcpStream::connect(server.address).unwrap(),
+        server.authority,
+    )
+    .unwrap()
+    .split();
+    sender
+        .send(
+            encoded(
+                SetupConnection {
+                    protocol: Protocol::MiningProtocol,
+                    min_version: 2,
+                    max_version: 2,
+                    flags: 4,
+                    endpoint_host: "localhost".try_into().unwrap(),
+                    endpoint_port: server.address.port(),
+                    vendor: "SRI translator".try_into().unwrap(),
+                    hardware_version: "".try_into().unwrap(),
+                    firmware: "1.0".try_into().unwrap(),
+                    device_id: "".try_into().unwrap(),
+                },
+                0,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        receiver
+            .receive(Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+            .header()
+            .msg_type(),
+        1
+    );
+    let mut work = std::collections::HashMap::new();
+    let mut parent = None;
+    let mut channels = Vec::new();
+    for request in 1..=2u32 {
+        sender
+            .send(
+                mining(Mining::OpenExtendedMiningChannel(
+                    OpenExtendedMiningChannel {
+                        request_id: request,
+                        user_identity: "cpu".try_into().unwrap(),
+                        nominal_hash_rate: 1000.0,
+                        max_target: (&[255; 32]).into(),
+                        min_extranonce_size: 8,
+                    },
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut frame = loop {
+            let frame = receiver.receive(Duration::from_secs(3)).unwrap().unwrap();
+            if frame.header().msg_type() == MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS {
+                break frame;
+            }
+        };
+        let opened: OpenExtendedMiningChannelSuccess =
+            binary_sv2::from_bytes(frame.payload()).unwrap();
+        channels.push((
+            opened.channel_id,
+            opened.group_channel_id,
+            opened.extranonce_prefix.as_ref().to_vec(),
+        ));
+        // The channel's own first job and its activation.
+        while read(&mut receiver, &mut work, &mut parent)
+            != (MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, opened.channel_id)
+        {}
+    }
+    let ((a, group, prefix_a), (b, also, prefix_b)) = (channels[0].clone(), channels[1].clone());
+    assert_ne!(group, 0);
+    assert_eq!(group, also, "one identity, one group");
+    let first = parent.unwrap();
+    let submit = |sender: &mut Sender, channel: u32, sequence: u32, work: &Work, nonce, ntime| {
+        sender
+            .send(
+                mining(Mining::SubmitSharesExtended(SubmitSharesExtended {
+                    channel_id: channel,
+                    sequence_number: sequence,
+                    job_id: work.job,
+                    nonce,
+                    ntime,
+                    version: work.version,
+                    extranonce: [0x42u8; 8].as_slice().try_into().unwrap(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+    };
+    let nonce = solve(&work[&a], &prefix_a, first);
+    submit(&mut sender, a, 1, &work[&a], nonce, first.1);
+    while read(&mut receiver, &mut work, &mut parent) != (MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS, a) {}
+    server.wait(|stats| stats.blocks_accepted == 1);
+    // The next parent's job comes once, to the group.
+    while read(&mut receiver, &mut work, &mut parent)
+        != (MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, group)
+    {}
+    let next = parent.unwrap();
+    assert_ne!(next.0, first.0);
+    let nonce = solve(&work[&group], &prefix_b, next);
+    submit(&mut sender, b, 2, &work[&group], nonce, next.1);
+    while read(&mut receiver, &mut work, &mut parent) != (MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS, b) {}
+    server.wait(|stats| stats.blocks_accepted == 2);
+    sender.close();
+}
+
+// #### PR #42
 // What: solo mining with a fallback pool, on loopback: an SV1 device mines
 // on the miner's node; when the node stops answering, the local server ends
 // its session and the adapter takes the device to the fallback pool

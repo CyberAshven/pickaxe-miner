@@ -4,8 +4,8 @@
 
 use super::{
     channel::{
-        share_work, Channel, ChannelKind, Share, TokenWin, ValidatedShare, DEVICE_EXTRANONCE_SIZE,
-        VERSION_ROLLING_MASK,
+        share_work, Channel, ChannelKind, Job, Share, TokenWin, ValidatedShare,
+        DEVICE_EXTRANONCE_SIZE, VERSION_ROLLING_MASK,
     },
     jd::{
         codec::parse_outputs,
@@ -19,7 +19,7 @@ use super::{
 use crate::config::MiningNetwork;
 use crate::donation::bch::BchPayout;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -36,6 +36,16 @@ use stratum_core::{
 };
 
 const MAX_CHANNELS: usize = 32;
+/// #### PR #42: channels on a connection whose extended channels are
+/// grouped: a proxy such as SRI's translator opens one per miner behind it.
+const MAX_GROUPED_CHANNELS: usize = 256;
+
+/// #### PR #42: a group channel: the extended channels of one payout
+/// identity on a connection, which share each template's job frame.
+struct Group {
+    payout: String,
+    members: BTreeSet<u32>,
+}
 
 pub struct MiningSession {
     network: MiningNetwork,
@@ -67,6 +77,10 @@ pub struct MiningSession {
     /// #### PR #42: a Job Declaration client's local server: each channel
     /// takes a lane from this server-wide counter as its extranonce prefix.
     lanes: Option<Arc<AtomicU32>>,
+    /// #### PR #42: whether this connection's extended channels are grouped,
+    /// and its groups by id.
+    grouping: bool,
+    groups: BTreeMap<u32, Group>,
 }
 
 pub struct Responses {
@@ -115,6 +129,8 @@ impl MiningSession {
             work_selection: false,
             custom_jobs: 0,
             lanes: None,
+            grouping: false,
+            groups: BTreeMap::new(),
         })
     }
 
@@ -169,6 +185,25 @@ impl MiningSession {
         self.current = Some((id, generation, template.clone()));
         self.payout_policy = payout;
         let mut frames = Vec::new();
+        // #### PR #42: the group broadcast
+        // What: on each template, a group of two or more extended channels
+        // (one payout identity on a connection) gets one job frame addressed
+        // to the group instead of one per channel; each member still gets
+        // its own SetTarget, and the channel installs its job as before. A
+        // single-member group, standard and custom-only channels get their
+        // own frames.
+        // Why: a proxy such as SRI's translator carries every miner behind
+        // it on one connection; one frame per template instead of one per
+        // miner keeps its link and the server light.
+        // Look here if: a proxy's miners stop getting jobs, or their shares
+        // are refused after a template change.
+        let broadcast: BTreeSet<u32> = self
+            .groups
+            .values()
+            .filter(|group| group.members.len() >= 2)
+            .flat_map(|group| group.members.iter().copied())
+            .collect();
+        let mut immediates = BTreeMap::new();
         for channel in self.channels.values_mut() {
             let immediate = channel.job().is_some_and(|job| {
                 job.template.previous_hash == template.previous_hash
@@ -218,7 +253,23 @@ impl MiningSession {
                 }))?);
             }
             channel.install_with_payout(id, generation, template.clone(), payout)?;
+            if broadcast.contains(&channel.id) {
+                immediates.insert(channel.id, immediate);
+                continue;
+            }
             frames.extend(job_frames(channel, immediate)?);
+        }
+        for (group, members) in self
+            .groups
+            .iter()
+            .filter(|(_, group)| group.members.len() >= 2)
+        {
+            frames.extend(group_frames(
+                *group,
+                &members.members,
+                &self.channels,
+                &immediates,
+            )?);
         }
         Ok(frames)
     }
@@ -312,6 +363,15 @@ impl MiningSession {
                 )?);
             } else {
                 self.setup_flags = Some(setup.flags);
+                // #### PR #42: group channels
+                // What: extended channels are grouped unless the connection
+                // asked for standard jobs, or it is a Pickaxe SV1 adapter from
+                // before group support (its firmware field was empty).
+                // Why: such an adapter would drop group-addressed jobs.
+                // Look here if: an older adapter's devices get no jobs.
+                self.grouping = setup.flags & 1 == 0
+                    && !(setup.vendor.as_utf8_or_hex() == "Pickaxe SV1 adapter"
+                        && setup.firmware.as_utf8_or_hex().is_empty());
                 // Upstream flag bit 0 means REQUIRES_FIXED_VERSION. Leave it
                 // clear: ASIC hardware, including Bitaxe, needs version rolling.
                 frames.push(encoded(
@@ -456,8 +516,19 @@ impl MiningSession {
                 });
             }
             Mining::CloseChannel(request) => {
-                self.channels.remove(&request.channel_id);
-                self.maximum_targets.remove(&request.channel_id);
+                // #### PR #42: closing a group closes its members.
+                let closed: Vec<u32> = match self.groups.remove(&request.channel_id) {
+                    Some(group) => group.members.into_iter().collect(),
+                    None => vec![request.channel_id],
+                };
+                for id in closed {
+                    self.channels.remove(&id);
+                    self.maximum_targets.remove(&id);
+                    for group in self.groups.values_mut() {
+                        group.members.remove(&id);
+                    }
+                }
+                self.groups.retain(|_, group| !group.members.is_empty());
             }
             // #### PR #42: SetCustomMiningJob (Coinbase-only)
             // What: a Job Declaration client sets its own job on its
@@ -735,7 +806,15 @@ impl MiningSession {
             Some("unsupported-min-extranonce-size")
         } else if maximum == [0; 32] {
             Some("max-target-out-of-range")
-        } else if self.channels.len() >= MAX_CHANNELS || self.next_channel == u32::MAX {
+        } else if self.channels.len()
+            >= if self.grouping {
+                MAX_GROUPED_CHANNELS
+            } else {
+                MAX_CHANNELS
+            }
+            || self.next_channel >= u32::MAX - 1
+        {
+            // #### PR #42: a grouped connection carries up to 256 channels.
             Some("channel-capacity-exhausted")
         } else if self.current.is_none() {
             Some("no-template-available")
@@ -791,8 +870,8 @@ impl MiningSession {
                     group_channel_id: 0,
                 },
             ))?;
+            self.maximum_targets.insert(channel.id, maximum);
             self.channels.insert(channel.id, channel);
-            self.maximum_targets.insert(self.next_channel, maximum);
             return Ok(vec![frame]);
         }
         let (id, generation, template) = self.current.as_ref().unwrap();
@@ -802,6 +881,36 @@ impl MiningSession {
         channel.settle(&template.target, tokens, &maximum);
         let target = channel.target;
         channel.install_with_payout(*id, *generation, template.clone(), self.payout_policy)?;
+        // #### PR #42: an extended channel joins its payout's group, made
+        // with the next id when it is the first; the group is announced here
+        // and never moved (no SetGroupChannel).
+        let group = if self.grouping && kind == ChannelKind::Extended {
+            let existing = self
+                .groups
+                .iter()
+                .find(|(_, group)| group.payout == payout)
+                .map(|(id, _)| *id);
+            let group = match existing {
+                Some(group) => group,
+                None => {
+                    self.next_channel += 1;
+                    self.groups.insert(
+                        self.next_channel,
+                        Group {
+                            payout: payout.clone(),
+                            members: BTreeSet::new(),
+                        },
+                    );
+                    self.next_channel
+                }
+            };
+            if let Some(members) = self.groups.get_mut(&group) {
+                members.members.insert(channel.id);
+            }
+            group
+        } else {
+            0
+        };
         let mut frames = vec![match kind {
             ChannelKind::Standard => mining(Mining::OpenStandardMiningChannelSuccess(
                 OpenStandardMiningChannelSuccess {
@@ -819,13 +928,13 @@ impl MiningSession {
                     target: (&target).into(),
                     extranonce_size: DEVICE_EXTRANONCE_SIZE as u16,
                     extranonce_prefix: channel.extranonce_prefix.as_slice().try_into().unwrap(),
-                    group_channel_id: 0,
+                    group_channel_id: group,
                 },
             ))?,
         }];
         frames.extend(job_frames(&channel, false)?);
+        self.maximum_targets.insert(channel.id, maximum);
         self.channels.insert(channel.id, channel);
-        self.maximum_targets.insert(self.next_channel, maximum);
         Ok(frames)
     }
 
@@ -907,16 +1016,66 @@ impl MiningSession {
 
 fn job_frames(channel: &Channel, immediate: bool) -> Result<Vec<SerializedFrame>, String> {
     let job = channel.job().ok_or("channel has no job")?;
-    let new = match channel.kind {
+    frames_for(channel.id, channel.kind, job, immediate)
+}
+
+/// #### PR #42: one job frame for a group's members when they hold the same
+/// job (its id, coinbase parts, merkle path, version and parent), activated
+/// at once only when every member's would be; otherwise each member's own.
+fn group_frames(
+    group: u32,
+    members: &BTreeSet<u32>,
+    channels: &BTreeMap<u32, Channel>,
+    immediates: &BTreeMap<u32, bool>,
+) -> Result<Vec<SerializedFrame>, String> {
+    let members: Vec<&Channel> = members.iter().filter_map(|id| channels.get(id)).collect();
+    let first = members
+        .first()
+        .and_then(|channel| channel.job())
+        .ok_or("group has no job")?;
+    let shared = members.iter().all(|channel| {
+        channel.job().is_some_and(|job| {
+            job.id == first.id
+                && job.parts.prefix == first.parts.prefix
+                && job.parts.suffix == first.parts.suffix
+                && job.parts.merkle_path == first.parts.merkle_path
+                && job.template.version == first.template.version
+                && job.template.previous_hash == first.template.previous_hash
+        })
+    });
+    let immediate = |channel: &Channel| immediates.get(&channel.id).copied().unwrap_or(false);
+    if !shared {
+        let mut frames = Vec::new();
+        for channel in members {
+            frames.extend(job_frames(channel, immediate(channel))?);
+        }
+        return Ok(frames);
+    }
+    frames_for(
+        group,
+        ChannelKind::Extended,
+        first,
+        members.iter().all(|channel| immediate(channel)),
+    )
+}
+
+/// A job's frames addressed to `channel_id` (a channel, or a group).
+fn frames_for(
+    channel_id: u32,
+    kind: ChannelKind,
+    job: &Job,
+    immediate: bool,
+) -> Result<Vec<SerializedFrame>, String> {
+    let new = match kind {
         ChannelKind::Standard => Mining::NewMiningJob(NewMiningJob {
-            channel_id: channel.id,
+            channel_id,
             job_id: job.id,
             min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
             merkle_root: (&job.standard_coinbase.merkle_root).into(),
         }),
         ChannelKind::Extended => Mining::NewExtendedMiningJob(NewExtendedMiningJob {
-            channel_id: channel.id,
+            channel_id,
             job_id: job.id,
             min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
@@ -946,7 +1105,7 @@ fn job_frames(channel: &Channel, immediate: bool) -> Result<Vec<SerializedFrame>
     let mut frames = vec![mining(new)?];
     if !immediate {
         frames.push(mining(Mining::SetNewPrevHash(SetNewPrevHash {
-            channel_id: channel.id,
+            channel_id,
             job_id: job.id,
             prev_hash: (&job.template.previous_hash).into(),
             min_ntime: job.template.current_time,
@@ -1939,5 +2098,370 @@ mod tests {
         let decoded: Block = consensus::deserialize(&bytes).unwrap();
         assert_eq!(decoded.txdata.len(), 4);
         assert!(decoded.check_merkle_root());
+    }
+
+    /// #### PR #42: a session set up with `flags` by `vendor` running
+    /// `firmware`.
+    fn session_by(flags: u32, vendor: &str, firmware: &str) -> MiningSession {
+        let mut server = session();
+        let reply = server
+            .receive(
+                encoded(
+                    SetupConnection {
+                        protocol: Protocol::MiningProtocol,
+                        min_version: 2,
+                        max_version: 2,
+                        flags,
+                        endpoint_host: "localhost".try_into().unwrap(),
+                        endpoint_port: 3336,
+                        vendor: vendor.try_into().unwrap(),
+                        hardware_version: "".try_into().unwrap(),
+                        firmware: firmware.try_into().unwrap(),
+                        device_id: "".try_into().unwrap(),
+                    },
+                    0,
+                    false,
+                )
+                .unwrap(),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(reply.frames[0].header().msg_type(), 1);
+        server
+    }
+
+    /// #### PR #42: opens an extended channel for `identity`: its id, its
+    /// group's id and its extranonce prefix, or the refusal's code.
+    fn open_extended(
+        server: &mut MiningSession,
+        identity: &str,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        let mut frames = server
+            .receive(
+                mining(Mining::OpenExtendedMiningChannel(
+                    OpenExtendedMiningChannel {
+                        request_id: 2,
+                        user_identity: identity.try_into().unwrap(),
+                        nominal_hash_rate: 1e12,
+                        max_target: (&[255; 32]).into(),
+                        min_extranonce_size: DEVICE_EXTRANONCE_SIZE as u16,
+                    },
+                ))
+                .unwrap(),
+                NOW,
+            )
+            .unwrap()
+            .frames;
+        if frames[0].header().msg_type() == MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR {
+            let error: OpenMiningChannelError =
+                binary_sv2::from_bytes(frames[0].payload()).unwrap();
+            return Err(String::from_utf8(error.error_code.as_ref().to_vec()).unwrap());
+        }
+        let success: OpenExtendedMiningChannelSuccess =
+            binary_sv2::from_bytes(frames[0].payload()).unwrap();
+        Ok((
+            success.channel_id,
+            success.group_channel_id,
+            success.extranonce_prefix.as_ref().to_vec(),
+        ))
+    }
+
+    /// #### PR #42: a template on another parent.
+    fn next_parent() -> Arc<BchTemplate> {
+        let mut next = rpc_template();
+        next["previousblockhash"] = serde_json::json!("cd".repeat(32));
+        Arc::new(BchTemplate::from_rpc(&next).unwrap())
+    }
+
+    /// #### PR #42: the channel ids the job frames among `frames` address.
+    fn job_targets(frames: &mut [SerializedFrame]) -> Vec<(u8, u32)> {
+        frames
+            .iter_mut()
+            .filter_map(|frame| match frame.header().msg_type() {
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
+                    let job: NewExtendedMiningJob =
+                        binary_sv2::from_bytes(frame.payload()).unwrap();
+                    Some((MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, job.channel_id))
+                }
+                MESSAGE_TYPE_NEW_MINING_JOB => {
+                    let job: NewMiningJob = binary_sv2::from_bytes(frame.payload()).unwrap();
+                    Some((MESSAGE_TYPE_NEW_MINING_JOB, job.channel_id))
+                }
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+                    let prev: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
+                    Some((MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, prev.channel_id))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    // #### PR #42
+    // What: two extended channels of one payout on a connection share a
+    // group, announced when each opens; a new template sends one job and one
+    // SetNewPrevHash to the group, not one per channel; a Pickaxe SV1 adapter
+    // from before group support (empty firmware) gets no group and its own
+    // frames.
+    // Look here if: the group broadcast or the legacy-adapter rule changes.
+    #[test]
+    fn grouped_extended_channels_get_one_job_frame_per_refresh() {
+        let mut server = session_by(4, "SRI translator", "1.0");
+        let (a, group, _) = open_extended(&mut server, "miner.a").unwrap();
+        let (b, also, _) = open_extended(&mut server, "miner.b").unwrap();
+        assert_ne!(group, 0);
+        assert_eq!(group, also);
+        assert!(group != a && group != b);
+        let mut frames = server.set_job(10, 4, next_parent()).unwrap();
+        assert_eq!(
+            job_targets(&mut frames),
+            vec![
+                (MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, group),
+                (MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, group),
+            ]
+        );
+        let mut legacy = session_by(4, "Pickaxe SV1 adapter", "");
+        let (a, group, _) = open_extended(&mut legacy, "sv1-device").unwrap();
+        let (b, _, _) = open_extended(&mut legacy, "sv1-device").unwrap();
+        assert_eq!(group, 0, "a legacy adapter is never grouped");
+        let mut frames = legacy.set_job(10, 4, next_parent()).unwrap();
+        let mut targets: Vec<u32> = job_targets(&mut frames)
+            .into_iter()
+            .map(|(_, channel)| channel)
+            .collect();
+        targets.dedup();
+        assert_eq!(targets, vec![a, b]);
+    }
+
+    // #### PR #42
+    // What: each member rebuilds its coinbase from the group's job, its own
+    // prefix and its extranonce, and its share on the group's job id is
+    // accepted on its own channel; a share or an UpdateChannel naming the
+    // group is invalid-channel-id, and CloseChannel on the group closes every
+    // member.
+    // Look here if: grouped shares are refused, or group ids are taken as
+    // channels.
+    #[test]
+    fn each_member_reconstructs_the_same_root_from_the_group_job_and_its_prefix() {
+        let mut server = session_by(4, "SRI translator", "1.0");
+        let (a, group, prefix_a) = open_extended(&mut server, "miner.a").unwrap();
+        let (b, _, prefix_b) = open_extended(&mut server, "miner.b").unwrap();
+        let mut frames = server.set_job(10, 4, next_parent()).unwrap();
+        let job_frame = frames
+            .iter_mut()
+            .find(|frame| frame.header().msg_type() == MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB)
+            .unwrap();
+        let job: NewExtendedMiningJob = binary_sv2::from_bytes(job_frame.payload()).unwrap();
+        let (job_id, version) = (job.job_id, job.version);
+        let path: Vec<Hash> = job
+            .merkle_path
+            .iter()
+            .map(|hash| hash.as_ref().try_into().unwrap())
+            .collect();
+        let (head, tail) = (
+            job.coinbase_tx_prefix.as_ref().to_vec(),
+            job.coinbase_tx_suffix.as_ref().to_vec(),
+        );
+        let previous = next_parent().previous_hash;
+        for (sequence, (channel, prefix)) in [(a, prefix_a), (b, prefix_b)].into_iter().enumerate()
+        {
+            let mut coinbase = head.clone();
+            coinbase.extend(&prefix);
+            coinbase.extend(DEVICE_EXTRANONCE);
+            coinbase.extend(&tail);
+            let root = super::super::template::fold(double_sha256(&coinbase), &path);
+            let mut header = [0; 80];
+            header[..4].copy_from_slice(&version.to_le_bytes());
+            header[4..36].copy_from_slice(&previous);
+            header[36..68].copy_from_slice(&root);
+            header[68..72].copy_from_slice(&NOW.to_le_bytes());
+            header[72..76].copy_from_slice(&0x207f_ffffu32.to_le_bytes());
+            // A nonce that makes the member's own header a block, so the
+            // server's block shows the header it rebuilt.
+            let nonce = (0..1_000u32)
+                .find(|nonce| {
+                    header[76..].copy_from_slice(&nonce.to_le_bytes());
+                    meets_target(
+                        &double_sha256(&header),
+                        &compact_target(0x207f_ffff).unwrap(),
+                    )
+                })
+                .unwrap();
+            let responses = server
+                .receive(
+                    mining(Mining::SubmitSharesExtended(SubmitSharesExtended {
+                        channel_id: channel,
+                        sequence_number: sequence as u32 + 1,
+                        job_id,
+                        nonce,
+                        ntime: NOW,
+                        version,
+                        extranonce: DEVICE_EXTRANONCE.as_slice().try_into().unwrap(),
+                    }))
+                    .unwrap(),
+                    NOW,
+                )
+                .unwrap();
+            assert_eq!(
+                responses.frames[0].header().msg_type(),
+                MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+                "member {channel}"
+            );
+            assert_eq!(responses.blocks.len(), 1, "member {channel}");
+            assert_eq!(responses.blocks[0].header, header, "member {channel}");
+        }
+        let mut refused = server
+            .receive(
+                mining(Mining::SubmitSharesExtended(SubmitSharesExtended {
+                    channel_id: group,
+                    sequence_number: 9,
+                    job_id,
+                    nonce: 0,
+                    ntime: NOW,
+                    version,
+                    extranonce: DEVICE_EXTRANONCE.as_slice().try_into().unwrap(),
+                }))
+                .unwrap(),
+                NOW,
+            )
+            .unwrap()
+            .frames;
+        let error: SubmitSharesError = binary_sv2::from_bytes(refused[0].payload()).unwrap();
+        assert_eq!(error.error_code.as_ref(), b"invalid-channel-id");
+        server
+            .receive(
+                mining(Mining::CloseChannel(CloseChannel {
+                    channel_id: group,
+                    reason_code: "done".try_into().unwrap(),
+                }))
+                .unwrap(),
+                NOW,
+            )
+            .unwrap();
+        assert!(server.channels.is_empty());
+        assert!(server.groups.is_empty());
+    }
+
+    // #### PR #42
+    // What: a connection that requires standard jobs gets no groups: its
+    // standard channels announce group 0 and get their own job frames, as
+    // before group support; one member alone gets its own frames too; a
+    // custom-only channel is never grouped.
+    // Look here if: grouping applies where it should not.
+    #[test]
+    fn requires_standard_jobs_and_single_members_get_per_channel_frames() {
+        let mut standard = session_by(5, "firmware", "1.0");
+        for _ in 0..2 {
+            let mut frames = standard.receive(open(), NOW).unwrap().frames;
+            let success: OpenStandardMiningChannelSuccess =
+                binary_sv2::from_bytes(frames[0].payload()).unwrap();
+            assert_eq!(success.group_channel_id, 0);
+        }
+        let mut frames = standard.set_job(10, 4, next_parent()).unwrap();
+        let ids: Vec<u32> = standard.channels.keys().copied().collect();
+        assert_eq!(
+            job_targets(&mut frames),
+            vec![
+                (MESSAGE_TYPE_NEW_MINING_JOB, ids[0]),
+                (MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, ids[0]),
+                (MESSAGE_TYPE_NEW_MINING_JOB, ids[1]),
+                (MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, ids[1]),
+            ]
+        );
+        assert!(standard.groups.is_empty());
+        let mut single = session_by(4, "SRI translator", "1.0");
+        let (channel, group, _) = open_extended(&mut single, "miner").unwrap();
+        assert_ne!(group, 0);
+        let mut frames = single.set_job(10, 4, next_parent()).unwrap();
+        assert_eq!(
+            job_targets(&mut frames),
+            vec![
+                (MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, channel),
+                (MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, channel),
+            ]
+        );
+        let (mut jd, _, _, _) = jd_session(0b110);
+        assert!(
+            jd.groups.is_empty(),
+            "custom-only channels are never grouped"
+        );
+        let frames = jd.set_job(10, 4, next_parent()).unwrap();
+        assert!(frames
+            .iter()
+            .all(|frame| frame.header().msg_type() != MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB));
+    }
+
+    // #### PR #42
+    // What: at a public pool each payout identity has its own group; the
+    // two channels of one miner share a job frame and the other miner gets
+    // its own.
+    // Look here if: public-pool groups mix miners.
+    #[test]
+    fn public_pool_groups_by_payout() {
+        let declarator = super::super::jd::server::tests::declarator();
+        let mut server = session();
+        server.set_public(Some(declarator.public.clone()));
+        let reply = server.receive(setup(4), NOW).unwrap();
+        assert_eq!(reply.frames[0].header().msg_type(), 1);
+        let miner = payout();
+        let other =
+            crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x56; 20], MiningNetwork::Chipnet)
+                .unwrap();
+        let (_, group, _) = open_extended(&mut server, &format!("{miner}.rig1")).unwrap();
+        let (_, same, _) = open_extended(&mut server, &format!("{miner}.rig2")).unwrap();
+        let (alone, apart, _) = open_extended(&mut server, &other).unwrap();
+        assert_eq!(group, same);
+        assert_ne!(group, apart);
+        let mut frames = server.set_job(10, 4, next_parent()).unwrap();
+        let targets = job_targets(&mut frames);
+        assert!(targets.contains(&(MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, group)));
+        assert!(targets.contains(&(MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, alone)));
+        assert_eq!(targets.len(), 4);
+    }
+
+    // #### PR #42
+    // What: vardiff stays per channel inside a group: a member's new target
+    // comes with its own SetTarget and its own job frame.
+    // Look here if: retarget changes for grouped channels.
+    #[test]
+    fn vardiff_retarget_stays_per_channel_inside_a_group() {
+        let mut server = session_by(4, "SRI translator", "1.0");
+        server.share_target = super::super::template::compact_target(0x1b0ffff0).unwrap();
+        let mut template = (*server.current.as_ref().unwrap().2).clone();
+        template.target = super::super::template::compact_target(0x1a00ffff).unwrap();
+        server.set_job(10, 4, Arc::new(template)).unwrap();
+        let (a, _, _) = open_extended(&mut server, "miner.a").unwrap();
+        open_extended(&mut server, "miner.b").unwrap();
+        server.channels.get_mut(&a).unwrap().vardiff_window(60, 0);
+        let mut next_id = 10;
+        let mut frames = server.retarget(&mut next_id).unwrap();
+        assert_eq!(frames[0].header().msg_type(), MESSAGE_TYPE_SET_TARGET);
+        assert_eq!(
+            job_targets(&mut frames),
+            vec![(MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, a)]
+        );
+    }
+
+    // #### PR #42
+    // What: a grouped connection carries 256 channels and refuses the
+    // 257th; an ungrouped one stops at 32.
+    // Look here if: MAX_GROUPED_CHANNELS or the capacity check changes.
+    #[test]
+    fn grouped_connections_accept_256_channels_and_refuse_the_257th() {
+        let mut server = session_by(4, "SRI translator", "1.0");
+        for _ in 0..MAX_GROUPED_CHANNELS {
+            open_extended(&mut server, "miner").unwrap();
+        }
+        assert_eq!(
+            open_extended(&mut server, "miner"),
+            Err("channel-capacity-exhausted".into())
+        );
+        let mut legacy = session_by(4, "Pickaxe SV1 adapter", "");
+        for _ in 0..MAX_CHANNELS {
+            open_extended(&mut legacy, "sv1-device").unwrap();
+        }
+        assert_eq!(
+            open_extended(&mut legacy, "sv1-device"),
+            Err("channel-capacity-exhausted".into())
+        );
     }
 }
