@@ -96,6 +96,8 @@ pub struct ServerOptions {
     /// Pools solo mining falls back on while the node gives no work, each a
     /// one-line SV2 address with its key, in order.
     pub fallback_pools: Vec<String>,
+    /// An ASIC-exclusive token solo mining mines instead of BCH, by name.
+    pub asic_token: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -110,7 +112,48 @@ impl Default for ServerOptions {
             job_declaration: None,
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
+            asic_token: None,
         }
+    }
+}
+
+// #### PR #42: ASIC-exclusive tokens in the setup
+// What: the setup lists the network's ASIC-exclusive tokens (none is
+// registered yet, so it says so), and with one chosen, solo mining mines it
+// instead of BCH with no node: a token row, the token's donation (never below
+// its minimum) and a warning when the token keeps the block version fixed.
+// Why: the server could mine a token (S26) but the setup could not choose
+// one.
+// Look here if: the token list, its rows or the token server's start change.
+/// An ASIC-exclusive token the setup offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsicToken {
+    pub name: &'static str,
+    /// The least share of mining work its donation takes.
+    pub donation_minimum: crate::donation::TokenDonation,
+    /// It keeps the block version fixed, which most current ASICs cannot
+    /// mine at full speed.
+    pub fixed_version: bool,
+}
+
+/// The ASIC-exclusive tokens registered on `network`: none yet.
+fn registered_asic_tokens(network: MiningNetwork) -> Vec<AsicToken> {
+    #[cfg(feature = "stratum-v2")]
+    {
+        crate::stratum_v2::merge::registry::header_tokens(network)
+            .iter()
+            .map(|token| AsicToken {
+                name: token.name,
+                donation_minimum: token.donation_minimum,
+                fixed_version: token.params.version
+                    == crate::stratum_v2::merge::safa::VersionRule::Fixed,
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "stratum-v2"))]
+    {
+        let _ = network;
+        Vec::new()
     }
 }
 
@@ -171,8 +214,11 @@ pub fn asic_serve_command(
         pool_tag,
         start_difficulty: options.start_difficulty.filter(|_| !joining),
         merge_test_token: None,
-        // Templates come from this server's own node.
-        tp_listen: options.template_port.filter(|_| !joining).map(everywhere),
+        // Templates come from this server's own node; a token has none.
+        tp_listen: options
+            .template_port
+            .filter(|_| !joining && options.asic_token.is_none())
+            .map(everywhere),
         accept_job_declaration: options
             .accept_job_declaration
             .filter(|_| public)
@@ -191,12 +237,12 @@ pub fn asic_serve_command(
                 }
             }),
         template_provider: Vec::new(),
-        fallback_pool: if solo {
+        fallback_pool: if solo && options.asic_token.is_none() {
             options.fallback_pools.clone()
         } else {
             Vec::new()
         },
-        asic_token: None,
+        asic_token: options.asic_token.clone().filter(|_| solo),
         asic_test_token: None,
     })
 }
@@ -388,6 +434,10 @@ enum SettingsRow {
     FallbackPools,
     /// An ASIC pool accepting its miners' own templates.
     AcceptJd,
+    /// #### PR #42: the ASIC-exclusive token mined instead of BCH, and its
+    /// donation.
+    AsicToken,
+    TokenDonation,
     Address,
     Intensity,
     Fulcrum,
@@ -416,8 +466,8 @@ enum TextField {
     FallbackPools,
 }
 
-/// What an ASIC can mine: BCH today (merge-mined tokens as they appear);
-/// ASIC-exclusive tokens come later.
+/// What an ASIC can mine: BCH (merge-mined tokens as they appear), or an
+/// ASIC-exclusive token instead (#### PR #42: once one is registered).
 /// #### PR #40: what a pool's miners mine: ASIC pools now, GPU pools later.
 const POOL_TARGETS: [&str; 2] = ["ASIC pool", "GPU pool"];
 
@@ -473,6 +523,11 @@ struct SetupFlow {
     /// Solo mining's fallback pools, each a one-line SV2 address with its
     /// key.
     fallback_pools: Vec<String>,
+    /// #### PR #42: the ASIC-exclusive token chosen, by position in the
+    /// network's list.
+    asic_token: usize,
+    /// The network's ASIC-exclusive tokens; tests replace the list.
+    asic_tokens: fn(MiningNetwork) -> Vec<AsicToken>,
     token_input: String,
     token_selected: usize,
     settings_row: usize,
@@ -579,6 +634,8 @@ impl SetupFlow {
             job_declaration: None,
             accept_jd: None,
             fallback_pools: Vec::new(),
+            asic_token: 0,
+            asic_tokens: registered_asic_tokens,
             token_input: String::new(),
             token_selected: 0,
             settings_row: 0,
@@ -818,6 +875,21 @@ impl SetupFlow {
                 SettingsRow::ProfileName,
                 SettingsRow::Start,
             ],
+            // #### PR #42: a token instead of BCH needs no node, serves no
+            // templates and has its own donation.
+            MiningMode::Asic if self.asic_target == 1 => self.with_advanced(
+                vec![
+                    SettingsRow::AsicTarget,
+                    SettingsRow::AsicToken,
+                    SettingsRow::Address,
+                ],
+                vec![
+                    SettingsRow::TokenDonation,
+                    SettingsRow::StartDifficulty,
+                    SettingsRow::Sv1Port,
+                    SettingsRow::Sv2Port,
+                ],
+            ),
             // #### PR #42: server options in the Advanced section.
             MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => self.with_advanced(
                 vec![
@@ -938,7 +1010,27 @@ impl SetupFlow {
             job_declaration: self.job_declaration,
             accept_job_declaration: self.accept_jd,
             fallback_pools: self.fallback_pools.clone(),
+            asic_token: self
+                .chosen_asic_token()
+                .filter(|_| self.mode == MiningMode::Asic && self.asic_target == 1)
+                .map(|token| token.name.to_owned()),
         }
+    }
+
+    /// #### PR #42: the chosen ASIC-exclusive token, if the network has any.
+    fn chosen_asic_token(&self) -> Option<AsicToken> {
+        let tokens = (self.asic_tokens)(self.config.network);
+        tokens
+            .get(self.asic_token.min(tokens.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// The chosen token's donation: the saved one, never below its minimum.
+    fn asic_token_donation(&self, token: AsicToken) -> crate::donation::TokenDonation {
+        self.config
+            .token_donation
+            .unwrap_or(token.donation_minimum)
+            .at_least(token.donation_minimum)
     }
 
     /// Job Declaration off, Full-Template, then Coinbase-only, in turn.
@@ -990,6 +1082,8 @@ impl SetupFlow {
                 key: self.join_key.trim().to_owned(),
             }),
             MiningMode::Gpu => None,
+            // #### PR #42: a token instead of BCH is mined by this server.
+            MiningMode::Asic if self.asic_target == 1 => Some(ServerSetup::Solo),
             MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => {
                 Some(ServerSetup::JoinPool {
                     address: self.join_address.trim().to_owned(),
@@ -1048,7 +1142,10 @@ impl SetupFlow {
                 .filter(|_| mode == SavedMode::AsicJoin),
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
+            asic_token: None,
         };
+        // #### PR #42: a token serves no templates and has no fallback pools.
+        let bch = options.asic_token.is_none();
         Some(match self.server_setup()? {
             ServerSetup::JoinGpuPool { .. } => joining(SavedMode::GpuRig),
             ServerSetup::JoinPool { .. } => joining(SavedMode::AsicJoin),
@@ -1057,8 +1154,13 @@ impl SetupFlow {
                 join_key: None,
                 backups: Vec::new(),
                 pool_user: None,
-                tp_port: options.template_port,
-                fallback_pools: options.fallback_pools.clone(),
+                tp_port: options.template_port.filter(|_| bch),
+                fallback_pools: if bch {
+                    options.fallback_pools.clone()
+                } else {
+                    Vec::new()
+                },
+                asic_token: options.asic_token.clone(),
                 ..joining(SavedMode::AsicSolo)
             },
             ServerSetup::GpuPool { fee, address } => SavedServer {
@@ -1116,6 +1218,8 @@ impl SetupFlow {
         self.job_declaration = None;
         self.accept_jd = None;
         self.fallback_pools.clear();
+        self.asic_target = 0;
+        self.asic_token = 0;
         let Some(server) = server else {
             self.mode = MiningMode::Gpu;
             return;
@@ -1151,6 +1255,38 @@ impl SetupFlow {
         self.job_declaration = server.job_declaration;
         self.accept_jd = server.accept_job_declaration;
         self.fallback_pools = server.fallback_pools.clone();
+        // #### PR #42: a token no longer registered leaves the list empty or
+        // on its first token; Start then says so.
+        if let Some(name) = &server.asic_token {
+            self.asic_target = 1;
+            self.asic_token = (self.asic_tokens)(self.config.network)
+                .iter()
+                .position(|token| token.name == name)
+                .unwrap_or(0);
+        }
+    }
+
+    /// #### PR #42: the profile the setup saves: the configuration, the
+    /// mode and pool values, and a token's own donation.
+    fn profile_settings(&self) -> SavedConfig {
+        let mut settings =
+            SavedConfig::from_effective(self.prefer.as_str(), &self.saved_choice(), &self.config);
+        // Servers and nodes live in the shared per-network store.
+        settings.fulcrum = None;
+        settings.node_rpc = None;
+        settings.server = self.saved_server();
+        // A token's donation is measured against its own minimum, not the
+        // GPU token's.
+        if let Some(token) = self.chosen_asic_token().filter(|_| {
+            settings
+                .server
+                .as_ref()
+                .is_some_and(|s| s.asic_token.is_some())
+        }) {
+            let donation = self.asic_token_donation(token);
+            settings.token_donation_bps = (donation != token.donation_minimum).then_some(donation);
+        }
+        settings
     }
 
     /// A new pool's fee and where it comes from, before anyone changes them.
@@ -1577,6 +1713,22 @@ impl SetupFlow {
                     SettingsRow::Templates => self.toggle_templates(),
                     SettingsRow::JobDeclaration => self.cycle_job_declaration(forward),
                     SettingsRow::AcceptJd => self.cycle_accept_jd(forward),
+                    // #### PR #42: the token, and its donation from its
+                    // minimum up in 0.5% steps.
+                    SettingsRow::AsicToken => {
+                        let count = (self.asic_tokens)(self.config.network).len().max(1);
+                        self.asic_token = (self.asic_token.min(count - 1)
+                            + if forward { 1 } else { count - 1 })
+                            % count;
+                    }
+                    SettingsRow::TokenDonation => {
+                        if let Some(token) = self.chosen_asic_token() {
+                            self.config.token_donation = Some(
+                                self.asic_token_donation(token)
+                                    .adjusted(forward, token.donation_minimum),
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1638,7 +1790,9 @@ impl SetupFlow {
                 | SettingsRow::PoolKind
                 | SettingsRow::PoolFee
                 | SettingsRow::FeeFrom
-                | SettingsRow::Donation => {
+                | SettingsRow::Donation
+                | SettingsRow::AsicToken
+                | SettingsRow::TokenDonation => {
                     self.status_line = "Use Left/Right to change this row.".into();
                 }
                 SettingsRow::ProfileName => {
@@ -1686,16 +1840,35 @@ impl SetupFlow {
                         return SetupAction::Complete;
                     }
                 }
+                // #### PR #42: a token instead of BCH needs one registered
+                // and a payout address for its wins, never a node.
+                SettingsRow::Start if self.mode == MiningMode::Asic && self.asic_target == 1 => {
+                    if self.chosen_asic_token().is_none() {
+                        self.status_line = format!(
+                            "No ASIC-exclusive token is deployed on {} yet; choose BCH.",
+                            network_label(self.config.network)
+                        );
+                    } else if crate::config::validate_payout_address(
+                        self.config.network,
+                        &self.config.payout_address,
+                    )
+                    .is_err()
+                    {
+                        self.status_line =
+                            "Enter a BCH payout address for the selected network: the token's wins go to it."
+                                .into();
+                        self.open_settings(SettingsRow::Address);
+                    } else {
+                        return SetupAction::Complete;
+                    }
+                }
                 // #### PR #40
                 // Joining a pool needs the pool; P2Pool v2 is coming.
                 SettingsRow::Start
                     if self.mode == MiningMode::Asic
                         && self.asic_mining == AsicMining::JoinPool =>
                 {
-                    if self.asic_target != 0 {
-                        self.status_line =
-                            "ASIC-exclusive tokens are not available yet; choose BCH.".into();
-                    } else if self.pool_kind == PoolKind::P2PoolV2 {
+                    if self.pool_kind == PoolKind::P2PoolV2 {
                         self.status_line =
                             "P2Pool v2 is coming soon; choose a normal pool for now.".into();
                     } else if !self.join_address.contains(':') {
@@ -1813,10 +1986,7 @@ impl SetupFlow {
                 // ASIC mode starts the BCH ASIC server: blocks come from the
                 // miner's own BCH node and pay the payout address directly.
                 SettingsRow::Start if self.mode == MiningMode::Asic => {
-                    if self.asic_target != 0 {
-                        self.status_line =
-                            "ASIC-exclusive tokens are not available yet; choose BCH.".into();
-                    } else if self.config.payout_address.trim().is_empty() {
+                    if self.config.payout_address.trim().is_empty() {
                         self.status_line = "Enter a payout address first.".into();
                         self.open_settings(SettingsRow::Address);
                     } else if crate::config::validate_payout_address(
@@ -2570,16 +2740,8 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
             SetupAction::Cancel => return Ok(None),
             SetupAction::Complete => {
                 let gpus = state.chosen_gpus();
-                let mut settings = SavedConfig::from_effective(
-                    state.prefer.as_str(),
-                    &state.saved_choice(),
-                    &state.config,
-                );
-                // Servers and nodes live in the shared per-network store.
-                settings.fulcrum = None;
-                settings.node_rpc = None;
                 // #### PR #42: the profile keeps its mode and pool values.
-                settings.server = state.saved_server();
+                let settings = state.profile_settings();
                 let mut profiles = state.profiles.clone();
                 let saved = profiles
                     .upsert(state.active_profile, &state.profile_name_input, settings)
@@ -3626,17 +3788,33 @@ fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             Line::from(dim(
                 "    Mines BCH and adds every merge-mined token automatically as each is supported.",
             )),
-            Line::from(vec![
-                Span::raw(format!(
-                    "{} {:<34}",
-                    selection_marker(state.asic_target == 1),
-                    ASIC_TARGETS[1]
-                )),
-                Span::styled("not supported yet", soon),
-            ]),
+            // #### PR #42: the network's ASIC-exclusive tokens, or none.
+            Line::from(Span::raw(format!(
+                "{} {}",
+                selection_marker(state.asic_target == 1),
+                ASIC_TARGETS[1]
+            ))),
             Line::from(dim(
-                "    Tokens only ASICs mine. Choose one from this list once supported.",
+                "    Your ASICs mine one token instead of BCH. No BCH node needed.",
             )),
+            match (state.asic_tokens)(state.config.network).as_slice() {
+                [] => Line::from(Span::styled(
+                    format!(
+                        "    None is deployed on {} yet.",
+                        network_label(state.config.network)
+                    ),
+                    soon,
+                )),
+                tokens => Line::from(dim(format!(
+                    "    {} available: {}",
+                    tokens.len(),
+                    tokens
+                        .iter()
+                        .map(|token| token.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))),
+            },
         ]
     } else {
         let matches = state.matching_tokens();
@@ -3703,9 +3881,17 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                         Style::default().fg(Color::Green),
                     ),
                 ]),
+                // #### PR #42: a token instead of BCH.
+                MiningMode::Asic if state.chosen_asic_token().is_some() => Line::from(vec![
+                    Span::raw(format!("{marker} ")),
+                    Span::styled(
+                        "Start the ASIC token server",
+                        Style::default().fg(Color::Green),
+                    ),
+                ]),
                 MiningMode::Asic => Line::from(vec![
                     Span::raw(format!("{marker} ")),
-                    dim("Start (ASIC-exclusive tokens come later)"),
+                    dim("Start (no ASIC-exclusive token is deployed yet)"),
                 ]),
                 MiningMode::Pool => Line::from(vec![
                     Span::raw(format!("{marker} ")),
@@ -3738,12 +3924,35 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             }
             SettingsRow::AsicTarget => (
                 "ASIC target",
-                Span::raw(if state.asic_target == 0 {
-                    ASIC_TARGETS[0].to_owned()
-                } else {
-                    format!("{}  (not supported yet)", ASIC_TARGETS[1])
-                }),
+                Span::raw(ASIC_TARGETS[state.asic_target].to_owned()),
                 "< >",
+            ),
+            // #### PR #42: the token and its donation.
+            SettingsRow::AsicToken => (
+                "Token",
+                match state.chosen_asic_token() {
+                    None => dim(format!("none deployed on {label} yet")),
+                    Some(token) if token.fixed_version => Span::raw(format!(
+                        "{}: keeps the block version fixed, so Bitaxe and most newer ASICs \
+                         cannot mine it at full speed",
+                        token.name
+                    )),
+                    Some(token) => Span::raw(token.name.to_owned()),
+                },
+                "< >",
+            ),
+            SettingsRow::TokenDonation => (
+                "Donation",
+                match state.chosen_asic_token() {
+                    None => dim("the token's own, at least its minimum"),
+                    Some(token) => Span::raw(format!(
+                        "{} of {} mining work (at least {})",
+                        state.asic_token_donation(token),
+                        token.name,
+                        token.donation_minimum
+                    )),
+                },
+                "< >  0.5% steps",
             ),
             // #### PR #40
             SettingsRow::Mining => (
@@ -6136,6 +6345,214 @@ mod tests {
         );
     }
 
+    /// #### PR #42: two ASIC-exclusive tokens, the second keeping the block
+    /// version fixed and taking at least 4%.
+    fn two_asic_tokens(_: MiningNetwork) -> Vec<AsicToken> {
+        vec![
+            AsicToken {
+                name: "Pickaxe ASIC test token",
+                donation_minimum: crate::donation::TokenDonation::from_bps(150),
+                fixed_version: false,
+            },
+            AsicToken {
+                name: "Fixed test token",
+                donation_minimum: crate::donation::TokenDonation::from_bps(400),
+                fixed_version: true,
+            },
+        ]
+    }
+
+    // #### PR #42
+    // What: with no ASIC-exclusive token registered, the ASIC targets list,
+    // the Token row and the Start line say none is deployed on the network,
+    // and Start refuses; with tokens, the list names them, the Token row
+    // cycles through them, and a fixed-version token carries its warning.
+    // Look here if: the token list or its texts change.
+    #[test]
+    fn asic_exclusive_lists_tokens_and_explains_when_none() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.step = SetupStep::Token;
+        setup.asic_target = 1;
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains("Your ASICs mine one token instead of BCH"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("None is deployed on Chipnet yet."),
+            "{screen}"
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        let rows = setup.settings_rows();
+        assert!(rows.contains(&SettingsRow::AsicToken));
+        assert!(!rows.contains(&SettingsRow::Node) && !rows.contains(&SettingsRow::Mining));
+        let screen = setup_text(&setup);
+        assert!(screen.contains("none deployed on Chipnet yet"), "{screen}");
+        assert!(
+            screen.contains("Start (no ASIC-exclusive token is deployed yet)"),
+            "{screen}"
+        );
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            setup.status_line,
+            "No ASIC-exclusive token is deployed on Chipnet yet; choose BCH."
+        );
+        assert_eq!(setup.server_options().asic_token, None);
+        // Tokens: listed, chosen with Left/Right, the fixed one warned about.
+        setup.asic_tokens = two_asic_tokens;
+        setup.step = SetupStep::Token;
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains("2 available: Pickaxe ASIC test token, Fixed test token"),
+            "{screen}"
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup_text(&setup).contains("Start the ASIC token server"));
+        setup.open_settings(SettingsRow::AsicToken);
+        assert!(setup_text(&setup).contains(&format!("{:<14}Pickaxe ASIC test token", "Token")));
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.chosen_asic_token().unwrap().name, "Fixed test token");
+        assert!(setup_text(&setup).contains("keeps the block version fixed"));
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            setup.chosen_asic_token().unwrap().name,
+            "Pickaxe ASIC test token"
+        );
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.chosen_asic_token().unwrap().name, "Fixed test token");
+        // BCH again: no token goes to the server.
+        setup.asic_target = 0;
+        assert_eq!(setup.server_options().asic_token, None);
+    }
+
+    // #### PR #42
+    // What: the token's donation row starts at the token's minimum (or the
+    // saved value), moves in 0.5% steps, never goes below the minimum, and
+    // the profile saves only a raised value, measured against the token's
+    // own minimum rather than the GPU token's.
+    // Look here if: asic_token_donation, the TokenDonation row or
+    // profile_settings change.
+    #[test]
+    fn token_donation_row_never_goes_below_the_minimum() {
+        use crate::donation::TokenDonation;
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.asic_tokens = two_asic_tokens;
+        setup.asic_target = 1;
+        setup.config.payout_address = chipnet_payout(3);
+        setup.open_settings(SettingsRow::TokenDonation);
+        assert!(setup.advanced_open);
+        assert!(
+            setup_text(&setup)
+                .contains("1.50% of Pickaxe ASIC test token mining work (at least 1.50%)"),
+            "{}",
+            setup_text(&setup)
+        );
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            setup.config.token_donation,
+            Some(TokenDonation::from_bps(150))
+        );
+        assert_eq!(setup.profile_settings().token_donation_bps, None);
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            setup.config.token_donation,
+            Some(TokenDonation::from_bps(200))
+        );
+        assert!(setup_text(&setup).contains("2.00% of Pickaxe ASIC test token"));
+        let settings = setup.profile_settings();
+        assert_eq!(
+            settings.token_donation_bps,
+            Some(TokenDonation::from_bps(200))
+        );
+        assert_eq!(
+            settings.server.as_ref().unwrap().asic_token.as_deref(),
+            Some("Pickaxe ASIC test token")
+        );
+        // A token with a 4% minimum lifts the 2% to its minimum.
+        setup.asic_token = 1;
+        assert!(setup_text(&setup).contains("4.00% of Fixed test token mining work"));
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            setup.config.token_donation,
+            Some(TokenDonation::from_bps(400))
+        );
+        assert_eq!(setup.profile_settings().token_donation_bps, None);
+    }
+
+    // #### PR #42
+    // What: mining a token instead of BCH needs a payout address and no
+    // node; the server starts with `--asic-token NAME` and never serves
+    // templates or falls back on pools in that mode, even with those set
+    // for BCH; a profile keeps the token and reopens on it.
+    // Look here if: the token's Start check, asic_serve_command or the
+    // saved token change.
+    #[test]
+    fn token_mode_does_not_require_a_node() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.asic_tokens = two_asic_tokens;
+        setup.template_port = Some(48442);
+        setup.fallback_pools = vec!["stratum2+tcp://a.example:3336/KEY".into()];
+        setup.asic_target = 1;
+        setup.config.node_url = None;
+        setup.config.payout_address = "bchtest:not-an-address".into();
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.current_row(), SettingsRow::Address);
+        assert!(
+            setup.status_line.contains("the token's wins go to it"),
+            "{}",
+            setup.status_line
+        );
+        setup.config.payout_address = chipnet_payout(3);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(setup.server_setup(), Some(ServerSetup::Solo));
+        match asic_serve_command(&ServerSetup::Solo, &setup.server_options()) {
+            Some(crate::cli::StratumV2Command::Serve {
+                asic_token,
+                tp_listen,
+                fallback_pool,
+                upstream,
+                public,
+                ..
+            }) => {
+                assert_eq!(asic_token.as_deref(), Some("Pickaxe ASIC test token"));
+                assert_eq!(tp_listen, None);
+                assert!(fallback_pool.is_empty() && upstream.is_empty() && !public);
+            }
+            other => panic!("not an ASIC server: {other:?}"),
+        }
+        let saved = setup.saved_server().unwrap();
+        assert_eq!(saved.asic_token.as_deref(), Some("Pickaxe ASIC test token"));
+        assert_eq!((saved.tp_port, saved.fallback_pools.len()), (None, 0));
+        SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(saved.clone()),
+            ..SavedConfig::default()
+        }
+        .validate()
+        .unwrap();
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.asic_tokens = two_asic_tokens;
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!((reopened.mode, reopened.asic_target), (MiningMode::Asic, 1));
+        assert_eq!(
+            reopened.server_options().asic_token.as_deref(),
+            Some("Pickaxe ASIC test token")
+        );
+        // The same profile after the token is gone: Start says none is
+        // deployed.
+        let mut gone = setup_for(MiningMode::Gpu);
+        gone.apply_saved_server(Some(&saved));
+        assert_eq!(gone.asic_target, 1);
+        gone.open_settings(SettingsRow::Start);
+        gone.handle_key(key(KeyCode::Enter));
+        assert!(gone
+            .status_line
+            .contains("No ASIC-exclusive token is deployed"));
+    }
+
     // #### PR #40
     #[test]
     fn an_asic_pool_can_name_its_blocks() {
@@ -6177,7 +6594,11 @@ mod tests {
         let screen = setup_text(&setup);
         assert!(screen.contains("BCH + all merge-mined tokens"), "{screen}");
         assert!(!screen.contains("coming soon"), "{screen}");
-        assert!(screen.contains("not supported yet"), "{screen}");
+        // #### PR #42: none registered yet, said per network.
+        assert!(
+            screen.contains("None is deployed on Chipnet yet."),
+            "{screen}"
+        );
         setup.open_settings(SettingsRow::AsicTarget);
         assert!(!setup_text(&setup).contains("coming soon"));
     }
@@ -6644,7 +7065,14 @@ mod tests {
         assert!(!rows.contains(&SettingsRow::Intensity));
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
-        assert!(setup.status_line.contains("not available yet"));
+        // #### PR #42: no ASIC-exclusive token is registered yet.
+        assert!(
+            setup
+                .status_line
+                .contains("No ASIC-exclusive token is deployed"),
+            "{}",
+            setup.status_line
+        );
         // BCH: a payout address, then the miner's own node, are required.
         setup.asic_target = 0;
         assert!(setup_text(&setup).contains("Start the BCH ASIC server"));

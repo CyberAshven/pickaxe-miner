@@ -665,7 +665,8 @@ and for Join a pool the backup pools (each `stratum2+tcp://HOST:PORT/KEY`,
 used in order when the pool fails), the username at the pool (your payout
 address by default) and **Your templates** (Job Declaration: off, full
 template or coinbase only; see [job-declaration.md](job-declaration.md)). A
-saved profile keeps them.
+saved profile keeps them. ASIC mining can also mine an ASIC-exclusive token
+instead of BCH, once one is registered (see [asic-tokens.md](asic-tokens.md#in-the-setup)).
 
 `--donation 2` selects 2%; the dashboard's Advanced settings (`a`) change the
 saved setting in 0.5% steps from 0% to 100%. Merge-mined tokens share this

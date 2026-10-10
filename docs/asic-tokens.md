@@ -159,11 +159,39 @@ pickaxe_miner stratum-v2 serve --config chipnet.json --listen 0.0.0.0:3336 \
   (the profile's token donation, 1.5% by default): donation jobs pay the
   donation's forwarder.
 - The overview reads "no node: an ASIC-exclusive token instead of BCH" and
-  lists the token's wins (proven, stale, dropped); the status file's
-  `header_token` has the same counts, never a script or an address.
+  lists the token with its difficulty and wins, such as "Pickaxe ASIC test
+  token · difficulty 1.00K · wins 3 (2 proven, 1 stale, 0 dropped)"; its
+  title is "Pickaxe · ASIC token mining". The status file says `"mode":
+  "asic-token"` (otherwise `"bch"`), and its `header_token` has the same
+  counts, never a script or an address.
+
+## In the setup
+
+Choose **ASIC**, then on the ASIC targets list **ASIC-exclusive token**:
+"Your ASICs mine one token instead of BCH. No BCH node needed." Below it the
+list names the network's tokens, or says "None is deployed on Chipnet yet."
+(none is, on either network; the hidden test token is not offered).
+
+- The settings page has a **Token** row (Left/Right chooses among the
+  network's tokens) and the payout address, which the token's wins go to;
+  there is no BCH node row, no Mining row and no pool.
+- Under **Advanced**: the token's **Donation**, "1.50% of TOKEN mining work
+  (at least 1.50%)", in 0.5% steps and never below the token's minimum (it
+  is not the BCH donation), then the start difficulty and both ports.
+- A token that keeps the block version fixed says so on its row: Bitaxe and
+  most newer ASICs cannot mine it at full speed.
+- Start reads "Start the ASIC token server" and starts `serve --asic-token
+  NAME`, which never serves templates or falls back on pools; with no token
+  it is dim, and Enter says "No ASIC-exclusive token is deployed on Chipnet
+  yet; choose BCH."
+- A saved profile keeps the token and its donation (measured against the
+  token's own minimum, not the GPU token's) and reopens on it.
+- On the running server, the Advanced page shows the token's donation apart
+  from the BCH donation, and Connection info says devices mine the token
+  instead of BCH, with no BCH node, and that claiming wins is not done yet.
 
 ## What is not done yet
 
-Reading real threads from Fulcrum or a node, setup rows, Case A pure-token
-jobs in this mode, and real claims and sweeps (judged by a local BCHN on
-regtest) follow in later slices.
+Reading real threads from Fulcrum or a node, Case A pure-token jobs in this
+mode, and real claims and sweeps (judged by a local BCHN on regtest) follow
+in later slices.

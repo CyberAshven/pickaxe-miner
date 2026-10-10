@@ -1964,3 +1964,28 @@ value, saved values refused outside their mode, the serve command each
 setup makes, the Connection info notes, and the watch header's Job
 Declaration lines read back from a saved status. Not yet run from the setup
 against a live pool.
+
+## ASIC-exclusive tokens in the setup (2026-10-10)
+
+#### PR #42
+
+The setup's ASIC targets list now offers an ASIC-exclusive token for real:
+it names the network's registered tokens, or says none is deployed on the
+network (none is yet). With one chosen, solo mining mines it instead of BCH
+with no node: a Token row, the payout address, and under Advanced the
+token's own donation (never below its minimum, 0.5% steps), the start
+difficulty and both ports; a fixed-version token carries a warning. Start
+needs a registered token and a valid payout address, and starts `serve
+--asic-token NAME` without templates or fallback pools. Profiles keep the
+token and its donation, measured against the token's own minimum. The server
+names what devices mine: the overview's title, the token's difficulty on
+its line, `"mode": "asic-token"` in the status file, the token's donation on
+the Advanced page, and a note on Connection info.
+
+Evidence: host tests for the empty list's texts and refusal, choosing among
+tokens and the fixed-version warning (with a test list), the donation row's
+minimum and steps and what the profile saves, Start needing no node, the
+serve command dropping templates and fallback pools in token mode, profiles
+keeping and refusing the token, the difficulty shown from compact bits, and
+the dashboard and status texts. Not yet run with hardware; no token is
+registered.

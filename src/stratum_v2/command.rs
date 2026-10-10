@@ -399,6 +399,14 @@ pub fn run(
                 .join(" → ")
         }),
         declaring: job_declaration.filter(|_| !pools.is_empty()),
+        token: header_work.as_ref().map(|work| {
+            let minimum = work.token().donation_minimum;
+            (
+                work.token().name,
+                config.token_donation.unwrap_or(minimum).at_least(minimum),
+                minimum,
+            )
+        }),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
@@ -565,8 +573,16 @@ pub fn run(
         ServeMode::JoinPool
     } else if public_pool.is_some() {
         ServeMode::Public
+    } else if let Some(work) = &header_work {
+        ServeMode::Token(work.token().name)
     } else {
         ServeMode::Solo
+    };
+    // #### PR #42: the overview's title names what devices mine.
+    let dashboard_title = if header_work.is_some() {
+        "Pickaxe · ASIC token mining"
+    } else {
+        "Pickaxe · BCH ASIC mining"
     };
     // #### PR #42: for the Connection info page.
     let job_declaration_on = declaring || declarator.is_some();
@@ -728,7 +744,13 @@ pub fn run(
                                 &started,
                             )
                         } else if overview {
-                            render_dashboard(frame, &overview_text, &devices, device_offset)
+                            render_dashboard(
+                                frame,
+                                dashboard_title,
+                                &overview_text,
+                                &devices,
+                                device_offset,
+                            )
                         } else {
                             render_workers(
                                 frame,
@@ -1088,6 +1110,13 @@ struct Started {
     /// #### PR #42: how this server declares its node's templates to the
     /// first pool, when it does.
     declaring: Option<crate::cli::JobDeclarationMode>,
+    /// #### PR #42: the ASIC-exclusive token mined instead of BCH, its
+    /// donation and that donation's minimum.
+    token: Option<(
+        &'static str,
+        crate::donation::TokenDonation,
+        crate::donation::TokenDonation,
+    )>,
 }
 
 /// #### PR #42
@@ -1145,6 +1174,13 @@ fn started_text(started: &Started) -> String {
         text.push_str(&format!(
             "Fallback pools  {fallbacks} (in order), while your node gives no work; devices \
              come back 30 seconds after it answers again\n"
+        ));
+    }
+    if let Some((token, donation, minimum)) = started.token {
+        text.push_str(&format!(
+            "Token  {token} instead of BCH; its donation is {donation} of the mining work (at \
+             least {minimum}), set in the setup or with --token-donation. The BCH donation \
+             above applies to BCH mining only.\n"
         ));
     }
     if let Some(mode) = started.declaring {
@@ -1231,6 +1267,7 @@ fn render_advanced(
 
 fn render_dashboard(
     frame: &mut Frame<'_>,
+    title: &str,
     status: &str,
     devices: &[DeviceSnapshot],
     offset: usize,
@@ -1243,7 +1280,7 @@ fn render_dashboard(
     .split(frame.area());
     frame.render_widget(
         Paragraph::new(status)
-            .block(Block::bordered().title("Pickaxe · BCH ASIC mining"))
+            .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         areas[0],
     );
@@ -1573,6 +1610,8 @@ enum ServeMode {
     Public,
     /// Devices mine at a remote pool through this computer.
     JoinPool,
+    /// #### PR #42: devices mine this ASIC-exclusive token instead of BCH.
+    Token(&'static str),
 }
 
 /// #### PR #40
@@ -1688,7 +1727,16 @@ fn connect_text(page: &ConnectPage) -> String {
     if page.lines.is_empty() {
         text.push_str("\nNo listener is open.\n");
     }
+    // #### PR #42: a token instead of BCH.
+    if let ServeMode::Token(token) = page.mode {
+        text.push_str(&format!(
+            "\nUsername: any name for the device; it names the device on the workers page. \
+             Devices here mine {token} instead of BCH, with no BCH node: this computer checks \
+             each win and saves it. Claiming wins is not done yet.\n"
+        ));
+    }
     text.push_str(match page.mode {
+        ServeMode::Token(_) => "",
         ServeMode::Solo => {
             "\nUsername: any name for the device; it names the device on the workers page. \
              Every block pays this server's payout address.\n"
@@ -1846,6 +1894,31 @@ fn jd_server_json(jd: &server::JdServerStats) -> serde_json::Value {
     })
 }
 
+/// #### PR #42: the template server's part of the status file, with no
+/// address.
+fn template_server_json(templates: &server::TemplateServerStats) -> serde_json::Value {
+    serde_json::json!({
+        "clients": templates.clients,
+        "sent": templates.sent,
+        "withheld": templates.withheld,
+        "solutions": {
+            "received": templates.solutions,
+            "invalid": templates.invalid,
+            "refused_locally": templates.refused_locally,
+            "unsaved": templates.unsaved,
+        },
+        "relayed": {
+            "pending": templates.relay_pending,
+            "accepted": templates.relay_accepted,
+            "rejected": templates.relay_rejected,
+        },
+        "sent_once": {
+            "sent": templates.once_sent,
+            "accepted": templates.once_accepted,
+        },
+    })
+}
+
 fn status_json(
     network: &str,
     upstream: Option<&str>,
@@ -1856,6 +1929,8 @@ fn status_json(
 ) -> serde_json::Value {
     serde_json::json!({
         "network": network,
+        // #### PR #42: what devices mine: BCH, or an ASIC-exclusive token.
+        "mode": if snapshot.header_token.is_some() { "asic-token" } else { "bch" },
         "upstream": upstream,
         "node": node,
         "updated": unix_now(),
@@ -1928,26 +2003,7 @@ fn status_json(
             "off": token.off,
         })),
         // #### PR #42: the template server's counts, with no address.
-        "template_server": snapshot.template_server.as_ref().map(|templates| serde_json::json!({
-            "clients": templates.clients,
-            "sent": templates.sent,
-            "withheld": templates.withheld,
-            "solutions": {
-                "received": templates.solutions,
-                "invalid": templates.invalid,
-                "refused_locally": templates.refused_locally,
-                "unsaved": templates.unsaved,
-            },
-            "relayed": {
-                "pending": templates.relay_pending,
-                "accepted": templates.relay_accepted,
-                "rejected": templates.relay_rejected,
-            },
-            "sent_once": {
-                "sent": templates.once_sent,
-                "accepted": templates.once_accepted,
-            },
-        })),
+        "template_server": snapshot.template_server.as_ref().map(template_server_json),
         "sv1_local_rejected": snapshot.sv1_local_rejected,
         "sessions_started": snapshot.sessions_started,
         "device_details": devices,
@@ -2536,8 +2592,13 @@ fn records_line(stats: &ServerStats) -> String {
         .map(|token| match &token.off {
             Some(off) => format!(" · {} off: {off}", token.token),
             None => format!(
-                " · {} wins {} ({} proven, {} stale, {} dropped)",
-                token.token, token.wins, token.proven, token.stale, token.dropped
+                " · {} · difficulty {} · wins {} ({} proven, {} stale, {} dropped)",
+                token.token,
+                token_difficulty(token.bits),
+                token.wins,
+                token.proven,
+                token.stale,
+                token.dropped
             ),
         })
         .unwrap_or_default();
@@ -2555,6 +2616,17 @@ fn records_line(stats: &ServerStats) -> String {
 /// After "Node Ready": the node's client while templates come from the node
 /// it was read from (the first in failover order), and which node of
 /// several, such as " (Bitcoin Cash Node 29.1.0) · node 1 of 2".
+/// #### PR #42: a token's difficulty from its compact target; below 1 (test
+/// targets) in scientific notation.
+fn token_difficulty(bits: u32) -> String {
+    let difficulty = super::merge::hub::difficulty_for_bits(bits);
+    if difficulty < 1.0 {
+        format!("{difficulty:.2e}")
+    } else {
+        format_difficulty(Some(difficulty))
+    }
+}
+
 fn node_label(client: Option<&str>, stats: &ServerStats) -> String {
     // #### PR #42: an ASIC-exclusive token needs no node.
     if stats.template_source == Some(super::provider::SourceKind::Token) {
@@ -2833,11 +2905,22 @@ mod tests {
         let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
         assert_eq!(status["header_token"]["proven"], 2);
         assert_eq!(status["header_token"]["bits"], "207fffff");
+        assert_eq!(status["mode"], "asic-token");
         assert_eq!(status["template_source"]["kind"], "token");
         let text = status.to_string();
         assert!(!text.contains("bchtest") && !text.contains("76a914"));
-        assert!(records_line(&stats)
-            .contains("Pickaxe ASIC test token wins 3 (2 proven, 1 stale, 0 dropped)"));
+        assert!(
+            records_line(&stats).contains(
+                "Pickaxe ASIC test token · difficulty 4.66e-10 · wins 3 (2 proven, 1 stale, 0 \
+                 dropped)"
+            ),
+            "{}",
+            records_line(&stats)
+        );
+        if let Some(token) = stats.header_token.as_mut() {
+            token.bits = super::super::merge::hub::bits_for_difficulty(1_000_000).unwrap();
+        }
+        assert!(records_line(&stats).contains("difficulty 1.00M"));
         assert!(node_label(None, &stats).contains("an ASIC-exclusive token instead of BCH"));
         if let Some(token) = stats.header_token.as_mut() {
             token.off = Some("a token win failed its own check".into());
@@ -2860,6 +2943,8 @@ mod tests {
         assert_eq!(templates_line(&stats), "");
         let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
         assert!(status["template_server"].is_null());
+        // #### PR #42: BCH unless an ASIC-exclusive token is mined.
+        assert_eq!(status["mode"], "bch");
         assert!(status["jd_server"].is_null());
         assert_eq!(jd_line(&stats), "");
         stats.jd_server = Some(server::JdServerStats {
@@ -3354,6 +3439,20 @@ mod tests {
             !declaring.contains("the pool builds the blocks"),
             "{declaring}"
         );
+        // #### PR #42: a token instead of BCH.
+        let token = connect_text(&ConnectPage {
+            lines: Vec::new(),
+            templates: Vec::new(),
+            key: None,
+            mode: ServeMode::Token("Pickaxe ASIC test token"),
+            job_declaration: false,
+            note: None,
+        });
+        assert!(
+            token.contains("Devices here mine Pickaxe ASIC test token instead of BCH"),
+            "{token}"
+        );
+        assert!(!token.contains("Every block pays"), "{token}");
         // A loopback listener: only this computer.
         let local_only = ConnectPage {
             lines: connect_lines(
@@ -3645,6 +3744,7 @@ mod tests {
                         job_declaration: Some(crate::stratum_v2::jd::AcceptJd::Both),
                         fallbacks: None,
                         declaring: None,
+                        token: None,
                     }),
                 )
             })
@@ -3686,6 +3786,7 @@ mod tests {
             job_declaration: None,
             fallbacks: None,
             declaring: Some(crate::cli::JobDeclarationMode::Coinbase),
+            token: None,
         });
         assert!(joined.contains("pool.example:3336 → b1.example:3336 (in failover order)"));
         assert!(joined.contains("username: your own"));
@@ -3707,7 +3808,20 @@ mod tests {
             job_declaration: None,
             fallbacks: Some("a.example:3336 → b.example:3336".into()),
             declaring: None,
+            token: Some((
+                "Pickaxe ASIC test token",
+                crate::donation::TokenDonation::from_bps(200),
+                crate::donation::TokenDonation::from_bps(150),
+            )),
         });
+        // #### PR #42: a token's donation, apart from the BCH donation.
+        assert!(
+            solo.contains(
+                "Token  Pickaxe ASIC test token instead of BCH; its donation is 2.00% of the \
+                 mining work (at least 1.50%)"
+            ),
+            "{solo}"
+        );
         assert!(solo.contains(
             "Fallback pools  a.example:3336 → b.example:3336 (in order), while your node gives \
              no work"
@@ -3768,7 +3882,15 @@ mod tests {
         for width in [100, 140] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal
-                .draw(|f| render_dashboard(f, "Chipnet · Node Ready · Donation 1.5%", &rows, 0))
+                .draw(|f| {
+                    render_dashboard(
+                        f,
+                        "Pickaxe · BCH ASIC mining",
+                        "Chipnet · Node Ready · Donation 1.5%",
+                        &rows,
+                        0,
+                    )
+                })
                 .unwrap();
             let text: String = terminal
                 .backend()
@@ -3787,7 +3909,15 @@ mod tests {
             assert!(!text.contains("+/- Donation"));
             assert!(!text.contains("2T/3"));
             terminal
-                .draw(|f| render_dashboard(f, "Chipnet · Node Ready", &rows, 1))
+                .draw(|f| {
+                    render_dashboard(
+                        f,
+                        "Pickaxe · BCH ASIC mining",
+                        "Chipnet · Node Ready",
+                        &rows,
+                        1,
+                    )
+                })
                 .unwrap();
             let text: String = terminal
                 .backend()

@@ -95,6 +95,18 @@ pub fn bits_for_difficulty(difficulty: u64) -> Result<u32, String> {
     Ok((size << 24) | mant)
 }
 
+/// #### PR #42: the share difficulty of a compact target, the inverse of
+/// `bits_for_difficulty`, for display.
+pub fn difficulty_for_bits(bits: u32) -> f64 {
+    let mantissa = f64::from(bits & 0x007f_ffff);
+    if mantissa == 0.0 {
+        return 0.0;
+    }
+    // Difficulty 1 is 0xffff · 256^26; a target is mantissa · 256^(size - 3).
+    let size = i32::try_from(bits >> 24).unwrap_or(0);
+    f64::from(0xffffu32) / mantissa * 256f64.powi(29 - size)
+}
+
 impl TokenHub {
     // #### PR #42: the Chipnet test token
     // What: a hub that merge-mines the test token in both modes, its Case A
@@ -393,7 +405,16 @@ mod tests {
             // Compact form keeps the top 16 to 23 bits.
             assert!(got <= expected, "{difficulty}");
             assert!(&expected - &got <= &expected >> 15u32, "{difficulty}");
+            // #### PR #42: and the difficulty shown comes back from it.
+            let shown = difficulty_for_bits(bits);
+            let wanted = difficulty as f64;
+            assert!(
+                (shown - wanted).abs() <= wanted / 30_000.0,
+                "{difficulty}: {shown}"
+            );
         }
+        assert_eq!(difficulty_for_bits(0x1d00_ffff), 1.0);
+        assert_eq!(difficulty_for_bits(0x2000_0000), 0.0);
         assert!(bits_for_difficulty(0).is_err());
         let path = std::env::temp_dir().join("pickaxe-hub-unused.json");
         assert!(

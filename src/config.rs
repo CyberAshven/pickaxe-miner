@@ -742,6 +742,10 @@ pub struct SavedServer {
     /// gives no work, each a one-line SV2 address with its key, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_pools: Vec<String>,
+    /// #### PR #42: ASIC solo mines this ASIC-exclusive token instead of BCH,
+    /// by its registry name; left out, BCH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asic_token: Option<String>,
 }
 
 impl SavedServer {
@@ -851,6 +855,23 @@ impl SavedServer {
             })
         {
             return Err("at most 8 fallback pools, each without spaces".into());
+        }
+        // #### PR #42: an ASIC-exclusive token instead of BCH, mined solo
+        // with no templates to serve and no fallback pools.
+        if let Some(name) = &self.asic_token {
+            if self.mode != SavedMode::AsicSolo {
+                return Err("only ASIC solo mining saves an ASIC-exclusive token".into());
+            }
+            if self.tp_port.is_some() || !self.fallback_pools.is_empty() {
+                return Err(
+                    "an ASIC-exclusive token serves no templates and has no fallback pools".into(),
+                );
+            }
+            if name.trim().is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+                return Err(
+                    "an ASIC-exclusive token's name is 1 to 64 printable characters".into(),
+                );
+            }
         }
         if self.pool_user.as_deref().is_some_and(|user| {
             user.is_empty() || user.len() > 255 || user.chars().any(char::is_control)
@@ -2011,6 +2032,7 @@ mod tests {
             job_declaration: None,
             accept_job_declaration: Some(SavedAccept::Both),
             fallback_pools: Vec::new(),
+            asic_token: None,
         };
         with(pool.clone()).validate().unwrap();
         let text = serde_json::to_string(&with(pool.clone())).unwrap();
@@ -2034,6 +2056,7 @@ mod tests {
             job_declaration: Some(SavedDeclaration::Full),
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
+            asic_token: None,
         };
         with(joining.clone()).validate().unwrap();
         // #### PR #42: Job Declaration and fallback pools round trip.
@@ -2054,6 +2077,20 @@ mod tests {
         let text = serde_json::to_string(&with(solo.clone())).unwrap();
         let back: SavedConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(back.server, Some(solo.clone()));
+        // #### PR #42: an ASIC-exclusive token round trips too.
+        let token = SavedServer {
+            fallback_pools: Vec::new(),
+            asic_token: Some("Pickaxe ASIC test token".into()),
+            ..solo.clone()
+        };
+        with(token.clone()).validate().unwrap();
+        let text = serde_json::to_string(&with(token.clone())).unwrap();
+        assert!(
+            text.contains("\"asic_token\":\"Pickaxe ASIC test token\""),
+            "{text}"
+        );
+        let back: SavedConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.server, Some(token.clone()));
         for (bad, why) in [
             (
                 SavedServer {
@@ -2181,6 +2218,34 @@ mod tests {
                     ..solo.clone()
                 },
                 "nine fallback pools",
+            ),
+            (
+                SavedServer {
+                    asic_token: Some("Pickaxe ASIC test token".into()),
+                    ..joining.clone()
+                },
+                "an ASIC-exclusive token while joining a pool",
+            ),
+            (
+                SavedServer {
+                    tp_port: Some(48442),
+                    ..token.clone()
+                },
+                "an ASIC-exclusive token serving templates",
+            ),
+            (
+                SavedServer {
+                    fallback_pools: vec!["stratum2+tcp://f.example:3336/KEY".into()],
+                    ..token.clone()
+                },
+                "an ASIC-exclusive token with fallback pools",
+            ),
+            (
+                SavedServer {
+                    asic_token: Some(" ".into()),
+                    ..token.clone()
+                },
+                "a blank token name",
             ),
         ] {
             assert!(with(bad).validate().is_err(), "{why}");
