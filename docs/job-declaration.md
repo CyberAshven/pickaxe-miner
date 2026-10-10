@@ -29,7 +29,9 @@ pickaxe_miner stratum-v2 serve --config pool.json --listen 0.0.0.0:3336 \
 
 `--accept-job-declaration` alone accepts both modes; `full` or `coinbase`
 accepts one. It is off by default. It shares the pool's SV2 port and key: a
-client pins one key for both of its sessions.
+client pins one key for both of its sessions. In the setup (Run a pool, ASIC
+pool) the **Miner templates** row under Advanced sets it: off, full template
+and coinbase only, full template only, or coinbase only.
 
 With Full-Template, the pool's first node checks declared templates with
 BCHN's `validateblocktemplate`; a node without that call (such as Knuth)
@@ -242,7 +244,12 @@ pickaxe_miner stratum-v2 serve --config miner.json --sv1-listen 0.0.0.0:3333 \
 ```
 
 `--job-declaration` alone is Full-Template; `coinbase` declares the coinbase
-only.
+only. In the setup (ASIC, Join a pool) the **Your templates** row under
+Advanced sets it: off, full template or coinbase only. While it is on, the BCH
+node row follows it, and Start asks for your node, a valid payout address and
+no other username at the pool. A saved profile keeps the mode, and the
+server's Advanced page names it; `stratum-v2 watch` shows the same state and
+counts as the overview line below.
 
 - The pool must be a Pickaxe pool that accepts Job Declaration: other pools'
   tokens are opaque, so their fee and donation cannot be known.
@@ -297,7 +304,7 @@ only.
 
 - Merge-mined tokens under Job Declaration: the commitment and tickets in the
   declared coinbase.
-- Job Declaration servers apart from the pools (`--jd-server`), the client's
-  own jobs when every pool is down, and the setup rows.
+- Job Declaration servers apart from the pools (`--jd-server`), and the
+  client's own jobs when every pool is down.
 - A live run against BCHN on Chipnet, and SRI's Job Declaration client against
   a Pickaxe pool.

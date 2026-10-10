@@ -447,6 +447,9 @@ pickaxe_miner stratum-v2 serve --config mainnet.json --sv1-listen 0.0.0.0:3333 \
   and they come back once Job Declaration has been active for 30 seconds.
 - Native SV2 devices such as a Bitaxe use their own backup pool, which the
   Device panel's Pools page can set.
+- In the setup, ASIC solo mining has a **Fallback pools** row under
+  Advanced: paste up to 8 pools, each with its key, separated by spaces or
+  commas. A saved profile keeps them; the server's Advanced page lists them.
 
 ### Group channels (proxies such as SRI's translator)
 
@@ -656,9 +659,12 @@ dashboard shows the total and both parts, each rounded up to two decimals; the
 combined effect of the two parts is slightly below the total (1.495% at 1.5%).
 In the setup, ASIC mining and Join a pool keep their server options under
 **Advanced** on the settings page (Enter on its header opens it): the
-donation, the start difficulty, the SV1 and SV2 ports, and for Join a pool the
-backup pools (each `stratum2+tcp://HOST:PORT/KEY`, used in order when the pool
-fails) and the username at the pool (your payout address by default). A
+donation, the start difficulty, the SV1 and SV2 ports, for solo mining the
+fallback pools (see [Fallback pools and coming back](#fallback-pools-and-coming-back)),
+and for Join a pool the backup pools (each `stratum2+tcp://HOST:PORT/KEY`,
+used in order when the pool fails), the username at the pool (your payout
+address by default) and **Your templates** (Job Declaration: off, full
+template or coinbase only; see [job-declaration.md](job-declaration.md)). A
 saved profile keeps them.
 
 `--donation 2` selects 2%; the dashboard's Advanced settings (`a`) change the

@@ -670,6 +670,26 @@ impl SavedMode {
     }
 }
 
+/// #### PR #42: how a profile that joins a pool declares its node's
+/// templates there (SV2 Job Declaration).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedDeclaration {
+    /// Full-Template: each template with its transactions.
+    Full,
+    /// Coinbase-only: the coinbase alone; this node submits the blocks.
+    Coinbase,
+}
+
+/// #### PR #42: the Job Declaration modes a profile's ASIC pool accepts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedAccept {
+    Full,
+    Coinbase,
+    Both,
+}
+
 /// A profile's mode and the pool values the setup asked for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -710,6 +730,18 @@ pub struct SavedServer {
     /// templates on (SV2 Template Distribution); left out, it serves none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tp_port: Option<u16>,
+    /// #### PR #42: Join a pool declares this node's templates to the pool
+    /// (SV2 Job Declaration); left out, devices mine the pool's own jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_declaration: Option<SavedDeclaration>,
+    /// #### PR #42: the Job Declaration modes an ASIC pool accepts from its
+    /// miners; left out, it accepts none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_job_declaration: Option<SavedAccept>,
+    /// #### PR #42: the pools ASIC solo mining falls back on while its node
+    /// gives no work, each a one-line SV2 address with its key, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_pools: Vec<String>,
 }
 
 impl SavedServer {
@@ -802,6 +834,23 @@ impl SavedServer {
             })
         {
             return Err("at most 8 backup pools, each without spaces".into());
+        }
+        // #### PR #42: Job Declaration and fallback pools, each in its mode.
+        if self.job_declaration.is_some() && self.mode != SavedMode::AsicJoin {
+            return Err("only ASICs joining a pool declare their node's templates".into());
+        }
+        if self.accept_job_declaration.is_some() && self.mode != SavedMode::AsicPool {
+            return Err("only an ASIC pool accepts miners' own templates".into());
+        }
+        if !self.fallback_pools.is_empty() && self.mode != SavedMode::AsicSolo {
+            return Err("only ASIC solo mining saves fallback pools".into());
+        }
+        if self.fallback_pools.len() > 8
+            || self.fallback_pools.iter().any(|pool| {
+                pool.is_empty() || pool.chars().any(|c| c.is_whitespace() || c.is_control())
+            })
+        {
+            return Err("at most 8 fallback pools, each without spaces".into());
         }
         if self.pool_user.as_deref().is_some_and(|user| {
             user.is_empty() || user.len() > 255 || user.chars().any(char::is_control)
@@ -1959,6 +2008,9 @@ mod tests {
             backups: Vec::new(),
             pool_user: None,
             tp_port: Some(48442),
+            job_declaration: None,
+            accept_job_declaration: Some(SavedAccept::Both),
+            fallback_pools: Vec::new(),
         };
         with(pool.clone()).validate().unwrap();
         let text = serde_json::to_string(&with(pool.clone())).unwrap();
@@ -1979,8 +2031,29 @@ mod tests {
             backups: vec!["stratum2+tcp://backup.example:3336/KEY".into()],
             pool_user: Some("rig-owner".into()),
             tp_port: None,
+            job_declaration: Some(SavedDeclaration::Full),
+            accept_job_declaration: None,
+            fallback_pools: Vec::new(),
         };
         with(joining.clone()).validate().unwrap();
+        // #### PR #42: Job Declaration and fallback pools round trip.
+        let text = serde_json::to_string(&with(joining.clone())).unwrap();
+        assert!(text.contains("\"job_declaration\":\"full\""), "{text}");
+        let back: SavedConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.server, Some(joining.clone()));
+        let solo = SavedServer {
+            mode: SavedMode::AsicSolo,
+            join: None,
+            backups: Vec::new(),
+            pool_user: None,
+            job_declaration: None,
+            fallback_pools: vec!["stratum2+tcp://fallback.example:3336/KEY".into()],
+            ..joining.clone()
+        };
+        with(solo.clone()).validate().unwrap();
+        let text = serde_json::to_string(&with(solo.clone())).unwrap();
+        let back: SavedConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.server, Some(solo.clone()));
         for (bad, why) in [
             (
                 SavedServer {
@@ -2073,6 +2146,41 @@ mod tests {
                     ..pool.clone()
                 },
                 "template port 0",
+            ),
+            (
+                SavedServer {
+                    job_declaration: Some(SavedDeclaration::Coinbase),
+                    ..solo.clone()
+                },
+                "Job Declaration without a pool to join",
+            ),
+            (
+                SavedServer {
+                    accept_job_declaration: Some(SavedAccept::Full),
+                    ..joining.clone()
+                },
+                "accepting miners' templates while joining a pool",
+            ),
+            (
+                SavedServer {
+                    fallback_pools: vec!["stratum2+tcp://fallback.example:3336/KEY".into()],
+                    ..joining.clone()
+                },
+                "fallback pools while joining a pool",
+            ),
+            (
+                SavedServer {
+                    fallback_pools: vec!["a b".into()],
+                    ..solo.clone()
+                },
+                "a fallback pool with a space",
+            ),
+            (
+                SavedServer {
+                    fallback_pools: vec!["stratum2+tcp://f.example:3336/KEY".into(); 9],
+                    ..solo.clone()
+                },
+                "nine fallback pools",
             ),
         ] {
             assert!(with(bad).validate().is_err(), "{why}");

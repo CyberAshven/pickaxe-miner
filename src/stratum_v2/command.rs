@@ -398,6 +398,7 @@ pub fn run(
                 .collect::<Vec<_>>()
                 .join(" → ")
         }),
+        declaring: job_declaration.filter(|_| !pools.is_empty()),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
@@ -567,6 +568,8 @@ pub fn run(
     } else {
         ServeMode::Solo
     };
+    // #### PR #42: for the Connection info page.
+    let job_declaration_on = declaring || declarator.is_some();
     let result = (|| {
         if terminal.is_none() {
             // The pool's identity may be a payout address: never printed.
@@ -832,6 +835,7 @@ pub fn run(
                                         templates: template_lines(tp_bound, interfaces),
                                         key: authority.clone(),
                                         mode: serve_mode,
+                                        job_declaration: job_declaration_on,
                                         note: None,
                                     });
                                 }
@@ -1081,6 +1085,9 @@ struct Started {
     job_declaration: Option<super::jd::AcceptJd>,
     /// #### PR #42: solo mining's fallback pools, in order.
     fallbacks: Option<String>,
+    /// #### PR #42: how this server declares its node's templates to the
+    /// first pool, when it does.
+    declaring: Option<crate::cli::JobDeclarationMode>,
 }
 
 /// #### PR #42
@@ -1138,6 +1145,16 @@ fn started_text(started: &Started) -> String {
         text.push_str(&format!(
             "Fallback pools  {fallbacks} (in order), while your node gives no work; devices \
              come back 30 seconds after it answers again\n"
+        ));
+    }
+    if let Some(mode) = started.declaring {
+        let mode = match mode {
+            crate::cli::JobDeclarationMode::Full => "Full-Template",
+            crate::cli::JobDeclarationMode::Coinbase => "Coinbase-only",
+        };
+        text.push_str(&format!(
+            "Your templates  {mode} Job Declaration at the first pool, from your node; devices \
+             mine the pools' own jobs while it refuses them\n"
         ));
     }
     if !started.pool_tag.is_empty() {
@@ -1577,6 +1594,9 @@ struct ConnectPage {
     templates: Vec<ConnectLine>,
     key: Option<String>,
     mode: ServeMode,
+    /// #### PR #42: Job Declaration is on: joining, this server declares its
+    /// node's templates to the pool; a public pool accepts miners' own.
+    job_declaration: bool,
     /// The last copy's result.
     note: Option<String>,
 }
@@ -1678,6 +1698,14 @@ fn connect_text(page: &ConnectPage) -> String {
              optionally followed by .name; the blocks they find pay it. SV2 devices give it \
              as their user identity.\n"
         }
+        // #### PR #42: with Job Declaration, this node builds the blocks.
+        ServeMode::JoinPool if page.job_declaration => {
+            "\nUsername: any name for the device; it names the device on the workers page. \
+             This computer mines at the pool for you with your node's templates (Job \
+             Declaration), and the pool's own jobs while the pool refuses them.\nMerge-mined \
+             tokens are not added under Job Declaration yet. Mine solo or run your own pool \
+             to merge-mine.\n"
+        }
         ServeMode::JoinPool => {
             "\nUsername: any name for the device; it names the device on the workers page. \
              This computer mines at the pool for you.\nMerge-mined tokens are off at a pool: \
@@ -1685,6 +1713,13 @@ fn connect_text(page: &ConnectPage) -> String {
              solo or run your own pool to merge-mine.\n"
         }
     });
+    // #### PR #42: where miners' own templates go.
+    if page.mode == ServeMode::Public && page.job_declaration {
+        text.push_str(
+            "Miners' own templates: a Job Declaration client (another Pickaxe's Join a pool \
+             with Your templates on) connects to an SV2 line above, with the same key.\n",
+        );
+    }
     text.push_str("Password: anything; it is not checked.\n");
     let reachable = page
         .lines
@@ -2104,9 +2139,51 @@ struct WatchStatus {
     blocks_accepted: u64,
     blocks_pending: usize,
     device_details: Vec<WorkerLine>,
+    /// #### PR #42: Job Declaration, as the client and as a pool.
+    jd_client: Option<WatchJdClient>,
+    jd_server: Option<WatchJdServer>,
+}
+
+/// #### PR #42: the Job Declaration client's part of the saved status.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WatchJdClient {
+    state: String,
+    mode: String,
+    custom_jobs: u64,
+    refused: u64,
+    fallbacks: u64,
+}
+
+/// #### PR #42: the Job Declaration server's part of the saved status.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WatchJdServer {
+    clients: u64,
+    custom_jobs: u64,
+    refused: u64,
+    blocks: u64,
 }
 
 impl WatchStatus {
+    /// #### PR #42: Job Declaration's lines, when it is on.
+    fn job_declaration(&self) -> String {
+        let mut text = String::new();
+        if let Some(jd) = &self.jd_client {
+            text.push_str(&format!(
+                "\nJob Declaration ({}): {} · {} custom jobs · {} refused · {} fallbacks",
+                jd.mode, jd.state, jd.custom_jobs, jd.refused, jd.fallbacks
+            ));
+        }
+        if let Some(jd) = &self.jd_server {
+            text.push_str(&format!(
+                "\nJob Declaration clients {} · {} custom jobs · {} refused · {} blocks",
+                jd.clients, jd.custom_jobs, jd.refused, jd.blocks
+            ));
+        }
+        text
+    }
+
     /// The workers page header, with how old the saved status is.
     fn header(&self, now: u64) -> String {
         let age = now.saturating_sub(self.updated);
@@ -2134,7 +2211,7 @@ impl WatchStatus {
                 crate::telemetry::format_hash_rate(rate),
                 self.shares_accepted,
                 self.shares_rejected,
-            );
+            ) + &self.job_declaration();
         }
         format!(
             "{} · Node {}{} · Height {} · Donation {} · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
@@ -2157,6 +2234,7 @@ impl WatchStatus {
             self.blocks_accepted,
             self.blocks_pending,
         ) + &self.records(age)
+            + &self.job_declaration()
     }
 
     /// #### PR #40
@@ -2868,6 +2946,7 @@ mod tests {
             templates: template_lines(Some("0.0.0.0:48442".parse().unwrap()), interfaces),
             key: Some("KEY".into()),
             mode: ServeMode::Solo,
+            job_declaration: false,
             note: None,
         };
         assert_eq!(page.templates[0].place, Place::LocalNetwork);
@@ -3188,9 +3267,29 @@ mod tests {
             templates: Vec::new(),
             key: None,
             mode: ServeMode::Public,
+            job_declaration: false,
             note: None,
         };
         let text = connect_text(&public);
+        assert!(!text.contains("Miners' own templates"), "{text}");
+        // #### PR #42: a pool accepting Job Declaration says where it goes.
+        let accepting = connect_text(&ConnectPage {
+            job_declaration: true,
+            lines: connect_lines(
+                Some("0.0.0.0:3336".parse().unwrap()),
+                None,
+                Some("KEY"),
+                both,
+            ),
+            templates: Vec::new(),
+            key: None,
+            mode: ServeMode::Public,
+            note: None,
+        });
+        assert!(
+            accepting.contains("Miners' own templates: a Job Declaration client"),
+            "{accepting}"
+        );
         assert!(text.contains("Most ASICs speak SV1"), "{text}");
         assert!(
             text.contains("  1  your network   stratum+tcp://192.168.0.160:3333"),
@@ -3220,6 +3319,7 @@ mod tests {
             templates: Vec::new(),
             key: None,
             mode: ServeMode::Solo,
+            job_declaration: false,
             note: Some("Copied stratum+tcp://192.168.0.160:3333".into()),
         };
         let text = connect_text(&solo);
@@ -3240,6 +3340,20 @@ mod tests {
         let text = connect_text(&join);
         assert!(text.contains("mines at the pool for you"), "{text}");
         assert!(!text.contains("with Join a"), "{text}");
+        // #### PR #42: with Job Declaration this node builds the blocks.
+        let declaring = connect_text(&ConnectPage {
+            job_declaration: true,
+            note: None,
+            ..join
+        });
+        assert!(
+            declaring.contains("with your node's templates (Job Declaration)"),
+            "{declaring}"
+        );
+        assert!(
+            !declaring.contains("the pool builds the blocks"),
+            "{declaring}"
+        );
         // A loopback listener: only this computer.
         let local_only = ConnectPage {
             lines: connect_lines(
@@ -3251,6 +3365,7 @@ mod tests {
             templates: Vec::new(),
             key: None,
             mode: ServeMode::Solo,
+            job_declaration: false,
             note: None,
         };
         let text = connect_text(&local_only);
@@ -3424,6 +3539,44 @@ mod tests {
             assert!(header.contains(part), "{part}");
         }
         assert!(saved.header(updated + 60).contains("Server not updating"));
+        assert!(!header.contains("Job Declaration"), "{header}");
+        // #### PR #42: Job Declaration's lines, as the client and as a pool.
+        stats.jd_client = Some(super::super::jd::client::JdClientSummary {
+            state: "active",
+            mode: "full-template",
+            custom_jobs: 12,
+            refused: 1,
+            fallbacks: 2,
+            ..Default::default()
+        });
+        stats.jd_server = Some(server::JdServerStats {
+            clients: 3,
+            custom_jobs: 5,
+            refused: 0,
+            blocks: 1,
+            ..Default::default()
+        });
+        let status = status_json(
+            "chipnet",
+            Some("pool.example:3336"),
+            None,
+            &stats,
+            BchDonation::default(),
+            &devices,
+        );
+        let saved: WatchStatus = serde_json::from_str(&status.to_string()).unwrap();
+        let header = saved.header(saved.updated);
+        assert!(
+            header.contains(
+                "Job Declaration (full-template): active · 12 custom jobs · 1 refused · 2 \
+                 fallbacks"
+            ),
+            "{header}"
+        );
+        assert!(
+            header.contains("Job Declaration clients 3 · 5 custom jobs · 0 refused · 1 blocks"),
+            "{header}"
+        );
         // Share ages count on from the save.
         assert_eq!(
             saved.rows(updated + 10)[0].last_share_seconds,
@@ -3491,6 +3644,7 @@ mod tests {
                         )),
                         job_declaration: Some(crate::stratum_v2::jd::AcceptJd::Both),
                         fallbacks: None,
+                        declaring: None,
                     }),
                 )
             })
@@ -3531,10 +3685,15 @@ mod tests {
             fee: None,
             job_declaration: None,
             fallbacks: None,
+            declaring: Some(crate::cli::JobDeclarationMode::Coinbase),
         });
         assert!(joined.contains("pool.example:3336 → b1.example:3336 (in failover order)"));
         assert!(joined.contains("username: your own"));
         assert!(!joined.contains("Start difficulty"));
+        // #### PR #42: Join a pool with the node's own templates says so.
+        assert!(joined.contains(
+            "Your templates  Coinbase-only Job Declaration at the first pool, from your node"
+        ));
         // #### PR #42: solo mining names its fallback pools.
         let solo = started_text(&Started {
             sv2: Some("0.0.0.0:3336".parse().unwrap()),
@@ -3547,6 +3706,7 @@ mod tests {
             fee: None,
             job_declaration: None,
             fallbacks: Some("a.example:3336 → b.example:3336".into()),
+            declaring: None,
         });
         assert!(solo.contains(
             "Fallback pools  a.example:3336 → b.example:3336 (in order), while your node gives \

@@ -12,8 +12,9 @@ The pool builds blocks from your own BCH node, as solo mining does (see
 [stratum-v2.md](stratum-v2.md)). In the setup choose **Run a pool**, then
 **ASIC pool**, and set the pool fee on the settings page. The rest is under
 **Advanced** on the same page (Enter opens it): where the fee comes from and
-its address, the pool's name, the start difficulty, the SV1 and SV2 ports and
-the donation. A saved profile keeps them all and reopens as a pool. From a
+its address, the pool's name, the start difficulty, the SV1 and SV2 ports,
+serving templates, whether miners may use their own templates, and the
+donation. A saved profile keeps them all and reopens as a pool. From a
 terminal:
 
 ```text
@@ -151,7 +152,8 @@ jobs cannot rotate work; the pool checks every custom job's outputs before
 accepting it. With Full-Template, a miner declares the transactions too: your
 node checks the template (`validateblocktemplate`) and gets the miner's blocks
 as well as the miner's own node. With Coinbase-only, only their nodes submit
-their blocks. Details, the error codes and the token format are in
+their blocks. In the setup it is the **Miner templates** row under Advanced
+(off by default). Details, the error codes and the token format are in
 [job-declaration.md](job-declaration.md).
 
 ## Templates for other pools and P2Pool

@@ -1756,79 +1756,13 @@ fn main() {
                         // on the miner's node, at someone's pool, or as a public
                         // pool for other miners.
                         if let Some(server) = setup.server.clone() {
-                            let mut pool_tag = None;
-                            let (
-                                upstream,
-                                upstream_key,
-                                public,
-                                pool_fee,
-                                pool_fee_mode,
-                                pool_fee_address,
-                            ) = match server {
-                                tui::ServerSetup::Solo => {
-                                    (Vec::new(), Vec::new(), false, None, None, None)
-                                }
-                                // #### PR #42: the pool, then the backup
-                                // pools from the Advanced section, each with
-                                // its key in its address.
-                                tui::ServerSetup::JoinPool { address, key } => {
-                                    let main = if address.contains("://") || key.is_empty() {
-                                        address
-                                    } else {
-                                        format!("stratum2+tcp://{address}/{key}")
-                                    };
-                                    let mut upstream = vec![main];
-                                    upstream.extend(setup.options.backups.iter().cloned());
-                                    (upstream, Vec::new(), false, None, None, None)
-                                }
-                                tui::ServerSetup::Public {
-                                    fee,
-                                    mode,
-                                    address,
-                                    tag,
-                                } => {
-                                    pool_tag = tag;
-                                    (Vec::new(), Vec::new(), true, Some(fee), Some(mode), address)
-                                }
+                            // #### PR #42: the command the setup's rows
+                            // make, with the Advanced section's values
+                            // (see `tui::asic_serve_command`).
+                            let Some(action) = tui::asic_serve_command(&server, &setup.options)
+                            else {
                                 // Started above, as a GPU coordinator or rig.
-                                tui::ServerSetup::GpuPool { .. }
-                                | tui::ServerSetup::JoinGpuPool { .. } => unreachable!(),
-                            };
-                            // #### PR #42: the ports, start difficulty
-                            // and pool username from the Advanced section.
-                            let options = &setup.options;
-                            let joining = !upstream.is_empty();
-                            let action = cli::StratumV2Command::Serve {
-                                listen: std::net::SocketAddr::from((
-                                    [0, 0, 0, 0],
-                                    options.sv2_port,
-                                )),
-                                sv1_listen: Some(std::net::SocketAddr::from((
-                                    [0, 0, 0, 0],
-                                    options.sv1_port,
-                                ))),
-                                donation: None,
-                                upstream,
-                                upstream_key,
-                                upstream_user: options.pool_user.clone().filter(|_| joining),
-                                public,
-                                pool_fee,
-                                pool_fee_mode,
-                                pool_fee_address,
-                                pool_tag,
-                                start_difficulty: options.start_difficulty.filter(|_| !joining),
-                                merge_test_token: None,
-                                // #### PR #42: templates from this node.
-                                tp_listen: options
-                                    .template_port
-                                    .filter(|_| !joining)
-                                    .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port))),
-                                accept_job_declaration: None,
-                                job_declaration: None,
-                                template_provider: Vec::new(),
-                                fallback_pool: Vec::new(),
-                                asic_token: None,
-                                asic_test_token: None,
+                                unreachable!()
                             };
                             #[cfg(feature = "stratum-v2")]
                             let result = stratum_v2::command::run(

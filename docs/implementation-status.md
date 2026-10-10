@@ -1936,3 +1936,31 @@ full queue drops and counts), the flags' conflicts, the status file, and a
 loopback run where a device's share on the test token is proven and its
 next job follows the win, with nothing at the node. Not yet run with
 hardware.
+
+## Setup rows for Job Declaration and fallback pools (2026-10-10)
+
+#### PR #42
+
+The setup's Advanced section now sets what only flags could: Join a pool's
+**Your templates** (Job Declaration off, full template or coinbase only; the
+BCH node row follows it while it is on, and Start asks for the node, a valid
+payout address and no other username at the pool), ASIC solo's **Fallback
+pools** (up to 8, each with its key, in order), and an ASIC pool's **Miner
+templates** (off, both modes, full template only or coinbase only). Profiles
+keep them (each refused outside its mode), and the server starts with
+`--job-declaration`, `--fallback-pool` or `--accept-job-declaration`. The
+setup's server command is now built in one tested place
+(`tui::asic_serve_command`) instead of in `main.rs`. The server's Advanced
+page names the Job Declaration mode when it declares; Connection info says
+that a declaring server's node builds the blocks (and that merge-mined
+tokens are not added under Job Declaration yet), and a pool accepting it
+tells its miners where their templates go; `stratum-v2 watch` shows Job
+Declaration's state and counts, as the client and as a pool.
+
+Evidence: host tests drive each row through its values, check the Node row
+appearing under Your templates, Start's checks, fallback pools refusing a
+pool without its key or a ninth pool, profiles keeping and restoring each
+value, saved values refused outside their mode, the serve command each
+setup makes, the Connection info notes, and the watch header's Job
+Declaration lines read back from a saved status. Not yet run from the setup
+against a live pool.

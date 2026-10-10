@@ -72,8 +72,8 @@ pub struct SetupResult {
 }
 
 /// #### PR #42: the ASIC server's options the setup's Advanced section
-/// sets: listening ports, the start difficulty, backup pools and the pool
-/// username.
+/// sets: listening ports, the start difficulty, backup pools, the pool
+/// username, serving templates, Job Declaration and fallback pools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerOptions {
     pub sv1_port: u16,
@@ -88,6 +88,14 @@ pub struct ServerOptions {
     /// The port this node's templates are served on to SV2 pools and
     /// P2Pool; `None` serves none.
     pub template_port: Option<u16>,
+    /// Join a pool declares this node's templates to the pool (SV2 Job
+    /// Declaration); `None` mines the pool's own jobs.
+    pub job_declaration: Option<crate::config::SavedDeclaration>,
+    /// The Job Declaration modes an ASIC pool accepts; `None` accepts none.
+    pub accept_job_declaration: Option<crate::config::SavedAccept>,
+    /// Pools solo mining falls back on while the node gives no work, each a
+    /// one-line SV2 address with its key, in order.
+    pub fallback_pools: Vec<String>,
 }
 
 impl Default for ServerOptions {
@@ -99,9 +107,100 @@ impl Default for ServerOptions {
             backups: Vec::new(),
             pool_user: None,
             template_port: None,
+            job_declaration: None,
+            accept_job_declaration: None,
+            fallback_pools: Vec::new(),
         }
     }
 }
+
+// #### PR #42: the setup's ASIC server as its command line
+// What: an ASIC setup (solo, joining a pool, or an ASIC pool) becomes the
+// `stratum-v2 serve` command it starts, with the Advanced section's values:
+// the ports, the start difficulty, backup pools, the pool username, serving
+// templates, Job Declaration (joining) or accepting it (a pool), and
+// fallback pools (solo).
+// Why: the mapping lived in main.rs, where no test reached it, and the new
+// rows had to reach the server.
+// Look here if: a setup row has no effect on the server it starts.
+/// The `stratum-v2 serve` command an ASIC setup starts; `None` for the GPU
+/// setups, which start as a coordinator or a rig.
+pub fn asic_serve_command(
+    server: &ServerSetup,
+    options: &ServerOptions,
+) -> Option<crate::cli::StratumV2Command> {
+    let mut pool_tag = None;
+    let (upstream, public, pool_fee, pool_fee_mode, pool_fee_address) = match server {
+        ServerSetup::Solo => (Vec::new(), false, None, None, None),
+        // The pool, then the backup pools, each with its key in its address.
+        ServerSetup::JoinPool { address, key } => {
+            let main = if address.contains("://") || key.is_empty() {
+                address.clone()
+            } else {
+                format!("stratum2+tcp://{address}/{key}")
+            };
+            let mut upstream = vec![main];
+            upstream.extend(options.backups.iter().cloned());
+            (upstream, false, None, None, None)
+        }
+        ServerSetup::Public {
+            fee,
+            mode,
+            address,
+            tag,
+        } => {
+            pool_tag = tag.clone();
+            (Vec::new(), true, Some(*fee), Some(*mode), address.clone())
+        }
+        ServerSetup::GpuPool { .. } | ServerSetup::JoinGpuPool { .. } => return None,
+    };
+    let joining = !upstream.is_empty();
+    let solo = !joining && !public;
+    let everywhere = |port: u16| std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    Some(crate::cli::StratumV2Command::Serve {
+        listen: everywhere(options.sv2_port),
+        sv1_listen: Some(everywhere(options.sv1_port)),
+        donation: None,
+        upstream,
+        upstream_key: Vec::new(),
+        upstream_user: options.pool_user.clone().filter(|_| joining),
+        public,
+        pool_fee,
+        pool_fee_mode,
+        pool_fee_address,
+        pool_tag,
+        start_difficulty: options.start_difficulty.filter(|_| !joining),
+        merge_test_token: None,
+        // Templates come from this server's own node.
+        tp_listen: options.template_port.filter(|_| !joining).map(everywhere),
+        accept_job_declaration: options
+            .accept_job_declaration
+            .filter(|_| public)
+            .map(|mode| match mode {
+                crate::config::SavedAccept::Full => crate::cli::AcceptJobDeclaration::Full,
+                crate::config::SavedAccept::Coinbase => crate::cli::AcceptJobDeclaration::Coinbase,
+                crate::config::SavedAccept::Both => crate::cli::AcceptJobDeclaration::Both,
+            }),
+        job_declaration: options
+            .job_declaration
+            .filter(|_| joining)
+            .map(|mode| match mode {
+                crate::config::SavedDeclaration::Full => crate::cli::JobDeclarationMode::Full,
+                crate::config::SavedDeclaration::Coinbase => {
+                    crate::cli::JobDeclarationMode::Coinbase
+                }
+            }),
+        template_provider: Vec::new(),
+        fallback_pool: if solo {
+            options.fallback_pools.clone()
+        } else {
+            Vec::new()
+        },
+        asic_token: None,
+        asic_test_token: None,
+    })
+}
+// #### end PR #42 ####
 
 /// #### PR #42: the ASIC server's defaults, as its command line has them.
 const DEFAULT_SV1_PORT: u16 = 3333;
@@ -109,6 +208,25 @@ const DEFAULT_SV2_PORT: u16 = 3336;
 const DEFAULT_START_DIFFICULTY: u64 = 4096;
 const MAX_START_DIFFICULTY: u64 = 1 << 48;
 const MAX_BACKUPS: usize = 8;
+
+/// #### PR #42: pools typed on one line (split on spaces or commas), each a
+/// one-line SV2 address with its key, at most 8: backup or fallback pools.
+fn pool_list(value: &str, what: &str) -> Result<Vec<String>, String> {
+    let pools: Vec<String> = value
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if pools.len() > MAX_BACKUPS {
+        return Err(format!("use at most {MAX_BACKUPS} {what}s"));
+    }
+    for pool in &pools {
+        if crate::stratum_v2::split_pool_address(pool)?.1.is_none() {
+            return Err(format!("give each {what} as stratum2+tcp://HOST:PORT/KEY"));
+        }
+    }
+    Ok(pools)
+}
 
 /// #### PR #42: the start difficulty one step down (half) or up (double),
 /// within 1 to 2^48; the default reads as `None`.
@@ -263,6 +381,13 @@ enum SettingsRow {
     Backups,
     /// The username at the pool (the payout address by default).
     PoolUser,
+    /// #### PR #42: Join a pool with this node's templates (SV2 Job
+    /// Declaration): off, Full-Template or Coinbase-only.
+    JobDeclaration,
+    /// Solo mining's pools to fall back on, in order.
+    FallbackPools,
+    /// An ASIC pool accepting its miners' own templates.
+    AcceptJd,
     Address,
     Intensity,
     Fulcrum,
@@ -288,6 +413,7 @@ enum TextField {
     Sv2Port,
     Backups,
     PoolUser,
+    FallbackPools,
 }
 
 /// What an ASIC can mine: BCH today (merge-mined tokens as they appear);
@@ -340,6 +466,13 @@ struct SetupFlow {
     backups: Vec<String>,
     /// Empty: the payout address.
     pool_user: String,
+    /// #### PR #42: Join a pool's Job Declaration; `None` is off.
+    job_declaration: Option<crate::config::SavedDeclaration>,
+    /// The Job Declaration modes an ASIC pool accepts; `None` is off.
+    accept_jd: Option<crate::config::SavedAccept>,
+    /// Solo mining's fallback pools, each a one-line SV2 address with its
+    /// key.
+    fallback_pools: Vec<String>,
     token_input: String,
     token_selected: usize,
     settings_row: usize,
@@ -443,6 +576,9 @@ impl SetupFlow {
             template_port: None,
             backups: Vec::new(),
             pool_user: String::new(),
+            job_declaration: None,
+            accept_jd: None,
+            fallback_pools: Vec::new(),
             token_input: String::new(),
             token_selected: 0,
             settings_row: 0,
@@ -692,12 +828,14 @@ impl SetupFlow {
                     SettingsRow::PoolKey,
                     SettingsRow::Address,
                 ],
-                vec![
-                    SettingsRow::Backups,
-                    SettingsRow::PoolUser,
-                    SettingsRow::Donation,
-                    SettingsRow::Sv1Port,
-                ],
+                // #### PR #42: Job Declaration builds jobs from this
+                // node, so its node row follows it while it is on.
+                [SettingsRow::Backups, SettingsRow::PoolUser]
+                    .into_iter()
+                    .chain([SettingsRow::JobDeclaration])
+                    .chain(self.job_declaration.map(|_| SettingsRow::Node))
+                    .chain([SettingsRow::Donation, SettingsRow::Sv1Port])
+                    .collect(),
             ),
             MiningMode::Asic => self.with_advanced(
                 vec![
@@ -712,6 +850,7 @@ impl SetupFlow {
                     SettingsRow::Sv1Port,
                     SettingsRow::Sv2Port,
                     SettingsRow::Templates,
+                    SettingsRow::FallbackPools,
                     SettingsRow::Fulcrum,
                 ],
             ),
@@ -741,6 +880,7 @@ impl SetupFlow {
                     SettingsRow::Sv1Port,
                     SettingsRow::Sv2Port,
                     SettingsRow::Templates,
+                    SettingsRow::AcceptJd,
                     SettingsRow::Donation,
                 ],
             ),
@@ -795,7 +935,33 @@ impl SetupFlow {
             backups: self.backups.clone(),
             pool_user: Some(self.pool_user.trim().to_owned()).filter(|user| !user.is_empty()),
             template_port: self.template_port,
+            job_declaration: self.job_declaration,
+            accept_job_declaration: self.accept_jd,
+            fallback_pools: self.fallback_pools.clone(),
         }
+    }
+
+    /// Job Declaration off, Full-Template, then Coinbase-only, in turn.
+    fn cycle_job_declaration(&mut self, forward: bool) {
+        use crate::config::SavedDeclaration::{Coinbase, Full};
+        self.job_declaration = match (self.job_declaration, forward) {
+            (None, true) | (Some(Coinbase), false) => Some(Full),
+            (Some(Full), true) | (None, false) => Some(Coinbase),
+            (Some(Coinbase), true) | (Some(Full), false) => None,
+        };
+    }
+
+    /// Accepting miners' templates off, in both modes, Full-Template only,
+    /// then Coinbase-only only, in turn.
+    fn cycle_accept_jd(&mut self, forward: bool) {
+        use crate::config::SavedAccept::{Both, Coinbase, Full};
+        const ORDER: [Option<crate::config::SavedAccept>; 4] =
+            [None, Some(Both), Some(Full), Some(Coinbase)];
+        let index = ORDER
+            .iter()
+            .position(|mode| *mode == self.accept_jd)
+            .unwrap_or(0);
+        self.accept_jd = ORDER[(index + if forward { 1 } else { ORDER.len() - 1 }) % ORDER.len()];
     }
 
     /// Serving templates on and off, on the network's template port, which
@@ -876,6 +1042,12 @@ impl SetupFlow {
             },
             pool_user: options.pool_user.clone().filter(|_| asic),
             tp_port: None,
+            // #### PR #42: each saved in its own mode.
+            job_declaration: options
+                .job_declaration
+                .filter(|_| mode == SavedMode::AsicJoin),
+            accept_job_declaration: None,
+            fallback_pools: Vec::new(),
         };
         Some(match self.server_setup()? {
             ServerSetup::JoinGpuPool { .. } => joining(SavedMode::GpuRig),
@@ -886,6 +1058,7 @@ impl SetupFlow {
                 backups: Vec::new(),
                 pool_user: None,
                 tp_port: options.template_port,
+                fallback_pools: options.fallback_pools.clone(),
                 ..joining(SavedMode::AsicSolo)
             },
             ServerSetup::GpuPool { fee, address } => SavedServer {
@@ -914,6 +1087,7 @@ impl SetupFlow {
                 backups: Vec::new(),
                 pool_user: None,
                 tp_port: options.template_port,
+                accept_job_declaration: options.accept_job_declaration,
                 ..joining(SavedMode::AsicPool)
             },
         })
@@ -939,6 +1113,9 @@ impl SetupFlow {
         self.template_port = None;
         self.backups.clear();
         self.pool_user.clear();
+        self.job_declaration = None;
+        self.accept_jd = None;
+        self.fallback_pools.clear();
         let Some(server) = server else {
             self.mode = MiningMode::Gpu;
             return;
@@ -971,6 +1148,9 @@ impl SetupFlow {
         self.template_port = server.tp_port;
         self.backups = server.backups.clone();
         self.pool_user = server.pool_user.clone().unwrap_or_default();
+        self.job_declaration = server.job_declaration;
+        self.accept_jd = server.accept_job_declaration;
+        self.fallback_pools = server.fallback_pools.clone();
     }
 
     /// A new pool's fee and where it comes from, before anyone changes them.
@@ -1395,6 +1575,8 @@ impl SetupFlow {
                         self.start_difficulty = step_difficulty(self.start_difficulty, forward)
                     }
                     SettingsRow::Templates => self.toggle_templates(),
+                    SettingsRow::JobDeclaration => self.cycle_job_declaration(forward),
+                    SettingsRow::AcceptJd => self.cycle_accept_jd(forward),
                     _ => {}
                 }
             }
@@ -1402,6 +1584,12 @@ impl SetupFlow {
                 // #### PR #42: the Advanced section.
                 SettingsRow::Advanced => self.toggle_advanced(),
                 SettingsRow::Templates => self.toggle_templates(),
+                SettingsRow::JobDeclaration => self.cycle_job_declaration(true),
+                SettingsRow::AcceptJd => self.cycle_accept_jd(true),
+                SettingsRow::FallbackPools => {
+                    let value = self.fallback_pools.join(" ");
+                    self.begin_edit(TextField::FallbackPools, value);
+                }
                 SettingsRow::StartDifficulty => {
                     let value = self
                         .start_difficulty
@@ -1521,6 +1709,36 @@ impl SetupFlow {
                         self.status_line =
                             "Enter your payout address: the pool knows you by it.".into();
                         self.open_settings(SettingsRow::Address);
+                    } else if self.job_declaration.is_some()
+                        && crate::config::validate_payout_address(
+                            self.config.network,
+                            &self.config.payout_address,
+                        )
+                        .is_err()
+                    {
+                        // #### PR #42: your own templates pay your payout
+                        // address at the pool, and come from your node.
+                        self.status_line =
+                            "Enter a BCH payout address for the selected network: the pool pays your blocks there."
+                                .into();
+                        self.open_settings(SettingsRow::Address);
+                    } else if self.job_declaration.is_some() && !self.pool_user.trim().is_empty() {
+                        self.status_line =
+                            "With your own templates the pool knows you by your payout address; clear the pool username."
+                                .into();
+                        self.open_settings(SettingsRow::PoolUser);
+                    } else if self.job_declaration.is_some()
+                        && self.config.custom_node_endpoints().is_empty()
+                    {
+                        self.connection_kind = ConnectionKind::Node;
+                        self.connection_selected = self
+                            .sources
+                            .list(self.config.network, ConnectionKind::Node)
+                            .len();
+                        self.step = SetupStep::Connections;
+                        self.check_local_node();
+                        self.status_line =
+                            "Your own templates come from your own BCH node: add it here.".into();
                     } else {
                         return SetupAction::Complete;
                     }
@@ -1816,25 +2034,12 @@ impl SetupFlow {
                 Ok(String::new())
             }
             TextField::Backups => {
-                let backups: Vec<String> = value
-                    .split(|c: char| c.is_whitespace() || c == ',')
-                    .filter(|text| !text.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-                if backups.len() > MAX_BACKUPS {
-                    return Err(format!("use at most {MAX_BACKUPS} backup pools"));
-                }
-                for backup in &backups {
-                    match crate::stratum_v2::split_pool_address(backup)? {
-                        (_, Some(_)) => (),
-                        (_, None) => {
-                            return Err(
-                                "give each backup pool as stratum2+tcp://HOST:PORT/KEY".into()
-                            )
-                        }
-                    }
-                }
-                self.backups = backups;
+                self.backups = pool_list(&value, "backup pool")?;
+                Ok(String::new())
+            }
+            // #### PR #42: solo mining's fallback pools.
+            TextField::FallbackPools => {
+                self.fallback_pools = pool_list(&value, "fallback pool")?;
                 Ok(String::new())
             }
             TextField::PoolUser => {
@@ -3745,6 +3950,50 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 ),
                 "[Enter]",
             ),
+            // #### PR #42: Job Declaration, accepting it, and fallback pools;
+            // all off by default.
+            SettingsRow::JobDeclaration => (
+                "Your templates",
+                match state.job_declaration {
+                    None => dim("off; devices mine the pool's own jobs"),
+                    Some(crate::config::SavedDeclaration::Full) => Span::raw(
+                        "full template: your node's templates, declared with their transactions",
+                    ),
+                    Some(crate::config::SavedDeclaration::Coinbase) => Span::raw(
+                        "coinbase only: your node's templates; the pool sees the coinbase",
+                    ),
+                },
+                "< > [Enter]  a Pickaxe pool",
+            ),
+            SettingsRow::AcceptJd => (
+                "Miner templates",
+                match state.accept_jd {
+                    None => dim("off; miners mine your node's templates"),
+                    Some(crate::config::SavedAccept::Both) => Span::raw(
+                        "full template and coinbase only: miners may mine their own node's templates",
+                    ),
+                    Some(crate::config::SavedAccept::Full) => Span::raw(
+                        "full template only: your node checks each miner's template",
+                    ),
+                    Some(crate::config::SavedAccept::Coinbase) => Span::raw(
+                        "coinbase only: miners' own nodes submit their blocks",
+                    ),
+                },
+                "< > [Enter]",
+            ),
+            SettingsRow::FallbackPools => (
+                "Fallback pools",
+                match state.fallback_pools.len() {
+                    _ if state.editing == Some(TextField::FallbackPools) => {
+                        Span::raw(format!("{}_", state.text_input))
+                    }
+                    0 => dim("none; paste stratum2+tcp://HOST:PORT/KEY lines".to_owned()),
+                    count => Span::raw(format!(
+                        "{count}, used in order while your node gives no work"
+                    )),
+                },
+                "[Enter]",
+            ),
             SettingsRow::ProfileName => (
                 "Profile name",
                 edit_value(
@@ -5637,6 +5886,254 @@ mod tests {
         setup.join_key = "KEY".into();
         assert!(!setup.settings_rows().contains(&SettingsRow::Templates));
         assert_eq!(setup.saved_server().unwrap().tp_port, None);
+    }
+
+    /// #### PR #42: the serve command's Job Declaration, accepted modes and
+    /// fallback pools, and its pools.
+    #[allow(clippy::type_complexity)]
+    fn serve_parts(
+        setup: &SetupFlow,
+    ) -> (
+        Vec<String>,
+        Option<crate::cli::JobDeclarationMode>,
+        Option<crate::cli::AcceptJobDeclaration>,
+        Vec<String>,
+    ) {
+        match asic_serve_command(&setup.server_setup().unwrap(), &setup.server_options()) {
+            Some(crate::cli::StratumV2Command::Serve {
+                upstream,
+                job_declaration,
+                accept_job_declaration,
+                fallback_pool,
+                ..
+            }) => (
+                upstream,
+                job_declaration,
+                accept_job_declaration,
+                fallback_pool,
+            ),
+            other => panic!("not an ASIC server: {other:?}"),
+        }
+    }
+
+    // #### PR #42
+    // What: Join a pool's "Your templates" row (Advanced) turns Job
+    // Declaration off, to Full-Template and to Coinbase-only; while it is on,
+    // the BCH node row follows it, and Start needs a valid payout address, no
+    // other username at the pool, and a node. A profile keeps the mode, and
+    // the server starts with `--job-declaration`; other modes never do.
+    // Look here if: the JobDeclaration row, its Start checks or
+    // asic_serve_command change.
+    #[test]
+    fn join_a_pool_can_declare_its_own_templates() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.asic_mining = AsicMining::JoinPool;
+        setup.join_address = "pool.example:3336".into();
+        setup.join_key = "KEY".into();
+        setup.config.payout_address = chipnet_payout(3);
+        setup.open_settings(SettingsRow::JobDeclaration);
+        assert!(setup.advanced_open);
+        assert!(setup_text(&setup).contains("off; devices mine the pool's own jobs"));
+        assert!(!setup.settings_rows().contains(&SettingsRow::Node));
+        assert_eq!(serve_parts(&setup).1, None);
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            setup.job_declaration,
+            Some(crate::config::SavedDeclaration::Full)
+        );
+        assert_eq!(setup.current_row(), SettingsRow::JobDeclaration);
+        let rows = setup.settings_rows();
+        let at = rows
+            .iter()
+            .position(|row| *row == SettingsRow::JobDeclaration)
+            .unwrap();
+        assert_eq!(rows[at + 1], SettingsRow::Node);
+        assert!(setup_text(&setup).contains("full template: your node's templates"));
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            setup.job_declaration,
+            Some(crate::config::SavedDeclaration::Coinbase)
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.job_declaration, None);
+        setup.handle_key(key(KeyCode::Left));
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            setup.job_declaration,
+            Some(crate::config::SavedDeclaration::Full)
+        );
+        // Start: another username at the pool, then no node.
+        setup.pool_user = "rig-owner".into();
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.current_row(), SettingsRow::PoolUser);
+        assert!(
+            setup.status_line.contains("clear the pool username"),
+            "{}",
+            setup.status_line
+        );
+        setup.pool_user.clear();
+        setup.config.node_url = None;
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Connections);
+        assert!(
+            setup.status_line.contains("from your own BCH node"),
+            "{}",
+            setup.status_line
+        );
+        setup.config.node_url = Some("http://user:pass@127.0.0.1:48332".into());
+        setup.config.payout_address = "bchtest:not-an-address".into();
+        setup.open_settings(SettingsRow::Start);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.current_row(), SettingsRow::Address);
+        setup.config.payout_address = chipnet_payout(3);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        // The server declares to the pool; a profile keeps the mode.
+        let (upstream, declaring, accepting, fallbacks) = serve_parts(&setup);
+        assert_eq!(upstream, ["stratum2+tcp://pool.example:3336/KEY"]);
+        assert_eq!(declaring, Some(crate::cli::JobDeclarationMode::Full));
+        assert_eq!((accepting, fallbacks.len()), (None, 0));
+        let saved = setup.saved_server().unwrap();
+        assert_eq!(
+            saved.job_declaration,
+            Some(crate::config::SavedDeclaration::Full)
+        );
+        SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(saved.clone()),
+            ..SavedConfig::default()
+        }
+        .validate()
+        .unwrap();
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!(reopened.server_options(), setup.server_options());
+        // Solo mining never declares, nor saves it.
+        setup.asic_mining = AsicMining::Solo;
+        assert!(!setup.settings_rows().contains(&SettingsRow::JobDeclaration));
+        assert_eq!(setup.saved_server().unwrap().job_declaration, None);
+        assert_eq!(serve_parts(&setup).1, None);
+    }
+
+    // #### PR #42
+    // What: ASIC solo's "Fallback pools" row (Advanced) takes up to 8 pools,
+    // each a one-line SV2 address with its key, in order; a profile keeps
+    // them and the server starts with them as `--fallback-pool`; joining
+    // never does.
+    // Look here if: the FallbackPools row, pool_list or asic_serve_command
+    // change.
+    #[test]
+    fn solo_mining_can_fall_back_on_pools() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.open_settings(SettingsRow::FallbackPools);
+        assert!(setup.advanced_open);
+        assert!(setup_text(&setup).contains("none; paste stratum2+tcp://HOST:PORT/KEY"));
+        for (typed, error) in [
+            ("fallback.example:3336", "give each fallback pool as"),
+            (
+                &"stratum2+tcp://f.example:3336/KEY ".repeat(9)[..],
+                "use at most 8 fallback pools",
+            ),
+        ] {
+            setup.handle_key(key(KeyCode::Enter));
+            setup.text_input.clear();
+            type_text(&mut setup, typed);
+            setup.handle_key(key(KeyCode::Enter));
+            assert!(setup.status_line.contains(error), "{}", setup.status_line);
+            setup.handle_key(key(KeyCode::Esc));
+        }
+        setup.handle_key(key(KeyCode::Enter));
+        setup.text_input.clear();
+        type_text(
+            &mut setup,
+            "stratum2+tcp://a.example:3336/KEY1, stratum2+tcp://b.example:3336/KEY2",
+        );
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.fallback_pools.len(), 2);
+        assert!(setup_text(&setup).contains("2, used in order while your node gives no work"));
+        let (upstream, declaring, _, fallbacks) = serve_parts(&setup);
+        assert!(upstream.is_empty() && declaring.is_none());
+        assert_eq!(
+            fallbacks,
+            [
+                "stratum2+tcp://a.example:3336/KEY1",
+                "stratum2+tcp://b.example:3336/KEY2"
+            ]
+        );
+        let saved = setup.saved_server().unwrap();
+        assert_eq!(saved.fallback_pools.len(), 2);
+        SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(saved.clone()),
+            ..SavedConfig::default()
+        }
+        .validate()
+        .unwrap();
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!(reopened.fallback_pools, setup.fallback_pools);
+        // Joining a pool uses its backup pools instead.
+        setup.asic_mining = AsicMining::JoinPool;
+        setup.join_address = "pool.example:3336".into();
+        setup.join_key = "KEY".into();
+        assert!(!setup.settings_rows().contains(&SettingsRow::FallbackPools));
+        assert!(setup.saved_server().unwrap().fallback_pools.is_empty());
+        assert!(serve_parts(&setup).3.is_empty());
+    }
+
+    // #### PR #42
+    // What: an ASIC pool's "Miner templates" row (Advanced) accepts miners'
+    // own templates in both modes, Full-Template only or Coinbase-only only,
+    // off by default; a profile keeps it and the server starts with
+    // `--accept-job-declaration`; a GPU pool has no such row.
+    // Look here if: the AcceptJd row or asic_serve_command change.
+    #[test]
+    fn an_asic_pool_can_accept_its_miners_templates() {
+        use crate::config::SavedAccept;
+        let mut setup = setup_for(MiningMode::Pool);
+        setup.open_settings(SettingsRow::AcceptJd);
+        assert!(setup.advanced_open);
+        assert!(setup_text(&setup).contains("off; miners mine your node's templates"));
+        assert_eq!(serve_parts(&setup).2, None);
+        for expected in [
+            Some(SavedAccept::Both),
+            Some(SavedAccept::Full),
+            Some(SavedAccept::Coinbase),
+            None,
+        ] {
+            setup.handle_key(key(KeyCode::Right));
+            assert_eq!(setup.accept_jd, expected);
+        }
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.accept_jd, Some(SavedAccept::Coinbase));
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.accept_jd, Some(SavedAccept::Both));
+        assert!(setup_text(&setup).contains("full template and coinbase only"));
+        assert_eq!(
+            serve_parts(&setup).2,
+            Some(crate::cli::AcceptJobDeclaration::Both)
+        );
+        let saved = setup.saved_server().unwrap();
+        assert_eq!(saved.accept_job_declaration, Some(SavedAccept::Both));
+        SavedConfig {
+            network: Some("chipnet".into()),
+            server: Some(saved.clone()),
+            ..SavedConfig::default()
+        }
+        .validate()
+        .unwrap();
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_saved_server(Some(&saved));
+        assert_eq!(reopened.accept_jd, Some(SavedAccept::Both));
+        setup.pool_target = 1;
+        assert!(!setup.settings_rows().contains(&SettingsRow::AcceptJd));
+        assert_eq!(setup.saved_server().unwrap().accept_job_declaration, None);
+        assert!(
+            asic_serve_command(&setup.server_setup().unwrap(), &setup.server_options()).is_none()
+        );
     }
 
     // #### PR #40
