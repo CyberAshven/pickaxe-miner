@@ -36,6 +36,9 @@ pub mod electrum;
 pub mod gpu_types;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hip_photon;
+// #### PR #42: where GPU mining takes its jobs, and the way back to the node.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod job_source;
 #[allow(dead_code)]
 pub mod m29_table;
 #[cfg(not(target_arch = "wasm32"))]

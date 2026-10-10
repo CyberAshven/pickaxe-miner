@@ -2033,3 +2033,34 @@ refused, a witness without the marker fails as outputs) and a pool session
 where an SRI-shaped declaration is validated as a block without a witness
 whose merkle root holds and whose declared job rebuilds the same coinbase.
 Not yet run against SRI's `jd-client` binary.
+
+## GPU mining goes back to the miner's node (2026-10-10)
+
+#### PR #42
+
+After a fall back to the Fulcrum servers, GPU mining now goes back to the
+miner's own node by itself. A watch (`src/job_source.rs`) asks the node again
+on its own thread, 15 seconds after the fall back and then waiting twice as
+long after each failure up to 5 minutes (2 minutes for a syncing node, 30 for
+a refused login, another network or a node without the PHOTON state). A node
+must be on the mined network, synced and at most a block behind the mined
+job, and then follow the mined baton (no scan while it is current). The
+supervisor hands the node over only with no winner, claim or winner refresh
+in flight, through the same path that installs any source. While the node
+is down, the cadence refresh no longer calls the node on the supervisor
+thread (before, an 8 s connect or a scan of up to 180 s there blocked
+refreshes and claims, and the session never went back).
+
+The dashboard's Source row names the source ("your node", "Fulcrum", or
+"Fulcrum (node down 4m, next try in 25s)") with a Node row giving the reason
+while it is down; the status file has `job_source` (kind, label, and while
+the node is down its time, next try, trouble and reason, never its address);
+the event log and JSON events name the node going down and coming back;
+`mine watch` shows the source's label. Reconnect asks the node at once.
+
+Evidence: host tests for the watch's waits and hand-over (held while a claim
+is in flight), the status texts, the error classes, the node checks (another
+network, syncing, lagging, a node that cannot follow the baton), a refresh
+on a fake Fulcrum server that leaves a configured node untouched while it is
+down, the Source and Node rows, the events, the status file and the watch
+header. Not yet run live (stopping the Chipnet node needs the operator's OK).

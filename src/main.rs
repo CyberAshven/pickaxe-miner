@@ -840,6 +840,13 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             runtime::RuntimeEvent::Error(error) => {
                 serde_json::json!({"event": "error", "error": error})
             }
+            // #### PR #42: the node down and back, its address redacted.
+            runtime::RuntimeEvent::NodeDown { reason } => {
+                serde_json::json!({"event": "node_down", "reason": reason})
+            }
+            runtime::RuntimeEvent::NodeBack { endpoint } => {
+                serde_json::json!({"event": "node_back", "endpoint": redact_url(&endpoint)})
+            }
         };
         println!("{value}");
         return;
@@ -897,6 +904,13 @@ fn print_runtime_event(event: runtime::RuntimeEvent, json: bool) {
             println!("direct reward accepted: tx={txid}")
         }
         runtime::RuntimeEvent::Error(error) => eprintln!("runtime error: {error}"),
+        // #### PR #42
+        runtime::RuntimeEvent::NodeDown { reason } => {
+            eprintln!("your node is not the PHOTON source; mining from Fulcrum: {reason}")
+        }
+        runtime::RuntimeEvent::NodeBack { endpoint } => {
+            eprintln!("back on your node: {}", redact_url(&endpoint))
+        }
     }
 }
 
@@ -959,6 +973,8 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "device": snapshot.gpu_device,
         "generation_id": snapshot.generation_id,
         "endpoint": redact_url(&snapshot.endpoint),
+        // #### PR #42: where jobs come from, and why the node is skipped.
+        "job_source": job_source_json(&snapshot.job_source),
         "height": snapshot.height,
         "baton_txid": snapshot.baton_txid,
         "baton_vout": snapshot.baton_vout,
@@ -992,6 +1008,25 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
         "gpus": gpus,
         "rigs": rigs,
     })
+}
+
+/// #### PR #42: the job source for the status file: its kind, its label,
+/// and while the node is down how long, the next try and why.
+fn job_source_json(source: &pickaxe_miner::job_source::JobSourceStatus) -> serde_json::Value {
+    let mut value = serde_json::json!({"kind": source.kind(), "label": source.label()});
+    if let pickaxe_miner::job_source::JobSourceStatus::FulcrumNodeDown {
+        down_secs,
+        next_try_secs,
+        trouble,
+        reason,
+    } = source
+    {
+        value["down_secs"] = (*down_secs).into();
+        value["next_try_secs"] = (*next_try_secs).into();
+        value["trouble"] = trouble.label().into();
+        value["reason"] = reason.clone().into();
+    }
+    value
 }
 
 /// Lower-case name of one GPU's mining status.
@@ -2187,6 +2222,7 @@ mod tests {
                 fan_percent: None,
             },
             rigs: None,
+            job_source: Default::default(),
             token_donation: pickaxe_miner::donation::TokenDonation::from_bps(400),
             donation_minimum: pickaxe_miner::donation::TokenDonation::from_bps(400),
         };
@@ -2221,6 +2257,24 @@ mod tests {
             runtime_gpus_text(&snapshot),
             "cuda:0 2.40 GH/s mining; wgpu:1 30.00 MH/s recovering"
         );
+        // #### PR #42: the job source, with the node's trouble while it is
+        // down and never its address.
+        assert_eq!(status["job_source"]["kind"], "fulcrum");
+        let mut snapshot = snapshot;
+        snapshot.job_source = pickaxe_miner::job_source::JobSourceStatus::FulcrumNodeDown {
+            down_secs: 61,
+            next_try_secs: 29,
+            trouble: pickaxe_miner::job_source::NodeTrouble::Syncing,
+            reason: "the node is syncing".into(),
+        };
+        let status = runtime_snapshot_json(&snapshot);
+        assert_eq!(status["job_source"]["kind"], "fulcrum-node-down");
+        assert_eq!(
+            status["job_source"]["label"],
+            "Fulcrum (node syncing 1m, next try in 29s)"
+        );
+        assert_eq!(status["job_source"]["down_secs"], 61);
+        assert_eq!(status["job_source"]["trouble"], "syncing");
     }
 
     #[test]

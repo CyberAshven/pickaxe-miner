@@ -52,6 +52,8 @@ day each fact was checked.
     one-line `stratum2+tcp://HOST:PORT/KEY`;
   - PHOTON jobs from the miner's own BCH node when one is configured (Fulcrum
     as the fallback), live on a pruned Chipnet BCHN with no transaction index;
+    after a fall back to Fulcrum, mining goes back to the node by itself once
+    it answers again (#42), and the dashboard names the source;
   - Run a pool for GPUs (the public GPU pool, live with two rigs on Chipnet)
     and joining a GPU pool or farm from the setup;
   - workers named by their owners (never by an address), and a pool's name

@@ -85,9 +85,14 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         crate::telemetry::format_hash_rate(own + farm),
         number(status, "verified_winners"),
         number(status, "rejected_winners"),
+        // #### PR #42: the job source's label (your node, Fulcrum, or
+        // Fulcrum while the node is down); older status files name the
+        // endpoint.
         status
-            .get("endpoint")
+            .get("job_source")
+            .and_then(|source| source.get("label"))
             .and_then(Value::as_str)
+            .or_else(|| status.get("endpoint").and_then(Value::as_str))
             .unwrap_or("—"),
     );
     let Some(rigs) = rigs else {
@@ -292,6 +297,17 @@ mod tests {
         assert_eq!(
             (titles[0], rows[0][0].as_str(), rows[0][3].as_str()),
             ("GPU", "RTX", "3")
+        );
+        // #### PR #42: the job source's label, rather than its endpoint.
+        let (header, _, _) = view(
+            &json!({"state": "mining", "updated": now, "endpoint": "wss://f.example",
+                "job_source": {"kind": "fulcrum-node-down",
+                    "label": "Fulcrum (node down 4m, next try in 25s)"}}),
+            now,
+        );
+        assert!(
+            header.contains("Source Fulcrum (node down 4m, next try in 25s)"),
+            "{header}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

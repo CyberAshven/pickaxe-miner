@@ -2979,6 +2979,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         search: Default::default(),
         gpu_telemetry: Default::default(),
         rigs: None,
+        job_source: Default::default(),
         token_donation: crate::donation::TokenDonation::from_bps(400),
         donation_minimum: crate::donation::TokenDonation::from_bps(400),
     };
@@ -4972,10 +4973,12 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
             )),
             5,
         ),
+        // #### PR #42: the Source row names where jobs come from.
         RuntimeField::new(
             "Source",
             wrap(format!(
-                "{} · errors: transport {} · refresh {} ({} in a row)",
+                "{} · {} · errors: transport {} · refresh {} ({} in a row)",
+                snapshot.job_source.label(),
                 if snapshot.source_degraded {
                     "degraded"
                 } else {
@@ -4993,6 +4996,18 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
             if snapshot.last_error.is_some() { 2 } else { 9 },
         ),
     ];
+    // #### PR #42: why the node is skipped, while it is, before the last
+    // error.
+    if let crate::job_source::JobSourceStatus::FulcrumNodeDown {
+        trouble, reason, ..
+    } = &snapshot.job_source
+    {
+        let at = fields.len() - 1;
+        fields.insert(
+            at,
+            RuntimeField::new("Node", wrap(format!("{}: {reason}", trouble.label())), 2),
+        );
+    }
     fields.splice(1..1, per_gpu);
     if let Some(rigs) = snapshot.rigs.as_ref() {
         for (offset, rig) in rigs.rigs.iter().enumerate() {
@@ -5617,6 +5632,11 @@ fn event_log_text(event: &RuntimeEvent) -> String {
             format!("direct reward accepted: tx={txid}")
         }
         RuntimeEvent::Error(error) => format!("error: {error}"),
+        // #### PR #42
+        RuntimeEvent::NodeDown { reason } => format!("node down, mining from Fulcrum: {reason}"),
+        RuntimeEvent::NodeBack { endpoint } => {
+            format!("back on your node {}", redact_endpoint(endpoint))
+        }
     }
 }
 
@@ -5724,6 +5744,7 @@ mod tests {
             search: Default::default(),
             gpu_telemetry: Default::default(),
             rigs: None,
+            job_source: Default::default(),
             token_donation: crate::donation::TokenDonation::from_bps(400),
             donation_minimum: crate::donation::TokenDonation::from_bps(400),
         }
@@ -7584,6 +7605,60 @@ mod tests {
             .any(|line| line.spans[1].content.contains("10.4 K")));
     }
 
+    // #### PR #42
+    // What: the Source row names where jobs come from (your node, Fulcrum,
+    // or Fulcrum while the node is down with the time and next try), and
+    // while the node is down a Node row gives the trouble and its reason;
+    // the event log names the node going down and coming back, its address
+    // redacted.
+    // Look here if: the Source row, the Node row or the node events change.
+    #[test]
+    fn the_source_row_names_the_node_or_fulcrum_while_the_node_is_down() {
+        let text = |snapshot: &RuntimeSnapshot, name: &str| {
+            runtime_field_groups(snapshot, 160)
+                .into_iter()
+                .find(|field| field.lines[0].spans[0].content.starts_with(name))
+                .map(|field| {
+                    field
+                        .lines
+                        .iter()
+                        .map(|line| line.spans[1].content.as_ref())
+                        .collect::<String>()
+                })
+        };
+        let mut snapshot = test_snapshot();
+        snapshot.job_source = crate::job_source::JobSourceStatus::Node;
+        assert!(text(&snapshot, "Source")
+            .unwrap()
+            .starts_with("your node · healthy"));
+        assert!(text(&snapshot, "Node").is_none());
+        snapshot.job_source = crate::job_source::JobSourceStatus::FulcrumNodeDown {
+            down_secs: 250,
+            next_try_secs: 25,
+            trouble: crate::job_source::NodeTrouble::Down,
+            reason: "connect: connection refused".into(),
+        };
+        let source = text(&snapshot, "Source").unwrap();
+        assert!(
+            source.starts_with("Fulcrum (node down 4m, next try in 25s) · healthy"),
+            "{source}"
+        );
+        assert_eq!(
+            text(&snapshot, "Node").unwrap(),
+            "not answering: connect: connection refused"
+        );
+        assert_eq!(
+            event_log_text(&RuntimeEvent::NodeBack {
+                endpoint: "http://user:secret@127.0.0.1:8332".into()
+            }),
+            "back on your node http://127.0.0.1:8332"
+        );
+        assert!(event_log_text(&RuntimeEvent::NodeDown {
+            reason: "timed out".into()
+        })
+        .contains("node down, mining from Fulcrum: timed out"));
+    }
+
     #[test]
     fn paused_runtime_shows_last_active_gpu_rate() {
         let mut snapshot = test_snapshot();
@@ -8287,6 +8362,7 @@ mod tests {
             search: Default::default(),
             gpu_telemetry: Default::default(),
             rigs: None,
+            job_source: Default::default(),
             token_donation: crate::donation::TokenDonation::from_bps(400),
             donation_minimum: crate::donation::TokenDonation::from_bps(400),
         };
