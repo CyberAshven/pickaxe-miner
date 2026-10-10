@@ -34,9 +34,18 @@ same across restarts. Keep that file private: it is the coordinator's identity.
 
 Without `--no-tui`, the dashboard shows a Rigs row (rigs connected, their GPUs,
 the farm's rate, winners and rejected winners, the listen address) and one row
-per rig (name, GPUs, rate, winners, minutes connected). Its Hashrate row adds
-the rigs' rate to the coordinator's own. `--json` status lines carry the same
-under `rigs`.
+per rig (name, GPUs, rate, winners, minutes connected, seconds since it was
+last heard). Under each rig, one row per GPU (#42): its name, status, rate,
+temperature, fan and power, winners, rejected winners and last error. A GPU
+that is not mining, is at 85°C or above, has rejected winners or reports an
+error keeps its row when the screen is short. Its Hashrate row adds the rigs'
+rate to the coordinator's own. `--json` status lines carry the same under
+`rigs` (each rig's `last_seen_secs`, `version` and `devices`, never a payout),
+and `mine watch` lists each rig's GPUs under it.
+
+Rigs send their GPUs with each report (every 5 seconds); a coordinator keeps
+at most 64 per rig. An older rig sends none and still works, and an older
+coordinator ignores them.
 
 Press `I` for Connection info: the exact command a rig runs, once for each
 address other computers reach the coordinator at (its address on your network

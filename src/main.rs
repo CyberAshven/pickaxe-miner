@@ -951,6 +951,11 @@ fn runtime_snapshot_json(snapshot: &runtime::RuntimeSnapshot) -> serde_json::Val
                     "rate": rig.rate,
                     "winners": rig.winners,
                     "connected_secs": rig.connected_secs,
+                    // #### PR #42: when it was last heard, its version and
+                    // each GPU's health.
+                    "last_seen_secs": rig.last_seen_secs,
+                    "version": rig.version,
+                    "devices": rig.devices,
                 })
             })
             .collect();
@@ -2196,6 +2201,7 @@ mod tests {
                         rate: 60_000.0,
                         active_rate: 2_400_000_000.0,
                         winners: 0,
+                        rejected_winners: 0,
                         status: search::GpuStatus::Mining,
                         last_error: None,
                     },
@@ -2206,6 +2212,7 @@ mod tests {
                         rate: 5_536.0,
                         active_rate: 30_000_000.0,
                         winners: 0,
+                        rejected_winners: 0,
                         status: search::GpuStatus::Recovering,
                         last_error: Some("device lost".into()),
                     },
@@ -2275,6 +2282,30 @@ mod tests {
         );
         assert_eq!(status["job_source"]["down_secs"], 61);
         assert_eq!(status["job_source"]["trouble"], "syncing");
+        // #### PR #42: each rig's GPUs, when it was last heard and its
+        // version; no payout anywhere in the rigs.
+        snapshot.rigs = Some(pickaxe_miner::rigs::RigSummary {
+            rigs: vec![pickaxe_miner::rigs::RigLine {
+                name: "rack-1".into(),
+                last_seen_secs: 4,
+                version: "0.0.4".into(),
+                devices: vec![pickaxe_miner::rigs::RigGpu {
+                    name: "RTX 3080".into(),
+                    temperature_c: Some(61.0),
+                    status: "mining".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let status = runtime_snapshot_json(&snapshot);
+        let rig = &status["rigs"]["rigs"][0];
+        assert_eq!(rig["last_seen_secs"], 4);
+        assert_eq!(rig["version"], "0.0.4");
+        assert_eq!(rig["devices"][0]["name"], "RTX 3080");
+        assert_eq!(rig["devices"][0]["temperature_c"], 61.0);
+        assert!(!status["rigs"].to_string().contains("payout"));
     }
 
     #[test]

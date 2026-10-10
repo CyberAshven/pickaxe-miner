@@ -140,14 +140,16 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
         number(rigs, "rejected"),
         rigs.get("listen").and_then(Value::as_str).unwrap_or("—"),
     ));
+    // #### PR #42: each rig, then its GPUs: status, rate, winners and
+    // health (or the error).
     let rows = rigs
         .get("rigs")
         .and_then(Value::as_array)
         .map(|each| {
             each.iter()
-                .map(|rig| {
+                .flat_map(|rig| {
                     let connected = number(rig, "connected_secs") + age;
-                    [
+                    let row = [
                         rig.get("name")
                             .and_then(Value::as_str)
                             .unwrap_or("rig")
@@ -156,7 +158,30 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
                         rate(rig.get("rate")),
                         number(rig, "winners").to_string(),
                         format!("{}m", connected / 60),
-                    ]
+                    ];
+                    let gpus = rig
+                        .get("devices")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|gpu| {
+                            let health = serde_json::from_value::<crate::rigs::RigGpu>(gpu)
+                                .map(crate::rigs::RigGpu::cleaned)
+                                .unwrap_or_default();
+                            let mut winners = health.winners.to_string();
+                            if health.rejected > 0 {
+                                winners.push_str(&format!(" ({} rejected)", health.rejected));
+                            }
+                            [
+                                format!("  {}", health.name),
+                                health.status.clone(),
+                                crate::telemetry::format_hash_rate(health.rate),
+                                winners,
+                                health.error.clone().unwrap_or_else(|| health.health()),
+                            ]
+                        });
+                    std::iter::once(row).chain(gpus).collect::<Vec<_>>()
                 })
                 .collect()
         })
@@ -164,7 +189,13 @@ fn view(status: &Value, now: u64) -> (String, Vec<[String; 5]>, [&'static str; 5
     (
         header,
         rows,
-        ["Rig", "GPUs", "Rate", "Winners", "Connected"],
+        [
+            "Rig / GPU",
+            "GPUs / status",
+            "Rate",
+            "Winners",
+            "Connected / health",
+        ],
     )
 }
 
@@ -262,7 +293,9 @@ mod tests {
                 "rigs": {"listen": "0.0.0.0:3340", "connected": 2, "gpus": 2,
                     "rate": 1.55e9, "winners": 95, "rejected": 0,
                     "rigs": [{"name": "pool-test-nvidia", "gpus": 1, "rate": 1.52e9,
-                        "winners": 94, "connected_secs": 600}]},
+                        "winners": 94, "connected_secs": 600,
+                        "devices": [{"name": "RTX 3080", "status": "mining", "rate": 1.52e9,
+                            "temperature_c": 61.0, "fan_percent": 40.0, "winners": 94}]}]},
             }),
         );
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -280,10 +313,14 @@ mod tests {
         ] {
             assert!(header.contains(part), "{part}: {header}");
         }
-        assert_eq!(titles[0], "Rig");
+        assert_eq!(titles[0], "Rig / GPU");
         assert_eq!(rows[0][0], "pool-test-nvidia");
         assert_eq!(rows[0][3], "94");
         assert_eq!(rows[0][4], "10m");
+        // #### PR #42: the rig's GPU under it, with its health.
+        assert_eq!(rows[1][0], "  RTX 3080");
+        assert_eq!(rows[1][1], "mining");
+        assert_eq!(rows[1][4], "61°C · fan 40%");
         // A stale status says so, and connected times count on.
         let (header, rows, _) = view(&saved, now + 60);
         assert!(header.contains("Miner not updating"), "{header}");

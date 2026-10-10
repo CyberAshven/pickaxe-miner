@@ -2064,3 +2064,24 @@ network, syncing, lagging, a node that cannot follow the baton), a refresh
 on a fake Fulcrum server that leaves a configured node untouched while it is
 down, the Source and Node rows, the events, the status file and the watch
 header. Not yet run live (stopping the Chipnet node needs the operator's OK).
+
+## Per-rig GPU health on the coordinator (2026-10-10)
+
+#### PR #42
+
+Each rig's report now carries its GPUs: name, engine and device, rate,
+temperature, fan, power, status, winners, rejected winners and last error
+(the search now counts rejected winners per GPU, and the rig samples its
+GPUs' telemetry). The coordinator keeps at most 64 per rig, with text
+stripped of control characters and capped and readings range-checked, plus
+the rig's version and when it was last heard. The dashboard lists each GPU
+under its rig, keeping a GPU that needs a look (not mining, 85°C or above,
+rejected winners, an error) when space is short; the status file and
+`mine watch` carry the same. Reports stay compatible both ways.
+
+Evidence: host tests for the report's round trip and both directions of
+compatibility, a worst-case report of 64 GPUs fitting one rig frame, the
+cleaning, matching search stats and telemetry to each GPU, a coordinator
+keeping 64 of 70 cleaned GPUs with the rig's version and last-heard time,
+the dashboard rows and priorities, the status file and the watch rows. Not
+yet run live with two rigs.

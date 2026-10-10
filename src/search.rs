@@ -274,6 +274,8 @@ pub struct GpuSearchStats {
     pub rate: f64,
     pub active_rate: f64,
     pub winners: u64,
+    /// #### PR #42: winners this GPU found that the host check rejected.
+    pub rejected_winners: u64,
     pub status: GpuStatus,
     pub last_error: Option<String>,
 }
@@ -1577,6 +1579,7 @@ impl SearchHandle {
                 rate: candidates as f64 / elapsed,
                 active_rate: gpu_stats.active_rate,
                 winners,
+                rejected_winners: gpu_stats.rejected_winners,
                 status,
                 last_error: gpu_stats.last_error,
             });

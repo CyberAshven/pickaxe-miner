@@ -5010,22 +5010,49 @@ fn runtime_field_groups(snapshot: &RuntimeSnapshot, pane_width: u16) -> Vec<Runt
     }
     fields.splice(1..1, per_gpu);
     if let Some(rigs) = snapshot.rigs.as_ref() {
-        for (offset, rig) in rigs.rigs.iter().enumerate() {
+        // #### PR #42: each rig, when it was last heard, and its GPUs under
+        // it; a GPU that needs a look (not mining, hot, rejected winners or
+        // an error) keeps its row when space is short.
+        let mut at = 1;
+        for rig in &rigs.rigs {
             fields.insert(
-                1 + offset,
+                at,
                 RuntimeField::new(
                     "  Rig",
                     wrap(format!(
-                        "{} · {} GPUs · {} · winners {} · {}m",
+                        "{} · {} GPUs · {} · winners {} · {}m · seen {}s ago",
                         rig.name,
                         rig.gpus,
                         crate::telemetry::format_hash_rate(rig.rate),
                         rig.winners,
-                        rig.connected_secs / 60
+                        rig.connected_secs / 60,
+                        rig.last_seen_secs
                     )),
                     4,
                 ),
             );
+            at += 1;
+            for gpu in &rig.devices {
+                let mut text = format!(
+                    "{} · {} · {} · {} · winners {}",
+                    gpu.name,
+                    gpu.status,
+                    crate::telemetry::format_hash_rate(gpu.rate),
+                    gpu.health(),
+                    gpu.winners
+                );
+                if gpu.rejected > 0 {
+                    text.push_str(&format!(" (rejected {})", gpu.rejected));
+                }
+                if let Some(error) = &gpu.error {
+                    text.push_str(&format!(" · {error}"));
+                }
+                fields.insert(
+                    at,
+                    RuntimeField::new("    GPU", wrap(text), if gpu.troubled() { 2 } else { 6 }),
+                );
+                at += 1;
+            }
         }
         fields.insert(
             1,
@@ -7659,6 +7686,79 @@ mod tests {
         .contains("node down, mining from Fulcrum: timed out"));
     }
 
+    // #### PR #42
+    // What: a coordinator shows each rig with when it was last heard, and
+    // each of its GPUs under it: a healthy one at low priority, a hot one at
+    // priority 2 with its temperature, rejected winners and error.
+    // Look here if: the rig rows or the GPU rows change.
+    #[test]
+    fn the_coordinator_shows_each_rig_gpu_and_keeps_troubled_ones() {
+        let healthy = crate::rigs::RigGpu {
+            name: "RTX 3080".into(),
+            backend: "cuda".into(),
+            device: 0,
+            rate: 1.0e9,
+            temperature_c: Some(60.0),
+            fan_percent: Some(50.0),
+            power_watts: Some(220.0),
+            status: "mining".into(),
+            winners: 2,
+            rejected: 0,
+            error: None,
+        };
+        let hot = crate::rigs::RigGpu {
+            name: "RX 6800".into(),
+            temperature_c: Some(91.0),
+            rejected: 1,
+            error: Some("rejected by the host".into()),
+            ..healthy.clone()
+        };
+        let mut snapshot = test_snapshot();
+        snapshot.rigs = Some(crate::rigs::RigSummary {
+            listen: "0.0.0.0:3340".into(),
+            connected: 1,
+            gpus: 2,
+            rate: 2.0e9,
+            rigs: vec![crate::rigs::RigLine {
+                name: "rack-1".into(),
+                gpus: 2,
+                rate: 2.0e9,
+                last_seen_secs: 3,
+                devices: vec![healthy, hot],
+                ..crate::rigs::RigLine::default()
+            }],
+            ..crate::rigs::RigSummary::default()
+        });
+        let fields = runtime_field_groups(&snapshot, 200);
+        let rows: Vec<(String, u8)> = fields
+            .iter()
+            .filter(|field| field.lines[0].spans[0].content.trim_end() == "    GPU")
+            .map(|field| {
+                (
+                    field
+                        .lines
+                        .iter()
+                        .map(|line| line.spans[1].content.as_ref())
+                        .collect::<String>(),
+                    field.priority,
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0]
+            .0
+            .starts_with("RTX 3080 · mining · 1.00 GH/s · 60°C"));
+        assert_eq!(rows[0].1, 6);
+        assert!(rows[1].0.contains("91°C"));
+        assert!(rows[1].0.contains("(rejected 1) · rejected by the host"));
+        assert_eq!(rows[1].1, 2);
+        let rig = fields
+            .iter()
+            .find(|field| field.lines[0].spans[0].content.trim_end() == "  Rig")
+            .unwrap();
+        assert!(rig.lines[0].spans[1].content.contains("seen 3s ago"));
+    }
+
     #[test]
     fn paused_runtime_shows_last_active_gpu_rate() {
         let mut snapshot = test_snapshot();
@@ -7729,6 +7829,7 @@ mod tests {
             rate: active_rate,
             active_rate,
             winners: 0,
+            rejected_winners: 0,
             status,
             last_error: None,
         };
@@ -7914,6 +8015,7 @@ mod tests {
                 rate: 2.0e9,
                 winners: 3,
                 connected_secs: 120,
+                ..crate::rigs::RigLine::default()
             }],
             public: false,
         });
