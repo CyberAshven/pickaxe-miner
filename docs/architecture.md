@@ -363,6 +363,12 @@ What this means for Pickaxe, and what step 1 did:
   the node is behind or on the wrong network.
 - When the node stops answering, keep mining from the Fulcrum list, show it on
   the dashboard, and switch back when the node returns (done in #42).
+- The setup's BCH node list checks every saved node when it opens (and after
+  a node is saved), each on its own thread, and says what it found: the
+  client and sync height and whether it follows PHOTON, a refused login, no
+  answer, another network or chain, or a node that answers but cannot follow
+  PHOTON (no gettxout, such as Knuth), whose BCH ASIC templates still work
+  (done in #42). A node without getnetworkinfo is "BCH node".
 - A node's chain is proven by its fork block (BCH's UAHF block 478,559 on
   mainnet, Chipnet's block 115,252), since a Bitcoin (BTC) node reports the
   same chain name and testnet4 shares Chipnet's genesis: the ASIC server and

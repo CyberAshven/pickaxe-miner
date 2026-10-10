@@ -2124,3 +2124,24 @@ fork block and asking the right one once per node, the node check (BCH
 passes and is not asked again, BTC refused, a young node syncing), and the
 GPU watch classing the refusal as another network. Not yet run against a
 BTC or testnet4 node.
+
+## Saved nodes are checked in the setup (2026-10-10)
+
+#### PR #42
+
+Opening the setup's BCH node list now checks every saved node of the network
+(at most 16, each on its own thread, and again after a node is saved). Each
+line says what its check found, never with the node's login: the client,
+sync height and "follows PHOTON"; "cannot follow PHOTON (no gettxout)" for a
+node such as Knuth, whose BCH ASIC templates still work; a refused RPC login;
+no answer; another network ("on Chipnet, not Mainnet"); or another chain by
+its fork block ("Bitcoin (BTC), not Bitcoin Cash", "testnet4, not Chipnet").
+A node without getnetworkinfo now reads as "BCH node" instead of failing.
+
+Not yet: the wider search of this computer (Fulcrum, ZMQ and other ports),
+`bitcoin.conf` logins and the Fulcrum list's tip beside a node's height.
+
+Evidence: host tests for the checks against scripted nodes (BCH following
+PHOTON, BTC, the other network, testnet4's fork block, no gettxout and no
+getnetworkinfo, an unreachable node without its login in the text) and the
+setup's list showing each saved node's result.

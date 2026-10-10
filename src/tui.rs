@@ -552,6 +552,14 @@ struct SetupFlow {
     local_node: LocalNodeCheck,
     /// How the check looks; tests replace it.
     probe_local_node: fn(MiningNetwork) -> crate::node::LocalNode,
+    /// #### PR #42: each saved node's check by URL, where running checks
+    /// report, and how a node is checked (tests replace it).
+    node_checks: std::collections::HashMap<String, crate::node::NodeCheck>,
+    node_checks_rx: Option<(
+        MiningNetwork,
+        mpsc::Receiver<(String, crate::node::NodeCheck)>,
+    )>,
+    check_node: fn(&str, MiningNetwork) -> crate::node::NodeCheck,
 }
 
 /// #### PR #40
@@ -654,6 +662,12 @@ impl SetupFlow {
             probe_local_node: crate::node::probe_local_node,
             #[cfg(test)]
             probe_local_node: |_| crate::node::LocalNode::Missing,
+            node_checks: std::collections::HashMap::new(),
+            node_checks_rx: None,
+            #[cfg(not(test))]
+            check_node: crate::node::check_node,
+            #[cfg(test)]
+            check_node: |_, _| crate::node::NodeCheck::NoAnswer("not checked in tests".into()),
         })
     }
 
@@ -667,6 +681,46 @@ impl SetupFlow {
             let _ = send.send(probe(network));
         });
         self.local_node = LocalNodeCheck::Running(network, receive);
+        // #### PR #42: and every saved node of the network.
+        self.check_saved_nodes();
+    }
+
+    /// #### PR #42: checks each saved node of the network on its own thread
+    /// (at most 16); the list shows "checking…" until each reports.
+    fn check_saved_nodes(&mut self) {
+        let network = self.config.network;
+        let urls: Vec<String> = self
+            .sources
+            .list(network, ConnectionKind::Node)
+            .iter()
+            .take(16)
+            .cloned()
+            .collect();
+        self.node_checks.clear();
+        let (send, receive) = mpsc::channel();
+        let check = self.check_node;
+        for url in urls {
+            let send = send.clone();
+            thread::spawn(move || {
+                let result = check(&url, network);
+                let _ = send.send((url, result));
+            });
+        }
+        self.node_checks_rx = Some((network, receive));
+    }
+
+    /// Takes the checks that have reported.
+    fn poll_node_checks(&mut self) {
+        let Some((network, receive)) = &self.node_checks_rx else {
+            return;
+        };
+        if *network != self.config.network {
+            self.node_checks_rx = None;
+            return;
+        }
+        while let Ok((url, check)) = receive.try_recv() {
+            self.node_checks.insert(url, check);
+        }
     }
 
     fn checking_local_node(&self) -> bool {
@@ -676,6 +730,8 @@ impl SetupFlow {
     /// Takes the check's result once it is in. The cursor moves to the
     /// offered node if it still rests on "+ add node", so Enter adds it.
     fn poll_local_node(&mut self) {
+        // #### PR #42: the saved nodes' checks too.
+        self.poll_node_checks();
         let LocalNodeCheck::Running(network, receive) = &self.local_node else {
             return;
         };
@@ -2230,6 +2286,10 @@ impl SetupFlow {
                     self.sources = updated;
                 }
                 self.save_sources()?;
+                // #### PR #42: the saved nodes are checked again.
+                if self.connection_kind == ConnectionKind::Node {
+                    self.check_saved_nodes();
+                }
                 Ok(format!(
                     "Saved for every profile on {}.",
                     network_label(network)
@@ -4289,15 +4349,24 @@ fn render_setup_connections(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow
     ])];
     for (index, entry) in saved.iter().enumerate() {
         let selected = state.connection_selected == index;
-        let shown = if selected && state.editing == Some(TextField::Connection) {
+        let editing = selected && state.editing == Some(TextField::Connection);
+        let shown = if editing {
             format!("{}_", state.text_input)
         } else {
             crate::node::redact_url(entry)
         };
-        lines.push(Line::from(format!(
-            "{} {shown}",
-            selection_marker(selected)
-        )));
+        let mut line = vec![Span::raw(format!("{} {shown}", selection_marker(selected)))];
+        // #### PR #42: what the check of a saved node found.
+        if state.connection_kind == ConnectionKind::Node && !editing {
+            line.push(Span::raw("  "));
+            line.push(match state.node_checks.get(entry) {
+                Some(check @ crate::node::NodeCheck::Ready { .. }) => Span::raw(check.summary()),
+                Some(check) => dim(check.summary()),
+                None if state.node_checks_rx.is_some() => dim("checking…"),
+                None => dim(""),
+            });
+        }
+        lines.push(Line::from(line));
     }
     let adding = state.connection_selected == saved.len();
     let add_label = match state.connection_kind {
@@ -7149,6 +7218,50 @@ mod tests {
         setup.config.node_url = Some("http://user:pass@127.0.0.1:8332".into());
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+    }
+
+    // #### PR #42
+    // What: opening the BCH node list checks every saved node of the network
+    // on its own thread; each line says "checking…" until its check reports,
+    // then what it found, never with the node's login.
+    // Look here if: check_saved_nodes or the node list's lines change.
+    #[test]
+    fn saved_nodes_show_their_checks() {
+        let mut setup = setup_for(MiningMode::Asic);
+        for node in [
+            "http://user:secret@192.168.0.55:48332",
+            "http://127.0.0.1:48332",
+        ] {
+            setup
+                .sources
+                .put(MiningNetwork::Chipnet, ConnectionKind::Node, None, node)
+                .unwrap();
+        }
+        setup.check_node = |url, _| {
+            if url.contains("192.168.0.55") {
+                crate::node::NodeCheck::NoAnswer("connect: timed out".into())
+            } else {
+                crate::node::NodeCheck::WrongChain("testnet4, not Chipnet".into())
+            }
+        };
+        setup.connection_kind = ConnectionKind::Node;
+        setup.step = SetupStep::Connections;
+        setup.check_local_node();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while setup.node_checks.len() < 2 && std::time::Instant::now() < deadline {
+            setup.poll_local_node();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains("no answer (connect: timed out)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("testnet4, not Chipnet: Pickaxe cannot use it"),
+            "{screen}"
+        );
+        assert!(!screen.contains("secret"), "{screen}");
     }
 
     // #### PR #40

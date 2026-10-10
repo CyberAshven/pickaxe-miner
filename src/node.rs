@@ -1216,16 +1216,114 @@ pub fn verify_chain(url: &str, network: crate::config::MiningNetwork) -> Result<
     Ok(())
 }
 
+// #### PR #42: saved nodes are checked
+// What: a check of a node asks its chain and sync state, proves its chain by
+// the fork block (BCH, not BTC; Chipnet, not testnet4), and tries gettxout,
+// which following PHOTON needs; it says what it found in one line, never
+// with a login.
+// Why: a saved node that was down, on another chain, wanting its login or
+// unable to follow PHOTON looked the same as a working one in the setup.
+// Look here if: the setup shows a wrong status for a saved node.
+/// What a check of a node found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeCheck {
+    /// It answers on the network, and whether it can follow PHOTON.
+    Ready {
+        info: NodeInfo,
+        follows_photon: bool,
+    },
+    NeedsLogin,
+    /// It is on another chain, as "on Chipnet, not Mainnet" or "Bitcoin
+    /// (BTC), not Bitcoin Cash".
+    WrongChain(String),
+    NoAnswer(String),
+}
+
+impl NodeCheck {
+    /// One line for screens.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Ready {
+                info,
+                follows_photon: true,
+            } => format!("{} · follows PHOTON", info.summary()),
+            Self::Ready { info, .. } => format!(
+                "{} · cannot follow PHOTON (no gettxout): PHOTON jobs come from Fulcrum; BCH \
+                 ASIC templates still work",
+                info.summary()
+            ),
+            Self::NeedsLogin => {
+                "wants its RPC login: add it as http://USER:PASSWORD@HOST:PORT".into()
+            }
+            Self::WrongChain(chain) => format!("{chain}: Pickaxe cannot use it"),
+            Self::NoAnswer(reason) => format!("no answer ({reason})"),
+        }
+    }
+}
+
+/// Checks the node at `url` for `network` (see `NodeCheck`).
+pub fn check_node(url: &str, network: crate::config::MiningNetwork) -> NodeCheck {
+    let (connect, read) = (Duration::from_secs(3), Duration::from_secs(5));
+    let label = |network: crate::config::MiningNetwork| match network {
+        crate::config::MiningNetwork::Mainnet => "Mainnet",
+        crate::config::MiningNetwork::Chipnet => "Chipnet",
+    };
+    let first_line = |error: String| error.lines().next().unwrap_or_default().to_owned();
+    let info = match node_info_timed(url, connect, read) {
+        Ok(info) => info,
+        Err(error) if error == NODE_RPC_LOGIN_REFUSED => return NodeCheck::NeedsLogin,
+        Err(error) => return NodeCheck::NoAnswer(first_line(error)),
+    };
+    match info.network() {
+        Some(found) if found == network => {}
+        Some(found) => {
+            return NodeCheck::WrongChain(format!("on {}, not {}", label(found), label(network)))
+        }
+        None => {
+            return NodeCheck::WrongChain(format!(
+                "on the {} chain, not {}",
+                if info.chain.is_empty() {
+                    "unnamed"
+                } else {
+                    info.chain.as_str()
+                },
+                label(network)
+            ))
+        }
+    }
+    let (fork, expected) = network.fork_block();
+    if info.blocks >= u64::from(fork) {
+        match rpc_call_timed(url, "getblockhash", json!([fork]), connect, read) {
+            Ok(block)
+                if block
+                    .as_str()
+                    .is_some_and(|block| block.eq_ignore_ascii_case(expected)) => {}
+            Ok(_) => return NodeCheck::WrongChain(network.foreign_chain().into()),
+            Err(error) => return NodeCheck::NoAnswer(first_line(error)),
+        }
+    }
+    let follows_photon =
+        rpc_call_timed(url, "gettxout", json!(["00".repeat(32), 0]), connect, read).is_ok();
+    NodeCheck::Ready {
+        info,
+        follows_photon,
+    }
+}
+
 /// Asks a node for its client, chain and sync state.
 pub fn node_info(url: &str) -> Result<NodeInfo, String> {
     node_info_timed(url, RPC_CONNECT_TIMEOUT, RPC_READ_TIMEOUT)
 }
 
 fn node_info_timed(url: &str, connect: Duration, read: Duration) -> Result<NodeInfo, String> {
-    let network = rpc_call_timed(url, "getnetworkinfo", json!([]), connect, read)?;
+    // #### PR #42: the chain first (a dead node fails once), then the client
+    // name, which a node without getnetworkinfo (Knuth) leaves as "BCH
+    // node".
     let chain = rpc_call_timed(url, "getblockchaininfo", json!([]), connect, read)?;
+    let network = rpc_call_timed(url, "getnetworkinfo", json!([]), connect, read).ok();
     let client = network
-        .get("subversion")
+        .as_ref()
+        .and_then(|network| network.get("subversion"))
         .and_then(Value::as_str)
         .and_then(client_from_subversion)
         .unwrap_or_else(|| "BCH node".into());
@@ -1787,8 +1885,12 @@ mod gbt_tests {
                     request_json.get("method").and_then(Value::as_str),
                     Some(expected_method)
                 );
-                let body =
-                    json!({"result": response_value, "error": null, "id": "pickaxe"}).to_string();
+                // #### PR #42: `{"__rpc_error": ...}` answers as an RPC error.
+                let body = match response_value.get("__rpc_error") {
+                    Some(error) => json!({"result": null, "error": error, "id": "pickaxe"}),
+                    None => json!({"result": response_value, "error": null, "id": "pickaxe"}),
+                }
+                .to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(), body
@@ -1987,15 +2089,16 @@ mod gbt_tests {
         server.join().unwrap();
         assert_eq!(refused, Err(NODE_RPC_LOGIN_REFUSED.to_string()));
 
+        // #### PR #42: the chain first, then the client.
         let (url, server) = serve_json_rpc_sequence(vec![
-            (
-                "getnetworkinfo",
-                json!({"subversion": "/Bitcoin Cash Node:29.1.0(EB32.0)/"}),
-            ),
             (
                 "getblockchaininfo",
                 json!({"chain": "chip", "blocks": 326900, "headers": 326900,
                     "initialblockdownload": false, "verificationprogress": 0.99999}),
+            ),
+            (
+                "getnetworkinfo",
+                json!({"subversion": "/Bitcoin Cash Node:29.1.0(EB32.0)/"}),
             ),
         ]);
         let info = node_info(&url).unwrap();
@@ -2122,6 +2225,120 @@ mod gbt_tests {
         server.join().unwrap();
         assert_eq!(reported_endpoint, endpoint);
         assert_eq!(policy.mempool_min_fee_sats_per_kb, 1_234);
+    }
+
+    /// #### PR #42: a synced node's chain report.
+    fn chain(name: &str, blocks: u64) -> Value {
+        json!({"chain": name, "blocks": blocks, "headers": blocks,
+            "initialblockdownload": false, "verificationprogress": 1.0})
+    }
+
+    // #### PR #42
+    // What: a check tells a BCH node that can follow PHOTON, a BTC node (its
+    // fork block), a node on the other network, and a Chipnet-named node
+    // with testnet4's fork block, each in one line.
+    // Look here if: check_node changes.
+    #[test]
+    fn check_node_tells_bch_from_btc_and_chipnet_from_testnet4() {
+        use crate::config::MiningNetwork;
+        let agent = json!({"subversion": "/Bitcoin Cash Node:29.1.0(EB32.0)/"});
+        let (_, bch) = MiningNetwork::Mainnet.fork_block();
+        let (node, server) = serve_json_rpc_sequence(vec![
+            ("getblockchaininfo", chain("main", 900_000)),
+            ("getnetworkinfo", agent.clone()),
+            ("getblockhash", json!(bch)),
+            ("gettxout", Value::Null),
+        ]);
+        let check = check_node(&node, MiningNetwork::Mainnet);
+        server.join().unwrap();
+        assert!(matches!(
+            check,
+            NodeCheck::Ready {
+                follows_photon: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            check.summary(),
+            "Bitcoin Cash Node 29.1.0 · synced at height 900000 · follows PHOTON"
+        );
+        let (btc, server) = serve_json_rpc_sequence(vec![
+            ("getblockchaininfo", chain("main", 900_000)),
+            ("getnetworkinfo", agent.clone()),
+            ("getblockhash", json!("00".repeat(32))),
+        ]);
+        assert_eq!(
+            check_node(&btc, MiningNetwork::Mainnet).summary(),
+            "Bitcoin (BTC), not Bitcoin Cash: Pickaxe cannot use it"
+        );
+        server.join().unwrap();
+        let (chipnet, server) = serve_json_rpc_sequence(vec![
+            ("getblockchaininfo", chain("chip", 300_000)),
+            ("getnetworkinfo", agent.clone()),
+        ]);
+        assert_eq!(
+            check_node(&chipnet, MiningNetwork::Mainnet),
+            NodeCheck::WrongChain("on Chipnet, not Mainnet".into())
+        );
+        server.join().unwrap();
+        let (testnet4, server) = serve_json_rpc_sequence(vec![
+            ("getblockchaininfo", chain("chip", 300_000)),
+            ("getnetworkinfo", agent),
+            ("getblockhash", json!("ae".repeat(32))),
+        ]);
+        assert_eq!(
+            check_node(&testnet4, MiningNetwork::Chipnet),
+            NodeCheck::WrongChain("testnet4, not Chipnet".into())
+        );
+        server.join().unwrap();
+    }
+
+    // #### PR #42
+    // What: a node without gettxout (a Knuth node, -32601) answers but
+    // cannot follow PHOTON, and one without getnetworkinfo is "BCH node".
+    // Look here if: check_node or node_info_timed changes.
+    #[test]
+    fn a_node_without_gettxout_does_not_follow_photon() {
+        use crate::config::MiningNetwork;
+        let (_, chipnet) = MiningNetwork::Chipnet.fork_block();
+        let missing = json!({"__rpc_error": {"code": -32601, "message": "Method not found"}});
+        let (node, server) = serve_json_rpc_sequence(vec![
+            ("getblockchaininfo", chain("chip", 300_000)),
+            ("getnetworkinfo", missing.clone()),
+            ("getblockhash", json!(chipnet)),
+            ("gettxout", missing),
+        ]);
+        let check = check_node(&node, MiningNetwork::Chipnet);
+        server.join().unwrap();
+        let NodeCheck::Ready {
+            info,
+            follows_photon,
+        } = &check
+        else {
+            panic!("{check:?}")
+        };
+        assert_eq!(info.client, "BCH node");
+        assert!(!follows_photon);
+        assert!(check
+            .summary()
+            .contains("cannot follow PHOTON (no gettxout)"));
+    }
+
+    // #### PR #42
+    // What: a node is refused its login or not reached at all, each said in
+    // one line with no login in it.
+    #[test]
+    fn a_node_check_names_a_refused_login_or_no_answer() {
+        use crate::config::MiningNetwork;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://user:secret@{}", closed.local_addr().unwrap());
+        drop(closed);
+        let check = check_node(&url, MiningNetwork::Chipnet);
+        assert!(matches!(check, NodeCheck::NoAnswer(_)), "{check:?}");
+        assert!(!check.summary().contains("secret"));
+        assert!(NodeCheck::NeedsLogin
+            .summary()
+            .contains("wants its RPC login"));
     }
 
     // #### PR #42
