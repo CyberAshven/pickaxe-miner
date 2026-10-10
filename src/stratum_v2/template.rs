@@ -3,7 +3,11 @@
 //! list and target; do not inherit Bitcoin witness or fixed block-size rules.
 
 use super::jd::plan::JdPlan;
-use super::merge::set::{AuxJob, AuxOutputs, TokenSet};
+use super::merge::{
+    header::{forwarder_body, MAX_P2S, TAG},
+    set::{AuxJob, AuxOutputs, TokenSet},
+    OutPoint,
+};
 use crate::config::MiningNetwork;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -47,6 +51,58 @@ pub struct BchTemplate {
     /// jobs built from this template pay the pool's outputs and nest their
     /// extranonce inside the pool channel's.
     jd: Option<Arc<JdPlan>>,
+    /// #### PR #42: a BCH block, or an ASIC-exclusive token's header.
+    work: Work,
+}
+
+// #### PR #42: Work::Token
+// What: a template is BCH block work (the default; merge-mined tokens may
+// ride along) or an ASIC-exclusive token's job, mined instead of BCH: a
+// header-shaped token (SAFA layout v1) whose header is the token's
+// commitment and whose coinbase is the keyless forwarder, or a Case A
+// pure-token job (a coinbase-only "block" whose commitment names the token).
+// Token work has no transactions, is never a block, and carries its own
+// version rule.
+// Why: one job pipeline: vardiff, the SV1 adapter, SV2 standard and
+// extended channels, telemetry and donation rotation run unchanged on token
+// jobs; with BCH selected nothing changes.
+// Look here if: a token job reaches the block journal, or a BCH job's
+// version rule changes.
+/// What a template's jobs are worth.
+#[derive(Clone, Debug, Default)]
+pub enum Work {
+    #[default]
+    Block,
+    Token(Arc<TokenJob>),
+}
+
+/// How a token's job is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// SAFA v1: the header is the token's commitment, and the coinbase is
+    /// the forwarder that receives the claim.
+    Safa,
+    /// Case A pure-token: a coinbase-only "block" whose output 0 commits to
+    /// the token.
+    CaseA,
+}
+
+/// An ASIC-exclusive token's job, mined instead of BCH.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenJob {
+    /// The token's name, for the dashboard.
+    pub token: &'static str,
+    pub layout: Layout,
+    /// The version bits a device may roll; 0 keeps the version fixed.
+    pub version_mask: u32,
+    /// What the work answers: HASH256 of the thread's commitment (SAFA), or
+    /// the Case A anchor.
+    pub anchor: Hash,
+    /// The thread (or baton) the job was issued for.
+    pub thread: OutPoint,
+    pub age: u16,
+    /// The chain's median time past when the job was built.
+    pub mtp: u32,
 }
 
 /// #### PR #42: where a template's jobs come from.
@@ -182,6 +238,7 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::Own,
             jd: None,
+            work: Work::Block,
         })
     }
 
@@ -271,6 +328,7 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::Own,
             jd: None,
+            work: Work::Block,
         })
     }
 
@@ -303,6 +361,7 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::HeaderOnly,
             jd: None,
+            work: Work::Block,
         }
     }
 
@@ -336,7 +395,78 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::Declared,
             jd: None,
+            work: Work::Block,
         }
+    }
+
+    /// #### PR #42
+    /// An ASIC-exclusive token's job: no transactions and no BCH value; the
+    /// previous hash, bits and target (at full precision) are the token's,
+    /// and devices start at `ntime_start`. `height` only shapes a Case A
+    /// coinbase's script.
+    pub fn token_only(
+        job: Arc<TokenJob>,
+        previous_hash: Hash,
+        version: u32,
+        bits: u32,
+        target: Hash,
+        ntime_start: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            previous_hash,
+            version,
+            bits,
+            target,
+            min_time: ntime_start,
+            current_time: ntime_start,
+            height,
+            // No block: a size that keeps the coinbase checks inert.
+            size_limit: 1_000_000,
+            coinbase_value: 0,
+            coinbase_flags: Vec::new(),
+            transactions: Vec::new().into(),
+            txids: Vec::new().into(),
+            index: Default::default(),
+            merkle_path: Vec::new().into(),
+            tokens: None,
+            origin: Origin::Own,
+            jd: None,
+            work: Work::Token(job),
+        }
+    }
+
+    /// #### PR #42: the token job, for token work.
+    pub fn token_job(&self) -> Option<&Arc<TokenJob>> {
+        match &self.work {
+            Work::Block => None,
+            Work::Token(job) => Some(job),
+        }
+    }
+
+    /// #### PR #42: whether this is BCH block work.
+    pub fn is_block(&self) -> bool {
+        matches!(self.work, Work::Block)
+    }
+
+    // #### PR #42: the per-template version rule
+    // What: the version bits a device may roll: BIP320's for BCH blocks and
+    // Case A token jobs, the token's own rule for a header-shaped token (none
+    // when the token fixes its version slot).
+    // Why: a header-shaped token's covenant checks the version slot.
+    // Look here if: shares are refused with invalid-version on token work.
+    /// The version bits a device may roll.
+    pub fn version_mask(&self) -> u32 {
+        match &self.work {
+            Work::Block => super::channel::VERSION_ROLLING_MASK,
+            Work::Token(job) => job.version_mask,
+        }
+    }
+
+    /// Whether this template's coinbase is the forwarder.
+    fn is_safa(&self) -> bool {
+        self.token_job()
+            .is_some_and(|job| job.layout == Layout::Safa)
     }
 
     /// #### PR #42: this template for a custom job set on it: the job's
@@ -500,6 +630,19 @@ impl BchTemplate {
         policy: crate::donation::bch::BchPayout,
         aux: Option<&AuxOutputs>,
     ) -> Result<Coinbase, String> {
+        // #### PR #42: the script coinbase
+        // What: on a SAFA job the coinbase is the forwarder: a push of the
+        // tag and the extranonce, OP_DROP, and the rule that forwards the
+        // claim to the job's beneficiary (the miner, or the donation in its
+        // work jobs). With no transactions the merkle root is its HASH256,
+        // the payout field the token checks.
+        // Why: devices hash a coinbase they never parse, so any SV1 or SV2
+        // device mines the token unchanged.
+        // Look here if: a SAFA win names another payout than its job's.
+        if self.is_safa() {
+            let scripts = super::payout::scripts(network, payout, operator)?;
+            return forwarder_coinbase(extranonce, super::payout::beneficiary(&scripts, policy));
+        }
         // #### PR #42: Job Declaration jobs pay the pool's outputs.
         let outputs = match &self.jd {
             Some(plan) => plan.outputs(self.coinbase_value),
@@ -640,9 +783,14 @@ impl BchTemplate {
 
     /// The parts of `coinbase`, whose extranonce is `extranonce_len` bytes.
     fn split(&self, coinbase: Coinbase, extranonce_len: usize) -> CoinbaseParts {
-        // The coinbase script is at most 100 bytes, so its CompactSize is one byte.
-        let offset =
-            4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len();
+        // The coinbase script is at most 100 bytes, so its CompactSize is one
+        // byte; #### PR #42: a forwarder's extranonce follows its push and
+        // tag.
+        let offset = if self.is_safa() {
+            1 + TAG.len()
+        } else {
+            4 + 1 + 32 + 4 + 1 + height_script(self.height).len() + self.coinbase_flags.len()
+        };
         CoinbaseParts {
             prefix: coinbase.bytes[..offset].to_vec(),
             suffix: coinbase.bytes[offset + extranonce_len..].to_vec(),
@@ -674,6 +822,10 @@ impl BchTemplate {
     pub fn block(&self, coinbase: &Coinbase, header: [u8; 80]) -> Result<Vec<u8>, String> {
         if self.origin == Origin::HeaderOnly {
             return Err("a custom job's template has no transactions".into());
+        }
+        // #### PR #42: block suppression: token work never becomes a block.
+        if !self.is_block() {
+            return Err("token work is not a BCH block".into());
         }
         self.check_block_size(coinbase.bytes.len())?;
         if header[4..36] != self.previous_hash
@@ -750,6 +902,25 @@ impl BchTemplate {
         }
         Ok(())
     }
+}
+
+/// #### PR #42: a SAFA job's coinbase: the forwarder to `destination`
+/// around `extranonce`, whose HASH256 is the merkle root.
+fn forwarder_coinbase(extranonce: &[u8], destination: &[u8]) -> Result<Coinbase, String> {
+    let pushed = TAG.len() + extranonce.len();
+    if pushed > 75 {
+        return Err("extranonce exceeds the forwarder's salt".into());
+    }
+    let mut bytes = vec![pushed as u8];
+    bytes.extend_from_slice(&TAG);
+    bytes.extend_from_slice(extranonce);
+    bytes.push(0x75);
+    bytes.extend(forwarder_body(destination)?);
+    if bytes.len() > MAX_P2S {
+        return Err("the forwarder exceeds 201 bytes".into());
+    }
+    let merkle_root = double_sha256(&bytes);
+    Ok(Coinbase { bytes, merkle_root })
 }
 
 /// #### PR #42: what a Template Distribution provider announced for one

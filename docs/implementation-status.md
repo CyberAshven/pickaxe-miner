@@ -1891,3 +1891,24 @@ scenario passes only through the sign bug), the adjustment table, the
 compact encoding against Bitcoin's for sizes 3 to 32, the freeze guard, each
 claim mutation, the version rules, the forwarder's golden hashes, SRI's own
 BIP141 check on every prefix, and the win record. No token is deployed.
+
+## Token work in the share path (2026-10-10)
+
+#### PR #42
+
+No change while BCH is selected. A template's work is a BCH block or a
+token's job (`Work::Token`); a token job has no transactions, a SAFA job's
+coinbase is the forwarder (the standard root is its HASH256; extended parts
+are its prefix and suffix with an empty path), and token work is never a
+block. A SAFA win is a share whose hash is positive and at or below the
+token's target. The version rule comes from the template: BIP320 for blocks
+and Case A, the token's own for a header-shaped token; for a token that
+fixes its version the server refuses clients that require rolling and sets
+the fixed-version bit, and the SV1 adapter asks for no rolling, answers
+`mining.configure` without it and takes jobs that disallow it.
+
+Evidence: host tests for block suppression and the positive-hash win, the
+version rules, the script coinbase and its parts, the fixed-version setup and
+jobs, the adapter's fixed version, and a loopback run where an SV2 standard
+device, an SV2 extended device and SV1 firmware through the adapter mine a
+SAFA job: every share accepted, none journaled, nothing at the node.

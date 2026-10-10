@@ -81,6 +81,8 @@ pub struct MiningSession {
     /// and its groups by id.
     grouping: bool,
     groups: BTreeMap<u32, Group>,
+    /// #### PR #42: the server mines a token that fixes the version slot.
+    fixed_version: bool,
 }
 
 pub struct Responses {
@@ -95,6 +97,9 @@ pub struct Responses {
     pub custom_job: Option<Result<(), &'static str>>,
     /// #### PR #42: accepted shares on Job Declaration jobs, for the pool.
     pub forward: Vec<ForwardShare>,
+    /// #### PR #42: accepted shares that win a header-shaped token (never
+    /// blocks).
+    pub header_wins: Vec<ValidatedShare>,
 }
 
 impl MiningSession {
@@ -131,7 +136,15 @@ impl MiningSession {
             lanes: None,
             grouping: false,
             groups: BTreeMap::new(),
+            fixed_version: false,
         })
+    }
+
+    /// #### PR #42: the server mines a token that fixes the version slot:
+    /// clients that require version rolling are refused, others are told
+    /// the version is fixed.
+    pub fn set_fixed_version(&mut self, fixed: bool) {
+        self.fixed_version = fixed;
     }
 
     /// #### PR #42: a Job Declaration client's local server, whose channels
@@ -342,12 +355,22 @@ impl MiningSession {
             } else {
                 0b101
             };
+            // #### PR #42: the Fixed-version setup
+            // What: when the server mines a token that fixes the version
+            // slot, a client that requires version rolling (bit 2, as every
+            // Bitaxe sets) is refused with that bit, and any other client is
+            // told the version is fixed (Success bit 0).
+            // Why: shares with rolled version bits would never be valid for
+            // such a token; refusing at setup says why.
+            // Look here if: a device cannot connect in token mode.
             let error = if setup.protocol != Protocol::MiningProtocol {
                 Some((0, "unsupported-protocol"))
             } else if setup.min_version > 2 || setup.max_version < 2 {
                 Some((0, "protocol-version-mismatch"))
             } else if setup.flags & !allowed != 0 {
                 Some((setup.flags & !allowed, "unsupported-feature-flags"))
+            } else if self.fixed_version && setup.flags & 0b100 != 0 {
+                Some((0b100, "unsupported-feature-flags"))
             } else {
                 None
             };
@@ -374,10 +397,11 @@ impl MiningSession {
                         && setup.firmware.as_utf8_or_hex().is_empty());
                 // Upstream flag bit 0 means REQUIRES_FIXED_VERSION. Leave it
                 // clear: ASIC hardware, including Bitaxe, needs version rolling.
+                // #### PR #42: set only for a token that fixes the version.
                 frames.push(encoded(
                     SetupConnectionSuccess {
                         used_version: 2,
-                        flags: 0,
+                        flags: u32::from(self.fixed_version),
                     },
                     common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
                     false,
@@ -390,6 +414,7 @@ impl MiningSession {
                 share_event,
                 custom_job: None,
                 forward: Vec::new(),
+                header_wins: Vec::new(),
             });
         }
         let flags = self
@@ -403,6 +428,7 @@ impl MiningSession {
         }
         let mut custom_job = None;
         let mut forward = Vec::new();
+        let mut header_wins = Vec::new();
         match msg {
             Mining::OpenStandardMiningChannel(request) => {
                 let maximum = request
@@ -459,6 +485,7 @@ impl MiningSession {
                     &mut blocks,
                     &mut token_wins,
                     &mut forward,
+                    &mut header_wins,
                 )?);
             }
             Mining::SubmitSharesExtended(request) => {
@@ -479,6 +506,7 @@ impl MiningSession {
                     &mut blocks,
                     &mut token_wins,
                     &mut forward,
+                    &mut header_wins,
                 )?);
             }
             Mining::UpdateChannel(request) => {
@@ -572,6 +600,7 @@ impl MiningSession {
             share_event,
             custom_job,
             forward,
+            header_wins,
         })
     }
 
@@ -948,6 +977,7 @@ impl MiningSession {
         blocks: &mut Vec<ValidatedShare>,
         token_wins: &mut Vec<TokenWin>,
         forward: &mut Vec<ForwardShare>,
+        header_wins: &mut Vec<ValidatedShare>,
     ) -> Result<ShareEvent, String> {
         let id = share.channel_id;
         let sequence = share.sequence;
@@ -998,6 +1028,8 @@ impl MiningSession {
                 }
                 if share.block {
                     blocks.push(share);
+                } else if share.header_win {
+                    header_wins.push(share);
                 }
                 Ok(event)
             }
@@ -1079,7 +1111,8 @@ fn frames_for(
             job_id: job.id,
             min_ntime: Sv2Option::new(immediate.then_some(job.template.current_time)),
             version: job.template.version,
-            version_rolling_allowed: true,
+            // #### PR #42: none for a token that fixes the version.
+            version_rolling_allowed: job.template.version_mask() != 0,
             merkle_path: job
                 .parts
                 .merkle_path
@@ -2462,6 +2495,75 @@ mod tests {
         assert_eq!(
             open_extended(&mut legacy, "sv1-device"),
             Err("channel-capacity-exhausted".into())
+        );
+    }
+
+    // #### PR #42
+    // What: for a token that fixes the version slot, a client requiring
+    // version rolling (Bitaxe's 0b101) is refused with bit 2; another is
+    // told the version is fixed (Success bit 0), and its extended jobs
+    // disallow rolling.
+    // Look here if: the Fixed-version setup changes.
+    #[test]
+    fn fixed_version_refuses_rolling_clients_and_disallows_rolling_in_jobs() {
+        let fixed_template = Arc::new(BchTemplate::token_only(
+            Arc::new(super::super::template::TokenJob {
+                token: "test",
+                layout: super::super::template::Layout::Safa,
+                version_mask: 0,
+                anchor: [5; 32],
+                thread: super::super::merge::OutPoint {
+                    txid: [6; 32],
+                    vout: 0,
+                },
+                age: 71,
+                mtp: NOW,
+            }),
+            [0xab; 32],
+            0x2000_0000,
+            0x207f_ffff,
+            [0xff; 32],
+            NOW,
+            1,
+        ));
+        let mut bitaxe = session();
+        bitaxe.set_fixed_version(true);
+        let mut reply = bitaxe.receive(setup(0b101), NOW).unwrap();
+        assert_eq!(reply.frames[0].header().msg_type(), 2);
+        let error: SetupConnectionError =
+            binary_sv2::from_bytes(reply.frames[0].payload()).unwrap();
+        assert_eq!(error.flags, 0b100);
+        let mut plain = session();
+        plain.set_fixed_version(true);
+        plain.set_job(10, 4, fixed_template).unwrap();
+        let mut reply = plain.receive(setup(0), NOW).unwrap();
+        let success: SetupConnectionSuccess =
+            binary_sv2::from_bytes(reply.frames[0].payload()).unwrap();
+        assert_eq!(success.flags, 1);
+        let mut frames = plain
+            .receive(
+                mining(Mining::OpenExtendedMiningChannel(
+                    OpenExtendedMiningChannel {
+                        request_id: 2,
+                        user_identity: "device".try_into().unwrap(),
+                        nominal_hash_rate: 1e12,
+                        max_target: (&[255; 32]).into(),
+                        min_extranonce_size: DEVICE_EXTRANONCE_SIZE as u16,
+                    },
+                ))
+                .unwrap(),
+                NOW,
+            )
+            .unwrap()
+            .frames;
+        let job: NewExtendedMiningJob = binary_sv2::from_bytes(frames[1].payload()).unwrap();
+        assert!(!job.version_rolling_allowed);
+        let mut usual = session();
+        let reply = usual.receive(setup(0b101), NOW).unwrap();
+        assert_eq!(
+            reply.frames[0].header().msg_type(),
+            1,
+            "BCH work is unchanged"
         );
     }
 }

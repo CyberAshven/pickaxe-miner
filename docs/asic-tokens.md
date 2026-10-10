@@ -104,9 +104,32 @@ and Pickaxe's own checks stay safe either way.
 5. **No change needed for SV1:** with the forwarder above, SV1 and SV2
    devices mine SAFA as specified.
 
+## Token work in the share path
+
+A server's template can be BCH block work (the default) or a token's job,
+mined instead of BCH. A token job has no transactions and no BCH value; its
+previous hash, bits and target (at full precision) are the token's, and its
+start time is below the chain's median time.
+
+- **Every channel kind mines it.** On a SAFA job the coinbase is the
+  forwarder: a standard channel's job carries its HASH256 as the merkle root,
+  an extended channel's job carries the forwarder's prefix and suffix with an
+  empty merkle path, and the SV1 adapter turns that into `mining.notify` as
+  usual (`coinb1` starts `2050584831`).
+- **Never a block.** No share on token work is a block: it never reaches the
+  block journal or a node.
+- **A win** is a share whose hash is positive and at or below the token's
+  target; the share is accepted as any other and handed on as a win.
+- **The version rule is the token's.** A BIP320 token lets devices roll bits
+  13 to 28; a token that fixes its version slot refuses rolled shares. On such
+  a token the server refuses a client that requires version rolling (as every
+  Bitaxe does) and tells others the version is fixed; the SV1 adapter then
+  asks for no version rolling and answers `mining.configure` without it.
+  Firmware that rolls anyway makes invalid shares, which only hardware tests
+  can show.
+
 ## What is not done yet
 
-The token work in the share path, the token worker with a Chipnet test
-token, setup rows, and real claims and sweeps (judged by a local BCHN on
-regtest) follow in later slices. No ASIC-exclusive token is registered on
-either network.
+The token worker with a Chipnet test token, setup rows, and real claims and
+sweeps (judged by a local BCHN on regtest) follow in later slices. No
+ASIC-exclusive token is registered on either network.

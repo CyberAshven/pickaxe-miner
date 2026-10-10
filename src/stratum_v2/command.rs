@@ -933,6 +933,7 @@ fn pool_upstreams(
                 donation: None,
                 public: false,
                 prefer: None,
+                fixed_version: false,
             })
         })
         .collect()
@@ -971,6 +972,7 @@ fn fallback_upstreams(
                 donation: None,
                 public: false,
                 prefer: None,
+                fixed_version: false,
             })
         })
         .collect()

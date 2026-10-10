@@ -162,6 +162,8 @@ pub struct Upstream {
     /// #### PR #42: a fallback pool's preferred source: sessions here end
     /// once it can serve devices again (`Preferred::should_return`).
     pub prefer: Option<Arc<Preferred>>,
+    /// #### PR #42: this server mines a token that fixes the version slot.
+    pub fixed_version: bool,
 }
 
 /// #### PR #40: the identity the adapter's channels open with at this
@@ -179,6 +181,7 @@ impl Upstream {
             donation: None,
             public: false,
             prefer: None,
+            fixed_version: false,
         }
     }
 
@@ -187,6 +190,15 @@ impl Upstream {
         Self {
             public: true,
             ..Self::local(address, authority)
+        }
+    }
+
+    /// #### PR #42: the same upstream, mining a token that fixes the
+    /// version slot when `fixed`.
+    pub fn with_fixed_version(self, fixed: bool) -> Self {
+        Self {
+            fixed_version: fixed,
+            ..self
         }
     }
 
@@ -370,7 +382,16 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
-            flags: 4,
+            // #### PR #42: the adapter's fixed version
+            // What: for a token that fixes the version slot, the adapter
+            // does not require version rolling, accepts the server's fixed
+            // version, answers mining.configure without version rolling,
+            // and takes jobs that do not allow it.
+            // Why: SV1 firmware that cannot roll would otherwise get no
+            // job; firmware that rolls anyway makes invalid shares, which
+            // only hardware can show.
+            // Look here if: SV1 devices get no job in token mode.
+            flags: if upstream.fixed_version { 0 } else { 4 },
             endpoint_host: host.try_into().map_err(|_| "invalid host")?,
             endpoint_port: peer.port(),
             vendor: "Pickaxe SV1 adapter"
@@ -388,11 +409,11 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
         false,
     )?)?;
     let reply = receive.receive(DEADLINE)?.ok_or("SV2 setup timed out")?;
-    validate_setup_reply(reply)?;
+    validate_setup_reply(reply, upstream.fixed_version)?;
     // #### PR #40: a public pool opens the device's channel at authorize.
     if upstream.public {
         return Ok(Opened {
-            bridge: Bridge::public(),
+            bridge: Bridge::public().with_fixed_version(upstream.fixed_version),
             send,
             receive,
             local,
@@ -422,7 +443,8 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
     Ok(Opened {
-        bridge: Bridge::new(opened, upstream.remote, upstream.donation.clone())?,
+        bridge: Bridge::new(opened, upstream.remote, upstream.donation.clone())?
+            .with_fixed_version(upstream.fixed_version),
         send,
         receive,
         local,
@@ -608,11 +630,14 @@ impl Lane {
 
     /// A job for this channel: kept for its parent, or with the same parent
     /// returned for activation.
+    /// `fixed`: the server mines a token that fixes the version slot, so
+    /// its jobs do not allow rolling.
     fn job(
         &mut self,
         job: NewExtendedMiningJob<'_>,
+        fixed: bool,
     ) -> Result<Option<(SetNewPrevHashOwned, NewExtendedMiningJobOwned)>, String> {
-        if !job.version_rolling_allowed {
+        if !job.version_rolling_allowed && !fixed {
             return Err("unexpected firmware job".into());
         }
         if self.future.contains_key(&job.job_id) || self.active.contains_key(&job.job_id) {
@@ -697,6 +722,8 @@ struct Bridge {
     owned: bool,
     /// A public pool's channel, opened under the device's username.
     public: Public,
+    /// #### PR #42: see `Upstream::fixed_version`.
+    fixed: bool,
 }
 
 /// #### PR #40
@@ -765,7 +792,14 @@ impl Bridge {
             donation_issue: None,
             owned: remote,
             public: Public::Off,
+            fixed: false,
         })
+    }
+
+    /// #### PR #42: see `Upstream::fixed_version`.
+    fn with_fixed_version(mut self, fixed: bool) -> Self {
+        self.fixed = fixed;
+        self
     }
 
     /// #### PR #40
@@ -800,6 +834,7 @@ impl Bridge {
             donation_issue: None,
             owned: true,
             public: Public::Waiting,
+            fixed: false,
         }
     }
 
@@ -1021,7 +1056,7 @@ impl Bridge {
                         json!(false),
                     );
                 }
-                if names.iter().any(|name| name == "version-rolling") {
+                if names.iter().any(|name| name == "version-rolling") && !self.fixed {
                     let mask = match value.pointer("/params/1/version-rolling.mask") {
                         Some(Value::String(s)) => {
                             u32::from_str_radix(s, 16).map_err(|_| "invalid version mask")?
@@ -1308,10 +1343,11 @@ impl Bridge {
                         )?);
                         continue;
                     }
+                    let fixed = self.fixed;
                     let Some(lane) = self.lane_mut(donation) else {
                         continue;
                     };
-                    if let Some((prev, job)) = lane.job(job.clone())? {
+                    if let Some((prev, job)) = lane.job(job.clone(), fixed)? {
                         out.extend(self.activate(donation, prev, job, false)?);
                     }
                 }
@@ -1485,7 +1521,9 @@ impl Bridge {
 // extended channels. The adapter requires version rolling and opens an extended
 // channel, so only the latter requirement is compatible. Fail closed on unknown
 // requirements; see Mining Protocol section 5.3.1.
-fn validate_setup_reply(mut reply: SerializedFrame) -> Result<(), String> {
+/// #### PR #42: `fixed`: the adapter mines a token that fixes the version,
+/// so the server's fixed-version bit is expected.
+fn validate_setup_reply(mut reply: SerializedFrame, fixed: bool) -> Result<(), String> {
     let header = reply.header();
     if header.msg_type() != 1 || header.channel_msg() || header.ext_type_without_channel_msg() != 0
     {
@@ -1493,7 +1531,8 @@ fn validate_setup_reply(mut reply: SerializedFrame) -> Result<(), String> {
     }
     let setup: SetupConnectionSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid setup reply")?;
-    if setup.used_version != 2 || setup.flags & !0b10 != 0 {
+    let allowed = if fixed { 0b11 } else { 0b10 };
+    if setup.used_version != 2 || setup.flags & !allowed != 0 {
         return Err("SV2 setup incompatible".into());
     }
     Ok(())
@@ -1643,7 +1682,7 @@ mod tests {
             let mut bytes = vec![0; frame.encoded_length()];
             frame.encode_into(&mut bytes).unwrap();
             let frame = SerializedFrame::from_bytes(bytes).unwrap();
-            assert_eq!(validate_setup_reply(frame).is_ok(), expected, "version={version}, flags={flags}, type={message_type}, channel={channel}, extension={extension}");
+            assert_eq!(validate_setup_reply(frame, false).is_ok(), expected, "version={version}, flags={flags}, type={message_type}, channel={channel}, extension={extension}");
         }
     }
 
@@ -2368,5 +2407,51 @@ mod tests {
         lines.bytes.clear();
         lines.started = Some(Instant::now() - DEADLINE);
         assert!(lines.read().is_err());
+    }
+
+    // #### PR #42
+    // What: an adapter for a token that fixes the version answers
+    // mining.configure without version rolling, accepts the server's
+    // fixed-version setup (which another adapter refuses), and takes jobs
+    // that disallow rolling.
+    // Look here if: the adapter's fixed version changes.
+    #[test]
+    fn fixed_version_adapter_answers_configure_without_rolling_and_accepts_fixed_jobs() {
+        let mut bridge = bridge_for(false).with_fixed_version(true);
+        let request = json!({"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":2}]});
+        let replies = bridge.request(request).unwrap().0;
+        assert_eq!(replies[0]["result"]["version-rolling"], false);
+        assert!(replies[0]["result"].get("version-rolling.mask").is_none());
+        let job = NewExtendedMiningJob {
+            channel_id: 3,
+            job_id: 1,
+            min_ntime: binary_sv2::Sv2Option::new(None),
+            version: 0x2000_0000,
+            version_rolling_allowed: false,
+            merkle_path: Vec::<binary_sv2::U256>::new().try_into().unwrap(),
+            coinbase_tx_prefix: [0x20u8, b'P', b'X', b'H', b'1', 1, 0, 0, 0]
+                .as_slice()
+                .try_into()
+                .unwrap(),
+            coinbase_tx_suffix: [0x75u8].as_slice().try_into().unwrap(),
+        };
+        assert!(bridge.user.job(job.clone(), true).is_ok());
+        assert_eq!(
+            bridge_for(false).user.job(job, false).err().as_deref(),
+            Some("unexpected firmware job")
+        );
+        let success = |flags| {
+            encoded(
+                SetupConnectionSuccess {
+                    used_version: 2,
+                    flags,
+                },
+                1,
+                false,
+            )
+            .unwrap()
+        };
+        assert!(validate_setup_reply(success(1), true).is_ok());
+        assert!(validate_setup_reply(success(1), false).is_err());
     }
 }

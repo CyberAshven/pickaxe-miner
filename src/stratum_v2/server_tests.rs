@@ -1594,6 +1594,7 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         donation: None,
         public: false,
         prefer: None,
+        fixed_version: false,
     };
     let upstreams = vec![pool_with([3; 32]), pool_with(pool.authority)];
     let thread = {
@@ -1632,6 +1633,97 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         (2, 0, "SV1")
     );
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+// #### PR #42
+// What: an SV2 standard device, an SV2 extended device and SV1 firmware
+// through the adapter mine a SAFA token job (from a test source) on the real
+// server: every share is accepted, none is a block (no journal entry,
+// nothing reaches the node), and the SV1 notify's coinbase part starts with
+// the forwarder's push and tag (2050584831…).
+// Look here if: token work in the share path changes.
+#[test]
+fn sv2_standard_extended_and_sv1_cpu_devices_mine_a_token_job() {
+    struct TokenJobs(super::template::BchTemplate);
+    impl super::provider::TemplateSource for TokenJobs {
+        fn kind(&self) -> super::provider::SourceKind {
+            super::provider::SourceKind::NodeRpc
+        }
+        fn current(&self) -> Option<(u64, &super::template::BchTemplate)> {
+            Some((1, &self.0))
+        }
+        fn tip_is_current(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn refresh(&mut self) -> Result<(u64, &super::template::BchTemplate), String> {
+            Ok((1, &self.0))
+        }
+        fn submit_saved(
+            &mut self,
+            _: &super::journal::PendingBlock,
+        ) -> super::provider::SubmissionOutcome {
+            super::provider::SubmissionOutcome::Pending("token work makes no blocks")
+        }
+        fn reset(&mut self) {}
+    }
+    let template = super::template::BchTemplate::token_only(
+        Arc::new(super::template::TokenJob {
+            token: "test",
+            layout: super::template::Layout::Safa,
+            version_mask: 0x1fff_e000,
+            anchor: [5; 32],
+            thread: super::merge::OutPoint {
+                txid: [6; 32],
+                vout: 0,
+            },
+            age: 71,
+            mtp: now(),
+        }),
+        [0xab; 32],
+        0x2000_0000,
+        0x207f_ffff,
+        super::template::compact_target(0x207f_ffff).unwrap(),
+        now() - 10,
+        1,
+    );
+    let node = pool_node();
+    let server = Running::start_config(
+        vec![node.clone()],
+        Arc::new(TestDirectory::new()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        vec![Box::new(TokenJobs(template))],
+    );
+    let mut standard = Device::connect(&server, false);
+    standard.solve_and_submit(1);
+    let mut extended = Device::connect(&server, true);
+    extended.solve_and_submit(1);
+    let adapter = FirmwareAdapter::new(&server);
+    let mut firmware = FirmwareDevice::connect(&adapter, true, false);
+    let difficulty = firmware.receive();
+    assert_eq!(difficulty["method"], "mining.set_difficulty");
+    let notify = firmware.receive();
+    assert!(
+        notify["params"][2]
+            .as_str()
+            .unwrap()
+            .starts_with("2050584831"),
+        "{notify}"
+    );
+    let (_, submit) = firmware.solve_notify(1, true, &notify);
+    firmware.send(submit);
+    assert_eq!(firmware.receive()["result"], true);
+    server.wait(|stats| stats.shares_accepted >= 3);
+    let stats = server.stats.lock().unwrap().clone();
+    assert_eq!((stats.blocks_pending, stats.blocks_accepted), (0, 0));
+    assert!(stats.recent_blocks.is_empty());
+    assert_eq!(node.lock().unwrap().submissions, 0);
+    firmware.write.shutdown(std::net::Shutdown::Both).unwrap();
+    standard.sender.close();
+    extended.sender.close();
 }
 
 // #### PR #42
@@ -1863,6 +1955,7 @@ fn solo_devices_move_to_the_fallback_pool_when_the_node_stops_and_return_when_it
             donation: None,
             public: false,
             prefer: Some(preferred),
+            fixed_version: false,
         },
     ];
     let thread = {
@@ -1914,6 +2007,7 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
         }),
         public: false,
         prefer: None,
+        fixed_version: false,
     }];
     let thread = {
         let stop = stop.clone();
@@ -2076,6 +2170,7 @@ fn real_sv2_pool_sends_work_to_sv1_firmware() {
         donation: None,
         public: false,
         prefer: None,
+        fixed_version: false,
     };
     let thread = {
         let stop = stop.clone();
@@ -2161,6 +2256,7 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             donation: None,
             public: false,
             prefer: None,
+            fixed_version: false,
         },
         super::sv1::Upstream {
             address: pool.address.to_string(),
@@ -2170,6 +2266,7 @@ fn a_device_whose_pools_all_fail_still_shows_the_reason() {
             donation: None,
             public: false,
             prefer: None,
+            fixed_version: false,
         },
     ];
     let thread = {

@@ -147,6 +147,9 @@ pub struct ValidatedShare {
     /// #### PR #42: the share as the pool takes it, on a Job Declaration
     /// job.
     pub forward: Option<super::jd::ForwardShare>,
+    /// #### PR #42: a header-shaped token's win (SAFA): its hash is
+    /// positive and at or below the token's target.
+    pub header_win: bool,
 }
 
 impl ValidatedShare {
@@ -601,7 +604,9 @@ impl Channel {
             return Err("invalid-sequence-number");
         }
         self.sequence = Some(share.sequence);
-        if (share.version ^ job.template.version) & !VERSION_ROLLING_MASK != 0 {
+        // #### PR #42: the template's own version rule (see
+        // `BchTemplate::version_mask`).
+        if (share.version ^ job.template.version) & !job.template.version_mask() != 0 {
             return Err("invalid-version");
         }
         let late = match job.kind {
@@ -656,7 +661,21 @@ impl Channel {
             .header(&coinbase, share.version, share.time, share.nonce)
             .map_err(|_| "invalid-ntime")?;
         let hash = double_sha256(&header);
-        let block = meets_target(&hash, &job.template.target);
+        // #### PR #42: block suppression
+        // What: only BCH block work can be a block; a header-shaped token's
+        // job is a win when its hash is positive (byte 31 below 0x80) and
+        // at or below the token's target.
+        // Why: token work must never reach the block journal or the node,
+        // and the draft covenant's signed compare would also pass negative
+        // hashes (see `merge::safa::proof_passes`).
+        // Look here if: token work is journaled, or a SAFA win is missed.
+        let block = job.template.is_block() && meets_target(&hash, &job.template.target);
+        let header_win = job
+            .template
+            .token_job()
+            .is_some_and(|token| token.layout == super::template::Layout::Safa)
+            && hash[31] & 0x80 == 0
+            && meets_target(&hash, &job.template.target);
         // #### PR #38
         // A job keeps the target it was issued with. After vardiff lowers the
         // difficulty, firmware may apply the new one to work it already holds
@@ -668,7 +687,7 @@ impl Channel {
         } else {
             self.target
         };
-        if !meets_target(&hash, &accepted) && !block {
+        if !meets_target(&hash, &accepted) && !block && !header_win {
             return Err("difficulty-too-low");
         }
         if self.seen.values().any(|seen| seen.contains(&hash)) {
@@ -746,6 +765,7 @@ impl Channel {
             token_wins,
             merkle_path,
             forward,
+            header_win,
         })
     }
 
@@ -1896,5 +1916,154 @@ mod tests {
         rolled.extend(device);
         assert_eq!(forward.extranonce, rolled);
         assert_eq!(share.coinbase.bytes, coinbase);
+    }
+
+    /// #### PR #42: a SAFA job on the test parent with version rule `mask`
+    /// and full-precision `target`.
+    fn safa_template(mask: u32, target: Hash) -> Arc<BchTemplate> {
+        Arc::new(BchTemplate::token_only(
+            Arc::new(super::super::template::TokenJob {
+                token: "test",
+                layout: super::super::template::Layout::Safa,
+                version_mask: mask,
+                anchor: [5; 32],
+                thread: OutPoint {
+                    txid: [6; 32],
+                    vout: 0,
+                },
+                age: 71,
+                mtp: 1_700_000_100,
+            }),
+            [0xab; 32],
+            0x2000_0000,
+            0x207f_ffff,
+            target,
+            1_700_000_010,
+            1,
+        ))
+    }
+
+    // #### PR #42
+    // What: no share on a SAFA job is a block; a share whose hash is at or
+    // below the token's target is a win only when the hash is positive
+    // (byte 31 below 0x80); below a hard target no share wins, but shares
+    // still count at the share target.
+    // Look here if: block suppression or the SAFA win check changes.
+    #[test]
+    fn token_work_never_reports_a_block_and_a_win_needs_a_positive_hash() {
+        let mut channel = channel_on(
+            1,
+            ChannelKind::Standard,
+            safa_template(0x1fff_e000, [0xff; 32]),
+        );
+        let (mut positive, mut negative) = (false, false);
+        for nonce in 0..64u32 {
+            let result = channel
+                .check(
+                    Share {
+                        nonce,
+                        ..share(nonce + 1)
+                    },
+                    1_700_000_010,
+                )
+                .unwrap();
+            assert!(!result.block, "token work is never a block");
+            if result.hash[31] & 0x80 == 0 {
+                assert!(result.header_win);
+                positive = true;
+            } else {
+                assert!(!result.header_win, "a negative hash never wins");
+                negative = true;
+            }
+        }
+        assert!(positive && negative);
+        let mut hard = [0; 32];
+        hard[0] = 1;
+        let mut channel = channel_on(1, ChannelKind::Standard, safa_template(0x1fff_e000, hard));
+        let result = channel.check(share(1), 1_700_000_010).unwrap();
+        assert!(!result.block && !result.header_win);
+    }
+
+    // #### PR #42
+    // What: a token that fixes its version slot refuses rolled version
+    // bits; a BIP320 token accepts them.
+    // Look here if: the per-template version rule changes.
+    #[test]
+    fn fixed_version_jobs_refuse_rolled_versions() {
+        let rolled = Share {
+            version: 0x2000_2000,
+            ..share(1)
+        };
+        let mut fixed = channel_on(1, ChannelKind::Standard, safa_template(0, [0xff; 32]));
+        assert_eq!(
+            fixed.check(rolled, 1_700_000_010).err(),
+            Some("invalid-version")
+        );
+        assert!(fixed.check(share(2), 1_700_000_010).is_ok());
+        let mut rolling = channel_on(
+            1,
+            ChannelKind::Standard,
+            safa_template(0x1fff_e000, [0xff; 32]),
+        );
+        assert!(rolling
+            .check(
+                Share {
+                    version: 0x2000_2000,
+                    ..share(1)
+                },
+                1_700_000_010
+            )
+            .is_ok());
+    }
+
+    // #### PR #42
+    // What: a SAFA job's standard coinbase is the 65-byte forwarder to the
+    // miner's script with the job id and the channel's prefix, and its root
+    // is that script's HASH256; an extended channel's parts are the
+    // forwarder's prefix (push, tag, job id) and suffix (OP_DROP, rule) with
+    // an empty path, and a share's coinbase is the whole forwarder.
+    // Look here if: the script coinbase or its parts change.
+    #[test]
+    fn script_coinbase_parts_rebuild_the_standard_root() {
+        use super::super::merge::header::{extended_parts, standard_script};
+        let template = safa_template(0x1fff_e000, [0xff; 32]);
+        let miner = super::super::payout::scripts(MiningNetwork::Chipnet, &payout(), None).unwrap()
+            [0]
+        .clone();
+        let standard = channel_on(1, ChannelKind::Standard, template.clone());
+        let job = standard.job().unwrap();
+        let expected = standard_script(
+            1,
+            &standard.extranonce_prefix.clone().try_into().unwrap(),
+            &miner,
+        )
+        .unwrap();
+        assert_eq!(job.standard_coinbase.bytes, expected);
+        assert_eq!(job.standard_coinbase.merkle_root, double_sha256(&expected));
+        let mut extended = channel_on(2, ChannelKind::Extended, template);
+        let (prefix, suffix) = extended_parts(1, &miner).unwrap();
+        {
+            let job = extended.job().unwrap();
+            assert_eq!(job.parts.prefix, prefix);
+            assert_eq!(job.parts.suffix, suffix);
+            assert!(job.parts.merkle_path.is_empty());
+        }
+        let result = extended
+            .check(
+                Share {
+                    channel_id: 2,
+                    extranonce: &[7; 8],
+                    ..share(1)
+                },
+                1_700_000_010,
+            )
+            .unwrap();
+        let mut script = prefix;
+        script.extend(&extended.extranonce_prefix);
+        script.extend([7; 8]);
+        script.extend(suffix);
+        assert_eq!(script.len(), 73);
+        assert_eq!(result.coinbase.bytes, script);
+        assert_eq!(result.header[36..68], double_sha256(&script));
     }
 }
