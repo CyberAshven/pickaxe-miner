@@ -79,6 +79,8 @@ pub mod stratum_v2;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod telemetry;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod tls;
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod tui;
 pub mod tx;

@@ -11,7 +11,7 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Error as WebSocketError, Message, WebSocket};
+use tungstenite::{Error as WebSocketError, Message, WebSocket};
 
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -295,10 +295,11 @@ impl ElectrumSession {
         if url_str.len() > 6 && url_str[..6].eq_ignore_ascii_case("tcp://") {
             return Self::connect_tcp(url_str, deployment);
         }
-        let (ws, _resp) = connect(url_str).map_err(|e| format!("connect: {e}"))?;
+        // #### PR #42: through rustls (see `tls`).
+        let (ws, _resp) = crate::tls::websocket(url_str)?;
 
         match ws.get_ref() {
-            MaybeTlsStream::NativeTls(t) => {
+            MaybeTlsStream::Rustls(t) => {
                 let _ = t.get_ref().set_read_timeout(Some(Duration::from_secs(15)));
                 let _ = t.get_ref().set_write_timeout(Some(Duration::from_secs(15)));
             }

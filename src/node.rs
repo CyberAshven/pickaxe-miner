@@ -10,7 +10,6 @@ use crate::fee::decimal_bch_to_sats;
 
 use crate::electrum::{ElectrumSession, LiveJob, LiveStateSnapshot};
 use crate::protocol::{derive_photon_state, PhotonDeployment};
-use native_tls::TlsConnector;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
@@ -1928,11 +1927,8 @@ fn rpc_call_timed(
     let mut stream: Box<dyn NodeRpcStream> = match target.scheme {
         NodeRpcScheme::Http => Box::new(tcp_stream),
         NodeRpcScheme::Https => {
-            let connector = TlsConnector::new().map_err(|e| format!("tls setup: {e}"))?;
-            let tls_stream = connector
-                .connect(host.as_str(), tcp_stream)
-                .map_err(|e| format!("tls handshake: {e}"))?;
-            Box::new(tls_stream)
+            // #### PR #42: through rustls (see `tls`).
+            Box::new(crate::tls::connect(host.as_str(), tcp_stream)?)
         }
     };
     stream

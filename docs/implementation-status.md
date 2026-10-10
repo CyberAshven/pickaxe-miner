@@ -2273,3 +2273,23 @@ public one refused, kept by the profile).
 
 Not yet: a live run against a Chipnet BCHN with `zmqpubhashblock` (it needs
 a change to the node's container, which waits for the operator's OK).
+
+## TLS through rustls, and a clean stop on SIGTERM (2026-10-10)
+
+#### PR #42
+
+wss:// Fulcrum servers and https:// nodes now connect through rustls
+(`src/tls.rs`) instead of native-tls: the aws-lc-rs provider (already in the
+build for the ASIC device library) and the operating system's verifier
+(`rustls-platform-verifier`), so the system's certificates still decide,
+including a CA the miner installed for a home server. native-tls and
+OpenSSL leave the build, so a Linux binary no longer links the system's
+libssl and can run on older Linux such as HiveOS's Ubuntu 20.04. A
+WebSocket connect now waits at most 10 s per address. `ctrlc`'s
+`termination` feature makes SIGTERM and SIGHUP take the Ctrl+C path, so a
+farm system or service manager stops the miner cleanly.
+
+Evidence: a host test for the configuration and a refused server name, and
+an opt-in live test against the built-in Fulcrum servers: on 2026-10-10
+every server that answered accepted the rustls handshake (18 of 21; the
+other three refused the connection itself).
