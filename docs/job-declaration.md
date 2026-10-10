@@ -17,6 +17,21 @@ No other BCH pool offers Job Declaration today. SRI's and ckpool's Job
 Declaration servers validate through Bitcoin Core's IPC, which BCH nodes do
 not have, so a Pickaxe client's counterpart is a Pickaxe pool.
 
+### Who works with whom
+
+| Client → pool | Works | How it is known |
+|---|---|---|
+| Pickaxe → Pickaxe pool | Yes, both modes | Loopback tests on both sides |
+| SRI's JD client (`jd-client`, fed by a BCH template provider) → Pickaxe pool | Expected, Full-Template | Its BIP141 bytes are stripped (below) and it keeps Pickaxe's tokens opaque, as the spec says; tested with SRI-shaped declarations, not yet with SRI's binary |
+| Pickaxe → SRI's or ckpool's JD server | No | Those servers need Bitcoin Core's IPC, which BCH nodes lack |
+
+SRI's job factory gives every coinbase BIP141's marker, flag and one 32-byte
+witness item, so its declarations carry them. A Pickaxe pool takes such a
+declaration without them (a BCH block cannot carry a witness, and the txid
+never covered it) and refuses any other witness as "segwit coinbase". A
+zero-value witness-commitment `OP_RETURN` in its outputs is allowed, like any
+output the payout rule does not count.
+
 ## Turning it on
 
 Job Declaration needs a public pool, where each miner's blocks pay their own

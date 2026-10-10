@@ -2014,3 +2014,22 @@ the client, the pool accepts the custom job (and, Full-Template, its node's
 `validateblocktemplate` passes the declaration), and the block with the
 commitment reaches the client's node and, Full-Template, the pool's. Not yet
 run live.
+
+## Job Declaration interop with SRI clients (2026-10-10)
+
+#### PR #42
+
+A Pickaxe pool now takes an SRI-shaped Full-Template declaration: BIP141's
+marker and flag and the one 32-byte witness item SRI's job factory gives
+every coinbase are left out (any other witness is refused as "segwit
+coinbase"), so the block the pool's node checks and submits is the one the
+client's devices mined (the txid never covered the witness). A zero-value
+witness-commitment `OP_RETURN` passes as an output the payout rule does not
+count. `docs/job-declaration.md` gains a table of who works with whom.
+
+Evidence: host tests for the strip (the stripped shape equals the plain one,
+any 32-byte item is accepted, no item, two items or a 31-byte item are
+refused, a witness without the marker fails as outputs) and a pool session
+where an SRI-shaped declaration is validated as a block without a witness
+whose merkle root holds and whose declared job rebuilds the same coinbase.
+Not yet run against SRI's `jd-client` binary.

@@ -472,6 +472,66 @@ fn session_full_template_flow() {
 }
 
 // #### PR #42
+// What: an SRI-shaped Full-Template declaration (BIP141's marker, flag and
+// one 32-byte witness item, and a zero-value witness-commitment OP_RETURN as
+// SRI's factory may add) is declared: the pool's node checks a block whose
+// coinbase has no witness, keeps the OP_RETURN, and whose merkle root holds;
+// the declared job rebuilds the same coinbase.
+// Look here if: CoinbaseShape's BIP141 strip or the payout rule changes.
+#[test]
+fn an_sri_shaped_declaration_is_checked_without_its_witness() {
+    let node = Arc::new(FakeNode::default());
+    let declarator = declarator_accepting(AcceptJd::FullTemplate).with_validator(node.clone());
+    let now = Instant::now();
+    let (mut session, token, scripts) = full_session(&declarator, now);
+    let pool = Arc::new(context(1));
+    let current = Context {
+        current: Some(&pool),
+        recent: &[],
+    };
+    let txids = ids(1..=1);
+    let (prefix, suffix) = coinbase_parts(pool.height, &scripts);
+    // SRI's shape: the marker and flag, a witness-commitment output worth
+    // 0, and one 32-byte witness item before the locktime.
+    let mut commitment = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    commitment.extend([0x5c; 32]);
+    let mut outputs = parse_outputs(&suffix[4..suffix.len() - 4]).unwrap();
+    outputs.push((0, commitment.clone()));
+    let mut marked = prefix.clone();
+    marked.splice(4..4, [0, 1]);
+    let mut witnessed = u32::MAX.to_le_bytes().to_vec();
+    witnessed.extend(serialize_outputs(&outputs));
+    witnessed.extend([1, 32]);
+    witnessed.extend([0; 32]);
+    witnessed.extend(0u32.to_le_bytes());
+    let mut reply = session
+        .receive(
+            &mut declare_frame(3, &token, pool.version, &(marked, witnessed), &txids),
+            &declarator,
+            &current,
+            now,
+        )
+        .unwrap();
+    assert_eq!((reply.validations, reply.declared), (1, 1));
+    let declared = declared_token(&mut reply);
+    let checked: Block = consensus::deserialize(&node.blocks.lock().unwrap()[0]).unwrap();
+    assert!(checked.check_merkle_root());
+    let coinbase = &checked.txdata[0];
+    assert!(coinbase.input[0].witness.is_empty());
+    assert_eq!(
+        coinbase.output.last().unwrap().script_pubkey.as_bytes(),
+        commitment.as_slice()
+    );
+    match declarator.redeem(&declared, &payout(), now) {
+        Ok(Custom::Declared(job)) => {
+            assert_eq!(job.shape.prefix, prefix);
+            assert_eq!(job.shape.outputs, outputs);
+        }
+        _ => panic!("the declared job"),
+    }
+}
+
+// #### PR #42
 // What: the node's refusals map as ckpool's do: "does not build on chain
 // tip" is stale-chain-tip and any other reason invalid-job, both with the
 // node's reason as details; a node that cannot be asked gives

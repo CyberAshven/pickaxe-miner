@@ -5,7 +5,7 @@
 
 use super::{codec::parse_outputs, Refusal};
 use crate::stratum_v2::template::{double_sha256, fold, meets_target, BchTemplate, Coinbase, Hash};
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 /// A declared coinbase: `prefix` runs through the script's head (up to the
 /// whole extranonce), `suffix` from the input's sequence.
@@ -27,7 +27,8 @@ pub struct CoinbaseShape {
 }
 
 impl CoinbaseShape {
-    /// Parses a declaration's prefix and suffix.
+    /// Parses a declaration's prefix and suffix; #### PR #42: SRI's BIP141
+    /// bytes are left out (see `strip_bip141`).
     pub fn parse(prefix: &[u8], suffix: &[u8]) -> Result<Self, Refusal> {
         let invalid = |details: &str| Refusal::new("invalid-coinbase-tx", details);
         let word = |bytes: Option<&[u8]>| {
@@ -37,11 +38,8 @@ impl CoinbaseShape {
         };
         let tx_version =
             word(prefix.get(..4)).ok_or_else(|| invalid("the coinbase prefix is too short"))?;
-        // BIP141's marker and flag: a segwit coinbase, which a BCH block
-        // cannot carry.
-        if prefix.get(4..6) == Some(&[0, 1][..]) {
-            return Err(invalid("segwit coinbase"));
-        }
+        let (prefix, suffix) = strip_bip141(prefix, suffix)?;
+        let (prefix, suffix) = (prefix.as_ref(), suffix.as_ref());
         if !matches!(tx_version, 1 | 2) {
             return Err(invalid("the coinbase version must be 1 or 2"));
         }
@@ -112,6 +110,42 @@ impl CoinbaseShape {
         bytes.extend_from_slice(&self.suffix);
         Some(bytes)
     }
+}
+
+// #### PR #42: SRI's BIP141 bytes in a declaration (D20)
+// What: a declared coinbase whose bytes 4 and 5 are 00 01 (BIP141's marker
+// and flag) is taken without them and without its one witness item of 32
+// bytes, which sits before the locktime; any other witness (no item, two
+// items, an item of another length) is refused as "segwit coinbase". A
+// coinbase without the marker is taken as it is.
+// Why: SRI's job factory gives every coinbase that witness, so an SRI Job
+// Declaration client declares it; a BCH block cannot carry it, and the txid
+// the client's merkle root uses never covered it, so the block built from
+// the stripped coinbase is the one its devices mined.
+// Look here if: an SRI client's declarations are refused as "segwit
+// coinbase", or a block built from one is refused by the node.
+/// A declaration's coinbase prefix and suffix, borrowed or rebuilt.
+type Parts<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
+
+/// The prefix and suffix without SRI's BIP141 marker, flag and witness.
+fn strip_bip141<'a>(prefix: &'a [u8], suffix: &'a [u8]) -> Result<Parts<'a>, Refusal> {
+    if prefix.get(4..6) != Some(&[0, 1][..]) {
+        return Ok((Cow::Borrowed(prefix), Cow::Borrowed(suffix)));
+    }
+    // One stack for the one input: an item count of 1, a length of 32, the
+    // item, then the locktime.
+    const WITNESS: usize = 2 + 32;
+    let start = suffix
+        .len()
+        .checked_sub(4 + WITNESS)
+        .filter(|start| *start >= 4)
+        .filter(|start| suffix[*start..*start + 2] == [1, 32])
+        .ok_or_else(|| Refusal::new("invalid-coinbase-tx", "segwit coinbase"))?;
+    let mut stripped_prefix = prefix[..4].to_vec();
+    stripped_prefix.extend_from_slice(&prefix[6..]);
+    let mut stripped_suffix = suffix[..start].to_vec();
+    stripped_suffix.extend_from_slice(&suffix[start + WITNESS..]);
+    Ok((Cow::Owned(stripped_prefix), Cow::Owned(stripped_suffix)))
 }
 
 /// Transaction ids in BCH's canonical order: strictly ascending as BCHN
@@ -251,6 +285,7 @@ pub(in crate::stratum_v2) mod tests {
         assert!(shape.coinbase(&[7; 31]).is_none());
         let refused =
             |prefix: &[u8], suffix: &[u8]| CoinbaseShape::parse(prefix, suffix).unwrap_err();
+        // #### PR #42: BIP141's marker with no witness item is refused.
         let mut segwit = prefix.clone();
         segwit.splice(4..4, [0, 1]);
         assert_eq!(
@@ -290,6 +325,60 @@ pub(in crate::stratum_v2) mod tests {
         assert_eq!(
             refused(&tiny, &empty).details,
             "the coinbase is under 65 bytes"
+        );
+    }
+
+    // #### PR #42
+    // What: an SRI-shaped declaration (BIP141's marker and flag, one 32-byte
+    // witness item before the locktime) parses to the coinbase without
+    // them, whose bytes and outputs are the plain one's; no item, two
+    // items, a 31-byte item or a witness without the marker are refused.
+    // Look here if: strip_bip141 changes.
+    #[test]
+    fn an_sri_shaped_coinbase_is_stripped_and_other_witnesses_refused() {
+        let head = [3, 0x15, 0xf9, 0x04, b'j', b'd'];
+        let (prefix, suffix) = shape_bytes(&head, 32);
+        let plain = CoinbaseShape::parse(&prefix, &suffix).unwrap();
+        let sri = |items: &[&[u8]]| {
+            let mut marked = prefix.clone();
+            marked.splice(4..4, [0, 1]);
+            let mut witnessed = suffix[..suffix.len() - 4].to_vec();
+            witnessed.push(items.len() as u8);
+            for item in items {
+                witnessed.push(item.len() as u8);
+                witnessed.extend_from_slice(item);
+            }
+            witnessed.extend_from_slice(&suffix[suffix.len() - 4..]);
+            (marked, witnessed)
+        };
+        let (marked, witnessed) = sri(&[&[0; 32]]);
+        let shape = CoinbaseShape::parse(&marked, &witnessed).unwrap();
+        assert_eq!(shape, plain);
+        assert_eq!(shape.coinbase(&[7; 32]), plain.coinbase(&[7; 32]));
+        // Any 32-byte item, as BIP141's reserved value may be.
+        let (marked, witnessed) = sri(&[&[0xab; 32]]);
+        assert_eq!(CoinbaseShape::parse(&marked, &witnessed).unwrap(), plain);
+        for items in [
+            &[][..],
+            &[&[0u8; 32][..], &[0; 32]][..],
+            &[&[0u8; 31][..]][..],
+        ] {
+            let (marked, witnessed) = sri(items);
+            assert_eq!(
+                CoinbaseShape::parse(&marked, &witnessed).unwrap_err(),
+                Refusal::new("invalid-coinbase-tx", "segwit coinbase"),
+                "{} items",
+                items.len()
+            );
+        }
+        // A witness without the marker is not one: its bytes are refused
+        // as outputs.
+        let (_, witnessed) = sri(&[&[0; 32]]);
+        assert_eq!(
+            CoinbaseShape::parse(&prefix, &witnessed)
+                .unwrap_err()
+                .details,
+            "malformed coinbase outputs"
         );
     }
 
