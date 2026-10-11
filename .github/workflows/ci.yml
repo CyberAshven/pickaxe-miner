@@ -133,7 +133,7 @@ jobs:
           cat hip/build/gfx1036/SHA256SUMS.txt
 
       - name: Upload verified gfx1036 code objects
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hip-gfx1036-${{ github.sha }}
           path: hip/build/gfx1036/
@@ -193,7 +193,7 @@ jobs:
           cat "hip/build/${{ matrix.arch }}/SHA256SUMS.txt"
 
       - name: Upload verified ${{ matrix.arch }} code objects
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hip-${{ matrix.arch }}-${{ github.sha }}
           path: hip/build/${{ matrix.arch }}/
@@ -354,7 +354,7 @@ jobs:
 
       - name: Upload ARM64 binary for testers
         if: runner.arch == 'ARM64'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pickaxe-${{ runner.os == 'Windows' && 'windows' || 'linux' }}-arm64-${{ github.sha }}
           path: target/release/pickaxe_miner${{ runner.os == 'Windows' && '.exe' || '' }}
