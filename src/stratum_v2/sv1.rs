@@ -600,9 +600,9 @@ struct Lane {
     extra_size: usize,
     target: [u8; 32],
     future: BTreeMap<u32, NewExtendedMiningJobOwned>,
-    active: BTreeMap<u32, u32>,
+    active: BTreeMap<u32, (u32, [u8; 32])>,
     previous_hash: Option<SetNewPrevHashOwned>,
-    notify: Option<Value>,
+    notify: Option<(Value, [u8; 32])>,
     sequence: u32,
     pending: BTreeMap<u32, Pending>,
 }
@@ -754,6 +754,7 @@ struct Pending {
     sent: Instant,
     /// The share target the firmware was mining to, for the rate estimate.
     target: [u8; 32],
+    donation_rate: BchDonation,
 }
 
 impl Bridge {
@@ -937,13 +938,12 @@ impl Bridge {
         let Some(lane) = self.lane(self.on_donation) else {
             return Ok(Vec::new());
         };
-        let Some(notify) = &lane.notify else {
+        let Some((notify, target)) = &lane.notify else {
             return Ok(Vec::new());
         };
-        let difficulty = sv2_to_sv1::build_sv1_set_difficulty_from_sv2_target(
-            Target::from_le_bytes(lane.target),
-        )
-        .map_err(|_| "invalid share target")?;
+        let difficulty =
+            sv2_to_sv1::build_sv1_set_difficulty_from_sv2_target(Target::from_le_bytes(*target))
+                .map_err(|_| "invalid share target")?;
         Ok(vec![to_json(difficulty)?, notify.clone()])
     }
 
@@ -958,14 +958,14 @@ impl Bridge {
     }
 
     /// #### PR #40
-    /// What: at a remote pool, the donation's share of mining time mines on
-    /// the donation channel, by a 10-minute cycle per device counted while it
-    /// has work, as the server's own donation work is. A switch sends the
+    /// What: at a remote pool, accepted shares weighted by their targets
+    /// repay the donation work quota; time only seeds the first share.
+    /// A switch sends the
     /// channel's difficulty and a clean job; the device never reconnects.
     /// Why: Pickaxe cannot add a coinbase output to a pool's blocks, so the
     /// whole donation is work, in the BCH setting's own 0%..100% range.
     /// Check: at 1.5%, a device's shares at the pool's donation identity are
-    /// about 1.5% of its shares there.
+    /// about 1.5% of its difficulty-weighted accepted work there.
     fn tick(&mut self, now: Instant) -> Result<Vec<Value>, String> {
         let Some(route) = &self.route else {
             return Ok(Vec::new());
@@ -1158,7 +1158,7 @@ impl Bridge {
                 // #### PR #40: the donation channel's jobs carry the top bit.
                 let number = submit.job_id.parse::<u32>().ok();
                 let donation = number.is_some_and(|number| number & DONATION_JOBS != 0);
-                let version = number.and_then(|number| {
+                let job = number.and_then(|number| {
                     self.lane(donation)?
                         .active
                         .get(&(number & !DONATION_JOBS))
@@ -1177,7 +1177,7 @@ impl Bridge {
                         Some((25, "not subscribed"))
                     } else if self.worker.as_deref() != Some(submit.user_name.as_str()) {
                         Some((24, "unauthorized worker"))
-                    } else if version.is_none() {
+                    } else if job.is_none() {
                         Some((21, "stale job"))
                     } else if submit.extra_nonce2.len() != self.extranonce2_size {
                         Some((20, "invalid extranonce size"))
@@ -1194,9 +1194,13 @@ impl Bridge {
                     self.local_rejection = Some(text);
                     out.push(reject(id, code, text));
                 } else {
-                    let version = version.ok_or("stale job")?;
+                    let (version, target) = job.ok_or("stale job")?;
                     // A worker may omit version_bits and use the original version.
                     let mask = submit.version_bits.as_ref().and(self.mask.clone());
+                    let donation_rate = self
+                        .route
+                        .as_ref()
+                        .map_or(BchDonation::default(), DonationRoute::rate);
                     let remote = self.remote;
                     let owned = self.owned;
                     let extranonce1 = self.extranonce1.clone();
@@ -1230,7 +1234,8 @@ impl Bridge {
                         Pending {
                             id,
                             sent: Instant::now(),
-                            target: lane.target,
+                            target,
+                            donation_rate,
                         },
                     );
                     lane.sequence = lane.sequence.wrapping_add(1);
@@ -1383,6 +1388,7 @@ impl Bridge {
                 if self.remote {
                     let donation =
                         self.on_lane(ack.channel_id, "unexpected share acknowledgement")?;
+                    let mut accepted = Vec::new();
                     let lane = self
                         .lane_mut(donation)
                         .ok_or("unexpected share acknowledgement")?;
@@ -1392,7 +1398,12 @@ impl Bridge {
                         if *entry.key() > ack.last_sequence_number {
                             break;
                         }
-                        verdicts.push(ShareEvent::Accepted(entry.remove().target));
+                        accepted.push(entry.remove());
+                    }
+                    for share in accepted {
+                        self.allocation
+                            .pool_accepted(&share.target, share.donation_rate, donation);
+                        verdicts.push(ShareEvent::Accepted(share.target));
                     }
                 } else {
                     // This server acknowledges each share on its own.
@@ -1486,7 +1497,8 @@ impl Bridge {
     ) -> Result<Vec<Value>, String> {
         let owned = self.owned;
         let lane = self.lane_mut(donation).ok_or("unknown mining channel")?;
-        lane.active.insert(job.job_id, job.version);
+        // SetTarget applies to new jobs, never reweights an older active job.
+        lane.active.insert(job.job_id, (job.version, lane.target));
         while lane.active.len() > MAX_ACTIVE_JOBS {
             lane.active.pop_first();
         }
@@ -1507,7 +1519,7 @@ impl Bridge {
         if donation {
             notify.job_id = (number | DONATION_JOBS).to_string();
         }
-        lane.notify = Some(to_json(notify.into())?);
+        lane.notify = Some((to_json(notify.into())?, lane.target));
         if donation == self.on_donation {
             self.notifications()
         } else {
@@ -1714,7 +1726,10 @@ mod tests {
         bridge
             .request(json!({"id":2,"method":"mining.authorize","params":["worker", "unused"]}))
             .unwrap();
-        bridge.user.active.insert(4, 0x20000000);
+        bridge
+            .user
+            .active
+            .insert(4, (0x20000000, bridge.user.target));
         bridge
     }
     fn ready() -> Bridge {
@@ -2211,6 +2226,8 @@ mod tests {
         )
         .unwrap();
         assert!(bridge.upstream(set).unwrap().0.is_empty());
+        // Switching back before the next job must retain the old difficulty.
+        assert_eq!(bridge.switched().unwrap(), first);
         let next = bridge.upstream(job(6, Some(1700000000))).unwrap().0;
         assert_eq!(next[0]["method"], "mining.set_difficulty");
         assert!((next[0]["params"][0].as_f64().unwrap() - 4096.0).abs() < 0.01);
@@ -2218,6 +2235,13 @@ mod tests {
         // Work in flight is kept: no clean_jobs, and the older job still counts.
         assert_eq!(next[1]["params"][8], false);
         assert!(bridge.user.active.contains_key(&5) && bridge.user.active.contains_key(&6));
+        // A delayed old-job share and a new-job share carry different weights.
+        for (id, number, expected) in [(70, "5", [255; 32]), (71, "6", target)] {
+            let mut share = submit(id);
+            share["params"][1] = json!(number);
+            bridge.request(share).unwrap();
+            assert_eq!(bridge.user.pending[&((id - 70) as u32)].target, expected);
+        }
     }
 
     #[test]
@@ -2257,6 +2281,41 @@ mod tests {
         assert_eq!(replies[0]["id"], 10);
         assert_eq!(replies[0]["error"][0], 22);
         assert!(bridge.user.pending.is_empty());
+    }
+
+    #[test]
+    fn remote_work_uses_pending_target_and_rate_only_after_acceptance() {
+        let mut bridge = ready_for(true);
+        let rate: BchDonation = "50".parse().unwrap();
+        bridge.route = Some(DonationRoute {
+            identity: "unused-in-fixture".into(),
+            rate: Arc::new(std::sync::RwLock::new(rate)),
+        });
+        bridge.allocation = WorkAllocation::new(300_000_000_000);
+        bridge.request(remote_submit(20)).unwrap();
+        bridge.user.target[31] = 31; // Eight expected hashes, not one share.
+        bridge.user.active.get_mut(&4).unwrap().1 = bridge.user.target;
+        bridge.request(remote_submit(21)).unwrap();
+        *bridge.route.as_ref().unwrap().rate.write().unwrap() = "0".parse().unwrap();
+        assert!(!bridge.allocation.pool_donation_work(rate));
+        let ack = |sequence| {
+            encoded(
+                SubmitSharesSuccess {
+                    channel_id: 3,
+                    last_sequence_number: sequence,
+                    new_submits_accepted_count: 1,
+                    new_shares_sum: 0,
+                },
+                MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+                true,
+            )
+            .unwrap()
+        };
+        bridge.upstream(ack(0)).unwrap();
+        assert!(!bridge.allocation.pool_donation_work(rate));
+        bridge.upstream(ack(1)).unwrap();
+        assert!(bridge.allocation.pool_donation_work(rate));
+        assert!(bridge.upstream(ack(1)).unwrap().1.is_empty());
     }
 
     #[test]

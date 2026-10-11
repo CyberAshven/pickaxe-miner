@@ -2,7 +2,9 @@
 
 Scope: all decisions, steps and follow-ups in `next-steps.md`, plus the SV2
 design in `stratum-v2.md`. A scaffold or passing build is not completion.
-Work continues on PR #38; this document does not narrow the requested scope.
+Current base: `dev` at `027dba9`, including merged #32, #35, #38, #40,
+#42 and #43 (audited 2026-10-11). Historical entries below record what was
+true at each checkpoint; the table is the current index, not a new scope.
 
 ## Invariants
 
@@ -20,31 +22,32 @@ Work continues on PR #38; this document does not narrow the requested scope.
 
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
-| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Real Chipnet full templates, confirmed ASIC blocks and independent public-server header checks pass; light/native TP pending |
-| S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Pending; Knuth live tests deferred, BCHN is the live-test baseline |
+| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. GBT-light remains an optional optimization, not an implemented path. |
+| S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Reference-encrypted TP client/server implemented in #42, with loopback provider and block-submission tests. Independent Knuth provider interoperability still needs a running compatible provider. |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests, unmodified upstream standard-channel CPU device and SV1 Avalon Nano 3 pass; native SV2 firmware and external extended-channel coverage pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
 | S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; workers page, read-only device reports and per-device vardiff observed on the Avalon Nano 3 on 2026-10-08; the read-only `watch` view and calmer vardiff host-tested |
-| S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | Default 1.5% policy, dashboard controls and saved configuration implemented; host/reference checks and four live-node proposals pass; updated physical ASIC payout observation pending |
+| S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | BCH rate/payout UI and immutable job policy implemented. This follow-up weights validated shares for work allocation; arithmetic, old-job attribution, replay and remote acknowledgement tests pass. New scheduler still needs a physical ASIC run. |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check; a coordinator crash during a claim is not exercised live |
 | G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live; backup coordinators host-tested; live failover and rigs on separate machines pending |
-| D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | Pending |
+| D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | BCH P2Pool is a separate project (architecture.md). Pickaxe has SV2, TP and Job Declaration boundaries; the sharechain and its payout-distribution integration are not completed by these tests. |
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | SV1 devices at SV2 pools with backup pools in order implemented and tested (pool mode below); Job Declaration in both modes, Pickaxe client to Pickaxe pool, implemented and loopback-tested (below); live Job Declaration runs and coinbase payouts at other pools pending |
-| D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Setup finds a BCHN on this computer and offers it with client, version and sync height; cookie login; unusable nodes named with their reason; live-checked against a throwaway Chipnet BCHN (below). GPU broadcasts already fall back to Fulcrum; ASIC mode has no fallback, since only a node supplies full templates |
-| T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | Pending protocol/deployment evidence |
-| T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Pending author covenant design |
-| F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Needs audit |
+| D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Scripted tests pass; remote setup discovery, real ZMQ and live recovery evidence remain. |
+| T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | SAFA reference core, firmware work path, worker, simulated Chipnet test token and setup implemented in #42. Registry remains empty pending a deployed author contract and covenant-VM/live proof. |
+| T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Case A/B commitments, independent reference proof verification, journals, worker and JD integration implemented in #42; docs/merge-mining.md exists. Author covenant/VM proof and deployment remain external prerequisites. |
+| F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Audited merged #35: claim readiness no longer waits for another GPU batch; shutdown still drains safely. Existing host regression retained and passing; no new GPU soak claimed. |
 | F2 | Intel, native HIP discrete AMD, Linux GPU and Apple Silicon validation | Actual hardware reports; compile results are insufficient | Pending hardware evidence |
-| F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | Pending audit |
+| F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | Audited telemetry.rs: wgpu uses PCI-matched vendor tools, otherwise explicit unavailable metrics; existing mixed-adapter mapping test passes. Native portable metrics without vendor tools are not implemented. |
 | F4 | Sustained integrated + discrete GPU test | Long serial comparison, correctness and thermals | Pending |
 | F5 | Next feature release version bump | Version/release plan approved for actual release | Deferred until release is ordered |
 
-The owner has an ASIC and a Start9 BCHN Chipnet node available. Connection and
-firmware details are being collected locally; they are not committed here.
+The dedicated ASIC and Chipnet node have prior live evidence below. New live
+runs require fresh connectivity and authorization checks; private connection
+configuration and payout details are never committed here.
 
 ## Initial audit (2026-10-07)
 
@@ -2315,3 +2318,34 @@ scripts run, HiveOS's and mmpOS's statistics, RaveOS's command and its
 statistics by PCI bus with a fake `ravinos`), shellcheck on every script,
 and a host test for "solo:1". Still to check on the systems themselves:
 each package uploaded to an account there, and a rig mining.
+
+## BCH work allocation and merged-scope audit (2026-10-11)
+
+#### PR follow-up
+
+The remaining BCH work-share request is implemented as a difficulty-weighted
+balance. The server credits only validated shares, using the original job's
+payout policy, and the SV1 remote-pool adapter credits only upstream-accepted
+shares using each pending submission's saved target and rate. The default
+work quota remains 0.5%; remote pools use the whole configured donation as
+work because Pickaxe cannot change their coinbases. Satoshi payouts, PHOTON,
+ASIC-exclusive token policies, and release/version configuration are unchanged.
+
+Validation: 725 library and 18 binary host tests passed (14 ignored,
+24 hardware tests filtered); formatting and all-feature Clippy passed.
+The adapter retains an active job's target across SetTarget and channel switches;
+regressions cover old/new target weights and acknowledgement replay. Deterministic experiments cover 400,000 accepted shares across unequal
+targets, changing rates, pauses, and donation/pool-fee jobs. Shares estimate
+hashes; short sessions, delayed work and reconnects are not exact hash counters.
+The older opt-in live proposal assertion expected the superseded compensated
+reward fraction; it now checks the merged 1% reward fraction independently.
+The opt-in live BCHN test passed on Chipnet: all four standard/extended personal
+and donation block proposals passed, and malformed-merkle controls failed. This
+validates block proposals, not a newly mined or propagated block.
+
+The latest merges already contain the merge-mining spec, GPU rig controls,
+Template Distribution, both Job Declaration modes, node discovery/cookies and
+ZMQ. Their historical pending labels were corrected rather than reimplementing
+those features. The remaining live/hardware/author-contract gates stay explicit
+in the table. Author deployments, independent pool integration and hardware tests remain
+separate validation requirements.

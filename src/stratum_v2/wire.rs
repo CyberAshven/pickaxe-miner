@@ -92,6 +92,7 @@ pub struct Responses {
     /// not they are also blocks.
     pub token_wins: Vec<TokenWin>,
     pub share_event: Option<ShareEvent>,
+    pub accepted_work: Option<(Hash, BchPayout)>,
     /// #### PR #42: a SetCustomMiningJob's outcome, its error code when
     /// refused.
     pub custom_job: Option<Result<(), &'static str>>,
@@ -335,6 +336,7 @@ impl MiningSession {
         let mut blocks = Vec::new();
         let mut token_wins = Vec::new();
         let mut share_event = None;
+        let mut accepted_work = None;
         if header.msg_type() == common::MESSAGE_TYPE_SETUP_CONNECTION {
             if self.setup_flags.is_some() || header.channel_msg() {
                 return Err("unexpected setup message".into());
@@ -412,6 +414,7 @@ impl MiningSession {
                 blocks,
                 token_wins,
                 share_event,
+                accepted_work,
                 custom_job: None,
                 forward: Vec::new(),
                 header_wins: Vec::new(),
@@ -486,6 +489,7 @@ impl MiningSession {
                     &mut token_wins,
                     &mut forward,
                     &mut header_wins,
+                    &mut accepted_work,
                 )?);
             }
             Mining::SubmitSharesExtended(request) => {
@@ -507,6 +511,7 @@ impl MiningSession {
                     &mut token_wins,
                     &mut forward,
                     &mut header_wins,
+                    &mut accepted_work,
                 )?);
             }
             Mining::UpdateChannel(request) => {
@@ -598,6 +603,7 @@ impl MiningSession {
             blocks,
             token_wins,
             share_event,
+            accepted_work,
             custom_job,
             forward,
             header_wins,
@@ -978,6 +984,7 @@ impl MiningSession {
         token_wins: &mut Vec<TokenWin>,
         forward: &mut Vec<ForwardShare>,
         header_wins: &mut Vec<ValidatedShare>,
+        accepted_work: &mut Option<(Hash, BchPayout)>,
     ) -> Result<ShareEvent, String> {
         let id = share.channel_id;
         let sequence = share.sequence;
@@ -994,6 +1001,7 @@ impl MiningSession {
         match result {
             Ok(share) => {
                 let event = ShareEvent::Accepted(share.share_target);
+                *accepted_work = Some((share.share_target, share.payout));
                 // #### PR #42: best share from the carried hash
                 // What: the best-share difficulty uses the hash the channel's
                 // check computed, instead of hashing the header again.
@@ -1557,6 +1565,41 @@ mod tests {
             }),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn validated_work_keeps_the_old_jobs_policy_and_ignores_replays() {
+        for kind in [ChannelKind::Standard, ChannelKind::Extended] {
+            let mut server = session();
+            server.receive(setup(4), NOW).unwrap();
+            let device = open_device(&mut server, kind);
+            let original = server.channels[&device.channel].job().unwrap().payout;
+            let changed = BchPayout {
+                donation: "9".parse().unwrap(),
+                donation_work: true,
+                ..Default::default()
+            };
+            server
+                .set_job_with_payout(
+                    10,
+                    4,
+                    Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+                    changed,
+                )
+                .unwrap();
+            let result = server
+                .receive(submit_share(&device, kind, 0, 0), NOW)
+                .unwrap();
+            assert_eq!(result.accepted_work, Some(([255; 32], original)));
+            let replay = server
+                .receive(submit_share(&device, kind, 1, 0), NOW)
+                .unwrap();
+            assert!(replay.accepted_work.is_none());
+            assert!(matches!(
+                replay.share_event,
+                Some(ShareEvent::Rejected("duplicate-share"))
+            ));
+        }
     }
 
     // #### PR #42: token wins leave with the responses

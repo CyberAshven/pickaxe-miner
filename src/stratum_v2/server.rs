@@ -1756,6 +1756,11 @@ fn serve_device(
                     .as_secs();
                 let now = u32::try_from(now).map_err(|_| "system time exceeds header range")?;
                 let responses = mining.receive(frame, now)?;
+                if config.token_donation.is_none() {
+                    if let Some((target, payout)) = responses.accepted_work {
+                        availability.allocation.accepted(&target, payout);
+                    }
+                }
                 // #### PR #42: shares for the pool, handed over without
                 // waiting (see `jd::client::forward`).
                 if let Some(uplink) = config.uplink.as_ref() {
@@ -2037,7 +2042,7 @@ mod retry_tests {
         assert!(availability
             .update(
                 &mut mining,
-                Some(job),
+                Some(job.clone()),
                 start + Duration::from_secs(6),
                 JobDonation::Bch("2".parse().unwrap()),
                 None,
@@ -2045,6 +2050,29 @@ mod retry_tests {
             )
             .unwrap()
             .is_empty());
+
+        // Accepted work changes the job even when the clock and tip stay fixed.
+        let rate = "2".parse().unwrap();
+        availability.allocation = WorkAllocation::new(0);
+        for expected in [true, false] {
+            let old = mining.channels[&1].job().unwrap();
+            let old_id = old.id;
+            availability.allocation.accepted(&old.target, old.payout);
+            availability
+                .update(
+                    &mut mining,
+                    Some(job.clone()),
+                    start + Duration::from_secs(6),
+                    JobDonation::Bch(rate),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let next = mining.channels[&1].job().unwrap();
+            assert!(next.id > old_id);
+            assert_eq!(next.generation, 99);
+            assert_eq!(next.payout.donation_work, expected);
+        }
     }
 
     #[test]
