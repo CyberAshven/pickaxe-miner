@@ -35,7 +35,7 @@ jobs:
           cargo +nightly-2026-04-11 run --locked --manifest-path tools/shared-gpu-proof/Cargo.toml --release -p pickaxe-shared-hash-builder
           # Rebuild the production filters from native Rust and reject drift.
           python3 tools/shared-gpu-proof/sync_filter.py
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pickaxe-shared-gpu-${{ inputs.source-ref }}
           path: |
@@ -115,7 +115,7 @@ jobs:
           git rev-parse HEAD > "dist/$archive/SOURCE_COMMIT.txt"
           tar -czf "dist/$archive.tar.gz" -C dist "$archive"
           (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS.txt)
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pickaxe-macos-arm64-${{ inputs.source-ref }}
           path: |
@@ -156,7 +156,7 @@ jobs:
           cp docs/portable.md dist/web/README.md
           tar -czf dist/pickaxe-browser.tar.gz -C dist web
           (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pickaxe-browser-${{ inputs.source-ref }}
           path: |
