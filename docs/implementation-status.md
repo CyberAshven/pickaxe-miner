@@ -2321,7 +2321,7 @@ each package uploaded to an account there, and a rig mining.
 
 ## BCH work allocation and merged-scope audit (2026-10-11)
 
-#### PR follow-up
+#### PR #48
 
 The remaining BCH work-share request is implemented as a difficulty-weighted
 balance. The server credits only validated shares, using the original job's

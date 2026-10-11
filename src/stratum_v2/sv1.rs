@@ -1497,7 +1497,8 @@ impl Bridge {
     ) -> Result<Vec<Value>, String> {
         let owned = self.owned;
         let lane = self.lane_mut(donation).ok_or("unknown mining channel")?;
-        // SetTarget applies to new jobs, never reweights an older active job.
+        // #### PR #48: keep active targets for delayed shares and lane switches.
+        // SetTarget applies only to the next job (Mining Protocol 5.3.21).
         lane.active.insert(job.job_id, (job.version, lane.target));
         while lane.active.len() > MAX_ACTIVE_JOBS {
             lane.active.pop_first();

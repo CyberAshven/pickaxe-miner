@@ -681,7 +681,7 @@ The BCH policy is attached to each job; changing the setting never changes an
 in-flight job's coinbase. Saved solved blocks retain that policy across restart,
 and pre-donation journal entries replay their original bytes.
 
-#### PR follow-up: work-weighted BCH allocation
+#### PR #48: work-weighted BCH allocation
 
 After the first accepted share, the work adapter accumulates the requested
 quota in expected hashes (`2^256 / (target + 1)`) and subtracts work credited

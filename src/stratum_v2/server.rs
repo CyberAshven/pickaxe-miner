@@ -1756,6 +1756,7 @@ fn serve_device(
                     .as_secs();
                 let now = u32::try_from(now).map_err(|_| "system time exceeds header range")?;
                 let responses = mining.receive(frame, now)?;
+                // #### PR #48: validated BCH work repays the original job's quota.
                 if config.token_donation.is_none() {
                     if let Some((target, payout)) = responses.accepted_work {
                         availability.allocation.accepted(&target, payout);

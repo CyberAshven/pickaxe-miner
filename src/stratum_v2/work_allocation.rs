@@ -67,7 +67,7 @@ impl WorkAllocation {
         self.position < u64::from(rate.bps()) * (PERIOD_NS / 10_000)
     }
 
-    // #### PR follow-up: validated work, not elapsed time, repays BCH work quotas.
+    // #### PR #48: validated work, not elapsed time, repays BCH work quotas.
     // Old jobs keep their own rates and recipient, including late valid shares.
     pub fn accepted(
         &mut self,
