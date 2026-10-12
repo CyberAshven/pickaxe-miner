@@ -1,0 +1,43 @@
+name: OSS Scanner Docker
+
+# Called for ordinary CI and by the release workflow. Do not rely on a
+# release/push-tag event: releases created with GITHUB_TOKEN do not trigger
+# a second workflow. Always use the source revision chosen by the caller.
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Immutable commit SHA to build and test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scanner:
+    name: Build and offline-test scanner image
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+
+      - name: Build scanner Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --progress=plain --pull \
+            -f .oss-scanner/Dockerfile \
+            -t pickaxe-miner-scanner-ci .
+
+      - name: Verify tests still run without network access
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint bash \
+            pickaxe-miner-scanner-ci -c \
+            'set -euo pipefail; cargo test --locked --offline --all-features --no-fail-fast -- --skip if_cuda --skip if_wgpu; cargo test --locked --offline --manifest-path rust-engine/Cargo.toml'
