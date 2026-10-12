@@ -262,7 +262,7 @@ jobs:
           cat hip/build/gfx1036/SHA256SUMS.txt
 
       - name: Upload gfx1036 code objects
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hip-gfx1036-codeobjects
           path: hip/build/gfx1036/
@@ -327,7 +327,7 @@ jobs:
           cat "hip/build/${{ matrix.arch }}/SHA256SUMS.txt"
 
       - name: Upload ${{ matrix.arch }} code objects
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hip-${{ matrix.arch }}-codeobjects
           path: hip/build/${{ matrix.arch }}/
@@ -692,7 +692,7 @@ jobs:
           Remove-Item -LiteralPath $packageDir -Recurse -Force
 
       - name: Upload packaged binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
@@ -736,7 +736,7 @@ jobs:
         run: cargo build --locked --release
 
       - name: Upload the binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: compat-linux-x86_64
           path: target/release/pickaxe_miner
@@ -821,7 +821,7 @@ jobs:
         run: tools/farm-os/build.sh "dist/${TAG}-linux-x86_64.tar.gz" farm
 
       - name: Upload the Linux x86_64 archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-linux-x86_64
           path: dist/*
@@ -830,7 +830,7 @@ jobs:
           retention-days: 14
 
       - name: Upload the packages
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-farm-os
           path: farm/*
@@ -936,7 +936,7 @@ jobs:
           fi
 
       - name: Upload release bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-bundle
           path: dist/*
