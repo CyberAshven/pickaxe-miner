@@ -13,7 +13,10 @@ import unittest
 
 
 class ReleaseChannelTest(unittest.TestCase):
+    """Run workflow release gates against isolated Git histories and artifacts."""
+
     def test_release_mode_skips_existing_versions_and_fails_on_lookup_errors(self):
+        """Require an explicit missing tag before a branch push can release."""
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
         block = re.search(
@@ -66,6 +69,7 @@ class ReleaseChannelTest(unittest.TestCase):
                         self.assertEqual(values['tag'], tag)
 
     def test_portable_archives_require_the_same_source_commit(self):
+        """Reject a portable archive whose recorded source differs from the release."""
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
         block = re.search(
@@ -103,6 +107,7 @@ class ReleaseChannelTest(unittest.TestCase):
                     self.assertTrue((root / 'dist' / f'{tag}-browser.tar.gz').is_file())
 
     def test_download_replacement_never_creates_a_release(self):
+        """Keep explicit download replacement confined to an existing release."""
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
         block = re.search(
@@ -140,6 +145,7 @@ class ReleaseChannelTest(unittest.TestCase):
                     self.assertEqual('release edit ' in commands, not missing)
 
     def test_publication_and_promotion_channels(self):
+        """Enforce stable and prerelease ancestry plus replacement provenance."""
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
         block = re.search(
@@ -153,6 +159,7 @@ class ReleaseChannelTest(unittest.TestCase):
             clone = root / 'clone'
 
             def git(cwd, *args):
+                """Run Git in a disposable repository and return its output."""
                 return subprocess.check_output(
                     ['git', *args], cwd=cwd, text=True,
                     stderr=subprocess.STDOUT).strip()
