@@ -414,7 +414,7 @@ jobs:
 
       - name: Download verified HIP code objects
         if: matrix.arch == 'x86_64'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: hip-*-codeobjects
           path: hip/downloaded
@@ -770,13 +770,13 @@ jobs:
           persist-credentials: false
 
       - name: Download the Linux x86_64 archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-linux-x86_64
           path: dist
 
       - name: Download the older-Linux binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: compat-linux-x86_64
           path: compat
@@ -851,20 +851,20 @@ jobs:
 
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
 
       - name: Download matching macOS package
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pickaxe-macos-arm64-${{ needs.validate.outputs.sha }}
           path: portable/mac
 
       - name: Download matching browser package
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pickaxe-browser-${{ needs.validate.outputs.sha }}
           path: portable/web
@@ -959,7 +959,7 @@ jobs:
 
     steps:
       - name: Download release bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-bundle
           path: dist
