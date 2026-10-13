@@ -613,11 +613,21 @@ impl Channel {
         if (share.version ^ job.template.version) & !job.template.version_mask() != 0 {
             return Err("invalid-version");
         }
+        // #### PR #48: wall-clock ntime
+        // What: an own job accepts a timestamp from the template's curtime
+        // through one minute past the server's clock. A stale curtime does
+        // not shrink that minute.
+        // Why: the unmodified SRI device stamps every header at wall-clock
+        // plus 60 seconds. Its first template is already several seconds
+        // old (it measures hashrate before connecting), and a successor
+        // template can cross a second boundary before the device builds
+        // the header. Capping at curtime plus 60 rejected those shares,
+        // so a run could accept one block and then reject everything.
+        // Look here if: a reference-device run accepts one block and then
+        // rejects shares, or a share more than a minute ahead of the
+        // server clock is accepted.
         let late = match job.kind {
-            JobKind::Own => {
-                share.time > now.saturating_add(60)
-                    || share.time > job.template.current_time.saturating_add(60)
-            }
+            JobKind::Own => share.time > now.saturating_add(60),
             // #### PR #42: a custom job's shares follow the client's start
             // time, up to a minute past it or past now.
             JobKind::Custom { min_ntime } => share.time > now.max(min_ntime).saturating_add(60),
@@ -877,6 +887,32 @@ mod tests {
             extranonce: &[],
         }
     }
+
+    // #### PR #48
+    // What: a timestamp one minute past the server clock is valid on a
+    // template whose curtime is already behind that clock, and one second
+    // further, or anything before curtime, is not.
+    // Why: that is the unmodified SRI device's header time (see the ntime
+    // check in `Channel::check_inner`).
+    // Look here if: upstream_reference_device rejects shares after one block.
+    #[test]
+    fn own_job_accepts_the_reference_device_clock_and_rejects_anything_later() {
+        let mut channel = channel(1, ChannelKind::Standard);
+        let current = channel.job().unwrap().template.current_time;
+        let wall = current + 7;
+        let mut on_time = share(1);
+        on_time.time = wall + 60;
+        channel
+            .check(on_time, wall)
+            .expect("wall clock plus 60 seconds");
+        let mut ahead = share(2);
+        ahead.time = wall + 61;
+        assert!(matches!(channel.check(ahead, wall), Err("invalid-ntime")));
+        let mut early = share(3);
+        early.time = current - 1;
+        assert!(matches!(channel.check(early, wall), Err("invalid-ntime")));
+    }
+
     #[test]
     fn retained_jobs_keep_exact_payouts_across_rate_and_work_rotations() {
         use crate::donation::bch::BchDonation;
