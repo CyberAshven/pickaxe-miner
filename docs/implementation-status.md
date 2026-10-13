@@ -2,8 +2,8 @@
 
 Scope: all decisions, steps and follow-ups in `next-steps.md`, plus the SV2
 design in `stratum-v2.md`. A scaffold or passing build is not completion.
-Current base: `dev` at `027dba9`, including merged #32, #35, #38, #40,
-#42 and #43 (audited 2026-10-11). Historical entries below record what was
+Current base: `dev` at `0270104`, including merged #32, #35, #38, #40,
+#42 through #46 (audited 2026-10-13). Historical entries below record what was
 true at each checkpoint; the table is the current index, not a new scope.
 
 ## Invariants
@@ -41,7 +41,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 | T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Case A/B commitments, independent reference proof verification, journals, worker and JD integration implemented in #42; docs/merge-mining.md exists. Author covenant/VM proof and deployment remain external prerequisites. |
 | F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Audited merged #35: claim readiness no longer waits for another GPU batch; shutdown still drains safely. Existing host regression retained and passing; no new GPU soak claimed. |
 | F2 | Intel, native HIP discrete AMD, Linux GPU and Apple Silicon validation | Actual hardware reports; compile results are insufficient | Pending hardware evidence |
-| F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | Audited telemetry.rs: wgpu uses PCI-matched vendor tools, otherwise explicit unavailable metrics; existing mixed-adapter mapping test passes. Native portable metrics without vendor tools are not implemented. |
+| F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | PR #48 adds native WDDM utilization and dedicated-memory counters to the shared sampler, matched by PCI address. Live counter reads passed for the NVIDIA discrete and AMD integrated adapters on one Windows PC. Missing/ambiguous PCI identity, linked adapters and unavailable counters remain unsupported; power, temperature and clocks still need vendor support. |
 | F4 | Sustained integrated + discrete GPU test | Long serial comparison, correctness and thermals | Pending |
 | F5 | Next feature release version bump | Version/release plan approved for actual release | Deferred until release is ordered |
 
@@ -2349,3 +2349,40 @@ ZMQ. Their historical pending labels were corrected rather than reimplementing
 those features. The remaining live/hardware/author-contract gates stay explicit
 in the table. Author deployments, independent pool integration and hardware tests remain
 separate validation requirements.
+
+## Native Windows GPU counters (2026-10-13)
+
+#### PR #48
+
+The local miner and remote rig share the existing telemetry worker. On Windows,
+that worker now reads PDH GPU engine and dedicated-memory counters when the
+selected GPU's vendor utility is unavailable. Intel and other PCI-identified
+adapters can use the same provider directly. No GPU work is submitted by the
+sampler, and no shader, batching or payout code changes in this addition.
+
+D3DKMT maps the adapter's PCI bus/device/function to the counter's LUID; the code
+never substitutes a display name or an ordinal from another provider. Duplicate
+PCI mappings and linked physical adapters are unavailable. It sums process
+usage within each engine and reports the busiest engine, capped at 100%, rather
+than adding engines that can run concurrently. Dedicated memory excludes shared
+system memory. Temperature, power, fan and clocks stay unavailable in this
+fallback.
+
+The ignored hardware test forces the native counter provider through the actual
+background sampler and stop path. It passed for the RTX 5070 Ti Laptop GPU and
+AMD Radeon integrated graphics on the same Windows machine while the existing
+CUDA miner ran. The samples distinguished the busy discrete GPU (100%, about
+313 MiB dedicated memory) from the integrated GPU (about 1%, 374 MiB). These are
+counter observations, not a new mining-performance benchmark or proof of AMD,
+Intel or Apple mining correctness. The aggregate/mapping regressions and strict
+all-feature Clippy also passed. The serial host regression run passed 726 library
+and 18 CLI tests, with 15 opt-in tests ignored and 24 GPU tests filtered to avoid
+competing with the live miner. Formatting and whitespace checks passed. Remote
+CI for this addition is a separate check; the earlier green branch run did not
+include these counters.
+
+The implementation follows Microsoft's
+[D3DKMT adapter enumeration](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmthk/nf-d3dkmthk-d3dkmtenumadapters2),
+[PDH array API](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhgetformattedcounterarrayw)
+and [GPU counter semantics](https://devblogs.microsoft.com/directx/gpus-in-the-task-manager/).
+The existing Windows dependency supplies the APIs; no package was added.
