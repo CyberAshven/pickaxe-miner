@@ -1126,9 +1126,10 @@ fn upstream_reference_device_authenticates_and_mines_successor_blocks() {
                     .unwrap_or_default();
             // Keep diagnostic output free of any protocol payloads/identities.
             panic!(
-                "reference experiment failed: exited={exited:?}, setup={}, channel={}, stats={snapshot:?}",
+                "reference experiment failed: exited={exited:?}, setup={}, channel={}, ntime={}, stats={snapshot:?}",
                 log.contains("SetupConnectionSuccess"),
                 log.contains("channel opened"),
+                log.contains("invalid-ntime"),
             );
         }
         thread::sleep(Duration::from_millis(50));
