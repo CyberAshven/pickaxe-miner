@@ -579,7 +579,8 @@ pools submit a coinbase with BIP141's marker, flag and one 32-byte witness
 item; Pickaxe strips exactly those and refuses any other witness, since BCH has
 no witnesses and the block carries the plain coinbase. The coinbase script
 must begin with the height push sent, the version may differ only in the
-version-rolling bits, and the header must meet the target. A block that passes
+version-rolling bits, and the header must meet the target (on Chipnet, and
+not be more than 20 minutes after the parent on normal bits). A block that passes
 is saved in `<config>.sv2-relay-blocks.json`, owner-only beside the block
 journal and never mixed with it, and then submitted and retried like this
 server's own blocks until the node answers. A restart, even without
@@ -646,7 +647,10 @@ at once as a fresh job on the same template, so SV1 firmware receives
 `set_difficulty` and a notify that keeps work in flight. When the network has
 easier work, the device's target follows it down so firmware does not discard
 valid Chipnet blocks, and returns on the next normal template (Chipnet allows
-difficulty-1 blocks after a 20-minute gap). A device target limit that cannot
+difficulty-1 blocks after a 20-minute gap). On Chipnet a template carries its
+parent's time, and a share more than 20 minutes after it on normal bits is
+credited as a share but not sent as a block, because the node would refuse
+it (bad-diffbits). A device target limit that cannot
 accommodate easier block work is rejected. Older jobs accept shares at the
 easier of their own target and the current one, and each share is credited at
 the target it met. While merge-mined tokens are mined (none is registered

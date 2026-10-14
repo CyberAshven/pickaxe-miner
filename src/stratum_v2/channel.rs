@@ -683,7 +683,13 @@ impl Channel {
         // and the draft covenant's signed compare would also pass negative
         // hashes (see `merge::safa::proof_passes`).
         // Look here if: token work is journaled, or a SAFA win is missed.
-        let block = job.template.is_block() && meets_target(&hash, &job.template.target);
+        // #### PR #48: on Chipnet, a share more than 20 minutes after the
+        // parent on normal bits is only a share: the node would refuse its
+        // block as bad-diffbits, and saving that block would hold back every
+        // later block on the parent (see `BchTemplate::stale_bits`).
+        let block = job.template.is_block()
+            && meets_target(&hash, &job.template.target)
+            && !job.template.stale_bits(share.time);
         let header_win = job
             .template
             .token_job()
@@ -911,6 +917,51 @@ mod tests {
         let mut early = share(3);
         early.time = current - 1;
         assert!(matches!(channel.check(early, wall), Err("invalid-ntime")));
+    }
+
+    // #### PR #48
+    // What: on a template that knows its parent's time (Chipnet's), a share
+    // meeting the block target at the parent's time plus 20 minutes is a
+    // block, and one second later only a share, still accepted. Without the
+    // parent's time (mainnet) it stays a block, and so does any time on the
+    // proof-of-work limit's bits. A Job Declaration context's parent time
+    // reaches its custom jobs.
+    // Why: BCHN requires the limit's bits strictly after the parent's time
+    // plus 1200 s and refuses other bits as bad-diffbits (see
+    // `BchTemplate::stale_bits`).
+    // Look here if: a Chipnet block is refused as bad-diffbits, or a block
+    // found after a long gap is not sent.
+    #[test]
+    fn a_chipnet_share_past_twenty_minutes_on_normal_bits_is_not_a_block() {
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let start = template.current_time;
+        let parent = start - 1100;
+        let mut sequence = 0;
+        let mut first_block = |channel: &mut Channel, time: u32| loop {
+            sequence += 1;
+            let mut share = share(sequence);
+            share.time = time;
+            share.nonce = sequence;
+            let validated = channel.check(share, parent + 1200).unwrap();
+            if meets_target(&validated.hash, &validated.template.target) {
+                return validated.block;
+            }
+        };
+        let mut unknown = channel_on(1, ChannelKind::Standard, Arc::new(template.clone()));
+        assert!(first_block(&mut unknown, parent + 1201));
+        template.parent_time = Some(parent);
+        let custom = BchTemplate::custom(&template, template.version, start, Vec::new());
+        assert_eq!(custom.parent_time, Some(parent));
+        let mut timed = channel_on(1, ChannelKind::Standard, Arc::new(template.clone()));
+        assert!(first_block(&mut timed, parent + 1200));
+        assert!(!first_block(&mut timed, parent + 1201));
+        assert!(!first_block(&mut timed, parent + 1260));
+        assert!(template.stale_bits(parent + 1201));
+        template.bits = super::super::template::MIN_DIFFICULTY_BITS;
+        assert!(!template.stale_bits(parent + 1201));
+        template.bits = 0x207fffff;
+        template.parent_time = Some(u32::MAX);
+        assert!(!template.stale_bits(u32::MAX));
     }
 
     #[test]

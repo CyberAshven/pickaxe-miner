@@ -2547,7 +2547,8 @@ job's template is old, most of all with a Template Provider source, which
 refreshes only on a new parent; the node then rejects the block. The old
 bound (template time plus a minute) had the same exposure for up to a
 minute. A full fix needs the parent's time (for example `getblockheader`) to
-cap such shares; left for a decision.
+cap such shares; left for a decision. (Addressed below, in "Chipnet's
+20-minute rule".)
 
 ## Review of the follow-up commits (2026-10-14)
 
@@ -2577,3 +2578,62 @@ was refuted.
   fourth landed during its read; turns now stop at four blocks.
 
 Validation is recorded with the commit that carries these fixes.
+
+## Chipnet's 20-minute rule (2026-10-14)
+
+#### PR #48
+
+The rule, read in Bitcoin Cash Node v29.2.0: `GetNextASERTWorkRequired`
+(`src/pow.cpp` lines 114-118) returns the proof-of-work limit's bits when
+`fPowAllowMinDifficultyBlocks` is set and the block's time is strictly
+greater than its parent's time plus twice the 10-minute spacing, and
+`ContextualCheckBlockHeader` (`src/validation.cpp` lines 3695-3698) refuses
+any other bits as `bad-diffbits`. Chipnet sets the flag, with the limit
+`00000000ffff…` (bits `0x1d00ffff`); mainnet does not (`src/chainparams.cpp`).
+`getblocktemplate` recomputes the bits for its `curtime` (`UpdateTime` in
+`src/miner.cpp`), so a node's template is consistent when fetched but does not
+change at the 20-minute point.
+
+Before this change a share on a normal-bits job could carry a time past
+that point: an own job accepts shares up to a minute past the server's
+clock, a node source refreshes every 15 seconds, and a Template Provider
+source takes bits and time only from `SetNewPrevHash`, which Pickaxe's own
+provider sends once per parent. The block was then refused, and because only the first
+block on a parent is saved, every later valid block on that parent was
+skipped too.
+
+Now, on Chipnet only:
+
+- A node source asks the node for its tip's header once per parent
+  (`getblockheader`) and gives the template the parent's time; a Template
+  Provider source takes it from the header its network guard already
+  fetched (from the first configured node, or a Fulcrum server's 80-byte
+  header). Job Declaration jobs inherit their context's. Mainnet asks for
+  nothing more and keeps no parent time.
+- A share past the parent's time plus 1200 seconds on any bits but the
+  limit's is accepted and credited as a share but not sent as a block
+  (`BchTemplate::stale_bits`, checked in `Channel::check_inner`). The same
+  check refuses such a block in a Job Declaration client's `PushSolution`
+  and marks a Template Distribution client's `SubmitSolution` refused locally
+  (`bad-diffbits`), so neither is saved.
+
+Tests: the boundary is exact (a share at the parent plus 1200 seconds is a
+block, one second later is not), a template without the parent's time
+(mainnet) is unchanged, the limit's bits are never refused, and the node is
+asked for the header once per parent. With the rule disabled, the three
+block-path tests fail.
+
+Not changed: devices still receive a minimum-difficulty job only from the
+next template (within 15 seconds on a node source). Pickaxe's own Template
+Provider does not re-announce a parent when its node switches to the limit's
+bits, so its clients keep normal bits for that parent. A Job Declaration
+custom job on the limit's bits with a time at or before the 20-minute point
+is not checked (that needs the ASERT computation, since ASERT itself can
+reach the limit).
+
+Checks before pushing: formatting, strict all-feature Clippy for Linux and
+`x86_64-pc-windows-gnu`, 747 library and 18 CLI tests, and both SRI
+reference tests (standard device, translator) twice each. A read-only review
+through four lenses (rule, block paths, regressions, documentation), with two
+skeptics per finding, raised three minor points and refuted all three; the
+wording two of them pointed at was made exact.

@@ -2848,6 +2848,8 @@ fn preflight_sources(
 
 /// #### PR #42: confirms a provider's parent on the selected network: by the
 /// first configured node, or by the network's Fulcrum servers.
+/// #### PR #48: gives the parent's time (from the same header) on a network
+/// that allows minimum-difficulty blocks.
 fn chain_guard(config: &RuntimeConfig) -> super::tdp::client::Guard {
     let network = config.network;
     let node = config
@@ -2863,12 +2865,21 @@ fn chain_guard(config: &RuntimeConfig) -> super::tdp::client::Guard {
         if let Some(node) = &node {
             let header =
                 crate::node::rpc_call(node, "getblockheader", serde_json::json!([display, true]))?;
-            return (header.get("hash").and_then(serde_json::Value::as_str)
-                == Some(display.as_str())
-                && header.get("height").and_then(serde_json::Value::as_u64)
-                    == Some(u64::from(parent)))
-            .then_some(())
-            .ok_or_else(|| "the parent is not on this network".to_owned());
+            if header.get("hash").and_then(serde_json::Value::as_str) != Some(display.as_str())
+                || header.get("height").and_then(serde_json::Value::as_u64)
+                    != Some(u64::from(parent))
+            {
+                return Err("the parent is not on this network".into());
+            }
+            if !network.allows_min_difficulty_blocks() {
+                return Ok(None);
+            }
+            return header
+                .get("time")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|time| u32::try_from(time).ok())
+                .map(Some)
+                .ok_or_else(|| "the node omitted the parent's time".to_owned());
         }
         let mut session = crate::electrum::ElectrumSession::connect_failover_for_deployment(
             &fulcrum,
@@ -2877,11 +2888,17 @@ fn chain_guard(config: &RuntimeConfig) -> super::tdp::client::Guard {
         let header = session.rpc("blockchain.block.header", serde_json::json!([parent]))?;
         let bytes = hex::decode(header.as_str().ok_or("malformed header")?)
             .map_err(|_| "malformed header")?;
+        if bytes.len() != 80 {
+            return Err("malformed header".into());
+        }
         let mut hash = super::template::double_sha256(&bytes);
         hash.reverse();
-        (hex::encode(hash) == display)
-            .then_some(())
-            .ok_or_else(|| "the parent is not on this network".to_owned())
+        if hex::encode(hash) != display {
+            return Err("the parent is not on this network".into());
+        }
+        Ok(network
+            .allows_min_difficulty_blocks()
+            .then(|| u32::from_le_bytes([bytes[68], bytes[69], bytes[70], bytes[71]])))
     })
 }
 

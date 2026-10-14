@@ -173,7 +173,9 @@ A block on a declared job is whole: the pool saves it in the JD journal, then
 its node gets it, retried until the node answers. It reaches the pool either
 as a share on the custom job or as the client's `PushSolution`, which the pool
 matches by proof of work against the connection's last 8 declared jobs; one
-block per parent is saved, and a solution no job matches is only counted. The
+block per parent is saved, and a solution no job matches is only counted (so
+is, on Chipnet, one more than 20 minutes after the parent on normal bits,
+which the node would refuse). The
 dashboard lists the block with the node's answer.
 
 ## The Coinbase-only flow

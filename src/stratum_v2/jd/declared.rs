@@ -214,8 +214,12 @@ impl DeclaredJob {
     /// The block `solution` names when it is one of this job's: its coinbase
     /// rebuilt with the pushed extranonce, on this job's parent and bits,
     /// with a hash that meets the bits' target. Returns the block's hash too.
+    /// #### PR #48: not a Chipnet block whose time needs other bits (see
+    /// `BchTemplate::stale_bits`).
     pub fn solved(&self, solution: &Solution) -> Option<(Hash, Vec<u8>)> {
-        if solution.prev_hash != self.template.previous_hash || solution.nbits != self.template.bits
+        if solution.prev_hash != self.template.previous_hash
+            || solution.nbits != self.template.bits
+            || self.template.stale_bits(solution.ntime)
         {
             return None;
         }
@@ -494,6 +498,17 @@ pub(in crate::stratum_v2) mod tests {
                 ..solution.clone()
             };
             assert!(job.solved(&elsewhere).is_none());
+            // #### PR #48: on Chipnet, not a block more than 20 minutes
+            // after the parent on normal bits (see `BchTemplate::stale_bits`).
+            for (gap, block) in [(1200, true), (1201, false)] {
+                let mut timed = (*job.template).clone();
+                timed.parent_time = Some(solution.ntime - gap);
+                let timed = DeclaredJob {
+                    shape: job.shape.clone(),
+                    template: Arc::new(timed),
+                };
+                assert_eq!(timed.solved(&solution).is_some(), block, "{gap}");
+            }
             let short = Solution {
                 extranonce: vec![0; 31],
                 ..solution

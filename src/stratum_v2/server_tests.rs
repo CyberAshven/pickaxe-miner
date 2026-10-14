@@ -230,7 +230,11 @@ impl NodeRpc for Rpc {
             "getblockheader" => {
                 let hash = params[0].as_str().unwrap();
                 if !node.lose_replies && node.known.contains(hash) {
-                    Ok(json!({"hash":hash,"confirmations":1}))
+                    Ok(json!({"hash":hash,"confirmations":1,"time":now() - 1}))
+                } else if hash == node.tip {
+                    // #### PR #48: the parent's time, for Chipnet's 20-minute
+                    // rule; a lost reply still confirms no block.
+                    Ok(json!({"hash":hash,"time":now() - 1}))
                 } else {
                     Err("header temporarily unavailable".into())
                 }
@@ -394,7 +398,7 @@ impl Running {
         let source = super::tdp::client::TdpSource::new(
             provider,
             super::tdp::PAYOUT_RESERVE,
-            Box::new(|_, _| Ok(())),
+            Box::new(|_, _| Ok(None)),
         );
         Self::start_config(
             vec![node],
