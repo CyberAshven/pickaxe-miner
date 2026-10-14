@@ -1175,8 +1175,9 @@ fn upstream_reference_translator_mines_successor_blocks_on_an_extended_channel()
         .local_addr()
         .unwrap();
     let config = server.state_directory.0.join("translator.toml");
-    // One extended channel per SV1 connection; difficulty follows the
-    // server's channel target rather than the translator's own vardiff.
+    // One extended channel per SV1 connection, the translator's vardiff off:
+    // it sets each miner's difficulty from the configured minimum hashrate
+    // (10 H/s, about 100 hashes a share).
     std::fs::write(
         &config,
         format!(
@@ -1238,8 +1239,11 @@ user_identity = "interop-test"
     struct Miner {
         device: FirmwareDevice,
         authorized: bool,
-        /// The latest job and the server's block count when it arrived.
+        /// The latest job and its parent's place in the chain: 0 for the
+        /// first parent seen, one more for each new one.
         job: Option<(Value, u64)>,
+        parent: Option<String>,
+        generation: u64,
         submitted: u32,
         accepted: u32,
     }
@@ -1274,19 +1278,23 @@ user_identity = "interop-test"
             device,
             authorized: false,
             job: None,
+            parent: None,
+            generation: 0,
             submitted: 0,
             accepted: 0,
         });
     }
 
     // Answers and notifications arrive in any order. The miners take turns,
-    // one block each, so two blocks never compete for one height.
+    // one block each, so two blocks never compete for one height. A job's
+    // generation comes from its parent, never from when it was read, and no
+    // one mines until both miners have their first job.
     let mut id = 0u32;
     loop {
-        let blocks = server.stats.lock().unwrap().blocks_accepted;
-        if blocks >= 4 {
+        if server.stats.lock().unwrap().blocks_accepted >= 4 {
             break;
         }
+        let both = miners.iter().all(|miner| miner.parent.is_some());
         if Instant::now() >= deadline || translator.0.try_wait().unwrap().is_some() {
             failed(&mut translator, "fewer than four blocks");
         }
@@ -1319,7 +1327,14 @@ user_identity = "interop-test"
                         (_, Some("mining.set_difficulty")) => {
                             device.difficulty = message["params"][0].as_f64().unwrap();
                         }
-                        (_, Some("mining.notify")) => miner.job = Some((message, blocks)),
+                        (_, Some("mining.notify")) => {
+                            let parent = message["params"][1].as_str().map(str::to_owned);
+                            if miner.parent.is_some() && miner.parent != parent {
+                                miner.generation += 1;
+                            }
+                            miner.parent = parent;
+                            miner.job = Some((message, miner.generation));
+                        }
                         _ => (),
                     }
                 }
@@ -1330,7 +1345,8 @@ user_identity = "interop-test"
                     ) => {}
                 Err(_) => failed(&mut translator, "SV1 read failed"),
             }
-            let turn = usize::try_from(blocks % 2).unwrap() == index;
+            let blocks = server.stats.lock().unwrap().blocks_accepted;
+            let turn = both && usize::try_from(blocks % 2).unwrap() == index;
             let current = miner.job.as_ref().is_some_and(|(_, at)| *at == blocks);
             if miner.authorized && !miner.device.prefix.is_empty() && turn && current {
                 let (notify, _) = miner.job.take().unwrap();

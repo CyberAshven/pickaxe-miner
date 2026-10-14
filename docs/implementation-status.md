@@ -2426,7 +2426,8 @@ The opt-in
 test runs the production server against the synthetic BCH node fixture. The
 translator authenticates with the pinned authority key. Two SV1 test miners
 connect to it, and it opens one extended channel for each on its one upstream
-connection, with its own vardiff off so the server's target applies. The
+connection, with its own vardiff off; it sets each miner's difficulty from
+its configured minimum hashrate (10 H/s, about 100 hashes a share). The
 server groups the two channels, so this is also the first run of PR #42's
 group jobs with SRI's translator. The miners take turns: only the miner whose
 turn it is submits, at the translator's difficulty and the block target.
