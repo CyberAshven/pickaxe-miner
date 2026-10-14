@@ -24,7 +24,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 |---|---|---|---|
 | S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. GBT-light remains an optional optimization, not an implemented path. |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Reference-encrypted TP client/server implemented in #42, with loopback provider and block-submission tests. Independent Knuth provider interoperability still needs a running compatible provider. |
-| S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests, unmodified upstream standard-channel CPU device and SV1 Avalon Nano 3 pass; native SV2 firmware and external extended-channel coverage pending |
+| S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests, unmodified upstream standard-channel CPU device, unmodified upstream translator on an extended channel (PR #48) and SV1 Avalon Nano 3 pass; native SV2 firmware pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
@@ -2407,3 +2407,55 @@ accepted, then 54 shares rejected. That is the `invalid-ntime` rejection fixed
 on PR #50 (own-job share time bounded by the server clock plus a minute, not
 also by the template's curtime plus a minute); the same commit is carried here
 unchanged.
+
+## External extended channel through the SRI translator (2026-10-14)
+
+#### PR #48
+
+The unmodified SRI translator (`translator_sv2`) from the same pinned
+`sv2-apps` commit, `3772e9d890dc7ec23bc82bcead41879542902402`, was built
+with Rust 1.98.1 on Ubuntu 24.04. The upstream Cargo.lock SHA256 is
+`a36babbc5f46ee6fb5aeaa5b12d9d103642889bb807cfc0c73bcc4e6bd6e4f95` with LF
+line endings; the `861a6f0c...` recorded above is the same file with CRLF
+line endings. The local translator executable SHA256 was
+`a8b858a02141a32af221b56db330258f5546024eba48416a5945300549e507bf`. No
+upstream source or lockfile is modified or copied into Pickaxe.
+
+The opt-in
+`upstream_reference_translator_mines_successor_blocks_on_an_extended_channel`
+test runs the production server against the synthetic BCH node fixture. The
+translator authenticates with the pinned authority key. Two SV1 test miners
+connect to it, and it opens one extended channel for each on its one upstream
+connection, with its own vardiff off so the server's target applies. The
+server groups the two channels, so this is also the first run of PR #42's
+group jobs with SRI's translator. The miners take turns: only the miner whose
+turn it is submits, at the translator's difficulty and the block target.
+The test requires four accepted blocks (two from each channel), no rejected
+share, and two `OpenExtendedMiningChannelSuccess` lines in the translator's
+log. The fixture checks each block's PoW, parent, merkle root, coinbase and
+payout. Five local runs passed in about 2 seconds each. Three more runs, with
+the reference-device test, passed in 11 to 25 seconds while six busy loops
+loaded the four CPUs. The reference-device test also passed three times
+unloaded with the ported `ntime` bound.
+
+The translator answers a one-argument `mining.authorize` by disconnecting; the
+test firmware sends a user name and a password, as cgminer-based firmware does.
+CI builds the translator beside the reference device in the same job and runs
+this test as its own step. This covers an independent extended-channel client,
+and a grouped proxy connection, on loopback. It does not cover native SV2
+firmware, other pools, or a translator in front of a physical ASIC.
+
+Known limit, unchanged here: the workers table keeps one row per connection,
+and each channel opened on a connection renames that row. Behind a translator,
+the dashboard credits every found block to the last miner that connected
+(all four blocks in this test show `miner2`). The label is for the dashboard
+only: each channel keeps its own payout, and the fixture checked every
+block's payout in this solo run.
+
+To reproduce, build the translator from the checkout described above and run
+the test:
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=0 cargo +1.98.1 build --locked --manifest-path ../sv2-reference/Cargo.toml -p translator_sv2 --bin translator_sv2 --jobs 2
+PICKAXE_SV2_REFERENCE_TRANSLATOR="$(realpath ../sv2-reference/target/debug/translator_sv2)" cargo test --locked --no-default-features --features stratum-v2 --lib upstream_reference_translator_mines_successor_blocks_on_an_extended_channel -- --ignored --test-threads=1
+```
