@@ -706,5 +706,15 @@ hardware hash count or guaranteed fraction of rewards. ASIC-exclusive tokens
 retain their own time-based policy. Fractional satoshis stay with the miner;
 coinbase amounts and the node's subsidy-plus-fees budget are unchanged.
 
+The server also tallies validated work by the payout of the job it was mined
+on (personal, donation or a public pool's fee), apart from the scheduler's
+balance. The status file (`<config>.sv2-status.json`) carries it as `work`,
+with `donation_fraction` and `fee_fraction`. The overview shows "Validated
+work: donation x% · fee y%", and `stratum-v2 watch` shows the donation's
+measured share beside the setting. Over a session it should approach the
+setting; the remaining difference is about one share's work, so it shrinks
+as shares accumulate. At a remote pool, only shares the pool acknowledged
+count.
+
 The authority encoding follows the [SV2 security specification, section
 4.7](https://github.com/stratum-mining/sv2-spec/blob/main/04-Protocol-Security.md#47-url-scheme-and-pool-authority-key).

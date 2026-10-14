@@ -13,7 +13,7 @@
 
 use super::{
     channel::MAX_ACTIVE_JOBS,
-    server::ServerStats,
+    server::{ServerStats, WorkSplit},
     telemetry::ShareEvent,
     transport::{Receiver, Sender, Session},
     wire::encoded,
@@ -73,7 +73,8 @@ const DONATION_REQUEST: u32 = 2;
 /// #### PR #40
 /// Where the BCH donation's work goes at a remote pool: a second channel at
 /// the same pool under the donation address, for the donation's share of
-/// mining time. The rate is the Advanced setting, read live.
+/// mining work (#### PR #48: accepted shares weighted by difficulty). The
+/// rate is the Advanced setting, read live.
 #[derive(Clone, Debug)]
 pub struct DonationRoute {
     pub identity: String,
@@ -539,6 +540,7 @@ fn serve_session(
             let (messages, verdicts) = bridge.upstream(frame)?;
             if !verdicts.is_empty() {
                 let mut stats = stats.lock().map_err(|_| "mining statistics unavailable")?;
+                stats.work.merge(std::mem::take(&mut bridge.work));
                 for verdict in verdicts {
                     match verdict {
                         ShareEvent::Accepted(_) => {
@@ -712,6 +714,9 @@ struct Bridge {
     route: Option<DonationRoute>,
     donation: Donation,
     allocation: WorkAllocation,
+    /// #### PR #48: work a remote pool acknowledged since the session last
+    /// added it to the server's statistics.
+    work: WorkSplit,
     /// The device mines the donation channel's jobs now.
     on_donation: bool,
     /// A donation problem not yet shown on the device's row.
@@ -789,6 +794,7 @@ impl Bridge {
             route: route.filter(|_| remote),
             donation: Donation::Off,
             allocation: WorkAllocation::new(rand::random()),
+            work: WorkSplit::default(),
             on_donation: false,
             donation_issue: None,
             owned: remote,
@@ -831,6 +837,7 @@ impl Bridge {
             route: None,
             donation: Donation::Off,
             allocation: WorkAllocation::new(rand::random()),
+            work: WorkSplit::default(),
             on_donation: false,
             donation_issue: None,
             owned: true,
@@ -1403,6 +1410,7 @@ impl Bridge {
                     for share in accepted {
                         self.allocation
                             .pool_accepted(&share.target, share.donation_rate, donation);
+                        self.work.add(&share.target, donation, false);
                         verdicts.push(ShareEvent::Accepted(share.target));
                     }
                 } else {

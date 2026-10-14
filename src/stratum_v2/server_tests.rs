@@ -1033,6 +1033,11 @@ fn a_public_pool_pays_each_miner_their_own_address_after_the_donation_and_fee() 
         drop(node);
         device.sender.close();
     }
+    // #### PR #48: both blocks came from personal jobs (the fee here is a
+    // coinbase split, not work).
+    let work = server.stats.lock().unwrap().work;
+    assert!(work.personal > 0.0);
+    assert_eq!(work.shares(), Some((0.0, 0.0)));
 }
 
 /// An external reference process started by one of the tests below.
@@ -1916,6 +1921,9 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         (rows[0].accepted, rows[0].rejected, rows[0].protocol),
         (2, 0, "SV1")
     );
+    // #### PR #48: both acknowledged shares count as personal work.
+    assert!(counted.work.personal > 0.0);
+    assert_eq!(counted.work.shares(), Some((0.0, 0.0)));
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
@@ -2386,6 +2394,10 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(stats.lock().unwrap().shares_rejected, 0);
+    // #### PR #48: the pool's acknowledgement counts as donation work.
+    let work = stats.lock().unwrap().work;
+    assert!(work.donation > 0.0 && work.personal == 0.0 && work.fee == 0.0);
+    assert_eq!(work.shares(), Some((1.0, 0.0)));
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 

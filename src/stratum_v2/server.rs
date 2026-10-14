@@ -133,6 +133,53 @@ pub struct ServerStats {
     pub template_source: Option<SourceKind>,
     /// #### PR #42: an ASIC-exclusive token's wins, when one is mined.
     pub header_token: Option<super::merge::source::HeaderSummary>,
+    /// #### PR #48: validated BCH work by the payout of the job it was mined
+    /// on, for checking the donation and fee shares of work over a session.
+    pub work: WorkSplit,
+}
+
+/// #### PR #48
+/// Validated work in expected hashes (`2^256 / (target + 1)` per accepted
+/// share), split by its job's payout: the miner's own, the donation's or a
+/// public pool operator's fee. Counted where the work balance is credited
+/// (this server's own BCH jobs, and shares a remote pool acknowledged), but
+/// tallied separately from that balance, so a session's split shows what the
+/// scheduler actually gave each payout.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+pub struct WorkSplit {
+    pub personal: f64,
+    pub donation: f64,
+    pub fee: f64,
+}
+
+impl WorkSplit {
+    pub fn add(&mut self, target: &super::template::Hash, donation: bool, fee: bool) {
+        let hashes = super::telemetry::expected_hashes(target);
+        if donation {
+            self.donation += hashes;
+        } else if fee {
+            self.fee += hashes;
+        } else {
+            self.personal += hashes;
+        }
+    }
+
+    pub fn merge(&mut self, other: WorkSplit) {
+        self.personal += other.personal;
+        self.donation += other.donation;
+        self.fee += other.fee;
+    }
+
+    pub fn total(&self) -> f64 {
+        self.personal + self.donation + self.fee
+    }
+
+    /// The donation's and the fee's fractions of all validated work, once
+    /// there is any.
+    pub fn shares(&self) -> Option<(f64, f64)> {
+        let total = self.total();
+        (total > 0.0).then(|| (self.donation / total, self.fee / total))
+    }
 }
 
 /// #### PR #42: what the Job Declaration server did. No count names a
@@ -1760,6 +1807,11 @@ fn serve_device(
                 if config.token_donation.is_none() {
                     if let Some((target, payout)) = responses.accepted_work {
                         availability.allocation.accepted(&target, payout);
+                        if let Ok(mut stats) = shared.stats.lock() {
+                            stats
+                                .work
+                                .add(&target, payout.donation_work, payout.fee_work);
+                        }
                     }
                 }
                 // #### PR #42: shares for the pool, handed over without

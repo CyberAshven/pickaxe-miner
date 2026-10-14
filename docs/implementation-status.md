@@ -29,7 +29,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 | S5 | Submit valid blocks and report actual acceptance | Chipnet BCHN block acceptance/propagation | Durable full-block journal and outcome classification implemented; local lost-reply/write-failure/crash proof and physical ASIC block acceptance, public headers and clean restart recovery pass; evidence below |
 | S6 | SV1 firmware translator into the same server | Reference translator and real user's ASIC | Reference adapter, CPU firmware TCP experiments and Avalon Nano 3 Chipnet blocks pass; retained-job fix deployed, refresh uniqueness follow-up below |
 | S7 | Device dashboard rates, shares, rejects and reconnect state | Rendered TUI plus live devices | Per-session rows, validated-work estimates and SV1-local diagnostics host-tested and observed on Avalon Nano 3; real brief RPC outage recovered without reconnect; workers page, read-only device reports and per-device vardiff observed on the Avalon Nano 3 on 2026-10-08; the read-only `watch` view and calmer vardiff host-tested |
-| S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | BCH rate/payout UI and immutable job policy implemented. This follow-up weights validated shares for work allocation; arithmetic, old-job attribution, replay and remote acknowledgement tests pass. New scheduler still needs a physical ASIC run. |
+| S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | BCH rate/payout UI and immutable job policy implemented. This follow-up weights validated shares for work allocation; arithmetic, old-job attribution, replay and remote acknowledgement tests pass. The status file, overview and `watch` now report validated work by payout. New scheduler still needs a physical ASIC run (procedure below). |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check; a coordinator crash during a claim is not exercised live |
@@ -2459,3 +2459,48 @@ the test:
 CARGO_PROFILE_DEV_DEBUG=0 cargo +1.98.1 build --locked --manifest-path ../sv2-reference/Cargo.toml -p translator_sv2 --bin translator_sv2 --jobs 2
 PICKAXE_SV2_REFERENCE_TRANSLATOR="$(realpath ../sv2-reference/target/debug/translator_sv2)" cargo test --locked --no-default-features --features stratum-v2 --lib upstream_reference_translator_mines_successor_blocks_on_an_extended_channel -- --ignored --test-threads=1
 ```
+
+## Validated work by payout, for the physical ASIC check (2026-10-14)
+
+#### PR #48
+
+The scheduler's own balance cannot show what it gave each payout, so the
+server now tallies validated work separately: each accepted share's expected
+hashes (`2^256 / (target + 1)`) go to its job's payout, personal, donation or
+a public pool's fee. It counts where the balance is credited: this server's
+own BCH jobs, and at a remote pool the shares the pool acknowledged. A local
+SV1 adapter's shares are counted once, by the server. ASIC-exclusive token
+mining is not counted (its donation stays time-based).
+
+The status file (`<config>.sv2-status.json`) carries `work` with `personal`,
+`donation`, `fee`, `donation_fraction` and `fee_fraction`. The overview shows
+"Validated work: donation x% · fee y%". `stratum-v2 watch` adds the measured
+share beside the Donation setting ("0.50% of work so far"). The ASIC pool-mode
+texts that still called the donation "mining time" now say mining work;
+GPU pool fees remain time-based and are unchanged.
+
+Tests: the split and its JSON and overview line; the watch view from a saved
+status, with and without work; personal work in a public pool's two blocks;
+donation work and personal work acknowledged by a remote pool.
+
+### Procedure for the physical ASIC run
+
+1. Run the server on the ASIC as usual (solo on the node, default 1.5%
+   donation). Note the start time and the Donation setting.
+2. After at least a few hours, read the split:
+   `jq .work <config>.sv2-status.json`, or watch the Donation line in
+   `stratum-v2 watch`.
+3. Compare `donation_fraction` with the setting's work share (0.5% at the
+   default 1.5%). Over N accepted shares at a steady difficulty, the expected
+   difference is about one share, roughly 1/N of the work; a large or growing
+   gap is a finding.
+4. As an independent cross-check on Chipnet, where an ASIC finds many blocks,
+   count found blocks whose coinbase pays the donation address in full
+   against personal blocks. Over many blocks the donation's share of blocks
+   should approach its share of work. This uses the chain, not the server's
+   counters, but it is coarse: at 0.5%, 2,000 blocks hold about 10 donation
+   blocks.
+
+Record the device, firmware, duration, accepted shares, the `work` values and
+the block counts here. Connection details and payout addresses stay out of
+this file.
