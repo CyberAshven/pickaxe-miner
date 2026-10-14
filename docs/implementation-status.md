@@ -2386,3 +2386,24 @@ The implementation follows Microsoft's
 [PDH array API](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhgetformattedcounterarrayw)
 and [GPU counter semantics](https://devblogs.microsoft.com/directx/gpus-in-the-task-manager/).
 The existing Windows dependency supplies the APIs; no package was added.
+
+## Startup phase after vardiff, and the reference device's clock (2026-10-14)
+
+#### PR #48
+
+Review finding: the first accepted share seeded the work balance with the
+random startup phase measured in that share's hashes. When vardiff then eased
+a high start difficulty (the default 4096 is several times a 1 TH/s device's
+settled share), that offset held back donation and pool-fee jobs for many later
+shares, so short sessions under-delivered both. The phase now stays a fraction
+of the latest accepted share; at a constant difficulty the decisions are
+unchanged. The regression mines one share at 1024 times the settled
+difficulty, then 4096 settled shares, across 200 startup phases. Before the
+change the mean donation work was 0.035 settled shares against 25.6 expected;
+after it, 25.59 donation and 50.95 fee against 25.6 and 50.94.
+
+CI on `9428218` failed the independent SV2 reference device: one block
+accepted, then 54 shares rejected. That is the `invalid-ntime` rejection fixed
+on PR #50 (own-job share time bounded by the server clock plus a minute, not
+also by the template's curtime plus a minute); the same commit is carried here
+unchanged.

@@ -42,7 +42,7 @@ impl WorkAllocation {
     pub fn donation_work(&self, rate: BchDonation) -> bool {
         self.balance.as_ref().map_or_else(
             || self.position < rate.work_units(PERIOD_NS),
-            |balance| u16::from(rate) != 0 && balance.donation > 0.0,
+            |balance| u16::from(rate) != 0 && balance.donation_due(),
         )
     }
 
@@ -50,7 +50,7 @@ impl WorkAllocation {
     pub fn pool_donation_work(&self, rate: BchDonation) -> bool {
         self.balance.as_ref().map_or_else(
             || self.position < rate.pool_work_units(PERIOD_NS),
-            |balance| u16::from(rate) == 10_000 || (u16::from(rate) != 0 && balance.donation > 0.0),
+            |balance| u16::from(rate) == 10_000 || (u16::from(rate) != 0 && balance.donation_due()),
         )
     }
 
@@ -113,9 +113,12 @@ impl WorkAllocation {
         let hashes = super::telemetry::expected_hashes(target);
         let phase = self.position as f64 / PERIOD_NS as f64;
         let balance = self.balance.get_or_insert(WorkBalance {
-            donation: -phase * hashes,
-            fee: -(1.0 - phase) * hashes,
+            donation: 0.0,
+            fee: 0.0,
+            phase,
+            share: hashes,
         });
+        balance.share = hashes;
         balance.donation += hashes * (donation - f64::from(u8::from(donated)));
         balance.fee += hashes * (fee - f64::from(u8::from(charged)));
     }
@@ -124,7 +127,7 @@ impl WorkAllocation {
     /// donation's and a share of what it leaves.
     pub fn fee_work(&self, rate: BchDonation, fee: crate::donation::bch::PoolFee) -> bool {
         if let Some(balance) = &self.balance {
-            return fee.work_units(PERIOD_NS) != 0 && balance.fee > 0.0;
+            return fee.work_units(PERIOD_NS) != 0 && balance.fee_due();
         }
         let donation = rate.work_units(PERIOD_NS);
         let fee = fee.work_units(PERIOD_NS - donation);
@@ -137,6 +140,22 @@ impl WorkAllocation {
 struct WorkBalance {
     donation: f64,
     fee: f64,
+    // #### PR #48: the randomized startup phase is a fraction of the latest
+    // share, not of the first. Vardiff can ease the target far below the
+    // start difficulty; an offset fixed in first-share hashes would then
+    // hold back donation and fee jobs for many later shares.
+    phase: f64,
+    share: f64,
+}
+
+impl WorkBalance {
+    fn donation_due(&self) -> bool {
+        self.donation > self.phase * self.share
+    }
+
+    fn fee_due(&self) -> bool {
+        self.fee > (1.0 - self.phase) * self.share
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +200,59 @@ mod tests {
             assert!((donated / total - 0.005).abs() < 0.00005);
             assert!((charged / total - 0.995 * 0.01).abs() < 0.00005);
         }
+    }
+
+    // #### PR #48
+    // What: the first accepted share is 1024 times the settled share (a
+    // start difficulty that vardiff then eases). Across startup phases, the
+    // donation and the fee still get their share of the session's work.
+    // Look here if: the startup phase or the work balance changes.
+    #[test]
+    fn startup_phase_follows_the_settled_share_after_vardiff_eases() {
+        use crate::donation::bch::{BchPayout, FeeMode, PoolFee};
+        let rate = BchDonation::default();
+        let fee = PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: FeeMode::Work,
+        };
+        let easy = [255; 32];
+        let mut hard = [255; 32];
+        hard[31] = 0;
+        hard[30] = 0x3f;
+        let first = super::super::telemetry::expected_hashes(&hard);
+        assert_eq!(first, 1024.0);
+        let later: u16 = 4096;
+        let total = first + f64::from(later);
+        let (phases, mut donated, mut charged) = (200, 0.0, 0.0);
+        for k in 0..phases {
+            // Past the time-based donation and fee windows, so the first
+            // share is personal work for every phase checked here.
+            let phase = 0.02 + 0.98 * f64::from(k) / f64::from(phases);
+            let mut allocation = WorkAllocation::new((phase * PERIOD_NS as f64) as u64);
+            for target in
+                std::iter::once(&hard).chain(std::iter::repeat_n(&easy, usize::from(later)))
+            {
+                let donation_work = allocation.donation_work(rate);
+                let payout = BchPayout {
+                    donation: rate,
+                    donation_work,
+                    fee: Some(fee),
+                    fee_work: !donation_work && allocation.fee_work(rate, fee),
+                };
+                let work = super::super::telemetry::expected_hashes(target);
+                donated += if payout.donation_work { work } else { 0.0 };
+                charged += if payout.fee_work { work } else { 0.0 };
+                allocation.accepted(target, payout);
+            }
+        }
+        // Within one settled share of each policy's whole-session work.
+        let donated = donated / f64::from(phases);
+        let charged = charged / f64::from(phases);
+        assert!((donated - 0.005 * total).abs() < 1.0, "donated {donated}");
+        assert!(
+            (charged - 0.995 * 0.01 * total).abs() < 1.0,
+            "charged {charged}"
+        );
     }
 
     #[test]

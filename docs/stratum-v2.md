@@ -692,7 +692,10 @@ and unacknowledged shares do not repay a quota. Remote-pool replies use the targ
 the share was submitted, including batched acknowledgements.
 
 Before the first accepted share, the existing randomly phased eligible-time
-schedule supplies a startup choice. Once shares arrive, idle time, template
+schedule supplies a startup choice. That phase then stays a fraction of the
+latest accepted share, not of the first: when vardiff eases a high start
+difficulty, the donation and fee jobs come as often as the settled share
+size implies. Once shares arrive, idle time, template
 refreshes and hashrate changes cannot themselves accrue donation work. A
 connection starts a new balance; short sessions and in-flight shares affect
 convergence. Firmware does not expose every hash, so this targets 0.5% of
