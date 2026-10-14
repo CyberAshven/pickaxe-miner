@@ -234,6 +234,11 @@ pub enum TelemetrySource {
     Amd(String),
     #[cfg(windows)]
     Windows(crate::backend::PciAddress),
+    /// #### PR #48: a lone CUDA or HIP GPU's vendor tool, by ordinal, with
+    /// the PCI address that names it for the WDDM counters when the tool
+    /// does not answer.
+    #[cfg(windows)]
+    Ordinal(Box<TelemetrySource>, crate::backend::PciAddress),
 }
 
 impl TelemetrySource {
@@ -243,13 +248,15 @@ impl TelemetrySource {
             Self::Amd(id) => sample_amd_telemetry(id),
             #[cfg(windows)]
             Self::Windows(_) => None,
+            #[cfg(windows)]
+            Self::Ordinal(source, _) => source.sample(),
         }
     }
 
     #[cfg(windows)]
     fn pci(&self) -> Option<crate::backend::PciAddress> {
         match self {
-            Self::Windows(pci) => Some(*pci),
+            Self::Windows(pci) | Self::Ordinal(_, pci) => Some(*pci),
             Self::Nvidia(id) | Self::Amd(id) => crate::backend::PciAddress::parse(id),
         }
     }
@@ -285,6 +292,12 @@ pub fn telemetry_sources(gpus: &[GpuDevice]) -> Vec<Option<TelemetrySource>> {
                 _ if gpu.backend == native => gpu.index.to_string(),
                 _ => return None,
             };
+            // #### PR #48: the ordinal names the GPU to its vendor tool, and
+            // its PCI address to the WDDM counters.
+            #[cfg(windows)]
+            if let Some(pci) = gpu.pci.filter(|_| lone_native) {
+                return Some(TelemetrySource::Ordinal(Box::new(source(id)), pci));
+            }
             Some(source(id))
         })
         .collect()
@@ -555,10 +568,18 @@ mod tests {
         ));
         #[cfg(not(windows))]
         let intel = None;
-        // A lone CUDA GPU keeps the ordinal used before several GPUs could mine.
+        // A lone CUDA GPU keeps the ordinal used before several GPUs could mine;
+        // on Windows its PCI address also names it to the WDDM counters.
+        #[cfg(windows)]
+        let lone = Some(TelemetrySource::Ordinal(
+            Box::new(TelemetrySource::Nvidia("0".into())),
+            crate::backend::PciAddress::parse("0000:01:00.0").unwrap(),
+        ));
+        #[cfg(not(windows))]
+        let lone = nvidia("0");
         assert_eq!(
             telemetry_sources(&[gpu("NVIDIA", BackendKind::Cuda, 0, Some(1))]),
-            [nvidia("0")]
+            [lone]
         );
         // Several NVIDIA cards, or one mined through wgpu, go by PCI address;
         // Windows can read an iGPU through WDDM, but never guesses a missing PCI id.

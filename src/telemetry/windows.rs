@@ -3,14 +3,24 @@
 
 use super::GpuTelemetry;
 use crate::backend::PciAddress;
-use std::{collections::BTreeMap, mem::size_of, ptr};
+use std::{
+    collections::BTreeMap,
+    mem::size_of,
+    ptr,
+    time::{Duration, Instant},
+};
 use windows_sys::{Wdk::Graphics::Direct3D::*, Win32::System::Performance::*};
+
+/// The shortest interval a rate counter is read over.
+const RATE_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(super) struct Sampler {
     query: PDH_HQUERY,
     engines: PDH_HCOUNTER,
     memory: PDH_HCOUNTER,
     adapters: BTreeMap<PciAddress, Option<String>>,
+    /// The last collection: a rate is measured from it.
+    collected: Instant,
 }
 
 impl Sampler {
@@ -25,6 +35,7 @@ impl Sampler {
             engines: ptr::null_mut(),
             memory: ptr::null_mut(),
             adapters: adapters(),
+            collected: Instant::now(),
         };
         for (path, counter) in [
             (
@@ -42,15 +53,22 @@ impl Sampler {
                 return None;
             }
         }
-        // Rate counters need a previous observation; the worker supplies the delay.
+        // Rate counters need a previous observation.
         unsafe { PdhCollectQueryData(query) };
+        sampler.collected = Instant::now();
         Some(sampler)
     }
 
     pub fn sample(&mut self) -> BTreeMap<PciAddress, GpuTelemetry> {
+        // The worker's first pass comes straight after `new`: a rate over a
+        // few microseconds is noise, so that pass reports nothing.
+        if self.collected.elapsed() < RATE_INTERVAL {
+            return BTreeMap::new();
+        }
         if unsafe { PdhCollectQueryData(self.query) } != 0 {
             return BTreeMap::new();
         }
+        self.collected = Instant::now();
         let engines = counter_values(self.engines);
         let memory = counter_values(self.memory);
         self.adapters

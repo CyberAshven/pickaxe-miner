@@ -51,6 +51,9 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// A remote pool's verdict on a share is counted if it arrives within this
 /// time; later or missing verdicts are dropped without closing the device.
 const REMOTE_VERDICT: Duration = Duration::from_secs(120);
+/// #### PR #48: donation shares in a row the pool refuses, or never answers
+/// within `REMOTE_VERDICT`, before the adapter stops donating at that pool.
+const DONATION_REFUSALS: u32 = 8;
 /// The rate a device declares when its channel opens at a remote pool, which
 /// sets the pool's first difficulty: 1 TH/s, about one Bitaxe. Pools then
 /// adjust it from the shares.
@@ -493,10 +496,9 @@ fn serve_session(
         }
         if upstream.remote {
             // Firmware already has its reply; a verdict that never comes is
-            // simply not counted.
-            for lane in bridge.lanes_mut() {
-                lane.pending
-                    .retain(|_, pending| pending.sent.elapsed() < REMOTE_VERDICT);
+            // simply not counted (see `expire_verdicts`).
+            for message in bridge.expire_verdicts()? {
+                downstream.write(&message)?;
             }
         } else if bridge
             .user
@@ -721,6 +723,9 @@ struct Bridge {
     on_donation: bool,
     /// A donation problem not yet shown on the device's row.
     donation_issue: Option<&'static str>,
+    /// #### PR #48: donation shares refused or unanswered since the last
+    /// accepted one (see `donation_refused`).
+    donation_refusals: u32,
     /// #### PR #40: the adapter owns the device's extranonce, at a remote
     /// pool or in a public pool, and puts the channel's prefix into the
     /// coinbase part the device receives.
@@ -797,6 +802,7 @@ impl Bridge {
             work: WorkSplit::default(),
             on_donation: false,
             donation_issue: None,
+            donation_refusals: 0,
             owned: remote,
             public: Public::Off,
             fixed: false,
@@ -840,6 +846,7 @@ impl Bridge {
             work: WorkSplit::default(),
             on_donation: false,
             donation_issue: None,
+            donation_refusals: 0,
             owned: true,
             public: Public::Waiting,
             fixed: false,
@@ -889,13 +896,40 @@ impl Bridge {
         }
     }
 
-    /// Both channels' shares, for expiring verdicts no longer awaited.
-    fn lanes_mut(&mut self) -> impl Iterator<Item = &mut Lane> {
-        let donation = match &mut self.donation {
-            Donation::Open(lane) => Some(lane.as_mut()),
-            _ => None,
+    /// Expires verdicts no longer awaited on both channels. A remote pool's
+    /// missing verdict is simply not counted; on the donation channel it
+    /// counts as refused (#### PR #48, see `donation_refused`).
+    fn expire_verdicts(&mut self) -> Result<Vec<Value>, String> {
+        let expire = |lane: &mut Lane| {
+            let before = lane.pending.len();
+            lane.pending
+                .retain(|_, pending| pending.sent.elapsed() < REMOTE_VERDICT);
+            before - lane.pending.len()
         };
-        std::iter::once(&mut self.user).chain(donation)
+        expire(&mut self.user);
+        let unanswered = self.lane_mut(true).map_or(0, expire);
+        self.donation_refused(unanswered)
+    }
+
+    // #### PR #48
+    // What: donation shares the pool refused or never answered are counted
+    // until one is accepted; at `DONATION_REFUSALS` in a row the adapter
+    // stops donating at this pool, as when the pool refuses the channel.
+    // Why: only accepted donation shares repay the donation's work quota, so
+    // a pool that opens the donation channel but never accepts its shares
+    // would otherwise keep the device on that channel for good.
+    // Look here if: a device stays on the donation channel, or leaves it
+    // after a few stale shares.
+    fn donation_refused(&mut self, count: usize) -> Result<Vec<Value>, String> {
+        if count == 0 || !matches!(self.donation, Donation::Open(_)) {
+            return Ok(Vec::new());
+        }
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        self.donation_refusals = self.donation_refusals.saturating_add(count);
+        if self.donation_refusals < DONATION_REFUSALS {
+            return Ok(Vec::new());
+        }
+        self.drop_donation("the pool refuses the donation's shares")
     }
 
     // #### PR #42: the SV1 adapter follows the pool's group channel
@@ -1407,6 +1441,9 @@ impl Bridge {
                         }
                         accepted.push(entry.remove());
                     }
+                    if donation && !accepted.is_empty() {
+                        self.donation_refusals = 0;
+                    }
                     for share in accepted {
                         self.allocation
                             .pool_accepted(&share.target, share.donation_rate, donation);
@@ -1441,7 +1478,12 @@ impl Bridge {
                     _ => (20, "rejected-by-pool"),
                 };
                 match (pending, self.remote) {
-                    (Some(_), true) => verdicts.push(ShareEvent::Rejected(reason)),
+                    (Some(_), true) => {
+                        verdicts.push(ShareEvent::Rejected(reason));
+                        if donation {
+                            out.extend(self.donation_refused(1)?);
+                        }
+                    }
                     // A verdict no longer awaited.
                     (None, true) => (),
                     (Some(pending), false) => {
@@ -1941,6 +1983,146 @@ mod tests {
         );
         assert!(addressed_to(9, 3, 9) && addressed_to(3, 3, 9));
         assert!(!addressed_to(0, 3, 0) && !addressed_to(9, 3, 0));
+    }
+
+    // #### PR #48
+    // What: a remote pool that opens the donation channel but refuses its
+    // shares, or never answers them, ends the donation at that pool after
+    // DONATION_REFUSALS in a row and the device mines its own channel again;
+    // an accepted donation share starts the count over.
+    // Look here if: `donation_refused` or `expire_verdicts` changes.
+    #[test]
+    fn a_pool_that_refuses_donation_shares_sends_the_device_back_to_its_channel() {
+        let donating = || {
+            let rate: BchDonation = "1.5".parse().unwrap();
+            let mut bridge = Bridge::new(
+                OpenExtendedMiningChannelSuccess {
+                    request_id: 1,
+                    channel_id: 3,
+                    group_channel_id: 0,
+                    target: (&[255u8; 32]).into(),
+                    extranonce_size: 8,
+                    extranonce_prefix: [7u8; 4].as_slice().try_into().unwrap(),
+                },
+                true,
+                Some(DonationRoute {
+                    identity: "donation".into(),
+                    rate: Arc::new(RwLock::new(rate)),
+                }),
+            )
+            .unwrap();
+            bridge
+                .request(json!({"id":1,"method":"mining.subscribe","params":[]}))
+                .unwrap();
+            bridge
+                .request(json!({"id":2,"method":"mining.authorize","params":["worker", ""]}))
+                .unwrap();
+            bridge.upstream(group_job(3, 5)).unwrap();
+            bridge.upstream(group_parent(3, 5)).unwrap();
+            bridge
+                .donation_request()
+                .unwrap()
+                .expect("donation channel");
+            let opened = encoded(
+                OpenExtendedMiningChannelSuccess {
+                    request_id: DONATION_REQUEST,
+                    channel_id: 9,
+                    group_channel_id: 0,
+                    target: (&[255u8; 32]).into(),
+                    extranonce_size: 8,
+                    extranonce_prefix: [9u8; 4].as_slice().try_into().unwrap(),
+                },
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+                false,
+            )
+            .unwrap();
+            bridge.upstream(opened).unwrap();
+            bridge.upstream(group_job(9, 5)).unwrap();
+            bridge.upstream(group_parent(9, 5)).unwrap();
+            // One accepted personal share makes the donation due at once.
+            bridge.allocation = WorkAllocation::new(0);
+            bridge.allocation.pool_accepted(&[255; 32], rate, false);
+            assert!(!bridge.tick(Instant::now()).unwrap().is_empty());
+            assert!(bridge.on_donation);
+            bridge
+        };
+        let share = |bridge: &mut Bridge, nonce: u32| {
+            let (_, shares) = bridge
+                .request(json!({"id":100 + nonce,"method":"mining.submit","params":["worker",(5 | DONATION_JOBS).to_string(),"0a0b0c0d","00000001",format!("{nonce:08x}")]}))
+                .unwrap();
+            assert_eq!(shares[0].channel_id, 9);
+            shares[0].sequence_number
+        };
+        let refuse = |bridge: &mut Bridge, sequence_number: u32| {
+            let error = encoded(
+                SubmitSharesError {
+                    channel_id: 9,
+                    sequence_number,
+                    error_code: "invalid-identity".try_into().unwrap(),
+                },
+                MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
+                true,
+            )
+            .unwrap();
+            bridge.upstream(error).unwrap().0
+        };
+        let mut bridge = donating();
+        let mut nonce = 0;
+        for _ in 1..DONATION_REFUSALS {
+            nonce += 1;
+            let sequence = share(&mut bridge, nonce);
+            assert!(refuse(&mut bridge, sequence).is_empty());
+        }
+        // An accepted donation share starts the count over.
+        nonce += 1;
+        let sequence = share(&mut bridge, nonce);
+        let accepted = encoded(
+            SubmitSharesSuccess {
+                channel_id: 9,
+                last_sequence_number: sequence,
+                new_submits_accepted_count: 1,
+                new_shares_sum: 0,
+            },
+            MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+            true,
+        )
+        .unwrap();
+        bridge.upstream(accepted).unwrap();
+        for _ in 1..DONATION_REFUSALS {
+            nonce += 1;
+            let sequence = share(&mut bridge, nonce);
+            assert!(refuse(&mut bridge, sequence).is_empty());
+        }
+        assert!(bridge.on_donation);
+        nonce += 1;
+        let sequence = share(&mut bridge, nonce);
+        // The next refusal ends the donation: a clean job on its own channel.
+        let back = refuse(&mut bridge, sequence);
+        assert_eq!(back.last().unwrap()["params"][0], "5");
+        assert_eq!(back.last().unwrap()["params"][8], true);
+        assert!(!bridge.on_donation);
+        assert!(matches!(bridge.donation, Donation::Unavailable));
+        assert_eq!(
+            bridge.donation_issue,
+            Some("the pool refuses the donation's shares")
+        );
+        assert!(bridge.tick(Instant::now()).unwrap().is_empty());
+
+        // Verdicts the pool never sends count the same way.
+        let mut bridge = donating();
+        for nonce in 1..=DONATION_REFUSALS {
+            share(&mut bridge, nonce);
+        }
+        assert!(bridge.expire_verdicts().unwrap().is_empty());
+        let long_ago = Instant::now()
+            .checked_sub(REMOTE_VERDICT + Duration::from_secs(1))
+            .unwrap();
+        for pending in bridge.lane_mut(true).unwrap().pending.values_mut() {
+            pending.sent = long_ago;
+        }
+        let back = bridge.expire_verdicts().unwrap();
+        assert_eq!(back.last().unwrap()["params"][0], "5");
+        assert!(!bridge.on_donation);
     }
 
     // #### PR #40

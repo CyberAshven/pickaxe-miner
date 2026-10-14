@@ -2846,6 +2846,8 @@ fn a_scripted_jd_client_sets_a_custom_job_and_mines_it() {
     assert_eq!(stats.connections, 1, "the JD session is not a device");
     assert_eq!(stats.device_stats.snapshots(Instant::now()).len(), 1);
     assert_eq!(server.node.lock().unwrap().submissions, 0);
+    // #### PR #48: a custom job's share is no one's work here.
+    assert_eq!(stats.work, super::server::WorkSplit::default());
     drop(jd);
     drop(jd_replies);
     server.wait(|stats| stats.jd_server.as_ref().is_some_and(|jd| jd.clients == 0));

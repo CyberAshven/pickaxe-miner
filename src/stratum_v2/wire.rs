@@ -1001,7 +1001,13 @@ impl MiningSession {
         match result {
             Ok(share) => {
                 let event = ShareEvent::Accepted(share.share_target);
-                *accepted_work = Some((share.share_target, share.payout));
+                // #### PR #48: only this server's own jobs carry its BCH
+                // payout policy. A Job Declaration job's coinbase is the
+                // client's (its payout here is a placeholder), so its work
+                // repays no quota and is not counted as anyone's here.
+                if !share.template.is_header_only() && !share.template.is_declared() {
+                    *accepted_work = Some((share.share_target, share.payout));
+                }
                 // #### PR #42: best share from the carried hash
                 // What: the best-share difficulty uses the hash the channel's
                 // check computed, instead of hashing the header again.

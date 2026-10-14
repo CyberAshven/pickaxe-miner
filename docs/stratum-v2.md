@@ -413,7 +413,10 @@ difficulty and a clean job, so the device never reconnects or falls back to
 its own backup pools. At 0% no donation channel is opened. A pool that refuses
 the second channel, for example one whose usernames are accounts rather than
 addresses, keeps the device mining on its own channel, and the workers page
-shows why. Native SV2 devices such as Bitaxe can connect to SV2 pools
+shows why. So does a pool that opens the second channel but refuses its
+shares, or never answers them within two minutes: after eight such donation
+shares in a row (#### PR #48), since only accepted donation shares repay the
+donation's work. Native SV2 devices such as Bitaxe can connect to SV2 pools
 themselves.
 
 Evidence, 2026-10-08: Pickaxe's own server as the pool, over TCP with Noise

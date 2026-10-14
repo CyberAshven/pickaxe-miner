@@ -2504,3 +2504,41 @@ donation work and personal work acknowledged by a remote pool.
 Record the device, firmware, duration, accepted shares, the `work` values and
 the block counts here. Connection details and payout addresses stay out of
 this file.
+
+## Review fixes: donation refusals, custom jobs, Windows counters (2026-10-14)
+
+#### PR #48
+
+A read-only multi-agent review of the whole PR raised these; each was then
+confirmed in the code. The donation and Job Declaration fixes have tests
+that fail without them. The Windows changes are compiled for Windows here
+and covered by the source-selection test on Windows CI; the 250 ms interval
+has no automated test, as it needs the Windows counters themselves.
+
+- A remote pool that opened the donation channel but refused its shares, or
+  never answered them, kept the device on that channel for good: only
+  accepted donation shares repay the work quota, and nothing else moved the
+  device back (the time-based schedule before this PR bounded it). The
+  adapter now counts donation shares refused or unanswered within two
+  minutes; eight in a row end the donation at that pool, as a refused
+  donation channel already did, and the workers page shows "the pool refuses
+  the donation's shares". An accepted donation share resets the count.
+- Job Declaration jobs carry a placeholder payout, yet their shares credited
+  the connection's work balance and would have counted as personal work in
+  the new split. Only this server's own jobs credit it now.
+- On Windows, a lone CUDA or HIP GPU is named by ordinal for its vendor tool,
+  so the WDDM fallback never found its PCI address. That source now also
+  carries the PCI address, and the counters cover it when `nvidia-smi` or
+  `amd-smi` does not answer. The vendor tool's query is unchanged.
+- The first WDDM utilization reading was a rate over a few microseconds
+  (the worker samples straight after creating the query). The sampler now
+  reports nothing until 250 ms have passed since the previous collection.
+
+Not changed here: on Chipnet a block more than 20 minutes after its parent
+must use minimum-difficulty bits. The own-job time bound (server clock plus a
+minute) can let a share on a normal-difficulty job pass that point when the
+job's template is old, most of all with a Template Provider source, which
+refreshes only on a new parent; the node then rejects the block. The old
+bound (template time plus a minute) had the same exposure for up to a
+minute. A full fix needs the parent's time (for example `getblockheader`) to
+cap such shares; left for a decision.
