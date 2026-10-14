@@ -711,13 +711,16 @@ coinbase amounts and the node's subsidy-plus-fees budget are unchanged.
 
 The server also tallies validated work by the payout of the job it was mined
 on (personal, donation or a public pool's fee), apart from the scheduler's
-balance. The status file (`<config>.sv2-status.json`) carries it as `work`,
-with `donation_fraction` and `fee_fraction`. The overview shows "Validated
-work: donation x% · fee y%", and `stratum-v2 watch` shows the donation's
-measured share beside the setting. Over a session it should approach the
-setting; the remaining difference is about one share's work, so it shrinks
-as shares accumulate. At a remote pool, only shares the pool acknowledged
-count.
+balance. The status file (`<config>.sv2-status.json`) carries this server's
+own jobs as `work` (solo or a public pool, compared with the donation's work
+share, 0.5% at the default 1.5%), and shares remote pools acknowledged as
+`pool_work` (pool mode and fallback pools, compared with the whole setting),
+each with `donation_fraction` and `fee_fraction`. `work` is null for an
+ASIC-exclusive token and as a Job Declaration client, whose donations are
+not this work share. The overview shows "Validated work: donation x% · fee
+y%", and `stratum-v2 watch` shows the measured share beside the setting.
+Over a session it should approach its target; the remaining difference is
+about one share's work, so it shrinks as shares accumulate.
 
 The authority encoding follows the [SV2 security specification, section
 4.7](https://github.com/stratum-mining/sv2-spec/blob/main/04-Protocol-Security.md#47-url-scheme-and-pool-authority-key).

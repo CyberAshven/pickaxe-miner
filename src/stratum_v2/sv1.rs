@@ -542,7 +542,7 @@ fn serve_session(
             let (messages, verdicts) = bridge.upstream(frame)?;
             if !verdicts.is_empty() {
                 let mut stats = stats.lock().map_err(|_| "mining statistics unavailable")?;
-                stats.work.merge(std::mem::take(&mut bridge.work));
+                stats.pool_work.merge(std::mem::take(&mut bridge.work));
                 for verdict in verdicts {
                     match verdict {
                         ShareEvent::Accepted(_) => {
@@ -726,9 +726,10 @@ struct Bridge {
     /// #### PR #48: donation shares refused or unanswered since the last
     /// accepted one (see `donation_refused`).
     donation_refusals: u32,
-    /// #### PR #48: the donation channel the adapter gave up on. It stays
-    /// open at the pool, whose jobs and verdicts for it are ignored.
-    dropped: Option<u32>,
+    /// #### PR #48: the donation channel the adapter gave up on, and its
+    /// group. It stays open at the pool, whose jobs, targets and verdicts for
+    /// it are ignored (a group the device's own channel is not in included).
+    dropped: Option<(u32, u32)>,
     /// #### PR #40: the adapter owns the device's extranonce, at a remote
     /// pool or in a public pool, and puts the channel's prefix into the
     /// coinbase part the device receives.
@@ -1054,7 +1055,7 @@ impl Bridge {
     /// Stops donating at this pool: the device goes back to its own channel.
     fn drop_donation(&mut self, reason: &'static str) -> Result<Vec<Value>, String> {
         if let Donation::Open(lane) = &self.donation {
-            self.dropped = Some(lane.channel);
+            self.dropped = Some((lane.channel, lane.group));
         }
         self.donation = Donation::Unavailable;
         self.donation_issue = Some(reason);
@@ -1313,16 +1314,17 @@ impl Bridge {
         let mut out = Vec::new();
         let mut verdicts = Vec::new();
         // #### PR #48: a channel message starts with its channel id; one for
-        // a dropped donation channel is no longer anyone's (see `dropped`).
-        if channel_message
-            && self.dropped.is_some()
-            && frame
+        // a dropped donation channel, or a group only it was in, is no longer
+        // anyone's (see `dropped`).
+        if let (true, Some((channel, group))) = (channel_message, self.dropped) {
+            let id = frame
                 .payload()
                 .first_chunk::<4>()
-                .map(|id| u32::from_le_bytes(*id))
-                == self.dropped
-        {
-            return Ok((out, verdicts));
+                .map(|id| u32::from_le_bytes(*id));
+            let own_group = self.user.group != 0 && self.user.group == group;
+            if id == Some(channel) || (group != 0 && !own_group && id == Some(group)) {
+                return Ok((out, verdicts));
+            }
         }
         match kind {
             // A common-protocol Reconnect: the device reconnects, and the
@@ -2047,7 +2049,9 @@ mod tests {
                 OpenExtendedMiningChannelSuccess {
                     request_id: DONATION_REQUEST,
                     channel_id: 9,
-                    group_channel_id: 0,
+                    // Pickaxe's own server groups channels by payout, so the
+                    // donation's is in a group of its own.
+                    group_channel_id: 12,
                     target: (&[255u8; 32]).into(),
                     extranonce_size: 8,
                     extranonce_prefix: [9u8; 4].as_slice().try_into().unwrap(),
@@ -2131,7 +2135,12 @@ mod tests {
         // are ignored, and the session goes on; other unknown ids still end it.
         nonce += 1;
         assert!(refuse(&mut bridge, nonce).is_empty());
-        for frame in [group_job(9, 6), group_parent(9, 6)] {
+        for frame in [
+            group_job(9, 6),
+            group_parent(9, 6),
+            group_job(12, 7),
+            group_parent(12, 7),
+        ] {
             let (messages, verdicts) = bridge.upstream(frame).unwrap();
             assert!(messages.is_empty() && verdicts.is_empty());
         }

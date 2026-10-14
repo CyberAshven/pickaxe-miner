@@ -1346,7 +1346,7 @@ user_identity = "interop-test"
                 Err(_) => failed(&mut translator, "SV1 read failed"),
             }
             let blocks = server.stats.lock().unwrap().blocks_accepted;
-            let turn = both && usize::try_from(blocks % 2).unwrap() == index;
+            let turn = both && blocks < 4 && usize::try_from(blocks % 2).unwrap() == index;
             let current = miner.job.as_ref().is_some_and(|(_, at)| *at == blocks);
             if miner.authorized && !miner.device.prefix.is_empty() && turn && current {
                 let (notify, _) = miner.job.take().unwrap();
@@ -1937,9 +1937,11 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         (rows[0].accepted, rows[0].rejected, rows[0].protocol),
         (2, 0, "SV1")
     );
-    // #### PR #48: both acknowledged shares count as personal work.
-    assert!(counted.work.personal > 0.0);
-    assert_eq!(counted.work.shares(), Some((0.0, 0.0)));
+    // #### PR #48: both acknowledged shares count as personal work at the
+    // pool, apart from this server's own jobs.
+    assert!(counted.pool_work.personal > 0.0);
+    assert_eq!(counted.pool_work.shares(), Some((0.0, 0.0)));
+    assert_eq!(counted.work, super::server::WorkSplit::default());
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
@@ -2410,8 +2412,9 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(stats.lock().unwrap().shares_rejected, 0);
-    // #### PR #48: the pool's acknowledgement counts as donation work.
-    let work = stats.lock().unwrap().work;
+    // #### PR #48: the pool's acknowledgement counts as donation work, apart
+    // from this server's own jobs.
+    let work = stats.lock().unwrap().pool_work;
     assert!(work.donation > 0.0 && work.personal == 0.0 && work.fee == 0.0);
     assert_eq!(work.shares(), Some((1.0, 0.0)));
     device.write.shutdown(std::net::Shutdown::Both).unwrap();

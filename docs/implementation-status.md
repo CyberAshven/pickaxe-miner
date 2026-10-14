@@ -2490,9 +2490,11 @@ donation work and personal work acknowledged by a remote pool.
    donation). Note the start time and the Donation setting.
 2. After at least a few hours, read the split:
    `jq .work <config>.sv2-status.json`, or watch the Donation line in
-   `stratum-v2 watch`.
-3. Compare `donation_fraction` with the setting's work share (0.5% at the
-   default 1.5%). Over N accepted shares at a steady difficulty, the expected
+   `stratum-v2 watch`. In pool mode, or for time spent at fallback pools,
+   read `.pool_work` instead.
+3. Compare `donation_fraction` with its target: the setting's work share for
+   `work` (0.5% at the default 1.5%), the whole setting for `pool_work`
+   (1.5%). Over N accepted shares at a steady difficulty, the expected
    difference is about one share, roughly 1/N of the work; a large or growing
    gap is a finding.
 4. As an independent cross-check on Chipnet, where an ASIC finds many blocks,
@@ -2546,3 +2548,32 @@ refreshes only on a new parent; the node then rejects the block. The old
 bound (template time plus a minute) had the same exposure for up to a
 minute. A full fix needs the parent's time (for example `getblockheader`) to
 cap such shares; left for a decision.
+
+## Review of the follow-up commits (2026-10-14)
+
+#### PR #48
+
+A second read-only review covered the commits after `f8df1ea` (the rustls
+update, the work split, the review fixes and the translator test). Each
+finding below was confirmed by two independent checks of the code, and none
+was refuted.
+
+- A dropped donation channel stays open at the pool, so its next job,
+  target or verdict ended the device's session, and the next session
+  reopened the donation and refused again. The adapter ignores that channel's
+  messages, and those for its group when the device's own channel is not in
+  it (Pickaxe's own server groups the donation's channel apart, by payout).
+- One work split mixed different targets: a Job Declaration client's local
+  jobs (donation 0, paid in the pool's coinbase) and fallback-pool work (the
+  whole setting) beside solo work (the work share). The status file now
+  keeps `work` (this server's own jobs; null for an ASIC-exclusive token and
+  as a Job Declaration client) and `pool_work` (shares remote pools
+  acknowledged) apart. The overview says "not measured in this mode" where
+  `work` is null, and the pool-mode watch header shows the setting beside the
+  measured share ("Donation 1.50% · 1.50% of work so far").
+- The README and a CLI test comment still called the pool-mode donation
+  mining time.
+- The translator test could let a miner submit a fifth block when the
+  fourth landed during its read; turns now stop at four blocks.
+
+Validation is recorded with the commit that carries these fixes.

@@ -27,7 +27,7 @@ the highlighted row's Device panel, online or offline, with confirmed controls
 most makes, through [asic-rs](https://github.com/256foundation/asic-rs).
 With `--upstream`, it sends SV1 devices to a remote Stratum V2 pool instead of
 your own node, with backup pools in order; there the pool builds the blocks,
-so the donation is that share of mining time at the pool. See [docs/stratum-v2.md](docs/stratum-v2.md).
+so the donation is that share of mining work at the pool. See [docs/stratum-v2.md](docs/stratum-v2.md).
 
 In ASIC mode, devices mine BCH together with every merge-mined token: each
 share is also checked against each token's lower target, so a token can be

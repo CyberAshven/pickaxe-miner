@@ -134,17 +134,23 @@ pub struct ServerStats {
     /// #### PR #42: an ASIC-exclusive token's wins, when one is mined.
     pub header_token: Option<super::merge::source::HeaderSummary>,
     /// #### PR #48: validated BCH work by the payout of the job it was mined
-    /// on, for checking the donation and fee shares of work over a session.
+    /// on, for checking the donation and fee shares of work over a session:
+    /// this server's own jobs (solo or a public pool, where the donation's
+    /// work share applies), and apart from them the shares a remote pool
+    /// acknowledged (pool mode and fallback pools, where the whole setting is
+    /// work).
     pub work: WorkSplit,
+    pub pool_work: WorkSplit,
 }
 
 /// #### PR #48
 /// Validated work in expected hashes (`2^256 / (target + 1)` per accepted
 /// share), split by its job's payout: the miner's own, the donation's or a
-/// public pool operator's fee. Counted where the work balance is credited
-/// (this server's own BCH jobs, and shares a remote pool acknowledged), but
-/// tallied separately from that balance, so a session's split shows what the
-/// scheduler actually gave each payout.
+/// public pool operator's fee. Counted where the work balance is credited,
+/// but tallied separately from that balance, so a session's split shows what
+/// the scheduler actually gave each payout. Not counted for an ASIC-exclusive
+/// token (its donation is time-based) or as a Job Declaration client (the
+/// pool's coinbase carries the donation).
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub struct WorkSplit {
     pub personal: f64,
@@ -1807,10 +1813,12 @@ fn serve_device(
                 if config.token_donation.is_none() {
                     if let Some((target, payout)) = responses.accepted_work {
                         availability.allocation.accepted(&target, payout);
-                        if let Ok(mut stats) = shared.stats.lock() {
-                            stats
-                                .work
-                                .add(&target, payout.donation_work, payout.fee_work);
+                        if config.uplink.is_none() {
+                            if let Ok(mut stats) = shared.stats.lock() {
+                                stats
+                                    .work
+                                    .add(&target, payout.donation_work, payout.fee_work);
+                            }
                         }
                     }
                 }
