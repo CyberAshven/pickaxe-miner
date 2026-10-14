@@ -726,6 +726,9 @@ struct Bridge {
     /// #### PR #48: donation shares refused or unanswered since the last
     /// accepted one (see `donation_refused`).
     donation_refusals: u32,
+    /// #### PR #48: the donation channel the adapter gave up on. It stays
+    /// open at the pool, whose jobs and verdicts for it are ignored.
+    dropped: Option<u32>,
     /// #### PR #40: the adapter owns the device's extranonce, at a remote
     /// pool or in a public pool, and puts the channel's prefix into the
     /// coinbase part the device receives.
@@ -803,6 +806,7 @@ impl Bridge {
             on_donation: false,
             donation_issue: None,
             donation_refusals: 0,
+            dropped: None,
             owned: remote,
             public: Public::Off,
             fixed: false,
@@ -847,6 +851,7 @@ impl Bridge {
             on_donation: false,
             donation_issue: None,
             donation_refusals: 0,
+            dropped: None,
             owned: true,
             public: Public::Waiting,
             fixed: false,
@@ -1048,6 +1053,9 @@ impl Bridge {
 
     /// Stops donating at this pool: the device goes back to its own channel.
     fn drop_donation(&mut self, reason: &'static str) -> Result<Vec<Value>, String> {
+        if let Donation::Open(lane) = &self.donation {
+            self.dropped = Some(lane.channel);
+        }
         self.donation = Donation::Unavailable;
         self.donation_issue = Some(reason);
         if self.on_donation {
@@ -1304,6 +1312,18 @@ impl Bridge {
         let channel_message = frame.header().channel_msg();
         let mut out = Vec::new();
         let mut verdicts = Vec::new();
+        // #### PR #48: a channel message starts with its channel id; one for
+        // a dropped donation channel is no longer anyone's (see `dropped`).
+        if channel_message
+            && self.dropped.is_some()
+            && frame
+                .payload()
+                .first_chunk::<4>()
+                .map(|id| u32::from_le_bytes(*id))
+                == self.dropped
+        {
+            return Ok((out, verdicts));
+        }
         match kind {
             // A common-protocol Reconnect: the device reconnects, and the
             // adapter with it.
@@ -2107,6 +2127,15 @@ mod tests {
             Some("the pool refuses the donation's shares")
         );
         assert!(bridge.tick(Instant::now()).unwrap().is_empty());
+        // The channel stays open at the pool: its late verdicts and new jobs
+        // are ignored, and the session goes on; other unknown ids still end it.
+        nonce += 1;
+        assert!(refuse(&mut bridge, nonce).is_empty());
+        for frame in [group_job(9, 6), group_parent(9, 6)] {
+            let (messages, verdicts) = bridge.upstream(frame).unwrap();
+            assert!(messages.is_empty() && verdicts.is_empty());
+        }
+        assert!(bridge.upstream(group_job(77, 6)).is_err());
 
         // Verdicts the pool never sends count the same way.
         let mut bridge = donating();

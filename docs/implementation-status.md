@@ -2524,6 +2524,9 @@ has no automated test, as it needs the Windows counters themselves.
   minutes; eight in a row end the donation at that pool, as a refused
   donation channel already did, and the workers page shows "the pool refuses
   the donation's shares". An accepted donation share resets the count.
+  The given-up channel stays open at the pool, which keeps answering shares
+  in flight and sending jobs to it; the adapter ignores every message for
+  that channel id instead of ending the session as for an unknown channel.
 - Job Declaration jobs carry a placeholder payout, yet their shares credited
   the connection's work balance and would have counted as personal work in
   the new split. Only this server's own jobs credit it now.
