@@ -2766,3 +2766,26 @@ carry that endpoint's coinbase layout (a 32-byte script: the height, a
 4-byte counter and 24 bytes of extranonce; one output to the server's
 payout), including the minimum-difficulty block 328020. That server's
 version, device panel and controls were not read from here.
+
+Pool mode, a public pool and Job Declaration, live on Chipnet the same day
+on the same PC: server A ran a public pool on the node (`--public
+--pool-fee 2 --pool-fee-mode both --accept-job-declaration --pool-tag`,
+start difficulty 1); server C1 joined it over SV2 in pool mode with no node
+of its own, and C2 joined it with `--job-declaration full` and the node.
+Three test-only CPU SV1 devices (about 85 MH/s each, written for this check
+and not in the repository) mined for ten minutes: through C1, 183 of 183
+shares accepted; straight into A's SV1 port, 150 of 150; through C2, 1 of 1
+(C2's devices start at difficulty 4096, which a CPU takes about seven
+minutes to ease down). C2 declared 56 templates, all taken as custom jobs
+with none refused, and A checked 15 of them with `validateblocktemplate`.
+A's personal jobs carried the pool tag and paid the miner's own address
+with one more output for the fee and the donation's coinbase part (the
+same address in this test), to the satoshi of the documented split. A
+counted 0.41% of the work for the donation and 0.88% for the fee over
+about 337 shares; C1 counted 1.46% for the donation, its whole setting as
+work in pool mode. An earlier run of the test devices sent the same share
+from several threads; A refused those as `duplicate-share`.
+
+Not shown live: native SV2 firmware (CI's independent SV2 reference device
+covers the protocol), a block found through the pool or Job Declaration
+paths, and failover between pools.
