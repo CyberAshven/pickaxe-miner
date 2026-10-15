@@ -556,7 +556,9 @@ What a client gets:
 - After its `CoinbaseOutputConstraints` (within 10 seconds): on a new parent,
   a future `NewTemplate` and at once its `SetNewPrevHash` (the node's current
   time, `nBits`, and the target `compact(nBits)`); on the same parent, a
-  current `NewTemplate` only. A lease renewal or a merge-mined token's change
+  current `NewTemplate` only, unless its bits changed (Chipnet's limit 20
+  minutes after the parent), which come as on a new parent; the earlier
+  templates are then stale. A lease renewal or a merge-mined token's change
   sends nothing. A change of constraints sends the template again, at most
   once a second.
 - The coinbase prefix is the BIP34 height push alone. A BCH template asks for
@@ -650,7 +652,10 @@ valid Chipnet blocks, and returns on the next normal template (Chipnet allows
 difficulty-1 blocks after a 20-minute gap). On Chipnet a template carries its
 parent's time, and a share more than 20 minutes after it on normal bits is
 credited as a share but not sent as a block, because the node would refuse
-it (bad-diffbits). A device target limit that cannot
+it (bad-diffbits). From that point the server asks the node for a template
+at once, and again each second for up to 15 seconds while the template keeps
+normal bits, so devices get the job on the limit's bits within about a
+second instead of at the next 15-second refresh. A device target limit that cannot
 accommodate easier block work is rejected. Older jobs accept shares at the
 easier of their own target and the current one, and each share is credited at
 the target it met. While merge-mined tokens are mined (none is registered

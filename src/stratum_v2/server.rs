@@ -843,7 +843,17 @@ pub fn run_with(
             } else {
                 true
             };
-            if !current || refreshed.elapsed() >= Duration::from_secs(15) {
+            // #### PR #48: Chipnet's 20-minute point refreshes too (see
+            // `min_difficulty_due`).
+            let wall = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let min_difficulty = min_difficulty_due(
+                sources[0].1.current().map(|(_, template)| template),
+                wall,
+                refreshed.elapsed(),
+            );
+            if !current || min_difficulty || refreshed.elapsed() >= Duration::from_secs(15) {
                 let slot = sources[0].0;
                 match sources[0].1.refresh() {
                     Ok((generation, template)) => {
@@ -1074,6 +1084,34 @@ impl RetrySchedule {
     fn remove(&mut self, hash: &str) {
         self.0.remove(hash);
     }
+}
+
+/// #### PR #48: how often, and for how long past Chipnet's 20-minute point,
+/// the node thread asks again while its template keeps normal bits.
+const MIN_DIFFICULTY_RETRY: Duration = Duration::from_secs(1);
+const MIN_DIFFICULTY_WINDOW: u64 = 15;
+
+// #### PR #48: the minimum-difficulty refresh
+// What: on Chipnet, once the server's clock passes the current template's
+// parent time plus 1200 seconds while the template is on normal bits, the
+// node thread refreshes at once, and again each second while the template
+// stays on normal bits, for at most 15 seconds; then the usual refresh
+// every 15 seconds takes over. Mainnet templates have no parent time, so
+// nothing changes there.
+// Why: getblocktemplate recomputes the bits for the node's time, so the
+// first template fetched after that point carries the limit's bits, but the
+// next regular refresh could be 15 seconds away, and every share in between
+// was only a share (see `BchTemplate::stale_bits`). Retrying covers a node
+// clock a few seconds behind the server's; a Template Provider source only
+// returns a new template once its provider announces one.
+// Look here if: devices get the minimum-difficulty job late on Chipnet, or
+// the node is asked for templates every second.
+fn min_difficulty_due(template: Option<&BchTemplate>, wall: u64, since_refresh: Duration) -> bool {
+    since_refresh >= MIN_DIFFICULTY_RETRY
+        && template
+            .and_then(BchTemplate::stale_from)
+            .and_then(|from| wall.checked_sub(u64::from(from)))
+            .is_some_and(|past| past < MIN_DIFFICULTY_WINDOW)
 }
 
 /// #### PR #42: the server's own generation numbers (see the node thread).
@@ -1311,9 +1349,24 @@ fn current_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
 struct Offered {
     /// The plan serial jobs were last published with.
     plan: Option<u64>,
-    /// The parent and plan of the last template sent to the uplink, and
-    /// when.
-    last: Option<(Hash, u64, Instant)>,
+    /// The parent, bits and plan of the last template sent to the uplink,
+    /// and when.
+    last: Option<(Hash, u32, u64, Instant)>,
+}
+
+impl Offered {
+    /// Whether `template` on plan `plan` is skipped (see `offer`); if not,
+    /// it is recorded as the last one offered.
+    fn coalesce(&mut self, template: &BchTemplate, plan: u64, now: Instant) -> bool {
+        let key = (template.previous_hash, template.bits, plan);
+        if self.last.is_some_and(|(parent, bits, last_plan, at)| {
+            (parent, bits, last_plan) == key && now.saturating_duration_since(at) < COALESCE
+        }) {
+            return true;
+        }
+        self.last = Some((key.0, key.1, key.2, now));
+        false
+    }
 }
 
 /// Under Job Declaration, templates on one parent and plan go to the
@@ -1358,15 +1411,11 @@ fn offer(
     // refreshes must not spend them.
     // Look here if: a pool refuses declarations for their rate, or devices
     // keep a template's job for over 15 seconds.
-    let now = Instant::now();
-    if offered.last.is_some_and(|(parent, plan, at)| {
-        parent == template.previous_hash
-            && plan == plan_serial
-            && now.saturating_duration_since(at) < COALESCE
-    }) {
+    // #### PR #48: new bits on the same parent (Chipnet's limit at the
+    // 20-minute point) go at once too, as a new parent does.
+    if offered.coalesce(&template, plan_serial, Instant::now()) {
         return;
     }
-    offered.last = Some((template.previous_hash, plan_serial, now));
     template.declare(plan);
     let template = Arc::new(template);
     let _ = uplink.events.try_send(UplinkEvent::Published {
@@ -1431,9 +1480,10 @@ enum JobDonation {
 struct JobAvailability {
     generation: Option<u64>,
     /// #### PR #42: the token set's serial of the job issued last (and the
-    /// plan's, under Job Declaration), and its parent.
+    /// plan's, under Job Declaration), and its parent (#### PR #48: and
+    /// bits).
     serial: Option<u64>,
-    parent: Option<Hash>,
+    parent: Option<(Hash, u32)>,
     unavailable_since: Option<Instant>,
     payout: Option<BchPayout>,
     next_id: u32,
@@ -1499,9 +1549,12 @@ impl JobAvailability {
             // devices have stays valid on its parent.
             // Look here if: devices keep one job on a parent while the pool
             // accepts newer ones, or shares wait in the uplink's cache.
+            // #### PR #48: new bits on the parent (Chipnet's limit at the
+            // 20-minute point) go at once too: the job devices have can no
+            // longer make a block (see `BchTemplate::stale_bits`).
             if acknowledged.is_some_and(|acknowledged| {
                 self.generation.is_some()
-                    && self.parent == Some(job.template.previous_hash)
+                    && self.parent == Some((job.template.previous_hash, job.template.bits))
                     && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
                     && job.generation > acknowledged
             }) {
@@ -1514,7 +1567,7 @@ impl JobAvailability {
                 .next_id
                 .checked_add(1)
                 .ok_or("job identifiers exhausted")?;
-            let parent = job.template.previous_hash;
+            let parent = (job.template.previous_hash, job.template.bits);
             let frames =
                 mining.set_job_with_payout(self.next_id, job.generation, job.template, payout)?;
             self.generation = Some(job.generation);
@@ -2285,10 +2338,83 @@ mod retry_tests {
             3,
             "a new parent goes at once"
         );
+        // #### PR #48: new bits on the parent go at once too.
+        next["bits"] = serde_json::json!("1d00ffff");
+        next["target"] = serde_json::json!(format!("00000000ffff{}", "00".repeat(26)));
+        let limit = Arc::new(BchTemplate::from_rpc(&next).unwrap());
+        assert_eq!(
+            offer(&mut availability, &mut mining, job(4, &limit), Some(3)),
+            4,
+            "new bits on the parent go at once"
+        );
         let mut plain = session();
         let mut alone = JobAvailability::new(0);
         offer(&mut alone, &mut plain, job(1, &template), None);
         assert_eq!(offer(&mut alone, &mut plain, job(2, &template), None), 2);
+    }
+
+    // #### PR #48
+    // What: the node thread refreshes for Chipnet's 20-minute point from the
+    // parent's time plus 1201 s, once a second at most, for 15 seconds,
+    // while the template is on normal bits; never for the limit's bits or a
+    // template without the parent's time (mainnet), nor before the point.
+    // Look here if: min_difficulty_due or BchTemplate::stale_from changes.
+    #[test]
+    fn the_minimum_difficulty_refresh_starts_at_the_twenty_minute_point() {
+        let mut template =
+            BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
+        let parent = 1_700_000_000u32;
+        let second = Duration::from_secs(1);
+        assert!(!min_difficulty_due(
+            Some(&template),
+            u64::from(parent) + 1201,
+            second
+        ));
+        template.parent_time = Some(parent);
+        assert_eq!(template.stale_from(), Some(parent + 1201));
+        let due = |template: &BchTemplate, past: u64, since: Duration| {
+            min_difficulty_due(Some(template), u64::from(parent) + 1201 + past, since)
+        };
+        assert!(!min_difficulty_due(
+            Some(&template),
+            u64::from(parent) + 1200,
+            second
+        ));
+        assert!(due(&template, 0, second));
+        assert!(due(&template, 14, Duration::from_secs(60)));
+        assert!(!due(&template, 15, Duration::from_secs(60)), "15 s at most");
+        assert!(
+            !due(&template, 0, Duration::from_millis(999)),
+            "once a second"
+        );
+        assert!(!min_difficulty_due(None, u64::from(parent) + 1201, second));
+        let mut limit = template.clone();
+        limit.bits = super::super::template::MIN_DIFFICULTY_BITS;
+        assert_eq!(limit.stale_from(), None);
+        assert!(!due(&limit, 0, second));
+        template.parent_time = Some(u32::MAX - 1200);
+        assert_eq!(template.stale_from(), None);
+    }
+
+    // #### PR #48
+    // What: under Job Declaration, a template on the parent, bits and plan
+    // offered less than 5 s ago is skipped; new bits on the same parent go
+    // at once, as a new parent or plan does.
+    // Look here if: Offered::coalesce changes.
+    #[test]
+    fn offers_coalesce_by_parent_bits_and_plan() {
+        let template =
+            BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
+        let mut limit = template.clone();
+        limit.bits = super::super::template::MIN_DIFFICULTY_BITS;
+        let start = Instant::now();
+        let mut offered = Offered::default();
+        assert!(!offered.coalesce(&template, 1, start));
+        assert!(offered.coalesce(&template, 1, start + Duration::from_secs(4)));
+        assert!(!offered.coalesce(&limit, 1, start + Duration::from_secs(4)));
+        assert!(offered.coalesce(&limit, 1, start + Duration::from_secs(5)));
+        assert!(!offered.coalesce(&limit, 2, start + Duration::from_secs(5)));
+        assert!(!offered.coalesce(&limit, 2, start + Duration::from_secs(10)));
     }
 
     #[test]

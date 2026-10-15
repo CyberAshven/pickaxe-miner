@@ -479,10 +479,18 @@ impl BchTemplate {
     /// other than the limit's. (The reverse, the limit's bits before that
     /// point, is not checked: ASERT itself can reach the limit.)
     pub fn stale_bits(&self, time: u32) -> bool {
-        self.bits != MIN_DIFFICULTY_BITS
-            && self.parent_time.is_some_and(|parent| {
-                u64::from(time) > u64::from(parent) + u64::from(MIN_DIFFICULTY_GAP)
-            })
+        self.stale_from().is_some_and(|from| time >= from)
+    }
+
+    /// #### PR #48: the first header time `stale_bits` refuses (the parent's
+    /// time plus 1201 seconds), on a template that knows its parent's time
+    /// and is not on the limit's bits; the node thread refreshes from then
+    /// (see `min_difficulty_due` in the server).
+    pub fn stale_from(&self) -> Option<u32> {
+        if self.bits == MIN_DIFFICULTY_BITS {
+            return None;
+        }
+        self.parent_time?.checked_add(MIN_DIFFICULTY_GAP + 1)
     }
 
     // #### PR #42: the per-template version rule

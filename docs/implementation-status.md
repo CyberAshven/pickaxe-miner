@@ -2629,7 +2629,8 @@ Provider does not re-announce a parent when its node switches to the limit's
 bits, so its clients keep normal bits for that parent. A Job Declaration
 custom job on the limit's bits with a time at or before the 20-minute point
 is not checked (that needs the ASERT computation, since ASERT itself can
-reach the limit).
+reach the limit). (The first two are addressed below, in "Chipnet's
+20-minute rule: follow-ups".)
 
 Checks before pushing: formatting, strict all-feature Clippy for Linux and
 `x86_64-pc-windows-gnu`, 747 library and 18 CLI tests, and both SRI
@@ -2637,3 +2638,47 @@ reference tests (standard device, translator) twice each. A read-only review
 through four lenses (rule, block paths, regressions, documentation), with two
 skeptics per finding, raised three minor points and refuted all three; the
 wording two of them pointed at was made exact.
+
+## Chipnet's 20-minute rule: follow-ups (2026-10-15)
+
+#### PR #48
+
+Two of the three points left open above.
+
+- Devices get the minimum-difficulty job promptly. Once the server's clock
+  passes the current template's parent time plus 1200 seconds while the
+  template is on normal bits, the node thread asks for a template at once,
+  and again each second for up to 15 seconds while it keeps normal bits (a
+  node clock a little behind the server's); then the usual 15-second refresh
+  takes over (`min_difficulty_due` in `server.rs`). The node recomputes the
+  bits for its time, so that template carries the limit's bits, and devices
+  get it as a new job with SetNewPrevHash. Mainnet templates carry no parent
+  time, so nothing changes there. A Template Provider source picks up a new
+  template within 250 ms of its provider announcing one, as before.
+- Under Job Declaration, the client's local server no longer holds back new
+  bits on the same parent: the 5-second coalescing of offers and the wait for
+  the pool's acceptance treat them as a new parent, since the job devices
+  have can no longer make a block.
+- Pickaxe's own Template Provider re-announces a parent whose bits change: a
+  template whose bits differ from the client's latest SetNewPrevHash on the
+  same parent goes out as on a new parent, a future NewTemplate and a
+  SetNewPrevHash with the new bits and target, and the earlier templates turn
+  stale (answered for 10 seconds more). SetNewPrevHash is the only Template
+  Distribution message that carries bits. Pickaxe's own client already takes
+  a second SetNewPrevHash on one parent and keeps the parent's time without
+  asking its guard again.
+
+Tests: the refresh starts at the parent's time plus 1201 seconds, at most
+once a second, for 15 seconds, never on the limit's bits or without the
+parent's time; through the real server a device's first job is on normal
+bits and its job on the limit's bits arrives within 12 seconds, both from the
+server's node and through another Pickaxe's template server (the fixture node
+recomputes bits for its time, as BCHN does); an SRI-shaped template client
+gets a future template and SetNewPrevHash on the same parent with the new
+bits, and its earlier template is stale; offers coalesce by parent, bits and
+plan; new bits on the parent pass the Job Declaration wait. Each fails with
+its change undone; the client test is a regression test of existing
+behaviour.
+
+Not changed here: a Job Declaration custom job on the limit's bits with a
+time at or before the 20-minute point is still not checked.

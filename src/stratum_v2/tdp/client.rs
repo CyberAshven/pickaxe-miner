@@ -722,6 +722,51 @@ mod tests {
         provider.join().unwrap();
     }
 
+    // #### PR #48
+    // What: a second SetNewPrevHash on the same parent with new bits (a
+    // provider at Chipnet's 20-minute point) gives a new template on those
+    // bits and their target, keeping the parent's time the guard gave
+    // without asking it again.
+    // Look here if: TdpSource::handle's SetNewPrevHash or the guard's cache
+    // changes.
+    #[test]
+    fn new_bits_on_the_same_parent_reach_the_template() {
+        let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let mut raw = rpc_template();
+        raw["bits"] = serde_json::json!("1d00ffff");
+        raw["target"] = serde_json::json!(format!("00000000ffff{}", "00".repeat(26)));
+        let limit = BchTemplate::from_rpc(&raw).unwrap();
+        let (address, provider) = scripted(vec![
+            super::super::convert::new_template(5, true, &template).unwrap(),
+            super::super::convert::set_new_prev_hash(5, &template).unwrap(),
+            super::super::convert::new_template(6, true, &limit).unwrap(),
+            super::super::convert::set_new_prev_hash(6, &limit).unwrap(),
+        ]);
+        let mut asked = 0;
+        let mut source = TdpSource::new(
+            address,
+            122,
+            Box::new(move |_, _| {
+                asked += 1;
+                assert_eq!(asked, 1, "the guard is asked once per parent");
+                Ok(Some(1_699_999_990))
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while source
+            .current()
+            .is_none_or(|(_, current)| current.bits != limit.bits)
+        {
+            assert!(Instant::now() < deadline, "the new bits never arrived");
+            source.refresh().unwrap();
+        }
+        let (_, refreshed) = source.current().unwrap();
+        assert_eq!(refreshed.previous_hash, template.previous_hash);
+        assert_eq!(refreshed.target, limit.target);
+        assert_eq!(refreshed.parent_time, Some(1_699_999_990));
+        provider.join().unwrap();
+    }
+
     // #### PR #42
     // What: the reserve is 122 bytes for the payouts alone, and 221 with
     // the Chipnet test token (a 53-byte commitment and one 46-byte ticket).

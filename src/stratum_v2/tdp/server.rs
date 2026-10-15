@@ -55,8 +55,9 @@ struct Active {
     reserve: u32,
     /// The node worker's template generation offered last, sent or withheld.
     generation: Option<u64>,
-    /// The parent of the client's latest SetNewPrevHash.
-    parent: Option<Hash>,
+    /// The parent of the client's latest SetNewPrevHash (#### PR #48: and
+    /// its bits).
+    parent: Option<(Hash, u32)>,
     retained: VecDeque<Retained>,
     /// When a constraints change sends the template again.
     resend: Option<Instant>,
@@ -209,8 +210,8 @@ fn constraints(frame: &mut SerializedFrame) -> Result<Option<u32>, String> {
 
 impl Active {
     /// Sends `template` when the client's reserve fits it: on a new parent
-    /// as a future template followed by its SetNewPrevHash, else as a
-    /// template for the current parent.
+    /// (or new bits) as a future template followed by its SetNewPrevHash,
+    /// else as a template for the current parent.
     fn offer(
         &mut self,
         template: &Arc<BchTemplate>,
@@ -232,7 +233,19 @@ impl Active {
             return Ok(());
         }
         let id = relay.next_id();
-        let future = self.parent != Some(template.previous_hash);
+        // #### PR #48: new bits on the same parent
+        // What: a template whose bits differ from the client's latest
+        // SetNewPrevHash on the same parent goes out as a new parent does: a
+        // future template and a SetNewPrevHash with the new bits, after which
+        // the earlier templates are stale (answered for 10 seconds more).
+        // Why: on Chipnet the node switches to the limit's bits 20 minutes
+        // after the parent; SetNewPrevHash is the only Template Distribution
+        // message that carries bits, so a current template alone left
+        // clients mining blocks the node would refuse (bad-diffbits).
+        // Look here if: a template client keeps normal bits past Chipnet's
+        // 20-minute point, or gets a second SetNewPrevHash on one parent.
+        let tip = (template.previous_hash, template.bits);
+        let future = self.parent != Some(tip);
         sender.send(convert::new_template(id, future, template)?)?;
         if future {
             sender.send(convert::set_new_prev_hash(id, template)?)?;
@@ -240,7 +253,7 @@ impl Active {
             for old in &mut self.retained {
                 old.stale_since.get_or_insert(now);
             }
-            self.parent = Some(template.previous_hash);
+            self.parent = Some(tip);
         }
         self.retained.push_back(Retained {
             id,

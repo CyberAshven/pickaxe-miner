@@ -54,6 +54,10 @@ pub(super) struct Node {
     /// often validateblocktemplate was called.
     pub(super) spendable: Vec<Value>,
     pub(super) validations: usize,
+    /// #### PR #48: the tip's time; one second ago when unset. Past it plus
+    /// 1200 s the templates carry the limit's bits, as BCHN's do on
+    /// Chipnet (it recomputes the bits for its curtime).
+    pub(super) parent_time: Option<u32>,
 }
 
 impl Node {
@@ -83,6 +87,7 @@ pub(super) fn pool_node() -> Arc<Mutex<Node>> {
         transactions: Vec::new(),
         spendable: Vec::new(),
         validations: 0,
+        parent_time: None,
     }))
 }
 
@@ -109,6 +114,10 @@ impl NodeRpc for Rpc {
                 template["curtime"] = json!(now());
                 template["mintime"] = json!(now() - 1);
                 template["transactions"] = json!(node.transactions);
+                if node.parent_time.is_some_and(|parent| now() > parent + 1200) {
+                    template["bits"] = json!("1d00ffff");
+                    template["target"] = json!(format!("00000000ffff{}", "00".repeat(26)));
+                }
                 Ok(template)
             }
             "submitblock" => {
@@ -234,7 +243,7 @@ impl NodeRpc for Rpc {
                 } else if hash == node.tip {
                     // #### PR #48: the parent's time, for Chipnet's 20-minute
                     // rule; a lost reply still confirms no block.
-                    Ok(json!({"hash":hash,"time":now() - 1}))
+                    Ok(json!({"hash":hash,"time":node.parent_time.unwrap_or(now() - 1)}))
                 } else {
                     Err("header temporarily unavailable".into())
                 }
@@ -273,6 +282,7 @@ impl Running {
             transactions: Vec::new(),
             spendable: Vec::new(),
             validations: 0,
+            parent_time: None,
         }));
         Self::start(node, Arc::new(TestDirectory::new()))
     }
@@ -292,6 +302,7 @@ impl Running {
             transactions: Vec::new(),
             spendable: Vec::new(),
             validations: 0,
+            parent_time: None,
         }));
         Self::start_with(node, Arc::new(TestDirectory::new()), Some(public))
     }
@@ -680,7 +691,7 @@ impl Drop for Running {
     }
 }
 
-fn now() -> u32 {
+pub(super) fn now() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -780,6 +791,25 @@ impl Device {
             prefix,
             extended,
         }
+    }
+
+    /// #### PR #48: the bits of each SetNewPrevHash until one carries
+    /// `bits`; fails when none does by `deadline`.
+    fn bits_until(&mut self, bits: u32, deadline: Instant) -> Vec<u32> {
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            let Some(mut frame) = self.receiver.receive(Duration::from_millis(100)).unwrap() else {
+                continue;
+            };
+            if frame.header().msg_type() == MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH {
+                let previous: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
+                seen.push(previous.nbits);
+                if previous.nbits == bits {
+                    return seen;
+                }
+            }
+        }
+        panic!("no job on bits {bits:#x} in time; saw {seen:x?}");
     }
 
     fn receive(&mut self) -> SerializedFrame {
@@ -906,6 +936,7 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
             transactions: Vec::new(),
             spendable: Vec::new(),
             validations: 0,
+            parent_time: None,
         }));
         let server = Running::start_full(vec![node], directory, None, Some(hub.clone()));
         let mut device = Device::connect(&server, extended);
@@ -1755,6 +1786,7 @@ fn the_server_moves_to_its_next_node_when_its_node_stops_answering() {
             transactions: Vec::new(),
             spendable: Vec::new(),
             validations: 0,
+            parent_time: None,
         }))
     };
     let (first, second) = (node(), node());
@@ -3280,4 +3312,45 @@ fn an_unpinned_provider_on_this_computer_serves_templates() {
     device.solve_and_submit(0);
     client.wait(|stats| stats.blocks_accepted == 1);
     device.sender.close();
+}
+
+// #### PR #48
+// What: on Chipnet, a device gets the job on the limit's bits a few seconds
+// after the parent's time plus 1200 s, not at the next 15-second refresh:
+// from this server's node (the minimum-difficulty refresh), and through
+// another Pickaxe's template server (which announces the new bits with a
+// SetNewPrevHash on the same parent). Its first job is on normal bits.
+// Why: until then every block a device finds is refused by the node
+// (bad-diffbits), so Pickaxe sends none (see `BchTemplate::stale_bits`).
+// Look here if: min_difficulty_due, the template server's same-parent bits
+// or the fixture node's bits change.
+#[test]
+fn devices_get_the_minimum_difficulty_job_at_the_twenty_minute_point() {
+    let node = pool_node();
+    let start = Instant::now();
+    // The point (the parent's time plus 1201 s) comes 4 to 5 s from now.
+    node.lock().unwrap().parent_time = Some(now() - 1196);
+    let provider = Running::templates(node, Arc::new(TestDirectory::new()));
+    let key = {
+        let mut encoded = vec![1, 0];
+        encoded.extend(provider.authority);
+        stratum_core::bitcoin::base58::encode_check(&encoded)
+    };
+    let address = super::tdp::client::TdpAddress::parse(&format!(
+        "sv2tp://{}/{key}",
+        provider.templates.unwrap()
+    ))
+    .unwrap();
+    let client = Running::tdp_client(pool_node(), address);
+    let mut direct = Device::connect(&provider, false);
+    let mut relayed = Device::connect(&client, true);
+    // Before the next 15-second refresh (the first was at `start`).
+    let deadline = start + Duration::from_secs(12);
+    let limit = super::template::MIN_DIFFICULTY_BITS;
+    for device in [&mut direct, &mut relayed] {
+        let seen = device.bits_until(limit, deadline);
+        assert_eq!(seen.first(), Some(&0x207f_ffff), "{seen:x?}");
+    }
+    direct.sender.close();
+    relayed.sender.close();
 }
