@@ -2629,8 +2629,8 @@ Provider does not re-announce a parent when its node switches to the limit's
 bits, so its clients keep normal bits for that parent. A Job Declaration
 custom job on the limit's bits with a time at or before the 20-minute point
 is not checked (that needs the ASERT computation, since ASERT itself can
-reach the limit). (The first two are addressed below, in "Chipnet's
-20-minute rule: follow-ups".)
+reach the limit). (All three are addressed below, in "Chipnet's 20-minute
+rule: follow-ups".)
 
 Checks before pushing: formatting, strict all-feature Clippy for Linux and
 `x86_64-pc-windows-gnu`, 747 library and 18 CLI tests, and both SRI
@@ -2643,7 +2643,7 @@ wording two of them pointed at was made exact.
 
 #### PR #48
 
-Two of the three points left open above.
+The three points left open above.
 
 - Devices get the minimum-difficulty job promptly. Once the server's clock
   passes the current template's parent time plus 1200 seconds while the
@@ -2667,6 +2667,24 @@ Two of the three points left open above.
   Distribution message that carries bits. Pickaxe's own client already takes
   a second SetNewPrevHash on one parent and keeps the parent's time without
   asking its guard again.
+- Job Declaration custom jobs and solutions on the limit's bits at or before
+  the 20-minute point are checked. `asert.rs` computes BCH's aserti3-2d bits
+  integer-exact as BCHN v29.2.0's `CalculateASERT` and
+  `GetNextASERTWorkRequired` (`src/pow.cpp`), from Chipnet's anchor in its
+  chain parameters (block 16844, bits `0x1d00ffff`, parent time 1605451779,
+  a one-hour half-life; the same as testnet4's) and the template's parent
+  height and time. `BchTemplate::wrong_bits` is what the node would refuse as
+  bad-diffbits: normal bits past the point (`stale_bits`), or the limit's
+  bits at or before it while ASERT gives the parent other bits. It replaces
+  `stale_bits` for shares (own and custom jobs), `PushSolution` and
+  `SubmitSolution`, and a `SetCustomMiningJob` (Coinbase-only or declared)
+  whose bits are wrong for its `min_ntime` is refused with `invalid-nbits`.
+  Normal bits before the point are not recomputed: they are the node's own
+  ASERT result, and a custom job must carry its pool's template's bits.
+  Every path has the inputs on Chipnet (the pool's template carries the
+  height and the parent's time, and custom and declared jobs inherit them);
+  where ASERT cannot be computed (a parent below the anchor) nothing more is
+  refused, and mainnet has no such rule.
 
 Tests: the refresh starts at the parent's time plus 1201 seconds, at most
 once a second, for 15 seconds, never on the limit's bits or without the
@@ -2680,5 +2698,28 @@ plan; new bits on the parent pass the Job Declaration wait. Each fails with
 its change undone; the client test is a regression test of existing
 behaviour.
 
-Not changed here: a Job Declaration custom job on the limit's bits with a
-time at or before the 20-minute point is still not checked.
+ASERT tests: three real Chipnet blocks carry the bits it gives after their
+parents (300000 on 299999, 300002 on the minimum-difficulty block 300001,
+328001 on 328000; heights, times and bits read from the chaingraph.cash Chipnet
+explorer), and 19 lines of the aserti3-2d specification's vectors (BCHN's
+qa-assets repository, `test_vectors/aserti3-2d`, runs 1 to 6, 11 and 12) give
+the same bits; a parent on schedule from the anchor gets the limit and one
+four seconds earlier `0x1d00ffcd`. A share, a `PushSolution` and a
+`SubmitSolution` on the limit's bits at the parent's time plus 1200 s are
+not blocks while ASERT gives other bits, and are one second later (the
+share also when ASERT gives the limit); custom jobs are refused or set by
+their start time in both flows. With ASERT's half of `wrong_bits` or the
+custom-job check undone, those tests fail.
+
+Left open: a template from another Template Provider keeps its provider's
+normal bits before the point unchecked (only the limit's bits are compared
+with ASERT). A Job Declaration client whose node reaches the limit's bits
+before its pool's does gets `invalid-nbits` until the pool's own refresh,
+now within about a second. None of this has run against a live Chipnet node
+or ASIC here.
+
+Checks before committing, on a Windows host: formatting, strict all-feature
+Clippy with rustc 1.98.1, the 307 Stratum library tests, and the whole suite
+once at the end: 754 library tests (29 ignored; the CUDA, HIP and wgpu tests
+skipped) and 18 CLI tests. Clippy for Linux and `x86_64-pc-windows-gnu` and
+the SRI reference tests were not run here.

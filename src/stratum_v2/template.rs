@@ -477,9 +477,48 @@ impl BchTemplate {
     // that meets the block target is not sent as a block.
     /// Whether a header at `time` is past Chipnet's 20-minute point on bits
     /// other than the limit's. (The reverse, the limit's bits before that
-    /// point, is not checked: ASERT itself can reach the limit.)
+    /// point, is `wrong_bits`'s other half.)
     pub fn stale_bits(&self, time: u32) -> bool {
         self.stale_from().is_some_and(|from| time >= from)
+    }
+
+    // #### PR #48: the limit's bits before the 20-minute point
+    // What: on a template that knows its parent's time (Chipnet's), a header
+    // at or before the parent's time plus 1200 s on the limit's bits is
+    // refused unless ASERT itself gives the limit for this parent (from
+    // Chipnet's anchor, the parent's height and time); with `stale_bits`,
+    // whatever the node would refuse as bad-diffbits. Normal bits there are
+    // the node's own ASERT result (a custom job must carry its pool's
+    // template's bits) and are not recomputed. When ASERT cannot be computed
+    // (a parent below the anchor) nothing is refused.
+    // Why: BCHN requires ASERT's bits up to the 20-minute point, and a Job
+    // Declaration custom job or solution on the limit's bits may carry an
+    // earlier time than its pool's template.
+    // Look here if: a Chipnet block on the limit's bits is refused as
+    // bad-diffbits, or one that ASERT allows is not sent.
+    /// Whether the node would refuse a header at `time` for this template's
+    /// bits: `stale_bits`, or the limit's bits at or before the 20-minute
+    /// point while ASERT gives other bits.
+    pub fn wrong_bits(&self, time: u32) -> bool {
+        self.stale_bits(time)
+            || (self.bits == MIN_DIFFICULTY_BITS
+                && self.parent_time.is_some_and(|parent| {
+                    u64::from(time) <= u64::from(parent) + u64::from(MIN_DIFFICULTY_GAP)
+                })
+                && self
+                    .asert_bits()
+                    .is_some_and(|bits| bits != MIN_DIFFICULTY_BITS))
+    }
+
+    /// #### PR #48: the bits ASERT gives this template's block, from
+    /// Chipnet's anchor: only Chipnet templates carry their parent's time
+    /// (`MiningNetwork::allows_min_difficulty_blocks`).
+    pub fn asert_bits(&self) -> Option<u32> {
+        super::asert::next_bits(
+            &super::asert::CHIPNET,
+            self.height.checked_sub(1)?,
+            self.parent_time?,
+        )
     }
 
     /// #### PR #48: the first header time `stale_bits` refuses (the parent's

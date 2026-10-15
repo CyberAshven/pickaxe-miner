@@ -215,11 +215,12 @@ impl DeclaredJob {
     /// rebuilt with the pushed extranonce, on this job's parent and bits,
     /// with a hash that meets the bits' target. Returns the block's hash too.
     /// #### PR #48: not a Chipnet block whose time needs other bits (see
-    /// `BchTemplate::stale_bits`).
+    /// `BchTemplate::wrong_bits`: normal bits past the 20-minute point, or
+    /// the limit's before it while ASERT gives other bits).
     pub fn solved(&self, solution: &Solution) -> Option<(Hash, Vec<u8>)> {
         if solution.prev_hash != self.template.previous_hash
             || solution.nbits != self.template.bits
-            || self.template.stale_bits(solution.ntime)
+            || self.template.wrong_bits(solution.ntime)
         {
             return None;
         }
@@ -508,6 +509,32 @@ pub(in crate::stratum_v2) mod tests {
                     template: Arc::new(timed),
                 };
                 assert_eq!(timed.solved(&solution).is_some(), block, "{gap}");
+            }
+            // #### PR #48: nor, on the limit's bits, one at or before that
+            // point while ASERT gives the parent other bits (see
+            // `BchTemplate::wrong_bits`; the test target stays easy).
+            for (gap, block) in [(1200, false), (1201, true)] {
+                let mut limit = (*job.template).clone();
+                limit.bits = crate::stratum_v2::template::MIN_DIFFICULTY_BITS;
+                limit.parent_time = Some(solution.ntime - gap);
+                let nonce = (0..1_000)
+                    .find(|nonce| {
+                        let header = limit
+                            .header(&coinbase, solution.version, solution.ntime, *nonce)
+                            .unwrap();
+                        meets_target(&double_sha256(&header), &limit.target)
+                    })
+                    .unwrap();
+                let pushed = Solution {
+                    nbits: limit.bits,
+                    nonce,
+                    ..solution.clone()
+                };
+                let limit = DeclaredJob {
+                    shape: job.shape.clone(),
+                    template: Arc::new(limit),
+                };
+                assert_eq!(limit.solved(&pushed).is_some(), block, "{gap}");
             }
             let short = Solution {
                 extranonce: vec![0; 31],

@@ -582,7 +582,8 @@ item; Pickaxe strips exactly those and refuses any other witness, since BCH has
 no witnesses and the block carries the plain coinbase. The coinbase script
 must begin with the height push sent, the version may differ only in the
 version-rolling bits, and the header must meet the target (on Chipnet, and
-not be more than 20 minutes after the parent on normal bits). A block that passes
+not be more than 20 minutes after the parent on normal bits, nor at or before
+then on the limit's bits unless ASERT gives them). A block that passes
 is saved in `<config>.sv2-relay-blocks.json`, owner-only beside the block
 journal and never mixed with it, and then submitted and retried like this
 server's own blocks until the node answers. A restart, even without
