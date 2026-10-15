@@ -2715,11 +2715,35 @@ Left open: a template from another Template Provider keeps its provider's
 normal bits before the point unchecked (only the limit's bits are compared
 with ASERT). A Job Declaration client whose node reaches the limit's bits
 before its pool's does gets `invalid-nbits` until the pool's own refresh,
-now within about a second. None of this has run against a live Chipnet node
-or ASIC here.
+now within about a second. The live check below covers the node and
+Template Provider paths, not Job Declaration or an ASIC.
 
 Checks before committing, on a Windows host: formatting, strict all-feature
 Clippy with rustc 1.98.1, the 307 Stratum library tests, and the whole suite
 once at the end: 754 library tests (29 ignored; the CUDA, HIP and wgpu tests
 skipped) and 18 CLI tests. Clippy for Linux and `x86_64-pc-windows-gnu` and
 the SRI reference tests were not run here.
+
+### Live check on Chipnet (2026-10-15)
+
+Built from `dev` with #48 and #51 merged locally, against a synced BCHN
+29.2.0 Chipnet node on the same Windows PC:
+
+- `stratum-v2 check-node`: ready, a template at height 328019 with 629
+  transactions. The opt-in proposal test
+  (`live_chipnet_node_validates_standard_and_extended_block_proposals`)
+  passed: the node validated standard and extended, personal and donation
+  blocks and refused a corrupted merkle root; nothing was submitted.
+- Two servers: A on the node's RPC with ZMQ notices and a template server; B
+  on A's Template Provider. A plain SV1 client on each recorded the jobs it
+  was sent (it did not hash).
+- A new block (328019) reached both as a clean job within a second, A
+  through ZMQ and B through the Template Provider.
+- At the 20-minute point of parent 328019 (its time plus 1201 s), both sent
+  a clean job on the limit's bits `1d00ffff` within one second, B through
+  the re-announced SetNewPrevHash. Another miner found that block a second
+  later, and both moved to the new parent within a second.
+
+Not shown here: a block mined by Pickaxe on Chipnet (a CPU loses the
+minimum-difficulty race; other miners took those blocks 1 to 9 seconds
+after the point), Job Declaration, and an ASIC.
