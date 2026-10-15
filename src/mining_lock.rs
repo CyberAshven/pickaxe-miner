@@ -37,8 +37,62 @@ fn try_lock(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
+// #### PR #52: current processes mark themselves
+// What: every Pickaxe process holds `run/<pid>.lock` beside the GPU lock
+// while it runs (`register_process`). On Windows a GPU miner refuses to
+// start only beside a `pickaxe_miner.exe` without that live mark: a v0.0.1
+// or v0.0.2 miner, which takes no GPU lock. Current GPU miners still keep
+// each other out with the GPU lock.
+// Why: the name check alone also refused a GPU miner or rig beside a
+// current ASIC server or a coordinator with no GPU, so one Windows PC could
+// not run a GPU farm and an ASIC farm together.
+// Look here if: a GPU miner starts beside an old miner, or is refused beside
+// a server or coordinator.
+fn process_mark_path(pid: u32) -> Result<PathBuf, String> {
+    Ok(gpu_lock_path()?
+        .with_file_name("run")
+        .join(format!("{pid}.lock")))
+}
+
+/// This process's mark; it lasts until the value is dropped.
+pub struct ProcessMark {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl Drop for ProcessMark {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Marks this process as a current Pickaxe for as long as the result is
+/// held. None when the mark cannot be made; other miners then treat this
+/// process as an old one.
+pub fn register_process() -> Option<ProcessMark> {
+    let path = process_mark_path(std::process::id()).ok()?;
+    let file = try_lock(&path).ok()?;
+    Some(ProcessMark {
+        file: Some(file),
+        path,
+    })
+}
+
+/// Whether process `pid` holds its mark (a current Pickaxe).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_marked(pid: u32) -> bool {
+    let Ok(path) = process_mark_path(pid) else {
+        return false;
+    };
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        Err(_) => false,
+    }
+}
+
 #[cfg(windows)]
-fn another_pickaxe_process_running() -> Result<bool, String> {
+fn old_pickaxe_process_running() -> Result<bool, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -72,6 +126,7 @@ fn another_pickaxe_process_running() -> Result<bool, String> {
             if entry.th32ProcessID != std::process::id()
                 && (name.eq_ignore_ascii_case("pickaxe_miner.exe")
                     || name.eq_ignore_ascii_case("pickaxe.exe"))
+                && !is_marked(entry.th32ProcessID)
             {
                 break Ok(true);
             }
@@ -97,9 +152,9 @@ fn another_pickaxe_process_running() -> Result<bool, String> {
 pub fn acquire_gpu_lock() -> Result<File, String> {
     let lock = try_lock(&gpu_lock_path()?)?;
     #[cfg(windows)]
-    if another_pickaxe_process_running()? {
+    if old_pickaxe_process_running()? {
         return Err(
-            "another Pickaxe GPU miner is already running; close it before starting this one"
+            "an older Pickaxe GPU miner is already running; close it before starting this one"
                 .into(),
         );
     }
@@ -122,11 +177,29 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    // #### PR #52
+    #[test]
+    fn a_marked_process_is_told_from_an_unmarked_one() {
+        let mark = register_process().expect("process mark");
+        assert!(is_marked(std::process::id()));
+        // A mark left by a process that ended is not held.
+        let ended = u32::MAX - std::process::id() % 1000;
+        let stale = process_mark_path(ended).unwrap();
+        fs::write(&stale, b"").unwrap();
+        assert!(!is_marked(ended));
+        let _ = fs::remove_file(stale);
+        assert!(!is_marked(ended - 1));
+        let path = mark.path.clone();
+        drop(mark);
+        assert!(!is_marked(std::process::id()));
+        assert!(!path.exists());
+    }
+
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires a separate running pickaxe_miner.exe"]
+    #[ignore = "requires a separate running pickaxe_miner.exe from v0.0.2 or earlier"]
     fn detects_running_legacy_miner() {
-        assert!(another_pickaxe_process_running().unwrap());
+        assert!(old_pickaxe_process_running().unwrap());
         let error = acquire_gpu_lock().unwrap_err();
         assert!(error.contains("already running"), "{error}");
     }

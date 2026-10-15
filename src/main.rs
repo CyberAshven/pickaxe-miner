@@ -1441,6 +1441,8 @@ fn main() {
     #[cfg(target_os = "linux")]
     relaunch_in_terminal();
     let args = cli::parse();
+    // #### PR #52: tells this process from an old miner (see `mining_lock`).
+    let _mark = mining_lock::register_process();
     let config_path = match config::config_path(args.config.as_deref()) {
         Ok(path) => path,
         Err(error) => {
