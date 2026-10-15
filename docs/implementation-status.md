@@ -2744,6 +2744,25 @@ Built from `dev` with #48 and #51 merged locally, against a synced BCHN
   the re-announced SetNewPrevHash. Another miner found that block a second
   later, and both moved to the new parent within a second.
 
-Not shown here: a block mined by Pickaxe on Chipnet (a CPU loses the
-minimum-difficulty race; other miners took those blocks 1 to 9 seconds
-after the point), Job Declaration, and an ASIC.
+Not shown here: a block mined by this test's servers (a CPU loses the
+minimum-difficulty race; the operator's ASIC took those blocks 1 to 9
+seconds after the point) and Job Declaration.
+
+GPUs on the same Windows PC (the same build plus #52), mining PHOTON on
+Chipnet: a coordinator with no GPU and a rig on the NVIDIA discrete GPU
+(CUDA) beside both test servers; the coordinator verified and claimed 362
+rig winners in about 15 minutes, 17 stale and none rejected, and one claim
+was read back from the node's mempool. The NVIDIA GPU (CUDA, about 1.50 G
+candidates/s) and the AMD integrated GPU (gfx1036 through wgpu/Vulkan,
+about 34 M/s) then mined as one miner for 150 seconds (28 winners claimed,
+none rejected), and the integrated GPU alone found a winner that was
+verified and claimed. Native HIP on the integrated GPU, a Linux GPU and a
+sustained run were not tested here.
+
+The operator's ASIC: it mines through a Pickaxe SV1 endpoint on the
+operator's Linux computer, which served a job on the node's tip at the
+starting difficulty 4096. 287 of the 288 Chipnet blocks 327735 to 328022
+carry that endpoint's coinbase layout (a 32-byte script: the height, a
+4-byte counter and 24 bytes of extranonce; one output to the server's
+payout), including the minimum-difficulty block 328020. That server's
+version, device panel and controls were not read from here.
