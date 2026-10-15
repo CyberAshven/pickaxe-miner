@@ -184,6 +184,9 @@ impl MiningToken {
             || query.eq_ignore_ascii_case(deployment.covenant_address)
         {
             Ok(Self::Photon)
+        } else if query.eq_ignore_ascii_case("electric") {
+            // #### PR #51: a CPU token with its own command.
+            Err("ELECTRIC mines on the CPU with `pickaxe electric mine`".into())
         } else {
             Err("unknown token name, category ID, or covenant bytecode; try PHOTON".into())
         }

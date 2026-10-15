@@ -162,8 +162,72 @@ pub enum Commands {
         #[command(subcommand)]
         command: FarmOsCommand,
     },
+    /// #### PR #51
+    /// ELECTRIC on the CPU, beside BCH or PHOTON, with the relay fee paid from
+    /// a pot you fund; no key is loaded (see docs/electric-token.md).
+    Electric {
+        #[command(subcommand)]
+        command: ElectricCommand,
+    },
     #[command(hide = true)]
     Repl,
+}
+
+/// #### PR #51
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ElectricCommand {
+    /// Print the fee pot's address for --address. Fund it from your wallet.
+    Pot {
+        #[command(flatten)]
+        deployment: ElectricDeploymentArgs,
+    },
+    /// Show the baton, the tip and what the pot holds.
+    Status {
+        #[command(flatten)]
+        deployment: ElectricDeploymentArgs,
+    },
+    /// Search on the CPU and claim from the pot.
+    Mine {
+        #[command(flatten)]
+        deployment: ElectricDeploymentArgs,
+        /// CPU threads (default: all but one).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Search no baton above this many zero bytes (3: only the cheap claims).
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=32))]
+        max_difficulty: u8,
+        /// Search without a funded pot and send nothing: shows this
+        /// computer's rate and how often it finds a proof.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Send each pot coin back to --address. Prints the transactions; add
+    /// --broadcast to send them.
+    Refund {
+        #[command(flatten)]
+        deployment: ElectricDeploymentArgs,
+        #[arg(long)]
+        broadcast: bool,
+    },
+}
+
+/// #### PR #51: another deployment of the same contract, such as your own
+/// Chipnet deploy (required there) or a redeploy; mainnet defaults to the
+/// published one.
+#[derive(clap::Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElectricDeploymentArgs {
+    /// The deployment's token category ID.
+    #[arg(long, value_name = "HEX")]
+    pub electric_category: Option<String>,
+    /// Token units per claim (default 60000000).
+    #[arg(long, value_name = "UNITS")]
+    pub electric_reward: Option<u64>,
+    /// The contract's minimum difficulty in bytes (default 3).
+    #[arg(long, value_name = "BYTES")]
+    pub electric_min_difficulty: Option<u8>,
+    /// The contract's maximum difficulty in bytes (default 4).
+    #[arg(long, value_name = "BYTES")]
+    pub electric_max_difficulty: Option<u8>,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
