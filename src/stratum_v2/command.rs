@@ -290,8 +290,8 @@ pub fn run(
     let preferred =
         (declaring || !fallbacks.is_empty()).then(|| Arc::new(super::sv1::Preferred::default()));
     // #### PR #40
-    // At a pool the donation is the setting's share of mining time under the
-    // donation address, on a second channel at the same pool.
+    // At a pool the donation is the setting's share of mining work (#### PR
+    // #48) under the donation address, on a second channel at the same pool.
     let at_pools = |pools: Vec<super::sv1::Upstream>| -> Vec<super::sv1::Upstream> {
         pools
             .into_iter()
@@ -692,22 +692,23 @@ pub fn run(
                 let overview_text = if let Some(pool) = pool_address.as_ref().filter(|_| !declaring)
                 {
                     format!(
-                        "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nThe pool builds the blocks; the donation is that share of mining time under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
+                        "{} · Pool {pool} (SV2, encrypted)\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nThe pool builds the blocks; the donation is that share of mining work under the donation address at the pool.\nConnection errors: SV1 {}\nSV1 {}",
                         config.network.as_str(),
                         snapshot.connections,
                         snapshot.sessions_started,
                         snapshot.shares_accepted,
                         snapshot.shares_rejected,
                         snapshot.sv1_local_rejected,
+                        work_line(&snapshot, true),
                         snapshot.sv1_connection_errors,
                         sv1_bound.map(|address| address.to_string()).unwrap_or_else(|| "Off".into()),
                     )
                 } else {
                     format!(
-                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}{}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
+                    "{} · Node {}{} · Height {} · Donation {}{}\nDevices {} · Sessions {} · Shares {} accepted / {} rejected ({} at SV1 adapter)\n{}\nBlocks {} accepted / {} pending / {} rejected · Retries {} · Last {}\nConnection errors: SV2 {} / SV1 {}\nTemplate errors {} · Last {}{}\nSV2 {} · SV1 {}\n{}\n{}{}{}{}",
                     config.network.as_str(), if snapshot.template_ready { "Ready" } else { "Waiting" }, node_label(node_client.as_deref(), &snapshot),
                     snapshot.height.map(|height| height.to_string()).unwrap_or_else(|| "Waiting".into()), donation_summary(donation_value), pool_suffix, snapshot.connections, snapshot.sessions_started,
-                    snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, snapshot.blocks_accepted, snapshot.blocks_pending,
+                    snapshot.shares_accepted, snapshot.shares_rejected, snapshot.sv1_local_rejected, work_line(&snapshot, false), snapshot.blocks_accepted, snapshot.blocks_pending,
                     snapshot.blocks_rejected, snapshot.block_retries, snapshot.last_block_result.unwrap_or("Waiting"),
                     snapshot.connection_errors, snapshot.sv1_connection_errors,
                     snapshot.template_failures, snapshot.last_template_error.unwrap_or("None"), notices_suffix(&snapshot),
@@ -1265,10 +1266,11 @@ fn render_advanced(
     started: &str,
 ) {
     let (work, reward) = donation.shares();
-    // #### PR #40: at a pool the whole donation is mining time.
+    // #### PR #40: at a pool the whole donation is mining work (#### PR #48:
+    // accepted shares weighted by difficulty).
     let split = if pool {
         format!(
-            "{donation} of each device's mining time mines at the pool under the Pickaxe \
+            "{donation} of each device's mining work mines at the pool under the Pickaxe \
              donation address; the pool builds the blocks, so none of it is a block reward."
         )
     } else {
@@ -1969,6 +1971,8 @@ fn status_json(
         "devices": snapshot.connections,
         "shares_accepted": snapshot.shares_accepted,
         "shares_rejected": snapshot.shares_rejected,
+        // #### PR #48: validated BCH work by its job's payout, in expected
+        // hashes, and the donation's and fee's fractions of all of it.
         "blocks_accepted": snapshot.blocks_accepted,
         "blocks_unconfirmed": snapshot.blocks_pending,
         "blocks_pending": snapshot.blocks_pending,
@@ -2036,6 +2040,11 @@ fn status_json(
         "sessions_started": snapshot.sessions_started,
         "device_details": devices,
     });
+    // #### PR #48: validated BCH work by payout. Not measured for an
+    // ASIC-exclusive token or as a Job Declaration client; work at remote
+    // pools is apart (see `ServerStats::work`).
+    status["work"] = local_work(snapshot).map_or(serde_json::Value::Null, work_json);
+    status["pool_work"] = work_json(&snapshot.pool_work);
     // #### PR #42: the node's ZMQ block notices.
     status["block_notices"] = serde_json::json!(snapshot.block_notices);
     status
@@ -2238,6 +2247,18 @@ struct WatchStatus {
     /// #### PR #42: Job Declaration, as the client and as a pool.
     jd_client: Option<WatchJdClient>,
     jd_server: Option<WatchJdServer>,
+    /// #### PR #48: the validated work split, from servers that save it:
+    /// this server's own jobs (absent when not measured), and remote pools'.
+    work: Option<WatchWork>,
+    pool_work: Option<WatchWork>,
+}
+
+/// #### PR #48: the donation's and fee's fractions of validated work.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WatchWork {
+    donation_fraction: Option<f64>,
+    fee_fraction: Option<f64>,
 }
 
 /// #### PR #42: the Job Declaration client's part of the saved status.
@@ -2262,6 +2283,23 @@ struct WatchJdServer {
 }
 
 impl WatchStatus {
+    /// #### PR #48: the donation's (and any fee's) measured share of the
+    /// validated work, beside the setting it should match over a session.
+    fn measured(work: Option<&WatchWork>) -> String {
+        let Some(work) = work else {
+            return String::new();
+        };
+        match (work.donation_fraction, work.fee_fraction) {
+            (None, _) => " · no validated work yet".into(),
+            (Some(donation), Some(fee)) if fee > 0.0 => format!(
+                " · {:.2}% of work so far, fee {:.2}%",
+                donation * 100.0,
+                fee * 100.0
+            ),
+            (Some(donation), _) => format!(" · {:.2}% of work so far", donation * 100.0),
+        }
+    }
+
     /// #### PR #42: Job Declaration's lines, when it is on.
     fn job_declaration(&self) -> String {
         let mut text = String::new();
@@ -2301,16 +2339,20 @@ impl WatchStatus {
         };
         if let Some(pool) = &self.upstream {
             return format!(
-                "{} · Pool {pool} (SV2, encrypted) · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected",
+                "{} · Pool {pool} (SV2, encrypted) · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected{}",
                 self.network,
                 self.device_details.len(),
                 crate::telemetry::format_hash_rate(rate),
                 self.shares_accepted,
                 self.shares_rejected,
+                Some(Self::measured(self.pool_work.as_ref()))
+                    .filter(|measured| !measured.is_empty())
+                    .map(|measured| format!(" · Donation {}{measured}", self.donation))
+                    .unwrap_or_default(),
             ) + &self.job_declaration();
         }
         format!(
-            "{} · Node {}{} · Height {} · Donation {} · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
+            "{} · Node {}{} · Height {} · Donation {}{} · {freshness}\n{online} of {} workers online · {} · Shares {} accepted / {} rejected · Blocks {} accepted / {} pending",
             self.network,
             if self.ready { "Ready" } else { "Waiting" },
             node_suffix(self.node.as_deref())
@@ -2323,6 +2365,7 @@ impl WatchStatus {
                 .map(|height| height.to_string())
                 .unwrap_or_else(|| "Waiting".into()),
             self.donation_summary.as_deref().unwrap_or(&self.donation),
+            Self::measured(self.work.as_ref()),
             self.device_details.len(),
             crate::telemetry::format_hash_rate(rate),
             self.shares_accepted,
@@ -2587,6 +2630,43 @@ fn templates_line(stats: &ServerStats) -> String {
     )
 }
 
+/// #### PR #48: this server's own validated work, when its split is
+/// measured: not for an ASIC-exclusive token (a time-based donation) nor as a
+/// Job Declaration client (the pool's coinbase carries the donation).
+fn local_work(stats: &ServerStats) -> Option<&super::server::WorkSplit> {
+    (stats.header_token.is_none() && stats.jd_client.is_none()).then_some(&stats.work)
+}
+
+fn work_json(work: &super::server::WorkSplit) -> serde_json::Value {
+    serde_json::json!({
+        "personal": work.personal,
+        "donation": work.donation,
+        "fee": work.fee,
+        "donation_fraction": work.shares().map(|(donation, _)| donation),
+        "fee_fraction": work.shares().map(|(_, fee)| fee),
+    })
+}
+
+/// #### PR #48: the donation's and fee's shares of the validated work so far
+/// (see `WorkSplit`), to compare with the Donation setting over a session:
+/// this server's own jobs, or with `pool` the work remote pools acknowledged.
+fn work_line(stats: &ServerStats, pool: bool) -> String {
+    let work = if pool {
+        Some(&stats.pool_work)
+    } else {
+        local_work(stats)
+    };
+    match work.map(super::server::WorkSplit::shares) {
+        None => "Validated work: not measured in this mode".into(),
+        Some(None) => "Validated work: none yet".into(),
+        Some(Some((donation, fee))) => format!(
+            "Validated work: donation {:.2}% · fee {:.2}%",
+            donation * 100.0,
+            fee * 100.0
+        ),
+    }
+}
+
 fn records_line(stats: &ServerStats) -> String {
     let best = stats
         .best_share
@@ -2768,6 +2848,8 @@ fn preflight_sources(
 
 /// #### PR #42: confirms a provider's parent on the selected network: by the
 /// first configured node, or by the network's Fulcrum servers.
+/// #### PR #48: gives the parent's time (from the same header) on a network
+/// that allows minimum-difficulty blocks.
 fn chain_guard(config: &RuntimeConfig) -> super::tdp::client::Guard {
     let network = config.network;
     let node = config
@@ -2783,12 +2865,21 @@ fn chain_guard(config: &RuntimeConfig) -> super::tdp::client::Guard {
         if let Some(node) = &node {
             let header =
                 crate::node::rpc_call(node, "getblockheader", serde_json::json!([display, true]))?;
-            return (header.get("hash").and_then(serde_json::Value::as_str)
-                == Some(display.as_str())
-                && header.get("height").and_then(serde_json::Value::as_u64)
-                    == Some(u64::from(parent)))
-            .then_some(())
-            .ok_or_else(|| "the parent is not on this network".to_owned());
+            if header.get("hash").and_then(serde_json::Value::as_str) != Some(display.as_str())
+                || header.get("height").and_then(serde_json::Value::as_u64)
+                    != Some(u64::from(parent))
+            {
+                return Err("the parent is not on this network".into());
+            }
+            if !network.allows_min_difficulty_blocks() {
+                return Ok(None);
+            }
+            return header
+                .get("time")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|time| u32::try_from(time).ok())
+                .map(Some)
+                .ok_or_else(|| "the node omitted the parent's time".to_owned());
         }
         let mut session = crate::electrum::ElectrumSession::connect_failover_for_deployment(
             &fulcrum,
@@ -2797,11 +2888,17 @@ fn chain_guard(config: &RuntimeConfig) -> super::tdp::client::Guard {
         let header = session.rpc("blockchain.block.header", serde_json::json!([parent]))?;
         let bytes = hex::decode(header.as_str().ok_or("malformed header")?)
             .map_err(|_| "malformed header")?;
+        if bytes.len() != 80 {
+            return Err("malformed header".into());
+        }
         let mut hash = super::template::double_sha256(&bytes);
         hash.reverse();
-        (hex::encode(hash) == display)
-            .then_some(())
-            .ok_or_else(|| "the parent is not on this network".to_owned())
+        if hex::encode(hash) != display {
+            return Err("the parent is not on this network".into());
+        }
+        Ok(network
+            .allows_min_difficulty_blocks()
+            .then(|| u32::from_le_bytes([bytes[68], bytes[69], bytes[70], bytes[71]])))
     })
 }
 
@@ -2927,6 +3024,60 @@ mod tests {
     // status file (kind "token"), with no script or address, and the
     // overview says no node is needed.
     // Look here if: the token's dashboard or status lines change.
+    // #### PR #48
+    // What: validated work is split by the job's payout, and the status JSON
+    // and the overview report the donation's and fee's fractions of it.
+    // Look here if: `WorkSplit`, the `work` JSON or the work line change.
+    #[test]
+    fn status_reports_the_donation_and_fee_shares_of_validated_work() {
+        let mut stats = ServerStats::default();
+        assert_eq!(work_line(&stats, false), "Validated work: none yet");
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert!(status["work"]["donation_fraction"].is_null());
+        // 196 personal hashes, 2 donation and 2 fee (a donation flag wins
+        // over a fee flag, as a job is one or the other).
+        let mut personal = [255; 32];
+        personal[31] = 1;
+        let one = [255; 32];
+        assert_eq!(super::super::telemetry::expected_hashes(&personal), 128.0);
+        stats.work.add(&personal, false, false);
+        for _ in 0..68 {
+            stats.work.add(&one, false, false);
+        }
+        stats.work.add(&one, true, false);
+        stats.work.add(&one, true, true);
+        stats.work.add(&one, false, true);
+        stats.work.add(&one, false, true);
+        assert_eq!(
+            (stats.work.personal, stats.work.donation, stats.work.fee),
+            (196.0, 2.0, 2.0)
+        );
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(status["work"]["personal"], 196.0);
+        assert_eq!(status["work"]["donation_fraction"], 0.01);
+        assert_eq!(status["work"]["fee_fraction"], 0.01);
+        // Work at remote pools is apart from this server's own jobs.
+        assert!(status["pool_work"]["donation_fraction"].is_null());
+        assert_eq!(work_line(&stats, true), "Validated work: none yet");
+        assert_eq!(
+            work_line(&stats, false),
+            "Validated work: donation 1.00% · fee 1.00%"
+        );
+        let mut more = super::super::server::WorkSplit::default();
+        more.add(&one, true, false);
+        stats.work.merge(more);
+        assert_eq!(stats.work.donation, 3.0);
+        // Not measured for an ASIC-exclusive token or as a Job Declaration
+        // client, whose donations are not this work share.
+        stats.jd_client = Some(Default::default());
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert!(status["work"].is_null());
+        assert_eq!(
+            work_line(&stats, false),
+            "Validated work: not measured in this mode"
+        );
+    }
+
     #[test]
     fn status_json_reports_token_mode_without_scripts_or_addresses() {
         let mut stats = ServerStats {
@@ -3730,6 +3881,48 @@ mod tests {
         }
         assert!(saved.header(updated + 60).contains("Server not updating"));
         assert!(!header.contains("Job Declaration"), "{header}");
+        // #### PR #48: the measured donation share, beside the setting.
+        assert!(header.contains("· no validated work yet ·"), "{header}");
+        stats.work = super::super::server::WorkSplit {
+            personal: 199.0,
+            donation: 1.0,
+            fee: 0.0,
+        };
+        let measured: WatchStatus = serde_json::from_value(status_json(
+            "chipnet",
+            None,
+            Some("Bitcoin Cash Node 29.1.0"),
+            &stats,
+            BchDonation::default(),
+            &devices,
+        ))
+        .unwrap();
+        let header = measured.header(measured.updated);
+        assert!(
+            header.contains("block rewards) · 0.50% of work so far · Live"),
+            "{header}"
+        );
+        // In pool mode the measured share is the work the pool acknowledged,
+        // beside the whole setting, which is all work there.
+        stats.pool_work = super::super::server::WorkSplit {
+            personal: 197.0,
+            donation: 3.0,
+            fee: 0.0,
+        };
+        let pool: WatchStatus = serde_json::from_value(status_json(
+            "chipnet",
+            Some("pool.example:3336"),
+            None,
+            &stats,
+            BchDonation::default(),
+            &devices,
+        ))
+        .unwrap();
+        let header = pool.header(pool.updated);
+        assert!(
+            header.contains("rejected · Donation 1.50% · 1.50% of work so far"),
+            "{header}"
+        );
         // #### PR #42: Job Declaration's lines, as the client and as a pool.
         stats.jd_client = Some(super::super::jd::client::JdClientSummary {
             state: "active",

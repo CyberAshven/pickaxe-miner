@@ -4,6 +4,9 @@
 //! Design check: [`docs/stratum-v2.md`](../../docs/stratum-v2.md).
 //! Reference crates (`stratum-core`) are optional behind feature `stratum-v2`.
 
+// #### PR #48: BCH's ASERT difficulty, for Chipnet's minimum-difficulty rule.
+#[cfg(feature = "stratum-v2")]
+pub mod asert;
 mod bch;
 #[cfg(feature = "stratum-v2")]
 pub mod channel;

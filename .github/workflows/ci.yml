@@ -237,6 +237,15 @@ jobs:
         env:
           PICKAXE_SV2_REFERENCE_DEVICE: ${{ github.workspace }}/target/sv2-reference/debug/mining_device
         run: cargo test --locked --no-default-features --features stratum-v2 --lib upstream_reference_device_authenticates_and_mines_successor_blocks -- --ignored --test-threads=1
+      # #### PR #48: the same pinned source's translator opens an extended channel.
+      - name: Build unmodified reference translator
+        run: |
+          cargo build --locked --manifest-path .reference/sv2-apps/Cargo.toml -p translator_sv2 --bin translator_sv2
+          sha256sum "$CARGO_TARGET_DIR/debug/translator_sv2"
+      - name: Verify an extended channel through the reference translator
+        env:
+          PICKAXE_SV2_REFERENCE_TRANSLATOR: ${{ github.workspace }}/target/sv2-reference/debug/translator_sv2
+        run: cargo test --locked --no-default-features --features stratum-v2 --lib upstream_reference_translator_mines_successor_blocks_on_an_extended_channel -- --ignored --test-threads=1
 
   rust:
     name: ${{ matrix.name }}

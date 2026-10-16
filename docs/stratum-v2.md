@@ -106,7 +106,9 @@ SV2 path using the reference translation library.
 The tests include a local TCP CPU miner and an independent block decoder.
 CI also builds a pinned, unmodified SRI CPU mining device and checks authority
 pinning and two successor blocks on one standard-channel connection against
-synthetic BCH templates. Build instructions and the exact source/binary evidence
+synthetic BCH templates. It also builds SRI's unmodified translator from the
+same source: two SV1 miners behind it mine four blocks on two grouped
+extended channels of one connection. Build instructions and the exact source/binary evidence
 are in `implementation-status.md`; this does not test a live native SV2 ASIC.
 An Avalon Nano 3 has also mined confirmed Chipnet blocks, including a header
 matched through two independent public servers. This does not establish native
@@ -401,17 +403,20 @@ eight miner extranonce bytes per channel; the adapter gives each device four
 bytes of its own as extranonce1 and lets it roll four as extranonce2, and puts
 the pool's channel prefix into the coinbase part the device receives.
 
-The donation applies in pool mode too, as mining time: since the pool builds
+The donation applies in pool mode too, as mining work: since the pool builds
 the blocks, Pickaxe cannot add a coinbase output, so the whole BCH donation
 setting (1.5% by default, 0% to 100% in Advanced settings or `--donation`) is
-that share of each device's mining time, mined at the same pool under the
-donation address on a second channel. A 10-minute cycle per device decides
-which channel feeds it (9 seconds at 1.5%); a switch sends the channel's
+that share of each device's accepted work, mined at the same pool under the
+donation address on a second channel. Shares are weighted by their submission
+target, not counted equally across difficulties; a switch sends the channel's
 difficulty and a clean job, so the device never reconnects or falls back to
 its own backup pools. At 0% no donation channel is opened. A pool that refuses
 the second channel, for example one whose usernames are accounts rather than
 addresses, keeps the device mining on its own channel, and the workers page
-shows why. Native SV2 devices such as Bitaxe can connect to SV2 pools
+shows why. So does a pool that opens the second channel but refuses its
+shares, or never answers them within two minutes: after eight such donation
+shares in a row (#### PR #48), since only accepted donation shares repay the
+donation's work. Native SV2 devices such as Bitaxe can connect to SV2 pools
 themselves.
 
 Evidence, 2026-10-08: Pickaxe's own server as the pool, over TCP with Noise
@@ -551,7 +556,9 @@ What a client gets:
 - After its `CoinbaseOutputConstraints` (within 10 seconds): on a new parent,
   a future `NewTemplate` and at once its `SetNewPrevHash` (the node's current
   time, `nBits`, and the target `compact(nBits)`); on the same parent, a
-  current `NewTemplate` only. A lease renewal or a merge-mined token's change
+  current `NewTemplate` only, unless its bits changed (Chipnet's limit 20
+  minutes after the parent), which come as on a new parent; the earlier
+  templates are then stale. A lease renewal or a merge-mined token's change
   sends nothing. A change of constraints sends the template again, at most
   once a second.
 - The coinbase prefix is the BIP34 height push alone. A BCH template asks for
@@ -574,7 +581,9 @@ pools submit a coinbase with BIP141's marker, flag and one 32-byte witness
 item; Pickaxe strips exactly those and refuses any other witness, since BCH has
 no witnesses and the block carries the plain coinbase. The coinbase script
 must begin with the height push sent, the version may differ only in the
-version-rolling bits, and the header must meet the target. A block that passes
+version-rolling bits, and the header must meet the target (on Chipnet, and
+not be more than 20 minutes after the parent on normal bits, nor at or before
+then on the limit's bits unless ASERT gives them). A block that passes
 is saved in `<config>.sv2-relay-blocks.json`, owner-only beside the block
 journal and never mixed with it, and then submitted and retried like this
 server's own blocks until the node answers. A restart, even without
@@ -641,7 +650,13 @@ at once as a fresh job on the same template, so SV1 firmware receives
 `set_difficulty` and a notify that keeps work in flight. When the network has
 easier work, the device's target follows it down so firmware does not discard
 valid Chipnet blocks, and returns on the next normal template (Chipnet allows
-difficulty-1 blocks after a 20-minute gap). A device target limit that cannot
+difficulty-1 blocks after a 20-minute gap). On Chipnet a template carries its
+parent's time, and a share more than 20 minutes after it on normal bits is
+credited as a share but not sent as a block, because the node would refuse
+it (bad-diffbits). From that point the server asks the node for a template
+at once, and again each second for up to 15 seconds while the template keeps
+normal bits, so devices get the job on the limit's bits within about a
+second instead of at the next 15-second refresh. A device target limit that cannot
 accommodate easier block work is rejected. Older jobs accept shares at the
 easier of their own target and the current one, and each share is credited at
 the target it met. While merge-mined tokens are mined (none is registered
@@ -653,8 +668,9 @@ is mined best effort. Vardiff counts and estimates only at its own target.
 Only the first solved block on each parent is saved; later
 solutions on the same parent count as shares. SV1 adapter rejects count in the
 shared dashboard totals; separate adapter/native connection error fields can
-both describe the same disconnected session. A Template Distribution client,
-distributed rigs and pool routing are still pending.
+both describe the same disconnected session. Template Distribution, distributed
+rigs and pool routing are implemented; the evidence matrix lists the remaining
+hardware and independent-provider checks.
 BCH uses an adjustable donation, defaulting to 1.5%: one third of it is mining
 work and two thirds is the block reward (0.5% and 1% at the default). The
 dashboard shows the total and both parts, each rounded up to two decimals; the
@@ -680,14 +696,41 @@ The BCH policy is attached to each job; changing the setting never changes an
 in-flight job's coinbase. Saved solved blocks retain that policy across restart,
 and pre-donation journal entries replay their original bytes.
 
-The work adapter schedules eligible channel time in ten-minute cycles with
-independent random starting phases, preserving the position through template
-refreshes and excluding unavailable work. ASIC hashes cannot be counted exactly
-from Stratum messages: this is a time allocation, not a claim of exact measured
-hash allocation or guaranteed rewards. Dispatch cadence and firmware response
-can affect short intervals. Fractional satoshis stay with the miner, and the
-complete coinbase retains the node's subsidy-plus-fees budget.
-The successful Chipnet experiments do not complete those remaining capabilities.
+#### PR #48: work-weighted BCH allocation
+
+After the first accepted share, the work adapter accumulates the requested
+quota in expected hashes (`2^256 / (target + 1)`) and subtracts work credited
+to each donation or pool-fee job. It issues donation work while that quota is
+owed, then returns to personal work. A late share keeps its original job's
+payout policy and the target under which it was accepted; rejected, duplicate
+and unacknowledged shares do not repay a quota. Remote-pool replies use the target and donation rate saved when
+the share was submitted, including batched acknowledgements.
+
+Before the first accepted share, the existing randomly phased eligible-time
+schedule supplies a startup choice. That phase then stays a fraction of the
+latest accepted share, not of the first: when vardiff eases a high start
+difficulty, the donation and fee jobs come as often as the settled share
+size implies. Once shares arrive, idle time, template
+refreshes and hashrate changes cannot themselves accrue donation work. A
+connection starts a new balance; short sessions and in-flight shares affect
+convergence. Firmware does not expose every hash, so this targets 0.5% of
+validated, difficulty-weighted work at the default setting, not an exact
+hardware hash count or guaranteed fraction of rewards. ASIC-exclusive tokens
+retain their own time-based policy. Fractional satoshis stay with the miner;
+coinbase amounts and the node's subsidy-plus-fees budget are unchanged.
+
+The server also tallies validated work by the payout of the job it was mined
+on (personal, donation or a public pool's fee), apart from the scheduler's
+balance. The status file (`<config>.sv2-status.json`) carries this server's
+own jobs as `work` (solo or a public pool, compared with the donation's work
+share, 0.5% at the default 1.5%), and shares remote pools acknowledged as
+`pool_work` (pool mode and fallback pools, compared with the whole setting),
+each with `donation_fraction` and `fee_fraction`. `work` is null for an
+ASIC-exclusive token and as a Job Declaration client, whose donations are
+not this work share. The overview shows "Validated work: donation x% · fee
+y%", and `stratum-v2 watch` shows the measured share beside the setting.
+Over a session it should approach its target; the remaining difference is
+about one share's work, so it shrinks as shares accumulate.
 
 The authority encoding follows the [SV2 security specification, section
 4.7](https://github.com/stratum-mining/sv2-spec/blob/main/04-Protocol-Security.md#47-url-scheme-and-pool-authority-key).

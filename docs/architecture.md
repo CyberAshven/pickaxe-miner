@@ -36,12 +36,12 @@ day each fact was checked.
   settings; the OpenCL engine for GPUs the other engines cannot drive; the
   portable engine on older Intel Vulkan drivers (wgpu's upstream fix), its
   self-test on T2 engines, and throttled mining at full batch sizes.
-- In review (PR #40): a read-only `watch` view for a server running as a
+- Merged (PR #40): a read-only `watch` view for a server running as a
   service, calmer vardiff, a setup that starts with GPU mining, ASIC mining or
   Run a pool, device reports and confirmed controls for every make through
   asic-rs (with Pickaxe's own CGMiner and Bitaxe code as the extension), and:
   - pool mode, where SV1 devices mine at a remote Stratum V2 pool through the
-    adapter with no node, and the donation is mining time on a second channel;
+    adapter with no node, and the donation is mining work on a second channel;
   - a public ASIC pool that pays each miner at their own address in the
     coinbase, with an operator fee from the coinbase, the mining work or both,
     to a q or p (multisig) address;
@@ -84,7 +84,7 @@ day each fact was checked.
 flowchart LR
   subgraph Sources
     F[Fulcrum auto list<br/>default]
-    N[Own node<br/>JSON-RPC / ZMQ<br/>Knuth C API]
+    N[Own node<br/>JSON-RPC / ZMQ]
     P[Optional SV2 pool<br/>with Job Declaration]
   end
   subgraph Coordinator

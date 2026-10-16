@@ -54,6 +54,10 @@ pub(super) struct Node {
     /// often validateblocktemplate was called.
     pub(super) spendable: Vec<Value>,
     pub(super) validations: usize,
+    /// #### PR #48: the tip's time; one second ago when unset. Past it plus
+    /// 1200 s the templates carry the limit's bits, as BCHN's do on
+    /// Chipnet (it recomputes the bits for its curtime).
+    pub(super) parent_time: Option<u32>,
 }
 
 impl Node {
@@ -83,6 +87,7 @@ pub(super) fn pool_node() -> Arc<Mutex<Node>> {
         transactions: Vec::new(),
         spendable: Vec::new(),
         validations: 0,
+        parent_time: None,
     }))
 }
 
@@ -109,6 +114,10 @@ impl NodeRpc for Rpc {
                 template["curtime"] = json!(now());
                 template["mintime"] = json!(now() - 1);
                 template["transactions"] = json!(node.transactions);
+                if node.parent_time.is_some_and(|parent| now() > parent + 1200) {
+                    template["bits"] = json!("1d00ffff");
+                    template["target"] = json!(format!("00000000ffff{}", "00".repeat(26)));
+                }
                 Ok(template)
             }
             "submitblock" => {
@@ -230,7 +239,11 @@ impl NodeRpc for Rpc {
             "getblockheader" => {
                 let hash = params[0].as_str().unwrap();
                 if !node.lose_replies && node.known.contains(hash) {
-                    Ok(json!({"hash":hash,"confirmations":1}))
+                    Ok(json!({"hash":hash,"confirmations":1,"time":now() - 1}))
+                } else if hash == node.tip {
+                    // #### PR #48: the parent's time, for Chipnet's 20-minute
+                    // rule; a lost reply still confirms no block.
+                    Ok(json!({"hash":hash,"time":node.parent_time.unwrap_or(now() - 1)}))
                 } else {
                     Err("header temporarily unavailable".into())
                 }
@@ -269,6 +282,7 @@ impl Running {
             transactions: Vec::new(),
             spendable: Vec::new(),
             validations: 0,
+            parent_time: None,
         }));
         Self::start(node, Arc::new(TestDirectory::new()))
     }
@@ -288,6 +302,7 @@ impl Running {
             transactions: Vec::new(),
             spendable: Vec::new(),
             validations: 0,
+            parent_time: None,
         }));
         Self::start_with(node, Arc::new(TestDirectory::new()), Some(public))
     }
@@ -394,7 +409,7 @@ impl Running {
         let source = super::tdp::client::TdpSource::new(
             provider,
             super::tdp::PAYOUT_RESERVE,
-            Box::new(|_, _| Ok(())),
+            Box::new(|_, _| Ok(None)),
         );
         Self::start_config(
             vec![node],
@@ -676,7 +691,7 @@ impl Drop for Running {
     }
 }
 
-fn now() -> u32 {
+pub(super) fn now() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -776,6 +791,25 @@ impl Device {
             prefix,
             extended,
         }
+    }
+
+    /// #### PR #48: the bits of each SetNewPrevHash until one carries
+    /// `bits`; fails when none does by `deadline`.
+    fn bits_until(&mut self, bits: u32, deadline: Instant) -> Vec<u32> {
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            let Some(mut frame) = self.receiver.receive(Duration::from_millis(100)).unwrap() else {
+                continue;
+            };
+            if frame.header().msg_type() == MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH {
+                let previous: SetNewPrevHash = binary_sv2::from_bytes(frame.payload()).unwrap();
+                seen.push(previous.nbits);
+                if previous.nbits == bits {
+                    return seen;
+                }
+            }
+        }
+        panic!("no job on bits {bits:#x} in time; saw {seen:x?}");
     }
 
     fn receive(&mut self) -> SerializedFrame {
@@ -902,6 +936,7 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
             transactions: Vec::new(),
             spendable: Vec::new(),
             validations: 0,
+            parent_time: None,
         }));
         let server = Running::start_full(vec![node], directory, None, Some(hub.clone()));
         let mut device = Device::connect(&server, extended);
@@ -1033,6 +1068,28 @@ fn a_public_pool_pays_each_miner_their_own_address_after_the_donation_and_fee() 
         drop(node);
         device.sender.close();
     }
+    // #### PR #48: both blocks came from personal jobs (the fee here is a
+    // coinbase split, not work).
+    let work = server.stats.lock().unwrap().work;
+    assert!(work.personal > 0.0);
+    assert_eq!(work.shares(), Some((0.0, 0.0)));
+}
+
+/// An external reference process started by one of the tests below.
+struct Reference(std::process::Child);
+impl Drop for Reference {
+    fn drop(&mut self) {
+        // Only this test's child process; never a running user miner.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The pinned authority key as SRI's configuration and CLI spell it.
+fn reference_authority(public: [u8; 32]) -> String {
+    let mut encoded = vec![1, 0];
+    encoded.extend(public);
+    stratum_core::bitcoin::base58::encode_check(&encoded)
 }
 
 // #### PR #38
@@ -1041,24 +1098,13 @@ fn a_public_pool_pays_each_miner_their_own_address_after_the_donation_and_fee() 
 #[test]
 #[ignore = "requires PICKAXE_SV2_REFERENCE_DEVICE built from the pinned SRI source"]
 fn upstream_reference_device_authenticates_and_mines_successor_blocks() {
-    use std::process::{Child, Command, Stdio};
-
-    struct Reference(Child);
-    impl Drop for Reference {
-        fn drop(&mut self) {
-            // Only this test's child process; never a running user miner.
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+    use std::process::{Command, Stdio};
 
     let executable = std::env::var_os("PICKAXE_SV2_REFERENCE_DEVICE")
         .expect("set PICKAXE_SV2_REFERENCE_DEVICE to the unmodified SRI mining_device binary");
     let server = Running::new(false);
     let start = |public: [u8; 32], name: &str| {
-        let mut encoded = vec![1, 0];
-        encoded.extend(public);
-        let authority = stratum_core::bitcoin::base58::encode_check(&encoded);
+        let authority = reference_authority(public);
         let log = std::fs::File::create(server.state_directory.0.join(name)).unwrap();
         Reference(
             Command::new(&executable)
@@ -1138,6 +1184,232 @@ fn upstream_reference_device_authenticates_and_mines_successor_blocks() {
     // coinbase serialization, configured payout and successor parent linkage.
     assert!(server.node.lock().unwrap().known.len() >= 2);
     drop(valid);
+}
+
+// #### PR #48
+// What: an independently built, unmodified SRI translator opens one extended
+// channel per SV1 miner on one connection to this server (a group), and two
+// SV1 miners take turns mining successor blocks through it.
+// Why: the reference device above opens a standard channel; this is the
+// external extended-channel client (S3 in implementation-status.md) and the
+// group-channel path of PR #42 with SRI's translator.
+// Look here if: the translator gets no job from the server, or the blocks it
+// forwards are rejected.
+#[test]
+#[ignore = "requires PICKAXE_SV2_REFERENCE_TRANSLATOR built from the pinned SRI source"]
+fn upstream_reference_translator_mines_successor_blocks_on_an_extended_channel() {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+
+    let executable = std::env::var_os("PICKAXE_SV2_REFERENCE_TRANSLATOR")
+        .expect("set PICKAXE_SV2_REFERENCE_TRANSLATOR to the unmodified SRI translator_sv2 binary");
+    let server = Running::new(false);
+    // A free port for the translator's SV1 listener.
+    let downstream = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let config = server.state_directory.0.join("translator.toml");
+    // One extended channel per SV1 connection, the translator's vardiff off:
+    // it sets each miner's difficulty from the configured minimum hashrate
+    // (10 H/s, about 100 hashes a share).
+    std::fs::write(
+        &config,
+        format!(
+            r#"downstream_address = "127.0.0.1"
+downstream_port = {downstream}
+max_supported_version = 2
+min_supported_version = 2
+downstream_extranonce2_size = 4
+aggregate_channels = false
+supported_extensions = []
+
+[downstream_difficulty_config]
+min_individual_miner_hashrate = 10.0
+shares_per_minute = 6.0
+enable_vardiff = false
+job_keepalive_interval_secs = 0
+
+[[upstreams]]
+address = "{host}"
+port = {port}
+authority_pubkey = "{authority}"
+user_identity = "interop-test"
+"#,
+            downstream = downstream.port(),
+            host = server.address.ip(),
+            port = server.address.port(),
+            authority = reference_authority(server.authority),
+        ),
+    )
+    .unwrap();
+    let log_path = server.state_directory.0.join("translator.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut translator = Reference(
+        Command::new(&executable)
+            .arg("--config")
+            .arg(&config)
+            // Channel opening is logged at debug level.
+            .env("RUST_LOG", "debug")
+            .stdin(Stdio::null())
+            .stderr(log.try_clone().unwrap())
+            .stdout(log)
+            .spawn()
+            .expect("cannot start the external reference translator"),
+    );
+    let failed = |translator: &mut Reference, why: &str| -> ! {
+        let exited = translator.0.try_wait().unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let snapshot = server.stats.lock().unwrap().clone();
+        // Keep diagnostic output free of any protocol payloads/identities.
+        panic!(
+            "reference translator experiment failed ({why}): exited={exited:?}, upstream={}, extended={}, stats={snapshot:?}",
+            log.contains("SetupConnectionSuccess"),
+            log.contains("Received OpenExtendedMiningChannelSuccess"),
+        );
+    };
+
+    // Two SV1 miners behind the translator: two extended channels on one
+    // connection, which the server groups (one job frame per template).
+    struct Miner {
+        device: FirmwareDevice,
+        authorized: bool,
+        /// The latest job and its parent's place in the chain: 0 for the
+        /// first parent seen, one more for each new one.
+        job: Option<(Value, u64)>,
+        parent: Option<String>,
+        generation: u64,
+        submitted: u32,
+        accepted: u32,
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut miners: Vec<Miner> = Vec::new();
+    while miners.len() < 2 {
+        let write = match TcpStream::connect(downstream) {
+            Ok(stream) => stream,
+            Err(_) if Instant::now() < deadline => {
+                if translator.0.try_wait().unwrap().is_some() {
+                    failed(&mut translator, "exited before listening");
+                }
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(_) => failed(&mut translator, "never listened"),
+        };
+        write
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut device = FirmwareDevice {
+            read: std::io::BufReader::new(write.try_clone().unwrap()),
+            write,
+            prefix: Vec::new(),
+            extra_size: 0,
+            name: format!("interop-test.{}", miners.len()),
+            clean: false,
+            difficulty: 0.0,
+        };
+        device.send(json!({"id":1,"method":"mining.subscribe","params":["Pickaxe test firmware"]}));
+        miners.push(Miner {
+            device,
+            authorized: false,
+            job: None,
+            parent: None,
+            generation: 0,
+            submitted: 0,
+            accepted: 0,
+        });
+    }
+
+    // Answers and notifications arrive in any order. The miners take turns,
+    // one block each, so two blocks never compete for one height. A job's
+    // generation comes from its parent, never from when it was read, and no
+    // one mines until both miners have their first job.
+    let mut id = 0u32;
+    loop {
+        if server.stats.lock().unwrap().blocks_accepted >= 4 {
+            break;
+        }
+        let both = miners.iter().all(|miner| miner.parent.is_some());
+        if Instant::now() >= deadline || translator.0.try_wait().unwrap().is_some() {
+            failed(&mut translator, "fewer than four blocks");
+        }
+        for (index, miner) in miners.iter_mut().enumerate() {
+            let device = &mut miner.device;
+            let mut line = String::new();
+            match device.read.read_line(&mut line) {
+                Ok(0) => failed(&mut translator, "SV1 connection closed"),
+                Ok(_) => {
+                    let message: Value = serde_json::from_str(&line).unwrap();
+                    match (message["id"].as_u64(), message["method"].as_str()) {
+                        (Some(1), None) => {
+                            device.prefix =
+                                hex::decode(message["result"][1].as_str().unwrap()).unwrap();
+                            device.extra_size = message["result"][2].as_u64().unwrap() as usize;
+                            assert!(device.extra_size >= 1, "{message}");
+                            let name = device.name.clone();
+                            device.send(
+                                json!({"id":2,"method":"mining.authorize","params":[name,"x"]}),
+                            );
+                        }
+                        (Some(2), None) => {
+                            assert_eq!(message["result"], true, "{message}");
+                            miner.authorized = true;
+                        }
+                        (Some(_), None) => {
+                            assert_eq!(message["result"], true, "{message}");
+                            miner.accepted += 1;
+                        }
+                        (_, Some("mining.set_difficulty")) => {
+                            device.difficulty = message["params"][0].as_f64().unwrap();
+                        }
+                        (_, Some("mining.notify")) => {
+                            let parent = message["params"][1].as_str().map(str::to_owned);
+                            if miner.parent.is_some() && miner.parent != parent {
+                                miner.generation += 1;
+                            }
+                            miner.parent = parent;
+                            miner.job = Some((message, miner.generation));
+                        }
+                        _ => (),
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => failed(&mut translator, "SV1 read failed"),
+            }
+            let blocks = server.stats.lock().unwrap().blocks_accepted;
+            let turn = both && blocks < 4 && usize::try_from(blocks % 2).unwrap() == index;
+            let current = miner.job.as_ref().is_some_and(|(_, at)| *at == blocks);
+            if miner.authorized && !miner.device.prefix.is_empty() && turn && current {
+                let (notify, _) = miner.job.take().unwrap();
+                id += 1;
+                let (_, submit) = miner.device.solve_notify(id, false, &notify);
+                miner.device.send(submit);
+                miner.submitted += 1;
+            }
+        }
+    }
+    let snapshot = server.stats.lock().unwrap().clone();
+    assert_eq!(snapshot.connections, 1);
+    // Only the miner whose turn it is submits, so each block came from the
+    // channel that mined it, with no competing or rejected share.
+    assert_eq!((snapshot.blocks_accepted, snapshot.shares_rejected), (4, 0));
+    assert!(snapshot.shares_accepted >= 4);
+    assert!(miners.iter().all(|miner| miner.submitted == 2));
+    assert!(miners.iter().all(|miner| miner.accepted >= 1));
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(
+        log.matches("Received OpenExtendedMiningChannelSuccess")
+            .count(),
+        2
+    );
+    // The RPC fixture independently deserializes and checks PoW, merkle, BCH
+    // coinbase serialization, configured payout and successor parent linkage.
+    assert!(server.node.lock().unwrap().known.len() >= 4);
+    drop(translator);
 }
 
 // #### PR #40
@@ -1311,6 +1583,9 @@ struct FirmwareDevice {
     /// The worker name it authorized with and submits under.
     name: String,
     clean: bool,
+    /// #### PR #48: the last `mining.set_difficulty` a proxy asked for.
+    /// Solutions meet it as well as the block target; 0 is the block alone.
+    difficulty: f64,
 }
 impl FirmwareDevice {
     fn connect(adapter: &FirmwareAdapter, rolling: bool, authorize_first: bool) -> Self {
@@ -1335,6 +1610,7 @@ impl FirmwareDevice {
             extra_size: 0,
             name: name.to_owned(),
             clean: false,
+            difficulty: 0.0,
         };
         if rolling {
             device.send(json!({"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":2}]}));
@@ -1438,6 +1714,8 @@ impl FirmwareDevice {
             .find(|n| {
                 header.nonce = *n;
                 header.validate_pow(header.target()).is_ok()
+                    && super::telemetry::share_difficulty(&header.block_hash().to_byte_array())
+                        >= self.difficulty
             })
             .unwrap();
         let mut params = vec![
@@ -1508,6 +1786,7 @@ fn the_server_moves_to_its_next_node_when_its_node_stops_answering() {
             transactions: Vec::new(),
             spendable: Vec::new(),
             validations: 0,
+            parent_time: None,
         }))
     };
     let (first, second) = (node(), node());
@@ -1694,6 +1973,11 @@ fn sv1_firmware_mines_at_a_remote_sv2_pool_and_the_adapter_counts_its_verdicts()
         (rows[0].accepted, rows[0].rejected, rows[0].protocol),
         (2, 0, "SV1")
     );
+    // #### PR #48: both acknowledged shares count as personal work at the
+    // pool, apart from this server's own jobs.
+    assert!(counted.pool_work.personal > 0.0);
+    assert_eq!(counted.pool_work.shares(), Some((0.0, 0.0)));
+    assert_eq!(counted.work, super::server::WorkSplit::default());
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
@@ -2164,6 +2448,11 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(stats.lock().unwrap().shares_rejected, 0);
+    // #### PR #48: the pool's acknowledgement counts as donation work, apart
+    // from this server's own jobs.
+    let work = stats.lock().unwrap().pool_work;
+    assert!(work.donation > 0.0 && work.personal == 0.0 && work.fee == 0.0);
+    assert_eq!(work.shares(), Some((1.0, 0.0)));
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
@@ -2612,6 +2901,8 @@ fn a_scripted_jd_client_sets_a_custom_job_and_mines_it() {
     assert_eq!(stats.connections, 1, "the JD session is not a device");
     assert_eq!(stats.device_stats.snapshots(Instant::now()).len(), 1);
     assert_eq!(server.node.lock().unwrap().submissions, 0);
+    // #### PR #48: a custom job's share is no one's work here.
+    assert_eq!(stats.work, super::server::WorkSplit::default());
     drop(jd);
     drop(jd_replies);
     server.wait(|stats| stats.jd_server.as_ref().is_some_and(|jd| jd.clients == 0));
@@ -3021,4 +3312,45 @@ fn an_unpinned_provider_on_this_computer_serves_templates() {
     device.solve_and_submit(0);
     client.wait(|stats| stats.blocks_accepted == 1);
     device.sender.close();
+}
+
+// #### PR #48
+// What: on Chipnet, a device gets the job on the limit's bits a few seconds
+// after the parent's time plus 1200 s, not at the next 15-second refresh:
+// from this server's node (the minimum-difficulty refresh), and through
+// another Pickaxe's template server (which announces the new bits with a
+// SetNewPrevHash on the same parent). Its first job is on normal bits.
+// Why: until then every block a device finds is refused by the node
+// (bad-diffbits), so Pickaxe sends none (see `BchTemplate::stale_bits`).
+// Look here if: min_difficulty_due, the template server's same-parent bits
+// or the fixture node's bits change.
+#[test]
+fn devices_get_the_minimum_difficulty_job_at_the_twenty_minute_point() {
+    let node = pool_node();
+    let start = Instant::now();
+    // The point (the parent's time plus 1201 s) comes 4 to 5 s from now.
+    node.lock().unwrap().parent_time = Some(now() - 1196);
+    let provider = Running::templates(node, Arc::new(TestDirectory::new()));
+    let key = {
+        let mut encoded = vec![1, 0];
+        encoded.extend(provider.authority);
+        stratum_core::bitcoin::base58::encode_check(&encoded)
+    };
+    let address = super::tdp::client::TdpAddress::parse(&format!(
+        "sv2tp://{}/{key}",
+        provider.templates.unwrap()
+    ))
+    .unwrap();
+    let client = Running::tdp_client(pool_node(), address);
+    let mut direct = Device::connect(&provider, false);
+    let mut relayed = Device::connect(&client, true);
+    // Before the next 15-second refresh (the first was at `start`).
+    let deadline = start + Duration::from_secs(12);
+    let limit = super::template::MIN_DIFFICULTY_BITS;
+    for device in [&mut direct, &mut relayed] {
+        let seen = device.bits_until(limit, deadline);
+        assert_eq!(seen.first(), Some(&0x207f_ffff), "{seen:x?}");
+    }
+    direct.sender.close();
+    relayed.sender.close();
 }
