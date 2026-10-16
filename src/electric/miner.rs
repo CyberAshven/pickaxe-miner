@@ -1,11 +1,12 @@
 //! #### PR #51
 //! What: `pickaxe electric`: the fee pot's address, the baton's state, the CPU
 //! miner that follows the baton through Fulcrum and claims from the pot, and
-//! the keyless refund.
+//! owner-authorized recovery (legacy pots remain explicitly selectable).
 //! Why: ELECTRIC is a CPU search beside BCH and PHOTON (docs/electric-token.md).
 //! Check: the tests in `electric` and `tools/reward-policy-vm/electric.mjs`
 //! cover what is broadcast; this file only reads Fulcrum and sends.
 
+use super::recovery::RecoveryKey;
 use super::{
     build_claim, build_refund, claim_locktime, parallel_search, script_hash_hex, Baton, Coin,
     Deployment, Pot, SearchJob, Win, POT_MIN_CHANGE_SATS, TOKEN_OUTPUT_SATS,
@@ -16,6 +17,7 @@ use crate::donation::{Recipient, Schedule};
 use crate::electrum::ElectrumSession;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -28,11 +30,23 @@ const IDLE_POLL: Duration = Duration::from_secs(10);
 const SCHEDULE_UNIT: u64 = 1 << 20;
 
 /// Runs one `pickaxe electric` command.
-pub fn run(cfg: &RuntimeConfig, command: &ElectricCommand) -> Result<(), String> {
+pub fn run(
+    cfg: &RuntimeConfig,
+    command: &ElectricCommand,
+    config_path: &Path,
+) -> Result<(), String> {
     match command {
         ElectricCommand::Pot { deployment } => {
-            let deployment = select(cfg, deployment)?;
-            let (pot, addresses) = pot_for(cfg, &deployment)?;
+            let args = deployment;
+            let deployment = select(cfg, args)?;
+            let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, true)?;
+            if let Some(path) = key_path {
+                println!(
+                    "Recovery key saved: {}. Back up this private file before funding.",
+                    path.display()
+                );
+                println!("The file is owner-only, not encrypted. Losing it prevents refunds.");
+            }
             print_deployment(cfg, &deployment, &addresses);
             println!("pot:        {}", pot.address());
             println!(
@@ -45,7 +59,8 @@ pub fn run(cfg: &RuntimeConfig, command: &ElectricCommand) -> Result<(), String>
             Ok(())
         }
         ElectricCommand::Status { deployment } => {
-            let deployment = select(cfg, deployment)?;
+            let args = deployment;
+            let deployment = select(cfg, args)?;
             let mut session = connect(cfg)?;
             let tip = read_tip(&mut session)?;
             let baton = read_baton(&mut session, &deployment)?;
@@ -53,7 +68,7 @@ pub fn run(cfg: &RuntimeConfig, command: &ElectricCommand) -> Result<(), String>
             println!("tip:        {tip}");
             print_baton(&deployment, &baton, tip);
             if !cfg.payout_address.trim().is_empty() {
-                let (pot, _) = pot_for(cfg, &deployment)?;
+                let (pot, _, _) = pot_for(cfg, &deployment, args, config_path, false)?;
                 let coins = read_pot(&mut session, &pot)?;
                 println!(
                     "pot:        {} ({} sats in {} coin{})",
@@ -69,8 +84,13 @@ pub fn run(cfg: &RuntimeConfig, command: &ElectricCommand) -> Result<(), String>
             deployment,
             broadcast,
         } => {
-            let deployment = select(cfg, deployment)?;
-            let (pot, addresses) = pot_for(cfg, &deployment)?;
+            let args = deployment;
+            let deployment = select(cfg, args)?;
+            let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, false)?;
+            let key = key_path
+                .as_deref()
+                .map(|path| RecoveryKey::load(path, false))
+                .transpose()?;
             let refund_lock = crate::tx::cashaddr_to_p2pkh_locking(&addresses[0])?;
             let mut session = connect(cfg)?;
             let fee = read_relay_fee(&mut session)?;
@@ -79,7 +99,13 @@ pub fn run(cfg: &RuntimeConfig, command: &ElectricCommand) -> Result<(), String>
                 println!("The pot {} holds nothing.", pot.address());
             }
             for coin in coins {
-                let refund = build_refund(&pot, &coin, &refund_lock, fee)?;
+                let refund = build_refund(
+                    &pot,
+                    &coin,
+                    &refund_lock,
+                    fee,
+                    key.as_ref().map(RecoveryKey::secret),
+                )?;
                 println!(
                     "refund {}:{} {} sats -> {} (fee {})",
                     coin.txid,
@@ -106,13 +132,23 @@ pub fn run(cfg: &RuntimeConfig, command: &ElectricCommand) -> Result<(), String>
             max_difficulty,
             dry_run,
         } => {
-            let deployment = select(cfg, deployment)?;
+            let args = deployment;
+            let deployment = select(cfg, args)?;
             let threads = threads.unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map_or(1, |n| n.get().saturating_sub(1))
                     .max(1)
             });
-            mine(cfg, &deployment, threads, *max_difficulty, *dry_run)
+            let (pot, addresses, _) = pot_for(cfg, &deployment, args, config_path, false)?;
+            mine(
+                cfg,
+                &deployment,
+                threads,
+                *max_difficulty,
+                *dry_run,
+                pot,
+                addresses,
+            )
         }
     }
 }
@@ -129,7 +165,13 @@ fn select(cfg: &RuntimeConfig, args: &ElectricDeploymentArgs) -> Result<Deployme
 
 /// The pot for the configured payout and the donation addresses, and the
 /// three recipients' addresses (miner, project, collaborator).
-fn pot_for(cfg: &RuntimeConfig, deployment: &Deployment) -> Result<(Pot, [String; 3]), String> {
+fn pot_for(
+    cfg: &RuntimeConfig,
+    deployment: &Deployment,
+    args: &ElectricDeploymentArgs,
+    config_path: &Path,
+    create: bool,
+) -> Result<(Pot, [String; 3], Option<PathBuf>), String> {
     if cfg.payout_address.trim().is_empty() {
         return Err("set a payout address with --address (a P2PKH CashAddr)".into());
     }
@@ -142,7 +184,21 @@ fn pot_for(cfg: &RuntimeConfig, deployment: &Deployment) -> Result<(Pot, [String
         locks.push(crate::tx::cashaddr_to_p2pkh_locking(address)?);
     }
     let locks: [Vec<u8>; 3] = locks.try_into().map_err(|_| "three recipients")?;
-    Ok((Pot::new(deployment, &locks)?, addresses))
+    let legacy = Pot::new(deployment, &locks)?;
+    if args.legacy_pot {
+        return Ok((legacy, addresses, None));
+    }
+    let path = args.pot_key.clone().unwrap_or_else(|| {
+        config_path.with_file_name(format!(
+            "electric-{}-{}.pot-key",
+            cfg.network.as_str(),
+            hex::encode(crate::proof::hash256(&legacy.redeem))
+        ))
+    });
+    let key = RecoveryKey::load(&path, create)?;
+    let pot = Pot::with_recovery(deployment, &locks, Some(key.public()))?;
+    // Only the public key reaches the mining loop; the secret is for refunds.
+    Ok((pot, addresses, Some(path)))
 }
 
 fn print_deployment(cfg: &RuntimeConfig, deployment: &Deployment, addresses: &[String; 3]) {
@@ -321,14 +377,16 @@ fn recipient_name(recipient: Recipient) -> &'static str {
 /// Searches each baton the pot pays for and broadcasts the claims. Never
 /// sends a proof twice: the contract would take a proof again while the
 /// baton's height stays put, and that reward is not Pickaxe's to take.
+#[allow(clippy::too_many_arguments)]
 fn mine(
     cfg: &RuntimeConfig,
     deployment: &Deployment,
     threads: usize,
     max_difficulty: u8,
     dry_run: bool,
+    pot: Pot,
+    addresses: [String; 3],
 ) -> Result<(), String> {
-    let (pot, addresses) = pot_for(cfg, deployment)?;
     print_deployment(cfg, deployment, &addresses);
     println!("pot:        {}", pot.address());
     println!("threads:    {threads}, up to difficulty {max_difficulty}");
@@ -573,5 +631,62 @@ fn report(outcome: Result<String, String>, win: &Win, claims: &mut u64, lost: &m
             println!("Claim not accepted: {error}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MiningNetwork;
+
+    #[test]
+    fn pot_identity_survives_restart_and_backup_and_isolated_from_other_payouts() {
+        let dir = std::env::temp_dir().join(format!("pickaxe-pot-{:016x}", rand::random::<u64>()));
+        let config = dir.join("config.json");
+        let mut cfg = RuntimeConfig {
+            payout_address: crate::tx::cashaddr_with_version(
+                0,
+                &[0x11; 20],
+                MiningNetwork::Mainnet,
+            ),
+            ..RuntimeConfig::default()
+        };
+        let deploy = Deployment::mainnet();
+        let args = ElectricDeploymentArgs::default();
+        assert!(pot_for(&cfg, &deploy, &args, &config, false).is_err());
+        assert!(!dir.exists());
+        let (pot, _, key_path) = pot_for(&cfg, &deploy, &args, &config, true).unwrap();
+        let key_path = key_path.unwrap();
+        assert_eq!(
+            pot,
+            pot_for(&cfg, &deploy, &args, &config, false).unwrap().0
+        );
+        let backup = dir.join("backup.pot-key");
+        std::fs::copy(&key_path, &backup).unwrap();
+        std::fs::remove_file(&key_path).unwrap();
+        assert!(pot_for(&cfg, &deploy, &args, &config, false).is_err());
+        let restored = ElectricDeploymentArgs {
+            pot_key: Some(backup),
+            ..args.clone()
+        };
+        assert_eq!(
+            pot,
+            pot_for(&cfg, &deploy, &restored, &config, false).unwrap().0
+        );
+        let legacy_args = ElectricDeploymentArgs {
+            legacy_pot: true,
+            ..args.clone()
+        };
+        let (legacy, _, no_key) = pot_for(&cfg, &deploy, &legacy_args, &config, false).unwrap();
+        assert!(no_key.is_none());
+        assert_ne!(legacy.address(), pot.address());
+        cfg.payout_address =
+            crate::tx::cashaddr_with_version(0, &[0x12; 20], MiningNetwork::Mainnet);
+        let (other, _, other_path) = pot_for(&cfg, &deploy, &args, &config, true).unwrap();
+        assert_ne!(other_path.unwrap(), key_path);
+        assert_ne!(other.address(), pot.address());
+        cfg.network = MiningNetwork::Chipnet;
+        assert!(pot_for(&cfg, &deploy, &args, &config, true).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

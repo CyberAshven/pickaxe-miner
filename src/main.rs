@@ -1536,7 +1536,7 @@ fn main() {
         }
         // #### PR #51: ELECTRIC on the CPU (no GPU lock; see `electric`).
         cli::Commands::Electric { command } => {
-            if let Err(error) = electric::miner::run(&cfg, &command) {
+            if let Err(error) = electric::miner::run(&cfg, &command, &config_path) {
                 eprintln!("error: {error}");
                 exit_after_error(1);
             }

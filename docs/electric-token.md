@@ -1,10 +1,11 @@
 # ELECTRIC, as a second token
 
 Status: `pickaxe electric` mines the published mainnet contract as it is, on
-the CPU, with the relay fee paid from a keyless pot (PR #51). No key, no WIF,
-no contract deploy. Nothing has been broadcast by Pickaxe yet: the first
-funded run is the operator's. The design note of 2026-10-13 (PR #50) is
-revised below where the implementation or the chain changed it.
+the CPU, with keyless fee-pot claims and a dedicated recovery key managed
+by Pickaxe (PR #51). No payout-wallet key or contract deploy is needed.
+The recovery redesign has no funded live validation yet. The design note
+of 2026-10-13 (PR #50) is revised below where the implementation or the
+chain changed it.
 
 Sources, read 2026-10-13 and 2026-10-15:
 
@@ -101,45 +102,67 @@ after the height. Stratum cannot aim the nonce field at this preimage, and
 both need a contract that accepts header work. This one does not, so the
 ASIC farm keeps mining BCH and the CPU searches ELECTRIC beside it.
 
-## Paying the fee without a key
+## Paying the fee with an owner-recoverable pot
 
-The fee needs BCH that is not on the baton. The options:
+#### PR #51
 
-| Option | Why not, or why |
-|---|---|
-| A throwaway WIF in the miner | The key can sign any transaction, not just a claim. Refused by the operator. |
-| The baton's own sats | The covenant keeps 1,800 and allows 1,000; 800 sats pay one fee, once, and leave every later claimer worse off. |
-| The wallet signs each claim (a WalletConnect-style session) | The wallet has to be online and answer within a second or two of a win; the race is lost in that time. |
-| Inputs pre-signed with ANYONECANPAY | Wallets do not offer it, and anyone who sees such an input in our claim can spend it in theirs. |
-| A keyless pot covenant | Chosen. Funded once from any wallet; it can only pay our claims or go back to the payout. |
+Pickaxe creates a dedicated recovery key for the fee pot. It does not import
+or store the payout wallet's key. Claims remain keyless; only refunds need
+the recovery signature. PHOTON and its runtime keys are unchanged.
 
-### The pot
+`pickaxe electric pot --address <payout>` creates the key before displaying
+the funding address, or reuses the existing key. Fund that P2SH32 address
+with plain BCH from any wallet. The default key file is beside the selected
+`--config`, named for the network and the pot's contract/payout parameters.
+`--pot-key <path>` selects a backed-up key explicitly; use it consistently
+on `pot`, `status`, `mine` and `refund`.
 
-`pickaxe electric pot --address <payout>` prints its P2SH32 address. The
-script commits the ELECTRIC covenant's locking bytecode, its minimum
-difficulty, the payout and both donation addresses, and the fee cap, so the
-address changes with any of them. Two spends:
+**Back up the key file before funding.** It contains a raw 32-byte secret,
+protected by owner-only file permissions (Windows ACLs or Unix 0600), not
+password encryption. Pickaxe never prints its contents. Someone running as
+your OS account can read it; protect backups too. Losing the key prevents
+refunds. Damaged files are refused, never overwritten. `status`, `mine` and
+`refund` refuse a missing key rather than silently creating a different pot.
+`pot` is the explicit creation command: if you deleted the old key, restore
+its backup instead of creating a new pot for already-funded coins.
 
-- **Claim** (the pot is input 1 of 2): input 0 is the ELECTRIC covenant;
-  output 0 pays the payout or a donation address (the contract makes it the
-  reward, 1,000 sats); output 1 keeps the baton's sats exactly; output 2
-  returns the rest to the pot with no token; the fee is at most 3,000 sats;
-  and the claim moves the baton to a new height or is the minimum-difficulty
-  claim after it.
-- **Refund** (the pot alone): one output, to the payout, taking at most
-  3,000 sats as fee. `pickaxe electric refund` prints these transactions and
-  sends them with `--broadcast`.
+The script commits the ELECTRIC covenant, minimum difficulty, payout,
+donation addresses, fee cap and recovery public key. It permits two spends:
 
-Anyone can spend the pot, but only into one of those shapes. Someone who
-uses it to pay for a claim sends the reward to us. The worst a stranger can
-do is spend fees on our behalf: at most 3,000 sats a claim and two claims a
-height, each paying us 60 ELECTRIC and returning the 1,000 sats with them.
-Keep the pot small (a few thousand sats a claim; a claim is about 800 bytes,
-800 sats at the 1 sat/byte relay fee).
+- **Claim** (input 1 of exactly 2): input 0 is the ELECTRIC covenant;
+  output 0 pays the payout or a donation address, including 1,000 sats;
+  output 1 keeps the baton's sats exactly; output 2 returns plain-BCH
+  change to the same pot. The fee is capped at 3,000 sats. The claim must
+  move the baton to a new height or be the minimum-difficulty claim after
+  it. No key or signature is needed for this branch.
+- **Refund** (the pot alone): the committed recovery key must sign the
+  entire transaction. Exactly one output returns BCH to the configured
+  payout, with no token and a fee at most 3,000 sats. `electric refund`
+  prints the signed transactions; `--broadcast` sends them. If the relay
+  fee exceeds the cap, Pickaxe refuses rather than underpaying it.
+
+The recovery key cannot redirect a refund or change donation recipients.
+Mining loads it only to derive the public key; the secret is dropped before
+search starts. This is separate from the ephemeral PHOTON search keys.
+
+### Existing keyless pots
+
+A recovery key changes the pot address; it cannot retroactively protect an
+already-funded covenant. `--legacy-pot` selects the original keyless script
+and its original claim/refund behavior, without creating a key file. Use
+`electric refund --legacy-pot` with the original payout/deployment settings
+to recover those coins, then fund the new address. Do not send funds to an
+old address expecting the new recovery protection.
+
+Anyone can still construct a valid claim, but its reward must pay one of
+the committed recipients. They cannot force a refund of a new pot without
+the recovery key. Keep the pot small: each claim spends 1,000 sats on the
+reward output plus its relay fee. A valid donation claim pays that recipient,
+not the miner. The published contract's replay weakness remains unchanged.
 
 When the pot cannot pay a claim, the miner does not search. A proof found
 while the pot ran dry is held and sent after a top-up if the baton has not
-moved; if it has, the proof is dropped. That win was never ours.
+moved; otherwise it is dropped.
 
 ## Donation
 
@@ -199,8 +222,10 @@ the old pot to the payout first.
   through the BCH 2026 VM in standard and consensus modes. Claims to the
   payout and both donation addresses, the cheap same-height claim and the
   refund pass; a same-height claim above the minimum, a claim to another
-  recipient, a fee above the cap and a refund elsewhere fail at the pot's
-  input after the contract's input passed.
+  recipient, a fee above the cap, a refund elsewhere, missing or attacker
+  recovery signatures, altered signed transactions and duplicate pot inputs
+  fail. Rejected claim vectors pass the ELECTRIC input first, then fail at
+  the pot's input.
 - `pickaxe electric status` read the live baton through Fulcrum on
   2026-10-15 (claim 1412, difficulty 4, height 972908).
 
@@ -210,4 +235,5 @@ the old pot to the payout first.
 - No setup-wizard screen; `pickaxe electric pot` prints the address.
 - Not inside `stratum-v2 serve`; run `pickaxe electric mine` beside it.
 - No `MiningToken` variant: that enum is the GPU tokens.
-- No broadcast, no deploy, no key.
+- No deploy or funded live validation in this change; refunds are signed locally
+  and broadcast only with `--broadcast`.

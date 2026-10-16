@@ -164,7 +164,7 @@ pub enum Commands {
     },
     /// #### PR #51
     /// ELECTRIC on the CPU, beside BCH or PHOTON, with the relay fee paid from
-    /// a pot you fund; no key is loaded (see docs/electric-token.md).
+    /// a pot you fund, with a dedicated recovery key (see docs/electric-token.md).
     Electric {
         #[command(subcommand)]
         command: ElectricCommand,
@@ -176,7 +176,7 @@ pub enum Commands {
 /// #### PR #51
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum ElectricCommand {
-    /// Print the fee pot's address for --address. Fund it from your wallet.
+    /// Create/load a dedicated recovery key and print the fee pot's address.
     Pot {
         #[command(flatten)]
         deployment: ElectricDeploymentArgs,
@@ -216,6 +216,12 @@ pub enum ElectricCommand {
 /// published one.
 #[derive(clap::Args, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ElectricDeploymentArgs {
+    /// Pot-only recovery key file (default: beside the config, per network/pot).
+    #[arg(long, value_name = "PATH", conflicts_with = "legacy_pot")]
+    pub pot_key: Option<std::path::PathBuf>,
+    /// Use an already-funded keyless pot from the original ELECTRIC build.
+    #[arg(long)]
+    pub legacy_pot: bool,
     /// The deployment's token category ID.
     #[arg(long, value_name = "HEX")]
     pub electric_category: Option<String>,
@@ -483,6 +489,33 @@ pub fn parse() -> Cli {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn electric_key_options_are_shared_and_exclude_legacy_mode() {
+        use clap::Parser;
+        for command in ["pot", "status", "mine", "refund"] {
+            assert!(super::Cli::try_parse_from([
+                "pickaxe",
+                "electric",
+                command,
+                "--pot-key",
+                "backup.pot-key"
+            ])
+            .is_ok());
+            assert!(
+                super::Cli::try_parse_from(["pickaxe", "electric", command, "--legacy-pot"])
+                    .is_ok()
+            );
+            assert!(super::Cli::try_parse_from([
+                "pickaxe",
+                "electric",
+                command,
+                "--legacy-pot",
+                "--pot-key",
+                "backup.pot-key"
+            ])
+            .is_err());
+        }
+    }
     use super::*;
 
     #[test]

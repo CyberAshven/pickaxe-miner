@@ -55,7 +55,7 @@ try {
   for (const sample of proof.samples) {
     const tx = decodeTransactionBch(hexToBin(sample.raw));
     assert.notEqual(typeof tx, 'string', sample.name);
-    const pot = { lockingBytecode: hexToBin(proof.pot_lock), valueSatoshis: BigInt(sample.pot_value) };
+    const pot = { lockingBytecode: hexToBin(sample.pot_lock), valueSatoshis: BigInt(sample.pot_value) };
     const refund = tx.inputs.length === 1;
     const sourceOutputs = refund ? [pot] : [{
       lockingBytecode: hexToBin(proof.electric_lock),
@@ -86,6 +86,27 @@ try {
           altered.outputs[0].token.amount += 1n;
         }
         assert.notEqual(vm.verify({ sourceOutputs, transaction: altered }), true, sample.name);
+        if (refund) {
+          const duplicate = structuredClone(tx);
+          duplicate.inputs.push({ ...structuredClone(tx.inputs[0]), outpointIndex: 999 });
+          assert.notEqual(vm.verify({ sourceOutputs: [pot, pot], transaction: duplicate }), true,
+            `${sample.name}: cannot share one refund output between two pot inputs`);
+          if (sample.owner) {
+            for (const change of [
+              t => { t.inputs[0].outpointIndex += 1; },
+              t => { t.outputs[0].valueSatoshis -= 1n; },
+              t => { t.outputs[0].lockingBytecode[3] ^= 1; },
+              t => { t.inputs[0].unlockingBytecode[1] ^= 1; },
+              t => { t.inputs[0].unlockingBytecode[65] = 0x42; },
+            ]) {
+              const tampered = structuredClone(tx);
+              change(tampered);
+              assert.notEqual(vm.verify({ sourceOutputs, transaction: tampered }), true, sample.name);
+            }
+            assert.notEqual(vm.verify({ sourceOutputs: [{ ...pot, valueSatoshis: pot.valueSatoshis + 1n }], transaction: tx }), true,
+              `${sample.name}: signature commits to the spent value`);
+          }
+        }
       } else {
         // The pot (input 1 of a claim, input 0 of a refund) is what refuses,
         // so for a claim the ELECTRIC covenant at input 0 accepted it.
@@ -95,9 +116,9 @@ try {
       }
     }
   }
-  assert.equal(valid, 2 * 5);
-  assert.equal(refused, 2 * 4);
-  console.log(`PASS ELECTRIC: the contract body matches the live mainnet covenant; ${proof.samples.length} claims and refunds in standard and consensus VMs: the pot pays claims to the payout and both donation addresses and the cheap same-height claim, refunds only to the payout, and refuses replay-shaped claims, other recipients and fees above its cap.`);
+  assert.equal(valid, 2 * 10);
+  assert.equal(refused, 2 * 10);
+  console.log(`PASS ELECTRIC: the contract body matches the live mainnet covenant; ${proof.samples.length} claims and refunds in standard and consensus VMs: the pot pays claims to the payout and both donation addresses and the cheap same-height claim, refunds only to the payout, and refuses replay-shaped claims, other recipients, fees above its cap, and unsigned or wrong-key recovery of owner pots.`);
 } finally {
   rmSync(temp, { recursive: true });
 }

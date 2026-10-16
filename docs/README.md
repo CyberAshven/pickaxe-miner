@@ -24,7 +24,7 @@
 - [Next steps](next-steps.md): BCH Stratum V2 first, then GPU scaling
 - [Architecture and research](architecture.md): the end-to-end design and what exists in BCH mining
 - [BCH Stratum V2 design check](stratum-v2.md)
-- [ELECTRIC](electric-token.md): a second token on the CPU, with a keyless fee pot; its replay weakness
+- [ELECTRIC](electric-token.md): a second token on the CPU, with keyless fee-pot claims and owner recovery; its replay weakness
 
 ## Records
 

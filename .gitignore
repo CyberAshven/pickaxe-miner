@@ -5,6 +5,7 @@ Thumbs.db
 *.pdb
 .env
 .env.*
+*.pot-key
 /artifacts/
 
 cuda/build/*
