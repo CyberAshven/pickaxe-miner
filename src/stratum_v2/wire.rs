@@ -92,6 +92,7 @@ pub struct Responses {
     /// not they are also blocks.
     pub token_wins: Vec<TokenWin>,
     pub share_event: Option<ShareEvent>,
+    pub accepted_work: Option<(Hash, BchPayout)>,
     /// #### PR #42: a SetCustomMiningJob's outcome, its error code when
     /// refused.
     pub custom_job: Option<Result<(), &'static str>>,
@@ -335,6 +336,7 @@ impl MiningSession {
         let mut blocks = Vec::new();
         let mut token_wins = Vec::new();
         let mut share_event = None;
+        let mut accepted_work = None;
         if header.msg_type() == common::MESSAGE_TYPE_SETUP_CONNECTION {
             if self.setup_flags.is_some() || header.channel_msg() {
                 return Err("unexpected setup message".into());
@@ -412,6 +414,7 @@ impl MiningSession {
                 blocks,
                 token_wins,
                 share_event,
+                accepted_work,
                 custom_job: None,
                 forward: Vec::new(),
                 header_wins: Vec::new(),
@@ -486,6 +489,7 @@ impl MiningSession {
                     &mut token_wins,
                     &mut forward,
                     &mut header_wins,
+                    &mut accepted_work,
                 )?);
             }
             Mining::SubmitSharesExtended(request) => {
@@ -507,6 +511,7 @@ impl MiningSession {
                     &mut token_wins,
                     &mut forward,
                     &mut header_wins,
+                    &mut accepted_work,
                 )?);
             }
             Mining::UpdateChannel(request) => {
@@ -598,6 +603,7 @@ impl MiningSession {
             blocks,
             token_wins,
             share_event,
+            accepted_work,
             custom_job,
             forward,
             header_wins,
@@ -640,6 +646,12 @@ impl MiningSession {
         }
         if request.min_ntime < context.min_time || request.min_ntime > now.saturating_add(600) {
             return Err("invalid-min-ntime");
+        }
+        // #### PR #48: on Chipnet, the bits its start time needs: not normal
+        // bits past the parent's time plus 1200 s, nor the limit's at or
+        // before it while ASERT gives other bits (`BchTemplate::wrong_bits`).
+        if context.wrong_bits(request.min_ntime) {
+            return Err("invalid-nbits");
         }
         let prefix = request.coinbase_prefix.as_ref();
         // The script: the client's prefix, this channel's 16-byte prefix and
@@ -750,6 +762,10 @@ impl MiningSession {
         }
         if request.min_ntime < context.min_time || request.min_ntime > now.saturating_add(600) {
             return Err("invalid-min-ntime");
+        }
+        // #### PR #48: the bits its start time needs, as above.
+        if template.wrong_bits(request.min_ntime) {
+            return Err("invalid-nbits");
         }
         let shape = &job.shape;
         if request.coinbase_tx_version != shape.tx_version {
@@ -978,6 +994,7 @@ impl MiningSession {
         token_wins: &mut Vec<TokenWin>,
         forward: &mut Vec<ForwardShare>,
         header_wins: &mut Vec<ValidatedShare>,
+        accepted_work: &mut Option<(Hash, BchPayout)>,
     ) -> Result<ShareEvent, String> {
         let id = share.channel_id;
         let sequence = share.sequence;
@@ -994,6 +1011,13 @@ impl MiningSession {
         match result {
             Ok(share) => {
                 let event = ShareEvent::Accepted(share.share_target);
+                // #### PR #48: only this server's own jobs carry its BCH
+                // payout policy. A Job Declaration job's coinbase is the
+                // client's (its payout here is a placeholder), so its work
+                // repays no quota and is not counted as anyone's here.
+                if !share.template.is_header_only() && !share.template.is_declared() {
+                    *accepted_work = Some((share.share_target, share.payout));
+                }
                 // #### PR #42: best share from the carried hash
                 // What: the best-share difficulty uses the hash the channel's
                 // check computed, instead of hashing the header again.
@@ -1559,6 +1583,41 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn validated_work_keeps_the_old_jobs_policy_and_ignores_replays() {
+        for kind in [ChannelKind::Standard, ChannelKind::Extended] {
+            let mut server = session();
+            server.receive(setup(4), NOW).unwrap();
+            let device = open_device(&mut server, kind);
+            let original = server.channels[&device.channel].job().unwrap().payout;
+            let changed = BchPayout {
+                donation: "9".parse().unwrap(),
+                donation_work: true,
+                ..Default::default()
+            };
+            server
+                .set_job_with_payout(
+                    10,
+                    4,
+                    Arc::new(BchTemplate::from_rpc(&rpc_template()).unwrap()),
+                    changed,
+                )
+                .unwrap();
+            let result = server
+                .receive(submit_share(&device, kind, 0, 0), NOW)
+                .unwrap();
+            assert_eq!(result.accepted_work, Some(([255; 32], original)));
+            let replay = server
+                .receive(submit_share(&device, kind, 1, 0), NOW)
+                .unwrap();
+            assert!(replay.accepted_work.is_none());
+            assert!(matches!(
+                replay.share_event,
+                Some(ShareEvent::Rejected("duplicate-share"))
+            ));
+        }
+    }
+
     // #### PR #42: token wins leave with the responses
     #[test]
     fn responses_carry_token_wins_for_standard_and_extended_submits() {
@@ -1935,6 +1994,62 @@ mod tests {
         );
     }
 
+    // #### PR #48
+    // What: on Chipnet a Coinbase-only custom job's bits must be those its
+    // start time needs: normal bits past the parent's time plus 1200 s, or
+    // the limit's at or before it while ASERT gives the parent other bits,
+    // are refused with invalid-nbits; normal bits before the point, the
+    // limit's after it, and the limit's before it when ASERT itself gives
+    // the limit (a parent on schedule from Chipnet's anchor) are set. The
+    // pool's template carries the parent's time and the job's bits.
+    // Look here if: the bits check in MiningSession::custom_job changes.
+    #[test]
+    fn a_chipnet_custom_job_needs_the_bits_its_start_time_needs() {
+        use super::super::template::MIN_DIFFICULTY_BITS;
+        let (mut server, declarator, channel, _) = jd_session(0b110);
+        let parent = NOW - 1100;
+        // Parent 325908 on ASERT's schedule from Chipnet's anchor.
+        let schedule = 1_605_451_779 + 600 * (325_908 - 16_844 + 1);
+        let pool = |bits: u32, parent_time: u32| {
+            let mut raw = rpc_template();
+            if bits == MIN_DIFFICULTY_BITS {
+                raw["bits"] = serde_json::json!("1d00ffff");
+                raw["target"] = serde_json::json!(format!("00000000ffff{}", "00".repeat(26)));
+            }
+            let mut template = BchTemplate::from_rpc(&raw).unwrap();
+            template.parent_time = Some(parent_time);
+            Arc::new(template)
+        };
+        let cases = [
+            (0x207f_ffff, parent, NOW, None),
+            (0x207f_ffff, parent, NOW + 101, Some("invalid-nbits")),
+            (
+                MIN_DIFFICULTY_BITS,
+                parent,
+                NOW + 100,
+                Some("invalid-nbits"),
+            ),
+            (MIN_DIFFICULTY_BITS, parent, NOW + 101, None),
+            (MIN_DIFFICULTY_BITS, schedule, NOW, None),
+        ];
+        for (generation, (bits, parent_time, min_ntime, refused)) in (5..).zip(cases) {
+            server
+                .set_job(generation, generation.into(), pool(bits, parent_time))
+                .unwrap();
+            let job = CustomJob {
+                bits,
+                min_ntime,
+                ..CustomJob::valid(&declarator)
+            };
+            let outcome = set_custom(&mut server, channel, &job);
+            assert_eq!(
+                outcome.err().as_deref(),
+                refused,
+                "{bits:#x} {parent_time} {min_ntime}"
+            );
+        }
+    }
+
     // #### PR #42
     // What: a work-selection connection's extended channel is custom-only
     // with 16 rollable bytes and no job of the pool's; its standard channel
@@ -2008,12 +2123,17 @@ mod tests {
     // token); an allocated token whose declared flag was forged is refused;
     // the job's shares rebuild the declared coinbase, and a block share
     // comes back on the declared template, whole, with its 3 transactions.
+    // #### PR #48: on Chipnet, a start time past the parent's time plus
+    // 1200 s on normal bits is invalid-nbits.
     // Look here if: MiningSession::declared_job changes.
     #[test]
     fn set_custom_mining_job_on_a_declared_job_must_match_the_declaration() {
         use super::super::jd::declared::{tests::context, CoinbaseShape, DeclaredJob};
         let (mut server, declarator, channel, prefix) = jd_session(0b110);
-        let pool = Arc::new(context(3));
+        // #### PR #48: on Chipnet's normal bits, the parent 1100 s back.
+        let mut pool = context(3);
+        pool.parent_time = Some(NOW - 1100);
+        let pool = Arc::new(pool);
         server.set_job(10, 4, pool.clone()).unwrap();
         let base = CustomJob::valid(&declarator);
         let mut head = base.tx_version.to_le_bytes().to_vec();
@@ -2060,6 +2180,9 @@ mod tests {
                 "invalid-min-ntime",
                 Box::new(|job| job.min_ntime = 1_699_999_999),
             ),
+            // #### PR #48: a start past the parent's time plus 1200 s needs
+            // the limit's bits (see `BchTemplate::wrong_bits`).
+            ("invalid-nbits", Box::new(|job| job.min_ntime = NOW + 101)),
             (
                 "invalid-coinbase-tx-version",
                 Box::new(|job| job.tx_version = 1),

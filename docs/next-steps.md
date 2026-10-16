@@ -3,7 +3,8 @@
 Decided on 2026-10-05, after #22 (the portable engine and every GPU of a
 machine in one miner) and its promotion to master in #31. The owner subsequently
 approved the shared BCH/SV2 and distributed GPU work together in PR #38. Keep
-that work in the existing PR; implementation and evidence are tracked in
+the merged work as the base for follow-up PRs. Implementation and evidence are
+tracked in
 [implementation-status.md](implementation-status.md).
 
 ## Decisions
@@ -128,10 +129,9 @@ Researched on 2026-10-05.
 
 ## Open questions
 
-- Build on the AGPL-3.0 bridge, or write Pickaxe's own template provider client
-  on the reference crates.
-- Whether Bitaxe's Stratum V2 client accepts header-only jobs, which
-  SAFA-style tokens need.
+- Resolved in #42: Pickaxe's Template Distribution client/server use the
+  reference protocol crates. See [architecture.md](architecture.md#open-questions)
+  for the current Bitaxe and Knuth findings.
 - When to start the merge-minable covenant design with PHOTON's author.
 
 ## Follow-ups from #22

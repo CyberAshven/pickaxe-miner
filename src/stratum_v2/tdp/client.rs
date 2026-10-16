@@ -95,8 +95,10 @@ impl TdpAddress {
 }
 
 /// Confirms a provider's new parent is on this server's network, given its
-/// hash and the template's height.
-pub type Guard = Box<dyn FnMut(&Hash, u32) -> Result<(), String> + Send>;
+/// hash and the template's height. #### PR #48: gives the parent's time on a
+/// network that allows minimum-difficulty blocks (see
+/// `BchTemplate::stale_bits`).
+pub type Guard = Box<dyn FnMut(&Hash, u32) -> Result<Option<u32>, String> + Send>;
 
 #[derive(Clone)]
 struct Announced {
@@ -144,7 +146,8 @@ pub struct TdpSource {
     previous: VecDeque<Ready>,
     generation: u64,
     confirmed: VecDeque<Hash>,
-    guarded: Option<Hash>,
+    /// The parent `guard` confirmed last, and its time when given.
+    guarded: Option<(Hash, Option<u32>)>,
 }
 
 impl TdpSource {
@@ -446,7 +449,7 @@ impl TemplateSource for TdpSource {
         if newest.outputs_count != 0 || !newest.outputs.is_empty() || !excess.is_empty() {
             return Err("template provider requires coinbase outputs (a Bitcoin template?)".into());
         }
-        let template = BchTemplate::from_provided(Provided {
+        let mut template = BchTemplate::from_provided(Provided {
             previous_hash: tip.prev,
             version: newest.version,
             bits: tip.bits,
@@ -473,11 +476,16 @@ impl TemplateSource for TdpSource {
         // waste every device's work.
         // Look here if: a provider is refused with "network is not
         // confirmed".
-        if self.guarded != Some(tip.prev) {
-            (self.guard)(&tip.prev, template.height)
-                .map_err(|_| "template provider's network is not confirmed")?;
-            self.guarded = Some(tip.prev);
-        }
+        let parent_time = match self.guarded {
+            Some((parent, time)) if parent == tip.prev => time,
+            _ => {
+                let time = (self.guard)(&tip.prev, template.height)
+                    .map_err(|_| "template provider's network is not confirmed")?;
+                self.guarded = Some((tip.prev, time));
+                time
+            }
+        };
+        template.parent_time = parent_time;
         if let Some(old) = self.current.take() {
             if old.template.previous_hash == template.previous_hash {
                 self.previous.push_back(old);
@@ -663,7 +671,7 @@ mod tests {
         let stray = super::super::convert::set_new_prev_hash(9, &template).unwrap();
         assert_eq!(stray.header().msg_type(), MESSAGE_TYPE_SET_NEW_PREV_HASH);
         let (address, provider) = scripted(vec![stray]);
-        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(())));
+        let mut source = TdpSource::new(address, 122, Box::new(|_, _| Ok(None)));
         assert_eq!(source.refresh().err().as_deref(), Some(BROKE_PROTOCOL));
         assert!(source.link.is_none());
         provider.join().unwrap();
@@ -672,7 +680,8 @@ mod tests {
     // #### PR #42
     // What: a template whose parent the guard does not confirm is refused
     // with "network is not confirmed"; the same template passes once the
-    // guard confirms it.
+    // guard confirms it. #### PR #48: and carries the parent's time the
+    // guard gave.
     // Look here if: the network guard changes.
     #[test]
     fn the_network_guard_refuses_a_provider_on_another_chain() {
@@ -702,13 +711,59 @@ mod tests {
             Box::new(move |previous, height| {
                 checked.push((*previous, height));
                 assert_eq!(height, 325_909);
-                Ok(())
+                Ok(Some(1_699_999_990))
             }),
         );
         let (generation, refreshed) = source.refresh().unwrap();
         assert_eq!(generation, 1);
         assert_eq!(refreshed.height, 325_909);
+        assert_eq!(refreshed.parent_time, Some(1_699_999_990));
         assert_eq!(refreshed.size_limit, 80 + 1 + 153 + 122);
+        provider.join().unwrap();
+    }
+
+    // #### PR #48
+    // What: a second SetNewPrevHash on the same parent with new bits (a
+    // provider at Chipnet's 20-minute point) gives a new template on those
+    // bits and their target, keeping the parent's time the guard gave
+    // without asking it again.
+    // Look here if: TdpSource::handle's SetNewPrevHash or the guard's cache
+    // changes.
+    #[test]
+    fn new_bits_on_the_same_parent_reach_the_template() {
+        let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let mut raw = rpc_template();
+        raw["bits"] = serde_json::json!("1d00ffff");
+        raw["target"] = serde_json::json!(format!("00000000ffff{}", "00".repeat(26)));
+        let limit = BchTemplate::from_rpc(&raw).unwrap();
+        let (address, provider) = scripted(vec![
+            super::super::convert::new_template(5, true, &template).unwrap(),
+            super::super::convert::set_new_prev_hash(5, &template).unwrap(),
+            super::super::convert::new_template(6, true, &limit).unwrap(),
+            super::super::convert::set_new_prev_hash(6, &limit).unwrap(),
+        ]);
+        let mut asked = 0;
+        let mut source = TdpSource::new(
+            address,
+            122,
+            Box::new(move |_, _| {
+                asked += 1;
+                assert_eq!(asked, 1, "the guard is asked once per parent");
+                Ok(Some(1_699_999_990))
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while source
+            .current()
+            .is_none_or(|(_, current)| current.bits != limit.bits)
+        {
+            assert!(Instant::now() < deadline, "the new bits never arrived");
+            source.refresh().unwrap();
+        }
+        let (_, refreshed) = source.current().unwrap();
+        assert_eq!(refreshed.previous_hash, template.previous_hash);
+        assert_eq!(refreshed.target, limit.target);
+        assert_eq!(refreshed.parent_time, Some(1_699_999_990));
         provider.join().unwrap();
     }
 

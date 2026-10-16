@@ -20,6 +20,12 @@ use stratum_core::bitcoin::{consensus, Transaction};
 /// Hash bytes in serialized/internal order, not RPC display order.
 pub type Hash = [u8; 32];
 
+/// #### PR #48: Chipnet's proof-of-work limit (00000000ffff…) as bits.
+pub const MIN_DIFFICULTY_BITS: u32 = 0x1d00ffff;
+/// #### PR #48: the gap after the parent's time from which a Chipnet block
+/// must carry `MIN_DIFFICULTY_BITS`: twice the 10-minute target spacing.
+pub const MIN_DIFFICULTY_GAP: u32 = 1200;
+
 #[derive(Clone, Debug)]
 pub struct BchTemplate {
     pub previous_hash: Hash,
@@ -31,6 +37,9 @@ pub struct BchTemplate {
     pub height: u32,
     pub size_limit: u64,
     pub coinbase_value: u64,
+    /// #### PR #48: the parent block's time, on a network that allows
+    /// minimum-difficulty blocks (Chipnet); see `stale_bits`.
+    pub parent_time: Option<u32>,
     coinbase_flags: Vec<u8>,
     /// #### PR #42: shared, so a template's copies (with tokens, a plan or a
     /// pool's name) and the jobs a pool checks for Job Declaration clients
@@ -230,6 +239,7 @@ impl BchTemplate {
             height: word(value, "height")?,
             size_limit,
             coinbase_value,
+            parent_time: None,
             coinbase_flags,
             merkle_path: coinbase_path(&transaction_hashes).into(),
             transactions: transactions.into(),
@@ -320,6 +330,7 @@ impl BchTemplate {
                 + super::tdp::COINBASE_FIXED
                 + u64::from(provided.reserve),
             coinbase_value: provided.value,
+            parent_time: None,
             coinbase_flags: prefix[push.len()..].to_vec(),
             transactions: provided.transactions.into_iter().map(Arc::from).collect(),
             txids: hashes.into(),
@@ -353,6 +364,7 @@ impl BchTemplate {
             height: context.height,
             size_limit: context.size_limit,
             coinbase_value: context.coinbase_value,
+            parent_time: context.parent_time,
             coinbase_flags: Vec::new(),
             transactions: Vec::new().into(),
             txids: Vec::new().into(),
@@ -387,6 +399,7 @@ impl BchTemplate {
             height: context.height,
             size_limit: context.size_limit,
             coinbase_value: context.coinbase_value,
+            parent_time: context.parent_time,
             coinbase_flags: Vec::new(),
             merkle_path: coinbase_path(&txids).into(),
             transactions: transactions.into(),
@@ -424,6 +437,7 @@ impl BchTemplate {
             // No block: a size that keeps the coinbase checks inert.
             size_limit: 1_000_000,
             coinbase_value: 0,
+            parent_time: None,
             coinbase_flags: Vec::new(),
             transactions: Vec::new().into(),
             txids: Vec::new().into(),
@@ -447,6 +461,75 @@ impl BchTemplate {
     /// #### PR #42: whether this is BCH block work.
     pub fn is_block(&self) -> bool {
         matches!(self.work, Work::Block)
+    }
+
+    // #### PR #48: Chipnet's 20-minute rule
+    // What: a header more than 20 minutes after the parent's time needs the
+    // proof-of-work limit's bits on Chipnet; one on any other bits is
+    // refused by the node (bad-diffbits). Only a template that knows its
+    // parent's time (Chipnet's) can tell.
+    // Why: BCHN's GetNextASERTWorkRequired returns the limit when the block's
+    // time is strictly greater than the parent's plus twice the target
+    // spacing, and ContextualCheckBlockHeader requires those exact bits.
+    // A share on an older normal-bits job may carry such a time (shares may
+    // run to a minute past the server's clock).
+    // Look here if: a Chipnet block is refused as bad-diffbits, or a share
+    // that meets the block target is not sent as a block.
+    /// Whether a header at `time` is past Chipnet's 20-minute point on bits
+    /// other than the limit's. (The reverse, the limit's bits before that
+    /// point, is `wrong_bits`'s other half.)
+    pub fn stale_bits(&self, time: u32) -> bool {
+        self.stale_from().is_some_and(|from| time >= from)
+    }
+
+    // #### PR #48: the limit's bits before the 20-minute point
+    // What: on a template that knows its parent's time (Chipnet's), a header
+    // at or before the parent's time plus 1200 s on the limit's bits is
+    // refused unless ASERT itself gives the limit for this parent (from
+    // Chipnet's anchor, the parent's height and time); with `stale_bits`,
+    // whatever the node would refuse as bad-diffbits. Normal bits there are
+    // the node's own ASERT result (a custom job must carry its pool's
+    // template's bits) and are not recomputed. When ASERT cannot be computed
+    // (a parent below the anchor) nothing is refused.
+    // Why: BCHN requires ASERT's bits up to the 20-minute point, and a Job
+    // Declaration custom job or solution on the limit's bits may carry an
+    // earlier time than its pool's template.
+    // Look here if: a Chipnet block on the limit's bits is refused as
+    // bad-diffbits, or one that ASERT allows is not sent.
+    /// Whether the node would refuse a header at `time` for this template's
+    /// bits: `stale_bits`, or the limit's bits at or before the 20-minute
+    /// point while ASERT gives other bits.
+    pub fn wrong_bits(&self, time: u32) -> bool {
+        self.stale_bits(time)
+            || (self.bits == MIN_DIFFICULTY_BITS
+                && self.parent_time.is_some_and(|parent| {
+                    u64::from(time) <= u64::from(parent) + u64::from(MIN_DIFFICULTY_GAP)
+                })
+                && self
+                    .asert_bits()
+                    .is_some_and(|bits| bits != MIN_DIFFICULTY_BITS))
+    }
+
+    /// #### PR #48: the bits ASERT gives this template's block, from
+    /// Chipnet's anchor: only Chipnet templates carry their parent's time
+    /// (`MiningNetwork::allows_min_difficulty_blocks`).
+    pub fn asert_bits(&self) -> Option<u32> {
+        super::asert::next_bits(
+            &super::asert::CHIPNET,
+            self.height.checked_sub(1)?,
+            self.parent_time?,
+        )
+    }
+
+    /// #### PR #48: the first header time `stale_bits` refuses (the parent's
+    /// time plus 1201 seconds), on a template that knows its parent's time
+    /// and is not on the limit's bits; the node thread refreshes from then
+    /// (see `min_difficulty_due` in the server).
+    pub fn stale_from(&self) -> Option<u32> {
+        if self.bits == MIN_DIFFICULTY_BITS {
+            return None;
+        }
+        self.parent_time?.checked_add(MIN_DIFFICULTY_GAP + 1)
     }
 
     // #### PR #42: the per-template version rule
