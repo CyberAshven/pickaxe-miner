@@ -1174,7 +1174,8 @@ mod tests {
         // its address, so a missing key is found when the server starts.
         assert!(with(&["--sv1-listen", "0.0.0.0:3333"]).is_ok());
         assert!(with(&["--upstream-key", "key"]).is_err());
-        // #### PR #40: at a pool the donation is mining time, set as anywhere.
+        // #### PR #40: at a pool the donation is mining work (#### PR #48),
+        // set as anywhere.
         assert!(with(&[
             "--upstream-key",
             "key",

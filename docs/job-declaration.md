@@ -160,6 +160,7 @@ The job must be exactly the one declared:
 | `nbits` differs | `invalid-nbits` |
 | `version` differs outside the version-rolling bits | `invalid-version` |
 | `min_ntime` before the pool's minimum, or over 10 minutes ahead | `invalid-min-ntime` |
+| on Chipnet, `min_ntime` past the parent's time plus 1200 s on normal bits, or at or before it on the limit's bits while ASERT gives other bits | `invalid-nbits` |
 | the coinbase version, prefix, sequence, outputs or locktime differ from the declaration | `invalid-coinbase-tx-version`, `invalid-coinbase-prefix`, `invalid-coinbase-tx-input-n-sequence`, `invalid-coinbase-tx-outputs`, `invalid-coinbase-tx-locktime` |
 | the merkle path is not the declared transactions' | `invalid-merkle-path` |
 | the declared extranonce is not the channel's 16 bytes plus 16 | `invalid-coinbase-tx` |
@@ -173,7 +174,10 @@ A block on a declared job is whole: the pool saves it in the JD journal, then
 its node gets it, retried until the node answers. It reaches the pool either
 as a share on the custom job or as the client's `PushSolution`, which the pool
 matches by proof of work against the connection's last 8 declared jobs; one
-block per parent is saved, and a solution no job matches is only counted. The
+block per parent is saved, and a solution no job matches is only counted (so
+is, on Chipnet, one more than 20 minutes after the parent on normal bits, or
+at or before then on the limit's bits while ASERT gives other bits, which
+the node would refuse). The
 dashboard lists the block with the node's answer.
 
 ## The Coinbase-only flow
@@ -196,6 +200,7 @@ channel's 16-byte prefix and 16 rollable bytes (at most 100 bytes) ‖
 | `nbits` differs from the pool's | `invalid-nbits` |
 | `version` differs outside the version-rolling bits | `invalid-version` |
 | `min_ntime` before the template's minimum, or over 10 minutes ahead | `invalid-min-ntime` |
+| on Chipnet, `min_ntime` past the parent's time plus 1200 s on normal bits, or at or before it on the limit's bits while ASERT gives other bits | `invalid-nbits` |
 | the prefix does not start with the minimal BIP34 height push, or the script would exceed 100 bytes | `invalid-coinbase-prefix` |
 | the coinbase version is not 1 or 2 | `invalid-coinbase-tx-version` |
 | the coinbase would be under 65 bytes | `invalid-coinbase-tx` |

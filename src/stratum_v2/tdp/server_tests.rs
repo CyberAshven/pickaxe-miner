@@ -385,6 +385,30 @@ fn templates_follow_the_node_future_on_a_new_parent_and_current_on_the_same_one(
     server.wait(|stats| counts(stats).sent >= 3 && counts(stats).clients == 1);
 }
 
+// #### PR #48
+// What: when the node's template moves to new bits on the same parent
+// (Chipnet's limit at the parent's time plus 1200 s), the client gets a
+// future template and a SetNewPrevHash on that parent with the new bits and
+// their target, not a current template; its earlier template is then stale.
+// Look here if: Active::offer's same-parent bits change.
+#[test]
+fn new_bits_on_the_same_parent_come_with_a_set_new_prev_hash() {
+    let node = pool_node();
+    // The point (the parent's time plus 1201 s) comes 2 to 3 s from now.
+    node.lock().unwrap().parent_time = Some(super::super::server_tests::now() - 1198);
+    let server = Running::templates(node, Arc::new(TestDirectory::new()));
+    let mut client = Client::setup(&server);
+    client.constraints(122);
+    let (first, parent) = client.future_template();
+    assert_eq!(parent.bits, 0x207f_ffff);
+    let (next, limit) = client.future_template();
+    assert!(next.id > first.id);
+    assert_eq!(limit.previous, parent.previous);
+    assert_eq!(limit.bits, super::super::template::MIN_DIFFICULTY_BITS);
+    assert_eq!(client.request(first.id), Err("stale-template-id".into()));
+    assert!(client.request(next.id).is_ok());
+}
+
 // #### PR #42
 // What: an SRI-shaped solution (version 2 coinbase with BIP141's marker,
 // flag and one 32-byte zero item) is stripped, saved in the relay journal,

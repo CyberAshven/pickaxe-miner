@@ -613,11 +613,21 @@ impl Channel {
         if (share.version ^ job.template.version) & !job.template.version_mask() != 0 {
             return Err("invalid-version");
         }
+        // #### PR #48: wall-clock ntime
+        // What: an own job accepts a timestamp from the template's curtime
+        // through one minute past the server's clock. A stale curtime does
+        // not shrink that minute.
+        // Why: the unmodified SRI device stamps every header at wall-clock
+        // plus 60 seconds. Its first template is already several seconds
+        // old (it measures hashrate before connecting), and a successor
+        // template can cross a second boundary before the device builds
+        // the header. Capping at curtime plus 60 rejected those shares,
+        // so a run could accept one block and then reject everything.
+        // Look here if: a reference-device run accepts one block and then
+        // rejects shares, or a share more than a minute ahead of the
+        // server clock is accepted.
         let late = match job.kind {
-            JobKind::Own => {
-                share.time > now.saturating_add(60)
-                    || share.time > job.template.current_time.saturating_add(60)
-            }
+            JobKind::Own => share.time > now.saturating_add(60),
             // #### PR #42: a custom job's shares follow the client's start
             // time, up to a minute past it or past now.
             JobKind::Custom { min_ntime } => share.time > now.max(min_ntime).saturating_add(60),
@@ -673,7 +683,16 @@ impl Channel {
         // and the draft covenant's signed compare would also pass negative
         // hashes (see `merge::safa::proof_passes`).
         // Look here if: token work is journaled, or a SAFA win is missed.
-        let block = job.template.is_block() && meets_target(&hash, &job.template.target);
+        // #### PR #48: on Chipnet, a share more than 20 minutes after the
+        // parent on normal bits is only a share: the node would refuse its
+        // block as bad-diffbits, and saving that block would hold back every
+        // later block on the parent (see `BchTemplate::stale_bits`); and
+        // one at or before that point on the limit's bits unless ASERT
+        // gives the limit (a custom job's start time may be that early; see
+        // `BchTemplate::wrong_bits`).
+        let block = job.template.is_block()
+            && meets_target(&hash, &job.template.target)
+            && !job.template.wrong_bits(share.time);
         let header_win = job
             .template
             .token_job()
@@ -877,6 +896,32 @@ mod tests {
             extranonce: &[],
         }
     }
+
+    // #### PR #48
+    // What: a timestamp one minute past the server clock is valid on a
+    // template whose curtime is already behind that clock, and one second
+    // further, or anything before curtime, is not.
+    // Why: that is the unmodified SRI device's header time (see the ntime
+    // check in `Channel::check_inner`).
+    // Look here if: upstream_reference_device rejects shares after one block.
+    #[test]
+    fn own_job_accepts_the_reference_device_clock_and_rejects_anything_later() {
+        let mut channel = channel(1, ChannelKind::Standard);
+        let current = channel.job().unwrap().template.current_time;
+        let wall = current + 7;
+        let mut on_time = share(1);
+        on_time.time = wall + 60;
+        channel
+            .check(on_time, wall)
+            .expect("wall clock plus 60 seconds");
+        let mut ahead = share(2);
+        ahead.time = wall + 61;
+        assert!(matches!(channel.check(ahead, wall), Err("invalid-ntime")));
+        let mut early = share(3);
+        early.time = current - 1;
+        assert!(matches!(channel.check(early, wall), Err("invalid-ntime")));
+    }
+
     #[test]
     fn retained_jobs_keep_exact_payouts_across_rate_and_work_rotations() {
         use crate::donation::bch::BchDonation;
@@ -2069,5 +2114,106 @@ mod tests {
         assert_eq!(script.len(), 73);
         assert_eq!(result.coinbase.bytes, script);
         assert_eq!(result.header[36..68], double_sha256(&script));
+    }
+
+    // #### PR #48
+    // What: on a template that knows its parent's time (Chipnet's), a share
+    // meeting the block target at the parent's time plus 20 minutes is a
+    // block, and one second later only a share, still accepted. Without the
+    // parent's time (mainnet) it stays a block, and so does any time on the
+    // proof-of-work limit's bits. A Job Declaration context's parent time
+    // reaches its custom jobs.
+    // Why: BCHN requires the limit's bits strictly after the parent's time
+    // plus 1200 s and refuses other bits as bad-diffbits (see
+    // `BchTemplate::stale_bits`).
+    // Look here if: a Chipnet block is refused as bad-diffbits, or a block
+    // found after a long gap is not sent.
+    #[test]
+    fn a_chipnet_share_past_twenty_minutes_on_normal_bits_is_not_a_block() {
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let start = template.current_time;
+        let parent = start - 1100;
+        let mut sequence = 0;
+        let mut first_block = |channel: &mut Channel, time: u32| loop {
+            sequence += 1;
+            let mut share = share(sequence);
+            share.time = time;
+            share.nonce = sequence;
+            let validated = channel.check(share, parent + 1200).unwrap();
+            if meets_target(&validated.hash, &validated.template.target) {
+                return validated.block;
+            }
+        };
+        let mut unknown = channel_on(1, ChannelKind::Standard, Arc::new(template.clone()));
+        assert!(first_block(&mut unknown, parent + 1201));
+        template.parent_time = Some(parent);
+        let custom = BchTemplate::custom(&template, template.version, start, Vec::new());
+        assert_eq!(custom.parent_time, Some(parent));
+        let mut timed = channel_on(1, ChannelKind::Standard, Arc::new(template.clone()));
+        assert!(first_block(&mut timed, parent + 1200));
+        assert!(!first_block(&mut timed, parent + 1201));
+        assert!(!first_block(&mut timed, parent + 1260));
+        assert!(template.stale_bits(parent + 1201));
+        template.bits = super::super::template::MIN_DIFFICULTY_BITS;
+        assert!(!template.stale_bits(parent + 1201));
+        template.bits = 0x207fffff;
+        template.parent_time = Some(u32::MAX);
+        assert!(!template.stale_bits(u32::MAX));
+    }
+
+    // #### PR #48
+    // What: on a Chipnet template on the limit's bits, a share meeting the
+    // block target at or before the parent's time plus 1200 s is only a
+    // share while ASERT gives the parent other bits, and one second later a
+    // block; a parent on ASERT's schedule from Chipnet's anchor gets the
+    // limit from ASERT itself (four seconds earlier it does not), and then
+    // the early share is a block. Without the parent's time nothing changes,
+    // and normal bits before the point are not recomputed. (The test target
+    // stays easy, so a CPU finds the shares.)
+    // Why: BCHN requires ASERT's bits up to the 20-minute point (see
+    // `BchTemplate::wrong_bits`); a custom job's start time can be that
+    // early on the limit's bits.
+    // Look here if: a Chipnet block on the limit's bits is refused as
+    // bad-diffbits, or one ASERT allows is not sent.
+    #[test]
+    fn a_chipnet_share_on_the_limits_bits_before_twenty_minutes_needs_asert() {
+        use super::super::template::MIN_DIFFICULTY_BITS;
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        template.bits = MIN_DIFFICULTY_BITS;
+        let start = template.current_time;
+        let parent = start - 1100;
+        let mut sequence = 0;
+        let mut first_block = |template: &BchTemplate, time: u32| {
+            let mut channel = channel_on(1, ChannelKind::Standard, Arc::new(template.clone()));
+            loop {
+                sequence += 1;
+                let mut share = share(sequence);
+                share.time = time;
+                share.nonce = sequence;
+                let validated = channel.check(share, parent + 1200).unwrap();
+                if meets_target(&validated.hash, &validated.template.target) {
+                    return validated.block;
+                }
+            }
+        };
+        assert!(first_block(&template, start));
+        template.parent_time = Some(parent);
+        assert_ne!(template.asert_bits(), Some(MIN_DIFFICULTY_BITS));
+        assert!(!first_block(&template, start));
+        assert!(!first_block(&template, parent + 1200));
+        assert!(first_block(&template, parent + 1201));
+        // Parent 325908 on schedule: the anchor's parent time plus 600 s for
+        // each block since the anchor and one more.
+        let schedule = 1_605_451_779 + 600 * (325_908 - 16_844 + 1);
+        template.parent_time = Some(schedule - 4);
+        assert_eq!(template.asert_bits(), Some(0x1d00_ffcd));
+        assert!(template.wrong_bits(schedule));
+        template.parent_time = Some(schedule);
+        assert_eq!(template.asert_bits(), Some(MIN_DIFFICULTY_BITS));
+        assert!(!template.wrong_bits(start));
+        assert!(first_block(&template, start));
+        template.bits = 0x207f_ffff;
+        template.parent_time = Some(parent);
+        assert!(!template.wrong_bits(start));
     }
 }
