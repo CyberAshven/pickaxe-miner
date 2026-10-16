@@ -36,6 +36,9 @@ it does not silently request a deposit, batch rewards, or ignore the split.
 Future tokens may select any supported mode independently. BCH coinbase payouts
 and token claims remain different transaction builders. No ASIC proxy or new
 token is enabled by selecting a fee mode.
+ELECTRIC's proposed hybrid (2% work and 2% of personal rewards, the
+PHOTON addresses) is [electric-token.md](electric-token.md). It is not
+selected here.
 
 The work scheduler counts completed candidate hashes, not uptime, wins or peak
 hashrate. It keeps its position across pauses, intensity changes, job updates and
