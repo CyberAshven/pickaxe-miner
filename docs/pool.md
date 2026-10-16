@@ -123,7 +123,7 @@ JSON start line (`--no-tui`) lists the same addresses under `connect`.
   comes off what is left, and the miner keeps the rest.
 - **Where the fee comes from** (`--pool-fee-mode`):
   - `coinbase`: an output to your fee address in every block a miner finds;
-  - `work`: that share of each miner's mining time mines to your fee address,
+  - `work`: that share of each miner's difficulty-weighted accepted work mines to your fee address,
     so a block found then pays you in full, with no money passing through
     anyone;
   - `both`: one third work and two thirds coinbase, the donation's own split.
@@ -133,7 +133,7 @@ JSON start line (`--no-tui`) lists the same addresses under `connect`.
 
 For example, with the default 1.5% donation and a 2% coinbase fee, a block
 paying 3.125 BCH pays the donation 0.03125 BCH (its coinbase part; its work
-part is separate mining time), your fee address 0.061875 BCH, and the miner
+part is separate mining work), your fee address 0.061875 BCH, and the miner
 3.031875 BCH.
 
 The dashboard header shows `Public pool, fee 2.00% from coinbase`. With SV2,

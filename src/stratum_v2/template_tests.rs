@@ -561,7 +561,9 @@ fn provider_keeps_inflight_solution_across_same_tip_refresh_only() {
             ("getblocktemplate", Ok(template)),
             ("getblockchaininfo", Ok(info)),
         ]);
-        if !change_tip {
+        if change_tip {
+            calls.push_back(("getblockheader", Ok(parent_header("cd".repeat(32)))));
+        } else {
             calls.push_back(("submitblock", Ok(Value::Null)));
         }
         let mut provider = TemplateProvider::new(RpcFixture(calls), MiningNetwork::Chipnet);
@@ -671,6 +673,10 @@ impl NodeRpc for RpcFixture {
         result
     }
 }
+/// #### PR #48: a node's header of a template's parent.
+fn parent_header(hash: String) -> Value {
+    json!({"hash": hash, "time": 1_699_999_990})
+}
 fn initial_calls() -> VecDeque<(&'static str, Result<Value, String>)> {
     VecDeque::from([
         ("getblockchaininfo", Ok(tip())),
@@ -681,6 +687,8 @@ fn initial_calls() -> VecDeque<(&'static str, Result<Value, String>)> {
         ),
         ("getblocktemplate", Ok(rpc_template())),
         ("getblockchaininfo", Ok(tip())),
+        // #### PR #48: the parent's time, once per parent on Chipnet.
+        ("getblockheader", Ok(parent_header("ab".repeat(32)))),
     ])
 }
 
@@ -733,6 +741,7 @@ fn provider_revokes_work_on_failure_wrong_network_sync_or_tip_race() {
     let mut calls = initial_calls();
     let mut changed = tip();
     changed["bestblockhash"] = json!("cd".repeat(32));
+    calls.pop_back();
     *calls.back_mut().unwrap() = ("getblockchaininfo", Ok(changed));
     let mut provider = TemplateProvider::new(RpcFixture(calls), MiningNetwork::Chipnet);
     assert!(provider.refresh().is_err());

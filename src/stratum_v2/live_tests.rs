@@ -99,7 +99,7 @@ fn live_chipnet_node_validates_standard_and_extended_block_proposals() {
             assert!(outputs[0].script_pubkey.as_bytes() == donor);
         } else {
             assert_eq!(outputs.len(), 2);
-            assert_eq!(outputs[1].value.to_sat(), template.coinbase_value * 2 / 199);
+            assert_eq!(outputs[1].value.to_sat(), template.coinbase_value / 100);
             assert!(outputs[1].script_pubkey.as_bytes() == donor);
             assert!(
                 outputs[0].script_pubkey.as_bytes()

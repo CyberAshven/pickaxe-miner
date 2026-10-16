@@ -73,6 +73,17 @@ impl MiningNetwork {
         }
     }
 
+    /// #### PR #48: Chipnet's 20-minute rule
+    /// What: on Chipnet a block more than 20 minutes after its parent must
+    /// carry the proof-of-work limit's bits (BCHN `fPowAllowMinDifficultyBlocks`);
+    /// mainnet has no such rule.
+    /// Why: templates on such a network carry their parent's time, so a
+    /// share past that point on normal bits is not sent as a block.
+    /// Look here if: a Chipnet node refuses a block as bad-diffbits.
+    pub fn allows_min_difficulty_blocks(self) -> bool {
+        matches!(self, Self::Chipnet)
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mainnet" => Ok(Self::Mainnet),

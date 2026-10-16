@@ -109,6 +109,9 @@ pub struct TemplateProvider<R> {
     previous: VecDeque<(u64, BchTemplate)>,
     /// #### PR #42: the node's fork block was checked (once per node).
     chain_proven: bool,
+    /// #### PR #48: the parent's hash (display order) and time, asked once
+    /// per parent on a network that allows minimum-difficulty blocks.
+    parent: Option<(String, u32)>,
 }
 
 impl<R: NodeRpc> TemplateProvider<R> {
@@ -120,6 +123,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
             current: None,
             previous: VecDeque::new(),
             chain_proven: false,
+            parent: None,
         }
     }
 
@@ -133,6 +137,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
         self.current = None;
         self.previous.clear();
         self.chain_proven = false;
+        self.parent = None;
     }
 
     pub fn current(&self) -> Option<(u64, &BchTemplate)> {
@@ -152,7 +157,7 @@ impl<R: NodeRpc> TemplateProvider<R> {
                 "mode": "template", "capabilities": ["coinbasevalue"], "checkvalidity": true
             }]),
         )?;
-        let template = BchTemplate::from_rpc(&raw).map_err(|_| "invalid block template")?;
+        let mut template = BchTemplate::from_rpc(&raw).map_err(|_| "invalid block template")?;
         let after = self.chain_tip()?;
         let mut previous_hash = template.previous_hash;
         previous_hash.reverse();
@@ -161,6 +166,9 @@ impl<R: NodeRpc> TemplateProvider<R> {
             || hex::encode(previous_hash) != before.1
         {
             return Err("node tip changed while fetching the template".into());
+        }
+        if self.network.allows_min_difficulty_blocks() {
+            template.parent_time = Some(self.parent_time(&before.1)?);
         }
         if let Some(previous) =
             previous.filter(|previous| previous.previous_hash == template.previous_hash)
@@ -280,6 +288,31 @@ impl<R: NodeRpc> TemplateProvider<R> {
         outcome
     }
 
+    /// #### PR #48: the parent's time (see `BchTemplate::stale_bits`), from
+    /// the node's header of it, asked once per parent.
+    fn parent_time(&mut self, hash: &str) -> Result<u32, String> {
+        if let Some((known, time)) = &self.parent {
+            if known == hash {
+                return Ok(*time);
+            }
+        }
+        let header = self.rpc.call("getblockheader", json!([hash, true]))?;
+        if !header
+            .get("hash")
+            .and_then(Value::as_str)
+            .is_some_and(|reported| reported.eq_ignore_ascii_case(hash))
+        {
+            return Err("node returned another block's header".into());
+        }
+        let time = header
+            .get("time")
+            .and_then(Value::as_u64)
+            .and_then(|time| u32::try_from(time).ok())
+            .ok_or("node omitted the parent's time")?;
+        self.parent = Some((hash.to_owned(), time));
+        Ok(time)
+    }
+
     fn chain_tip(&mut self) -> Result<(u64, String), String> {
         let info = self.rpc.call("getblockchaininfo", json!([]))?;
         let expected = match self.network {
@@ -356,6 +389,60 @@ mod durable_tests {
     fn tip() -> Value {
         json!({"chain":"chip","blocks":42,"headers":42,"bestblockhash":"ab".repeat(32),"initialblockdownload":false})
     }
+    /// #### PR #48: a node's header of a template's parent.
+    fn parent_header(hash: String) -> Value {
+        json!({"hash": hash, "time": 1_699_999_990})
+    }
+
+    // #### PR #48
+    // What: on Chipnet a refresh asks the node for the parent's header once
+    // per parent and gives the template the parent's time; a header of
+    // another block, or one without a time, fails the refresh. Mainnet asks
+    // for no header and leaves the time out.
+    // Look here if: a Chipnet template has no parent time, or the node is
+    // asked for the header on every refresh.
+    #[test]
+    fn chipnet_templates_carry_the_parent_time_asked_once_per_parent() {
+        let mut template = super::super::template_tests::rpc_template();
+        template["height"] = json!(43);
+        let refresh = |info: Value| {
+            [
+                ("getblockchaininfo", Ok(info.clone())),
+                ("getblocktemplate", Ok(template.clone())),
+                ("getblockchaininfo", Ok(info)),
+            ]
+        };
+        let mut calls = VecDeque::from(refresh(tip()));
+        calls.push_back(("getblockheader", Ok(parent_header("ab".repeat(32)))));
+        calls.extend(refresh(tip()));
+        let mut provider = TemplateProvider::new(Rpc(calls), MiningNetwork::Chipnet);
+        assert_eq!(
+            provider.refresh().unwrap().1.parent_time,
+            Some(1_699_999_990)
+        );
+        assert_eq!(
+            provider.refresh().unwrap().1.parent_time,
+            Some(1_699_999_990)
+        );
+        assert!(provider.rpc.0.is_empty());
+        for header in [
+            parent_header("cd".repeat(32)),
+            json!({"hash": "ab".repeat(32)}),
+            json!({"hash": "ab".repeat(32), "time": -1}),
+        ] {
+            let mut calls = VecDeque::from(refresh(tip()));
+            calls.push_back(("getblockheader", Ok(header)));
+            let mut provider = TemplateProvider::new(Rpc(calls), MiningNetwork::Chipnet);
+            assert!(provider.refresh().is_err());
+            assert!(provider.current().is_none());
+        }
+        let mut mainnet = tip();
+        mainnet["chain"] = json!("main");
+        let calls = VecDeque::from(refresh(mainnet));
+        let mut provider = TemplateProvider::new(Rpc(calls), MiningNetwork::Mainnet);
+        assert_eq!(provider.refresh().unwrap().1.parent_time, None);
+        assert!(provider.rpc.0.is_empty());
+    }
 
     // #### PR #42
     // What: a node past the fork height whose block there is not the
@@ -386,6 +473,7 @@ mod durable_tests {
                 Ok(super::super::template_tests::rpc_template()),
             ),
             ("getblockchaininfo", Ok(synced.clone())),
+            ("getblockheader", Ok(parent_header("ab".repeat(32)))),
         ]);
         let mut provider = TemplateProvider::new(Rpc(calls), MiningNetwork::Chipnet);
         provider.refresh().unwrap();

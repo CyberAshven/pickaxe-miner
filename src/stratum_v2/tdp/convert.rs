@@ -137,7 +137,10 @@ impl Assembled {
 /// #### PR #42: the checks (D24)
 /// What: the coinbase script must begin with the height push sent, the
 /// version may differ only in the version-rolling bits, the header must
-/// meet the block target, and the block must fit the size limit. A
+/// meet the block target (#### PR #48: and on Chipnet not be more than 20
+/// minutes after the parent on normal bits, nor at or before then on the
+/// limit's bits unless ASERT gives them), and the block must fit the
+/// size limit. A
 /// solution failing one is still assembled, and the caller sends it to the
 /// node at a bounded rate instead of saving it.
 /// Why: the checks keep spam out of the relay journal, but a bug in them
@@ -169,6 +172,10 @@ pub fn assemble(template: &BchTemplate, solution: &SubmitSolution) -> Result<Ass
         Some("version")
     } else if !meets_target(&double_sha256(&header), &template.target) {
         Some("high-hash")
+    } else if template.wrong_bits(solution.header_timestamp) {
+        // #### PR #48: a Chipnet block whose time needs other bits (see
+        // `BchTemplate::wrong_bits`).
+        Some("bad-diffbits")
     } else if coinbase.len() as u64 > template.coinbase_budget() {
         Some("block-size")
     } else {
@@ -321,7 +328,9 @@ pub(super) mod tests {
     // coinbase, stripped of BIP141's marker, flag and one 32-byte item; a
     // wrong prefix, a version outside the rolling bits or a header above the
     // target is still assembled but marked refused; any other witness, or a
-    // coinbase that is not one, has no block.
+    // coinbase that is not one, has no block. #### PR #48: so is a Chipnet
+    // header more than 20 minutes after the parent on normal bits, or at or
+    // before then on the limit's bits while ASERT gives other bits.
     // Look here if: assemble or strip_bip141 changes.
     #[test]
     fn assemble_rebuilds_the_block_and_refuses_bad_prefix_version_or_pow() {
@@ -375,6 +384,25 @@ pub(super) mod tests {
             Some("version")
         );
         assert!((0..10_000).any(|nonce| refused(&plain, rolled, nonce) == Some("high-hash")));
+        for (gap, refused) in [(1200, None), (1201, Some("bad-diffbits"))] {
+            let mut timed = template.clone();
+            timed.parent_time = Some(time - gap);
+            let assembled = assemble(&timed, &solution(1, &witness, rolled, time, solved)).unwrap();
+            assert_eq!(assembled.refused, refused, "{gap}");
+        }
+        // #### PR #48: and one on the limit's bits at or before that point
+        // while ASERT gives the parent other bits (the test target stays
+        // easy).
+        for (gap, refused) in [(1200, Some("bad-diffbits")), (1201, None)] {
+            let mut limit = template.clone();
+            limit.bits = crate::stratum_v2::template::MIN_DIFFICULTY_BITS;
+            limit.parent_time = Some(time - gap);
+            let solve = |nonce| assemble(&limit, &solution(1, &witness, rolled, time, nonce));
+            let nonce = (0..10_000)
+                .find(|nonce| solve(*nonce).unwrap().refused != Some("high-hash"))
+                .unwrap();
+            assert_eq!(solve(nonce).unwrap().refused, refused, "{gap}");
+        }
         // No block: another witness, or not a coinbase.
         let at = witness.len() - 4 - 34;
         let mut two_items = witness.clone();
