@@ -2868,3 +2868,30 @@ It still failed with `upstream certificate version is not SV2's; the pool
 must fix it`. No identity from the user's wallets was used, no GPU was used,
 and no share or block was submitted. Pickaxe's rejection remains unchanged;
 this result does not test the new upstream server binary or disprove its fix.
+
+## Journal lock release during process creation (2026-10-17)
+
+#### PR #53
+
+The Linux ARM64 job for `56bc10f` failed when the legacy-journal test reopened
+its journal: the lock was still held after the previous owner was dropped.
+Test directories have independent random names. Other tests create subprocesses
+in parallel, which can inherit open file descriptions before `exec` closes them.
+
+A standalone Rust probe on Linux reproduced the lock lifetime: duplicating the
+locked descriptor, closing its original owner, and opening the file again still
+returned `WouldBlock`. Explicit `unlock` permitted reopening while preserving
+exclusion for the new owner. This demonstrates a mechanism consistent with the
+CI failure; the failed runner did not capture a syscall trace.
+
+The shared solo/relay/Job Declaration journal now explicitly unlocks on drop.
+It retains the original file-close fallback if unlocking fails. Journal data,
+atomic writes, payout bindings and concurrent-writer rejection are unchanged.
+The Unix-only regression retains a duplicate descriptor across a real journal
+reopen, checks unchanged saved bytes, and ensures closing the old descriptor
+cannot unlock the replacement owner. All 16 journal tests passed on Windows;
+the Unix regression requires the Linux/macOS CI run for this revision.
+
+The lifetime follows the documented behavior of Rust's
+[`File` locks](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)
+and Unix [`flock`](https://man7.org/linux/man-pages/man2/flock.2.html).
