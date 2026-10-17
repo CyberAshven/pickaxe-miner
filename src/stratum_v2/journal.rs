@@ -59,6 +59,13 @@ pub struct Journal {
     state: State,
 }
 
+// #### PR #53: release ownership even while a forked child retains the descriptor.
+impl Drop for Journal {
+    fn drop(&mut self) {
+        let _ = self._lock.unlock();
+    }
+}
+
 /// #### PR #42: what a journal's blocks are checked against.
 pub enum JournalBinding {
     /// This server's own blocks: they pay its payout (with the donation and
@@ -621,4 +628,26 @@ impl Drop for TestDirectory {
             .starts_with("pickaxe-sv2-test-"));
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn journal_close_releases_lock_with_an_inherited_descriptor() {
+    let dir = TestDirectory::new();
+    let open = || Journal::open_relay(&dir.journal(), MiningNetwork::Chipnet);
+    let journal = open().unwrap();
+    // dup and fork retain the same open-file description on Unix.
+    let inherited = journal._lock.try_clone().unwrap();
+    assert!(open().is_err(), "the live owner must remain exclusive");
+    let saved = fs::read(dir.journal()).unwrap();
+    drop(journal);
+    let reopened = open().expect("closing the journal must release its lock");
+    assert_eq!(fs::read(dir.journal()).unwrap(), saved);
+    drop(inherited);
+    assert!(
+        open().is_err(),
+        "closing the old descriptor must not unlock the new owner"
+    );
+    drop(reopened);
+    assert!(open().is_ok());
 }

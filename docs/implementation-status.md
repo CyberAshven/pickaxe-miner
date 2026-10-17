@@ -2,8 +2,8 @@
 
 Scope: all decisions, steps and follow-ups in `next-steps.md`, plus the SV2
 design in `stratum-v2.md`. A scaffold or passing build is not completion.
-Current base: `dev` at `0270104`, including merged #32, #35, #38, #40,
-#42 through #46 (audited 2026-10-13). Historical entries below record what was
+Current base: `dev` at `aa3acb0`, including merged #32, #35, #38, #40,
+#42 through #49 (audited 2026-10-17). Historical entries below record what was
 true at each checkpoint; the table is the current index, not a new scope.
 
 ## Invariants
@@ -33,10 +33,10 @@ true at each checkpoint; the table is the current index, not a new scope.
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check; a coordinator crash during a claim is not exercised live |
-| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live; backup coordinators host-tested; live failover and rigs on separate machines pending |
+| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig now passes synthetic primary-to-backup failover on one PC with reused job IDs; see the regression below. Cross-machine failover and crash-during-claim evidence remain pending. |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | BCH P2Pool is a separate project (architecture.md). Pickaxe has SV2, TP and Job Declaration boundaries; the sharechain and its payout-distribution integration are not completed by these tests. |
-| D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | SV1 devices at SV2 pools with backup pools in order implemented and tested (pool mode below); Job Declaration in both modes, Pickaxe client to Pickaxe pool, implemented and loopback-tested (below); live Job Declaration runs and coinbase payouts at other pools pending |
-| D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Scripted tests pass; remote setup discovery, real ZMQ and live recovery evidence remain. |
+| D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pool mode and both Job Declaration modes implemented; local live Chipnet shares, custom jobs and payouts checked on 2026-10-15. Pool failover delivered fresh real-node jobs on 2026-10-16 without hashing. Independent external-pool interoperability and accepted blocks through failover/JD remain pending. |
+| D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Real ZMQ and TP new-parent/minimum-difficulty delivery checked on 2026-10-15; remote guided setup and live recovery remain. |
 | T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | SAFA reference core, firmware work path, worker, simulated Chipnet test token and setup implemented in #42. Registry remains empty pending a deployed author contract and covenant-VM/live proof. |
 | T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Case A/B commitments, independent reference proof verification, journals, worker and JD integration implemented in #42; docs/merge-mining.md exists. Author covenant/VM proof and deployment remain external prerequisites. |
 | F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Audited merged #35: claim readiness no longer waits for another GPU batch; shutdown still drains safely. Existing host regression retained and passing; no new GPU soak claimed. |
@@ -2789,3 +2789,109 @@ from several threads; A refused those as `duplicate-share`.
 Not shown live: native SV2 firmware (CI's independent SV2 reference device
 covers the protocol), a block found through the pool or Job Declaration
 paths, and failover between pools.
+
+## Pool failover with real Chipnet jobs (2026-10-16)
+
+An SV1 observer followed a pool-mode bridge between two local Pickaxe SV2
+servers, each serving a synced BCHN Chipnet node. After the primary stopped,
+the backup delivered fresh work in 2.094 seconds. After the primary restarted
+and the backup stopped, the primary delivered fresh work in 0.062 seconds.
+All three observations used parent height 328095, clean jobs and difficulty 1;
+the observer independently checked coinbase outputs and unique extranonces.
+
+The Windows CI binary was from `9df163d`, SHA256
+`453c3dc488d1601b193f701c5bf217ed403611487ec811246caaa3f02a1a75be`.
+This was job delivery only: zero submitted shares, zero blocks and no GPU
+work. The servers shut down cleanly with empty pending journals. It does not
+prove accepted shares or blocks across failover, nor external-pool interop.
+
+## GPU coordinator session isolation (2026-10-17)
+
+#### PR #53
+
+A disconnected rig retained its paused search. When a backup or restarted
+coordinator reused that search's generation number, `replace_job` treated the
+new job as unchanged. The rig resumed the old baton and could also send queued
+old winners to the new coordinator. Generation numbers are local to a
+coordinator, not identities shared by every coordinator.
+
+The search now belongs to one encrypted connection. Disconnection stops and
+joins its GPU workers and discards their queued winners before reconnecting.
+The next connection starts only after receiving its own job. Normal job
+updates within a connection still reuse the existing GPU search. No kernel,
+payout, donation policy or claim-journal behavior changed.
+
+The opt-in regression
+`rigs::tests::gpu_rig_failover_replaces_a_reused_generation_if_cuda_present`
+runs the production rig and two encrypted coordinators on one Windows PC.
+They both use generation 7, with different synthetic baton outpoints. The
+RTX 5070 Ti Laptop GPU must produce a winner that passes the coordinator's
+independent signature, transaction-digest and target checks before and after
+the primary disconnects. It takes the normal GPU lock and fails, rather than
+skipping, if no idle CUDA GPU is available.
+
+- Before the fix: failed in 5.74 seconds because the backup rejected an old
+  coordinator's winner.
+- With the fix: passed in 7.01 seconds with winners for both correct jobs and
+  no rejected winner at either coordinator.
+- PTX SHA256:
+  `380967a534ea4f877556e5db20be7561193361355979287c6f91d4172ea1e7de`.
+  The kernel came from the `9df163d` CI artifact; its sources are unchanged
+  in the `aa3acb0` base.
+
+These times include startup and are not throughput measurements. The test
+uses synthetic work and never connects to the chain or broadcasts a claim.
+It proves GPU search isolation on one host, not cross-machine live failover,
+claim recovery after a coordinator crash, or hardware other than this NVIDIA
+GPU. Reconnection reloads GPU search resources; sustained mining within a
+connection follows the unchanged path.
+
+Host validation: `cargo test --locked --no-default-features --features
+stratum-v2,rust-t2 --no-fail-fast -- --skip if_cuda --skip if_hip --skip if_wgpu
+--test-threads=1` passed 741 library and 18 CLI tests (18 manual/hardware
+tests ignored, 32 GPU tests filtered). Formatting and strict Clippy passed
+for the same features and all targets. The separate CUDA test above was
+run explicitly with `--ignored --nocapture --test-threads=1` while the live
+miner was stopped cleanly and its pending reward journal was empty.
+
+## External BCH pool certificate recheck (2026-10-17)
+
+CashStratum closed [its certificate issue](https://github.com/cashstratum/cashstratum/issues/3)
+after publishing v1.2.5 with format version 0 and client rejection of other
+versions. Its maintainer reported source-level comparison with SRI, not a
+live SRI-client test. A deployment must upgrade and restart before that source
+fix changes its handshake.
+
+The existing read-only `real_sv2_pool_sends_work_to_sv1_firmware` test was
+rerun against `eu-bch.solofury.com:7333` with its previously pinned authority.
+It still failed with `upstream certificate version is not SV2's; the pool
+must fix it`. No identity from the user's wallets was used, no GPU was used,
+and no share or block was submitted. Pickaxe's rejection remains unchanged;
+this result does not test the new upstream server binary or disprove its fix.
+
+## Journal lock release during process creation (2026-10-17)
+
+#### PR #53
+
+The Linux ARM64 job for `56bc10f` failed when the legacy-journal test reopened
+its journal: the lock was still held after the previous owner was dropped.
+Test directories have independent random names. Other tests create subprocesses
+in parallel, which can inherit open file descriptions before `exec` closes them.
+
+A standalone Rust probe on Linux reproduced the lock lifetime: duplicating the
+locked descriptor, closing its original owner, and opening the file again still
+returned `WouldBlock`. Explicit `unlock` permitted reopening while preserving
+exclusion for the new owner. This demonstrates a mechanism consistent with the
+CI failure; the failed runner did not capture a syscall trace.
+
+The shared solo/relay/Job Declaration journal now explicitly unlocks on drop.
+It retains the original file-close fallback if unlocking fails. Journal data,
+atomic writes, payout bindings and concurrent-writer rejection are unchanged.
+The Unix-only regression retains a duplicate descriptor across a real journal
+reopen, checks unchanged saved bytes, and ensures closing the old descriptor
+cannot unlock the replacement owner. All 16 journal tests passed on Windows;
+the Unix regression requires the Linux/macOS CI run for this revision.
+
+The lifetime follows the documented behavior of Rust's
+[`File` locks](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)
+and Unix [`flock`](https://man7.org/linux/man-pages/man2/flock.2.html).

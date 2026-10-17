@@ -426,9 +426,12 @@ channel opened with a 4-byte extranonce prefix and 8-byte extranonce2,
 difficulty 1024, and a first job delivered to an SV1 device stand-in.
 SoloFury's BCH SV2 endpoints run CashStratum, which signs its certificate with
 format version 1; the SV2 spec requires 0 and requires clients to refuse other
-versions, so Pickaxe reports "upstream certificate version is not SV2's" there
-until CashStratum fixes it
-([cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3)).
+versions, so Pickaxe reports "upstream certificate version is not SV2's" there.
+CashStratum fixed its source in v1.2.5
+([cashstratum/cashstratum#3](https://github.com/cashstratum/cashstratum/issues/3));
+the read-only recheck of `eu-bch.solofury.com:7333` on 2026-10-17 still received
+the old certificate version. That endpoint must upgrade and restart before
+its BCH interoperability can be retested; Pickaxe never relaxes the check.
 
 ### Fallback pools and coming back
 

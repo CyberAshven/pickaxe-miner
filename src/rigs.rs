@@ -1068,7 +1068,6 @@ mod net {
                     .collect::<Vec<_>>(),
             }),
         );
-        let mut search: Option<SearchHandle> = None;
         let mut backoff = Duration::from_secs(1);
         let mut winners_sent = 0u64;
         // #### PR #42: each GPU's temperature, fan and power for the reports.
@@ -1095,6 +1094,8 @@ mod net {
         while !stop.load(Ordering::Relaxed) {
             match connect_first(&coordinators) {
                 Ok((index, (mut sender, mut receiver))) => {
+                    // #### PR #53: coordinator generations and queued winners belong to this connection only.
+                    let mut search: Option<SearchHandle> = None;
                     backoff = Duration::from_secs(1);
                     report(
                         json,
@@ -1235,9 +1236,8 @@ mod net {
                     })();
                     sender.close();
                     receiver.close();
-                    if let Some(handle) = search.as_ref() {
-                        // Without the coordinator the job may go stale.
-                        let _ = handle.apply_control(SearchCommand::Pause);
+                    if let Some(handle) = search {
+                        handle.stop();
                     }
                     if let Err(error) = link {
                         report(json, "disconnected", serde_json::json!({"reason": error}));
@@ -1257,9 +1257,6 @@ mod net {
                 thread::sleep(Duration::from_millis(100));
             }
             backoff = (backoff * 2).min(Duration::from_secs(30));
-        }
-        if let Some(handle) = search {
-            handle.stop();
         }
         telemetry.stop();
         Ok(())
@@ -1494,6 +1491,102 @@ mod tests {
         assert_eq!(index, 1);
         assert!(net::connect_first(&[(down, authority)]).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // #### PR #53: reused coordinator IDs must not resume or forward the old GPU work.
+    #[cfg(all(feature = "stratum-v2", feature = "rust-t2"))]
+    #[test]
+    #[ignore = "requires an idle CUDA GPU; synthetic jobs, no chain connection"]
+    fn gpu_rig_failover_replaces_a_reused_generation_if_cuda_present() {
+        use crate::backend::{self, BackendKind};
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let _gpu_lock = crate::mining_lock::acquire_gpu_lock().expect("GPU must be free");
+        let gpu = backend::list_devices(BackendKind::Cuda)
+            .expect("CUDA discovery")
+            .into_iter()
+            .find(|gpu| gpu.ready)
+            .expect("an idle CUDA GPU is required");
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-rig-failover-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let primary = RigHub::start("127.0.0.1:0".parse().unwrap(), &dir.join("primary")).unwrap();
+        let backup = RigHub::start("127.0.0.1:0".parse().unwrap(), &dir.join("backup")).unwrap();
+        let mut job = sample_job();
+        // About one winner per 2^24 candidates, without filling the winner buffer.
+        job.target_le_hex = format!("{}ffffff000000", "00".repeat(26));
+        primary.publish(job.clone());
+        let mut next = job.clone();
+        next.baton_txid = "22".repeat(32);
+        next.source_identity = "backup".into();
+        backup.publish(next.clone());
+        assert_eq!(job.generation_id, next.generation_id);
+        let coordinators = vec![
+            (primary.listen().to_owned(), primary.key().to_owned()),
+            (backup.listen().to_owned(), backup.key().to_owned()),
+        ];
+        let stop = Arc::new(AtomicBool::new(false));
+        let rig_stop = Arc::clone(&stop);
+        let rig = thread::spawn(move || {
+            run_rig(
+                &coordinators,
+                Some("failover-test"),
+                None,
+                &[gpu],
+                100,
+                true,
+                rig_stop,
+                None,
+            )
+        });
+        let wait_for_winner = |hub: &RigHub, expected: &MiningJob| -> Result<(), String> {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while Instant::now() < deadline {
+                if hub.summary().rejected != 0 {
+                    return Err(
+                        "a winner from the previous coordinator crossed the session boundary"
+                            .into(),
+                    );
+                }
+                let winners = hub.take_winners();
+                if !winners.is_empty() {
+                    for winner in winners {
+                        crate::mining_job::verify_rig_winner(&winner, expected)?;
+                        assert_eq!(winner.baton_txid, expected.baton_txid);
+                    }
+                    return Ok(());
+                }
+                if rig.is_finished() {
+                    return Err("rig stopped before producing a winner".into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err("timed out waiting for a verified GPU winner".into())
+        };
+        let first = wait_for_winner(&primary, &job);
+        drop(primary);
+        let second = if first.is_ok() {
+            wait_for_winner(&backup, &next)
+        } else {
+            Ok(())
+        };
+        stop.store(true, Ordering::Relaxed);
+        let result = rig.join().expect("rig thread panicked");
+        drop(backup);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(first.is_ok(), "primary: {first:?}; rig: {result:?}");
+        assert!(second.is_ok(), "backup: {second:?}; rig: {result:?}");
+        result.unwrap();
     }
 
     /// #### PR #42: a GPU report with every field set.
