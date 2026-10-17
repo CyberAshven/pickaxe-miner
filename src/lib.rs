@@ -30,6 +30,9 @@ mod cuda_stage_b;
 #[allow(dead_code)]
 pub mod cuda_stage_c;
 pub mod donation;
+// #### PR #51: ELECTRIC on the CPU with keyless claims and pot recovery.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod electric;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod electrum;
