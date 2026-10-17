@@ -2853,3 +2853,18 @@ tests ignored, 32 GPU tests filtered). Formatting and strict Clippy passed
 for the same features and all targets. The separate CUDA test above was
 run explicitly with `--ignored --nocapture --test-threads=1` while the live
 miner was stopped cleanly and its pending reward journal was empty.
+
+## External BCH pool certificate recheck (2026-10-17)
+
+CashStratum closed [its certificate issue](https://github.com/cashstratum/cashstratum/issues/3)
+after publishing v1.2.5 with format version 0 and client rejection of other
+versions. Its maintainer reported source-level comparison with SRI, not a
+live SRI-client test. A deployment must upgrade and restart before that source
+fix changes its handshake.
+
+The existing read-only `real_sv2_pool_sends_work_to_sv1_firmware` test was
+rerun against `eu-bch.solofury.com:7333` with its previously pinned authority.
+It still failed with `upstream certificate version is not SV2's; the pool
+must fix it`. No identity from the user's wallets was used, no GPU was used,
+and no share or block was submitted. Pickaxe's rejection remains unchanged;
+this result does not test the new upstream server binary or disprove its fix.
