@@ -5,8 +5,8 @@
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 use pickaxe_miner::{
-    backend, benchmark, cli, config, electrum, mine_watch, mining_lock, node, reach, rigs, runtime,
-    search, self_test, stratum_v2, telemetry, tui, tx,
+    backend, benchmark, cli, config, electric, electrum, mine_watch, mining_lock, node, reach,
+    rigs, runtime, search, self_test, stratum_v2, telemetry, tui, tx,
 };
 
 use config::RuntimeConfig;
@@ -1533,6 +1533,13 @@ fn main() {
                 "error: run it first on the line: pickaxe farm-os mine --pool ... --user ..."
             );
             exit_after_error(2);
+        }
+        // #### PR #51: ELECTRIC on the CPU (no GPU lock; see `electric`).
+        cli::Commands::Electric { command } => {
+            if let Err(error) = electric::miner::run(&cfg, &command, &config_path) {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
         }
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {

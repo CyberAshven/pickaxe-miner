@@ -3960,9 +3960,10 @@ mod tests {
             header.contains("Job Declaration clients 3 · 5 custom jobs · 0 refused · 1 blocks"),
             "{header}"
         );
-        // Share ages count on from the save.
+        // Share ages count on from the save (this status's own: a second
+        // may have passed since the first save above).
         assert_eq!(
-            saved.rows(updated + 10)[0].last_share_seconds,
+            saved.rows(saved.updated + 10)[0].last_share_seconds,
             devices[0].last_share_seconds.map(|s| s + 10)
         );
         let mut terminal = Terminal::new(TestBackend::new(180, 20)).unwrap();
