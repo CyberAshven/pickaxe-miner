@@ -67,7 +67,7 @@ fn reverse(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Decodes a displayed transaction ID into 32 bytes.
-fn parse_txid_display(txid: &str) -> Result<[u8; 32], String> {
+pub(crate) fn parse_txid_display(txid: &str) -> Result<[u8; 32], String> {
     let txid = txid.trim();
     if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("transaction id must be exactly 64 hexadecimal characters".into());
@@ -84,7 +84,7 @@ pub fn transaction_id(raw: &[u8]) -> String {
 }
 
 /// Encodes a length as a Bitcoin compact-size integer.
-fn compact_uint(value: u64) -> Vec<u8> {
+pub(crate) fn compact_uint(value: u64) -> Vec<u8> {
     if value < 0xfd {
         vec![value as u8]
     } else if value <= u16::MAX as u64 {
@@ -109,7 +109,7 @@ fn compact_token_amount(value: u128) -> Result<Vec<u8>, String> {
 }
 
 /// Encodes data as a script push operation.
-fn push_data(data: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn push_data(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(data.len() + 3);
     match data.len() {
         0..=75 => out.push(data.len() as u8),

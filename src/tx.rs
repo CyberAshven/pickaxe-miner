@@ -142,8 +142,9 @@ pub fn cashaddr_to_coinbase_locking(address: &str) -> Result<Vec<u8>, String> {
 }
 
 /// #### PR #40: encodes any CashAddr version and hash, for tests of P2SH
-/// payouts and of where P2SH is refused.
-#[cfg(test)]
+/// payouts and of where P2SH is refused. #### PR #51: also the ELECTRIC
+/// fee pot's P2SH32 address.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn cashaddr_with_version(
     version: u8,
     hash: &[u8],
