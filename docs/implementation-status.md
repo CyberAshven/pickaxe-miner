@@ -2807,6 +2807,8 @@ prove accepted shares or blocks across failover, nor external-pool interop.
 
 ## GPU coordinator session isolation (2026-10-17)
 
+#### PR #53
+
 A disconnected rig retained its paused search. When a backup or restarted
 coordinator reused that search's generation number, `replace_job` treated the
 new job as unchanged. The rig resumed the old baton and could also send queued

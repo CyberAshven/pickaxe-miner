@@ -1094,7 +1094,7 @@ mod net {
         while !stop.load(Ordering::Relaxed) {
             match connect_first(&coordinators) {
                 Ok((index, (mut sender, mut receiver))) => {
-                    // Coordinator generations and queued winners belong to this connection only.
+                    // #### PR #53: coordinator generations and queued winners belong to this connection only.
                     let mut search: Option<SearchHandle> = None;
                     backoff = Duration::from_secs(1);
                     report(
@@ -1493,6 +1493,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // #### PR #53: reused coordinator IDs must not resume or forward the old GPU work.
     #[cfg(all(feature = "stratum-v2", feature = "rust-t2"))]
     #[test]
     #[ignore = "requires an idle CUDA GPU; synthetic jobs, no chain connection"]
