@@ -1,9 +1,10 @@
 # Architecture implementation and evidence
 
 Scope: all decisions, steps and follow-ups in `next-steps.md`, plus the SV2
-design in `stratum-v2.md`. A scaffold or passing build is not completion.
-Current base: `dev` at `aa3acb0`, including merged #32, #35, #38, #40,
-#42 through #49 (audited 2026-10-17). Historical entries below record what was
+design in `stratum-v2.md` and the ELECTRIC implementation in #51. A scaffold
+or passing build is not completion.
+Current base: `dev` at `699a96e`, including merged #32, #35, #38, #40,
+#42 through #49, #51 and #52 (audited 2026-10-17). Historical entries below record what was
 true at each checkpoint; the table is the current index, not a new scope.
 
 ## Invariants
@@ -22,7 +23,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
-| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. GBT-light remains an optional optimization, not an implemented path. |
+| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. GBT-light remains an unimplemented integration target. |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Reference-encrypted TP client/server implemented in #42, with loopback provider and block-submission tests. Independent Knuth provider interoperability still needs a running compatible provider. |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests, unmodified upstream standard-channel CPU device, unmodified upstream translator on an extended channel (PR #48) and SV1 Avalon Nano 3 pass; native SV2 firmware pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
@@ -44,6 +45,38 @@ true at each checkpoint; the table is the current index, not a new scope.
 | F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | PR #48 adds native WDDM utilization and dedicated-memory counters to the shared sampler, matched by PCI address. Live counter reads passed for the NVIDIA discrete and AMD integrated adapters on one Windows PC. Missing/ambiguous PCI identity, linked adapters and unavailable counters remain unsupported; power, temperature and clocks still need vendor support. |
 | F4 | Sustained integrated + discrete GPU test | Long serial comparison, correctness and thermals | Pending |
 | F5 | Next feature release version bump | Version/release plan approved for actual release | Deferred until release is ordered |
+| E1 | Pickaxe-managed ELECTRIC recovery key and owner refund | Restart/key-file checks, negative covenant VM proofs and funded recovery | Merged #51 implements a separate pot recovery key, keyless constrained claims and signed owner refunds. Host tests and BCH VM proofs pass; funded claim/refund and lost-race validation remain. |
+| E2 | ELECTRIC setup and operation alongside the other miner modes | Setup funding/top-up flow and integrated CPU lifecycle | The CLI offers `electric pot/status/mine/refund`. The earlier setup-wizard and automatic sidecar design is not implemented; today the CPU miner is a separate command. |
+
+## Remaining work after the #51/#52 merges
+
+Use #53 for the remaining Pickaxe changes and evidence. The older #50 design
+is superseded by #51: its documentation was revised in the implementation,
+and its earlier timestamp-validation change is already in merged #48.
+
+- **Implementation:** GBT-light (S1), ELECTRIC setup and automatic sidecar
+  integration (E2), and Pickaxe's eventual P2Pool launch/payout integration
+  (D1). The BCH P2Pool sharechain itself remains a separate project, as stated
+  in `architecture.md`; an SV2 connection alone does not finish it.
+- **Available hardware/access:** a fresh physical ASIC donation audit using
+  distinct recipient scripts (S8), cross-machine GPU failover and a crash
+  during an in-flight claim (G3/G4), accepted blocks through pool failover/JD
+  and independent pool interoperability (D2), remote guided-node recovery
+  (D3), and a sustained integrated/discrete GPU run (F4). Previous narrow
+  tests remain valid evidence, but do not complete these broader checks.
+- **External prerequisites:** a compatible Knuth provider (S2), native SV2
+  ASIC firmware (S3/S4), author-approved token contracts/deployments and VM
+  proofs (T1/T2), and Intel/discrete AMD/Linux GPU/Apple Silicon hardware
+  runs (F2). The registry stays empty until token prerequisites are met.
+- **Funded ELECTRIC validation:** a claim, a lost race retaining its pot,
+  restart/top-up and signed refund (E1). The local key/VM tests do not prove
+  network acceptance, and the author's existing replay weakness remains.
+
+PR #53's GPU session isolation and journal lock fixes passed all CI and
+packaging checks at `a3761c5`, which includes the merged #51/#52 source.
+Release publication was skipped. The Unix journal regression passed on Linux
+ARM64 as part of that run. Those results do not close the unfinished items
+above; later commits require their own checks.
 
 The dedicated ASIC and Chipnet node have prior live evidence below. New live
 runs require fresh connectivity and authorization checks; private connection

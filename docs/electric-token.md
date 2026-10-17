@@ -20,7 +20,8 @@ Sources, read 2026-10-13 and 2026-10-15:
 ## Decision
 
 Mine the published contract beside BCH and PHOTON, on a CPU search, without
-a key in Pickaxe. Document its replay weakness, never use it, and keep the
+the payout wallet's key in Pickaxe. A separate pot-only recovery key protects
+refunds. Document its replay weakness, never use it, and keep the
 deployment as data so a fixed contract is one new `Contract` variant.
 
 ## Replay
