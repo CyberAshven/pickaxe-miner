@@ -2413,6 +2413,7 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
             identity: crate::donation::bch::address(crate::config::MiningNetwork::Chipnet)
                 .to_owned(),
             rate: Arc::new(std::sync::RwLock::new("100".parse().unwrap())),
+            fallback: None,
         }),
         public: false,
         prefer: None,
