@@ -235,17 +235,16 @@ fn display(monitor: &Monitor, finished: impl Fn() -> bool) -> Result<(), String>
                     KeyCode::Char('p') => {
                         monitor.paused.fetch_xor(true, Relaxed);
                     }
+                    // Only this thread changes the intensity; the miner reads it.
                     KeyCode::Char('+') | KeyCode::Char('=') => {
-                        monitor
-                            .intensity
-                            .fetch_update(Relaxed, Relaxed, |n| Some((n + 5).min(100)))
-                            .ok();
+                        let now = monitor.intensity.load(Relaxed);
+                        monitor.intensity.store((now + 5).min(100), Relaxed);
                     }
                     KeyCode::Char('-') => {
+                        let now = monitor.intensity.load(Relaxed);
                         monitor
                             .intensity
-                            .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(5).max(10)))
-                            .ok();
+                            .store(now.saturating_sub(5).max(10), Relaxed);
                     }
                     _ => {}
                 }
