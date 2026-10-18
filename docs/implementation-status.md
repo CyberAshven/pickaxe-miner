@@ -22,7 +22,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
-| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. GBT-light remains an optional optimization, not an implemented path. |
+| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. The SV2 server keeps full templates by design (2026-10-18 decision below); the GPU console's light path in `node.rs` is unchanged. |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Reference-encrypted TP client/server implemented in #42, with loopback provider and block-submission tests. Independent Knuth provider interoperability still needs a running compatible provider. |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests, unmodified upstream standard-channel CPU device, unmodified upstream translator on an extended channel (PR #48) and SV1 Avalon Nano 3 pass; native SV2 firmware pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
@@ -2789,3 +2789,34 @@ from several threads; A refused those as `duplicate-share`.
 Not shown live: native SV2 firmware (CI's independent SV2 reference device
 covers the protocol), a block found through the pool or Job Declaration
 paths, and failover between pools.
+
+## Full templates kept for the SV2 server (2026-10-18)
+
+#### PR #55
+
+GBT-light (`getblocktemplatelight` / `submitblocklight`) is not added to
+the SV2 server. Reasons, from the code as merged:
+
+- The block journal (`journal.rs`) saves whole blocks, so a saved block can
+  go to whichever node or provider is active after a failover or restart.
+  A light job id belongs to the one node that issued it.
+- `BchTemplate::from_rpc` checks every transaction (txid, no witness, CTOR
+  order, no duplicates) and sizes the coinbase budget from them; a light
+  template has no transactions to check or size.
+- The Template Distribution server (`RequestTransactionData`, assembly of
+  `SubmitSolution`) and Full-Template Job Declaration (declaring, providing
+  missing transactions, the pool's lookups) need the transaction bytes.
+
+A light source would therefore need a node-bound journal entry, a coinbase
+reserve that BCHN does not report, and refusal of `--tp-listen` and both
+Job Declaration flags with it. At current BCH block sizes the bandwidth it
+saves does not justify weaker block durability. The GPU console's existing
+light path (`node::fetch_block_template` / `submit_block`) is unchanged.
+Revisit if template bandwidth becomes the bottleneck.
+
+## Deferred live checks (2026-10-18)
+
+The sustained integrated plus discrete GPU run (F4) and a coordinator crash
+during an in-flight claim (G3) need this PC's GPUs. A mainnet PHOTON miner
+held the GPU lock throughout the session, so neither was run; both need a
+window in which the operator stops that miner.
