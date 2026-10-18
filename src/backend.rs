@@ -139,6 +139,41 @@ pub fn resolve_mining_devices(
     }
 }
 
+// #### PR #58: ELECTRIC uses CUDA or the portable engine, never a CPU fallback.
+pub fn resolve_electric_devices(
+    prefer: BackendKind,
+    selection: &DeviceSelection,
+) -> Result<Vec<GpuDevice>, String> {
+    if prefer != BackendKind::Auto {
+        return match prefer {
+            BackendKind::Cuda | BackendKind::Wgpu => resolve_mining_devices(prefer, selection),
+            _ => Err("ELECTRIC uses --backend cuda or wgpu (including integrated GPUs)".into()),
+        };
+    }
+    electric_engines_for(select_gpus(mining_gpus(), selection, prefer)?)
+}
+
+/// The engines ELECTRIC mines the chosen GPUs with: CUDA and portable GPUs
+/// as they are, any other GPU through its portable (wgpu) adapter.
+pub fn electric_engines_for(gpus: Vec<GpuDevice>) -> Result<Vec<GpuDevice>, String> {
+    if gpus.is_empty() {
+        return Err("no GPU selected for ELECTRIC".into());
+    }
+    let portable = list_wgpu_devices().unwrap_or_default();
+    gpus.into_iter()
+        .map(|gpu| {
+            if matches!(gpu.backend, BackendKind::Cuda | BackendKind::Wgpu) {
+                return Ok(gpu);
+            }
+            portable
+                .iter()
+                .find(|other| same_physical_gpu(std::slice::from_ref(&gpu), other))
+                .cloned()
+                .ok_or_else(|| format!("ELECTRIC needs CUDA or wgpu support for {}", gpu.name))
+        })
+        .collect()
+}
+
 /// Every GPU automatic selection can mine on: one entry per physical GPU.
 pub fn mining_gpus() -> Vec<GpuDevice> {
     let gpus = physical_gpus(

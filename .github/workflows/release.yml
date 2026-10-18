@@ -493,6 +493,7 @@ jobs:
           if [[ "${ARCH}" == "x86_64" ]]; then
           mkdir -p "dist/${package}/cuda/build"
           for artifact in \
+            electric_rust.ptx \
             photon_rust.ptx \
             stage_a_rfc6979.ptx \
             photon_stage_b16.ptx \
@@ -625,6 +626,7 @@ jobs:
           $cudaDir = Join-Path $packageDir 'cuda\build'
           New-Item -ItemType Directory -Force -Path $cudaDir | Out-Null
           $requiredPtx = @(
+            'electric_rust.ptx',
             'photon_rust.ptx',
             'stage_a_rfc6979.ptx',
             'photon_stage_b16.ptx',

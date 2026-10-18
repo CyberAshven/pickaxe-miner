@@ -1,22 +1,21 @@
 //! #### PR #51
-//! What: `pickaxe electric`: the fee pot's address, the baton's state, the CPU
-//! miner that follows the baton through Fulcrum and claims from the pot, and
+//! What: `pickaxe electric`: the fee pot's address, the baton's state, the
+//! GPU miner that follows the baton through Fulcrum and claims from the pot, and
 //! owner-authorized recovery (legacy pots remain explicitly selectable).
-//! Why: ELECTRIC is a CPU search beside BCH and PHOTON (docs/electric-token.md).
+//! Why: ELECTRIC shares GPU hashing and device selection with PHOTON.
 //! Check: the tests in `electric` and `tools/reward-policy-vm/electric.mjs`
 //! cover what is broadcast; this file only reads Fulcrum and sends.
 
 use super::recovery::RecoveryKey;
 use super::{
-    build_claim, build_refund, claim_locktime, parallel_search, script_hash_hex, Baton, Coin,
-    Deployment, Pot, SearchJob, Win, POT_MIN_CHANGE_SATS, TOKEN_OUTPUT_SATS,
+    build_claim, build_refund, claim_locktime, script_hash_hex, Baton, Coin, Deployment, Pot,
+    SearchJob, POT_MIN_CHANGE_SATS, TOKEN_OUTPUT_SATS,
 };
 use crate::cli::{ElectricCommand, ElectricDeploymentArgs};
 use crate::config::{MiningToken, RuntimeConfig};
 use crate::donation::{Recipient, Schedule};
 use crate::electrum::ElectrumSession;
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -34,6 +33,9 @@ pub fn run(
     cfg: &RuntimeConfig,
     command: &ElectricCommand,
     config_path: &Path,
+    backend: crate::backend::BackendKind,
+    devices: &crate::backend::DeviceSelection,
+    no_tui: bool,
 ) -> Result<(), String> {
     match command {
         ElectricCommand::Pot { deployment } => {
@@ -126,32 +128,199 @@ pub fn run(
             }
             Ok(())
         }
+        ElectricCommand::Deploy {
+            funding,
+            funding_sats,
+            change,
+            supply,
+            height,
+            electric_reward,
+            electric_min_difficulty,
+            electric_max_difficulty,
+        } => {
+            let (txid, vout) = funding
+                .rsplit_once(':')
+                .and_then(|(txid, vout)| Some((txid, vout.parse::<u32>().ok()?)))
+                .ok_or("--funding is TXID:0")?;
+            let deployment = Deployment::select(
+                cfg.network,
+                Some(txid),
+                *electric_reward,
+                *electric_min_difficulty,
+                *electric_max_difficulty,
+            )?;
+            let change = match change {
+                Some(address) => address.clone(),
+                None if !cfg.payout_address.trim().is_empty() => cfg.payout_address.clone(),
+                None => return Err("give --change or --address for the change".into()),
+            };
+            let change_lock = crate::tx::cashaddr_to_p2pkh_locking(
+                &crate::config::validate_payout_address(cfg.network, &change)?,
+            )?;
+            let mut session = connect(cfg)?;
+            let height = match height {
+                Some(height) => *height,
+                None => read_tip(&mut session)?,
+            };
+            let fee = read_relay_fee(&mut session)?;
+            let genesis = super::build_genesis(
+                &deployment,
+                &Coin {
+                    txid: txid.to_ascii_lowercase(),
+                    vout,
+                    value: *funding_sats,
+                },
+                &change_lock,
+                supply.unwrap_or(deployment.reward.saturating_mul(1_000_000)),
+                height,
+                fee,
+            )?;
+            println!("ELECTRIC genesis on {}", cfg.network.as_str());
+            println!("category:   {}", deployment.category_hex());
+            println!(
+                "contract:   reward {} units, difficulty {}-{} bytes, baton at height {height}",
+                deployment.reward, deployment.min_difficulty, deployment.max_difficulty
+            );
+            println!("covenant:   {}", hex::encode(deployment.locking_bytecode()));
+            println!("fee:        {} sats", genesis.fee);
+            println!("unsigned:   {}", hex::encode(&genesis.raw));
+            println!(
+                "Sign input 0 with the funding coin's wallet and send it. Then mine with \
+                 --electric-category {}",
+                deployment.category_hex()
+            );
+            Ok(())
+        }
         ElectricCommand::Mine {
             deployment,
-            threads,
+            once,
             max_difficulty,
             dry_run,
         } => {
-            let args = deployment;
-            let deployment = select(cfg, args)?;
-            let threads = threads.unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(1, |n| n.get().saturating_sub(1))
-                    .max(1)
-            });
-            let (pot, addresses, _) = pot_for(cfg, &deployment, args, config_path, false)?;
-            mine(
+            // Fail on a bad payout or a missing key before taking the GPUs.
+            pot_for(
                 cfg,
-                &deployment,
-                threads,
-                *max_difficulty,
-                *dry_run,
-                pot,
-                addresses,
+                &select(cfg, deployment)?,
+                deployment,
+                config_path,
+                false,
+            )?;
+            let _gpu_lock = crate::mining_lock::acquire_gpu_lock()?;
+            let devices = crate::backend::resolve_electric_devices(backend, devices)?;
+            session(
+                cfg,
+                deployment,
+                &devices,
+                config_path,
+                Session {
+                    max_difficulty: *max_difficulty,
+                    dry_run: *dry_run,
+                    once: *once,
+                    plain: no_tui,
+                    create_key: false,
+                },
             )
         }
     }
 }
+
+/// How one mining session runs.
+struct Session {
+    max_difficulty: u8,
+    dry_run: bool,
+    once: bool,
+    plain: bool,
+    /// Make the pot's recovery key if there is none (the setup's flow).
+    create_key: bool,
+}
+
+/// Mines the deployment on `devices` with the ELECTRIC screen (or plain
+/// lines), following the baton and claiming from the pot.
+fn session(
+    cfg: &RuntimeConfig,
+    args: &ElectricDeploymentArgs,
+    devices: &[crate::backend::GpuDevice],
+    config_path: &Path,
+    options: Session,
+) -> Result<(), String> {
+    let deployment = select(cfg, args)?;
+    let (pot, addresses, key_path) =
+        pot_for(cfg, &deployment, args, config_path, options.create_key)?;
+    let mut engines = devices
+        .iter()
+        .map(super::gpu::Engine::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    use std::io::IsTerminal;
+    let monitor = super::ui::Monitor::new(
+        cfg.intensity,
+        options.plain || !std::io::stdout().is_terminal(),
+        devices
+            .iter()
+            .map(|gpu| format!("{} ({})", gpu.name, gpu.backend.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    monitor.set_pot(&pot.address(), key_path.as_deref());
+    let journal_path = config_path.with_file_name(format!(
+        "electric-{}-{}.pending.json",
+        cfg.network.as_str(),
+        hex::encode(crate::proof::hash256(&pot.redeem)),
+    ));
+    super::ui::run(&monitor, || {
+        mine(
+            cfg,
+            &deployment,
+            &mut engines,
+            options.max_difficulty,
+            options.dry_run,
+            options.once,
+            &pot,
+            &addresses,
+            &journal_path,
+            &monitor,
+        )
+    })
+}
+
+/// The setup's ELECTRIC choice: mine the network's deployment on the chosen
+/// GPUs with the ELECTRIC screen, making the pot's recovery key if needed.
+pub fn run_from_setup(
+    cfg: &RuntimeConfig,
+    gpus: &[crate::backend::GpuDevice],
+    config_path: &Path,
+) -> Result<(), String> {
+    let _gpu_lock = crate::mining_lock::acquire_gpu_lock()?;
+    let devices = crate::backend::electric_engines_for(gpus.to_vec())?;
+    session(
+        cfg,
+        &ElectricDeploymentArgs::default(),
+        &devices,
+        config_path,
+        Session {
+            max_difficulty: MAX_SEARCH_DIFFICULTY,
+            dry_run: false,
+            once: false,
+            plain: false,
+            create_key: true,
+        },
+    )
+}
+
+/// The fee pot for the configured payout on the network's deployment, made
+/// with a new recovery key beside `config_path` if there is none: its
+/// address and where the key is saved (the setup shows both).
+pub fn default_pot(cfg: &RuntimeConfig, config_path: &Path) -> Result<(String, PathBuf), String> {
+    let args = ElectricDeploymentArgs::default();
+    let deployment = select(cfg, &args)?;
+    let (pot, _, key_path) = pot_for(cfg, &deployment, &args, config_path, true)?;
+    Ok((
+        pot.address(),
+        key_path.ok_or("the pot has no recovery key")?,
+    ))
+}
+
+/// The most difficulty the setup's sessions search (the contract's maximum).
+const MAX_SEARCH_DIFFICULTY: u8 = 4;
 
 fn select(cfg: &RuntimeConfig, args: &ElectricDeploymentArgs) -> Result<Deployment, String> {
     Deployment::select(
@@ -343,6 +512,23 @@ struct Snapshot {
     baton: Baton,
     coin: Option<Coin>,
     relay_fee: u64,
+    /// All the pot's plain-BCH sats, and the claims they pay.
+    pot_sats: u64,
+    pot_claims: u64,
+}
+
+/// About the size of a claim, for counting the claims a pot pays.
+const CLAIM_BYTES_ESTIMATE: u64 = 850;
+
+/// The claims `coins` pay, each claim taking its 1,000 sats and fee from one
+/// coin and leaving at least the pot's minimum change.
+fn claims_paid(coins: &[Coin], relay_fee_sats_per_kb: u64) -> u64 {
+    let cost = TOKEN_OUTPUT_SATS
+        + (CLAIM_BYTES_ESTIMATE * relay_fee_sats_per_kb.max(1_000)).div_ceil(1_000);
+    coins
+        .iter()
+        .map(|coin| coin.value.saturating_sub(POT_MIN_CHANGE_SATS) / cost)
+        .sum()
 }
 
 fn snapshot(
@@ -355,14 +541,17 @@ fn snapshot(
     let relay_fee = read_relay_fee(session)?;
     // A claim is about 800 bytes; a coin that cannot pay one is skipped.
     let least = TOKEN_OUTPUT_SATS + POT_MIN_CHANGE_SATS + relay_fee.max(1_000);
-    let coin = read_pot(session, pot)?
-        .into_iter()
-        .find(|coin| coin.value >= least);
+    let coins = read_pot(session, pot)?;
+    let pot_sats = coins.iter().map(|coin| coin.value).sum();
+    let pot_claims = claims_paid(&coins, relay_fee);
+    let coin = coins.into_iter().find(|coin| coin.value >= least);
     Ok(Snapshot {
         tip,
         baton,
         coin,
         relay_fee,
+        pot_sats,
+        pot_claims,
     })
 }
 
@@ -374,134 +563,198 @@ fn recipient_name(recipient: Recipient) -> &'static str {
     }
 }
 
-/// Searches each baton the pot pays for and broadcasts the claims. Never
-/// sends a proof twice: the contract would take a proof again while the
-/// baton's height stays put, and that reward is not Pickaxe's to take.
+// #### PR #58: save completed proofs and exact claims before network submission.
 #[allow(clippy::too_many_arguments)]
 fn mine(
     cfg: &RuntimeConfig,
     deployment: &Deployment,
-    threads: usize,
+    engines: &mut [super::gpu::Engine],
     max_difficulty: u8,
     dry_run: bool,
-    pot: Pot,
-    addresses: [String; 3],
+    once: bool,
+    pot: &Pot,
+    addresses: &[String; 3],
+    journal_path: &Path,
+    monitor: &super::ui::Monitor,
 ) -> Result<(), String> {
-    print_deployment(cfg, deployment, &addresses);
-    println!("pot:        {}", pot.address());
-    println!("threads:    {threads}, up to difficulty {max_difficulty}");
-    if dry_run {
-        println!("Dry run: nothing is sent and the pot is not needed.");
-    }
+    use super::pending::{Journal, Pending, Prepared};
     let mut pkhs = [[0u8; 20]; 3];
-    for (pkh, address) in pkhs.iter_mut().zip(&addresses) {
+    for (pkh, address) in pkhs.iter_mut().zip(addresses) {
         pkh.copy_from_slice(&crate::tx::cashaddr_to_p2pkh_locking(address)?[3..23]);
+    }
+    let mut journal = Journal::open(journal_path, deployment, pot, &pkhs)?;
+    if dry_run && journal.pending().is_some() {
+        return Err("a pending ELECTRIC claim needs recovery; run without --dry-run".into());
+    }
+    monitor.event(format!(
+        "ELECTRIC on {} · pot {}",
+        cfg.network.as_str(),
+        pot.address()
+    ));
+    if dry_run {
+        monitor.event("Dry run: no transactions will be sent.");
     }
     let policy = deployment.donation_policy(cfg.token_donation);
     let schedule = Mutex::new(Schedule::new(policy.scheme, SCHEDULE_UNIT, rand::random())?);
     let next_nonce = AtomicU64::new(rand::random());
-    let hashes = AtomicU64::new(0);
-    let mut sent: HashSet<(u32, [u8; 20], u64)> = HashSet::new();
-    let mut pending: Option<(Baton, Win)> = None;
     let mut session: Option<ElectrumSession> = None;
-    let mut waiting = String::new();
-    let (mut claims, mut lost) = (0u64, 0u64);
-    // The baton our last claim spent, until Fulcrum lists its successor.
     let mut spent: Option<(String, u32)> = None;
-    loop {
+    while !monitor.stopped() {
         let link = match session.as_mut() {
             Some(link) => link,
             None => match connect(cfg) {
                 Ok(link) => {
-                    println!("server:     {}", link.url);
+                    monitor.event(format!("Connected: {}", link.url));
                     session.insert(link)
                 }
                 Err(error) => {
-                    eprintln!("Fulcrum: {error}");
-                    std::thread::sleep(IDLE_POLL);
+                    monitor.state("Reconnecting");
+                    monitor.event(format!("Fulcrum: {error}"));
+                    monitor.wait(IDLE_POLL);
                     continue;
                 }
             },
         };
-        let now = match snapshot(link, deployment, &pot) {
-            Ok(now) => now,
+        let now = match snapshot(link, deployment, pot) {
+            Ok(now) => {
+                monitor.pot_balance(now.pot_sats, now.pot_claims);
+                now
+            }
             Err(error) => {
-                eprintln!("Fulcrum: {error}");
+                monitor.state("Reconnecting; pending proof retained");
+                monitor.event(format!("Fulcrum: {error}"));
                 session = None;
-                std::thread::sleep(IDLE_POLL);
+                monitor.wait(IDLE_POLL);
                 continue;
             }
         };
-        let note = |waiting: &mut String, text: String| {
-            if *waiting != text {
-                println!("{text}");
-                *waiting = text;
-            }
-        };
-        // A win found while the pot was empty, if its baton is still there.
-        if let Some((baton, win)) = pending.take() {
-            if baton != now.baton {
-                println!("The baton moved on before the pot was funded; that proof is gone.");
-            } else if now.coin.is_none() {
-                pending = Some((baton, win));
-                note(
-                    &mut waiting,
-                    format!("Holding a win: fund the pot {}", pot.address()),
+        if let Some(mut pending) = journal.pending() {
+            monitor.state("Submitting saved claim");
+            if let Some(prepared) = &pending.prepared {
+                let expected = crate::reward::transaction_id(
+                    &hex::decode(&prepared.raw).map_err(|_| "invalid saved claim")?,
                 );
-                std::thread::sleep(IDLE_POLL);
-                continue;
-            } else {
-                let outcome = claim(link, deployment, &pot, &now, &win, &mut sent);
-                if report(outcome, &win, &mut claims, &mut lost) {
-                    spent = Some((now.baton.txid.clone(), now.baton.vout));
+                let outcome = claim_outcome(&now.baton, &pending.baton, &expected, |txid| {
+                    link.rpc("blockchain.transaction.get", json!([txid, false]))?
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| "server returned invalid transaction data".into())
+                });
+                match outcome {
+                    Ok(ClaimOutcome::Accepted) => {
+                        spent = Some((pending.baton.txid, pending.baton.vout));
+                        journal.save(None)?;
+                        monitor.accepted();
+                        monitor.event(format!(
+                            "Reward accepted for {}: {expected}",
+                            recipient_name(pending.win.recipient)
+                        ));
+                        if once {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Ok(ClaimOutcome::Conflicted) => {
+                        journal.retire_conflict()?;
+                        monitor.event("Another claim advanced the baton; saved claim archived, following new work.");
+                        continue;
+                    }
+                    Ok(ClaimOutcome::Unchanged) => {}
+                    Err(error) => {
+                        monitor.state("Recovering pending claim");
+                        monitor.event(format!("Claim retained: {error}"));
+                        session = None;
+                        monitor.wait(BATON_POLL);
+                        continue;
+                    }
                 }
+            } else if pending.baton != now.baton {
+                journal.save(None)?;
+                monitor.event("Baton changed before broadcast; unspent pot preserved.");
                 continue;
             }
+            if pending.prepared.is_none() {
+                let Some(coin) = now.coin.as_ref() else {
+                    monitor.state("Holding verified proof; waiting for pot funding");
+                    monitor.wait(IDLE_POLL);
+                    continue;
+                };
+                let locktime = claim_locktime(now.baton.state, now.tip, deployment)
+                    .ok_or("saved proof is not currently eligible for the pot")?;
+                let built = build_claim(
+                    deployment,
+                    pot,
+                    &pending.baton,
+                    coin,
+                    &pending.win,
+                    locktime,
+                    now.relay_fee,
+                )?;
+                pending.prepared = Some(Prepared {
+                    coin: coin.clone(),
+                    locktime,
+                    relay_fee: now.relay_fee,
+                    raw: hex::encode(built.raw),
+                });
+                journal.save(Some(pending.clone()))?;
+            }
+            let raw = &pending.prepared.as_ref().unwrap().raw;
+            let expected = crate::reward::transaction_id(
+                &hex::decode(raw).map_err(|_| "invalid saved claim")?,
+            );
+            match link.broadcast_raw(raw) {
+                Ok(txid) if txid.eq_ignore_ascii_case(&expected) => {
+                    monitor.event(format!("Claim sent: {expected}; checking propagation"))
+                }
+                Ok(_) => {
+                    return Err(
+                        "server returned another transaction id; pending claim preserved".into(),
+                    )
+                }
+                Err(error) => {
+                    monitor.event(format!("Claim retained for retry: {error}"));
+                    session = None;
+                }
+            }
+            monitor.wait(BATON_POLL);
+            continue;
         }
         if spent.as_ref() == Some(&(now.baton.txid.clone(), now.baton.vout)) {
-            std::thread::sleep(BATON_POLL);
+            monitor.state("Waiting for authoritative baton advance");
+            monitor.wait(BATON_POLL);
+            continue;
+        }
+        if monitor.paused.load(Ordering::Relaxed) {
+            monitor.state("Paused");
+            monitor.wait(Duration::from_millis(100));
             continue;
         }
         let state = now.baton.state;
         if now.coin.is_none() && !dry_run {
-            note(
-                &mut waiting,
-                format!("Waiting for BCH in the pot {}", pot.address()),
-            );
-            std::thread::sleep(IDLE_POLL);
+            monitor.state(format!("Waiting for BCH in the fee pot {}", pot.address()));
+            monitor.wait(IDLE_POLL);
             continue;
         }
-        if claim_locktime(state, now.tip, deployment).is_none() {
-            note(
-                &mut waiting,
-                format!(
-                    "Waiting for block {}: the baton is at difficulty {} on height {}",
-                    state.last_height + 1,
-                    state.difficulty,
-                    state.last_height
-                ),
-            );
-            std::thread::sleep(IDLE_POLL);
+        if claim_locktime(state, now.tip, deployment).is_none() || state.difficulty > max_difficulty
+        {
+            monitor.state(format!(
+                "Waiting for block {} · difficulty {}",
+                state.last_height + 1,
+                state.difficulty
+            ));
+            monitor.wait(IDLE_POLL);
             continue;
         }
-        if state.difficulty > max_difficulty {
-            note(
-                &mut waiting,
-                format!(
-                    "Waiting: the baton needs difficulty {} (above --max-difficulty {max_difficulty})",
-                    state.difficulty
-                ),
-            );
-            std::thread::sleep(IDLE_POLL);
-            continue;
+        if state.difficulty < deployment.min_difficulty
+            || state.difficulty > deployment.max_difficulty
+            || now.baton.token_amount < deployment.reward
+        {
+            return Err("ELECTRIC baton has invalid difficulty or insufficient rewards".into());
         }
-        waiting.clear();
-        println!(
-            "Searching difficulty {} for height {} (claim {})",
-            state.difficulty,
-            state.last_height,
-            state.mine_count + 1
-        );
+        monitor.state(format!(
+            "Mining · height {} · difficulty {}",
+            now.tip, state.difficulty
+        ));
         let job = SearchJob {
             last_height: state.last_height,
             difficulty: state.difficulty,
@@ -509,15 +762,19 @@ fn mine(
         };
         let stop = AtomicBool::new(false);
         let started = Instant::now();
-        let before = hashes.load(Ordering::Relaxed);
+        let before = monitor.hashes.load(Ordering::Relaxed);
         let mut moved = false;
         let win = std::thread::scope(|scope| {
-            let search = scope
-                .spawn(|| parallel_search(job, &schedule, threads, &next_nonce, &stop, &hashes));
+            let search = scope.spawn(|| {
+                super::gpu::search_all(engines, job, &schedule, &next_nonce, &stop, monitor)
+            });
             let mut polled = Instant::now();
             while !search.is_finished() {
-                std::thread::sleep(Duration::from_millis(100));
-                if polled.elapsed() < BATON_POLL {
+                std::thread::sleep(Duration::from_millis(20));
+                if monitor.stopped() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                if polled.elapsed() < BATON_POLL || monitor.stopped() {
                     continue;
                 }
                 polled = Instant::now();
@@ -528,116 +785,144 @@ fn mine(
                         stop.store(true, Ordering::Relaxed);
                     }
                     Err(error) => {
-                        eprintln!("Fulcrum: {error}");
+                        monitor.event(format!("Fulcrum: {error}"));
                         stop.store(true, Ordering::Relaxed);
                     }
                 }
             }
-            search.join().unwrap_or(None)
-        });
-        let rate = (hashes.load(Ordering::Relaxed) - before) as f64
+            search
+                .join()
+                .map_err(|_| "ELECTRIC search thread panicked".to_string())?
+        })?;
+        let rate = (monitor.hashes.load(Ordering::Relaxed) - before) as f64
             / started.elapsed().as_secs_f64().max(1e-3);
-        let Some(win) = win else {
-            if moved {
-                lost += 1;
-                println!(
-                    "The baton moved after {:.1}s at {:.1} MH/s; searching the new one",
-                    started.elapsed().as_secs_f64(),
-                    rate / 1e6
-                );
-            }
-            continue;
-        };
-        println!(
-            "Found a proof for {} after {:.1}s at {:.1} MH/s",
-            recipient_name(win.recipient),
-            started.elapsed().as_secs_f64(),
-            rate / 1e6
-        );
-        if dry_run {
-            continue;
+        if moved {
+            monitor.event("Baton changed during search; following new work.");
         }
-        // Claim against what is there now, not what was there at the start.
-        let now = match snapshot(link, deployment, &pot) {
-            Ok(fresh) if fresh.baton == now.baton => fresh,
-            Ok(_) => {
-                lost += 1;
-                println!("Too late: the baton moved before the claim was sent");
-                continue;
+        if let Some(win) = win {
+            monitor.event(format!(
+                "Verified proof for {} · {:.2} MH/s",
+                recipient_name(win.recipient),
+                rate / 1e6
+            ));
+            if dry_run {
+                if once {
+                    return Ok(());
+                }
+            } else if !moved {
+                journal.save(Some(Pending {
+                    baton: now.baton,
+                    win,
+                    prepared: None,
+                }))?;
             }
-            Err(error) => {
-                eprintln!("Fulcrum: {error}");
-                session = None;
-                pending = Some((now.baton, win));
-                continue;
-            }
-        };
-        if now.coin.is_none() {
-            println!(
-                "The pot cannot pay this claim; fund {} to send it",
-                pot.address()
-            );
-            pending = Some((now.baton, win));
-            continue;
-        }
-        let outcome = claim(link, deployment, &pot, &now, &win, &mut sent);
-        if report(outcome, &win, &mut claims, &mut lost) {
-            spent = Some((now.baton.txid.clone(), now.baton.vout));
         }
     }
+    Ok(())
 }
 
-/// Builds and sends one claim, once per proof.
-fn claim(
-    session: &mut ElectrumSession,
-    deployment: &Deployment,
-    pot: &Pot,
-    now: &Snapshot,
-    win: &Win,
-    sent: &mut HashSet<(u32, [u8; 20], u64)>,
-) -> Result<String, String> {
-    let state = now.baton.state;
-    let locktime = claim_locktime(state, now.tip, deployment)
-        .ok_or("the pot does not pay a claim on this baton yet")?;
-    let coin = now.coin.as_ref().ok_or("the pot is empty")?;
-    if !sent.insert((state.last_height, win.pkh, win.nonce)) {
-        return Err("this proof was sent before; Pickaxe does not replay proofs".into());
-    }
-    let built = build_claim(
-        deployment,
-        pot,
-        &now.baton,
-        coin,
-        win,
-        locktime,
-        now.relay_fee,
-    )?;
-    session.broadcast_raw(&hex::encode(&built.raw))
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimOutcome {
+    Unchanged,
+    Accepted,
+    Conflicted,
 }
 
-/// Prints a claim's outcome; true when the server took it.
-fn report(outcome: Result<String, String>, win: &Win, claims: &mut u64, lost: &mut u64) -> bool {
-    match outcome {
-        Ok(txid) => {
-            *claims += 1;
-            println!(
-                "Claimed for {}: {txid} ({claims} claimed, {lost} lost)",
-                recipient_name(win.recipient)
-            );
-            true
-        }
-        Err(error) => {
-            *lost += 1;
-            println!("Claim not accepted: {error}");
-            false
-        }
+// Transaction visibility alone does not prove a reward belongs to the live baton.
+fn claim_outcome(
+    current: &Baton,
+    old: &Baton,
+    expected: &str,
+    mut fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<ClaimOutcome, String> {
+    let mut cursor = (current.txid.clone(), current.vout);
+    if cursor == (old.txid.clone(), old.vout) {
+        return Ok(ClaimOutcome::Unchanged);
     }
+    for _ in 0..256 {
+        if cursor == (expected.to_owned(), 1) {
+            return Ok(ClaimOutcome::Accepted);
+        }
+        if cursor.1 != 1 {
+            return Err("live ELECTRIC baton is not on the saved claim's lineage".into());
+        }
+        let raw = fetch(&cursor.0)?;
+        let bytes = hex::decode(&raw).map_err(|_| "invalid baton transaction hex")?;
+        if crate::reward::transaction_id(&bytes) != cursor.0 {
+            return Err("baton transaction bytes do not match the requested id".into());
+        }
+        let previous = crate::runtime::first_input_outpoint(&raw)?;
+        if previous == (old.txid.clone(), old.vout) {
+            return Ok(ClaimOutcome::Conflicted);
+        }
+        cursor = previous;
+    }
+    Err("ELECTRIC recovery exceeded 256 baton advances; saved claim retained".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::MiningNetwork;
+
+    #[test]
+    fn lost_reply_and_conflicting_claim_follow_verified_baton_lineage() {
+        let old = Baton {
+            txid: "42".repeat(32),
+            vout: 0,
+            value: 1000,
+            token_amount: 100,
+            state: super::super::State {
+                difficulty: 1,
+                last_height: 1,
+                mine_count: 0,
+            },
+        };
+        let child = |parent: &Baton, marker: u8| {
+            let mut raw = vec![2, 0, 0, 0, 1];
+            let mut id = hex::decode(&parent.txid).unwrap();
+            id.reverse();
+            raw.extend(id);
+            raw.extend(parent.vout.to_le_bytes());
+            raw.extend([
+                0, 255, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, marker, 0, 0, 0, 0,
+            ]);
+            (
+                Baton {
+                    txid: crate::reward::transaction_id(&raw),
+                    vout: 1,
+                    ..parent.clone()
+                },
+                hex::encode(raw),
+            )
+        };
+        let (won, _) = child(&old, 0x51);
+        let (later, raw) = child(&won, 0x51);
+        assert_eq!(
+            claim_outcome(&old, &old, &won.txid, |_| panic!(
+                "unchanged requires no fetch"
+            ))
+            .unwrap(),
+            ClaimOutcome::Unchanged
+        );
+        assert_eq!(
+            claim_outcome(&won, &old, &won.txid, |_| panic!("own txid")).unwrap(),
+            ClaimOutcome::Accepted
+        );
+        assert_eq!(
+            claim_outcome(&later, &old, &won.txid, |_| Ok(raw.clone())).unwrap(),
+            ClaimOutcome::Accepted
+        );
+        let (competitor, rival_raw) = child(&old, 0x52);
+        assert_eq!(
+            claim_outcome(&competitor, &old, &won.txid, |_| Ok(rival_raw.clone())).unwrap(),
+            ClaimOutcome::Conflicted
+        );
+        assert!(claim_outcome(&competitor, &old, &won.txid, |_| Ok(raw.clone())).is_err());
+        assert!(
+            claim_outcome(&competitor, &old, &won.txid, |_| Err("disconnected".into())).is_err()
+        );
+    }
 
     #[test]
     fn pot_identity_survives_restart_and_backup_and_isolated_from_other_payouts() {
