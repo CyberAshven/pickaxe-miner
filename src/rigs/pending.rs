@@ -30,6 +30,18 @@ struct SavedWinner {
     winner: WireWinner,
 }
 
+impl SavedWinner {
+    /// The proof's claim transaction becomes the next baton, so a job on it
+    /// shows the claim reached the chain. The digest is that transaction's
+    /// hash, which `open`/`record` verified.
+    fn claimed_by(&self, job: &MiningJob) -> bool {
+        hex::decode(&self.winner.digest).is_ok_and(|mut digest| {
+            digest.reverse();
+            hex::encode(digest).eq_ignore_ascii_case(&job.baton_txid)
+        })
+    }
+}
+
 pub(super) struct PendingWinners {
     path: PathBuf,
     saved: Vec<SavedWinner>,
@@ -78,6 +90,7 @@ impl PendingWinners {
         winners: &[VerifiedWinner],
     ) -> Result<(), String> {
         let mut next = self.saved.clone();
+        let mut added = false;
         let job_wire = WireJob::from(job);
         for winner in winners {
             // A prior generation finishing after a job change is already stale.
@@ -93,8 +106,15 @@ impl PendingWinners {
                 job: job_wire.clone(),
                 winner: WireWinner::from(winner),
             });
+            added = true;
         }
-        if next.len() != self.saved.len() {
+        // Batons advance many times per block, and lost races are never
+        // claimed by this rig. Each newer proof spends a later baton, so the
+        // oldest are the ones already spent; dropping one costs at most a
+        // re-mined winner, while refusing the new one would stop mining.
+        let excess = next.len().saturating_sub(MAX_WINNERS);
+        next.drain(..excess);
+        if added {
             self.commit(next)?;
         }
         Ok(())
@@ -103,14 +123,16 @@ impl PendingWinners {
     pub(super) fn for_job(&mut self, job: &MiningJob) -> Result<Vec<VerifiedWinner>, String> {
         crate::mining_job::validate_job(job)?;
         let mut next = self.saved.clone();
-        // Only a higher chain tip retires a proof. Another baton at the same
-        // height may come from an indexer that has not yet seen the newest
-        // claim, so the proof stays; it is never re-sent to different work.
+        // A job on the proof's own claim, or a higher chain tip, retires a
+        // proof. Another baton at the same height may come from an indexer
+        // that has not yet seen the newest claim, so the proof stays; it is
+        // never re-sent to different work.
         next.retain(|entry| {
             entry.job.network != job.network.as_str()
-                || entry.job.height >= job.height
-                || (entry.job.baton_txid == job.baton_txid
-                    && entry.job.baton_vout == job.baton_vout)
+                || (!entry.claimed_by(job)
+                    && (entry.job.height >= job.height
+                        || (entry.job.baton_txid == job.baton_txid
+                            && entry.job.baton_vout == job.baton_vout)))
         });
         if next.len() != self.saved.len() {
             self.commit(next)?;
@@ -244,6 +266,51 @@ mod tests {
             .for_job(&job)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_proof_retires_once_its_claim_is_the_baton() {
+        let dir = TestDirectory::new();
+        let job = easy_job();
+        let winner = solved_winner(&job, [3; 32]);
+        let mut pending = PendingWinners::open(&dir.journal()).unwrap();
+        pending.record(&job, std::slice::from_ref(&winner)).unwrap();
+        // Claimed: the next job, at the same height, spends the claim's output.
+        let mut next = job.clone();
+        let mut claim = winner.digest;
+        claim.reverse();
+        next.baton_txid = hex::encode(claim);
+        next.generation_id += 1;
+        assert!(pending.for_job(&next).unwrap().is_empty());
+        assert!(PendingWinners::open(&dir.journal())
+            .unwrap()
+            .for_job(&job)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn many_unclaimed_proofs_in_one_block_never_stop_mining() {
+        let dir = TestDirectory::new();
+        let mut pending = PendingWinners::open(&dir.journal()).unwrap();
+        let mut jobs = Vec::new();
+        for round in 0..MAX_WINNERS + 4 {
+            // Lost races: every new baton at this height is another miner's claim.
+            let mut job = easy_job();
+            job.baton_txid = format!("{:064x}", round + 0x100);
+            job.generation_id += round as u64;
+            pending
+                .record(&job, &[solved_winner(&job, [3; 32])])
+                .unwrap();
+            jobs.push(job);
+        }
+        let mut reopened = PendingWinners::open(&dir.journal()).unwrap();
+        assert_eq!(reopened.saved.len(), MAX_WINNERS);
+        assert!(
+            reopened.for_job(&jobs[3]).unwrap().is_empty(),
+            "the oldest proofs make room"
+        );
+        assert_eq!(reopened.for_job(jobs.last().unwrap()).unwrap().len(), 1);
     }
 
     #[test]

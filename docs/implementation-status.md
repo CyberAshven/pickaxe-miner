@@ -33,8 +33,8 @@ true at each checkpoint; the table is the current index, not a new scope.
 | S8 | Adjustable BCH donation with immutable job payouts | Arithmetic, journal recovery, independent wire/node checks and live payouts | BCH rate/payout UI and immutable job policy implemented. This follow-up weights validated shares for work allocation; arithmetic, old-job attribution, replay and remote acknowledgement tests pass. The status file, overview and `watch` now report validated work by payout. New scheduler still needs a physical ASIC run (procedure below). |
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
-| G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check; a coordinator crash during a claim is not exercised live |
-| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig now passes synthetic primary-to-backup failover on one PC with reused job IDs; see the regression below. Cross-machine failover and crash-during-claim evidence remain pending. |
+| G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check. On 2026-10-18 five live coordinator kills during rig claims, one with a claim journal open, lost no winner and spent no baton twice; all 130 claims confirmed. The same test found #53's proof store stopping a busy rig, fixed below. |
+| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig now passes synthetic primary-to-backup failover on one PC with reused job IDs, and live coordinator crashes during claims on one PC; see below. Cross-machine failover remains pending. |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | BCH P2Pool is a separate project (architecture.md). Pickaxe has SV2, TP and Job Declaration boundaries; the sharechain and its payout-distribution integration are not completed by these tests. |
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pool mode and both Job Declaration modes implemented; local live Chipnet shares, custom jobs and payouts checked on 2026-10-15. Pool failover delivered fresh real-node jobs on 2026-10-16 without hashing. Independent external-pool interoperability and accepted blocks through failover/JD remain pending. |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Real ZMQ and TP new-parent/minimum-difficulty delivery checked on 2026-10-15; remote guided setup and live recovery remain. |
@@ -43,7 +43,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 | F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Audited merged #35: claim readiness no longer waits for another GPU batch; shutdown still drains safely. Existing host regression retained and passing; no new GPU soak claimed. |
 | F2 | Intel, native HIP discrete AMD, Linux GPU and Apple Silicon validation | Actual hardware reports; compile results are insufficient | Pending hardware evidence |
 | F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | PR #48 adds native WDDM utilization and dedicated-memory counters to the shared sampler, matched by PCI address. Live counter reads passed for the NVIDIA discrete and AMD integrated adapters on one Windows PC. Missing/ambiguous PCI identity, linked adapters and unavailable counters remain unsupported; power, temperature and clocks still need vendor support. |
-| F4 | Sustained integrated + discrete GPU test | Long serial comparison, correctness and thermals | Pending |
+| F4 | Sustained integrated + discrete GPU test | Long serial comparison, correctness and thermals | 20-minute Chipnet run on 2026-10-18 with the RTX 5070 Ti (CUDA) and AMD integrated (wgpu) together: medians 1,489.5 and 24.4 MH/s, 189 winners, none rejected, 74–88 °C. No single-GPU baseline in the same window. |
 | F5 | Next feature release version bump | Version/release plan approved for actual release | Deferred until release is ordered |
 | E1 | Pickaxe-managed ELECTRIC recovery key and owner refund | Restart/key-file checks, negative covenant VM proofs and funded recovery | Merged #51 implements a separate pot recovery key, keyless constrained claims and signed owner refunds. Host tests and BCH VM proofs pass; funded claim/refund and lost-race validation remain. |
 | E2 | ELECTRIC setup and operation alongside the other miner modes | Setup funding/top-up flow and integrated CPU lifecycle | The CLI offers `electric pot/status/mine/refund`. The earlier setup-wizard and automatic sidecar design is not implemented; today the CPU miner is a separate command. |
@@ -59,11 +59,12 @@ and its earlier timestamp-validation change is already in merged #48.
   (D1). The BCH P2Pool sharechain itself remains a separate project, as stated
   in `architecture.md`; an SV2 connection alone does not finish it.
 - **Available hardware/access:** a fresh physical ASIC donation audit using
-  distinct recipient scripts (S8), cross-machine GPU failover and a crash
-  during an in-flight claim (G3/G4), accepted blocks through pool failover/JD
-  and independent pool interoperability (D2), remote guided-node recovery
-  (D3), and a sustained integrated/discrete GPU run (F4). Previous narrow
-  tests remain valid evidence, but do not complete these broader checks.
+  distinct recipient scripts (S8), cross-machine GPU failover (G4), accepted
+  blocks through pool failover/JD and independent pool interoperability (D2),
+  and remote guided-node recovery (D3). Previous narrow tests remain valid
+  evidence, but do not complete these broader checks. One-PC coordinator
+  crashes during claims (G3) and a sustained integrated/discrete GPU run (F4)
+  passed on 2026-10-18.
 - **External prerequisites:** a compatible Knuth provider (S2), native SV2
   ASIC firmware (S3/S4), author-approved token contracts/deployments and VM
   proofs (T1/T2), and Intel/discrete AMD/Linux GPU/Apple Silicon hardware
@@ -2995,7 +2996,9 @@ claim, and four ways a winner could still be lost or the rig stop wrongly:
 - A job at the same height on another baton deleted a saved proof, although
   a backup coordinator's indexer can lag the newest claim. Only a higher tip
   now retires a proof (or the same baton, as before); a proof is still never
-  re-sent to work that differs from its own.
+  re-sent to work that differs from its own. The live window below found that
+  this alone fills the store within one block; a proof's own claim now also
+  retires it.
 - Winners from the connection's previous job were dropped instead of sent,
   including a public pool's winners across a fee-window change, which the
   coordinator accepts. Every winner drained from this connection's search is
@@ -3008,3 +3011,58 @@ claim, and four ways a winner could still be lost or the rig stop wrongly:
 Checks: formatting, strict all-feature Clippy (rustc 1.98.1), 774 library
 and 18 CLI host tests; the updated proof-store test keeps a proof across a
 same-height baton change and retires it at a higher tip.
+
+## Live GPU window and proof-store fix (2026-10-18)
+
+#### PR #53
+
+One window on the operator's Windows PC: RTX 5070 Ti Laptop GPU, AMD
+integrated graphics, Chipnet, with a `--rigs-only` coordinator and a CUDA rig
+on loopback. The live miner was stopped for each run and restarted after it.
+No payout or connection details are recorded here.
+
+**Coordinator crashes during claims (G3), `dev` head.** The coordinator was
+killed five times, 15–40 s apart at random, and restarted 2 s later. The rig
+found 141 winners; the coordinator verified 133, classed 8 stale and rejected
+none. 132 claim acceptances named 130 distinct transactions; all 130 are
+confirmed in 4 blocks and no baton was spent by two claims. One kill hit an
+open claim journal, which the restarted coordinator completed. The two
+repeated acceptances were byte-identical rebuilds: after a restart the
+indexer returned a baton two claims old, the rig re-sent the proofs it still
+held, and the same transactions were broadcast again. A transaction confirms
+once, so this paid nothing extra and lost nothing.
+
+**The same test on #53 at `0a4dabe`.** The rig stopped with `cannot persist
+rig winners; mining stopped` after 26 winners. The review fix above kept every
+proof until the chain height rose, but photon batons advance many times per
+block (the sustained run below averaged 9 claims a minute), so 16 proofs
+filled the store within one block. The 26 claims were distinct and none was
+lost before the stop.
+
+Fix: a job on a proof's own claim retires it at once. The winner's digest,
+reversed, is the claim's txid, which becomes the next baton, so a rig that
+wins keeps at most one proof. Lost races, which this rig never claims, can
+still collect within a block; the oldest now make room, since each newer
+proof spends a later baton. Dropping one costs at most a re-mined winner,
+where refusing the newest stopped mining. A failed disk write still stops the
+rig as before.
+
+**Fixed build, live.** The same five crashes plus four minutes of steady
+mining: 31 winners in one block (height 328410), all verified, none stale or
+rejected, 31 distinct claims, no baton spent twice, and the store empty at the
+end. The claims were in the mempool when checked. Fewer winners per minute
+than on `dev` came from the token, not the build: its target had tightened
+about ninefold after the window's earlier claims.
+
+**Sustained two-GPU run (F4), `dev` head.** 1,202 s with `--device 0,1`.
+Medians: RTX 1,489.5 MH/s (p10–p90 1,475–1,510), AMD 24.4 MH/s (22.4–24.6).
+189 winners (183 + 6): 188 claims and 1 stale, none rejected, no device error,
+still mining at the end. Per-minute `nvidia-smi`: 74–88 °C, 94–124 W and
+94–99 % utilization. 109 claims were confirmed at the check and the rest were
+in the mempool. No single-GPU baseline ran in the same window, so this shows
+stability and correctness, not scaling.
+
+Checks: formatting, strict all-feature Clippy (rustc 1.98.1), and 779 library
+and 18 CLI host tests with the CUDA-only tests filtered. Two new regressions: a
+claimed proof retires at the same height, and 20 unclaimed proofs in one block
+keep the newest 16 without an error.
