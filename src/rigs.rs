@@ -14,6 +14,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(feature = "stratum-v2", not(target_arch = "wasm32")))]
+mod pending;
+
 /// What the coordinator shows about its rigs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RigSummary {
@@ -956,6 +959,15 @@ mod net {
                             winner.generation_id &= !FEE_JOBS;
                             winner.payout = job.map(|job| job.payout_address);
                         }
+                        // A reconnect may repeat an undelivered receipt; do not crowd out other proofs.
+                        if checked
+                            && state
+                                .winners
+                                .iter()
+                                .any(|queued| queued.digest == winner.digest)
+                        {
+                            continue;
+                        }
                         if checked && state.winners.len() < MAX_QUEUED_WINNERS {
                             state.winners.push_back(winner);
                         } else {
@@ -1070,6 +1082,12 @@ mod net {
         );
         let mut backoff = Duration::from_secs(1);
         let mut winners_sent = 0u64;
+        let pending_path = match status {
+            Some(path) => path.to_path_buf(),
+            None => crate::config::config_path(None)?,
+        }
+        .with_extension("rig-winners.json");
+        let mut pending = super::pending::PendingWinners::open(&pending_path)?;
         // #### PR #42: each GPU's temperature, fan and power for the reports.
         let mut telemetry = crate::telemetry::LiveTelemetrySampler::start(
             crate::telemetry::telemetry_sources(gpus),
@@ -1094,8 +1112,10 @@ mod net {
         while !stop.load(Ordering::Relaxed) {
             match connect_first(&coordinators) {
                 Ok((index, (mut sender, mut receiver))) => {
-                    // #### PR #53: coordinator generations and queued winners belong to this connection only.
+                    // #### PR #53: GPU searches are session-local; saved proofs are rechecked on reconnect.
                     let mut search: Option<SearchHandle> = None;
+                    let mut current_job = None;
+                    let mut storage_failed = false;
                     backoff = Duration::from_secs(1);
                     report(
                         json,
@@ -1134,6 +1154,14 @@ mod net {
                                     .unwrap_or_else(|| MiningToken::Photon.donation_minimum());
                                 let job = MiningJob::try_from(wire)?;
                                 let (height, generation) = (job.height, job.generation_id);
+                                let retry = pending
+                                    .for_job(&job)
+                                    .inspect_err(|_| storage_failed = true)?;
+                                let replaying = !retry.is_empty();
+                                for winner in retry {
+                                    sender.send(frame(WINNER, &WireWinner::from(&winner))?)?;
+                                }
+                                current_job = Some(job.clone());
                                 // #### PR #32: the coordinator's donation,
                                 // never below the token's minimum.
                                 let policy =
@@ -1154,7 +1182,15 @@ mod net {
                                         let _ = handle.apply_control(SearchCommand::Resume);
                                     }
                                 }
-                                paused_since = None;
+                                paused_since = if replaying {
+                                    let _ = search
+                                        .as_ref()
+                                        .expect("search has a job")
+                                        .apply_control(SearchCommand::Pause);
+                                    Some(Instant::now())
+                                } else {
+                                    None
+                                };
                                 report(
                                     json,
                                     "job",
@@ -1185,7 +1221,14 @@ mod net {
                                 );
                                 last_saved = Instant::now();
                             }
-                            for winner in handle.drain_winners() {
+                            let winners = handle.drain_winners();
+                            pending
+                                .record(current_job.as_ref().expect("search has a job"), &winners)
+                                .inspect_err(|_| storage_failed = true)?;
+                            for winner in winners.into_iter().filter(|winner| {
+                                Some(winner.generation_id)
+                                    == current_job.as_ref().map(|job| job.generation_id)
+                            }) {
                                 sender.send(frame(WINNER, &WireWinner::from(&winner))?)?;
                                 winners_sent = winners_sent.saturating_add(1);
                                 paused_since = Some(Instant::now());
@@ -1237,7 +1280,12 @@ mod net {
                     sender.close();
                     receiver.close();
                     if let Some(handle) = search {
-                        handle.stop();
+                        let winners = handle.stop_and_drain();
+                        pending
+                            .record(current_job.as_ref().expect("search has a job"), &winners)?;
+                    }
+                    if storage_failed {
+                        return Err("cannot persist rig winners; mining stopped".into());
                     }
                     if let Err(error) = link {
                         report(json, "disconnected", serde_json::json!({"reason": error}));
@@ -1454,6 +1502,9 @@ mod tests {
         sender
             .send(net::frame(3, &WireWinner::from(&winner)).unwrap())
             .unwrap();
+        sender
+            .send(net::frame(3, &WireWinner::from(&winner)).unwrap())
+            .unwrap();
         // A forged one (its digest does not match its transaction) is not.
         let mut forged = winner.clone();
         forged.digest = [0; 32];
@@ -1461,15 +1512,15 @@ mod tests {
             .send(net::frame(3, &WireWinner::from(&forged)).unwrap())
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while hub.summary().winners < 2 && std::time::Instant::now() < deadline {
+        while hub.summary().winners < 3 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         let summary = hub.summary();
         assert_eq!((summary.connected, summary.gpus), (1, 2));
-        assert_eq!((summary.winners, summary.rejected), (2, 1));
+        assert_eq!((summary.winners, summary.rejected), (3, 1));
         assert_eq!(summary.rigs.len(), 1);
         assert_eq!(summary.rigs[0].name, "test");
-        assert_eq!(summary.rigs[0].winners, 2);
+        assert_eq!(summary.rigs[0].winners, 3);
         assert_eq!(hub.take_winners(), vec![winner]);
         assert!(!hub.has_winner());
         // A rig pinning another key does not accept this coordinator.
@@ -1522,21 +1573,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let primary = RigHub::start("127.0.0.1:0".parse().unwrap(), &dir.join("primary")).unwrap();
         let backup = RigHub::start("127.0.0.1:0".parse().unwrap(), &dir.join("backup")).unwrap();
+        let fresh = RigHub::start("127.0.0.1:0".parse().unwrap(), &dir.join("fresh")).unwrap();
         let mut job = sample_job();
         // About one winner per 2^24 candidates, without filling the winner buffer.
         job.target_le_hex = format!("{}ffffff000000", "00".repeat(26));
         primary.publish(job.clone());
-        let mut next = job.clone();
+        let mut retry_job = job.clone();
+        retry_job.generation_id += 10;
+        retry_job.source_identity = "backup".into();
+        backup.publish(retry_job.clone());
+        let mut next = retry_job.clone();
         next.baton_txid = "22".repeat(32);
-        next.source_identity = "backup".into();
-        backup.publish(next.clone());
-        assert_eq!(job.generation_id, next.generation_id);
+        next.source_identity = "fresh".into();
+        fresh.publish(next.clone());
+        assert_eq!(retry_job.generation_id, next.generation_id);
         let coordinators = vec![
             (primary.listen().to_owned(), primary.key().to_owned()),
             (backup.listen().to_owned(), backup.key().to_owned()),
+            (fresh.listen().to_owned(), fresh.key().to_owned()),
         ];
         let stop = Arc::new(AtomicBool::new(false));
         let rig_stop = Arc::clone(&stop);
+        let status = dir.join("rig-status.json");
         let rig = thread::spawn(move || {
             run_rig(
                 &coordinators,
@@ -1546,46 +1604,51 @@ mod tests {
                 100,
                 true,
                 rig_stop,
-                None,
+                Some(&status),
             )
         });
-        let wait_for_winner = |hub: &RigHub, expected: &MiningJob| -> Result<(), String> {
-            let deadline = Instant::now() + Duration::from_secs(45);
-            while Instant::now() < deadline {
-                if hub.summary().rejected != 0 {
-                    return Err(
-                        "a winner from the previous coordinator crossed the session boundary"
-                            .into(),
-                    );
-                }
-                let winners = hub.take_winners();
-                if !winners.is_empty() {
-                    for winner in winners {
-                        crate::mining_job::verify_rig_winner(&winner, expected)?;
-                        assert_eq!(winner.baton_txid, expected.baton_txid);
+        let wait_for_winner =
+            |hub: &RigHub, expected: &MiningJob| -> Result<VerifiedWinner, String> {
+                let deadline = Instant::now() + Duration::from_secs(45);
+                while Instant::now() < deadline {
+                    if hub.summary().rejected != 0 {
+                        return Err(
+                            "a winner from the previous coordinator crossed the session boundary"
+                                .into(),
+                        );
                     }
-                    return Ok(());
+                    let winners = hub.take_winners();
+                    if !winners.is_empty() {
+                        for winner in &winners {
+                            crate::mining_job::verify_rig_winner(winner, expected)?;
+                            assert_eq!(winner.baton_txid, expected.baton_txid);
+                        }
+                        return Ok(winners.into_iter().next().unwrap());
+                    }
+                    if rig.is_finished() {
+                        return Err("rig stopped before producing a winner".into());
+                    }
+                    thread::sleep(Duration::from_millis(50));
                 }
-                if rig.is_finished() {
-                    return Err("rig stopped before producing a winner".into());
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err("timed out waiting for a verified GPU winner".into())
-        };
-        let first = wait_for_winner(&primary, &job);
-        drop(primary);
-        let second = if first.is_ok() {
-            wait_for_winner(&backup, &next)
-        } else {
+                Err("timed out waiting for a verified GPU winner".into())
+            };
+        let phases = (|| -> Result<(), String> {
+            let first = wait_for_winner(&primary, &job)?;
+            drop(primary);
+            let retry = wait_for_winner(&backup, &retry_job)?;
+            assert_eq!(
+                retry.transaction, first.transaction,
+                "retry must preserve the completed proof and payout"
+            );
+            drop(backup);
+            wait_for_winner(&fresh, &next)?;
             Ok(())
-        };
+        })();
         stop.store(true, Ordering::Relaxed);
         let result = rig.join().expect("rig thread panicked");
-        drop(backup);
+        drop(fresh);
         std::fs::remove_dir_all(dir).unwrap();
-        assert!(first.is_ok(), "primary: {first:?}; rig: {result:?}");
-        assert!(second.is_ok(), "backup: {second:?}; rig: {result:?}");
+        assert!(phases.is_ok(), "failover: {phases:?}; rig: {result:?}");
         result.unwrap();
     }
 

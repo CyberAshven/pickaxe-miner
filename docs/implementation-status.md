@@ -2848,15 +2848,16 @@ new job as unchanged. The rig resumed the old baton and could also send queued
 old winners to the new coordinator. Generation numbers are local to a
 coordinator, not identities shared by every coordinator.
 
-The search now belongs to one encrypted connection. Disconnection stops and
-joins its GPU workers and discards their queued winners before reconnecting.
-The next connection starts only after receiving its own job. Normal job
-updates within a connection still reuse the existing GPU search. No kernel,
-payout, donation policy or claim-journal behavior changed.
+The search belongs to one encrypted connection. The initial fix stopped and
+joined its GPU workers and discarded queued winners before reconnecting.
+The 2026-10-18 follow-up below retains completed proofs separately, including
+proofs from the final in-flight batch. The next GPU search starts only after
+receiving its own job. Normal job updates within a connection still reuse
+the existing search; kernels and donation policy are unchanged.
 
 The opt-in regression
 `rigs::tests::gpu_rig_failover_replaces_a_reused_generation_if_cuda_present`
-runs the production rig and two encrypted coordinators on one Windows PC.
+initially ran the production rig and two encrypted coordinators on one Windows PC.
 They both use generation 7, with different synthetic baton outpoints. The
 RTX 5070 Ti Laptop GPU must produce a winner that passes the coordinator's
 independent signature, transaction-digest and target checks before and after
@@ -2928,3 +2929,58 @@ the Unix regression requires the Linux/macOS CI run for this revision.
 The lifetime follows the documented behavior of Rust's
 [`File` locks](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)
 and Unix [`flock`](https://man7.org/linux/man-pages/man2/flock.2.html).
+
+## Rig proof delivery and journal-open safety (2026-10-18)
+
+#### PR #53
+
+A reward-safety audit found that discarding the old GPU search also discarded
+completed proofs during a transport failure, including a proof still queued
+when the rig noticed the disconnect. A successful socket write was also not
+proof that the coordinator had persisted its claim.
+
+The rig now saves a completed proof before sending it, using an owner-only
+atomic file next to its status file, with the extension `rig-winners.json`.
+The process already holds Pickaxe's GPU-session lock. A normal stop joins the
+workers before collecting their final proofs. Restart or reconnect retries
+only when every work field matches, including network, baton, target, amounts,
+fee rate and payout. Only the coordinator-local generation and source label
+can change; the signed transaction and digest never change. An authenticated
+new job on an advanced baton retires its obsolete proofs. Repeated solutions
+for identical work share one saved proof because only one can spend the baton.
+Duplicate deliveries already waiting in the coordinator queue do not fill it.
+Unreadable/corrupt storage or failed persistence stops the rig without replacing
+its existing saved proofs or pretending delivery succeeded.
+
+The BCH solo/relay/Job Declaration journal lock is now an ownership guard
+created immediately after lock acquisition. This also explicitly unlocks on
+failed validation/opening, before a complete `Journal` exists. Successful
+journal persistence, payout binding and submission receipts are unchanged.
+The behavior follows Rust's [file unlock contract](https://doc.rust-lang.org/std/fs/struct.File.html#method.unlock)
+and the [Unix shared lock lifetime](https://man7.org/linux/man-pages/man2/flock.2.html).
+
+Validation:
+
+- 775 host library tests and 18 CLI tests passed, 0 failed; 29 tests were
+  ignored and 34 GPU tests filtered. This includes failed-save preservation,
+  abrupt child-process exit/reopen, and the existing BCH lost-reply/restart,
+  exact-block replay, payout-binding and persistence-before-ACK regressions.
+- CPU tests exercise encrypted coordinator restart with a saved proof and
+  unchanged transaction/payout, changed job/payout/target/network refusal,
+  duplicate delivery, and a worker completing a winning batch during shutdown.
+- The expanded production CUDA regression passed in 14.70 seconds on the RTX
+  5070 Ti Laptop GPU: primary generation 7, backup generation 17 with identical
+  work (must receive the original exact proof), then another backup reusing
+  generation 17 for a different baton (must receive fresh valid work). Each
+  coordinator checks signature, digest and target; none rejected a proof.
+- The existing mainnet TUI was stopped through its console after pending=0
+  and no pending reward journal, then restored after the serial GPU test.
+- Formatting and strict all-feature Clippy passed. Unix ownership-guard
+  regressions require Linux CI; exact-commit CI must pass before merging.
+
+Limits: these failure injections use synthetic proofs and local encrypted
+connections, not funded live claims or cross-machine failover. A proof cannot
+be recovered after power loss before its first successful disk sync, nor can
+it win after another transaction has spent its baton. No claim is made that
+ELECTRIC has received a funded Chipnet reward or that its pot refund has been
+validated live. No kernel, donation allocation, release or tag changed.

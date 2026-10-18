@@ -1504,6 +1504,13 @@ impl SearchHandle {
         self.snapshot_final()
     }
 
+    // #### PR #53: a disconnected rig must keep proofs from the final in-flight batch.
+    #[cfg_attr(not(feature = "stratum-v2"), allow(dead_code))]
+    pub(crate) fn stop_and_drain(mut self) -> Vec<VerifiedWinner> {
+        self.stop_workers();
+        self.drain_winners()
+    }
+
     fn stop_workers(&mut self) {
         for worker in &self.workers {
             worker.counters.stop.store(true, Ordering::Relaxed);
@@ -2031,6 +2038,29 @@ mod tests {
                 thread::park_timeout(Duration::from_millis(5));
             }
         })
+    }
+
+    // #### PR #53: disconnect can happen while a winning GPU batch is still completing.
+    #[test]
+    fn shutdown_collects_winners_from_the_final_in_flight_batch() {
+        let job = crate::mining_job::tests::easy_job();
+        let winner = crate::mining_job::tests::solved_winner(&job, [3; 32]);
+        let expected = winner.clone();
+        let counters = GpuCounters::new();
+        let stop = Arc::clone(&counters.stop);
+        let (winner_tx, winner_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::park_timeout(Duration::from_millis(5));
+            }
+            winner_tx.send(winner).unwrap();
+        });
+        let handle = test_handle(
+            vec![(worker, counters)],
+            winner_rx,
+            Arc::new(AtomicU64::new(job.generation_id)),
+        );
+        assert_eq!(handle.stop_and_drain(), vec![expected]);
     }
 
     /// A search handle over fake GPUs, one per answer.
