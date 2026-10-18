@@ -23,7 +23,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
-| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. GBT-light remains an unimplemented integration target. |
+| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. The SV2 server keeps full templates by design (2026-10-18 decision below); the GPU console's light path in `node.rs` is unchanged. |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Reference-encrypted TP client/server implemented in #42, with loopback provider and block-submission tests. Independent Knuth provider interoperability still needs a running compatible provider. |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests, unmodified upstream standard-channel CPU device, unmodified upstream translator on an extended channel (PR #48) and SV1 Avalon Nano 3 pass; native SV2 firmware pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
@@ -34,7 +34,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check. On 2026-10-18 five live coordinator kills during rig claims, one with a claim journal open, lost no winner and spent no baton twice; all 130 claims confirmed. The same test found #53's proof store stopping a busy rig, fixed below. |
-| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig now passes synthetic primary-to-backup failover on one PC with reused job IDs, live coordinator crashes during claims, and live failover between two independent coordinators in both directions on one PC (2–4 s, 24 unique claims); see below. Failover across separate machines remains pending. |
+| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig passes live failover between two independent coordinators on one PC (PR #53: 2–4 s, 24 unique claims) and across two computers on 2026-10-18: primary on the rig's Windows PC, backup on a Linux computer over Tailscale, six live kills during claims, the rig on the other computer in 2.2–4.3 s every time, 16 distinct claims all confirmed, none duplicated and no baton spent twice; see below. A rig on a third computer, with neither coordinator local, was not part of the run. |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | BCH P2Pool is a separate project (architecture.md). Pickaxe has SV2, TP and Job Declaration boundaries; the sharechain and its payout-distribution integration are not completed by these tests. |
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pool mode and both Job Declaration modes implemented; local live Chipnet shares, custom jobs and payouts checked on 2026-10-15. Pool failover delivered fresh real-node jobs on 2026-10-16 without hashing. Independent external-pool interoperability and accepted blocks through failover/JD remain pending. |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Real ZMQ and TP new-parent/minimum-difficulty delivery checked on 2026-10-15; remote guided setup and live recovery remain. |
@@ -59,14 +59,13 @@ and its earlier timestamp-validation change is already in merged #48.
   (D1). The BCH P2Pool sharechain itself remains a separate project, as stated
   in `architecture.md`; an SV2 connection alone does not finish it.
 - **Available hardware/access:** a fresh physical ASIC donation audit using
-  distinct recipient scripts (S8), cross-machine GPU failover (G4), accepted
-  blocks through pool failover/JD and independent pool interoperability (D2),
-  and remote guided-node recovery (D3). Previous narrow tests remain valid
-  evidence, but do not complete these broader checks. One-PC coordinator
-  crashes during claims (G3), live failover between two independent
-  coordinators (G4, one PC) and a sustained integrated/discrete GPU run (F4)
-  passed on 2026-10-18. Cross-machine failover needs SSH access to the
-  operator's Linux computer, which its Tailscale policy refused.
+  distinct recipient scripts (S8), accepted blocks through pool failover/JD
+  and independent pool interoperability (D2), and remote guided-node
+  recovery (D3). Previous narrow tests remain valid evidence, but do not
+  complete these broader checks. Coordinator crashes during claims (G3),
+  live failover between independent coordinators on one PC and across two
+  computers (G4) and a sustained integrated/discrete GPU run (F4) passed on
+  2026-10-18.
 - **External prerequisites:** a compatible Knuth provider (S2), native SV2
   ASIC firmware (S3/S4), author-approved token contracts/deployments and VM
   proofs (T1/T2), and Intel/discrete AMD/Linux GPU/Apple Silicon hardware
@@ -3075,10 +3074,110 @@ restarted 45 s later with the same key. The rig moved to the survivor every
 time: primary to backup in 4.0 s, backup to primary in 2.0 s. It found 24
 winners; the primary verified and claimed 15 and the backup 9, none stale or
 rejected, 24 distinct claims and no baton spent twice, with the rig's proof
-store empty at the end. All 24 confirmed in block 328418. Separate
-hardware (another machine's network and clock) is still to be shown.
+store empty at the end. All 24 confirmed in block 328418. Failover across
+two computers ran the same day; see "Cross-machine rig failover" below.
 
 Checks: formatting, strict all-feature Clippy (rustc 1.98.1), and 779 library
 and 18 CLI host tests with the CUDA-only tests filtered. Two new regressions: a
 claimed proof retires at the same height, and 20 unclaimed proofs in one block
 keep the newest 16 without an error.
+
+## Full templates kept for the SV2 server (2026-10-18)
+
+#### PR #55
+
+GBT-light (`getblocktemplatelight` / `submitblocklight`) is not added to
+the SV2 server. Reasons, from the code as merged:
+
+- The block journal (`journal.rs`) saves whole blocks, so a saved block can
+  go to whichever node or provider is active after a failover or restart.
+  A light job id belongs to the one node that issued it.
+- `BchTemplate::from_rpc` checks every transaction (txid, no witness, CTOR
+  order, no duplicates) and sizes the coinbase budget from them; a light
+  template has no transactions to check or size.
+- The Template Distribution server (`RequestTransactionData`, assembly of
+  `SubmitSolution`) and Full-Template Job Declaration (declaring, providing
+  missing transactions, the pool's lookups) need the transaction bytes.
+
+A light source would therefore need a node-bound journal entry, a coinbase
+reserve that BCHN does not report, and refusal of `--tp-listen` and both
+Job Declaration flags with it. At current BCH block sizes the bandwidth it
+saves does not justify weaker block durability. The GPU console's existing
+light path (`node::fetch_block_template` / `submit_block`) is unchanged.
+Revisit if template bandwidth becomes the bottleneck.
+
+## GPU live checks (2026-10-18)
+
+The sustained integrated plus discrete GPU run (F4) and coordinator crashes
+during in-flight claims (G3) need this PC's GPUs, which a mainnet PHOTON
+miner held earlier in the session. Both ran later that day in a window where
+the operator's miner was stopped and then restored; the results, and the
+proof-store fix that window led to, are recorded with PR #53.
+
+## Pickaxe with the BCH P2Pool node on Chipnet (2026-10-18)
+
+The BCH P2Pool node (`BitcoinCash-p2poolv2` at `353e7e60`, debug build) ran
+on Chipnet against a synced local BCHN 29.2.0 node: Mini share chain,
+SV1 and a Noise-encrypted SV2 port (Pickaxe test identity as the authority),
+and `wait_for_chain_sync = false` because it was the first node of a fresh
+share chain with no peers.
+
+- **Pool mode works.** `stratum-v2 serve --upstream stratum2+tcp://…/KEY`
+  with a test-only CPU SV1 device behind it: 6 of 6 shares accepted
+  upstream at difficulty 1, none rejected, and P2Pool promoted share blocks
+  from that work to confirmed heights 1 to 3 of its share chain.
+- **Job Declaration does not connect yet.** Pickaxe's client opens its
+  custom-work channel with `min_extranonce_size = 16` (`JD_ROLLABLE`: job
+  id, local lane and the device's 8 bytes). P2Pool grants at most 8 bytes on
+  extended channels (`EXTRANONCE_SIZE`) and answers
+  `min-extranonce-size-too-large`, so Pickaxe reports a refused channel
+  and keeps the devices on the pool's own jobs, as designed.
+
+The fix belongs in Pickaxe. P2Pool's 8 bytes are not a local choice: its
+share header stores the extranonce as a fixed 12-byte array (4 prefix and 8
+rolled, `shares::extranonce::Extranonce`), and peers rebuild declared
+coinbases from it, so a larger grant would change the share-chain format.
+Pickaxe needs a compact Job Declaration layout for pools that grant only 8
+bytes: for example a 2-byte job id, a 2-byte lane and 4 bytes for each
+device, chosen when a 16-byte request is refused. Devices behind the client
+would then roll 4 bytes, and since they learn that size when they connect,
+a layout change must reconnect them. It touches the channel, wire, SV1 and
+Job Declaration code (about 40 places) and is left for its own change. No
+block was found in this run.
+
+## Cross-machine rig failover (2026-10-18)
+
+PR #53 head `b374cb5`, with release builds of the same source on two
+computers: the operator's Windows PC (RTX 5070 Ti Laptop GPU) and the
+operator's x86_64 Debian computer, connected over Tailscale. The Linux build
+(rustc 1.98.1) ran from its own folder as an unprivileged user, beside the
+operator's ASIC server, which kept running untouched; the folder was removed
+afterwards. No payout or connection details are recorded here.
+
+One CUDA rig on the PC was given a primary and a backup coordinator
+(`--coordinator` twice). Each was `--rigs-only` with its own state directory,
+claim journal and Fulcrum connection: the primary on the PC, the backup on the
+Linux computer. The PC's mainnet miner was stopped for the 10-minute window
+and restarted after it. The Linux clock was within 0.5 s of the PC's and
+NTP-synchronized.
+
+Each coordinator was killed in turn, three times each and 15–40 s apart at
+random, during live Chipnet claims, then restarted 45 s later with the same
+key. The rig moved to the other computer every time: to the Linux backup in
+4.3 s and back to the primary in 2.2 s. At a median 1.50 GH/s it found 16
+winners at heights 328428–328429. The primary verified and claimed 6 and the
+backup 10. None was stale or rejected, and each winner's digest matches
+exactly one claim. The 16 claims are distinct, no txid was claimed by both
+coordinators, no baton was spent twice, and each claim after the first spends
+the one before it: one baton chain across both computers. The rig's proof
+store was empty at the end.
+
+This PC's own Chipnet node was retired during the window. Every claim was
+checked instead against two public Chipnet Fulcrum servers that neither
+coordinator used: the transaction, the baton it spends, its block, and a
+merkle proof against that block's header. Both servers agree on all 16, and
+all 16 are confirmed: 1 in block 328429 and 15 in 328430.
+
+This shows failover across separate hosts, network paths and clocks. The rig
+and the primary shared the PC, so a rig on a third computer, with neither
+coordinator local, was not part of the run.
