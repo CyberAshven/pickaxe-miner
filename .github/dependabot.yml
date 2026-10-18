@@ -2,7 +2,7 @@ version: 2
 updates:
   # Routine changes enter the alpha/testing branch for review.
   - package-ecosystem: cargo
-    directories: ["/", "/rust-engine"]
+    directory: "/"
     target-branch: dev
     schedule:
       interval: weekly
@@ -10,6 +10,19 @@ updates:
     groups:
       compatible-rust-updates:
         update-types: [minor, patch]
+  - package-ecosystem: cargo
+    directory: "/rust-engine"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      compatible-rust-updates:
+        update-types: [minor, patch]
+    ignore:
+      # PHOTON's CUDA kernels (photon_rust.ptx) must stay byte-identical to the
+      # GPU-validated baseline; sha2 moves only with a GPU-tested change.
+      - dependency-name: sha2
   - package-ecosystem: github-actions
     directory: "/"
     target-branch: dev
