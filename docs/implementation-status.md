@@ -22,7 +22,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 
 | ID | Requirement | Evidence needed | Current state |
 |---|---|---|---|
-| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. GBT-light remains an optional optimization, not an implemented path. |
+| S1 | BCHN GBT-light/full template source and pinned submission | RPC fixtures, real Chipnet templates and accepted block | Full GBT, pinned full-block submission and TP client/server implemented; physical Chipnet full-template blocks previously verified. The SV2 server keeps full templates by design (2026-10-18 decision below); the GPU console's light path in `node.rs` is unchanged. |
 | S2 | Knuth native Template Distribution client | Encrypted TP interoperability and fresh templates | Reference-encrypted TP client/server implemented in #42, with loopback provider and block-submission tests. Independent Knuth provider interoperability still needs a running compatible provider. |
 | S3 | Reference Noise, framing, setup, standard/extended mining channels | Reference device, tamper/replay/truncation and reconnect tests | Local encrypted TCP tests, unmodified upstream standard-channel CPU device, unmodified upstream translator on an extended channel (PR #48) and SV1 Avalon Nano 3 pass; native SV2 firmware pending |
 | S4 | Per-device unique work, share validation, duplicate/stale rejection | Independent header oracle and reference CPU device | Header/merkle oracle, local and upstream CPU devices, Avalon Nano 3 and refresh uniqueness pass; native SV2 firmware pending |
@@ -2789,3 +2789,66 @@ from several threads; A refused those as `duplicate-share`.
 Not shown live: native SV2 firmware (CI's independent SV2 reference device
 covers the protocol), a block found through the pool or Job Declaration
 paths, and failover between pools.
+
+## Full templates kept for the SV2 server (2026-10-18)
+
+#### PR #55
+
+GBT-light (`getblocktemplatelight` / `submitblocklight`) is not added to
+the SV2 server. Reasons, from the code as merged:
+
+- The block journal (`journal.rs`) saves whole blocks, so a saved block can
+  go to whichever node or provider is active after a failover or restart.
+  A light job id belongs to the one node that issued it.
+- `BchTemplate::from_rpc` checks every transaction (txid, no witness, CTOR
+  order, no duplicates) and sizes the coinbase budget from them; a light
+  template has no transactions to check or size.
+- The Template Distribution server (`RequestTransactionData`, assembly of
+  `SubmitSolution`) and Full-Template Job Declaration (declaring, providing
+  missing transactions, the pool's lookups) need the transaction bytes.
+
+A light source would therefore need a node-bound journal entry, a coinbase
+reserve that BCHN does not report, and refusal of `--tp-listen` and both
+Job Declaration flags with it. At current BCH block sizes the bandwidth it
+saves does not justify weaker block durability. The GPU console's existing
+light path (`node::fetch_block_template` / `submit_block`) is unchanged.
+Revisit if template bandwidth becomes the bottleneck.
+
+## GPU live checks (2026-10-18)
+
+The sustained integrated plus discrete GPU run (F4) and coordinator crashes
+during in-flight claims (G3) need this PC's GPUs, which a mainnet PHOTON
+miner held earlier in the session. Both ran later that day in a window where
+the operator's miner was stopped and then restored; the results, and the
+proof-store fix that window led to, are recorded with PR #53.
+
+## Pickaxe with the BCH P2Pool node on Chipnet (2026-10-18)
+
+The BCH P2Pool node (`BitcoinCash-p2poolv2` at `353e7e60`, debug build) ran
+on Chipnet against a synced local BCHN 29.2.0 node: Mini share chain,
+SV1 and a Noise-encrypted SV2 port (Pickaxe test identity as the authority),
+and `wait_for_chain_sync = false` because it was the first node of a fresh
+share chain with no peers.
+
+- **Pool mode works.** `stratum-v2 serve --upstream stratum2+tcp://…/KEY`
+  with a test-only CPU SV1 device behind it: 6 of 6 shares accepted
+  upstream at difficulty 1, none rejected, and P2Pool promoted share blocks
+  from that work to confirmed heights 1 to 3 of its share chain.
+- **Job Declaration does not connect yet.** Pickaxe's client opens its
+  custom-work channel with `min_extranonce_size = 16` (`JD_ROLLABLE`: job
+  id, local lane and the device's 8 bytes). P2Pool grants at most 8 bytes on
+  extended channels (`EXTRANONCE_SIZE`) and answers
+  `min-extranonce-size-too-large`, so Pickaxe reports a refused channel
+  and keeps the devices on the pool's own jobs, as designed.
+
+The fix belongs in Pickaxe. P2Pool's 8 bytes are not a local choice: its
+share header stores the extranonce as a fixed 12-byte array (4 prefix and 8
+rolled, `shares::extranonce::Extranonce`), and peers rebuild declared
+coinbases from it, so a larger grant would change the share-chain format.
+Pickaxe needs a compact Job Declaration layout for pools that grant only 8
+bytes: for example a 2-byte job id, a 2-byte lane and 4 bytes for each
+device, chosen when a 16-byte request is refused. Devices behind the client
+would then roll 4 bytes, and since they learn that size when they connect,
+a layout change must reconnect them. It touches the channel, wire, SV1 and
+Job Declaration code (about 40 places) and is left for its own change. No
+block was found in this run.

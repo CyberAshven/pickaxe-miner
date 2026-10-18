@@ -129,10 +129,14 @@ impl Client {
     }
 
     fn receive(&mut self) -> SerializedFrame {
+        self.receive_within(Duration::from_secs(5))
+    }
+
+    fn receive_within(&mut self, wait: Duration) -> SerializedFrame {
         self.receiver
-            .receive(Duration::from_secs(5))
+            .receive(wait)
             .unwrap()
-            .expect("a frame within 5 s")
+            .unwrap_or_else(|| panic!("a frame within {wait:?}"))
     }
 
     /// True when nothing arrives for `wait`.
@@ -154,7 +158,11 @@ impl Client {
     }
 
     fn template(&mut self) -> Template {
-        let mut frame = self.receive();
+        self.template_within(Duration::from_secs(5))
+    }
+
+    fn template_within(&mut self, wait: Duration) -> Template {
+        let mut frame = self.receive_within(wait);
         assert_eq!(frame.header().msg_type(), MESSAGE_TYPE_NEW_TEMPLATE);
         let message: NewTemplate = binary_sv2::from_bytes(frame.payload()).unwrap();
         assert_eq!(message.coinbase_tx_version, 2);
@@ -178,7 +186,12 @@ impl Client {
 
     /// A future template and the SetNewPrevHash that activates it.
     fn future_template(&mut self) -> (Template, Parent) {
-        let template = self.template();
+        self.future_template_within(Duration::from_secs(5))
+    }
+
+    /// The same, waiting up to `wait` for the template.
+    fn future_template_within(&mut self, wait: Duration) -> (Template, Parent) {
+        let template = self.template_within(wait);
         assert!(template.future);
         let mut frame = self.receive();
         assert_eq!(frame.header().msg_type(), MESSAGE_TYPE_SET_NEW_PREV_HASH);
@@ -394,14 +407,15 @@ fn templates_follow_the_node_future_on_a_new_parent_and_current_on_the_same_one(
 #[test]
 fn new_bits_on_the_same_parent_come_with_a_set_new_prev_hash() {
     let node = pool_node();
-    // The point (the parent's time plus 1201 s) comes 2 to 3 s from now.
-    node.lock().unwrap().parent_time = Some(super::super::server_tests::now() - 1198);
+    // The point (the parent's time plus 1201 s) comes about 8 s from now,
+    // so a slow runner has started the server and client well before it.
+    node.lock().unwrap().parent_time = Some(super::super::server_tests::now() - 1193);
     let server = Running::templates(node, Arc::new(TestDirectory::new()));
     let mut client = Client::setup(&server);
     client.constraints(122);
     let (first, parent) = client.future_template();
     assert_eq!(parent.bits, 0x207f_ffff);
-    let (next, limit) = client.future_template();
+    let (next, limit) = client.future_template_within(Duration::from_secs(15));
     assert!(next.id > first.id);
     assert_eq!(limit.previous, parent.previous);
     assert_eq!(limit.bits, super::super::template::MIN_DIFFICULTY_BITS);
