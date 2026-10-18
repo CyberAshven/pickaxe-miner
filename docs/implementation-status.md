@@ -2813,8 +2813,12 @@ canonical padding and a share commitment, with sequence `0xfffffffe` and
 locktime `height - 1` (its `docs/bch-job-declaration.md`). Pickaxe's client
 accepts only a Pickaxe pool's token, whose rates it can pay, and reports
 `the pool's tokens are not a Pickaxe pool's; Job Declaration needs one`.
-Building P2Pool's coinbase needs its share-chain window (its node serves
-`/pplns_shares`) and its payout rounding, and is the remaining D1 work.
+Building P2Pool's coinbase needs its share-chain window and its payout
+rounding, and is the remaining D1 work. P2Pool keeps 8 rollable bytes after
+its upstream share-header change, so the compact layout stays the path there.
+Its maintainers plan a node API that returns a token's exact coinbase outputs
+for a coinbase value, after their first alpha; Pickaxe should use that rather
+than reimplement PPLNS. Until then Pickaxe reaches P2Pool in pool mode.
 
 Checks: formatting, strict all-feature Clippy (rustc 1.98.1), and 772 of 773
 library tests and 18 CLI tests with CUDA-only tests filtered. The one
