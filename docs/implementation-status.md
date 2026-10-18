@@ -2984,3 +2984,27 @@ be recovered after power loss before its first successful disk sync, nor can
 it win after another transaction has spent its baton. No claim is made that
 ELECTRIC has received a funded Chipnet reward or that its pot refund has been
 validated live. No kernel, donation allocation, release or tag changed.
+
+## Review fixes for saved rig proofs (2026-10-18)
+
+#### PR #53
+
+A read-only review of `a842f5d` found no path that duplicates or misdirects a
+claim, and four ways a winner could still be lost or the rig stop wrongly:
+
+- A job at the same height on another baton deleted a saved proof, although
+  a backup coordinator's indexer can lag the newest claim. Only a higher tip
+  now retires a proof (or the same baton, as before); a proof is still never
+  re-sent to work that differs from its own.
+- Winners from the connection's previous job were dropped instead of sent,
+  including a public pool's winners across a fee-window change, which the
+  coordinator accepts. Every winner drained from this connection's search is
+  sent again; its coordinator judges stale ones, as before #53.
+- When saving failed, the winners in hand were neither saved nor sent. They
+  are now sent before mining stops with the storage error.
+- A job the rig cannot mine set the storage failure and stopped the rig. It
+  is now validated first and ends only the connection, which is retried.
+
+Checks: formatting, strict all-feature Clippy (rustc 1.98.1), 774 library
+and 18 CLI host tests; the updated proof-store test keeps a proof across a
+same-height baton change and retires it at a higher tip.

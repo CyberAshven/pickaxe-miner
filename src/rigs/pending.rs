@@ -103,9 +103,12 @@ impl PendingWinners {
     pub(super) fn for_job(&mut self, job: &MiningJob) -> Result<Vec<VerifiedWinner>, String> {
         crate::mining_job::validate_job(job)?;
         let mut next = self.saved.clone();
+        // Only a higher chain tip retires a proof. Another baton at the same
+        // height may come from an indexer that has not yet seen the newest
+        // claim, so the proof stays; it is never re-sent to different work.
         next.retain(|entry| {
             entry.job.network != job.network.as_str()
-                || entry.job.height > job.height
+                || entry.job.height >= job.height
                 || (entry.job.baton_txid == job.baton_txid
                     && entry.job.baton_vout == job.baton_vout)
         });
@@ -226,8 +229,15 @@ mod tests {
             assert!(pending.for_job(&changed).unwrap().is_empty());
         }
         assert_eq!(pending.for_job(&job).unwrap().len(), 1);
-        let mut advanced = job.clone();
-        advanced.baton_txid = "22".repeat(32);
+        // Another baton at the same height (an indexer behind the newest
+        // claim, or a claim already made) is not sent the proof but keeps it.
+        let mut other = job.clone();
+        other.baton_txid = "22".repeat(32);
+        assert!(pending.for_job(&other).unwrap().is_empty());
+        assert_eq!(pending.for_job(&job).unwrap().len(), 1);
+        // A higher tip on another baton retires it.
+        let mut advanced = other.clone();
+        advanced.height += 1;
         assert!(pending.for_job(&advanced).unwrap().is_empty());
         assert!(PendingWinners::open(&dir.journal())
             .unwrap()

@@ -1153,6 +1153,10 @@ mod net {
                                     .donation
                                     .unwrap_or_else(|| MiningToken::Photon.donation_minimum());
                                 let job = MiningJob::try_from(wire)?;
+                                // A job this rig cannot mine ends the
+                                // connection and is retried; only a failure
+                                // of the saved proofs stops mining.
+                                crate::mining_job::validate_job(&job)?;
                                 let (height, generation) = (job.height, job.generation_id);
                                 let retry = pending
                                     .for_job(&job)
@@ -1222,13 +1226,15 @@ mod net {
                                 last_saved = Instant::now();
                             }
                             let winners = handle.drain_winners();
-                            pending
-                                .record(current_job.as_ref().expect("search has a job"), &winners)
-                                .inspect_err(|_| storage_failed = true)?;
-                            for winner in winners.into_iter().filter(|winner| {
-                                Some(winner.generation_id)
-                                    == current_job.as_ref().map(|job| job.generation_id)
-                            }) {
+                            // Save first, but never hold a winner back: when
+                            // saving fails it is still sent before mining
+                            // stops. The search belongs to this connection, so
+                            // every winner here is for this coordinator's jobs
+                            // (it judges one from an earlier job, such as the
+                            // other side of a public pool's fee window).
+                            let saved = pending
+                                .record(current_job.as_ref().expect("search has a job"), &winners);
+                            for winner in winners {
                                 sender.send(frame(WINNER, &WireWinner::from(&winner))?)?;
                                 winners_sent = winners_sent.saturating_add(1);
                                 paused_since = Some(Instant::now());
@@ -1238,6 +1244,7 @@ mod net {
                                     serde_json::json!({"height": winner.height, "nonce": winner.nonce}),
                                 );
                             }
+                            saved.inspect_err(|_| storage_failed = true)?;
                             if paused_since
                                 .is_some_and(|since| since.elapsed() >= RESUME_AFTER_WINNER)
                             {
