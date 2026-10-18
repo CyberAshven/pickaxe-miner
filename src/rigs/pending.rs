@@ -141,6 +141,12 @@ impl PendingWinners {
             .unwrap_or(Path::new("."));
         fs::create_dir_all(parent).map_err(|_| "cannot create rig journal directory")?;
         config::write_private_atomic(&self.path, &bytes)?;
+        fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "cannot sync installed rig journal")?;
         #[cfg(unix)]
         fs::File::open(parent)
             .and_then(|file| file.sync_all())

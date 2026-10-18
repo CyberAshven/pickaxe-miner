@@ -661,8 +661,8 @@ fn journal_close_releases_lock_with_an_inherited_descriptor() {
 fn failed_journal_initialization_releases_the_owned_lock() {
     let dir = TestDirectory::new();
     let path = dir.journal();
-    let mut inherited = None;
-    let failed: Result<(), &str> = (|| {
+    let inherited;
+    let failed: Result<(), &str> = {
         let file = File::options()
             .read(true)
             .write(true)
@@ -672,10 +672,10 @@ fn failed_journal_initialization_releases_the_owned_lock() {
             .unwrap();
         file.try_lock().unwrap();
         let lock = JournalLock(file);
-        inherited = Some(lock.0.try_clone().unwrap());
+        inherited = lock.0.try_clone().unwrap();
         assert!(Journal::open_relay(&path, MiningNetwork::Chipnet).is_err());
         Err("journal validation failed before construction")
-    })();
+    };
     assert!(failed.is_err());
     let recovered = Journal::open_relay(&path, MiningNetwork::Chipnet).unwrap();
     drop(inherited);
