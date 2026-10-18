@@ -14,7 +14,7 @@ use super::{
     codec::{parse_outputs, serialize_outputs},
     plan::JdPlan,
     token::PxToken,
-    ForwardShare, JdMode, JD_ROLLABLE, MAX_DECLARED_TXS,
+    ForwardShare, JdMode, JD_COMPACT_ROLLABLE, JD_ROLLABLE, MAX_DECLARED_TXS,
 };
 use crate::stratum_v2::{
     sv1::addressed_to,
@@ -300,20 +300,36 @@ fn uplink(
         Protocol::MiningProtocol,
         0b110,
     )?;
-    pool.send(mining(Mining::OpenExtendedMiningChannel(
-        OpenExtendedMiningChannel {
-            request_id: 1,
-            user_identity: target
-                .identity
-                .as_str()
-                .try_into()
-                .map_err(|_| "identity too long")?,
-            nominal_hash_rate: 1e12,
-            max_target: (&[0xff; 32]).into(),
-            min_extranonce_size: JD_ROLLABLE as u16,
-        },
-    ))?)?;
+    let open = |pool: &mut Sender, request_id: u32, rollable: usize| -> Result<(), String> {
+        pool.send(mining(Mining::OpenExtendedMiningChannel(
+            OpenExtendedMiningChannel {
+                request_id,
+                user_identity: target
+                    .identity
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| "identity too long")?,
+                nominal_hash_rate: 1e12,
+                max_target: (&[0xff; 32]).into(),
+                min_extranonce_size: rollable as u16,
+            },
+        ))?)
+    };
+    open(&mut pool, 1, JD_ROLLABLE)?;
     let mut frame = answer(&mut replies, stop)?;
+    // #### PR #56: the compact layout
+    // What: a pool that refuses 16 rollable bytes is asked once more for 8;
+    // granted, the plan is compact: a 2-byte job id, the pad, a 2-byte lane
+    // and 4 bytes for each device. Local channels opened on another layout
+    // end at their next job and reopen on this one.
+    // Why: BCH P2Pool grants at most 8 bytes, the size its share chain
+    // stores, so the 16-byte layout cannot mine there.
+    // Look here if: a pool refuses both requests, or local devices
+    // reconnect when the pool changes.
+    if frame.header().msg_type() == MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR {
+        open(&mut pool, 2, JD_COMPACT_ROLLABLE)?;
+        frame = answer(&mut replies, stop)?;
+    }
     let (channel, mut group, mut pool_target, prefix, rollable) = match frame.header().msg_type() {
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS => {
             let opened: OpenExtendedMiningChannelSuccess =
@@ -328,9 +344,10 @@ fn uplink(
         }
         _ => return Err("the pool refused the Job Declaration channel".into()),
     };
-    if rollable < JD_ROLLABLE {
+    if rollable < JD_COMPACT_ROLLABLE {
         return Err("the pool's extranonce space is too small for Job Declaration".into());
     }
+    let compact = rollable < JD_ROLLABLE;
     let mut requests = 0u32;
     for _ in 0..TOKENS_AHEAD {
         allocate(target, &mut jd, &mut requests)?;
@@ -340,7 +357,16 @@ fn uplink(
     let plan = Arc::new(JdPlan {
         serial,
         upstream_prefix: prefix,
-        pad: vec![0; rollable - JD_ROLLABLE],
+        pad: vec![
+            0;
+            rollable
+                - if compact {
+                    JD_COMPACT_ROLLABLE
+                } else {
+                    JD_ROLLABLE
+                }
+        ],
+        compact,
         scripts,
         rates: first.1,
         pool_target,

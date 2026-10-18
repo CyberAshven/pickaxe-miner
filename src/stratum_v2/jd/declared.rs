@@ -422,6 +422,7 @@ pub(in crate::stratum_v2) mod tests {
                 serial: 1,
                 upstream_prefix: vec![9; 16],
                 pad: Vec::new(),
+                compact: false,
                 scripts: vec![vec![0x51], vec![0x52]],
                 rates: PoolRates {
                     donation_bps: 150,

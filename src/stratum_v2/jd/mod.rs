@@ -20,6 +20,13 @@ use std::time::Duration;
 
 /// Rollable extranonce bytes a work-selection channel gets.
 pub const JD_ROLLABLE: usize = 16;
+/// #### PR #56: the compact layout for pools that grant only 8 rollable
+/// bytes, as BCH P2Pool does (its share chain stores the extranonce as 4
+/// prefix and 8 rolled bytes): a 2-byte job id, a 2-byte lane and 4 bytes
+/// for each device.
+pub const JD_COMPACT_ROLLABLE: usize = 8;
+/// Bytes each device rolls under the compact layout.
+pub const COMPACT_DEVICE_EXTRANONCE: usize = 4;
 /// How long an allocated token can be redeemed.
 pub const TOKEN_TTL: Duration = Duration::from_secs(600);
 /// How long a declared job's token can be redeemed.

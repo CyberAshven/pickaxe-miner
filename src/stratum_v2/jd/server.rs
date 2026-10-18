@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, RwLock,
     },
     time::{Duration, Instant},
@@ -241,6 +241,9 @@ pub struct Declarator {
     validator: Option<Arc<dyn Validator>>,
     slots: Slots,
     next_owner: AtomicU64,
+    /// #### PR #56: the rollable bytes a work-selection channel is granted;
+    /// tests lower it to stand in for a pool that grants fewer.
+    grant: AtomicUsize,
 }
 
 /// What a custom job's token sets.
@@ -268,7 +271,21 @@ impl Declarator {
             validator: None,
             slots: Slots::default(),
             next_owner: AtomicU64::new(0),
+            grant: AtomicUsize::new(super::JD_ROLLABLE),
         }
+    }
+
+    /// #### PR #56: the rollable bytes a client's work-selection channel
+    /// gets: 16.
+    pub fn grant(&self) -> usize {
+        self.grant.load(Ordering::Relaxed)
+    }
+
+    /// #### PR #56: grants `bytes` instead, as a pool such as BCH P2Pool
+    /// grants 8.
+    #[cfg(test)]
+    pub fn set_grant(&self, bytes: usize) {
+        self.grant.store(bytes, Ordering::Relaxed);
     }
 
     /// The node check for Full-Template declarations; without one, only

@@ -282,6 +282,14 @@ counts as the overview line below.
   its script carries the pool channel's prefix, then the job id, the lane of
   the device's channel and the device's 8 bytes, which are the 16 bytes the
   pool lets you roll.
+- A pool that refuses 16 rollable bytes is asked once more for 8 (BCH P2Pool
+  grants at most 8, the size its share chain stores). The compact layout
+  then fits them: the job id's low 2 bytes, a 2-byte lane and 4 bytes for
+  each device; more than 8 granted goes to zero padding after the job id.
+  Devices learn their size when they connect, so on a compact pool they roll
+  4 bytes: SV1 devices through the adapter get a 4-byte extranonce2, and an
+  SV2 device asking for more than 4 is refused. A device connected on the
+  other layout is disconnected at its next job and reconnects on this one.
 - Full-Template: each template is declared with its transactions, the
   transactions the pool asks for are sent from the template, and the custom
   job is set with the declared token. A template over 65,535 transactions is
