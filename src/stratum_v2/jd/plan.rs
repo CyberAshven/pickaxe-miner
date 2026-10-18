@@ -19,8 +19,11 @@ pub struct JdPlan {
     /// right after the client's prefix.
     pub upstream_prefix: Vec<u8>,
     /// Zero bytes after the job id when the pool lets the client roll more
-    /// than 16 bytes.
+    /// than the layout needs.
     pub pad: Vec<u8>,
+    /// #### PR #56: the pool granted fewer than 16 bytes, so the compact
+    /// layout (2-byte job id and lane, 4 bytes per device) is used.
+    pub compact: bool,
     /// The pool's outputs, in its order: the miner's own script first.
     pub scripts: Vec<Vec<u8>>,
     pub rates: PoolRates,
@@ -75,9 +78,20 @@ impl JdPlan {
     }
 
     /// The rollable bytes the pool takes: the job id, the pad, the lane and
-    /// the device's 8.
+    /// the device's.
     pub fn rollable(&self) -> usize {
-        4 + self.pad.len() + 4 + crate::stratum_v2::channel::DEVICE_EXTRANONCE_SIZE
+        let (id, lane, device) = self.layout();
+        id + self.pad.len() + lane + device
+    }
+
+    /// #### PR #56: the bytes of the job id, the lane and each device: 4, 4
+    /// and 8, or 2, 2 and 4 in the compact layout.
+    pub fn layout(&self) -> (usize, usize, usize) {
+        if self.compact {
+            (2, 2, super::COMPACT_DEVICE_EXTRANONCE)
+        } else {
+            (4, 4, crate::stratum_v2::channel::DEVICE_EXTRANONCE_SIZE)
+        }
     }
 
     /// Whether the pool's outputs name valid indexes: the miner first, the
@@ -111,6 +125,7 @@ mod tests {
             serial: 1,
             upstream_prefix: vec![0; 16],
             pad: Vec::new(),
+            compact: false,
             scripts: vec![vec![0x51], vec![0x52], vec![0x53]],
             rates: PoolRates {
                 donation_bps: 150,
@@ -122,6 +137,18 @@ mod tests {
         };
         assert!(plan.is_valid());
         assert_eq!(plan.rollable(), 16);
+        // #### PR #56: the compact layout fits a pool's 8 bytes, its pad
+        // taking any it grants beyond them.
+        let compact = JdPlan {
+            compact: true,
+            ..plan.clone()
+        };
+        assert_eq!((compact.layout(), compact.rollable()), ((2, 2, 4), 8));
+        let wider = JdPlan {
+            pad: vec![0; 4],
+            ..compact
+        };
+        assert_eq!(wider.rollable(), 12);
         let outputs = plan.outputs(312_500_000);
         assert_eq!(
             outputs,

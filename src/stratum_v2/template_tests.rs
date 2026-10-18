@@ -831,6 +831,7 @@ fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
         serial: 1,
         upstream_prefix: vec![0xee; 16],
         pad: Vec::new(),
+        compact: false,
         scripts: vec![vec![0x51], vec![0x52], vec![0x53]],
         rates: PoolRates {
             donation_bps: 150,

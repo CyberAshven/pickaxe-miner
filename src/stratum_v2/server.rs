@@ -26,7 +26,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender},
         Arc, Mutex, RwLock,
     },
@@ -294,7 +294,7 @@ pub(super) struct Shared {
     /// worker, when templates are served or relayed blocks wait.
     pub(super) relay: Option<Relay>,
     /// #### PR #42: the lanes a Job Declaration client's local channels take.
-    lanes: Arc<AtomicU32>,
+    lanes: Arc<super::wire::Lanes>,
     /// #### PR #42: blocks found on Full-Template declared jobs.
     declared: Option<DeclaredBlocks>,
     /// #### PR #42: the latest published templates with different
@@ -648,7 +648,7 @@ pub fn run_with(
         solved: Mutex::new(SolvedParents::default()),
         claims,
         relay,
-        lanes: Arc::new(AtomicU32::new(0)),
+        lanes: Arc::default(),
         declared,
         recent: full_template.then(|| Mutex::new(VecDeque::new())),
         preferred: config.preferred.clone(),
