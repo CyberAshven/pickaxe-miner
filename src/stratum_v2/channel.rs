@@ -86,6 +86,11 @@ pub struct Channel {
     /// #### PR #42: a Job Declaration client's channel: it mines only the
     /// custom jobs the client sets, with 16 rollable extranonce bytes.
     pub custom_only: bool,
+    /// #### PR #56: the extranonce bytes each share rolls: 8 from a device,
+    /// 4 on a compact lane, what the pool grants a Job Declaration client.
+    rolled: usize,
+    /// #### PR #56: a Job Declaration lane in the compact layout.
+    compact: bool,
 }
 
 /// #### PR #42: whose job a channel mines.
@@ -255,25 +260,39 @@ impl Channel {
             hashrate: hash_rate_from_target(target.into(), f64::from(SHARES_PER_MINUTE))
                 .map_or(MIN_HASHRATE, |rate| rate as f32),
             custom_only: false,
+            rolled: DEVICE_EXTRANONCE_SIZE,
+            compact: false,
         })
     }
 
     /// #### PR #42: a Job Declaration client's local channel: its
     /// extranonce prefix is its lane, unique across the server, so that the
     /// job id, the lane and the device's 8 bytes fit the 16 the pool lets
-    /// the client roll.
-    pub fn set_lane(&mut self, lane: u32) {
-        self.extranonce_prefix = lane.to_le_bytes().to_vec();
+    /// the client roll. #### PR #56: in the compact layout the lane is its
+    /// low 2 bytes and the device rolls 4, to fit a pool's 8.
+    pub fn set_lane(&mut self, lane: u32, compact: bool) {
+        self.compact = compact;
+        if compact {
+            self.extranonce_prefix = (lane as u16).to_le_bytes().to_vec();
+            self.rolled = super::jd::COMPACT_DEVICE_EXTRANONCE;
+        } else {
+            self.extranonce_prefix = lane.to_le_bytes().to_vec();
+            self.rolled = DEVICE_EXTRANONCE_SIZE;
+        }
+    }
+
+    /// #### PR #42: a Job Declaration client's channel at this pool, which
+    /// rolls the `rolled` bytes granted to it.
+    pub fn set_custom_only(&mut self, rolled: usize) {
+        self.custom_only = true;
+        self.rolled = rolled;
     }
 
     /// #### PR #42: the rollable extranonce bytes this channel's shares
-    /// carry: 8 from a device, 16 from a Job Declaration client.
+    /// carry: 8 from a device (#### PR #56: 4 on a compact lane), 16 from a
+    /// Job Declaration client.
     pub fn rollable(&self) -> usize {
-        if self.custom_only {
-            super::jd::JD_ROLLABLE
-        } else {
-            DEVICE_EXTRANONCE_SIZE
-        }
+        self.rolled
     }
 
     pub fn install(
@@ -313,16 +332,31 @@ impl Channel {
         // exactly that shape.
         // Look here if: the pool refuses forwarded shares, or the local
         // devices' coinbases differ from the custom job's.
-        let (upstream, pad) = template.jd_plan().map_or((&[][..], &[][..]), |plan| {
-            (plan.upstream_prefix.as_slice(), plan.pad.as_slice())
+        // #### PR #56: a compact plan takes the job id's low 2 bytes (a
+        // channel's retained jobs have consecutive ids, so they stay
+        // distinct). A lane opened on the other layout cannot carry this
+        // plan's jobs: the error ends its connection and the device
+        // reopens on the plan's layout.
+        if template
+            .jd_plan()
+            .is_some_and(|plan| plan.compact != self.compact)
+        {
+            return Err("the pool's extranonce layout changed; reconnect the device".into());
+        }
+        let (upstream, pad, id_bytes) = template.jd_plan().map_or((&[][..], &[][..], 4), |plan| {
+            (
+                plan.upstream_prefix.as_slice(),
+                plan.pad.as_slice(),
+                plan.layout().0,
+            )
         });
         let mut extra = upstream.to_vec();
-        extra.extend(id.to_le_bytes());
+        extra.extend_from_slice(&id.to_le_bytes()[..id_bytes]);
         extra.extend_from_slice(pad);
         extra.extend_from_slice(&self.extranonce_prefix);
-        let parts_extranonce = extra.len() + DEVICE_EXTRANONCE_SIZE;
+        let parts_extranonce = extra.len() + self.rolled;
         if template.jd_plan().is_some() && self.kind == ChannelKind::Standard {
-            extra.extend([0; DEVICE_EXTRANONCE_SIZE]);
+            extra.extend(std::iter::repeat_n(0, self.rolled));
         }
         // #### end PR #42 ####
         // #### PR #42: merge-mined tokens in each job
@@ -362,7 +396,9 @@ impl Channel {
         )?;
         // #### end PR #42 ####
         parts.prefix.extend_from_slice(upstream);
-        parts.prefix.extend(id.to_le_bytes());
+        parts
+            .prefix
+            .extend_from_slice(&id.to_le_bytes()[..id_bytes]);
         parts.prefix.extend_from_slice(pad);
         self.retain_previous(&template);
         self.job = Some(Job {
@@ -754,7 +790,7 @@ impl Channel {
         // #### PR #42: shares forwarded to the pool (Job Declaration): the
         // rolled bytes start at the job id, at the end of the job's prefix.
         let forward = job.template.jd_plan().map(|plan| {
-            let start = job.parts.prefix.len() - plan.pad.len() - 4;
+            let start = job.parts.prefix.len() - plan.pad.len() - plan.layout().0;
             super::jd::ForwardShare {
                 serial: job.generation,
                 version: share.version,
@@ -1898,6 +1934,7 @@ mod tests {
             serial: 3,
             upstream_prefix: vec![0xee; 16],
             pad: vec![0; 2],
+            compact: false,
             scripts: vec![vec![0x51], vec![0x52]],
             rates: PoolRates {
                 donation_bps: 0,
@@ -1918,7 +1955,7 @@ mod tests {
             &super::super::template_tests::payout(),
         )
         .unwrap();
-        channel.set_lane(7);
+        channel.set_lane(7, false);
         let job = channel.install(5, 11, template.clone()).unwrap();
         let head = template.script_head();
         let mut expected_prefix = job.parts.prefix[..42 + head.len()].to_vec();
@@ -1965,6 +2002,94 @@ mod tests {
         rolled.extend(device);
         assert_eq!(forward.extranonce, rolled);
         assert_eq!(share.coinbase.bytes, coinbase);
+    }
+
+    // #### PR #56
+    // What: under a compact plan a lane's coinbase script is the head, the
+    // pool's prefix, the job id's low 2 bytes, the pad, a 2-byte lane and the
+    // device's 4 bytes: the 8 a pool such as BCH P2Pool grants, which a share
+    // forwards exactly. A lane opened on the other layout refuses the plan's
+    // jobs, and a standard lane's device bytes are 4 zeros.
+    // Look here if: the compact layout or ForwardShare changes.
+    #[test]
+    fn compact_layout_fits_a_pools_8_rolled_bytes() {
+        use super::super::jd::{plan::JdPlan, token::PoolRates};
+        let mut template =
+            BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
+        let plan = JdPlan {
+            serial: 3,
+            upstream_prefix: vec![0xee; 4],
+            pad: Vec::new(),
+            compact: true,
+            scripts: vec![vec![0x51], vec![0x52]],
+            rates: PoolRates {
+                donation_bps: 0,
+                fee_bps: 100,
+                donation_output: None,
+                fee_output: Some(1),
+            },
+            pool_target: [0xff; 32],
+        };
+        template.declare(Arc::new(plan.clone()));
+        let template = Arc::new(template);
+        let lane = |kind, compact| {
+            let mut channel = Channel::new(
+                1,
+                kind,
+                [255; 32],
+                [9; 12],
+                MiningNetwork::Chipnet,
+                &super::super::template_tests::payout(),
+            )
+            .unwrap();
+            channel.set_lane(0x0003_0007, compact);
+            channel
+        };
+        assert!(lane(ChannelKind::Extended, false)
+            .install(5, 11, template.clone())
+            .is_err());
+        let mut channel = lane(ChannelKind::Extended, true);
+        assert_eq!(
+            (channel.extranonce_prefix.clone(), channel.rollable()),
+            (vec![7, 0], 4)
+        );
+        let id = 0x0001_0005;
+        let job = channel.install(id, 11, template.clone()).unwrap();
+        let head = template.script_head();
+        let mut expected_prefix = job.parts.prefix[..42 + head.len()].to_vec();
+        expected_prefix.extend([0xee; 4]);
+        expected_prefix.extend([5, 0]);
+        assert_eq!(job.parts.prefix, expected_prefix);
+        assert_eq!(job.parts.prefix[41] as usize, head.len() + 4 + 8);
+        let device = [0x42; 4];
+        let mut coinbase = job.parts.prefix.clone();
+        coinbase.extend([7, 0]);
+        coinbase.extend(device);
+        coinbase.extend(&job.parts.suffix);
+        let share = channel
+            .check(
+                Share {
+                    channel_id: 1,
+                    job_id: id,
+                    sequence: 1,
+                    version: template.version,
+                    time: template.current_time,
+                    nonce: 0,
+                    extranonce: &device,
+                },
+                template.current_time,
+            )
+            .unwrap();
+        assert_eq!(share.coinbase.bytes, coinbase);
+        assert_eq!(
+            share.forward.unwrap().extranonce,
+            [5, 0, 7, 0, 0x42, 0x42, 0x42, 0x42]
+        );
+        let mut standard = lane(ChannelKind::Standard, true);
+        let job = standard.install(id, 11, template.clone()).unwrap();
+        let mut zeros = expected_prefix.clone();
+        zeros.extend([7, 0, 0, 0, 0, 0]);
+        assert!(job.standard_coinbase.bytes.starts_with(&zeros));
     }
 
     /// #### PR #42: a SAFA job on the test parent with version rule `mask`
