@@ -2820,3 +2820,28 @@ The sustained integrated plus discrete GPU run (F4) and a coordinator crash
 during an in-flight claim (G3) need this PC's GPUs. A mainnet PHOTON miner
 held the GPU lock throughout the session, so neither was run; both need a
 window in which the operator stops that miner.
+
+## Pickaxe with the BCH P2Pool node on Chipnet (2026-10-18)
+
+The BCH P2Pool node (`BitcoinCash-p2poolv2` at `353e7e60`, debug build) ran
+on Chipnet against a synced local BCHN 29.2.0 node: Mini share chain,
+SV1 and a Noise-encrypted SV2 port (Pickaxe test identity as the authority),
+and `wait_for_chain_sync = false` because it was the first node of a fresh
+share chain with no peers.
+
+- **Pool mode works.** `stratum-v2 serve --upstream stratum2+tcp://…/KEY`
+  with a test-only CPU SV1 device behind it: 6 of 6 shares accepted
+  upstream at difficulty 1, none rejected, and P2Pool promoted share blocks
+  from that work to confirmed heights 1 to 3 of its share chain.
+- **Job Declaration does not connect yet.** Pickaxe's client opens its
+  custom-work channel with `min_extranonce_size = 16` (`JD_ROLLABLE`: job
+  id, local lane and the device's 8 bytes). P2Pool grants at most 8 bytes on
+  extended channels (`EXTRANONCE_SIZE`) and answers
+  `min-extranonce-size-too-large`, so Pickaxe reports a refused channel
+  and keeps the devices on the pool's own jobs, as designed.
+
+Fixing it needs a coinbase-layout change on one side. Recommended: P2Pool
+grants up to 16 bytes to work-selection channels (it allocates the space,
+and checks those channels' custom-job shares by that size instead of a fixed
+8). The alternative is a smaller Job Declaration layout in Pickaxe, which
+would also shrink every device's extranonce. No block was found in this run.
