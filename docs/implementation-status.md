@@ -2814,12 +2814,13 @@ saves does not justify weaker block durability. The GPU console's existing
 light path (`node::fetch_block_template` / `submit_block`) is unchanged.
 Revisit if template bandwidth becomes the bottleneck.
 
-## Deferred live checks (2026-10-18)
+## GPU live checks (2026-10-18)
 
-The sustained integrated plus discrete GPU run (F4) and a coordinator crash
-during an in-flight claim (G3) need this PC's GPUs. A mainnet PHOTON miner
-held the GPU lock throughout the session, so neither was run; both need a
-window in which the operator stops that miner.
+The sustained integrated plus discrete GPU run (F4) and coordinator crashes
+during in-flight claims (G3) need this PC's GPUs, which a mainnet PHOTON
+miner held earlier in the session. Both ran later that day in a window where
+the operator's miner was stopped and then restored; the results, and the
+proof-store fix that window led to, are recorded with PR #53.
 
 ## Pickaxe with the BCH P2Pool node on Chipnet (2026-10-18)
 
