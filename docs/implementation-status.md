@@ -33,7 +33,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check; a coordinator crash during a claim is not exercised live |
-| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live; backup coordinators host-tested; live failover and rigs on separate machines pending |
+| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig passes live failover between two independent coordinators on one PC (PR #53: 2–4 s, 24 unique claims) and across two computers on 2026-10-18: primary on the rig's Windows PC, backup on a Linux computer over Tailscale, six live kills during claims, the rig on the other computer in 2.2–4.3 s every time, 16 distinct claims all confirmed, none duplicated and no baton spent twice; see below. A rig on a third computer, with neither coordinator local, was not part of the run. |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | BCH P2Pool is a separate project (architecture.md). Pickaxe has SV2, TP and Job Declaration boundaries; the sharechain and its payout-distribution integration are not completed by these tests. |
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | SV1 devices at SV2 pools with backup pools in order implemented and tested (pool mode below); Job Declaration in both modes, Pickaxe client to Pickaxe pool, implemented and loopback-tested (below); live Job Declaration runs and coinbase payouts at other pools pending |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Scripted tests pass; remote setup discovery, real ZMQ and live recovery evidence remain. |
@@ -2852,3 +2852,40 @@ would then roll 4 bytes, and since they learn that size when they connect,
 a layout change must reconnect them. It touches the channel, wire, SV1 and
 Job Declaration code (about 40 places) and is left for its own change. No
 block was found in this run.
+
+## Cross-machine rig failover (2026-10-18)
+
+PR #53 head `b374cb5`, with release builds of the same source on two
+computers: the operator's Windows PC (RTX 5070 Ti Laptop GPU) and the
+operator's x86_64 Debian computer, connected over Tailscale. The Linux build
+(rustc 1.98.1) ran from its own folder as an unprivileged user, beside the
+operator's ASIC server, which kept running untouched; the folder was removed
+afterwards. No payout or connection details are recorded here.
+
+One CUDA rig on the PC was given a primary and a backup coordinator
+(`--coordinator` twice). Each was `--rigs-only` with its own state directory,
+claim journal and Fulcrum connection: the primary on the PC, the backup on the
+Linux computer. The PC's mainnet miner was stopped for the 10-minute window
+and restarted after it. The Linux clock was within 0.5 s of the PC's and
+NTP-synchronized.
+
+Each coordinator was killed in turn, three times each and 15–40 s apart at
+random, during live Chipnet claims, then restarted 45 s later with the same
+key. The rig moved to the other computer every time: to the Linux backup in
+4.3 s and back to the primary in 2.2 s. At a median 1.50 GH/s it found 16
+winners at heights 328428–328429. The primary verified and claimed 6 and the
+backup 10. None was stale or rejected, and each winner's digest matches
+exactly one claim. The 16 claims are distinct, no txid was claimed by both
+coordinators, no baton was spent twice, and each claim after the first spends
+the one before it: one baton chain across both computers. The rig's proof
+store was empty at the end.
+
+This PC's own Chipnet node was retired during the window. Every claim was
+checked instead against two public Chipnet Fulcrum servers that neither
+coordinator used: the transaction, the baton it spends, its block, and a
+merkle proof against that block's header. Both servers agree on all 16, and
+all 16 are confirmed: 1 in block 328429 and 15 in 328430.
+
+This shows failover across separate hosts, network paths and clocks. The rig
+and the primary shared the PC, so a rig on a third computer, with neither
+coordinator local, was not part of the run.
