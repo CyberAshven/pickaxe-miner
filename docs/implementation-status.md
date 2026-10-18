@@ -2840,8 +2840,14 @@ share chain with no peers.
   `min-extranonce-size-too-large`, so Pickaxe reports a refused channel
   and keeps the devices on the pool's own jobs, as designed.
 
-Fixing it needs a coinbase-layout change on one side. Recommended: P2Pool
-grants up to 16 bytes to work-selection channels (it allocates the space,
-and checks those channels' custom-job shares by that size instead of a fixed
-8). The alternative is a smaller Job Declaration layout in Pickaxe, which
-would also shrink every device's extranonce. No block was found in this run.
+The fix belongs in Pickaxe. P2Pool's 8 bytes are not a local choice: its
+share header stores the extranonce as a fixed 12-byte array (4 prefix and 8
+rolled, `shares::extranonce::Extranonce`), and peers rebuild declared
+coinbases from it, so a larger grant would change the share-chain format.
+Pickaxe needs a compact Job Declaration layout for pools that grant only 8
+bytes: for example a 2-byte job id, a 2-byte lane and 4 bytes for each
+device, chosen when a 16-byte request is refused. Devices behind the client
+would then roll 4 bytes, and since they learn that size when they connect,
+a layout change must reconnect them. It touches the channel, wire, SV1 and
+Job Declaration code (about 40 places) and is left for its own change. No
+block was found in this run.
