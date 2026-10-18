@@ -149,9 +149,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ac1c861872e5bfc3ea1ac711e07b8738d8e6a9a15088bdca4413edd7a7ddbcb"
+checksum = "b048a0aaca075e6e5f17ce0ce0832f85dbb46c88750a7f482d71b9d5401e2ecc"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -162,7 +162,9 @@ dependencies = [
  "asic-rs-firmwares-braiins",
  "asic-rs-firmwares-elphapex",
  "asic-rs-firmwares-epic",
+ "asic-rs-firmwares-forgeaxe",
  "asic-rs-firmwares-futurebit",
+ "asic-rs-firmwares-goldshell",
  "asic-rs-firmwares-luxminer",
  "asic-rs-firmwares-marathon",
  "asic-rs-firmwares-nerdaxe",
@@ -178,7 +180,9 @@ dependencies = [
  "asic-rs-makes-braiins",
  "asic-rs-makes-elphapex",
  "asic-rs-makes-epic",
+ "asic-rs-makes-forgeaxe",
  "asic-rs-makes-futurebit",
+ "asic-rs-makes-goldshell",
  "asic-rs-makes-marathon",
  "asic-rs-makes-nerdaxe",
  "asic-rs-makes-proto",
@@ -200,9 +204,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-core"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89951990ba73f5a53306df95263cf576b9650a16f1ff438ca6c7a7609bf52e90"
+checksum = "63c3a6e330ac862a4a114800a1d81050443024320f0bdf8f3ebc4542eaeacf4b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -225,9 +229,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-antminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb56b1afd2ca3c826f413311936bc77b3f8ce17feda75079cbf70662a4e933d6"
+checksum = "6fd747c769ab69291c1d20a8901926ddc157c1ad95463d7272a594fa90ab4fda"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -248,9 +252,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-auradine"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1379dd7a035156837d6488d70d40d06aeb9951660e9a0b91f1491371165f984"
+checksum = "128e095a3d0452baa36f1cb894aff4739a18031217647638f79663b7ace44fc0"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -267,9 +271,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-avalonminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd57200d0d1f0558d76a9b78e6fe3651b19147b4ab88f03555e9da5119d872c8"
+checksum = "d620d28a519e035da6cf0a53d1fff55a945237dd9a2e8b597d65ecff32b7f7ed"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -285,9 +289,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-bitaxe"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5f0550f983df35cec9fef0852f4b594277516123bd0ccfe69f3a2398c1a2b0f"
+checksum = "178a9ed9e1aea81326dae7cce3dc42c2babf65c4d2f6f4a72854eb92fdb1c5ba"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -304,9 +308,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-braiins"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "528931a08959d0c4fe41f91349d1df81dedcc1db2a90f0d184fc28837cf91b8a"
+checksum = "d78c84fd124ae870017cd5c17c34754dab8c4e636c580c21e7b3427986ae5e2d"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -325,9 +329,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-elphapex"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe94a0bf5f77570e74d4945a499a0254f42e22da540e379045a4a20d04171f6"
+checksum = "ed64c7646b6a1aac1909e0c3a0913e70398431fd6a391f79c60e7612ab716d4d"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -345,9 +349,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-epic"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c85018ae7c5975d347758c0a75757d3d44976316212835f80c6008a35405fd59"
+checksum = "b29de61ea947f33fe9bf2832aef06119b82e876ed39c76a76c2134875a827147"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -368,10 +372,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "asic-rs-firmwares-futurebit"
-version = "0.8.5"
+name = "asic-rs-firmwares-forgeaxe"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49af119f03fee1eed0e34105df8807c7d7b6ca9fe91b896e062aea2b5c4be8c9"
+checksum = "b6c6f2a4c855aab6c962fa9dbfe77ceb312e644ad4d5f3c8227ab85b0c6aff3c"
+dependencies = [
+ "anyhow",
+ "asic-rs-core",
+ "asic-rs-makes-forgeaxe",
+ "async-trait",
+ "macaddr",
+ "measurements",
+ "once_cell",
+ "reqwest",
+ "semver",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "asic-rs-firmwares-futurebit"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e231518d0c62c6539200aaa701f32ffc88b2a2e66e80ed6e851bd63237beffb6"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -387,10 +410,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "asic-rs-firmwares-luxminer"
-version = "0.8.5"
+name = "asic-rs-firmwares-goldshell"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13b544302d910c097e6b80441812dcae83a6e06f8303ca2400d4083376e34f29"
+checksum = "3d93d1af87806c76c29725d01c4ef59aad9c5faa6ed1a950a4e18a723337381f"
+dependencies = [
+ "anyhow",
+ "asic-rs-core",
+ "asic-rs-makes-goldshell",
+ "async-trait",
+ "macaddr",
+ "measurements",
+ "reqwest",
+ "semver",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "asic-rs-firmwares-luxminer"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cb42c4c93c4c95cc4db475a7c0e1ef04c2071addfed1505926bbfa3c1c3bf0a"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -405,9 +446,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-marathon"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa1ef2deab5c4f6c0734bc56e0e64f9a75439f774aebdf8b2c0dc06567a0fbc4"
+checksum = "7e1e87539d62660aea10e128ffc248fea8160211e87214367509f477a54d32b2"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -425,9 +466,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-nerdaxe"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dee006e782630c3dfe975fd7fa0f11aff0c0da4b3d11b48a0216a1628303fedb"
+checksum = "0c139b48765e02170191ec34d77c0c08cabe70cd8d2fbef3b8cf99ecead4fd90"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -444,9 +485,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-proto"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a19d2da51c47c011fb3b213969d34ab7d0ac0f0ef29b76491f7aaf5aef2333"
+checksum = "b07c408353f923038b6f36840b3bcd40a2ad5398623441516e2bebf50502bfb8"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -464,9 +505,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-sealminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "908610ef356e0c67008084f820db8d1fd6a9b157746b30a7974f7345644726cb"
+checksum = "d90a3fe5d935645ec01e6b84bbdc385f0592e26cf325f0042525af33bb89113b"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -483,9 +524,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-vnish"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4178dec5036890a100514030321081c24a7de19edb7bf111e7c90e545d4795b"
+checksum = "eff281280959bbbf1bc6e073cf0f5a952f29eddc3268fafbf870ba38f94b83c3"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -503,9 +544,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-volcminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f1e3445fcc04a27a4b8f42512494eb375cf8a2d061f78cbca5026f6c89d214c"
+checksum = "05f137af78c357c6975a7e36416e1cd7a19f52c2a606a06126527756f289fb02"
 dependencies = [
  "anyhow",
  "asic-rs-core",
@@ -524,9 +565,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-firmwares-whatsminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ebf7aa87833dc76a04a0a4bb36774450b4496576d012ae45fcea446ad6a7921"
+checksum = "e7c018eab510960f2c0b5d843ec12177da0fee652da24e3b1f92103757d664c7"
 dependencies = [
  "aes",
  "anyhow",
@@ -550,9 +591,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-macros"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08aaf0ef99e9608eaaa3f4376a9abc11f8f41dd0593ae7a136e9b6a9b3443b38"
+checksum = "bc2933fd3da2963505fcb9dc8e269ec86d10a593b188007e9398d8cf01b0d3da"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -561,9 +602,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-antminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7722441ca68860ba82302319f1fb2b08f0f520108f0705735062efe4f0fe11bc"
+checksum = "ca1f7a9f03eb2b0bff2f3b154215019a942b5a79c9e207a24da25337e611a811"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -575,9 +616,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-auradine"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "475d81264d0be989ef3a9db66e51b3247199a2989bf9e35f8c35f3e24adf6cf9"
+checksum = "462514df61939e1e0bba9af9d463d6c9e46a14388d8286de5d884710f8ace571"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -589,9 +630,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-avalon"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ef4eb502b32029ca7a5fe398953b6d450ff31f458ef166851b8f1f50706a656"
+checksum = "f055475ebb0a34fdbdfc87fd0cf524a6f4bedc0c5f6932051e76f5d99df108b5"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -603,9 +644,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-bitaxe"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc01bbdb3ee71531429875801862462966ce20421e5f39393f399ee159bb2ed0"
+checksum = "8817a380a5bce2615d0b17c6b77dbbc27a018e21791cdac6c36fb193037f170f"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -617,9 +658,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-braiins"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5acf5eb0ec49b705a203e8a160a20c03b02b0261ab23ea0af78f497b4931ee40"
+checksum = "157a00c60bbef0ce89920de75eee24045443b5d3a9a426b03a0adef51333b5dd"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -631,9 +672,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-elphapex"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e4f5f1fca9abf95ca6e9d23678c7f22ad6f1ce81c17608bfc93e9ef0aa4c1c3"
+checksum = "2a41a9137cbad6713b6b76d216863346d6dd6b8723de1d6f610eb34e43747d73"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -645,9 +686,23 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-epic"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e182fbc012f7fb6637410f0a5ded4a96df58f2475f93520c40e88b455d93dd9"
+checksum = "ae3e3d0ba3ac4aeb6fb9544484b21558e498a997d729519ca9764145559d905f"
+dependencies = [
+ "asic-rs-core",
+ "asic-rs-macros",
+ "serde",
+ "serde_json",
+ "strum",
+ "ts-rs",
+]
+
+[[package]]
+name = "asic-rs-makes-forgeaxe"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd953054c5ceae858df3f28d4848006aeb9583102710b5ce00f49d4377e40d61"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -659,9 +714,23 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-futurebit"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a9279f66c799c6690b757320f7d777ff3f3b7575df10f5a9d274df68a1d5d58"
+checksum = "fbffcd6e35d4a94140c0a0befe4c7120de764be06faf171f0342983e166e6122"
+dependencies = [
+ "asic-rs-core",
+ "asic-rs-macros",
+ "serde",
+ "serde_json",
+ "strum",
+ "ts-rs",
+]
+
+[[package]]
+name = "asic-rs-makes-goldshell"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "addebecbb472e2cc49ec951b3cb9a8261c1db923c84d862fbd4a8fc43f32873e"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -673,9 +742,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-marathon"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a16fcb3c0b314e32766eddbe9fb6158abdaa5f1851d75caa1d3199b6ed10cf09"
+checksum = "a2433b388d7cc9d419b614d8ee958a3c2bf890546c4eba1fe669397755216be6"
 dependencies = [
  "asic-rs-core",
  "serde",
@@ -686,9 +755,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-nerdaxe"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aae19a01044ef4ae3088cba8561e0d84b64859f67fb9968db6cbdf9b006701e5"
+checksum = "10619b72078e727f9b14e8dde55857c3c7798d79418c8f2093c6ef5d8d80280c"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -700,9 +769,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-proto"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d36634ce417cd5d792856fbd94784344b851214c0d8cc50b2eba5faf97d0b3d"
+checksum = "9278332cbb60af35a441a44b24513fc7913a74c1b3c4919c1c5f3c285dd77e34"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -714,9 +783,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-sealminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1927b991574686215476711c0ce1c59783f85a776e10cc4c8ab91a953d34ace3"
+checksum = "7922710b970242312739acb81b8d96ce8cc72979184468311ff2acc0153ad88f"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -728,9 +797,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-volcminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbce4d9c6e9853004634d51e68ecd274a5b3723eee6bec97b7c92bd6db18739a"
+checksum = "b2e0eff2bea6f7c6f30d4736a83ddb0314d94e6fd15ab187cc148081c658f3e9"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -742,9 +811,9 @@ dependencies = [
 
 [[package]]
 name = "asic-rs-makes-whatsminer"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5da5aebd5e0e7cb441bef2ce0763095aeae2ad32af3820d1bbaef32c019abbe"
+checksum = "c992664c347b80b9385e5bc7e42c33bada5f0271536dbdebab85595d3047c839"
 dependencies = [
  "asic-rs-core",
  "asic-rs-macros",
@@ -3282,7 +3351,7 @@ dependencies = [
  "secp256k1 0.33.1",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "stratum-core",
  "tokio",
  "tungstenite",
@@ -3767,6 +3836,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4092,15 +4162,27 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
  "itoa",
  "memchr",
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
+ "serde",
 ]
 
 [[package]]
@@ -4127,9 +4209,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
@@ -4562,9 +4644,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
