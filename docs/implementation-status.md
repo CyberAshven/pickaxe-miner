@@ -34,7 +34,7 @@ true at each checkpoint; the table is the current index, not a new scope.
 | G1 | Coordinator CLI, payout, chain connections, claim journal and relay | End-to-end coordinator process tests | `mine --rigs-listen`, or `--rigs-only` with no GPU; the normal miner's payout, chain connections, claim journal and relay; live two-rig Chipnet test below |
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check. On 2026-10-18 five live coordinator kills during rig claims, one with a claim journal open, lost no winner and spent no baton twice; all 130 claims confirmed. The same test found #53's proof store stopping a busy rig, fixed below. |
-| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig now passes synthetic primary-to-backup failover on one PC with reused job IDs, and live coordinator crashes during claims on one PC; see below. Cross-machine failover remains pending. |
+| G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig now passes synthetic primary-to-backup failover on one PC with reused job IDs, live coordinator crashes during claims, and live failover between two independent coordinators in both directions on one PC (2–4 s, 24 unique claims); see below. Failover across separate machines remains pending. |
 | D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | BCH P2Pool is a separate project (architecture.md). Pickaxe has SV2, TP and Job Declaration boundaries; the sharechain and its payout-distribution integration are not completed by these tests. |
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pool mode and both Job Declaration modes implemented; local live Chipnet shares, custom jobs and payouts checked on 2026-10-15. Pool failover delivered fresh real-node jobs on 2026-10-16 without hashing. Independent external-pool interoperability and accepted blocks through failover/JD remain pending. |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Real ZMQ and TP new-parent/minimum-difficulty delivery checked on 2026-10-15; remote guided setup and live recovery remain. |
@@ -63,8 +63,10 @@ and its earlier timestamp-validation change is already in merged #48.
   blocks through pool failover/JD and independent pool interoperability (D2),
   and remote guided-node recovery (D3). Previous narrow tests remain valid
   evidence, but do not complete these broader checks. One-PC coordinator
-  crashes during claims (G3) and a sustained integrated/discrete GPU run (F4)
-  passed on 2026-10-18.
+  crashes during claims (G3), live failover between two independent
+  coordinators (G4, one PC) and a sustained integrated/discrete GPU run (F4)
+  passed on 2026-10-18. Cross-machine failover needs SSH access to the
+  operator's Linux computer, which its Tailscale policy refused.
 - **External prerequisites:** a compatible Knuth provider (S2), native SV2
   ASIC firmware (S3/S4), author-approved token contracts/deployments and VM
   proofs (T1/T2), and Intel/discrete AMD/Linux GPU/Apple Silicon hardware
@@ -3050,7 +3052,8 @@ rig as before.
 **Fixed build, live.** The same five crashes plus four minutes of steady
 mining: 31 winners in one block (height 328410), all verified, none stale or
 rejected, 31 distinct claims, no baton spent twice, and the store empty at the
-end. The claims were in the mempool when checked. Fewer winners per minute
+end. All 31 confirmed at a later check, as did the 26 of the stopped run.
+Fewer winners per minute
 than on `dev` came from the token, not the build: its target had tightened
 about ninefold after the window's earlier claims.
 
@@ -3058,9 +3061,22 @@ about ninefold after the window's earlier claims.
 Medians: RTX 1,489.5 MH/s (p10–p90 1,475–1,510), AMD 24.4 MH/s (22.4–24.6).
 189 winners (183 + 6): 188 claims and 1 stale, none rejected, no device error,
 still mining at the end. Per-minute `nvidia-smi`: 74–88 °C, 94–124 W and
-94–99 % utilization. 109 claims were confirmed at the check and the rest were
-in the mempool. No single-GPU baseline ran in the same window, so this shows
-stability and correctness, not scaling.
+94–99 % utilization. All 188 claims confirmed at a later check. No
+single-GPU baseline ran in the same window, so this shows stability and
+correctness, not scaling.
+
+**Backup coordinator failover (G4), fixed build.** One CUDA rig was given a
+primary and a backup coordinator (`--coordinator` twice), each `--rigs-only`
+with its own state directory, claim journal and chain connection, standing in
+for coordinators on other machines; they ran from a renamed copy of the
+executable so the rig's check for older local GPU miners did not count them.
+Each coordinator was killed in turn, three times, during live claims and
+restarted 45 s later with the same key. The rig moved to the survivor every
+time: primary to backup in 4.0 s, backup to primary in 2.0 s. It found 24
+winners; the primary verified and claimed 15 and the backup 9, none stale or
+rejected, 24 distinct claims and no baton spent twice, with the rig's proof
+store empty at the end. The claims were in the mempool at the check. Separate
+hardware (another machine's network and clock) is still to be shown.
 
 Checks: formatting, strict all-feature Clippy (rustc 1.98.1), and 779 library
 and 18 CLI host tests with the CUDA-only tests filtered. Two new regressions: a
