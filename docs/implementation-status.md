@@ -2889,3 +2889,43 @@ all 16 are confirmed: 1 in block 328429 and 15 in 328430.
 This shows failover across separate hosts, network paths and clocks. The rig
 and the primary shared the PC, so a rig on a third computer, with neither
 coordinator local, was not part of the run.
+
+## Compact Job Declaration layout for 8-byte pools (2026-10-18)
+
+#### PR #56
+
+BCH P2Pool grants at most 8 rollable extranonce bytes, the size its share
+chain stores, and answered Pickaxe's 16-byte request with
+`min-extranonce-size-too-large`. The client now asks once more for 8 and
+uses a compact layout: the job id's low 2 bytes, any padding, a 2-byte lane
+and 4 bytes for each device. Pools granting 16 (Pickaxe pools) keep the
+16-byte layout byte for byte. Devices learn their size at connection, so a
+compact lane rolls 4 bytes (SV1 devices through the adapter get a 4-byte
+extranonce2), and a lane opened on the other layout is disconnected at its
+next job and reconnects on the plan's.
+
+Live on Chipnet against the P2Pool node (`353e7e60`, debug build, the
+synced local BCHN 29.2.0 node, a fresh peerless Mini share chain): the
+work-selection channel now opens with 8 bytes. Job Declaration still stops
+at the token: P2Pool's tokens anchor a PPLNS window, and its custom jobs
+must pay exactly those PPLNS outputs, a zero-value auxiliary commitment,
+canonical padding and a share commitment, with sequence `0xfffffffe` and
+locktime `height - 1` (its `docs/bch-job-declaration.md`). Pickaxe's client
+accepts only a Pickaxe pool's token, whose rates it can pay, and reports
+`the pool's tokens are not a Pickaxe pool's; Job Declaration needs one`.
+Building P2Pool's coinbase needs its share-chain window and its payout
+rounding, and is the remaining D1 work. P2Pool keeps 8 rollable bytes after
+its upstream share-header change, so the compact layout stays the path there.
+Its maintainers plan a node API that returns a token's exact coinbase outputs
+for a coinbase value, after their first alpha; Pickaxe should use that rather
+than reimplement PPLNS. Until then Pickaxe reaches P2Pool in pool mode.
+
+Checks: formatting, strict all-feature Clippy (rustc 1.98.1), and 772 of 773
+library tests and 18 CLI tests with CUDA-only tests filtered. The one
+failure, a 4 MiB Noise frame given 60 s in a debug build under the full
+suite and a running GPU miner, is in unchanged transport code and passed
+three runs alone. New: the compact plan's sizes, a compact lane's coinbase
+and forwarded bytes (and refusal of the other layout), and a loopback
+client at a pool granting 8 whose 4-byte device's block reaches the
+miner's node with its share accepted at the pool; that test fails without
+the second request.

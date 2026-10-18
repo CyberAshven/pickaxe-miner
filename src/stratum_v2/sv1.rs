@@ -432,7 +432,13 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
             1.0
         },
         Target::from_le_bytes([255; 32]),
-        8,
+        // #### PR #56: the local server grants 8, or 4 on a compact Job
+        // Declaration lane; a remote pool must grant the adapter's 8.
+        if upstream.remote {
+            8
+        } else {
+            super::jd::COMPACT_DEVICE_EXTRANONCE as u16
+        },
     )
     .map_err(|_| "cannot open firmware channel")?;
     send.send(encoded(
@@ -778,7 +784,8 @@ impl Bridge {
         route: Option<DonationRoute>,
     ) -> Result<Self, String> {
         let size = open.extranonce_size as usize;
-        if open.request_id != 1 || size != 8 && !(remote && size > 8) {
+        let compact = !remote && size == super::jd::COMPACT_DEVICE_EXTRANONCE;
+        if open.request_id != 1 || size != 8 && !(remote && size > 8) && !compact {
             return Err("unexpected SV2 extranonce allocation".into());
         }
         let user = Lane::new(&open)?;

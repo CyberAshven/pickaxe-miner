@@ -11,7 +11,7 @@ use super::{
         codec::parse_outputs,
         server::{Custom, Declarator},
         token::PxToken,
-        ForwardShare, CUSTOM_JOB_BIT, JD_ROLLABLE,
+        ForwardShare, COMPACT_DEVICE_EXTRANONCE, CUSTOM_JOB_BIT, JD_ROLLABLE,
     },
     telemetry::ShareEvent,
     template::{meets_target, BchTemplate, CoinbaseParts, Hash},
@@ -21,7 +21,7 @@ use crate::donation::bch::BchPayout;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
 };
@@ -39,6 +39,15 @@ const MAX_CHANNELS: usize = 32;
 /// #### PR #42: channels on a connection whose extended channels are
 /// grouped: a proxy such as SRI's translator opens one per miner behind it.
 const MAX_GROUPED_CHANNELS: usize = 256;
+
+/// #### PR #42: the lanes a Job Declaration client's local channels take,
+/// from one server-wide counter. #### PR #56: and the layout of the last
+/// plan a job carried, for channels opened while no plan is current.
+#[derive(Default)]
+pub struct Lanes {
+    next: AtomicU32,
+    compact: AtomicBool,
+}
 
 /// #### PR #42: a group channel: the extended channels of one payout
 /// identity on a connection, which share each template's job frame.
@@ -76,7 +85,7 @@ pub struct MiningSession {
     custom_jobs: u32,
     /// #### PR #42: a Job Declaration client's local server: each channel
     /// takes a lane from this server-wide counter as its extranonce prefix.
-    lanes: Option<Arc<AtomicU32>>,
+    lanes: Option<Arc<Lanes>>,
     /// #### PR #42: whether this connection's extended channels are grouped,
     /// and its groups by id.
     grouping: bool,
@@ -150,7 +159,7 @@ impl MiningSession {
 
     /// #### PR #42: a Job Declaration client's local server, whose channels
     /// take lanes from `lanes`.
-    pub fn set_lanes(&mut self, lanes: Option<Arc<AtomicU32>>) {
+    pub fn set_lanes(&mut self, lanes: Option<Arc<Lanes>>) {
         self.lanes = lanes;
     }
 
@@ -198,6 +207,9 @@ impl MiningSession {
     ) -> Result<Vec<SerializedFrame>, String> {
         self.current = Some((id, generation, template.clone()));
         self.payout_policy = payout;
+        if let (Some(lanes), Some(plan)) = (&self.lanes, template.jd_plan()) {
+            lanes.compact.store(plan.compact, Ordering::Relaxed);
+        }
         let mut frames = Vec::new();
         // #### PR #42: the group broadcast
         // What: on each template, a group of two or more extended channels
@@ -618,13 +630,17 @@ impl MiningSession {
             .clone()
             .filter(|_| self.work_selection)
             .ok_or("jd-not-supported")?;
-        let payout = self
+        let (payout, extranonce) = self
             .channels
             .get(&request.channel_id)
             .filter(|channel| channel.custom_only)
-            .ok_or("invalid-channel-id")?
-            .payout()
-            .to_owned();
+            .map(|channel| {
+                (
+                    channel.payout().to_owned(),
+                    channel.extranonce_prefix.len() + channel.rollable(),
+                )
+            })
+            .ok_or("invalid-channel-id")?;
         let context = self
             .current
             .as_ref()
@@ -655,8 +671,9 @@ impl MiningSession {
         }
         let prefix = request.coinbase_prefix.as_ref();
         // The script: the client's prefix, this channel's 16-byte prefix and
-        // the client's 16 rollable bytes, at most 100 bytes.
-        let script = prefix.len() + 16 + JD_ROLLABLE;
+        // the client's rollable bytes (16, #### PR #56: or what this channel
+        // was granted), at most 100 bytes.
+        let script = prefix.len() + extranonce;
         if !prefix.starts_with(&context.height_push()) || script > 100 {
             return Err("invalid-coinbase-prefix");
         }
@@ -673,7 +690,7 @@ impl MiningSession {
         let mut suffix = request.coinbase_tx_input_n_sequence.to_le_bytes().to_vec();
         suffix.extend_from_slice(outputs);
         suffix.extend_from_slice(&request.coinbase_tx_locktime.to_le_bytes());
-        if head.len() + 16 + JD_ROLLABLE + suffix.len() < 65 {
+        if head.len() + extranonce + suffix.len() < 65 {
             return Err("invalid-coinbase-tx");
         }
         let merkle_path = request
@@ -838,8 +855,24 @@ impl MiningSession {
         // custom-only, with 16 rollable bytes; its standard channels are
         // refused, as the spec names.
         let custom_only = self.work_selection && kind == ChannelKind::Extended;
+        // #### PR #56: a Job Declaration lane takes the current plan's
+        // layout, or the last plan's while none is current; a compact lane's
+        // device rolls 4 bytes.
+        let compact = self.lanes.as_ref().is_some_and(|lanes| {
+            self.current
+                .as_ref()
+                .and_then(|(_, _, template)| template.jd_plan())
+                .map_or_else(
+                    || lanes.compact.load(Ordering::Relaxed),
+                    |plan| plan.compact,
+                )
+        });
         let rollable = if custom_only {
-            JD_ROLLABLE
+            self.declarator
+                .as_ref()
+                .map_or(JD_ROLLABLE, |declarator| declarator.grant())
+        } else if compact {
+            COMPACT_DEVICE_EXTRANONCE
         } else {
             DEVICE_EXTRANONCE_SIZE
         };
@@ -899,10 +932,10 @@ impl MiningSession {
             channel.set_operator(Some(&public.address))?;
         }
         if let Some(lanes) = &self.lanes {
-            channel.set_lane(lanes.fetch_add(1, Ordering::Relaxed));
+            channel.set_lane(lanes.next.fetch_add(1, Ordering::Relaxed), compact);
         }
         if custom_only {
-            channel.custom_only = true;
+            channel.set_custom_only(rollable);
             let (_, _, template) = self.current.as_ref().unwrap();
             channel.settle(&template.target, None, &maximum);
             let frame = mining(Mining::OpenExtendedMiningChannelSuccess(
@@ -910,7 +943,7 @@ impl MiningSession {
                     request_id: request,
                     channel_id: channel.id,
                     target: (&channel.target).into(),
-                    extranonce_size: JD_ROLLABLE as u16,
+                    extranonce_size: rollable as u16,
                     extranonce_prefix: channel.extranonce_prefix.as_slice().try_into().unwrap(),
                     group_channel_id: 0,
                 },
@@ -971,7 +1004,7 @@ impl MiningSession {
                     request_id: request,
                     channel_id: channel.id,
                     target: (&target).into(),
-                    extranonce_size: DEVICE_EXTRANONCE_SIZE as u16,
+                    extranonce_size: channel.rollable() as u16,
                     extranonce_prefix: channel.extranonce_prefix.as_slice().try_into().unwrap(),
                     group_channel_id: group,
                 },

@@ -265,6 +265,8 @@ pub(super) struct Running {
     pub(super) templates: Option<SocketAddr>,
     /// #### PR #42: a Job Declaration client's uplink thread.
     uplink: Option<thread::JoinHandle<()>>,
+    /// #### PR #56: a pool's Job Declaration rules, when it accepts them.
+    pub(super) declarator: Option<Arc<super::jd::server::Declarator>>,
 }
 
 impl Running {
@@ -617,7 +619,7 @@ impl Running {
             declared_journal_path: declarator
                 .as_ref()
                 .map(|_| state_directory.0.join("jd-blocks.json")),
-            declarator,
+            declarator: declarator.clone(),
             uplink: uplink.as_ref().map(|(handle, _)| handle.clone()),
             preferred,
             token_donation: header_work
@@ -656,6 +658,7 @@ impl Running {
             state_directory,
             templates: template_address,
             uplink: uplink.map(|(_, thread)| thread),
+            declarator,
         };
         running.wait(|stats| stats.template_ready);
         running
@@ -704,6 +707,8 @@ struct Device {
     id: u32,
     prefix: Vec<u8>,
     extended: bool,
+    /// #### PR #56: the extranonce bytes the device rolls.
+    rolled: usize,
 }
 
 impl Device {
@@ -712,6 +717,13 @@ impl Device {
     }
 
     fn connect_as(server: &Running, extended: bool, identity: &str) -> Self {
+        let device = Self::connect_rolling(server, extended, identity, 8);
+        assert_eq!(device.rolled, 8);
+        device
+    }
+
+    /// #### PR #56: a device asking for at least `rolling` extranonce bytes.
+    fn connect_rolling(server: &Running, extended: bool, identity: &str, rolling: u16) -> Self {
         let (mut sender, mut receiver) = Session::initiate(
             TcpStream::connect(server.address).unwrap(),
             server.authority,
@@ -748,7 +760,7 @@ impl Device {
                 user_identity: identity.try_into().unwrap(),
                 nominal_hash_rate: 1000.0,
                 max_target: (&maximum).into(),
-                min_extranonce_size: 8,
+                min_extranonce_size: rolling,
             })
         } else {
             Mining::OpenStandardMiningChannel(OpenStandardMiningChannel {
@@ -760,17 +772,17 @@ impl Device {
         };
         sender.send(mining(open).unwrap()).unwrap();
         let mut response = receiver.receive(Duration::from_secs(3)).unwrap().unwrap();
-        let (id, prefix) = if extended {
+        let (id, prefix, rolled) = if extended {
             assert_eq!(
                 response.header().msg_type(),
                 MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
             );
             let opened: OpenExtendedMiningChannelSuccess =
                 binary_sv2::from_bytes(response.payload()).unwrap();
-            assert_eq!(opened.extranonce_size, 8);
             (
                 opened.channel_id,
                 opened.extranonce_prefix.as_ref().to_vec(),
+                usize::from(opened.extranonce_size),
             )
         } else {
             assert_eq!(
@@ -782,6 +794,7 @@ impl Device {
             (
                 opened.channel_id,
                 opened.extranonce_prefix.as_ref().to_vec(),
+                8,
             )
         };
         Self {
@@ -790,6 +803,7 @@ impl Device {
             id,
             prefix,
             extended,
+            rolled,
         }
     }
 
@@ -821,7 +835,7 @@ impl Device {
 
     fn solve_and_submit(&mut self, sequence: u32) -> String {
         let mut frame = self.receive();
-        let extra = [sequence as u8; 8];
+        let extra = vec![sequence as u8; self.rolled];
         let (job_id, version, root) = if self.extended {
             assert_eq!(
                 frame.header().msg_type(),
@@ -831,7 +845,7 @@ impl Device {
             assert!(job.version_rolling_allowed);
             let mut coinbase = job.coinbase_tx_prefix.as_ref().to_vec();
             coinbase.extend(&self.prefix);
-            coinbase.extend(extra);
+            coinbase.extend(&extra);
             coinbase.extend(job.coinbase_tx_suffix.as_ref());
             let mut root = sha256d::Hash::hash(&coinbase).to_byte_array();
             for sibling in job.merkle_path.iter() {
@@ -3032,6 +3046,52 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
     assert_eq!(found.result, Some("submitted by the miner's node"));
     let summary = format!("{:?}", client.stats.lock().unwrap().jd_client);
     assert!(!summary.contains("bchtest"), "{summary}");
+    device.sender.close();
+}
+
+// #### PR #56
+// What: a pool granting only 8 rollable bytes, as BCH P2Pool does, refuses
+// the client's 16; the client asks again for 8 and mines in the compact
+// layout. Its local device rolls 4 bytes on a 2-byte lane, the device's
+// block reaches the miner's node, and the forwarded share is accepted on
+// the pool's custom job.
+// Look here if: the compact layout or the uplink's channel request changes.
+#[test]
+fn a_pool_granting_8_bytes_gets_the_compact_layout() {
+    let pool = Running::jd_pool(super::payout::PublicPool {
+        fee: Some(crate::donation::bch::PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: crate::donation::bch::FeeMode::Work,
+        }),
+        address: address(0x34),
+    });
+    pool.declarator.as_ref().unwrap().set_grant(8);
+    let miner_node = pool_node();
+    let client = Running::jd_client(miner_node.clone(), &pool, super::jd::JdMode::CoinbaseOnly);
+    client.wait(|stats| {
+        stats
+            .jd_client
+            .as_ref()
+            .is_some_and(|jd| jd.state == "active" && jd.custom_jobs >= 1)
+    });
+    let mut device = Device::connect_rolling(&client, true, "cpu", 4);
+    assert_eq!((device.prefix.len(), device.rolled), (2, 4));
+    device.solve_and_submit(0);
+    client.wait(|stats| stats.blocks_accepted == 1);
+    assert_eq!(miner_node.lock().unwrap().submitted.len(), 1);
+    pool.wait(|stats| {
+        stats
+            .jd_server
+            .as_ref()
+            .is_some_and(|jd| jd.custom_jobs >= 1 && jd.blocks >= 1)
+            && stats.shares_accepted >= 1
+    });
+    client.wait(|stats| {
+        stats
+            .jd_client
+            .as_ref()
+            .is_some_and(|jd| jd.forwarded >= 1 && jd.accepted >= 1 && jd.rejected == 0)
+    });
     device.sender.close();
 }
 
