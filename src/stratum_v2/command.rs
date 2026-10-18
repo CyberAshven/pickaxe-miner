@@ -296,10 +296,11 @@ pub fn run(
         pools
             .into_iter()
             .map(|pool| super::sv1::Upstream {
-                donation: Some(super::sv1::DonationRoute {
-                    identity: crate::donation::bch::address(config.network).to_owned(),
-                    rate: donation.clone(),
-                }),
+                donation: Some(donation_route(
+                    config.network,
+                    &pool.identity,
+                    donation.clone(),
+                )),
                 prefer: preferred.clone(),
                 ..pool
             })
@@ -976,6 +977,42 @@ pub fn run(
         None => Ok(()),
     };
     result.and(server_result).and(firmware_result)
+}
+
+// #### PR #59
+// What: when the device's identity names a share address (`,p2p=`, as a
+// BCH P2Pool node with no share address of its own requires), the donation
+// channel names the donation key's own share address the same way; refused
+// (a node with a share address of its own refuses another), it asks once
+// more under the bare donation address.
+// Why: such a node refused the bare donation address, which dropped the
+// donation at every P2Pool pool of that kind. P2Pool's own block donation
+// is the pool's and separate from Pickaxe's.
+// Look here if: the donation channel is refused at a P2Pool node.
+fn donation_route(
+    network: crate::config::MiningNetwork,
+    identity: &str,
+    rate: Arc<RwLock<crate::donation::bch::BchDonation>>,
+) -> super::sv1::DonationRoute {
+    let address = crate::donation::bch::address(network).to_owned();
+    let names_share = identity
+        .split_once([',', ' '])
+        .is_some_and(|(_, options)| options.contains("p2p="));
+    match names_share
+        .then(|| crate::tx::p2pool_share_address(&address).ok())
+        .flatten()
+    {
+        Some(share) => super::sv1::DonationRoute {
+            identity: format!("{address},p2p={share}"),
+            rate,
+            fallback: Some(address),
+        },
+        None => super::sv1::DonationRoute {
+            identity: address,
+            rate,
+            fallback: None,
+        },
+    }
 }
 
 /// #### PR #40
