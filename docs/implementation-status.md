@@ -3075,7 +3075,7 @@ restarted 45 s later with the same key. The rig moved to the survivor every
 time: primary to backup in 4.0 s, backup to primary in 2.0 s. It found 24
 winners; the primary verified and claimed 15 and the backup 9, none stale or
 rejected, 24 distinct claims and no baton spent twice, with the rig's proof
-store empty at the end. The claims were in the mempool at the check. Separate
+store empty at the end. All 24 confirmed in block 328418. Separate
 hardware (another machine's network and clock) is still to be shown.
 
 Checks: formatting, strict all-feature Clippy (rustc 1.98.1), and 779 library
