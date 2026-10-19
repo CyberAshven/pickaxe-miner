@@ -801,7 +801,7 @@ fn screen(
     layout: &std::sync::Mutex<String>,
 ) -> Result<(), String> {
     use crossterm::{
-        event::{self, Event, KeyCode, KeyEventKind},
+        event::{self, Event, KeyEventKind},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -824,6 +824,7 @@ fn screen(
         selected: 0,
         show_qr: None,
         status: String::new(),
+        editing: false,
     };
     while !stop.load(Ordering::Relaxed) {
         take_events(runtimes, &mut events);
@@ -859,28 +860,54 @@ fn screen(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        view.status.clear();
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => stop.store(true, Ordering::SeqCst),
-            KeyCode::Up => view.selected = (view.selected + slots.len() - 1) % slots.len(),
-            KeyCode::Down => view.selected = (view.selected + 1) % slots.len(),
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('-') => {
-                let up = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
-                let total = total(slots.iter().map(|slot| slot.share.load(Ordering::Relaxed)));
-                let slot = &slots[view.selected];
-                match step(slot.share.load(Ordering::Relaxed), total, up) {
-                    Ok(next) => slot.share.store(next, Ordering::Relaxed),
-                    Err(error) => view.status = error,
-                }
-            }
-            KeyCode::Char('f') => {
-                let funded = electric.pot.is_some_and(|(_, claims)| claims > 0);
-                view.show_qr = Some(!view.show_qr.unwrap_or(!funded));
-            }
-            _ => {}
+        let funded = electric.pot.is_some_and(|(_, claims)| claims > 0);
+        if on_key(&mut view, slots, funded, key.code) {
+            stop.store(true, Ordering::SeqCst);
         }
     }
     Ok(())
+}
+
+/// Applies one key to the split screen; true stops mining. Only q quits, as
+/// on the main mining screen, and a share changes only after Enter opens it,
+/// so a stray key neither stops the miner nor moves the split.
+fn on_key(view: &mut View, slots: &[Slot], funded: bool, code: crossterm::event::KeyCode) -> bool {
+    use crossterm::event::KeyCode;
+    view.status.clear();
+    match code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+        KeyCode::Esc if view.editing => view.editing = false,
+        KeyCode::Esc => view.status = "q stops mining and quits".into(),
+        KeyCode::Up => {
+            view.editing = false;
+            view.selected = (view.selected + slots.len() - 1) % slots.len();
+        }
+        KeyCode::Down => {
+            view.editing = false;
+            view.selected = (view.selected + 1) % slots.len();
+        }
+        KeyCode::Enter => view.editing = !view.editing,
+        KeyCode::Left | KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('-')
+            if !view.editing =>
+        {
+            view.status = format!(
+                "Press Enter to change {}'s share",
+                slots[view.selected].token.name()
+            );
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('-') => {
+            let up = matches!(code, KeyCode::Right | KeyCode::Char('+'));
+            let total = total(slots.iter().map(|slot| slot.share.load(Ordering::Relaxed)));
+            let slot = &slots[view.selected];
+            match step(slot.share.load(Ordering::Relaxed), total, up) {
+                Ok(next) => slot.share.store(next, Ordering::Relaxed),
+                Err(error) => view.status = error,
+            }
+        }
+        KeyCode::Char('f') => view.show_qr = Some(!view.show_qr.unwrap_or(!funded)),
+        _ => {}
+    }
+    false
 }
 
 /// The screen's own state: the picked token, the QR choice (`None`: shown
@@ -889,6 +916,8 @@ struct View {
     selected: usize,
     show_qr: Option<bool>,
     status: String,
+    /// The picked token's share is open for ←/→ (Enter opens and closes it).
+    editing: bool,
 }
 
 /// Everything one frame draws.
@@ -1028,7 +1057,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &Shown<'_>) {
         areas[1],
     );
     frame.render_widget(
-        Paragraph::new("↑/↓ token · ←/→ share ±5% · f fee pot QR · q quit (pending claims saved)"),
+        Paragraph::new(if state.view.editing {
+            "←/→ share ±5% · Enter done"
+        } else {
+            "↑/↓ token · Enter change share · f fee pot QR · q quit (pending claims saved)"
+        }),
         areas[2],
     );
 }
@@ -1293,6 +1326,51 @@ mod tests {
     }
 
     #[test]
+    fn a_share_changes_only_after_enter_and_esc_never_quits() {
+        use crossterm::event::KeyCode;
+        let (photon, electric) = (Fake::new(true, 1), Fake::new(true, 1));
+        let slots = slots_of(&photon, &electric);
+        let shares = |slots: &[Slot]| {
+            (
+                slots[0].share.load(Ordering::Relaxed),
+                slots[1].share.load(Ordering::Relaxed),
+            )
+        };
+        let mut view = View {
+            selected: 0,
+            show_qr: None,
+            status: String::new(),
+            editing: false,
+        };
+        // A stray arrow key leaves 80/20 alone and says how to change it.
+        assert!(!on_key(&mut view, &slots, false, KeyCode::Right));
+        assert!(!on_key(&mut view, &slots, false, KeyCode::Left));
+        assert_eq!(shares(&slots), (80, 20));
+        assert_eq!(view.status, "Press Enter to change PHOTON's share");
+        // Esc no longer stops the miner.
+        assert!(!on_key(&mut view, &slots, false, KeyCode::Esc));
+        assert_eq!(view.status, "q stops mining and quits");
+        // Enter opens the share for ←/→, and Enter again keeps it.
+        on_key(&mut view, &slots, false, KeyCode::Enter);
+        on_key(&mut view, &slots, false, KeyCode::Left);
+        assert_eq!(shares(&slots), (75, 20));
+        on_key(&mut view, &slots, false, KeyCode::Enter);
+        on_key(&mut view, &slots, false, KeyCode::Left);
+        assert_eq!(shares(&slots), (75, 20));
+        // Moving to another token or Esc closes an open share.
+        on_key(&mut view, &slots, false, KeyCode::Enter);
+        on_key(&mut view, &slots, false, KeyCode::Down);
+        assert_eq!((view.selected, view.editing), (1, false));
+        on_key(&mut view, &slots, false, KeyCode::Enter);
+        assert!(!on_key(&mut view, &slots, false, KeyCode::Esc));
+        assert!(!view.editing);
+        on_key(&mut view, &slots, false, KeyCode::Right);
+        assert_eq!(shares(&slots), (75, 20));
+        // Only q quits.
+        assert!(on_key(&mut view, &slots, false, KeyCode::Char('q')));
+    }
+
+    #[test]
     fn the_scheduler_gives_each_token_its_share_and_releases_every_hold_at_stop() {
         let (photon, electric) = (Fake::new(true, 1), Fake::new(true, 1));
         let slots = slots_of(&photon, &electric);
@@ -1391,6 +1469,7 @@ mod tests {
             selected: 1,
             show_qr: None,
             status: String::new(),
+            editing: false,
         };
         let text = |electric: &crate::electric::ui::Summary| {
             screen_text(&Shown {
@@ -1418,7 +1497,7 @@ mod tests {
             " Fund the pot ".into(),
             "PHOTON job g=1".into(),
             "ELECTRIC Connected: wss://example".into(),
-            "←/→ share ±5%".into(),
+            "Enter change share".into(),
         ] {
             assert!(unfunded.contains(&expected), "{expected}: {unfunded}");
         }

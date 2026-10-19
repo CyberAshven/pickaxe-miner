@@ -776,6 +776,9 @@ struct SetupFlow {
     /// #### PR #53: a hash split between every GPU token, and its shares.
     split: bool,
     split_shares: Option<crate::hash_split::Shares>,
+    /// A share changes only after Enter opens it for editing, so a stray
+    /// arrow key cannot move a split the operator settled on.
+    share_editing: bool,
     /// #### PR #53: the fee pot's balance as Start read it (sats, claims
     /// it pays), and the pot whose shortfall Start already warned about, so
     /// the next press starts anyway. Tests swap the reader.
@@ -968,6 +971,7 @@ impl SetupFlow {
             electric_pot: None,
             split: false,
             split_shares: None,
+            share_editing: false,
             pot_balance: None,
             pot_warned: None,
             pot_reader: crate::electric::miner::pot_balance,
@@ -2336,6 +2340,7 @@ impl SetupFlow {
 
     fn open_settings(&mut self, row: SettingsRow) {
         self.step = SetupStep::Settings;
+        self.share_editing = false;
         // #### PR #42: a row inside the closed Advanced section opens it.
         if !self.settings_rows().contains(&row) {
             self.advanced_open = true;
@@ -2780,6 +2785,8 @@ impl SetupFlow {
         let row = self.current_row();
         self.status_line.clear();
         match key.code {
+            // Esc first closes a share being edited, keeping its value.
+            KeyCode::Esc if self.share_editing => self.share_editing = false,
             KeyCode::Esc => {
                 if let Some(index) = self.active_profile {
                     self.step = SetupStep::Profiles;
@@ -2788,8 +2795,14 @@ impl SetupFlow {
                     self.step = SetupStep::Token;
                 }
             }
-            KeyCode::Up => self.settings_row = (self.settings_row + rows.len() - 1) % rows.len(),
-            KeyCode::Down => self.settings_row = (self.settings_row + 1) % rows.len(),
+            KeyCode::Up => {
+                self.share_editing = false;
+                self.settings_row = (self.settings_row + rows.len() - 1) % rows.len();
+            }
+            KeyCode::Down => {
+                self.share_editing = false;
+                self.settings_row = (self.settings_row + 1) % rows.len();
+            }
             KeyCode::Left | KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('-') => {
                 let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
                 match row {
@@ -2820,6 +2833,9 @@ impl SetupFlow {
                             self.config.intensity.saturating_sub(10).max(10)
                         };
                         let _ = self.config.set_intensity(next);
+                    }
+                    SettingsRow::Share(_) if !self.share_editing => {
+                        self.status_line = "Press Enter to change the split.".into();
                     }
                     // #### PR #53: 5% steps, never past 100% in all.
                     SettingsRow::Share(index) => {
@@ -3290,7 +3306,14 @@ impl SetupFlow {
                 },
                 SettingsRow::Gpu => self.step = SetupStep::Gpus,
                 SettingsRow::Token => self.open_token_list(),
-                SettingsRow::Intensity | SettingsRow::AsicTarget | SettingsRow::Share(_) => {
+                SettingsRow::Share(_) => {
+                    self.share_editing = !self.share_editing;
+                    if self.share_editing {
+                        self.status_line =
+                            "Left/Right changes this share in 5% steps; Enter keeps it.".into();
+                    }
+                }
+                SettingsRow::Intensity | SettingsRow::AsicTarget => {
                     self.status_line = "Use Left/Right to change this row.".into();
                 }
             },
@@ -5599,7 +5622,11 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                         "░".repeat(20 - filled),
                         share
                     )),
-                    "< >  5% steps",
+                    if state.share_editing && state.current_row() == row {
+                        "< >  5% steps · [Enter] done"
+                    } else {
+                        "[Enter] change"
+                    },
                 )
             }
             SettingsRow::Fulcrum => (
@@ -8600,15 +8627,25 @@ mod tests {
                 SettingsRow::Start
             ]
         );
-        // 50/50 at first, so PHOTON cannot go up until ELECTRIC goes down.
+        // A share stays put until Enter opens it, so a stray key cannot
+        // move the split.
         setup.open_settings(SettingsRow::Share(0));
+        assert!(setup_text(&setup).contains("50%   [Enter] change"));
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.shares().get(photon), 50);
+        assert_eq!(setup.status_line, "Press Enter to change the split.");
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup_text(&setup).contains("50%   < >  5% steps · [Enter] done"));
+        // 50/50 at first, so PHOTON cannot go up until ELECTRIC goes down.
         setup.handle_key(key(KeyCode::Right));
         assert!(setup.status_line.contains("100%"), "{}", setup.status_line);
         setup.open_settings(SettingsRow::Share(1));
+        setup.handle_key(key(KeyCode::Enter));
         for _ in 0..6 {
             setup.handle_key(key(KeyCode::Left));
         }
         setup.open_settings(SettingsRow::Share(0));
+        setup.handle_key(key(KeyCode::Enter));
         for _ in 0..6 {
             setup.handle_key(key(KeyCode::Right));
         }
@@ -8617,6 +8654,20 @@ mod tests {
             (shares.get(photon), shares.get(SplitToken::Electric)),
             (80, 20)
         );
+        // Enter keeps the share and locks it again; Esc closes an open share
+        // without leaving the settings, and moving away closes it too.
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.shares().get(photon), 80);
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Esc));
+        assert_eq!(setup.step, SetupStep::Settings);
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.shares().get(photon), 80);
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Down));
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.shares().get(SplitToken::Electric), 20);
         let screen = setup_text(&setup);
         for expected in [
             "· hash split",
@@ -8665,6 +8716,7 @@ mod tests {
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
         // With ELECTRIC at 0% the split mines PHOTON alone: no pot to check.
         setup.open_settings(SettingsRow::Share(1));
+        setup.handle_key(key(KeyCode::Enter));
         for _ in 0..4 {
             setup.handle_key(key(KeyCode::Left));
         }
@@ -8686,6 +8738,7 @@ mod tests {
         assert_eq!(reopened.token_selected, reopened.split_index());
         // And with nothing at all, Start says so.
         setup.open_settings(SettingsRow::Share(0));
+        setup.handle_key(key(KeyCode::Enter));
         for _ in 0..16 {
             setup.handle_key(key(KeyCode::Left));
         }
