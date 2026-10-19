@@ -339,6 +339,13 @@ pub enum StratumV2Command {
     /// Show a running server's workers table, read-only (for example a
     /// service started with --no-tui). Use the same --config as the server.
     Watch,
+    /// #### PR #59: Print the BCH P2Pool share address of a P2PKH address
+    /// (default: the configured payout address). A P2Pool node with no share
+    /// address of its own needs one in --upstream-user, after ",p2p=".
+    ShareAddress {
+        /// A P2PKH CashAddr from the wallet whose key should own the shares.
+        address: Option<String>,
+    },
     /// Serve encrypted BCH mining jobs to SV2 devices.
     Serve {
         /// Listener address. Use a LAN address to connect an external ASIC.
