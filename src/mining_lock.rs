@@ -1,4 +1,5 @@
-//! One GPU mining session per operating-system user, across Pickaxe windows.
+//! One GPU mining session per GPU and operating-system user, across Pickaxe
+//! windows (#### PR #60: per GPU, not per PC, when GPUs report their PCI location).
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,16 @@ fn gpu_lock_path() -> Result<PathBuf, String> {
 }
 
 fn try_lock(path: &Path) -> Result<File, String> {
+    lock_file(
+        path,
+        false,
+        "another Pickaxe GPU miner is already running; close it before starting this one",
+    )
+}
+
+/// Locks `path` exclusively, or shared beside other shared holders; `busy`
+/// is the error when another process holds it.
+fn lock_file(path: &Path, shared: bool, busy: &str) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("create GPU lock directory: {error}"))?;
@@ -27,11 +38,13 @@ fn try_lock(path: &Path) -> Result<File, String> {
         .truncate(false)
         .open(path)
         .map_err(|error| format!("open GPU session lock: {error}"))?;
-    file.try_lock().map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => {
-            "another Pickaxe GPU miner is already running; close it before starting this one"
-                .to_string()
-        }
+    let locked = if shared {
+        file.try_lock_shared()
+    } else {
+        file.try_lock()
+    };
+    locked.map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => busy.to_string(),
         std::fs::TryLockError::Error(error) => format!("enforce GPU session lock: {error}"),
     })?;
     Ok(file)
@@ -149,8 +162,14 @@ fn old_pickaxe_process_running() -> Result<bool, String> {
     result
 }
 
+/// Every GPU, as a miner whose GPUs' PCI locations are unknown takes them.
 pub fn acquire_gpu_lock() -> Result<File, String> {
     let lock = try_lock(&gpu_lock_path()?)?;
+    refuse_beside_old_miner()?;
+    Ok(lock)
+}
+
+fn refuse_beside_old_miner() -> Result<(), String> {
     #[cfg(windows)]
     if old_pickaxe_process_running()? {
         return Err(
@@ -158,7 +177,60 @@ pub fn acquire_gpu_lock() -> Result<File, String> {
                 .into(),
         );
     }
-    Ok(lock)
+    Ok(())
+}
+
+// #### PR #60
+// What: a miner whose GPUs all report their PCI location shares the
+// machine-wide lock and takes one lock per GPU, so two miners can run on
+// different GPUs of one PC (PHOTON on one, ELECTRIC on another). A GPU with
+// no PCI location, and every older build, takes the machine-wide lock
+// exclusively, which still keeps every other miner off every GPU.
+// Why: one lock per PC kept a second token's miner off an idle GPU.
+// Look here if: two miners share one GPU, or a miner is refused beside one
+// that mines another GPU.
+/// What a GPU miner holds while it mines.
+pub struct GpuLocks {
+    _held: Vec<File>,
+}
+
+/// Locks the GPUs in `gpus` (see `GpuLocks`).
+pub fn acquire_gpu_locks(gpus: &[crate::backend::GpuDevice]) -> Result<GpuLocks, String> {
+    let held = lock_gpus(
+        &gpu_lock_path()?,
+        gpus.iter().map(|gpu| gpu.pci).collect::<Option<Vec<_>>>(),
+    )?;
+    refuse_beside_old_miner()?;
+    Ok(GpuLocks { _held: held })
+}
+
+fn lock_gpus(
+    machine: &Path,
+    pcis: Option<Vec<crate::backend::PciAddress>>,
+) -> Result<Vec<File>, String> {
+    let Some(mut pcis) = pcis.filter(|pcis| !pcis.is_empty()) else {
+        return Ok(vec![try_lock(machine)?]);
+    };
+    pcis.sort();
+    pcis.dedup();
+    let mut held = vec![lock_file(
+        machine,
+        true,
+        "another Pickaxe GPU miner is using every GPU; close it before starting this one",
+    )?];
+    for pci in pcis {
+        let name = format!(
+            "gpu-{:04x}-{:02x}-{:02x}-{:x}.lock",
+            pci.domain, pci.bus, pci.device, pci.function
+        );
+        let busy = format!(
+            "the GPU at PCI {:02x}:{:02x}.{:x} is already mining in another Pickaxe; \
+             choose another GPU with --device, or close that miner",
+            pci.bus, pci.device, pci.function
+        );
+        held.push(lock_file(&machine.with_file_name(name), false, &busy)?);
+    }
+    Ok(held)
 }
 
 #[cfg(test)]
@@ -175,6 +247,37 @@ mod tests {
         let second = try_lock(&path).unwrap();
         drop(second);
         let _ = fs::remove_file(path);
+    }
+
+    // #### PR #60: miners on different GPUs run together; one on the same
+    // GPU, or beside a miner holding every GPU, is refused.
+    #[test]
+    fn miners_share_the_pc_only_on_different_gpus() {
+        use crate::backend::PciAddress;
+        let dir = std::env::temp_dir().join(format!("pickaxe-gpu-locks-{}", std::process::id()));
+        let machine = dir.join("gpu.lock");
+        let pci = |bus| PciAddress {
+            domain: 0,
+            bus,
+            device: 0,
+            function: 0,
+        };
+        let photon = lock_gpus(&machine, Some(vec![pci(1)])).unwrap();
+        let electric = lock_gpus(&machine, Some(vec![pci(0xc4), pci(0xc4)])).unwrap();
+        assert!(lock_gpus(&machine, Some(vec![pci(1)]))
+            .unwrap_err()
+            .contains("already mining"));
+        assert!(lock_gpus(&machine, None)
+            .unwrap_err()
+            .contains("already running"));
+        drop((photon, electric));
+        let every = lock_gpus(&machine, None).unwrap();
+        assert!(lock_gpus(&machine, Some(vec![pci(1)]))
+            .unwrap_err()
+            .contains("every GPU"));
+        drop(every);
+        assert!(lock_gpus(&machine, Some(Vec::new())).is_ok());
+        let _ = fs::remove_dir_all(dir);
     }
 
     // #### PR #52

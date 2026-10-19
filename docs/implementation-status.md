@@ -2929,3 +2929,27 @@ and forwarded bytes (and refusal of the other layout), and a loopback
 client at a pool granting 8 whose 4-byte device's block reaches the
 miner's node with its share accepted at the pool; that test fails without
 the second request.
+
+## One GPU lock per GPU (2026-10-19)
+
+#### PR #60
+
+The GPU lock was one file per PC, so a second token's miner could not use an
+idle GPU: ELECTRIC on the integrated GPU was refused while PHOTON mined on the
+discrete one. A miner whose GPUs all report their PCI location now shares the
+machine-wide lock and takes one lock per GPU. A GPU with no PCI location, and
+every older build, still takes the machine-wide lock exclusively, so no
+miner can share a GPU with another, and an older build keeps everyone out.
+The Windows check that refuses to start beside an unmarked older
+`pickaxe_miner.exe`/`pickaxe.exe` (#52) is unchanged.
+
+Live on this PC on mainnet: PHOTON (`mine --token PHOTON --backend cuda`) on
+the RTX 5070 Ti at 100% utilization and ELECTRIC (`electric mine --device 1`)
+on the AMD integrated GPU at about 45 MH/s ran together. ELECTRIC claimed
+twice at height 973544 within two minutes of starting
+(`1fd2b841…5771` at difficulty 4 and `149a5cfa…db50` at difficulty 3) while
+PHOTON kept mining.
+
+Checks: a new test runs two miners on different PCI locations together and
+refuses a third on the same GPU, a whole-machine miner beside them, and a
+per-GPU miner beside a whole-machine one.

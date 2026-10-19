@@ -205,8 +205,8 @@ pub fn run(
                 config_path,
                 false,
             )?;
-            let _gpu_lock = crate::mining_lock::acquire_gpu_lock()?;
             let devices = crate::backend::resolve_electric_devices(backend, devices)?;
+            let _gpu_lock = crate::mining_lock::acquire_gpu_locks(&devices)?;
             session(
                 cfg,
                 deployment,
@@ -289,8 +289,8 @@ pub fn run_from_setup(
     gpus: &[crate::backend::GpuDevice],
     config_path: &Path,
 ) -> Result<(), String> {
-    let _gpu_lock = crate::mining_lock::acquire_gpu_lock()?;
     let devices = crate::backend::electric_engines_for(gpus.to_vec())?;
+    let _gpu_lock = crate::mining_lock::acquire_gpu_locks(&devices)?;
     session(
         cfg,
         &ElectricDeploymentArgs::default(),
