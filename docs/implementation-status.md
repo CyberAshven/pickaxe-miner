@@ -3,9 +3,11 @@
 Scope: all decisions, steps and follow-ups in `next-steps.md`, plus the SV2
 design in `stratum-v2.md` and the ELECTRIC implementation in #51. A scaffold
 or passing build is not completion.
-Current base: `dev` at `699a96e`, including merged #32, #35, #38, #40,
-#42 through #49, #51 and #52 (audited 2026-10-17). Historical entries below record what was
-true at each checkpoint; the table is the current index, not a new scope.
+Current base: `dev` at `5b1065c` (merged into #53 on 2026-10-19), including
+merged #32, #35, #38, #40, #42 through #49 and #51 through #59. The table was
+audited on 2026-10-17 and updated for G4 and ELECTRIC on 2026-10-19.
+Historical entries below record what was true at each checkpoint; the table
+is the current index, not a new scope.
 
 ## Invariants
 
@@ -39,14 +41,14 @@ true at each checkpoint; the table is the current index, not a new scope.
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pool mode and both Job Declaration modes implemented; local live Chipnet shares, custom jobs and payouts checked on 2026-10-15. Pool failover delivered fresh real-node jobs on 2026-10-16 without hashing. Independent external-pool interoperability and accepted blocks through failover/JD remain pending. |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Real ZMQ and TP new-parent/minimum-difficulty delivery checked on 2026-10-15; remote guided setup and live recovery remain. |
 | T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | SAFA reference core, firmware work path, worker, simulated Chipnet test token and setup implemented in #42. Registry remains empty pending a deployed author contract and covenant-VM/live proof. |
-| T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Case A/B commitments, independent reference proof verification, journals, worker and JD integration implemented in #42; docs/merge-mining.md exists. Author covenant/VM proof and deployment remain external prerequisites. |
+| T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Case A/B commitments, independent reference proof verification, journals, worker and JD integration implemented in #42; docs/merge-mining.md exists. Author covenant/VM proof and deployment remain external prerequisites. #53 adds a VM proof that PHOTON's live contract can be the parent of an AuxPoW token (docs/photon-electric-auxpow.md); that token's contract is the author's. |
 | F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Audited merged #35: claim readiness no longer waits for another GPU batch; shutdown still drains safely. Existing host regression retained and passing; no new GPU soak claimed. |
 | F2 | Intel, native HIP discrete AMD, Linux GPU and Apple Silicon validation | Actual hardware reports; compile results are insufficient | Pending hardware evidence |
 | F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | PR #48 adds native WDDM utilization and dedicated-memory counters to the shared sampler, matched by PCI address. Live counter reads passed for the NVIDIA discrete and AMD integrated adapters on one Windows PC. Missing/ambiguous PCI identity, linked adapters and unavailable counters remain unsupported; power, temperature and clocks still need vendor support. |
 | F4 | Sustained integrated + discrete GPU test | Long serial comparison, correctness and thermals | 20-minute Chipnet run on 2026-10-18 with the RTX 5070 Ti (CUDA) and AMD integrated (wgpu) together: medians 1,489.5 and 24.4 MH/s, 189 winners, none rejected, 74–88 °C. No single-GPU baseline in the same window. |
 | F5 | Next feature release version bump | Version/release plan approved for actual release | Deferred until release is ordered |
-| E1 | Pickaxe-managed ELECTRIC recovery key and owner refund | Restart/key-file checks, negative covenant VM proofs and funded recovery | Merged #51 implements a separate pot recovery key, keyless constrained claims and signed owner refunds. Host tests and BCH VM proofs pass; funded claim/refund and lost-race validation remain. |
-| E2 | ELECTRIC setup and operation alongside the other miner modes | Setup funding/top-up flow and integrated CPU lifecycle | The CLI offers `electric pot/status/mine/refund`. The earlier setup-wizard and automatic sidecar design is not implemented; today the CPU miner is a separate command. |
+| E1 | Pickaxe-managed ELECTRIC recovery key and owner refund | Restart/key-file checks, negative covenant VM proofs and funded recovery | Merged #51 implements a separate pot recovery key, keyless constrained claims and signed owner refunds. Host tests and BCH VM proofs pass. Funded claims confirmed on Chipnet (2026-10-18, #58) and mainnet (2026-10-19, below). A lost race, a held proof sent after a top-up and a signed refund remain to show live. |
+| E2 | ELECTRIC setup and operation alongside the other miner modes | Setup funding/top-up flow and integrated CPU lifecycle | Merged #58: ELECTRIC mines on GPUs and is a token in the setup, which makes the fee pot and shows its QR code as soon as the payout is in; its screen shows the pot's balance and the QR again whenever the pot cannot pay. The setup does not read the pot's balance before Start. Mining ELECTRIC beside PHOTON on the same GPUs (the automatic sidecar) is not implemented; run together, the two split the GPU (docs/photon-electric-auxpow.md). |
 
 ## Remaining work after the #51/#52 merges
 
@@ -54,8 +56,8 @@ Use #53 for the remaining Pickaxe changes and evidence. The older #50 design
 is superseded by #51: its documentation was revised in the implementation,
 and its earlier timestamp-validation change is already in merged #48.
 
-- **Implementation:** GBT-light (S1), ELECTRIC setup and automatic sidecar
-  integration (E2), and Pickaxe's eventual P2Pool launch/payout integration
+- **Implementation:** GBT-light (S1), ELECTRIC beside PHOTON on the same
+  GPUs (E2; its setup merged in #58), and Pickaxe's eventual P2Pool launch/payout integration
   (D1). The BCH P2Pool sharechain itself remains a separate project, as stated
   in `architecture.md`; an SV2 connection alone does not finish it.
 - **Available hardware/access:** a fresh physical ASIC donation audit using
@@ -70,9 +72,9 @@ and its earlier timestamp-validation change is already in merged #48.
   ASIC firmware (S3/S4), author-approved token contracts/deployments and VM
   proofs (T1/T2), and Intel/discrete AMD/Linux GPU/Apple Silicon hardware
   runs (F2). The registry stays empty until token prerequisites are met.
-- **Funded ELECTRIC validation:** a claim, a lost race retaining its pot,
-  restart/top-up and signed refund (E1). The local key/VM tests do not prove
-  network acceptance, and the author's existing replay weakness remains.
+- **Funded ELECTRIC validation:** claims are confirmed on Chipnet and
+  mainnet; a lost race retaining its pot, restart/top-up and a signed refund
+  remain (E1). The author's existing replay weakness remains.
 
 PR #53's GPU session isolation and journal lock fixes passed all CI and
 packaging checks at `a3761c5`, which includes the merged #51/#52 source.
@@ -3221,3 +3223,25 @@ and forwarded bytes (and refusal of the other layout), and a loopback
 client at a pool granting 8 whose 4-byte device's block reaches the
 miner's node with its share accepted at the pool; that test fails without
 the second request.
+
+## ELECTRIC on mainnet: first funded claims (2026-10-19)
+
+#### PR #53
+
+The operator funded a mainnet fee pot (with its recovery key, as in #51 and
+#58) from a wallet. With the operator's PHOTON miner paused for the window
+and restarted after it, a release build of `dev` with #58 ran
+`electric mine --once` on the RTX 5070 Ti Laptop GPU over CUDA. A dry run
+first found a valid proof within seconds at 2,710 MH/s and sent nothing.
+Then two claims on the baton at height 973515:
+
+- `72a975a9…3016`, for one of the two donation addresses, at difficulty 4;
+- `d6db3c02…f5ff`, for the payout, the cheap claim after it at difficulty 3.
+
+Both confirmed in block 973516, checked through a Fulcrum server neither
+claim used. Afterwards `electric status` read 717,383 sats in one coin in the
+pot, and the baton still at the payout's claim (tip 973519, claim 1,469). No
+payout details are recorded here.
+
+Not shown: a lost race, a proof held while the pot was empty and sent after a
+top-up, and a signed refund.
