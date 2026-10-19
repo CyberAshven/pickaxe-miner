@@ -6,6 +6,7 @@
 //! or reimplements P2Pool's logic: P2Pool is updated, not integrated.
 pub mod http;
 pub mod launch;
+pub mod own;
 pub mod release;
 pub mod screen;
 

@@ -150,13 +150,31 @@ pub(crate) fn cashaddr_with_version(
     hash: &[u8],
     network: crate::config::MiningNetwork,
 ) -> String {
-    let mut decoded = vec![version];
-    decoded.extend_from_slice(hash);
-    let payload = convert_bits(&decoded, 8, 5, true).unwrap();
     let prefix = match network {
         crate::config::MiningNetwork::Mainnet => "bitcoincash",
         crate::config::MiningNetwork::Chipnet => "bchtest",
     };
+    cashaddr_with_prefix(prefix, version, hash)
+}
+
+/// #### PR #61: the BCH P2Pool share address of a P2PKH CashAddr: the same
+/// key under the share chain's prefix (`p2pool:` for `bitcoincash:`,
+/// `tp2pool:` for `bchtest:`), as P2Pool's `bch-share-address` prints it.
+/// A miner names it with `p2p=` when the node has no share address of its own.
+pub fn p2pool_share_address(address: &str) -> Result<String, String> {
+    let locking = cashaddr_to_p2pkh_locking(address)?;
+    let prefix = if address.trim().to_ascii_lowercase().starts_with("bchtest:") {
+        "tp2pool"
+    } else {
+        "p2pool"
+    };
+    Ok(cashaddr_with_prefix(prefix, 0, &locking[3..23]))
+}
+
+fn cashaddr_with_prefix(prefix: &str, version: u8, hash: &[u8]) -> String {
+    let mut decoded = vec![version];
+    decoded.extend_from_slice(hash);
+    let payload = convert_bits(&decoded, 8, 5, true).unwrap();
     let mut checksum_input: Vec<u8> = prefix.bytes().map(|c| c & 31).collect();
     checksum_input.push(0);
     checksum_input.extend_from_slice(&payload);
@@ -1378,5 +1396,21 @@ mod tests {
         );
         assert!(set_payout_value_sats(&mut candidate, 674).is_err());
         assert!(set_payout_value_sats(&mut candidate, 886).is_err());
+    }
+
+    // #### PR #61: the vectors P2Pool v0.0.1-alpha's `bch-share-address`
+    // prints for the two donation addresses; a P2SH address has no share key.
+    #[test]
+    fn p2pool_share_addresses_match_p2pools_own_encoding() {
+        assert_eq!(
+            p2pool_share_address("bitcoincash:qze95tc2dqrnltvxfa5yhunwx5952f34fvw4g6365k").unwrap(),
+            "p2pool:qze95tc2dqrnltvxfa5yhunwx5952f34fvcnerd5h8"
+        );
+        assert_eq!(
+            p2pool_share_address("bchtest:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcma6x2tvp").unwrap(),
+            "tp2pool:qrzq5f9ltv70u4su7d40agd4nlnp8qlgqcpjxs8987"
+        );
+        let p2sh = cashaddr_with_version(8, &[7; 20], crate::config::MiningNetwork::Mainnet);
+        assert!(p2pool_share_address(&p2sh).is_err());
     }
 }

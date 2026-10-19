@@ -187,8 +187,8 @@ addresses, serial numbers and host names are never collected. Device
 addresses are used only for these queries and never appear in the dashboard
 or JSON. The overview page (Tab) shows each device's model and power.
 
-The setup screen starts the same server: choose ASIC, then "BCH + all
-merge-mined tokens", and set a payout address and your BCH node. It listens on
+The setup screen starts the same server: choose ASIC, then "BCH +
+merge-mined CashTokens", and set a payout address and your BCH node. It listens on
 the local network (SV1 on port 3333, SV2 on 3336) and the workers page shows
 this computer's address to point devices at, and names each device by the
 worker name its owner set (`rig1`, or `rig1` in `ADDRESS.rig1`; an address
@@ -418,6 +418,13 @@ shares, or never answers them within two minutes: after eight such donation
 shares in a row (#### PR #48), since only accepted donation shares repay the
 donation's work. Native SV2 devices such as Bitaxe can connect to SV2 pools
 themselves.
+
+#### PR #61: `--own-p2pool` (with `--sv1-listen`, instead of `--upstream`)
+mines at your own BCH P2Pool node: the server installs, updates and starts
+P2Pool with the configuration's node, ZMQ block notices and payout, mines at
+it as at any SV2 pool under `<payout>,p2p=<share address>`, shows P2Pool's
+and the node's lights on its dashboard, and stops P2Pool when it stops. See
+[p2pool.md](p2pool.md).
 
 Evidence, 2026-10-08: Pickaxe's own server as the pool, over TCP with Noise
 and a host name (two blocks mined, both counted by the adapter), and SoloFury's

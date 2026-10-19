@@ -8,11 +8,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// #### PR #61: how many GPUs the hash split can hold one by one.
+pub const MAX_HELD_GPUS: usize = 64;
+
 pub struct Monitor {
     pub stop: Arc<AtomicBool>,
     pub paused: AtomicBool,
     /// #### PR #53: the hash split holds the GPUs for another token.
     pub held: AtomicBool,
+    /// #### PR #61: or one GPU alone, by its place in the session's GPUs
+    /// (the first `MAX_HELD_GPUS`).
+    held_gpus: Box<[AtomicBool]>,
     /// #### PR #53: a search is running: the pot can pay and the baton is
     /// minable, so ELECTRIC wants its share of the GPUs.
     pub searching: AtomicBool,
@@ -95,6 +101,7 @@ impl Monitor {
             stop: Arc::new(AtomicBool::new(false)),
             paused: AtomicBool::new(false),
             held: AtomicBool::new(false),
+            held_gpus: (0..MAX_HELD_GPUS).map(|_| AtomicBool::new(false)).collect(),
             searching: AtomicBool::new(false),
             intensity: AtomicU8::new(intensity),
             hashes: AtomicU64::new(0),
@@ -112,6 +119,48 @@ impl Monitor {
     }
     pub fn stopped(&self) -> bool {
         self.stop.load(Relaxed)
+    }
+
+    /// #### PR #61: holds or releases the GPU at `device` alone.
+    pub fn hold_gpu(&self, device: usize, held: bool) {
+        if let Some(gpu) = self.held_gpus.get(device) {
+            gpu.store(held, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// #### PR #61: whether the GPU at `device` waits for its turn.
+    pub fn gpu_held(&self, device: usize) -> bool {
+        self.held.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .held_gpus
+                .get(device)
+                .is_some_and(|gpu| gpu.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// #### PR #61: each of the first `count` GPUs' hashes a second while
+    /// it mines (not while held), over the last five seconds; 0 before it
+    /// measured.
+    pub fn gpu_rates(&self, count: usize) -> Vec<f64> {
+        let view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        (0..count)
+            .map(|device| {
+                let (hashes, busy) = view
+                    .samples
+                    .iter()
+                    .filter(|(_, sample, _, _)| *sample == device)
+                    .fold(
+                        (0u64, Duration::ZERO),
+                        |(hashes, busy), &(_, _, count, took)| {
+                            (hashes + u64::from(count), busy + took)
+                        },
+                    );
+                if busy.is_zero() {
+                    0.0
+                } else {
+                    hashes as f64 / busy.as_secs_f64()
+                }
+            })
+            .collect()
     }
     pub fn wait(&self, duration: Duration) {
         let start = Instant::now();

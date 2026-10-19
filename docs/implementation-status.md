@@ -37,7 +37,7 @@ is the current index, not a new scope.
 | G2 | Rig CLI using every local GPU, pushed jobs and unique search keys | Multiple rigs/devices with independent winner verification | `mine --coordinator`, every local GPU, its own search key; live with a CUDA rig and a wgpu rig below |
 | G3 | Coordinator re-verification, pause, durable claim and successor broadcast | Races, crashes/restart, stale winners and accepted claim | 349 live rig winners checked and claimed with successor jobs, 3 stale, none rejected, 346 confirmed in blocks at the check. On 2026-10-18 five live coordinator kills during rig claims, one with a claim journal open, lost no winner and spent no baton twice; all 130 claims confirmed. The same test found #53's proof store stopping a busy rig, fixed below. |
 | G4 | SV2 rig transport, backup coordinator failover, unified dashboard | Disconnect/failover tests without duplicate claims | Noise transport with the coordinator's pinned key, dashboard and JSON rig rows live. A real CUDA rig passes live failover between two independent coordinators on one PC (PR #53: 2–4 s, 24 unique claims) and across two computers on 2026-10-18: primary on the rig's Windows PC, backup on a Linux computer over Tailscale, six live kills during claims, the rig on the other computer in 2.2–4.3 s every time, 16 distinct claims all confirmed, none duplicated and no baton spent twice; see below. A rig on a third computer, with neither coordinator local, was not part of the run. |
-| D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | BCH P2Pool is a separate project (architecture.md) that Pickaxe calls, never changes. Pickaxe has SV2, TP and Job Declaration boundaries. #53 adds `pickaxe p2pool`: P2Pool installed from its releases (SHA-256 and GitHub digest checked, rollback), auto-updated by default, run as a supervised child with Pickaxe's node and payout, and lights for P2Pool and the node; green on Chipnet with the Start9 BCHN on 2026-10-19 (docs/p2pool.md). The ASIC server preferring it with solo as fallback remains. |
+| D1 | P2Pool first-class/default destination beside own node | BCH sharechain interoperability and payouts | BCH P2Pool is a separate project (architecture.md) that Pickaxe calls, never changes. Pickaxe has SV2, TP and Job Declaration boundaries. #53 adds `pickaxe p2pool`: P2Pool installed from its releases (SHA-256 and GitHub digest checked, rollback), auto-updated by default, run as a supervised child with Pickaxe's node and payout, and lights for P2Pool and the node; green on Chipnet with the Start9 BCHN on 2026-10-19 (docs/p2pool.md). #61: the ASIC setup joins a P2Pool node or runs your own with your node (`serve --own-p2pool`), under `<payout>,p2p=<share address>`, with P2Pool's and the node's lights on the dashboard; a list of choices, with no automatic switch to solo. Running a P2Pool node for other miners remains. |
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pool mode and both Job Declaration modes implemented; local live Chipnet shares, custom jobs and payouts checked on 2026-10-15. Pool failover delivered fresh real-node jobs on 2026-10-16 without hashing. Independent external-pool interoperability and accepted blocks through failover/JD remain pending. |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Real ZMQ and TP new-parent/minimum-difficulty delivery checked on 2026-10-15; remote guided setup and live recovery remain. |
 | T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | SAFA reference core, firmware work path, worker, simulated Chipnet test token and setup implemented in #42. Registry remains empty pending a deployed author contract and covenant-VM/live proof. |
@@ -48,7 +48,7 @@ is the current index, not a new scope.
 | F4 | Sustained integrated + discrete GPU test | Long serial comparison, correctness and thermals | 20-minute Chipnet run on 2026-10-18 with the RTX 5070 Ti (CUDA) and AMD integrated (wgpu) together: medians 1,489.5 and 24.4 MH/s, 189 winners, none rejected, 74–88 °C. No single-GPU baseline in the same window. |
 | F5 | Next feature release version bump | Version/release plan approved for actual release | Deferred until release is ordered |
 | E1 | Pickaxe-managed ELECTRIC recovery key and owner refund | Restart/key-file checks, negative covenant VM proofs and funded recovery | Merged #51 implements a separate pot recovery key, keyless constrained claims and signed owner refunds. Host tests and BCH VM proofs pass. Funded claims confirmed on Chipnet (2026-10-18, #58) and mainnet (2026-10-19, below). A lost race, a held proof sent after a top-up and a signed refund remain to show live. |
-| E2 | ELECTRIC setup and operation alongside the other miner modes | Setup funding/top-up flow and integrated CPU lifecycle | Merged #58: ELECTRIC mines on GPUs and is a token in the setup, which makes the fee pot and shows its QR code as soon as the payout is in; its screen shows the pot's balance and the QR again whenever the pot cannot pay. #53 adds the token hash split (docs/hash-split.md): ELECTRIC beside PHOTON on the same GPUs, each for its share in 5% steps, an empty pot's share going to PHOTON, and Start reading the pot's balance first; on mainnet at 80/20 ELECTRIC mined at 19% of its solo rate and claimed twice on 2026-10-19. |
+| E2 | ELECTRIC setup and operation alongside the other miner modes | Setup funding/top-up flow and integrated CPU lifecycle | Merged #58: ELECTRIC mines on GPUs and is a token in the setup, which makes the fee pot and shows its QR code as soon as the payout is in; its screen shows the pot's balance and the QR again whenever the pot cannot pay. #53 adds the token hash split (docs/hash-split.md): ELECTRIC beside PHOTON on the same GPUs, each for its share in 5% steps, an empty pot's share going to PHOTON, and Start reading the pot's balance first; on mainnet at 80/20 ELECTRIC mined at 19% of its solo rate and claimed twice on 2026-10-19. #61: the setup reads the pot's balance while it shows (every 30 s), ELECTRIC and the split save profiles, and on several GPUs the split gives whole GPUs first, weighed by measured speed, with turns only on the GPUs left over. |
 
 ## Remaining work after the #51/#52 merges
 
@@ -3245,3 +3245,38 @@ payout details are recorded here.
 
 Not shown: a lost race, a proof held while the pot was empty and sent after a
 top-up, and a signed refund.
+
+## Setup choices, P2Pool from the ASIC setup and a split by whole GPUs
+
+#### PR #61
+
+Branch `feat/setup-pools`, on `dev` at `9f783d8` with
+`feat/p2pool-alpha-upstream` (P2Pool share addresses and the donation
+channel at P2Pool alpha nodes) merged in.
+
+- **ASIC setup:** the targets are named "BCH + merge-mined CashTokens" and
+  "ASIC-exclusive CashTokens (SAFA, ...)". Join a pool's Pool type is a
+  normal SV2 pool or P2Pool. With P2Pool, "Your templates" off joins a
+  P2Pool node (its HOST:PORT and key); on, Pickaxe runs your own P2Pool node
+  with your BCH node. Start checks for a P2PKH payout (P2Pool pays shares to
+  a key), the node's address and key, or your node and its ZMQ notices.
+  "Your templates" is a main row for a normal pool too.
+- **Server:** `stratum-v2 serve --own-p2pool` starts P2Pool as `pickaxe
+  p2pool run` would (installing or updating it first) and mines at it; the
+  dashboard's top line has colored lights: P2Pool and Node for your own
+  P2Pool node, Pool when joining one, Node (and Pool for Job Declaration)
+  when building templates.
+- **GPU setup:** the farm hint names HiveOS, mmpOS, RaveOS and SimpleMining
+  OS. ELECTRIC and the hash split save profiles; their choices, like
+  P2Pool's, are kept in `profile-choices.json` beside the profiles, which
+  stay readable by every build. The fee pot's balance is read in the
+  background while the pot shows.
+- **Hash split on several GPUs:** each GPU is held on its own; whole GPUs go
+  to tokens first and only the rest take turns; GPUs are weighed by their
+  measured rates (the same for one model) after three rounds of turns on
+  every GPU; a token that starts or stops being able to mine starts a new
+  round at once. See docs/hash-split.md.
+
+Not in this change: GPUs mining BCH (with merge-mined CashTokens) over SV2
+pools and P2Pool, which needs a BCH header kernel; running a P2Pool node for
+other miners from the setup.
