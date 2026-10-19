@@ -20,6 +20,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Keep the project-owned audit image tested even when no release is due.
+  scanner-docker:
+    name: Verify scanner Docker image
+    uses: ./.github/workflows/scanner-docker.yml
+    with:
+      source-ref: ${{ github.sha }}
+
   # #### PR #22
   # Native and browser portability checks belong to the same commit-level CI.
   # Packaging remains read-only; this call cannot create a tag or release.

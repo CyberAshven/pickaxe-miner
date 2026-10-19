@@ -155,21 +155,21 @@ Keep the tab open while mining. Names: `wgpu` is the Rust GPU library inside Pic
 
 ## Install
 
-Download the archive for your operating system from the [v0.0.3 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.3). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
+Download the archive for your operating system from the [v0.0.4 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.4). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
 
 Linux:
 
 ```bash
-tar -xzf pickaxe-miner-v0.0.3-linux-x86_64.tar.gz
-cd pickaxe-miner-v0.0.3-linux-x86_64
+tar -xzf pickaxe-miner-v0.0.4-linux-x86_64.tar.gz
+cd pickaxe-miner-v0.0.4-linux-x86_64
 ./pickaxe mine
 ```
 
 Windows PowerShell:
 
 ```powershell
-Expand-Archive pickaxe-miner-v0.0.3-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.3-windows-x86_64
-cd pickaxe-miner-v0.0.3-windows-x86_64
+Expand-Archive pickaxe-miner-v0.0.4-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.4-windows-x86_64
+cd pickaxe-miner-v0.0.4-windows-x86_64
 .\pickaxe.exe mine
 ```
 
@@ -273,7 +273,7 @@ The legacy CUDA C++ backend remains available with
 `cargo build --release --locked --no-default-features --features tail-grind`.
 Use a separate output directory when comparing the two builds.
 
-The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.3`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
+The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.4`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
 
 The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing backend. Other NVIDIA architectures require compatible CUDA files and separate validation.
 
