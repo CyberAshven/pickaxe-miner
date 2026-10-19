@@ -395,7 +395,7 @@ fn reference_shader_source_for_wgpu() -> Result<String, String> {
 
 /// Rejects non-hardware WGPU adapters for mining.
 #[cfg(not(target_arch = "wasm32"))]
-fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
+pub(crate) fn is_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
     // #### PR #22
     // CI executes the real kernels on lavapipe. This opt-in exists only in a
     // test binary, requires a software device, and is never a mining fallback.

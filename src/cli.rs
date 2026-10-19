@@ -162,9 +162,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: FarmOsCommand,
     },
-    /// #### PR #51
-    /// ELECTRIC on the CPU, beside BCH or PHOTON, with the relay fee paid from
-    /// a pot you fund, with a dedicated recovery key (see docs/electric-token.md).
+    /// #### PR #51, #58
+    /// ELECTRIC on your GPUs, beside BCH or PHOTON, with the relay fee paid
+    /// from a pot you fund, with a dedicated recovery key (see
+    /// docs/electric-token.md).
     Electric {
         #[command(subcommand)]
         command: ElectricCommand,
@@ -186,13 +187,13 @@ pub enum ElectricCommand {
         #[command(flatten)]
         deployment: ElectricDeploymentArgs,
     },
-    /// Search on the CPU and claim from the pot.
+    /// Search on the selected GPUs and claim from the pot.
     Mine {
         #[command(flatten)]
         deployment: ElectricDeploymentArgs,
-        /// CPU threads (default: all but one).
+        /// Exit after one accepted reward (or one dry-run proof).
         #[arg(long)]
-        threads: Option<usize>,
+        once: bool,
         /// Search no baton above this many zero bytes (3: only the cheap claims).
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=32))]
         max_difficulty: u8,
@@ -208,6 +209,35 @@ pub enum ElectricCommand {
         deployment: ElectricDeploymentArgs,
         #[arg(long)]
         broadcast: bool,
+    },
+    /// Build the genesis of your own deployment (Chipnet has none published):
+    /// the baton with the whole supply at the contract. Prints the unsigned
+    /// transaction for the funding coin's wallet to sign and send.
+    Deploy {
+        /// The funding coin, TXID:0; its txid becomes the token category.
+        #[arg(long, value_name = "TXID:0")]
+        funding: String,
+        /// The funding coin's value in sats.
+        #[arg(long, value_name = "SATS")]
+        funding_sats: u64,
+        /// Where the change goes (default: --address).
+        #[arg(long, value_name = "CASHADDR")]
+        change: Option<String>,
+        /// Token units on the baton (default: one million rewards).
+        #[arg(long, value_name = "UNITS")]
+        supply: Option<u64>,
+        /// The baton's starting height (default: the chain tip).
+        #[arg(long, value_name = "HEIGHT")]
+        height: Option<u32>,
+        /// The contract's reward per claim (default 60000000).
+        #[arg(long, value_name = "UNITS")]
+        electric_reward: Option<u64>,
+        /// The contract's minimum difficulty in bytes (default 3).
+        #[arg(long, value_name = "BYTES")]
+        electric_min_difficulty: Option<u8>,
+        /// The contract's maximum difficulty in bytes (default 4).
+        #[arg(long, value_name = "BYTES")]
+        electric_max_difficulty: Option<u8>,
     },
 }
 

@@ -1,6 +1,6 @@
 //! #### PR #51
 //! What: ELECTRIC (`PoWMineStateful`), a CashToken whose `mine` claim needs a
-//! SHA-256d proof over 32 bytes, searched on the CPU. The relay fee comes from
+//! SHA-256d proof over 32 bytes, searched on CUDA or portable GPUs. The relay fee comes from
 //! a pot covenant with keyless claims and owner-authorized refunds. Pickaxe
 //! stores a separate recovery key; it never imports the payout wallet's key.
 //! Why: the operator asked (2026-10-15) to mine the published contract as it
@@ -10,8 +10,11 @@
 //! built here through the BCH 2026 VM; the tests below check the proof
 //! encoding against two claims accepted on mainnet.
 
+pub mod gpu;
 pub mod miner;
+mod pending;
 mod recovery;
+pub(crate) mod ui;
 
 use crate::config::{
     MiningNetwork, CHIPNET_DONATION_ADDRESS, DONATION_ADDRESS, SHREC_DONATION_ADDRESS,
@@ -42,6 +45,10 @@ pub const MAINNET_CATEGORY_HEX: &str =
 /// baton on 2026-10-15.
 pub const MAINNET_COVENANT_LOCK_HEX: &str =
     "aa20f3b3cc8e800544dacb055235a1d45d7b7d0804a894935d301ef4796a2b08e70587";
+/// Pickaxe's Chipnet deployment of the same contract (genesis
+/// `6ba9682c…3ee1`, 2026-10-18), with the mainnet constructor values.
+pub const CHIPNET_CATEGORY_HEX: &str =
+    "39629630f3f5ba91c6e656e7b79c2c8de2fc6f776bfe085e1b7eaf70aa8a5e76";
 /// The published deployment's constructor values (`electric-webgpu-miner/src/config.ts`).
 pub const MAINNET_REWARD: u64 = 60_000_000;
 pub const MAINNET_MIN_DIFFICULTY: u8 = 3;
@@ -93,8 +100,20 @@ impl Deployment {
         }
     }
 
-    /// The deployment to mine: the published one on mainnet, or one the
-    /// miner names (such as their own Chipnet deploy of the same contract).
+    /// Pickaxe's Chipnet deployment.
+    pub fn chipnet() -> Self {
+        Self {
+            network: MiningNetwork::Chipnet,
+            contract: Contract::PoWMineStatefulV1,
+            category: parse_txid_display(CHIPNET_CATEGORY_HEX).expect("constant category"),
+            reward: MAINNET_REWARD,
+            min_difficulty: MAINNET_MIN_DIFFICULTY,
+            max_difficulty: MAINNET_MAX_DIFFICULTY,
+        }
+    }
+
+    /// The deployment to mine: the published one on mainnet, Pickaxe's on
+    /// Chipnet, or one the miner names (such as their own deploy).
     pub fn select(
         network: MiningNetwork,
         category: Option<&str>,
@@ -106,13 +125,14 @@ impl Deployment {
             || reward.is_some()
             || min_difficulty.is_some()
             || max_difficulty.is_some();
-        if network == MiningNetwork::Mainnet && !custom {
-            return Ok(Self::mainnet());
+        if !custom {
+            return Ok(match network {
+                MiningNetwork::Mainnet => Self::mainnet(),
+                MiningNetwork::Chipnet => Self::chipnet(),
+            });
         }
-        let category = category.ok_or(
-            "ELECTRIC has no published Chipnet deployment: deploy PoWMineStateful with your \
-             own wallet and pass --electric-category",
-        )?;
+        let category =
+            category.ok_or("--electric-category is needed with other contract values")?;
         let deployment = Self {
             network,
             contract: Contract::PoWMineStatefulV1,
@@ -192,7 +212,7 @@ impl Deployment {
 }
 
 /// The baton's 16-byte NFT commitment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub difficulty: u8,
     pub last_height: u32,
@@ -330,7 +350,7 @@ pub struct SearchJob {
     pub pkhs: [[u8; 20]; 3],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Win {
     pub recipient: Recipient,
     pub pkh: [u8; 20],
@@ -393,7 +413,7 @@ pub fn parallel_search(
 }
 
 /// An unspent baton as Fulcrum lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Baton {
     pub txid: String,
     pub vout: u32,
@@ -403,7 +423,7 @@ pub struct Baton {
 }
 
 /// An unspent pot output.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Coin {
     pub txid: String,
     pub vout: u32,
@@ -723,6 +743,73 @@ pub fn build_refund(
     })
 }
 
+/// The most a P2PKH signature and public key add to an unsigned input.
+const P2PKH_UNLOCK_BYTES: usize = 107;
+
+/// Builds the genesis of a new deployment of the contract (for Chipnet,
+/// where none is published): the baton with the whole `supply` at the
+/// covenant, at the minimum difficulty and `height`, and the change. The
+/// funding coin is output 0 of its transaction, so its txid becomes the
+/// category. The input is left unsigned for the coin's wallet to sign, so
+/// the returned txid changes once it is signed.
+pub fn build_genesis(
+    deployment: &Deployment,
+    funding: &Coin,
+    change_lock: &[u8],
+    supply: u64,
+    height: u32,
+    relay_fee_sats_per_kb: u64,
+) -> Result<Built, String> {
+    if funding.vout != 0 || parse_txid_display(&funding.txid)? != deployment.category {
+        return Err(
+            "the funding coin must be output 0 of the transaction named by the category".into(),
+        );
+    }
+    if supply < deployment.reward || supply > i64::MAX as u64 {
+        return Err("the supply must hold at least one reward".into());
+    }
+    let state = State {
+        difficulty: deployment.min_difficulty,
+        last_height: height,
+        mine_count: 0,
+    };
+    let mut baton_token = vec![0xef];
+    baton_token.extend(deployment.category_le());
+    baton_token.push(0x71);
+    baton_token.extend(compact_uint(16));
+    baton_token.extend(state.encode());
+    baton_token.extend(compact_uint(supply));
+    let assemble = |change: u64| -> Result<Vec<u8>, String> {
+        let mut tx = 2u32.to_le_bytes().to_vec();
+        tx.extend(compact_uint(1));
+        tx.extend(input(&funding.txid, 0, &[], 0xffff_ffff)?);
+        tx.extend(compact_uint(2));
+        tx.extend(output(
+            TOKEN_OUTPUT_SATS,
+            &baton_token,
+            &deployment.locking_bytecode(),
+        ));
+        tx.extend(output(change, &[], change_lock));
+        tx.extend(0u32.to_le_bytes());
+        Ok(tx)
+    };
+    let fee = relay_fee(
+        assemble(0)?.len() + P2PKH_UNLOCK_BYTES,
+        relay_fee_sats_per_kb,
+    );
+    let change = funding
+        .value
+        .checked_sub(TOKEN_OUTPUT_SATS + fee)
+        .filter(|change| *change >= 546)
+        .ok_or("the funding coin cannot pay the baton's 1,000 sats and the fee")?;
+    let raw = assemble(change)?;
+    Ok(Built {
+        txid: transaction_id(&raw),
+        raw,
+        fee,
+    })
+}
+
 /// The relay fee for `size` bytes, rounded up.
 fn relay_fee(size: usize, sats_per_kb: u64) -> u64 {
     (size as u64)
@@ -826,7 +913,14 @@ mod tests {
             Deployment::select(MiningNetwork::Mainnet, None, None, None, None).unwrap(),
             mainnet
         );
-        assert!(Deployment::select(MiningNetwork::Chipnet, None, None, None, None).is_err());
+        assert_eq!(
+            Deployment::select(MiningNetwork::Chipnet, None, None, None, None).unwrap(),
+            Deployment::chipnet()
+        );
+        assert_eq!(
+            hex::encode(Deployment::chipnet().locking_bytecode()),
+            "aa207e5c85e853901c250eba8a0e4786af7ef2d9e022159832296f9572ad9bb1017187"
+        );
         assert!(Deployment::select(
             MiningNetwork::Mainnet,
             Some(MAINNET_CATEGORY_HEX),
@@ -997,6 +1091,76 @@ mod tests {
     }
 
     #[test]
+    fn genesis_puts_the_whole_supply_on_a_minimum_difficulty_baton() {
+        let funding_txid = "39629630f3f5ba91c6e656e7b79c2c8de2fc6f776bfe085e1b7eaf70aa8a5e76";
+        let deployment =
+            Deployment::select(MiningNetwork::Chipnet, Some(funding_txid), None, None, None)
+                .unwrap();
+        let coin = |vout, value| Coin {
+            txid: funding_txid.into(),
+            vout,
+            value,
+        };
+        let change = p2pkh(&MINER);
+        let supply = deployment.reward * 1_000_000;
+        let genesis = build_genesis(
+            &deployment,
+            &coin(0, 10_000),
+            &change,
+            supply,
+            328_450,
+            1_000,
+        )
+        .unwrap();
+        let raw = &genesis.raw;
+        // One unsigned input spending output 0 of the category's transaction.
+        assert_eq!(raw[4], 1);
+        assert_eq!(&raw[5..37], &deployment.category_le());
+        assert_eq!(&raw[37..41], &[0; 4]);
+        assert_eq!(raw[41], 0);
+        // The baton: 1,000 sats, a mutable NFT with the starting state and
+        // the whole supply, at the covenant.
+        let mut token = vec![0xef];
+        token.extend(deployment.category_le());
+        token.push(0x71);
+        token.push(16);
+        token.extend(
+            State {
+                difficulty: deployment.min_difficulty,
+                last_height: 328_450,
+                mine_count: 0,
+            }
+            .encode(),
+        );
+        token.extend(compact_uint(supply));
+        let baton = output(TOKEN_OUTPUT_SATS, &token, &deployment.locking_bytecode());
+        assert_eq!(&raw[47..47 + baton.len()], &baton[..]);
+        // The change pays the fee for the signed size.
+        let rest = &raw[47 + baton.len()..];
+        let value = u64::from_le_bytes(rest[..8].try_into().unwrap());
+        assert_eq!(value, 10_000 - TOKEN_OUTPUT_SATS - genesis.fee);
+        assert_eq!(
+            genesis.fee,
+            relay_fee(raw.len() + P2PKH_UNLOCK_BYTES, 1_000)
+        );
+        assert_eq!(&rest[9..34], &change[..]);
+        assert_eq!(&rest[34..], &[0; 4]);
+        // Output 0 only, enough for the baton and fee, at least one reward.
+        assert!(build_genesis(&deployment, &coin(1, 10_000), &change, supply, 1, 1_000).is_err());
+        assert!(build_genesis(&deployment, &coin(0, 1_500), &change, supply, 1, 1_000).is_err());
+        assert!(build_genesis(&deployment, &coin(0, 10_000), &change, 1, 1, 1_000).is_err());
+        let other = Deployment::select(
+            MiningNetwork::Chipnet,
+            Some(&"ab".repeat(32)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(build_genesis(&other, &coin(0, 10_000), &change, supply, 1, 1_000).is_err());
+    }
+
+    #[test]
     fn claims_and_refunds_have_the_contract_shape_and_exact_fees() {
         let deployment = Deployment::mainnet();
         let locks = recipients(MiningNetwork::Mainnet);
@@ -1101,6 +1265,13 @@ mod tests {
         let Some(path) = std::env::var_os("PICKAXE_ELECTRIC_PROOF") else {
             return;
         };
+        write_vm_vectors(&std::path::PathBuf::from(path), search);
+    }
+
+    pub(super) fn write_vm_vectors(
+        path: &std::path::Path,
+        mut search: impl FnMut(u32, &[u8; 20], u8, u64, u64) -> Option<u64>,
+    ) {
         let deployment = Deployment::select(
             MiningNetwork::Mainnet,
             Some(&"5a".repeat(32)),
@@ -1142,8 +1313,7 @@ mod tests {
                     "pot_value": coin.value,
                 }));
             };
-            let find = |state: State, recipient: usize| {
-                let pkh = pkh(&locks[recipient]);
+            let mut find = |state: State, pkh: [u8; 20], recipient: usize| {
                 let nonce = search(state.last_height, &pkh, state.difficulty, 0, 1 << 24).unwrap();
                 Win {
                     recipient: Recipient::ALL[recipient],
@@ -1162,9 +1332,9 @@ mod tests {
                     mine_count: 41,
                 },
             };
-            for recipient in 0..3 {
+            for (recipient, lock) in locks.iter().enumerate() {
                 let baton = baton_at(2, 1_000);
-                let win = find(baton.state, recipient);
+                let win = find(baton.state, pkh(lock), recipient);
                 let built =
                     build_claim(&deployment, &pot, &baton, &coin, &win, 1_001, 1_000).unwrap();
                 sample(
@@ -1175,7 +1345,7 @@ mod tests {
                 );
             }
             let cheap = baton_at(1, 1_000);
-            let win = find(cheap.state, 0);
+            let win = find(cheap.state, pkh(&locks[0]), 0);
             let built = build_claim(&deployment, &pot, &cheap, &coin, &win, 1_000, 1_000).unwrap();
             sample(
                 "minimum difficulty at the same height",
@@ -1185,19 +1355,23 @@ mod tests {
             );
             // The contract accepts these; the pot does not pay for them.
             let replay = baton_at(2, 1_000);
-            let win = find(replay.state, 0);
+            let win = find(replay.state, pkh(&locks[0]), 0);
             let built = build_claim(&deployment, &pot, &replay, &coin, &win, 1_000, 1_000).unwrap();
             sample("same height above the minimum", "pot", &replay, &built);
-            let stranger = Win {
-                recipient: Recipient::Miner,
-                pkh: [0x77; 20],
-                nonce: search(1_000, &[0x77; 20], 2, 0, 1 << 24).unwrap(),
-            };
+            let stranger = find(
+                State {
+                    difficulty: 2,
+                    last_height: 1_000,
+                    mine_count: 41,
+                },
+                [0x77; 20],
+                0,
+            );
             let baton = baton_at(2, 1_000);
             let built =
                 build_claim(&deployment, &pot, &baton, &coin, &stranger, 1_001, 1_000).unwrap();
             sample("another recipient", "pot", &baton, &built);
-            let win = find(baton.state, 0);
+            let win = find(baton.state, pkh(&locks[0]), 0);
             let valid = build_claim(&deployment, &pot, &baton, &coin, &win, 1_001, 1_000).unwrap();
             let mut greedy = valid.clone();
             let change_at = greedy.raw.len() - 4 - 44;
