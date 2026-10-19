@@ -1177,7 +1177,7 @@ fn run_headless_mining(
     let _gpu_lock = if gpus.is_empty() && rigs.is_some() {
         None
     } else {
-        Some(mining_lock::acquire_gpu_lock()?)
+        Some(mining_lock::acquire_gpu_locks(gpus)?)
     };
     // Cache device information before the live miner starts so `/devices` never
     // probes drivers or creates temporary GPU contexts in the mining hot path.
@@ -1297,7 +1297,7 @@ fn run_as_rig(
     status: Option<&std::path::Path>,
 ) {
     let result = (|| {
-        let _gpu_lock = mining_lock::acquire_gpu_lock()?;
+        let _gpu_lock = mining_lock::acquire_gpu_locks(gpus)?;
         let stop = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&stop);
         ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
