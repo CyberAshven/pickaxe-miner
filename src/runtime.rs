@@ -2618,6 +2618,8 @@ pub struct RuntimeSupervisor {
     shutdown: ShutdownSignal,
     worker: Option<JoinHandle<()>>,
     telemetry: LiveTelemetrySampler,
+    /// #### PR #53: the hash split's hold on this miner's GPU search.
+    hold: crate::search::SearchHold,
 }
 
 impl RuntimeSupervisor {
@@ -2706,6 +2708,7 @@ impl RuntimeSupervisor {
             )?
         };
         let initial_search = search.snapshot();
+        let hold = search.hold_handle();
         let telemetry = LiveTelemetrySampler::start(crate::telemetry::telemetry_sources(gpus));
         let shutdown = ShutdownSignal::new(search.pause_handle());
         let initial_snapshot = RuntimeSnapshot {
@@ -2799,7 +2802,13 @@ impl RuntimeSupervisor {
             shutdown,
             worker: Some(worker),
             telemetry,
+            hold,
         })
+    }
+
+    /// #### PR #53: the hash split's hold on this miner's GPU search.
+    pub fn hold_handle(&self) -> crate::search::SearchHold {
+        self.hold.clone()
     }
 
     /// Captures the current state of the live mining runtime.

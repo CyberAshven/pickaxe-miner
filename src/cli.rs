@@ -170,8 +170,64 @@ pub enum Commands {
         #[command(subcommand)]
         command: ElectricCommand,
     },
+    /// #### PR #53
+    /// Mine several GPU tokens on the selected GPUs, each for its share of
+    /// the time in 5% steps, for example `--share photon=80 --share
+    /// electric=20` (see docs/hash-split.md).
+    Split {
+        /// TOKEN=PERCENT, once per token; multiples of 5, at most 100 in all.
+        #[arg(long = "share", value_name = "TOKEN=PERCENT", required = true)]
+        shares: Vec<String>,
+    },
+    /// #### PR #53
+    /// BCH P2Pool as a dependency Pickaxe installs from P2Pool's releases,
+    /// keeps updated and runs with your node and payout (see docs/p2pool.md).
+    P2pool {
+        #[command(subcommand)]
+        command: P2poolCommand,
+    },
     #[command(hide = true)]
     Repl,
+}
+
+/// #### PR #53
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum P2poolCommand {
+    /// Run P2Pool with --node-rpc, --node-zmq and --address on --network,
+    /// restarting it when it exits, with a screen of its state and the node's.
+    Run {
+        /// Start the installed version without installing a newer one.
+        #[arg(long)]
+        no_update: bool,
+    },
+    /// Install the newest P2Pool release after checking it against the
+    /// SHA-256 published beside it.
+    Update {
+        /// Only say whether a newer release is out.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Go back to the P2Pool version installed before this one.
+    Rollback,
+    /// The installed and newest versions, and the settings.
+    Status,
+    /// Change the settings: automatic updates, the share chain, peers.
+    Set {
+        /// on (the default) or off: off, a newer release waits for
+        /// `pickaxe p2pool update` or `u` on the screen.
+        #[arg(long, value_name = "on|off")]
+        auto_update: Option<String>,
+        /// main or mini (the default; shares 256 times easier).
+        #[arg(long, value_name = "main|mini")]
+        share_chain: Option<String>,
+        /// Another P2Pool node to join, such as /ip4/203.0.113.7/tcp/6884;
+        /// repeat for more.
+        #[arg(long = "peer", value_name = "ADDRESS")]
+        peers: Vec<String>,
+        /// Forget the saved peers (this node then starts its own share chain).
+        #[arg(long)]
+        no_peers: bool,
+    },
 }
 
 /// #### PR #51

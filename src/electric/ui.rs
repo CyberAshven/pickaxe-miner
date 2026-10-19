@@ -11,11 +11,30 @@ use std::{
 pub struct Monitor {
     pub stop: Arc<AtomicBool>,
     pub paused: AtomicBool,
+    /// #### PR #53: the hash split holds the GPUs for another token.
+    pub held: AtomicBool,
+    /// #### PR #53: a search is running: the pot can pay and the baton is
+    /// minable, so ELECTRIC wants its share of the GPUs.
+    pub searching: AtomicBool,
     pub intensity: AtomicU8,
     pub hashes: AtomicU64,
     view: Mutex<View>,
     plain: bool,
     started: Instant,
+}
+
+/// #### PR #53: what the hash split's screen shows of the ELECTRIC session.
+#[derive(Debug, Clone, Default)]
+pub struct Summary {
+    pub state: String,
+    /// Hashes a second over the last two seconds.
+    pub rate: f64,
+    pub claims: u64,
+    pub pot_address: Option<String>,
+    pub pot_qr: Vec<String>,
+    /// Plain-BCH sats in the pot and the claims they pay, once read.
+    pub pot: Option<(u64, u64)>,
+    pub events: Vec<String>,
 }
 
 struct View {
@@ -75,6 +94,8 @@ impl Monitor {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
             paused: AtomicBool::new(false),
+            held: AtomicBool::new(false),
+            searching: AtomicBool::new(false),
             intensity: AtomicU8::new(intensity),
             hashes: AtomicU64::new(0),
             view: Mutex::new(View {
@@ -150,6 +171,49 @@ impl Monitor {
         if let Some(pot) = &mut self.view.lock().unwrap_or_else(|e| e.into_inner()).pot {
             pot.sats = Some(sats);
             pot.claims = claims;
+        }
+    }
+    /// #### PR #53: the GPUs the session mines on, as its screen names them.
+    pub fn devices(&self) -> String {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .devices
+            .clone()
+    }
+    /// #### PR #53: the session as the hash split's screen shows it.
+    pub fn summary(&self) -> Summary {
+        let view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        // Wall-clock rate: work done in the last two seconds, so a token
+        // that held the GPUs for part of them shows what it really got.
+        let window = Duration::from_secs(2);
+        let recent: u64 = view
+            .samples
+            .iter()
+            .filter(|(time, ..)| now.duration_since(*time) <= window)
+            .map(|&(_, _, count, _)| u64::from(count))
+            .sum();
+        let elapsed = now.duration_since(self.started).min(window);
+        Summary {
+            state: if self.stopped() {
+                "Stopping; preserving pending claim".into()
+            } else {
+                view.state.clone()
+            },
+            rate: recent as f64 / elapsed.as_secs_f64().max(1e-3),
+            claims: view.claims,
+            pot_address: view.pot.as_ref().map(|pot| pot.address.clone()),
+            pot_qr: view
+                .pot
+                .as_ref()
+                .map(|pot| pot.qr.clone())
+                .unwrap_or_default(),
+            pot: view
+                .pot
+                .as_ref()
+                .and_then(|pot| pot.sats.map(|sats| (sats, pot.claims))),
+            events: view.events.iter().cloned().collect(),
         }
     }
     pub fn record(&self, device: usize, count: u32, duration: Duration) {

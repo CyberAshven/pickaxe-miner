@@ -53,10 +53,19 @@ struct State {
 // No Debug: blocks contain the configured payout script.
 pub struct Journal {
     path: PathBuf,
-    _lock: File,
+    _lock: JournalLock,
     network: MiningNetwork,
     binding: JournalBinding,
     state: State,
+}
+
+// #### PR #53: release ownership even while a forked child retains the descriptor.
+struct JournalLock(File);
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// #### PR #42: what a journal's blocks are checked against.
@@ -189,6 +198,8 @@ impl Journal {
             .map_err(|_| "cannot open block journal lock")?;
         lock.try_lock()
             .map_err(|_| "block journal is already in use or cannot be locked")?;
+        // Failed validation/opening must release ownership too, before a Journal exists.
+        let lock = JournalLock(lock);
         config::restrict_private_config(&lock_path)
             .map_err(|_| "cannot protect block journal lock")?;
         regular_if_present(path)?;
@@ -621,4 +632,54 @@ impl Drop for TestDirectory {
             .starts_with("pickaxe-sv2-test-"));
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn journal_close_releases_lock_with_an_inherited_descriptor() {
+    let dir = TestDirectory::new();
+    let open = || Journal::open_relay(&dir.journal(), MiningNetwork::Chipnet);
+    let journal = open().unwrap();
+    // dup and fork retain the same open-file description on Unix.
+    let inherited = journal._lock.0.try_clone().unwrap();
+    assert!(open().is_err(), "the live owner must remain exclusive");
+    let saved = fs::read(dir.journal()).unwrap();
+    drop(journal);
+    let reopened = open().expect("closing the journal must release its lock");
+    assert_eq!(fs::read(dir.journal()).unwrap(), saved);
+    drop(inherited);
+    assert!(
+        open().is_err(),
+        "closing the old descriptor must not unlock the new owner"
+    );
+    drop(reopened);
+    assert!(open().is_ok());
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn failed_journal_initialization_releases_the_owned_lock() {
+    let dir = TestDirectory::new();
+    let path = dir.journal();
+    let inherited;
+    let failed: Result<(), &str> = {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("blocks-lock"))
+            .unwrap();
+        file.try_lock().unwrap();
+        let lock = JournalLock(file);
+        inherited = lock.0.try_clone().unwrap();
+        assert!(Journal::open_relay(&path, MiningNetwork::Chipnet).is_err());
+        Err("journal validation failed before construction")
+    };
+    assert!(failed.is_err());
+    let recovered = Journal::open_relay(&path, MiningNetwork::Chipnet).unwrap();
+    drop(inherited);
+    assert!(Journal::open_relay(&path, MiningNetwork::Chipnet).is_err());
+    drop(recovered);
+    assert!(Journal::open_relay(&path, MiningNetwork::Chipnet).is_ok());
 }

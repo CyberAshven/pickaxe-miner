@@ -21,7 +21,8 @@ Sources, read 2026-10-13 and 2026-10-15:
 ## Decision
 
 Mine the published contract beside BCH and PHOTON, on a GPU search, without
-a payout key in Pickaxe. Document its replay weakness, never use it, and keep the
+the payout wallet's key in Pickaxe. A separate pot-only recovery key protects
+refunds. Document its replay weakness, never use it, and keep the
 deployment as data so a fixed contract is one new `Contract` variant.
 
 ## Replay
@@ -103,6 +104,10 @@ after the height. Stratum cannot aim the nonce field at this preimage, and
 both need a contract that accepts header work. This one does not, so the
 ASIC farm keeps mining BCH and the CPU searches ELECTRIC beside it.
 
+PHOTON cannot share work with it either; on one GPU the two split the time.
+A new ELECTRIC contract could be merge-mined with PHOTON as the parent,
+without changing PHOTON: see [photon-electric-auxpow.md](photon-electric-auxpow.md).
+
 ## Paying the fee with an owner-recoverable pot
 
 #### PR #51
@@ -112,7 +117,8 @@ or store the payout wallet's key. Claims remain keyless; only refunds need
 the recovery signature. PHOTON and its runtime keys are unchanged.
 
 `pickaxe electric pot --address <payout>` creates the key before displaying
-the funding address, or reuses the existing key. Fund that P2SH32 address
+the funding address, or reuses the existing key. #### PR #53: it prints the
+address's QR code too, the same one the setup shows. Fund that P2SH32 address
 with plain BCH from any wallet. The default key file is beside the selected
 `--config`, named for the network and the pot's contract/payout parameters.
 `--pot-key <path>` selects a backed-up key explicitly; use it consistently
@@ -210,6 +216,11 @@ ELECTRIC screen: rate, accepted rewards, the pot's balance and how many
 claims it pays, and the QR code again whenever the pot cannot pay a claim
 (`f` shows or hides it). `--no-tui` prints the same address, QR code and
 key path once, then each state and event as a line.
+
+#### PR #53: Start first reads the pot's balance. A pot that cannot pay a
+claim yet (or cannot be read) is reported, and the next Start press starts
+anyway. To mine ELECTRIC beside PHOTON on the same GPUs, each for a share of
+the time, choose Hash split instead ([hash-split.md](hash-split.md)).
 
 The ELECTRIC choice saves no profile. Profiles reject unknown fields, and
 an older Pickaxe reading the same file must keep working; pick ELECTRIC in

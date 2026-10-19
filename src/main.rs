@@ -5,8 +5,8 @@
 //! Search/CPU/crypto: Lead Dev. Electrum/win-tx: Dev Assist.
 
 use pickaxe_miner::{
-    backend, benchmark, cli, config, electric, electrum, mine_watch, mining_lock, node, reach,
-    rigs, runtime, search, self_test, stratum_v2, telemetry, tui, tx,
+    backend, benchmark, cli, config, electric, electrum, hash_split, mine_watch, mining_lock, node,
+    reach, rigs, runtime, search, self_test, stratum_v2, telemetry, tui, tx,
 };
 
 use config::RuntimeConfig;
@@ -1550,6 +1550,44 @@ fn main() {
                 exit_after_error(1);
             }
         }
+        // #### PR #53: several GPU tokens on the selected GPUs, by share.
+        cli::Commands::Split { shares } => {
+            use std::io::IsTerminal;
+            let result = hash_split::Shares::parse(&shares, cfg.network).and_then(|shares| {
+                let gpus = backend::resolve_mining_devices(backend_kind, &effective_device)?;
+                hash_split::run(
+                    &cfg,
+                    &gpus,
+                    &shares,
+                    &config_path,
+                    args.no_tui || !io::stdout().is_terminal(),
+                )
+            });
+            if let Err(error) = result {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
+        }
+        // #### PR #53: P2Pool as a managed dependency.
+        cli::Commands::P2pool { command } => {
+            use std::io::IsTerminal;
+            #[cfg(feature = "stratum-v2")]
+            let result = pickaxe_miner::p2pool::screen::command(
+                &cfg,
+                &command,
+                &config_path,
+                args.no_tui || !io::stdout().is_terminal(),
+            );
+            #[cfg(not(feature = "stratum-v2"))]
+            let result: Result<(), String> = {
+                let _ = (&command, io::stdout().is_terminal());
+                Err("this build has no stratum-v2 feature, which P2Pool needs".into())
+            };
+            if let Err(error) = result {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
+        }
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {
                 eprintln!("error: {error}");
@@ -1880,6 +1918,17 @@ fn main() {
                     // (`tui::gpu_launch`).
                     // #### PR #58: ELECTRIC chosen in the setup mines in its
                     // own session (fee pot, claims, its screen), not PHOTON's.
+                    // #### PR #53: a hash split mines every token with a share
+                    // in one session, on the chosen GPUs.
+                    if let Some(shares) = &setup.split {
+                        if let Err(error) =
+                            hash_split::run(&setup.config, &setup.gpus, shares, &config_path, false)
+                        {
+                            eprintln!("error: {error}");
+                            exit_after_error(1);
+                        }
+                        return;
+                    }
                     if setup.electric {
                         if let Err(error) = electric::miner::run_from_setup(
                             &setup.config,
