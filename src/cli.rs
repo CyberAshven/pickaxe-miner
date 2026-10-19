@@ -339,7 +339,7 @@ pub enum StratumV2Command {
     /// Show a running server's workers table, read-only (for example a
     /// service started with --no-tui). Use the same --config as the server.
     Watch,
-    /// #### PR #59: Print the BCH P2Pool share address of a P2PKH address
+    /// #### PR #61: Print the BCH P2Pool share address of a P2PKH address
     /// (default: the configured payout address). A P2Pool node with no share
     /// address of its own needs one in --upstream-user, after ",p2p=".
     ShareAddress {
@@ -376,6 +376,12 @@ pub enum StratumV2Command {
         /// payout address.
         #[arg(long, requires = "upstream")]
         upstream_user: Option<String>,
+        /// #### PR #61
+        /// Mine at your own BCH P2Pool node, which Pickaxe installs, keeps
+        /// updated and runs with --node-rpc, --node-zmq and --address (see
+        /// docs/p2pool.md). SV1 devices connect to --sv1-listen.
+        #[arg(long, requires = "sv1_listen", conflicts_with_all = ["upstream", "public"])]
+        own_p2pool: bool,
         /// #### PR #40
         /// Run a public pool: each miner's username is their own payout
         /// address (q or p, optionally with .worker) and the blocks they find

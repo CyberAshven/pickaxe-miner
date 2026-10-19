@@ -2611,6 +2611,24 @@ impl ShutdownSignal {
     }
 }
 
+/// #### PR #61: a runtime's GPUs' hashes a second while each mines (not
+/// while held), in the order the GPUs were chosen; 0 before one measured.
+#[derive(Clone)]
+pub struct GpuRates(Arc<Mutex<RuntimeSnapshot>>);
+
+impl GpuRates {
+    pub fn rates(&self) -> Vec<f64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .search
+            .gpus
+            .iter()
+            .map(|gpu| gpu.active_rate)
+            .collect()
+    }
+}
+
 pub struct RuntimeSupervisor {
     command_tx: SyncSender<SupervisorCommand>,
     event_rx: Receiver<RuntimeEvent>,
@@ -2809,6 +2827,12 @@ impl RuntimeSupervisor {
     /// #### PR #53: the hash split's hold on this miner's GPU search.
     pub fn hold_handle(&self) -> crate::search::SearchHold {
         self.hold.clone()
+    }
+
+    /// #### PR #61: each GPU's rate, readable from the hash split's
+    /// scheduler.
+    pub fn gpu_rates(&self) -> GpuRates {
+        GpuRates(Arc::clone(&self.snapshot))
     }
 
     /// Captures the current state of the live mining runtime.

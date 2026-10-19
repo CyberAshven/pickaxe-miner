@@ -201,19 +201,35 @@ fn step(share: u8, total: u8, up: bool) -> Result<u8, String> {
     Ok(share + STEP)
 }
 
-/// A token mining in a split: whether it can use the GPUs now, and the
-/// hold that keeps it off them during other tokens' turns.
+/// A token mining in a split: whether it can use the GPUs now, the hold
+/// that keeps it off a GPU while another token has that GPU, and (#### PR
+/// #61) each GPU's hashes a second while it mines, to weigh the GPUs.
 pub trait Member: Send + Sync {
     fn wants_gpu(&self) -> bool;
-    fn hold(&self, held: bool);
+    /// Holds or releases the GPU at `gpu`, in the order the GPUs were chosen.
+    fn hold(&self, gpu: usize, held: bool);
+    /// The first `gpus` GPUs' hashes a second while this token mines them;
+    /// 0 for a GPU not measured yet.
+    fn gpu_rates(&self, gpus: usize) -> Vec<f64>;
 }
 
-impl Member for crate::search::SearchHold {
+/// A token the PHOTON runtime mines: its search's hold and its GPUs' rates.
+pub struct RuntimeMember {
+    pub hold: crate::search::SearchHold,
+    pub rates: crate::runtime::GpuRates,
+}
+
+impl Member for RuntimeMember {
     fn wants_gpu(&self) -> bool {
-        crate::search::SearchHold::wants_gpu(self)
+        self.hold.wants_gpu()
     }
-    fn hold(&self, held: bool) {
-        self.set(held);
+    fn hold(&self, gpu: usize, held: bool) {
+        self.hold.set_gpu(gpu, held);
+    }
+    fn gpu_rates(&self, gpus: usize) -> Vec<f64> {
+        let mut rates = self.rates.rates();
+        rates.resize(gpus, 0.0);
+        rates
     }
 }
 
@@ -225,8 +241,11 @@ impl Member for ElectricMember {
     fn wants_gpu(&self) -> bool {
         self.0.searching.load(Ordering::Acquire) && !self.0.paused.load(Ordering::Relaxed)
     }
-    fn hold(&self, held: bool) {
-        self.0.held.store(held, Ordering::Release);
+    fn hold(&self, gpu: usize, held: bool) {
+        self.0.hold_gpu(gpu, held);
+    }
+    fn gpu_rates(&self, gpus: usize) -> Vec<f64> {
+        self.0.gpu_rates(gpus)
     }
 }
 
@@ -237,12 +256,34 @@ pub struct Slot {
     pub member: Box<dyn Member>,
 }
 
-/// One round's turns: which slot has the GPUs (`None`: they idle) and for
-/// how long. Each slot that wants the GPUs mines for its share, plus a
-/// part of the shares of slots that cannot mine now, in proportion to its
-/// own; the shares' remainder to 100% idles. With no slot able to mine,
-/// the whole round idles.
-pub fn plan(shares: &[u8], wants: &[bool], period: Duration) -> Vec<(Option<usize>, Duration)> {
+/// Parts of a whole closer than this count as equal.
+const EPSILON: f64 = 1e-9;
+
+/// #### PR #61
+/// What: one round of the split on the GPUs. Whole GPUs go to the tokens
+/// first: each GPU, the fastest first, to whoever needs the most of the
+/// rig's speed without the GPU being more than that (the idle rest of 100%
+/// counts too). Only the GPUs left over take turns, each token for what it
+/// still needs. A token that cannot mine now gives its share to the others
+/// in proportion to theirs; with nobody able to mine, the round idles.
+/// `weights` are the GPUs' speeds (any scale; equal for one GPU model).
+/// Why: on five GPUs at 80/20 every GPU took turns between the tokens; now
+/// four mine PHOTON and one ELECTRIC all round, and one GPU still takes
+/// turns as before.
+/// Look here if: a rig's GPUs keep switching tokens although the shares
+/// divide into whole GPUs, or a token mines more than its share.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Round {
+    /// Each GPU's token for the whole round (`Some(None)`: it idles), or
+    /// `None` for a GPU that takes turns.
+    pub gpus: Vec<Option<Option<usize>>>,
+    /// The turns on the GPUs that take turns, in round order.
+    pub turns: Vec<(Option<usize>, Duration)>,
+}
+
+/// What each slot with a share that wants the GPUs, and the idle rest
+/// (`None`), needs of the rig's speed, in parts of 1.
+fn needs(shares: &[u8], wants: &[bool]) -> Vec<(Option<usize>, f64)> {
     let total = total(shares.iter().copied());
     let wanted: u32 = shares
         .iter()
@@ -250,46 +291,227 @@ pub fn plan(shares: &[u8], wants: &[bool], period: Duration) -> Vec<(Option<usiz
         .filter(|(_, wants)| **wants)
         .map(|(share, _)| u32::from(*share))
         .sum();
-    let mut turns = Vec::new();
+    let mut needs = Vec::new();
     if wanted > 0 {
         for (index, (&share, &wants)) in shares.iter().zip(wants).enumerate() {
             if share > 0 && wants {
                 let percent = f64::from(share) * f64::from(total) / f64::from(wanted);
-                turns.push((Some(index), period.mul_f64(percent / 100.0)));
+                needs.push((Some(index), percent / 100.0));
             }
         }
     }
     let idle = if wanted == 0 { 100 } else { 100 - total };
     if idle > 0 {
-        turns.push((None, period.mul_f64(f64::from(idle) / 100.0)));
+        needs.push((None, f64::from(idle) / 100.0));
     }
-    turns
+    needs
 }
 
-/// Hands the GPUs to one slot at a time by `plan`, every `period`, until
-/// `stop`; then releases every hold so each token can stop cleanly.
-pub fn schedule(slots: &[Slot], stop: &AtomicBool, period: Duration) {
-    let mut current: Option<Option<usize>> = None;
-    let give = |turn: Option<usize>| {
-        for (index, slot) in slots.iter().enumerate() {
-            slot.member.hold(Some(index) != turn);
+/// Turns of one `period` for what `needs` still want, in proportion.
+fn turns(needs: &[(Option<usize>, f64)], period: Duration) -> Vec<(Option<usize>, Duration)> {
+    let left: f64 = needs.iter().map(|(_, need)| need.max(0.0)).sum();
+    if left <= EPSILON {
+        return Vec::new();
+    }
+    needs
+        .iter()
+        .filter(|(_, need)| *need > EPSILON)
+        .map(|(owner, need)| (*owner, period.mul_f64(need / left)))
+        .collect()
+}
+
+pub fn plan(shares: &[u8], wants: &[bool], weights: &[f64], period: Duration) -> Round {
+    let mut needs = needs(shares, wants);
+    let sum: f64 = weights.iter().sum();
+    let weights: Vec<f64> = if sum > 0.0 && weights.iter().all(|w| w.is_finite() && *w >= 0.0) {
+        weights.iter().map(|weight| weight / sum).collect()
+    } else {
+        vec![1.0 / weights.len().max(1) as f64; weights.len()]
+    };
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by(|a, b| weights[*b].total_cmp(&weights[*a]));
+    let mut gpus = vec![None; weights.len()];
+    for gpu in order {
+        let mut most: Option<usize> = None;
+        for (index, (_, need)) in needs.iter().enumerate() {
+            // On a near tie the earlier token keeps the GPU.
+            if *need + EPSILON >= weights[gpu]
+                && most.is_none_or(|best| *need > needs[best].1 + EPSILON)
+            {
+                most = Some(index);
+            }
+        }
+        if let Some(index) = most {
+            gpus[gpu] = Some(needs[index].0);
+            needs[index].1 -= weights[gpu];
+        }
+    }
+    let turns = if gpus.iter().any(Option::is_none) {
+        turns(&needs, period)
+    } else {
+        Vec::new()
+    };
+    Round { gpus, turns }
+}
+
+/// #### PR #61: how long every GPU takes turns at the start, so each token
+/// mines every GPU and the GPUs' speeds can be measured; and how long the
+/// scheduler keeps trying before it weighs the GPUs as equal.
+const MEASURE_ROUNDS: u32 = 3;
+const MEASURE_LIMIT: Duration = Duration::from_secs(60);
+
+/// #### PR #61: each GPU's speed from the rates of the token with the
+/// largest share that measured every GPU, the same for GPUs of the same
+/// model (`names`); `None` while no token has measured them all.
+fn weigh(slots: &[Slot], names: &[String]) -> Option<Vec<f64>> {
+    let gpus = names.len();
+    let mut by_share: Vec<&Slot> = slots.iter().collect();
+    by_share.sort_by_key(|slot| std::cmp::Reverse(slot.share.load(Ordering::Relaxed)));
+    let rates = by_share
+        .iter()
+        .map(|slot| slot.member.gpu_rates(gpus))
+        .find(|rates| {
+            rates.len() == gpus && rates.iter().all(|rate| rate.is_finite() && *rate > 0.0)
+        })?;
+    Some(
+        names
+            .iter()
+            .map(|name| {
+                let same: Vec<f64> = names
+                    .iter()
+                    .zip(&rates)
+                    .filter(|(other, _)| *other == name)
+                    .map(|(_, rate)| *rate)
+                    .collect();
+                same.iter().sum::<f64>() / same.len() as f64
+            })
+            .collect(),
+    )
+}
+
+/// What the screen says of a round: which GPUs mine which token, and the
+/// turns on the rest. GPUs are numbered from 1 in the order chosen.
+fn layout_text(round: &Round, slots: &[Slot]) -> String {
+    let name = |owner: Option<usize>| owner.map_or("idle", |index| slots[index].token.name());
+    let mut parts: Vec<String> = Vec::new();
+    let mut owners: Vec<Option<usize>> = Vec::new();
+    for owner in round.gpus.iter().flatten() {
+        if !owners.contains(owner) {
+            owners.push(*owner);
+        }
+    }
+    for owner in owners {
+        let numbers: Vec<String> = round
+            .gpus
+            .iter()
+            .enumerate()
+            .filter(|(_, gpu)| **gpu == Some(owner))
+            .map(|(index, _)| (index + 1).to_string())
+            .collect();
+        parts.push(format!("GPU {} {}", numbers.join(", "), name(owner)));
+    }
+    let shared: Vec<String> = round
+        .gpus
+        .iter()
+        .enumerate()
+        .filter(|(_, gpu)| gpu.is_none())
+        .map(|(index, _)| (index + 1).to_string())
+        .collect();
+    if !shared.is_empty() {
+        let period: Duration = round.turns.iter().map(|(_, length)| *length).sum();
+        let turns: Vec<String> = round
+            .turns
+            .iter()
+            .map(|(owner, length)| {
+                format!(
+                    "{} {:.0}%",
+                    name(*owner),
+                    100.0 * length.as_secs_f64() / period.as_secs_f64().max(1e-9)
+                )
+            })
+            .collect();
+        let gpus = if round.gpus.len() == 1 {
+            "The GPU".to_owned()
+        } else {
+            format!("GPU {}", shared.join(", "))
+        };
+        parts.push(if turns.is_empty() {
+            format!("{gpus} idle")
+        } else {
+            format!("{gpus} takes turns: {}", turns.join(" · "))
+        });
+    }
+    parts.join(" · ")
+}
+
+/// Hands each GPU to one slot at a time by `plan`, every `period`, until
+/// `stop`; then releases every hold so each token can stop cleanly. The
+/// GPUs (`names`, in the order chosen) all take turns until their speeds
+/// are measured; `layout` says how the GPUs are shared now.
+/// #### PR #61: a round starts again as soon as a token starts or stops
+/// wanting the GPUs, so its GPUs and time go to the others at once.
+pub fn schedule(
+    slots: &[Slot],
+    names: &[String],
+    stop: &AtomicBool,
+    period: Duration,
+    layout: &std::sync::Mutex<String>,
+) {
+    let gpus = names.len().max(1);
+    let started = Instant::now();
+    let mut weights: Option<Vec<f64>> = (gpus == 1).then(|| vec![1.0]);
+    let give = |owners: &[Option<usize>]| {
+        for (gpu, owner) in owners.iter().enumerate() {
+            for (index, slot) in slots.iter().enumerate() {
+                slot.member.hold(gpu, *owner != Some(index));
+            }
         }
     };
+    let wants_now = || -> Vec<bool> {
+        slots
+            .iter()
+            .map(|slot| slot.share.load(Ordering::Relaxed) > 0 && slot.member.wants_gpu())
+            .collect()
+    };
     while !stop.load(Ordering::Relaxed) {
+        if weights.is_none() && started.elapsed() >= period * MEASURE_ROUNDS {
+            weights = weigh(slots, names)
+                .or_else(|| (started.elapsed() >= MEASURE_LIMIT).then(|| vec![1.0; gpus]));
+        }
         let shares: Vec<u8> = slots
             .iter()
             .map(|slot| slot.share.load(Ordering::Relaxed))
             .collect();
-        let wants: Vec<bool> = slots.iter().map(|slot| slot.member.wants_gpu()).collect();
-        let nobody = !shares
-            .iter()
-            .zip(&wants)
-            .any(|(share, wants)| *share > 0 && *wants);
-        for (turn, length) in plan(&shares, &wants, period) {
-            if current != Some(turn) {
-                give(turn);
-                current = Some(turn);
+        let wants = wants_now();
+        let round = match &weights {
+            Some(weights) => plan(&shares, &wants, weights, period),
+            None => Round {
+                gpus: vec![None; gpus],
+                turns: turns(&needs(&shares, &wants), period),
+            },
+        };
+        let text = match &weights {
+            Some(_) => layout_text(&round, slots),
+            None => format!(
+                "measuring the GPUs; meanwhile {}",
+                layout_text(&round, slots)
+            ),
+        };
+        *layout.lock().unwrap_or_else(|e| e.into_inner()) = text;
+        let mut owners: Vec<Option<usize>> = round.gpus.iter().map(|gpu| gpu.flatten()).collect();
+        // A round with no turns still lasts a period.
+        let turns = if round.turns.is_empty() {
+            vec![(None, period)]
+        } else {
+            round.turns.clone()
+        };
+        'round: for (turn, length) in turns {
+            for (gpu, whole) in round.gpus.iter().enumerate() {
+                if whole.is_none() {
+                    owners[gpu] = turn;
+                }
             }
+            give(&owners);
             let end = Instant::now() + length;
             while !stop.load(Ordering::Relaxed) {
                 let now = Instant::now();
@@ -297,19 +519,9 @@ pub fn schedule(slots: &[Slot], stop: &AtomicBool, period: Duration) {
                     break;
                 }
                 // A token that can no longer mine (a winner to claim, an
-                // empty pot) ends its turn early; an idle round with nobody
-                // able to mine ends as soon as one can.
-                let ended = match turn {
-                    Some(index) => !slots[index].member.wants_gpu(),
-                    None => {
-                        nobody
-                            && slots.iter().any(|slot| {
-                                slot.share.load(Ordering::Relaxed) > 0 && slot.member.wants_gpu()
-                            })
-                    }
-                };
-                if ended {
-                    break;
+                // empty pot) or can again starts a new round.
+                if wants_now() != wants {
+                    break 'round;
                 }
                 std::thread::sleep((end - now).min(Duration::from_millis(5)));
             }
@@ -318,8 +530,10 @@ pub fn schedule(slots: &[Slot], stop: &AtomicBool, period: Duration) {
             }
         }
     }
-    for slot in slots {
-        slot.member.hold(false);
+    for gpu in 0..gpus {
+        for slot in slots {
+            slot.member.hold(gpu, false);
+        }
     }
 }
 
@@ -345,6 +559,7 @@ pub fn run(
         return Err("no GPU selected for mining".into());
     }
     let _gpu_lock = crate::mining_lock::acquire_gpu_lock()?;
+    let names: Vec<String> = gpus.iter().map(|gpu| gpu.name.clone()).collect();
     let electric_devices = crate::backend::electric_engines_for(gpus.to_vec())?;
     let monitor = Arc::new(Monitor::new(
         100,
@@ -368,12 +583,18 @@ pub fn run(
                 // The split decides how much of the time each token mines.
                 token_cfg.set_intensity(100)?;
                 let supervisor = RuntimeSupervisor::start_on_gpus(token_cfg, gpus)?;
+                // Every GPU waits for the scheduler's first turn.
                 let hold = supervisor.hold_handle();
-                hold.set(true);
+                for gpu in 0..gpus.len() {
+                    hold.set_gpu(gpu, true);
+                }
                 slots.push(Slot {
                     token,
                     share: AtomicU8::new(share),
-                    member: Box::new(hold),
+                    member: Box::new(RuntimeMember {
+                        hold,
+                        rates: supervisor.gpu_rates(),
+                    }),
                 });
                 runtimes.push(Runtime {
                     token,
@@ -382,7 +603,9 @@ pub fn run(
                 });
             }
             SplitToken::Electric => {
-                monitor.held.store(true, Ordering::Release);
+                for gpu in 0..gpus.len() {
+                    monitor.hold_gpu(gpu, true);
+                }
                 slots.push(Slot {
                     token,
                     share: AtomicU8::new(share),
@@ -392,6 +615,7 @@ pub fn run(
         }
     }
     let electric = shares.get(SplitToken::Electric) > 0;
+    let layout = std::sync::Mutex::new(String::new());
     let outcome = std::thread::scope(|scope| {
         let electric = electric.then(|| {
             scope.spawn(|| {
@@ -404,11 +628,11 @@ pub fn run(
                 mined
             })
         });
-        let scheduler = scope.spawn(|| schedule(&slots, &stop, PERIOD));
+        let scheduler = scope.spawn(|| schedule(&slots, &names, &stop, PERIOD, &layout));
         let shown = if plain {
-            report(&stop, &mut runtimes, &monitor, &slots)
+            report(&stop, &mut runtimes, &monitor, &slots, &layout)
         } else {
-            screen(&stop, &mut runtimes, &monitor, &slots, cfg.network)
+            screen(&stop, &mut runtimes, &monitor, &slots, cfg.network, &layout)
         };
         stop.store(true, Ordering::SeqCst);
         let _ = scheduler.join();
@@ -519,6 +743,7 @@ fn report(
     runtimes: &mut [Runtime],
     monitor: &Monitor,
     slots: &[Slot],
+    layout: &std::sync::Mutex<String>,
 ) -> Result<(), String> {
     println!(
         "Hash split: {}. Ctrl+C stops.",
@@ -534,8 +759,15 @@ fn report(
     );
     let mut events = VecDeque::new();
     let mut printed = Instant::now();
+    let mut shown_layout = String::new();
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(250));
+        // #### PR #61: how the GPUs are shared, when it changes.
+        let now = layout.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if now != shown_layout && !now.is_empty() {
+            println!("GPUs: {now}");
+            shown_layout = now;
+        }
         take_events(runtimes, &mut events);
         for event in events.drain(..) {
             println!("{event}");
@@ -566,6 +798,7 @@ fn screen(
     monitor: &Monitor,
     slots: &[Slot],
     network: MiningNetwork,
+    layout: &std::sync::Mutex<String>,
 ) -> Result<(), String> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEventKind},
@@ -596,6 +829,7 @@ fn screen(
         take_events(runtimes, &mut events);
         let electric = monitor.summary();
         let rows = rows(runtimes, &electric, slots);
+        let layout = layout.lock().unwrap_or_else(|e| e.into_inner()).clone();
         terminal
             .draw(|frame| {
                 draw(
@@ -604,6 +838,7 @@ fn screen(
                         network,
                         uptime: started.elapsed(),
                         devices: &monitor.devices(),
+                        layout: &layout,
                         rows: &rows,
                         electric: slots
                             .iter()
@@ -661,6 +896,8 @@ struct Shown<'a> {
     network: MiningNetwork,
     uptime: Duration,
     devices: &'a str,
+    /// #### PR #61: which GPUs mine which token.
+    layout: &'a str,
     rows: &'a [Row],
     electric: Option<&'a crate::electric::ui::Summary>,
     events: &'a VecDeque<String>,
@@ -682,6 +919,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &Shown<'_>) {
             state.uptime.as_secs() / 60,
             state.uptime.as_secs() % 60
         )),
+        Line::from(format!("Split      {}", state.layout)),
         Line::from(""),
         Line::from(Span::styled(
             format!(
@@ -883,56 +1121,141 @@ mod tests {
             .collect()
     }
 
+    /// A round on `gpus` equal GPUs: each GPU's whole owner, and the turns.
+    #[allow(clippy::type_complexity)]
+    fn round(
+        shares: &[u8],
+        wants: &[bool],
+        gpus: usize,
+    ) -> (Vec<Option<Option<usize>>>, Vec<(Option<usize>, u128)>) {
+        let round = plan(shares, wants, &vec![1.0; gpus], Duration::from_millis(2000));
+        (round.gpus, turn_ms(&round.turns))
+    }
+
     #[test]
     fn a_round_follows_the_shares_and_gives_a_waiting_tokens_time_to_the_others() {
-        let period = Duration::from_millis(2000);
+        // One GPU: the tokens take turns as their shares say.
         assert_eq!(
-            turn_ms(&plan(&[80, 20], &[true, true], period)),
-            [(Some(0), 1600), (Some(1), 400)]
+            round(&[80, 20], &[true, true], 1),
+            (vec![None], vec![(Some(0), 1600), (Some(1), 400)])
         );
         // ELECTRIC's pot is empty: PHOTON mines the whole round.
         assert_eq!(
-            turn_ms(&plan(&[80, 20], &[true, false], period)),
-            [(Some(0), 2000)]
+            round(&[80, 20], &[true, false], 1),
+            (vec![Some(Some(0))], vec![])
         );
         // The idle part stays idle, whoever waits.
         assert_eq!(
-            turn_ms(&plan(&[40, 40], &[true, true], period)),
-            [(Some(0), 800), (Some(1), 800), (None, 400)]
+            round(&[40, 40], &[true, true], 1),
+            (
+                vec![None],
+                vec![(Some(0), 800), (Some(1), 800), (None, 400)]
+            )
         );
         assert_eq!(
-            turn_ms(&plan(&[40, 40], &[false, true], period)),
-            [(Some(1), 1600), (None, 400)]
+            round(&[40, 40], &[false, true], 1),
+            (vec![None], vec![(Some(1), 1600), (None, 400)])
         );
         // Nobody can mine: the round idles; a token at 0% never mines.
         assert_eq!(
-            turn_ms(&plan(&[80, 20], &[false, false], period)),
-            [(None, 2000)]
+            round(&[80, 20], &[false, false], 1),
+            (vec![Some(None)], vec![])
         );
         assert_eq!(
-            turn_ms(&plan(&[100, 0], &[true, true], period)),
-            [(Some(0), 2000)]
+            round(&[100, 0], &[true, true], 1),
+            (vec![Some(Some(0))], vec![])
         );
     }
 
-    /// A member that counts how long it held the GPUs.
+    // #### PR #61: whole GPUs first; turns only on the GPUs left over.
+    #[test]
+    fn a_rig_gives_whole_gpus_first_and_turns_only_on_the_rest() {
+        // Five GPUs at 80/20: four mine PHOTON, one ELECTRIC; no turns.
+        assert_eq!(
+            round(&[80, 20], &[true, true], 5),
+            (
+                vec![
+                    Some(Some(0)),
+                    Some(Some(0)),
+                    Some(Some(0)),
+                    Some(Some(0)),
+                    Some(Some(1))
+                ],
+                vec![]
+            )
+        );
+        // ELECTRIC waits for its pot: all five mine PHOTON.
+        assert_eq!(
+            round(&[80, 20], &[true, false], 5).0,
+            vec![Some(Some(0)); 5]
+        );
+        // Two GPUs at 80/20: PHOTON has one; the other takes turns 60/40.
+        assert_eq!(
+            round(&[80, 20], &[true, true], 2),
+            (
+                vec![Some(Some(0)), None],
+                vec![(Some(0), 1200), (Some(1), 800)]
+            )
+        );
+        // Three GPUs at 50/50: one each, the third takes turns.
+        assert_eq!(
+            round(&[50, 50], &[true, true], 3),
+            (
+                vec![Some(Some(0)), Some(Some(1)), None],
+                vec![(Some(0), 1000), (Some(1), 1000)]
+            )
+        );
+        // The idle rest of 100% is a GPU too.
+        assert_eq!(
+            round(&[60, 20], &[true, true], 5).0,
+            vec![
+                Some(Some(0)),
+                Some(Some(0)),
+                Some(Some(0)),
+                Some(Some(1)),
+                Some(None)
+            ]
+        );
+        // A fast GPU and a slow one (3:1) at 80/20: the fast one mines
+        // PHOTON; the slow one takes turns for the rest of both.
+        let mixed = plan(
+            &[80, 20],
+            &[true, true],
+            &[3.0, 1.0],
+            Duration::from_millis(2000),
+        );
+        assert_eq!(mixed.gpus, vec![Some(Some(0)), None]);
+        assert_eq!(turn_ms(&mixed.turns), [(Some(0), 400), (Some(1), 1600)]);
+    }
+
+    /// A member that counts how long it held each GPU, at a fixed rate.
     struct Fake {
         wants: AtomicBool,
-        held: AtomicBool,
-        mined: Mutex<(Duration, Option<Instant>)>,
+        held: Vec<AtomicBool>,
+        mined: Vec<Mutex<(Duration, Option<Instant>)>>,
+        rate: f64,
     }
 
     impl Fake {
-        fn new(wants: bool) -> Arc<Self> {
+        fn new(wants: bool, gpus: usize) -> Arc<Self> {
             Arc::new(Self {
                 wants: AtomicBool::new(wants),
-                held: AtomicBool::new(true),
-                mined: Mutex::new((Duration::ZERO, None)),
+                held: (0..gpus).map(|_| AtomicBool::new(true)).collect(),
+                mined: (0..gpus)
+                    .map(|_| Mutex::new((Duration::ZERO, None)))
+                    .collect(),
+                rate: 1e9,
             })
         }
-        fn mined(&self) -> Duration {
-            let (total, since) = *self.mined.lock().unwrap();
+        fn mined_on(&self, gpu: usize) -> Duration {
+            let (total, since) = *self.mined[gpu].lock().unwrap();
             total + since.map_or(Duration::ZERO, |since| since.elapsed())
+        }
+        fn mined(&self) -> Duration {
+            (0..self.mined.len()).map(|gpu| self.mined_on(gpu)).sum()
+        }
+        fn released(&self) -> bool {
+            self.held.iter().all(|held| !held.load(Ordering::Relaxed))
         }
     }
 
@@ -940,36 +1263,44 @@ mod tests {
         fn wants_gpu(&self) -> bool {
             self.wants.load(Ordering::Relaxed)
         }
-        fn hold(&self, held: bool) {
-            let mut mined = self.mined.lock().unwrap();
+        fn hold(&self, gpu: usize, held: bool) {
+            let mut mined = self.mined[gpu].lock().unwrap();
             match (held, mined.1) {
                 (true, Some(since)) => *mined = (mined.0 + since.elapsed(), None),
                 (false, None) => mined.1 = Some(Instant::now()),
                 _ => {}
             }
-            self.held.store(held, Ordering::Relaxed);
+            self.held[gpu].store(held, Ordering::Relaxed);
+        }
+        fn gpu_rates(&self, gpus: usize) -> Vec<f64> {
+            vec![self.rate; gpus]
         }
     }
 
-    #[test]
-    fn the_scheduler_gives_each_token_its_share_and_releases_every_hold_at_stop() {
-        let (photon, electric) = (Fake::new(true), Fake::new(true));
-        let slots = [
+    fn slots_of(photon: &Arc<Fake>, electric: &Arc<Fake>) -> [Slot; 2] {
+        [
             Slot {
                 token: SplitToken::Gpu(MiningToken::Photon),
                 share: AtomicU8::new(80),
-                member: Box::new(Arc::clone(&photon)),
+                member: Box::new(Arc::clone(photon)),
             },
             Slot {
                 token: SplitToken::Electric,
                 share: AtomicU8::new(20),
-                member: Box::new(Arc::clone(&electric)),
+                member: Box::new(Arc::clone(electric)),
             },
-        ];
+        ]
+    }
+
+    #[test]
+    fn the_scheduler_gives_each_token_its_share_and_releases_every_hold_at_stop() {
+        let (photon, electric) = (Fake::new(true, 1), Fake::new(true, 1));
+        let slots = slots_of(&photon, &electric);
         let stop = AtomicBool::new(false);
         let period = Duration::from_millis(200);
+        let layout = Mutex::new(String::new());
         std::thread::scope(|scope| {
-            scope.spawn(|| schedule(&slots, &stop, period));
+            scope.spawn(|| schedule(&slots, &["GPU".into()], &stop, period, &layout));
             std::thread::sleep(period * 5);
             let (p, e) = (photon.mined(), electric.mined());
             let share = p.as_secs_f64() / (p + e).as_secs_f64();
@@ -982,7 +1313,37 @@ mod tests {
             assert!(gained > 0.9, "PHOTON had {gained:.3} with ELECTRIC waiting");
             stop.store(true, Ordering::Relaxed);
         });
-        assert!(!photon.held.load(Ordering::Relaxed) && !electric.held.load(Ordering::Relaxed));
+        assert!(photon.released() && electric.released());
+    }
+
+    // #### PR #61: once the GPUs are measured, a rig mines whole GPUs.
+    #[test]
+    fn the_scheduler_measures_a_rig_then_gives_it_whole_gpus() {
+        let (photon, electric) = (Fake::new(true, 5), Fake::new(true, 5));
+        let slots = slots_of(&photon, &electric);
+        let stop = AtomicBool::new(false);
+        let period = Duration::from_millis(100);
+        let layout = Mutex::new(String::new());
+        let names = vec!["RTX 3070".to_string(); 5];
+        std::thread::scope(|scope| {
+            scope.spawn(|| schedule(&slots, &names, &stop, period, &layout));
+            std::thread::sleep(period * 2);
+            assert!(layout.lock().unwrap().starts_with("measuring the GPUs"));
+            std::thread::sleep(period * (MEASURE_ROUNDS + 1));
+            let before: Vec<Duration> = (0..5).map(|gpu| electric.mined_on(gpu)).collect();
+            std::thread::sleep(period * 5);
+            let gained: Vec<Duration> = (0..5)
+                .map(|gpu| electric.mined_on(gpu) - before[gpu])
+                .collect();
+            assert!(gained[..4].iter().all(Duration::is_zero), "{gained:?}");
+            assert!(gained[4] > period * 4, "{gained:?}");
+            assert_eq!(
+                *layout.lock().unwrap(),
+                "GPU 1, 2, 3, 4 PHOTON · GPU 5 ELECTRIC"
+            );
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(photon.released() && electric.released());
     }
 
     fn screen_text(state: &Shown<'_>) -> String {
@@ -1036,6 +1397,7 @@ mod tests {
                 network: MiningNetwork::Mainnet,
                 uptime: Duration::from_secs(75),
                 devices: "RTX 5070 Ti (cuda)",
+                layout: "The GPU takes turns: PHOTON 80% · ELECTRIC 20%",
                 rows: &rows,
                 electric: Some(electric),
                 events: &events,
@@ -1045,6 +1407,7 @@ mod tests {
         let unfunded = text(&electric);
         for expected in [
             " Pickaxe · hash split · mainnet ".to_string(),
+            "Split      The GPU takes turns: PHOTON 80% · ELECTRIC 20%".into(),
             format!(
                 "  {:<10} {:>4}%  {:>11}  {:>7}  Mining · height 973600",
                 "PHOTON", 80, "1.35 GH/s", 2

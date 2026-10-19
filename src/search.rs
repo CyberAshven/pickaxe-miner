@@ -605,6 +605,9 @@ struct GpuCounters {
     batches: Arc<AtomicU64>,
     winners: Arc<AtomicU64>,
     diagnostics: Arc<WorkerDiagnostics>,
+    /// #### PR #61: the hash split holds this GPU alone, so a rig's GPUs
+    /// can mine different tokens at once.
+    held: Arc<AtomicBool>,
     /// The newest job for this GPU. A newer job replaces one the worker has
     /// not taken yet, so a GPU that falls behind resumes on the current job
     /// and a stuck GPU never blocks the others.
@@ -620,6 +623,7 @@ impl GpuCounters {
             batches: Arc::new(AtomicU64::new(0)),
             winners: Arc::new(AtomicU64::new(0)),
             diagnostics: Arc::new(WorkerDiagnostics::new()),
+            held: Arc::new(AtomicBool::new(false)),
             mailbox: Arc::new(Mutex::new(None)),
         }
     }
@@ -797,6 +801,7 @@ fn run_worker(
         batches,
         winners,
         diagnostics,
+        held: gpu_held,
         mailbox: _,
     } = gpu;
     // Every start, including a restart, signs under a fresh random key.
@@ -905,7 +910,8 @@ fn run_worker(
         }
         // #### PR #53: another token's turn on the GPUs. A short poll keeps
         // the hand-over within a few milliseconds of the split's plan.
-        if held.load(Ordering::Acquire) {
+        // #### PR #61: or this GPU's alone.
+        if held.load(Ordering::Acquire) || gpu_held.load(Ordering::Acquire) {
             batch_in_flight.store(false, Ordering::SeqCst);
             thread::park_timeout(HOLD_POLL);
             pacer.reset(Instant::now());
@@ -1115,12 +1121,22 @@ impl SearchPauseHandle {
 pub struct SearchHold {
     held: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    /// #### PR #61: each GPU's own hold, in the order the GPUs were chosen.
+    gpus: Vec<Arc<AtomicBool>>,
 }
 
 impl SearchHold {
     /// Holds (`true`) or releases this search's GPU work at its next batch.
     pub fn set(&self, held: bool) {
         self.held.store(held, Ordering::Release);
+    }
+
+    /// #### PR #61: holds or releases the GPU at `index` (in the order the
+    /// GPUs were chosen) at its next batch.
+    pub fn set_gpu(&self, index: usize, held: bool) {
+        if let Some(gpu) = self.gpus.get(index) {
+            gpu.store(held, Ordering::Release);
+        }
     }
 
     /// Whether the search would mine if it had the GPUs.
@@ -1135,6 +1151,11 @@ impl SearchHandle {
         SearchHold {
             held: Arc::clone(&self.shared.held),
             paused: Arc::clone(&self.shared.paused),
+            gpus: self
+                .workers
+                .iter()
+                .map(|worker| Arc::clone(&worker.counters.held))
+                .collect(),
         }
     }
 

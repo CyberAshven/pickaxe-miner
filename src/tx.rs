@@ -157,7 +157,7 @@ pub(crate) fn cashaddr_with_version(
     cashaddr_with_prefix(prefix, version, hash)
 }
 
-/// #### PR #59: the BCH P2Pool share address of a P2PKH CashAddr: the same
+/// #### PR #61: the BCH P2Pool share address of a P2PKH CashAddr: the same
 /// key under the share chain's prefix (`p2pool:` for `bitcoincash:`,
 /// `tp2pool:` for `bchtest:`), as P2Pool's `bch-share-address` prints it.
 /// A miner names it with `p2p=` when the node has no share address of its own.
@@ -1398,7 +1398,7 @@ mod tests {
         assert!(set_payout_value_sats(&mut candidate, 886).is_err());
     }
 
-    // #### PR #59: the vectors P2Pool v0.0.1-alpha's `bch-share-address`
+    // #### PR #61: the vectors P2Pool v0.0.1-alpha's `bch-share-address`
     // prints for the two donation addresses; a P2SH address has no share key.
     #[test]
     fn p2pool_share_addresses_match_p2pools_own_encoding() {

@@ -50,9 +50,11 @@ pub fn plan(
     installed: &Installed,
     settings: &Settings,
 ) -> Result<Plan, String> {
+    // #### PR #61: the first of the configured nodes.
     let node = cfg
-        .node_url
-        .as_deref()
+        .custom_node_endpoints()
+        .first()
+        .copied()
         .ok_or("P2Pool needs your BCH node: give --node-rpc http://HOST:PORT")?;
     let (node_url, login) = crate::node::rpc_endpoint_and_login(node)?;
     let zmq = match &cfg.node_zmq {

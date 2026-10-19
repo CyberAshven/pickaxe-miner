@@ -82,7 +82,7 @@ const DONATION_REQUEST: u32 = 2;
 pub struct DonationRoute {
     pub identity: String,
     pub rate: Arc<RwLock<BchDonation>>,
-    /// #### PR #59: the identity asked for once if the pool refuses
+    /// #### PR #61: the identity asked for once if the pool refuses
     /// `identity`: BCH P2Pool nodes differ in whether each miner names a
     /// share address (`,p2p=`).
     pub fallback: Option<String>,
@@ -465,7 +465,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     })
 }
 
-/// #### PR #59: why a pool refused the device's channel, from its error
+/// #### PR #61: why a pool refused the device's channel, from its error
 /// code. A BCH P2Pool node with no share address of its own needs one from
 /// each miner, and one that has its own refuses a different one.
 fn channel_refusal(reply: &mut SerializedFrame) -> String {
@@ -1434,7 +1434,7 @@ impl Bridge {
                 {
                     return Err("unexpected SV2 channel error".into());
                 }
-                // #### PR #59: asked once more under the fallback identity.
+                // #### PR #61: asked once more under the fallback identity.
                 match self.route.as_mut().and_then(|route| {
                     let fallback = route.fallback.take()?;
                     route.identity = fallback;
@@ -2458,7 +2458,7 @@ mod tests {
         assert!(local.tick(Instant::now()).unwrap().is_empty());
     }
 
-    // #### PR #59: a refused donation identity is followed once by the
+    // #### PR #61: a refused donation identity is followed once by the
     // fallback; a second refusal drops the donation.
     #[test]
     fn a_refused_donation_identity_retries_once_under_the_fallback() {

@@ -143,7 +143,7 @@ fn peers_text(settings: &Settings) -> String {
 
 /// What the update line says.
 #[derive(Debug, Clone, PartialEq)]
-enum Update {
+pub(crate) enum Update {
     UpToDate,
     Available(Release),
     /// The release list could not be read.
@@ -154,7 +154,7 @@ enum Update {
 /// The installed P2Pool after applying the update policy: install when
 /// none is installed; with auto-update on, install a newer release (and
 /// keep the current one if that fails); with it off, offer it.
-fn prepare(
+pub(crate) fn prepare(
     home: &Path,
     settings: &Settings,
     no_update: bool,
@@ -194,13 +194,13 @@ fn prepare(
 }
 
 /// The BCH node as its light shows it, checked every 15 seconds.
-struct NodeWatch {
+pub(crate) struct NodeWatch {
     state: Arc<Mutex<Option<NodeCheck>>>,
     stop: Arc<AtomicBool>,
 }
 
 impl NodeWatch {
-    fn start(url: String, network: MiningNetwork) -> Self {
+    pub(crate) fn start(url: String, network: MiningNetwork) -> Self {
         let state = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -221,7 +221,7 @@ impl NodeWatch {
         Self { state, stop }
     }
 
-    fn check(&self) -> Option<NodeCheck> {
+    pub(crate) fn check(&self) -> Option<NodeCheck> {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
@@ -232,7 +232,7 @@ impl Drop for NodeWatch {
     }
 }
 
-fn node_light(check: Option<&NodeCheck>) -> (Light, String) {
+pub(crate) fn node_light(check: Option<&NodeCheck>) -> (Light, String) {
     match check {
         None => (Light::Grey, "checking…".into()),
         Some(NodeCheck::Ready { info, .. }) if info.syncing || info.blocks < info.headers => {
@@ -261,8 +261,9 @@ fn run(
     let mut settings = Settings::load(&home)?;
     let (mut installed, mut update) = prepare(&home, &settings, no_update)?;
     let node = cfg
-        .node_url
-        .clone()
+        .custom_node_endpoints()
+        .first()
+        .map(|node| (*node).to_owned())
         .ok_or("P2Pool needs your BCH node: give --node-rpc http://HOST:PORT")?;
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -452,7 +453,7 @@ struct Shown<'a> {
     status: &'a str,
 }
 
-fn light_span(light: Light) -> ratatui::text::Span<'static> {
+pub(crate) fn light_span(light: Light) -> ratatui::text::Span<'static> {
     use ratatui::style::{Color, Style};
     let (mark, color) = match light {
         Light::Green => ("●", Color::Green),

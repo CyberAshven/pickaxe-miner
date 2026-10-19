@@ -43,7 +43,8 @@ pub fn search_all(
                             continue;
                         }
                         // #### PR #53: another token's turn on the GPUs.
-                        if monitor.held.load(std::sync::atomic::Ordering::Acquire) {
+                        // #### PR #61: or on this GPU alone.
+                        if monitor.gpu_held(device) {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                             pacer.reset(started.elapsed());
                             continue;
