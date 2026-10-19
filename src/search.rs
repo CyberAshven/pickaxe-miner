@@ -42,6 +42,8 @@ use crate::gpu_types::THROTTLED_BATCH_DIVISOR;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const PAUSE_POLL: Duration = Duration::from_millis(25);
+/// #### PR #60: how often a held GPU worker looks for its turn again.
+const HOLD_POLL: Duration = Duration::from_millis(2);
 
 pub(crate) enum PhotonEngine {
     Cuda(Box<CudaPhotonEngine>),
@@ -583,6 +585,9 @@ enum WorkerExit {
 #[derive(Clone)]
 struct SharedControl {
     paused: Arc<AtomicBool>,
+    /// #### PR #60: the hash split holds this token's GPU work while
+    /// another token has the GPUs; unlike `paused`, nothing else clears it.
+    held: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
     generation_id: Arc<AtomicU64>,
     /// #### PR #32: the donation's share of the work, changed while mining
@@ -772,6 +777,7 @@ fn run_worker(
 ) -> WorkerExit {
     let SharedControl {
         paused,
+        held,
         intensity,
         generation_id,
         work_fee: shared_work_fee,
@@ -894,6 +900,14 @@ fn run_worker(
         if paused.load(Ordering::SeqCst) {
             batch_in_flight.store(false, Ordering::SeqCst);
             thread::park_timeout(PAUSE_POLL);
+            pacer.reset(Instant::now());
+            continue;
+        }
+        // #### PR #60: another token's turn on the GPUs. A short poll keeps
+        // the hand-over within a few milliseconds of the split's plan.
+        if held.load(Ordering::Acquire) {
+            batch_in_flight.store(false, Ordering::SeqCst);
+            thread::park_timeout(HOLD_POLL);
             pacer.reset(Instant::now());
             continue;
         }
@@ -1094,7 +1108,37 @@ impl SearchPauseHandle {
     }
 }
 
+/// #### PR #60: the hash split's grip on one search: hold its GPUs while
+/// another token mines, and see whether it wants them at all (not while a
+/// winner's claim or the user pauses it).
+#[derive(Clone)]
+pub struct SearchHold {
+    held: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+}
+
+impl SearchHold {
+    /// Holds (`true`) or releases this search's GPU work at its next batch.
+    pub fn set(&self, held: bool) {
+        self.held.store(held, Ordering::Release);
+    }
+
+    /// Whether the search would mine if it had the GPUs.
+    pub fn wants_gpu(&self) -> bool {
+        !self.paused.load(Ordering::SeqCst)
+    }
+}
+
 impl SearchHandle {
+    /// #### PR #60: the hash split's hold on this search.
+    pub fn hold_handle(&self) -> SearchHold {
+        SearchHold {
+            held: Arc::clone(&self.shared.held),
+            paused: Arc::clone(&self.shared.paused),
+        }
+    }
+
+    /// Starts GPU search using the configured backend.
     /// Starts GPU search using the configured backend.
     pub fn start(intensity: u8, job: MiningJob) -> Result<Self, String> {
         Self::start_on_device(0, intensity, job)
@@ -1218,6 +1262,7 @@ impl SearchHandle {
         Ok(Self {
             shared: SharedControl {
                 paused: Arc::new(AtomicBool::new(false)),
+                held: Arc::new(AtomicBool::new(false)),
                 intensity: Arc::new(AtomicU8::new(intensity)),
                 generation_id: Arc::new(AtomicU64::new(job.generation_id)),
                 work_fee: Arc::new(Mutex::new(Some(policy))),
@@ -1283,6 +1328,7 @@ impl SearchHandle {
 
         let shared = SharedControl {
             paused: Arc::new(AtomicBool::new(initially_paused)),
+            held: Arc::new(AtomicBool::new(false)),
             intensity: Arc::new(AtomicU8::new(intensity)),
             generation_id: Arc::new(AtomicU64::new(job.generation_id)),
             work_fee: Arc::new(Mutex::new(work_fee)),
@@ -2004,6 +2050,7 @@ mod tests {
         SearchHandle {
             shared: SharedControl {
                 paused: Arc::new(AtomicBool::new(false)),
+                held: Arc::new(AtomicBool::new(false)),
                 intensity: Arc::new(AtomicU8::new(10)),
                 generation_id,
                 work_fee: Arc::new(Mutex::new(None)),
@@ -2212,6 +2259,7 @@ mod tests {
     fn failed_gpu_takes_job_changes_while_waiting_to_restart() {
         let shared = SharedControl {
             paused: Arc::new(AtomicBool::new(false)),
+            held: Arc::new(AtomicBool::new(false)),
             intensity: Arc::new(AtomicU8::new(100)),
             generation_id: Arc::new(AtomicU64::new(1)),
             work_fee: Arc::new(Mutex::new(None)),
@@ -2809,6 +2857,54 @@ mod tests {
     /// `backend:ordinal` (default `wgpu:0,wgpu:1`). With
     /// `PICKAXE_TEST_WGPU_ADAPTER` set, every wgpu entry opens that adapter,
     /// so two workers can share one GPU and no other GPU is touched.
+    // #### PR #60: the hash split's hold stops a search's GPU work without
+    // pausing it, so the search still wants the GPUs; a pause is different.
+    #[cfg(feature = "portable-wgpu")]
+    #[test]
+    fn a_held_search_hashes_nothing_until_released_if_wgpu_present() {
+        let handle = match SearchHandle::start_inner(
+            &[(BackendKind::Wgpu, 0)],
+            100,
+            control_job(1),
+            false,
+            None,
+        ) {
+            Ok(handle) => handle,
+            Err(error) if error.contains("no hardware WGPU adapter") => {
+                eprintln!("skip held search test: {error}");
+                return;
+            }
+            Err(error) => panic!("search start failed: {error}"),
+        };
+        wait_for(
+            &handle,
+            Duration::from_secs(120),
+            "the GPU mines",
+            |stats| stats.candidates > 0,
+        );
+        let hold = handle.hold_handle();
+        hold.set(true);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while handle.batch_in_flight() {
+            assert!(Instant::now() < deadline, "the GPU kept a batch in flight");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let held = handle.snapshot().candidates;
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(handle.snapshot().candidates, held);
+        assert!(hold.wants_gpu(), "a held search still wants its turn");
+        hold.set(false);
+        wait_for(
+            &handle,
+            Duration::from_secs(30),
+            "the GPU resumes",
+            |stats| stats.candidates > held,
+        );
+        handle.apply_control(RuntimeCommand::Pause).unwrap();
+        assert!(!hold.wants_gpu(), "a paused search gives its turn away");
+        handle.stop();
+    }
+
     #[cfg(feature = "portable-wgpu")]
     #[test]
     fn several_gpus_share_job_changes_pauses_and_stop_if_wgpu_present() {

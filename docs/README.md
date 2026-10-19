@@ -26,6 +26,7 @@
 - [Architecture and research](architecture.md): the end-to-end design and what exists in BCH mining
 - [BCH Stratum V2 design check](stratum-v2.md)
 - [ELECTRIC](electric-token.md): a second GPU token, chosen in the setup, with keyless fee-pot claims and owner recovery; Pickaxe's Chipnet deployment; its replay weakness
+- [Token hash split](hash-split.md): several GPU tokens on the same GPUs, each for its share of the time in 5% steps
 
 ## Records
 
