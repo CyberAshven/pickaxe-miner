@@ -605,6 +605,8 @@ enum SetupAction {
 /// One row of the settings page. Rows never change each other's options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsRow {
+    /// #### PR #63: the token, which a saved profile can change here.
+    Token,
     Gpu,
     AsicTarget,
     /// #### PR #40: solo or join a pool; the pool's kind, address and key;
@@ -1702,12 +1704,13 @@ impl SetupFlow {
             // the intensity.
             // #### PR #61: ELECTRIC and the split save profiles too.
             MiningMode::Gpu if self.split => {
-                let mut rows = vec![SettingsRow::Gpu, SettingsRow::Address];
+                let mut rows = vec![SettingsRow::Token, SettingsRow::Gpu, SettingsRow::Address];
                 rows.extend((0..self.shares().len() as u8).map(SettingsRow::Share));
                 self.with_advanced(rows, vec![SettingsRow::TokenDonation])
             }
             MiningMode::Gpu if self.electric => self.with_advanced(
                 vec![
+                    SettingsRow::Token,
                     SettingsRow::Gpu,
                     SettingsRow::Address,
                     SettingsRow::Intensity,
@@ -1729,6 +1732,7 @@ impl SetupFlow {
             // donation, in Advanced.
             MiningMode::Gpu => self.with_advanced(
                 vec![
+                    SettingsRow::Token,
                     SettingsRow::Gpu,
                     SettingsRow::Mining,
                     SettingsRow::Address,
@@ -2467,6 +2471,24 @@ impl SetupFlow {
         Ok(())
     }
 
+    /// #### PR #63: the Token row opens the token list on the current token.
+    /// An open profile stays open, so Start saves the new token into it.
+    fn open_token_list(&mut self) {
+        self.token_input.clear();
+        self.token_selected = if self.split {
+            self.split_index()
+        } else if self.electric {
+            self.matching_tokens().len()
+        } else {
+            self.matching_tokens()
+                .iter()
+                .position(|token| *token == self.config.token)
+                .unwrap_or(0)
+        };
+        self.status_line.clear();
+        self.step = SetupStep::Token;
+    }
+
     /// Starts a new profile from the launch configuration.
     fn new_profile(&mut self) -> Result<(), String> {
         self.config = self.base_config.clone();
@@ -2669,6 +2691,11 @@ impl SetupFlow {
             return SetupAction::Continue;
         }
         match key.code {
+            // #### PR #63: back to the open profile's settings, which sent
+            // it here; a new profile goes back a step.
+            KeyCode::Esc if self.active_profile.is_some() => {
+                self.open_settings(SettingsRow::Token);
+            }
             KeyCode::Esc => {
                 self.step = SetupStep::Network;
                 self.status_line.clear();
@@ -3262,6 +3289,7 @@ impl SetupFlow {
                     Err(error) => self.status_line = error,
                 },
                 SettingsRow::Gpu => self.step = SetupStep::Gpus,
+                SettingsRow::Token => self.open_token_list(),
                 SettingsRow::Intensity | SettingsRow::AsicTarget | SettingsRow::Share(_) => {
                     self.status_line = "Use Left/Right to change this row.".into();
                 }
@@ -5346,6 +5374,17 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             continue;
         }
         let (name, value, hint) = match row {
+            SettingsRow::Token => (
+                "Token",
+                Span::raw(if state.split {
+                    "Hash split".to_owned()
+                } else if state.electric {
+                    "ELECTRIC".to_owned()
+                } else {
+                    state.config.token.as_str().to_owned()
+                }),
+                "[Enter] change",
+            ),
             SettingsRow::Gpu => {
                 let gpus = state.chosen_gpus();
                 let value = match gpus.as_slice() {
@@ -5437,7 +5476,7 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             SettingsRow::Mining => (
                 "Mining",
                 Span::raw(match (state.mode, state.gpu_join, state.asic_mining) {
-                    (MiningMode::Gpu, false, _) => "Alone (claims to your address)",
+                    (MiningMode::Gpu, false, _) => "Solo (claims to your address)",
                     (MiningMode::Gpu, true, _) => {
                         "Join a GPU pool or farm (rigs on HiveOS, mmpOS, RaveOS, ...)"
                     }
@@ -8431,6 +8470,7 @@ mod tests {
         assert_eq!(
             setup.settings_rows(),
             vec![
+                SettingsRow::Token,
                 SettingsRow::Gpu,
                 SettingsRow::Address,
                 SettingsRow::Intensity,
@@ -8518,7 +8558,7 @@ mod tests {
         setup.token_selected = 0;
         setup.handle_key(key(KeyCode::Enter));
         assert!(!setup.electric);
-        assert_ne!(setup.settings_rows()[1], SettingsRow::Address);
+        assert_ne!(setup.settings_rows()[2], SettingsRow::Address);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8550,6 +8590,7 @@ mod tests {
         assert_eq!(
             setup.settings_rows(),
             vec![
+                SettingsRow::Token,
                 SettingsRow::Gpu,
                 SettingsRow::Address,
                 SettingsRow::Share(0),
@@ -9571,6 +9612,57 @@ mod tests {
         assert_eq!(setup.chosen, [false, true, false]);
     }
     // #### end PR #22 test ####
+
+    // #### PR #63: a saved profile can change its token: its Settings page
+    // starts with a Token row whose Enter opens the token list on the
+    // profile's own token; Esc there, or a choice, comes back to the same
+    // profile's settings. The GPU Mining row names solo mining "Solo".
+    #[test]
+    fn a_saved_profile_changes_its_token_from_its_settings() {
+        let mut setup = SetupFlow::new(
+            RuntimeConfig::default(),
+            test_devices(),
+            BackendKind::Auto,
+            &[],
+        )
+        .unwrap();
+        let mut payout = RuntimeConfig::default();
+        payout
+            .set_payout("bitcoincash:zphqsyxwagf5z2mnl66p2e4r6tgvu48pqys3lr2frh".into())
+            .unwrap();
+        let settings =
+            SavedConfig::from_effective("auto", &DeviceSelection::Indices(vec![0]), &payout);
+        setup.profiles.upsert(None, "Usual", settings).unwrap();
+        setup.open_profile(0).unwrap();
+        assert_eq!(setup.active_profile, Some(0));
+        assert_eq!(setup.settings_rows()[0], SettingsRow::Token);
+        let screen = setup_text(&setup);
+        assert!(
+            screen.contains("Token") && screen.contains("PHOTON"),
+            "{screen}"
+        );
+        assert!(screen.contains("Solo (claims to your address)"), "{screen}");
+        assert!(!screen.contains("Alone"), "{screen}");
+
+        setup.open_settings(SettingsRow::Token);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Token);
+        let photon = setup
+            .matching_tokens()
+            .iter()
+            .position(|token| *token == setup.config.token)
+            .unwrap();
+        assert_eq!(setup.token_selected, photon);
+        setup.handle_key(key(KeyCode::Esc));
+        assert_eq!(setup.step, SetupStep::Settings);
+        assert_eq!(setup.current_row(), SettingsRow::Token);
+        assert_eq!(setup.active_profile, Some(0));
+
+        setup.handle_key(key(KeyCode::Enter));
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Settings);
+        assert_eq!(setup.active_profile, Some(0));
+    }
 
     #[test]
     fn setup_rejects_unknown_token_and_accepts_chipnet_photon() {
