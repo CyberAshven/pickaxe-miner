@@ -82,6 +82,10 @@ const DONATION_REQUEST: u32 = 2;
 pub struct DonationRoute {
     pub identity: String,
     pub rate: Arc<RwLock<BchDonation>>,
+    /// #### PR #61: the identity asked for once if the pool refuses
+    /// `identity`: BCH P2Pool nodes differ in whether each miner names a
+    /// share address (`,p2p=`).
+    pub fallback: Option<String>,
 }
 
 impl DonationRoute {
@@ -448,7 +452,7 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     )?)?;
     let mut reply = receive.receive(DEADLINE)?.ok_or("SV2 channel timed out")?;
     if reply.header().msg_type() != MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS {
-        return Err("SV2 channel rejected".into());
+        return Err(channel_refusal(&mut reply));
     }
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
@@ -459,6 +463,32 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
         receive,
         local,
     })
+}
+
+/// #### PR #61: why a pool refused the device's channel, from its error
+/// code. A BCH P2Pool node with no share address of its own needs one from
+/// each miner, and one that has its own refuses a different one.
+fn channel_refusal(reply: &mut SerializedFrame) -> String {
+    let code = (reply.header().msg_type() == MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR)
+        .then(|| binary_sv2::from_bytes::<OpenMiningChannelError>(reply.payload()).ok())
+        .flatten()
+        .map(|error| {
+            String::from_utf8_lossy(error.error_code.as_ref())
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>()
+        });
+    match code.as_deref() {
+        Some("share-address-required") => "the pool needs a share address: add \
+            ,p2p=<share address> to --upstream-user (`pickaxe stratum-v2 share-address` \
+            prints one)"
+            .into(),
+        Some("invalid-share-address") => "the pool refused the share address in \
+            --upstream-user: it has one of its own, so remove ,p2p=, or correct it"
+            .into(),
+        Some(code) if !code.is_empty() => format!("SV2 channel rejected: {code}"),
+        _ => "SV2 channel rejected".into(),
+    }
 }
 
 fn serve_session(
@@ -1404,7 +1434,17 @@ impl Bridge {
                 {
                     return Err("unexpected SV2 channel error".into());
                 }
-                out.extend(self.drop_donation("the pool refused the donation channel")?);
+                // #### PR #61: asked once more under the fallback identity.
+                match self.route.as_mut().and_then(|route| {
+                    let fallback = route.fallback.take()?;
+                    route.identity = fallback;
+                    Some(())
+                }) {
+                    Some(()) => self.donation = Donation::Off,
+                    None => {
+                        out.extend(self.drop_donation("the pool refused the donation channel")?)
+                    }
+                }
             }
             // #### PR #42: a job, parent or target may be addressed to the
             // lanes' group channel, and then reaches each lane in it.
@@ -1937,6 +1977,7 @@ mod tests {
         let mut bridge = grouped_bridge(Some(DonationRoute {
             identity: "donation".into(),
             rate: rate.clone(),
+            fallback: None,
         }));
         bridge.upstream(group_job(9, 5)).unwrap();
         bridge.upstream(group_parent(9, 5)).unwrap();
@@ -2037,6 +2078,7 @@ mod tests {
                 Some(DonationRoute {
                     identity: "donation".into(),
                     rate: Arc::new(RwLock::new(rate)),
+                    fallback: None,
                 }),
             )
             .unwrap();
@@ -2218,6 +2260,7 @@ mod tests {
             Some(DonationRoute {
                 identity: "donation".into(),
                 rate: rate.clone(),
+                fallback: None,
             }),
         )
         .unwrap();
@@ -2383,6 +2426,7 @@ mod tests {
             Some(DonationRoute {
                 identity: "donation".into(),
                 rate,
+                fallback: None,
             }),
         )
         .unwrap();
@@ -2412,6 +2456,56 @@ mod tests {
         let mut local = ready();
         assert!(local.donation_request().unwrap().is_none());
         assert!(local.tick(Instant::now()).unwrap().is_empty());
+    }
+
+    // #### PR #61: a refused donation identity is followed once by the
+    // fallback; a second refusal drops the donation.
+    #[test]
+    fn a_refused_donation_identity_retries_once_under_the_fallback() {
+        let mut bridge = Bridge::new(
+            OpenExtendedMiningChannelSuccess {
+                request_id: 1,
+                channel_id: 3,
+                group_channel_id: 0,
+                target: (&[255u8; 32]).into(),
+                extranonce_size: 8,
+                extranonce_prefix: [7u8; 4].as_slice().try_into().unwrap(),
+            },
+            true,
+            Some(DonationRoute {
+                identity: "donation,p2p=share".into(),
+                rate: Arc::new(RwLock::new(BchDonation::default())),
+                fallback: Some("donation".into()),
+            }),
+        )
+        .unwrap();
+        bridge
+            .request(json!({"id":1,"method":"mining.subscribe","params":[]}))
+            .unwrap();
+        bridge
+            .request(json!({"id":2,"method":"mining.authorize","params":["worker", ""]}))
+            .unwrap();
+        let refused = || {
+            encoded(
+                OpenMiningChannelError {
+                    request_id: DONATION_REQUEST,
+                    error_code: "invalid-share-address".try_into().unwrap(),
+                },
+                MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+                false,
+            )
+            .unwrap()
+        };
+        assert!(bridge.donation_request().unwrap().is_some());
+        assert!(bridge.upstream(refused()).unwrap().0.is_empty());
+        assert_eq!(bridge.donation_issue, None);
+        assert_eq!(bridge.route.as_ref().unwrap().identity, "donation");
+        assert!(bridge.donation_request().unwrap().is_some());
+        assert!(bridge.upstream(refused()).unwrap().0.is_empty());
+        assert_eq!(
+            bridge.donation_issue,
+            Some("the pool refused the donation channel")
+        );
     }
 
     #[test]
@@ -2526,6 +2620,7 @@ mod tests {
         bridge.route = Some(DonationRoute {
             identity: "unused-in-fixture".into(),
             rate: Arc::new(std::sync::RwLock::new(rate)),
+            fallback: None,
         });
         bridge.allocation = WorkAllocation::new(300_000_000_000);
         bridge.request(remote_submit(20)).unwrap();

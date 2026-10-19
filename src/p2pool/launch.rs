@@ -50,9 +50,11 @@ pub fn plan(
     installed: &Installed,
     settings: &Settings,
 ) -> Result<Plan, String> {
+    // #### PR #61: the first of the configured nodes.
     let node = cfg
-        .node_url
-        .as_deref()
+        .custom_node_endpoints()
+        .first()
+        .copied()
         .ok_or("P2Pool needs your BCH node: give --node-rpc http://HOST:PORT")?;
     let (node_url, login) = crate::node::rpc_endpoint_and_login(node)?;
     let zmq = match &cfg.node_zmq {
@@ -737,11 +739,12 @@ fn pause(reason: &str, failures: &mut usize, shared: &Mutex<Shared>, stop: &Atom
         if left.is_zero() {
             return true;
         }
+        // Whole seconds left, rounded up: exactly 5 s left reads 5, not 6.
         set(
             shared,
             State::Restarting {
                 reason: reason.to_owned(),
-                in_secs: left.as_secs() + 1,
+                in_secs: left.as_secs() + u64::from(left.subsec_nanos() > 0),
             },
         );
         std::thread::sleep(left.min(Duration::from_millis(200)));

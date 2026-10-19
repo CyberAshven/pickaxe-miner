@@ -14,6 +14,7 @@ use crate::{
     cli::StratumV2Command,
     config::{self, RuntimeConfig},
     donation::bch::BchDonation,
+    p2pool::launch::Light,
     tui::TerminalSession,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -55,16 +56,33 @@ pub fn run(
     if let StratumV2Command::Watch = action {
         return watch(config_path);
     }
+    // #### PR #61: your own P2Pool node, started here and mined at as this
+    // server's pool under your share address.
+    let own_p2pool = match &action {
+        StratumV2Command::Serve {
+            own_p2pool: true, ..
+        } => Some(crate::p2pool::own::OwnNode::start(config, config_path)?),
+        _ => None,
+    };
     // #### PR #40
     // Pool mode: SV1 devices mine at a remote SV2 pool through the adapter,
     // and no local node or SV2 server runs.
-    let pools = match &action {
-        StratumV2Command::Serve {
-            upstream,
-            upstream_key,
-            upstream_user,
-            ..
-        } if !upstream.is_empty() => {
+    let pools = match (&action, &own_p2pool) {
+        (_, Some(own)) => pool_upstreams(
+            config,
+            std::slice::from_ref(&own.url),
+            &[],
+            Some(&own.identity),
+        )?,
+        (
+            StratumV2Command::Serve {
+                upstream,
+                upstream_key,
+                upstream_user,
+                ..
+            },
+            None,
+        ) if !upstream.is_empty() => {
             pool_upstreams(config, upstream, upstream_key, upstream_user.as_deref())?
         }
         _ => Vec::new(),
@@ -296,10 +314,11 @@ pub fn run(
         pools
             .into_iter()
             .map(|pool| super::sv1::Upstream {
-                donation: Some(super::sv1::DonationRoute {
-                    identity: crate::donation::bch::address(config.network).to_owned(),
-                    rate: donation.clone(),
-                }),
+                donation: Some(donation_route(
+                    config.network,
+                    &pool.identity,
+                    donation.clone(),
+                )),
                 prefer: preferred.clone(),
                 ..pool
             })
@@ -383,12 +402,14 @@ pub fn run(
     // The pools as the dashboard and status show them; never the identity.
     // #### PR #40: a public pool says so on the dashboard, with its fee.
     let pool_suffix = public_pool_suffix(public.as_ref());
-    let pool_address = (!pools.is_empty()).then(|| {
-        pools
+    // #### PR #61: your own P2Pool node by name, not its local address.
+    let pool_address = (!pools.is_empty()).then(|| match &own_p2pool {
+        Some(own) => format!("your P2Pool node ({})", own.tag),
+        None => pools
             .iter()
             .map(|pool| pool.address.as_str())
             .collect::<Vec<_>>()
-            .join(" → ")
+            .join(" → "),
     });
     // #### PR #42: what the server started with, for its Advanced page.
     let started = started_text(&Started {
@@ -753,6 +774,12 @@ pub fn run(
                         snapshot.blocks_pending,
                     )
                 };
+                let lights = status_lights(
+                    own_p2pool.as_ref(),
+                    pool_address.is_some() && !declaring,
+                    &snapshot,
+                    &devices,
+                );
                 let lines: Vec<WorkerLine> = devices.iter().map(WorkerLine::from).collect();
                 // #### PR #42: the highlight follows its device's label.
                 let labels: Vec<&str> = lines.iter().map(|line| line.label.as_str()).collect();
@@ -779,6 +806,7 @@ pub fn run(
                                 &overview_text,
                                 &devices,
                                 device_offset,
+                                &lights,
                             )
                         } else {
                             render_workers(
@@ -787,6 +815,7 @@ pub fn run(
                                 &lines,
                                 &mut selection.table,
                                 SERVE_FOOTER,
+                                &lights,
                             )
                         }
                     })
@@ -976,6 +1005,42 @@ pub fn run(
         None => Ok(()),
     };
     result.and(server_result).and(firmware_result)
+}
+
+// #### PR #61
+// What: when the device's identity names a share address (`,p2p=`, as a
+// BCH P2Pool node with no share address of its own requires), the donation
+// channel names the donation key's own share address the same way; refused
+// (a node with a share address of its own refuses another), it asks once
+// more under the bare donation address.
+// Why: such a node refused the bare donation address, which dropped the
+// donation at every P2Pool pool of that kind. P2Pool's own block donation
+// is the pool's and separate from Pickaxe's.
+// Look here if: the donation channel is refused at a P2Pool node.
+fn donation_route(
+    network: crate::config::MiningNetwork,
+    identity: &str,
+    rate: Arc<RwLock<crate::donation::bch::BchDonation>>,
+) -> super::sv1::DonationRoute {
+    let address = crate::donation::bch::address(network).to_owned();
+    let names_share = identity
+        .split_once([',', ' '])
+        .is_some_and(|(_, options)| options.contains("p2p="));
+    match names_share
+        .then(|| crate::tx::p2pool_share_address(&address).ok())
+        .flatten()
+    {
+        Some(share) => super::sv1::DonationRoute {
+            identity: format!("{address},p2p={share}"),
+            rate,
+            fallback: Some(address),
+        },
+        None => super::sv1::DonationRoute {
+            identity: address,
+            rate,
+            fallback: None,
+        },
+    }
 }
 
 /// #### PR #40
@@ -1295,21 +1360,131 @@ fn render_advanced(
     );
 }
 
+/// #### PR #61
+/// What: the colored lights over both dashboard pages, as on the P2Pool
+/// screen: P2Pool's and your BCH node's when the server runs your own
+/// P2Pool node, the pool's when it joins one, and the node's when it builds
+/// its own templates (solo, or Job Declaration with the pool's light too).
+/// Why: whether the pool and node work was a line of text among many.
+/// Look here if: a light's color disagrees with its text.
+type StatusLight = (&'static str, Light, String);
+
+fn status_lights(
+    own: Option<&crate::p2pool::own::OwnNode>,
+    joining: bool,
+    stats: &ServerStats,
+    devices: &[DeviceSnapshot],
+) -> Vec<StatusLight> {
+    if let Some(own) = own {
+        return own.lights();
+    }
+    if joining {
+        let (light, text) = pool_light(devices);
+        return vec![("Pool", light, text)];
+    }
+    let mut lights = Vec::new();
+    // An ASIC-exclusive token needs no node.
+    if stats.template_source != Some(super::provider::SourceKind::Token) {
+        let (light, text) = match (stats.template_ready, stats.last_template_error) {
+            (true, _) => (
+                Light::Green,
+                stats
+                    .height
+                    .map(|height| format!("templates ready · height {height}"))
+                    .unwrap_or_else(|| "templates ready".into()),
+            ),
+            (false, Some(error)) => (Light::Red, error.to_owned()),
+            (false, None) => (Light::Yellow, "waiting for the first template".into()),
+        };
+        lights.push(("Node", light, text));
+    }
+    if let Some(jd) = &stats.jd_client {
+        let light = match jd.state {
+            "active" => Light::Green,
+            "connecting" => Light::Yellow,
+            _ => Light::Red,
+        };
+        lights.push(("Pool", light, format!("Job Declaration {}", jd.state)));
+    }
+    lights
+}
+
+/// The pool's light when the server joins one: green while a worker mines
+/// through it, red when the last connection failed at the pool.
+fn pool_light(devices: &[DeviceSnapshot]) -> (Light, String) {
+    let online = devices.iter().filter(|device| device.connected).count();
+    if online > 0 {
+        return (
+            Light::Green,
+            format!("connected · {online} of {} workers", devices.len()),
+        );
+    }
+    let refused = devices
+        .iter()
+        .filter_map(|device| device.adapter_error.or(device.connection_error))
+        .find(|error| error.starts_with("upstream"));
+    match refused {
+        Some(error) => (Light::Red, error.to_owned()),
+        None if devices.is_empty() => (Light::Grey, "connects when a worker does".into()),
+        None => (Light::Yellow, "no worker connected".into()),
+    }
+}
+
+/// The lights as one line, or one line each when they do not fit in
+/// `width` columns together, so they never push the page's own text out.
+fn light_lines(lights: &[StatusLight], width: u16) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line, Span};
+    let spans = |(name, light, detail): &StatusLight| {
+        vec![
+            Span::raw(format!("{name} ")),
+            crate::p2pool::screen::light_span(*light),
+            Span::raw(format!(" {detail}")),
+        ]
+    };
+    let mut together = Vec::new();
+    for (index, light) in lights.iter().enumerate() {
+        if index > 0 {
+            together.push(Span::raw("   "));
+        }
+        together.extend(spans(light));
+    }
+    let together = Line::from(together);
+    if lights.is_empty() {
+        Vec::new()
+    } else if together.width() <= usize::from(width) {
+        vec![together]
+    } else {
+        lights
+            .iter()
+            .map(|light| Line::from(spans(light)))
+            .collect()
+    }
+}
+
+/// `text` below `lights`.
+fn with_lights<'a>(lights: Vec<ratatui::text::Line<'a>>, text: &'a str) -> ratatui::text::Text<'a> {
+    let mut lines = lights;
+    lines.extend(ratatui::text::Text::from(text).lines);
+    ratatui::text::Text::from(lines)
+}
+
 fn render_dashboard(
     frame: &mut Frame<'_>,
     title: &str,
     status: &str,
     devices: &[DeviceSnapshot],
     offset: usize,
+    lights: &[StatusLight],
 ) {
+    let lights = light_lines(lights, frame.area().width.saturating_sub(2));
     let areas = Layout::vertical([
-        Constraint::Length(10),
+        Constraint::Length(10 + lights.len() as u16),
         Constraint::Min(4),
         Constraint::Length(2),
     ])
     .split(frame.area());
     frame.render_widget(
-        Paragraph::new(status)
+        Paragraph::new(with_lights(lights, status))
             .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         areas[0],
@@ -1430,15 +1605,17 @@ fn render_workers(
     devices: &[WorkerLine],
     state: &mut TableState,
     footer: &str,
+    lights: &[StatusLight],
 ) {
+    let lights = light_lines(lights, frame.area().width.saturating_sub(2));
     let areas = Layout::vertical([
-        Constraint::Length(5),
+        Constraint::Length(5 + lights.len() as u16),
         Constraint::Min(4),
         Constraint::Length(2),
     ])
     .split(frame.area());
     frame.render_widget(
-        Paragraph::new(header)
+        Paragraph::new(with_lights(lights, header))
             .block(Block::bordered().title("Pickaxe · BCH ASIC mining · Workers"))
             .wrap(Wrap { trim: false }),
         areas[0],
@@ -2471,7 +2648,14 @@ fn watch(config_path: &Path) -> Result<(), String> {
             .terminal
             .draw(|frame| match panel.as_ref() {
                 Some(view) => super::panel::render(frame, view),
-                None => render_workers(frame, &header, &rows, &mut selection.table, WATCH_FOOTER),
+                None => render_workers(
+                    frame,
+                    &header,
+                    &rows,
+                    &mut selection.table,
+                    WATCH_FOOTER,
+                    &[],
+                ),
             })
             .map_err(|_| "cannot draw workers table")?;
         if event::poll(Duration::from_millis(500)).map_err(|_| "cannot read terminal")? {
@@ -3376,6 +3560,7 @@ mod tests {
                     &rows,
                     &mut selection.table,
                     SERVE_FOOTER,
+                    &[],
                 )
             })
             .unwrap();
@@ -3975,6 +4160,7 @@ mod tests {
                     &saved.rows(updated),
                     &mut TableState::default(),
                     WATCH_FOOTER,
+                    &[],
                 )
             })
             .unwrap();
@@ -4151,6 +4337,119 @@ mod tests {
         assert!(save_donation(&path, Some("Gone"), rate).is_err());
     }
 
+    // #### PR #61: the dashboard's lights: the pool's when joining one, the
+    // node's when building templates, drawn as one colored line.
+    #[test]
+    fn the_dashboard_lights_show_the_pool_and_the_node() {
+        use super::super::telemetry::Devices;
+        let start = Instant::now();
+        let mut devices = Devices::default();
+        let stats = ServerStats::default();
+        // Joining a pool: no worker yet, then one connected, then refused.
+        assert_eq!(
+            status_lights(None, true, &stats, &devices.snapshots(start)),
+            [(
+                "Pool",
+                Light::Grey,
+                "connects when a worker does".to_string()
+            )]
+        );
+        let worker = devices.connect("127.0.0.1:1000".parse().unwrap(), true, start);
+        assert_eq!(
+            status_lights(None, true, &stats, &devices.snapshots(start)),
+            [(
+                "Pool",
+                Light::Green,
+                "connected · 1 of 1 workers".to_string()
+            )]
+        );
+        devices.close(worker, true, Some("SV2 server unavailable"), start);
+        let refused = status_lights(None, true, &stats, &devices.snapshots(start));
+        assert_eq!(refused[0].1, Light::Red, "{refused:?}");
+        assert_eq!(refused[0].2, "upstream unavailable");
+        // Solo: the node's light follows its templates.
+        assert_eq!(
+            status_lights(None, false, &stats, &[]),
+            [(
+                "Node",
+                Light::Yellow,
+                "waiting for the first template".to_string()
+            )]
+        );
+        let failing = ServerStats {
+            last_template_error: Some("node unavailable"),
+            ..ServerStats::default()
+        };
+        assert_eq!(status_lights(None, false, &failing, &[])[0].1, Light::Red);
+        let ready = ServerStats {
+            template_ready: true,
+            height: Some(328_500),
+            ..ServerStats::default()
+        };
+        assert_eq!(
+            status_lights(None, false, &ready, &[]),
+            [(
+                "Node",
+                Light::Green,
+                "templates ready · height 328500".to_string()
+            )]
+        );
+        // The lights go on one line above the page's own text, or one line
+        // each when they do not fit together.
+        let ready_lights = status_lights(None, false, &ready, &[]);
+        let text = with_lights(light_lines(&ready_lights, 80), "Chipnet · Node Ready");
+        assert_eq!(text.lines.len(), 2);
+        assert_eq!(
+            text.lines[0].to_string(),
+            "Node ● templates ready · height 328500"
+        );
+        assert_eq!(with_lights(Vec::new(), "Chipnet").lines.len(), 1);
+        let two = [
+            ("P2Pool", Light::Green, "v0.0.1-alpha · running".to_string()),
+            ("Node", Light::Green, "synced at height 328550".to_string()),
+        ];
+        assert_eq!(
+            light_lines(&two, 80)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["P2Pool ● v0.0.1-alpha · running   Node ● synced at height 328550"]
+        );
+        assert_eq!(
+            light_lines(&two, 40)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "P2Pool ● v0.0.1-alpha · running",
+                "Node ● synced at height 328550"
+            ]
+        );
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|f| {
+                render_workers(
+                    f,
+                    "Chipnet · Node Ready",
+                    &[],
+                    &mut TableState::default(),
+                    SERVE_FOOTER,
+                    &status_lights(None, false, &ready, &[]),
+                )
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Node ● templates ready"), "{screen}");
+        assert!(screen.contains("Chipnet · Node Ready"), "{screen}");
+    }
+
     #[test]
     fn device_dashboard_renders_estimates_failures_and_scrolled_sessions() {
         use super::super::telemetry::{Devices, ShareEvent};
@@ -4174,6 +4473,7 @@ mod tests {
                         "Chipnet · Node Ready · Donation 1.5%",
                         &rows,
                         0,
+                        &[],
                     )
                 })
                 .unwrap();
@@ -4201,6 +4501,7 @@ mod tests {
                         "Chipnet · Node Ready",
                         &rows,
                         1,
+                        &[],
                     )
                 })
                 .unwrap();

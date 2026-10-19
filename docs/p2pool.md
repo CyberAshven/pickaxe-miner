@@ -4,10 +4,11 @@
 
 Status: `pickaxe p2pool` installs the BCH P2Pool node from P2Pool's own
 releases, keeps it updated, runs it with your node and payout, restarts it
-when it exits, and shows a light for P2Pool and one for the BCH node. Not
-yet: Pickaxe's ASIC server preferring this P2Pool and falling back to solo
-mining while it is not green, with the same lights on its dashboard, and the
-setup's P2Pool choice (still "coming soon"); that is the next change.
+when it exits, and shows a light for P2Pool and one for the BCH node.
+#### PR #61: the ASIC setup's P2Pool choice is ready: join a P2Pool node, or
+have Pickaxe run your own P2Pool node with your BCH node and mine at it,
+with its lights on the ASIC dashboard (see "Mining at it from the ASIC
+setup").
 
 ## The approach
 
@@ -105,6 +106,45 @@ devices connect, restarts, and P2Pool's newest log lines. Keys: `u` install
 an update, `a` automatic updates on or off, `r` restart P2Pool, `q` quit.
 `--no-tui` prints each change of either light instead.
 
+## Mining at it from the ASIC setup
+
+#### PR #61
+
+ASIC mining, **Join a pool**, then **Pool type: P2Pool**. The choices are a
+list; Pickaxe never moves devices from one to another by itself.
+
+| Your templates | What runs | You give |
+|---|---|---|
+| off: join a P2Pool node, which builds the jobs | Pickaxe's server mines at that node over SV2 | its HOST:PORT and authority key |
+| your node's: Pickaxe runs your own P2Pool node with it | Pickaxe installs, updates and runs P2Pool as above, and mines at it | your BCH node (and its ZMQ block notices) |
+
+- **Payout:** P2Pool pays shares to a key, so the payout must be a P2PKH
+  (`q…`) address. The server's identity at P2Pool is
+  `<payout>,p2p=<share address>`, the share address made from the payout's
+  key (`pickaxe stratum-v2 share-address` prints it). Pickaxe's donation
+  channel names the donation key's own share address the same way.
+- **Your own P2Pool node:** the setup asks for your BCH node and refuses ZMQ
+  notices set to off. Its server command is `pickaxe stratum-v2 serve
+  --own-p2pool --sv1-listen 0.0.0.0:3333 ...` with the profile's node,
+  notices and payout: it installs or updates P2Pool as `pickaxe p2pool set`
+  says, starts it, mines at `stratum2+tcp://127.0.0.1:3361/<its key>`, and
+  stops it when the server stops (P2Pool's own job object on Windows).
+  Templates, fallback pools and Job Declaration are off: P2Pool builds the
+  jobs, and the pool sets the difficulty.
+- **Lights:** the ASIC dashboard's top line shows P2Pool's and the node's
+  lights (as on the P2Pool screen, with a waiting update noted) for your own
+  P2Pool node; the pool's light when joining one (green while a worker
+  mines through it, red when the pool refused the last connection); and the
+  node's light when the server builds its own templates (solo, and Job
+  Declaration with the pool's light beside it).
+- **When P2Pool is not green:** devices wait on it; there is no switch to
+  solo. Choose solo mining in the setup to mine solo.
+- **Profiles:** saved as joining a pool, which every build reads; that it is
+  P2Pool, and your own, is kept in `profile-choices.json` beside the
+  profiles.
+- A P2Pool node to join takes no Job Declaration yet; "Your templates"
+  chooses your own P2Pool node instead.
+
 ## Commands
 
 | Command | Does |
@@ -117,10 +157,8 @@ an update, `a` automatic updates on or off, `r` restart P2Pool, `q` quit.
 
 ## Not in this change
 
-- The ASIC server's use of it: devices to this P2Pool while it is green,
-  solo to the node while it is not, the two lights on the ASIC dashboard,
-  and the setup's P2Pool choice. P2Pool needs each miner's share address
-  (`,p2p=`); the code that derives it is on `feat/p2pool-alpha-upstream`.
+- Running a P2Pool node for other miners from the setup (ASIC pool with
+  P2Pool is still "coming soon").
 - `v0.0.1-alpha` predates P2Pool's `/miner` API and its template-refresh
   fix; a new release brings them to everyone running it.
 - A newer release that will not start is not rolled back by itself; the
@@ -151,6 +189,30 @@ On the operator's Windows PC, in a scratch configuration folder:
 - Closing Pickaxe by force left P2Pool running and holding its ports; with
   the job object it now ends with Pickaxe.
 
+## Live check: your own P2Pool node from the ASIC server (2026-10-19)
+
+#### PR #61
+
+On the operator's Windows PC, with a release build of this branch and the
+P2Pool already installed above: `stratum-v2 serve --network chipnet
+--own-p2pool --sv1-listen 127.0.0.1:3399` with the Start9 BCHN (login in the
+environment), its ZMQ notices and a throwaway Chipnet payout.
+
+- The server started P2Pool `v0.0.1-alpha` (no newer release) and mined at
+  it: the dashboard said "Pool your P2Pool node (v0.0.1-alpha)", with the
+  lights "P2Pool ● v0.0.1-alpha · running · share chain tip 0 · 0 peers" and
+  "Node ● Bitcoin Cash Node 29.1.0 · synced at height 328550".
+- A stand-in SV1 device (subscribe and authorize, no hashing) was answered
+  at once and got P2Pool's jobs at difficulty 10,000: seven in 45 seconds.
+  Its row recorded no refusal, of its channel or the donation's.
+- The first build wrapped the two lights at 118 columns and pushed the
+  header's last line out; they now go one per line when they do not fit.
+- Stopping the server, and closing its terminal, stopped P2Pool and freed
+  its ports; the operator's other P2Pool nodes and miner were untouched.
+
+Not shown: shares and a block (P2Pool's share difficulty is beyond a CPU),
+and a real ASIC at it.
+
 ## Checks
 
 - `p2pool::http`: URLs (ports, IPv6, no logins), chunked and sized bodies,
@@ -168,3 +230,7 @@ On the operator's Windows PC, in a scratch configuration folder:
   with the reason, and one turning green and stopping on request.
 - `p2pool::screen`: both lights, the version and update line, where devices
   connect and the log.
+- #### PR #61: `tui::tests::an_asic_can_join_a_pool_or_a_p2pool_node` and
+  `tui::tests::an_asic_can_mine_at_its_own_p2pool_node` (the rows, Start's
+  checks, the serve command for each, the profile and its kept choices), and
+  `stratum_v2::command::tests::the_dashboard_lights_show_the_pool_and_the_node`.

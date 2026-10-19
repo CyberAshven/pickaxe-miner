@@ -1707,6 +1707,19 @@ fn main() {
             cli::StratumV2Command::Status => {
                 print!("{}", stratum_v2::status_report());
             }
+            cli::StratumV2Command::ShareAddress { address } => {
+                let address = address.unwrap_or_else(|| cfg.payout_address.clone());
+                match crate::tx::p2pool_share_address(&address) {
+                    Ok(share) if args.json => {
+                        println!("{}", serde_json::json!({ "share_address": share }));
+                    }
+                    Ok(share) => println!("{share}"),
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        exit_after_error(1);
+                    }
+                }
+            }
             action => {
                 #[cfg(feature = "stratum-v2")]
                 let result = stratum_v2::command::run(

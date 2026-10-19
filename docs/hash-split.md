@@ -37,8 +37,45 @@ runs one token's kernels at a time.
   happens mid-round.
 - The shares' remainder to 100% idles. With no token able to mine, the
   round idles and ends as soon as one can.
+- #### PR #61: a token that starts or stops being able to mine starts a new
+  round at once, so its GPUs and time go to the others without waiting for
+  the round to end.
 - Each token keeps its own donation: 4% of that token's work for PHOTON and
   ELECTRIC, decided before each of its batches as without a split.
+
+## Several GPUs
+
+#### PR #61
+
+The shares are parts of the whole rig, not of each GPU. Whole GPUs go to
+the tokens first; only the GPUs left over take turns:
+
+| GPUs | Shares | Each round |
+| --- | --- | --- |
+| 1 | PHOTON 80 / ELECTRIC 20 | the GPU takes turns, 1.6 s and 0.4 s |
+| 2 | PHOTON 80 / ELECTRIC 20 | GPU 1 PHOTON; GPU 2 takes turns 60/40 |
+| 3 | PHOTON 50 / ELECTRIC 50 | GPU 1 PHOTON, GPU 2 ELECTRIC; GPU 3 takes turns 50/50 |
+| 5 | PHOTON 80 / ELECTRIC 20 | GPUs 1 to 4 PHOTON, GPU 5 ELECTRIC; no turns |
+| 5 | PHOTON 60 / ELECTRIC 20 | GPUs 1 to 3 PHOTON, GPU 4 ELECTRIC, GPU 5 idles |
+
+- Each GPU, the fastest first, goes whole to the token (or the idle rest of
+  100%) that needs the most of the rig's speed, if the GPU is not more than
+  that; on a near tie the token listed first keeps it. The GPUs left over
+  take turns for what each token still needs, as one GPU does.
+- The GPUs are weighed by speed, so a fast card and a slow one split by
+  hashes, not by count. For the first three rounds (6 s) every GPU takes
+  turns, so each token mines every GPU; then each GPU's rate while mining
+  (not while held) is read from the token with the largest share that
+  measured every GPU, and GPUs of the same model get their average. With no
+  token able to measure them all within 60 s, the GPUs count as equal. The
+  weights are kept for the session.
+- A token that cannot mine gives its whole GPUs to the others too: with
+  ELECTRIC waiting for its pot, all five GPUs mine PHOTON.
+- Each GPU is held on its own (`SearchHold::set_gpu`, `Monitor::hold_gpu`),
+  so a rig's GPUs mine different tokens at once.
+- The screen's **Split** line says how the GPUs are shared now, such as
+  "GPU 1, 2, 3, 4 PHOTON · GPU 5 ELECTRIC"; `--no-tui` prints it when it
+  changes.
 
 ## Using it
 
@@ -49,10 +86,20 @@ token first. Under the last token: the total and the idle part.
 
 With ELECTRIC above 0%, the setup makes its fee pot and recovery key as soon
 as the payout is in and shows the pot's QR code, as for ELECTRIC alone.
-**Start reads the pot's balance** (for ELECTRIC alone too): a pot that can
-pay a claim starts at once; an empty pot (or one that cannot be read) is
-reported, and the next Start press starts anyway, with the other tokens
-mining ELECTRIC's share until the pot is funded.
+#### PR #61: the pot's balance is read in the background as soon as the pot
+shows, and every 30 s after, so funding it shows up on the page (for
+ELECTRIC alone too). **Start reads the balance again**: a pot that can pay a
+claim starts at once; an empty pot (or one that cannot be read) is reported,
+and the next Start press starts anyway, with the other tokens mining
+ELECTRIC's share until the pot is funded.
+
+#### PR #61: the split and ELECTRIC save profiles like any other GPU
+mining. The profiles file stays the one every build reads; which tokens
+mine and their shares (`PHOTON=80` and so on, tokens at 0% left out) are
+kept beside it in `profile-choices.json`, by profile name, and follow a
+rename or delete. The profile list shows "Hash split PHOTON 80% · ELECTRIC
+20%" or "ELECTRIC" for the token. A build without these choices opens such
+a profile as plain PHOTON mining.
 
 From the command line:
 
@@ -72,9 +119,6 @@ token; pending claims are kept as they are without a split.
 
 ## Limits
 
-- The split saves no profile; choose it in the setup each time, or use
-  `pickaxe split`. (ELECTRIC saves none either: profiles reject unknown
-  fields, and older binaries read the same file.)
 - Local GPUs only: not for a rig of a coordinator, a farm's coordinator or a
   pool.
 - Only tokens started with a share can be changed on the screen; a token at
@@ -105,6 +149,12 @@ day: PHOTON 1,688 MH/s (benchmark), ELECTRIC about 2,900 MH/s (dry run).
   to mine); the scheduler giving 80/20 within 5% over five rounds, PHOTON
   taking the round while ELECTRIC waits, and every hold released at stop;
   the screen with an unfunded and a funded pot.
+- #### PR #61: `a_rig_gives_whole_gpus_first_and_turns_only_on_the_rest`
+  (the table above and a 3:1 pair of GPUs) and
+  `the_scheduler_measures_a_rig_then_gives_it_whole_gpus` (five GPUs of one
+  model: every GPU takes turns while measuring, then GPUs 1 to 4 mine
+  PHOTON and GPU 5 ELECTRIC with no turns, and every hold is released at
+  stop).
 - `search::tests::a_held_search_hashes_nothing_until_released_if_wgpu_present`
   (GPU): a held search does no work for 300 ms yet still wants its turn,
   resumes when released, and gives its turn away when paused. Passed on the
@@ -113,4 +163,8 @@ day: PHOTON 1,688 MH/s (benchmark), ELECTRIC about 2,900 MH/s (dry run).
   the token list entry, the share rows and their limit, the pot panel, Start
   without a payout, an empty pot warning once and starting on the next
   press, a funded pot starting at once, PHOTON alone with ELECTRIC at 0%,
-  and no start with every share at 0%.
+  and no start with every share at 0%; #### PR #61: the profile's kept
+  shares and their label, and a setup reopened with them.
+- #### PR #61: `tui::tests::electric_setup_shows_the_fee_pot_to_fund_and_saves_its_profile`
+  (the balance read while the pot shows) and
+  `tui::tests::profile_choices_are_kept_renamed_and_dropped_with_their_profile`.

@@ -40,6 +40,8 @@ use std::{
 const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// #### PR #61: how often the setup reads the shown fee pot's balance again.
+const POT_READ_INTERVAL: Duration = Duration::from_secs(30);
 const EVENT_HISTORY_CAP: usize = 96;
 /// Spacing of chart history samples.
 const HISTORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
@@ -60,6 +62,8 @@ const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
 type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
 /// #### PR #53: reads a fee pot's plain-BCH sats and the claims they pay.
 type PotReader = fn(&RuntimeConfig, &std::path::Path) -> Result<(u64, u64), String>;
+/// #### PR #61: a fee pot's balance as read: sats and the claims it pays.
+type PotBalance = Result<(u64, u64), String>;
 
 #[derive(Debug, Clone)]
 pub struct SetupResult {
@@ -257,18 +261,30 @@ pub fn asic_serve_command(
     options: &ServerOptions,
 ) -> Option<crate::cli::StratumV2Command> {
     let mut pool_tag = None;
+    // #### PR #61: P2Pool's identity, or your own P2Pool node.
+    let mut upstream_user = options.pool_user.clone();
+    let own_p2pool = matches!(server, ServerSetup::OwnP2Pool);
+    // The pool, then the backup pools, each with its key in its address.
+    let pools = |address: &String, key: &String| {
+        let main = if address.contains("://") || key.is_empty() {
+            address.clone()
+        } else {
+            format!("stratum2+tcp://{address}/{key}")
+        };
+        let mut upstream = vec![main];
+        upstream.extend(options.backups.iter().cloned());
+        upstream
+    };
     let (upstream, public, pool_fee, pool_fee_mode, pool_fee_address) = match server {
-        ServerSetup::Solo => (Vec::new(), false, None, None, None),
-        // The pool, then the backup pools, each with its key in its address.
-        ServerSetup::JoinPool { address, key } => {
-            let main = if address.contains("://") || key.is_empty() {
-                address.clone()
-            } else {
-                format!("stratum2+tcp://{address}/{key}")
-            };
-            let mut upstream = vec![main];
-            upstream.extend(options.backups.iter().cloned());
-            (upstream, false, None, None, None)
+        ServerSetup::Solo | ServerSetup::OwnP2Pool => (Vec::new(), false, None, None, None),
+        ServerSetup::JoinPool { address, key } => (pools(address, key), false, None, None, None),
+        ServerSetup::JoinP2Pool {
+            address,
+            key,
+            identity,
+        } => {
+            upstream_user = Some(identity.clone());
+            (pools(address, key), false, None, None, None)
         }
         ServerSetup::Public {
             fee,
@@ -281,16 +297,19 @@ pub fn asic_serve_command(
         }
         ServerSetup::GpuPool { .. } | ServerSetup::JoinGpuPool { .. } => return None,
     };
-    let joining = !upstream.is_empty();
+    // Your own P2Pool node is a pool on this computer: no templates or
+    // fallback pools here, and the pool sets the difficulty.
+    let joining = !upstream.is_empty() || own_p2pool;
     let solo = !joining && !public;
     let everywhere = |port: u16| std::net::SocketAddr::from(([0, 0, 0, 0], port));
     Some(crate::cli::StratumV2Command::Serve {
         listen: everywhere(options.sv2_port),
         sv1_listen: Some(everywhere(options.sv1_port)),
         donation: None,
+        upstream_user: upstream_user.filter(|_| !upstream.is_empty()),
         upstream,
         upstream_key: Vec::new(),
-        upstream_user: options.pool_user.clone().filter(|_| joining),
+        own_p2pool,
         public,
         pool_fee,
         pool_fee_mode,
@@ -311,9 +330,10 @@ pub fn asic_serve_command(
                 crate::config::SavedAccept::Coinbase => crate::cli::AcceptJobDeclaration::Coinbase,
                 crate::config::SavedAccept::Both => crate::cli::AcceptJobDeclaration::Both,
             }),
+        // #### PR #61: P2Pool takes no Job Declaration yet.
         job_declaration: options
             .job_declaration
-            .filter(|_| joining)
+            .filter(|_| matches!(server, ServerSetup::JoinPool { .. }))
             .map(|mode| match mode {
                 crate::config::SavedDeclaration::Full => crate::cli::JobDeclarationMode::Full,
                 crate::config::SavedDeclaration::Coinbase => {
@@ -380,6 +400,17 @@ pub enum ServerSetup {
         address: String,
         key: String,
     },
+    /// #### PR #61: join someone's BCH P2Pool node (`HOST:PORT` and its
+    /// key); `identity` names the payout and its share address
+    /// (`<payout>,p2p=<share address>`), which P2Pool pays shares to.
+    JoinP2Pool {
+        address: String,
+        key: String,
+        identity: String,
+    },
+    /// #### PR #61: your own BCH P2Pool node, which the server installs,
+    /// updates and runs with your node.
+    OwnP2Pool,
     Public {
         fee: crate::donation::bch::BchDonation,
         mode: crate::donation::bch::FeeMode,
@@ -402,6 +433,93 @@ pub enum ServerSetup {
         /// `None` is the payout address.
         address: Option<String>,
     },
+}
+
+/// #### PR #61: choices a profile keeps beside its saved settings, by
+/// profile name, in `profile-choices.json` next to the profiles. The
+/// profiles file stays one every build reads (its records reject unknown
+/// fields); a build without these choices opens the profile without them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct ProfileChoices {
+    /// The pool to join is a BCH P2Pool node.
+    p2pool: bool,
+    /// With P2Pool: your own P2Pool node, run with your node.
+    own_p2pool: bool,
+    /// The GPUs mine ELECTRIC instead of the profile's token.
+    electric: bool,
+    /// A hash split instead of one token: each token's share as
+    /// `TOKEN=PERCENT`, as `pickaxe split --share` takes them.
+    split: Vec<String>,
+}
+
+impl ProfileChoices {
+    fn path(profiles: &Path) -> PathBuf {
+        profiles.with_file_name("profile-choices.json")
+    }
+
+    /// Every profile's choices; none when the file is missing or unreadable.
+    fn load(profiles: &Path) -> std::collections::BTreeMap<String, Self> {
+        std::fs::read_to_string(Self::path(profiles))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Keeps `name`'s choices (removes them when they are the defaults).
+    fn save(profiles: &Path, name: &str, choices: &Self) -> Result<(), String> {
+        let mut all = Self::load(profiles);
+        if *choices == Self::default() {
+            if all.remove(name).is_none() {
+                return Ok(());
+            }
+        } else {
+            all.insert(name.to_owned(), choices.clone());
+        }
+        Self::write(profiles, &all)
+    }
+
+    /// Moves `old`'s choices to the renamed profile `new`, or drops them
+    /// with a deleted profile (`None`).
+    fn rename(profiles: &Path, old: &str, new: Option<&str>) -> Result<(), String> {
+        let mut all = Self::load(profiles);
+        let Some(choices) = all.remove(old) else {
+            return Ok(());
+        };
+        if let Some(new) = new {
+            all.insert(new.to_owned(), choices);
+        }
+        Self::write(profiles, &all)
+    }
+
+    fn write(
+        profiles: &Path,
+        all: &std::collections::BTreeMap<String, Self>,
+    ) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(all).map_err(|error| error.to_string())?;
+        crate::config::write_private_atomic(&Self::path(profiles), text.as_bytes())
+            .map_err(|error| format!("save profile choices: {error}"))
+    }
+
+    /// What the profile list shows instead of the saved token, if anything:
+    /// "ELECTRIC", or the split's shares ("Hash split PHOTON 80% · ELECTRIC
+    /// 20%").
+    fn token_label(&self) -> Option<String> {
+        if self.electric {
+            return Some("ELECTRIC".into());
+        }
+        (!self.split.is_empty()).then(|| {
+            let shares: Vec<String> = self
+                .split
+                .iter()
+                .map(|pair| match pair.split_once('=') {
+                    Some((token, share)) => format!("{token} {share}%"),
+                    None => pair.clone(),
+                })
+                .collect();
+            format!("Hash split {}", shares.join(" · "))
+        })
+    }
 }
 
 #[derive(Default)]
@@ -577,8 +695,8 @@ enum TextField {
 const POOL_TARGETS: [&str; 2] = ["ASIC pool", "GPU pool"];
 
 const ASIC_TARGETS: [&str; 2] = [
-    "BCH + all merge-mined tokens",
-    "ASIC-exclusive token (SAFA, ...)",
+    "BCH + merge-mined CashTokens",
+    "ASIC-exclusive CashTokens (SAFA, ...)",
 ];
 
 struct SetupFlow {
@@ -589,6 +707,8 @@ struct SetupFlow {
     active_profile: Option<usize>,
     profile_name_input: String,
     profile_delete_pending: bool,
+    /// #### PR #61: every profile's kept choices, for the profile list.
+    saved_choices: std::collections::BTreeMap<String, ProfileChoices>,
     sources: SharedSources,
     sources_path: Option<PathBuf>,
     base_config: RuntimeConfig,
@@ -623,6 +743,9 @@ struct SetupFlow {
     pool_user: String,
     /// #### PR #42: Join a pool's Job Declaration; `None` is off.
     job_declaration: Option<crate::config::SavedDeclaration>,
+    /// #### PR #61: with P2Pool as the pool type, run your own P2Pool node
+    /// with your node (true) or join someone's P2Pool node (false).
+    own_p2pool: bool,
     /// The Job Declaration modes an ASIC pool accepts; `None` is off.
     accept_jd: Option<crate::config::SavedAccept>,
     /// Solo mining's fallback pools, each a one-line SV2 address with its
@@ -657,6 +780,10 @@ struct SetupFlow {
     pot_balance: Option<Result<(u64, u64), String>>,
     pot_warned: Option<String>,
     pot_reader: PotReader,
+    /// #### PR #61: the balance read in the background while the pot
+    /// shows, for the pot it was read for, and when the last one finished.
+    pot_read: Option<(String, mpsc::Receiver<PotBalance>)>,
+    pot_read_at: Option<Instant>,
     settings_row: usize,
     editing: Option<TextField>,
     text_input: String,
@@ -799,6 +926,7 @@ impl SetupFlow {
             active_profile: None,
             profile_name_input: String::new(),
             profile_delete_pending: false,
+            saved_choices: Default::default(),
             sources: SharedSources::default(),
             sources_path: None,
             base_config: config.clone(),
@@ -823,6 +951,7 @@ impl SetupFlow {
             backups: Vec::new(),
             pool_user: String::new(),
             job_declaration: None,
+            own_p2pool: false,
             accept_jd: None,
             fallback_pools: Vec::new(),
             asic_token: 0,
@@ -840,6 +969,8 @@ impl SetupFlow {
             pot_balance: None,
             pot_warned: None,
             pot_reader: crate::electric::miner::pot_balance,
+            pot_read: None,
+            pot_read_at: None,
             settings_row: 0,
             editing: None,
             text_input: String::new(),
@@ -1506,37 +1637,83 @@ impl SetupFlow {
         self.electric_pot = Some((made_for, pot));
     }
 
+    /// #### PR #61
+    /// What: while ELECTRIC's fee pot shows (ELECTRIC chosen, or a hash
+    /// split giving it a share), its balance is read in the background as
+    /// soon as the pot is made and every 30 s after, so funding it shows up
+    /// before Start.
+    /// Why: the balance was read only when Start was pressed.
+    /// Look here if: the pot's balance line stays on "Reading its balance".
+    fn poll_pot_balance(&mut self) {
+        if let Some((made_for, receive)) = &self.pot_read {
+            let balance = match receive.try_recv() {
+                Ok(balance) => Some(balance),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            };
+            let current = self
+                .electric_pot
+                .as_ref()
+                .is_some_and(|(made, _)| made == made_for);
+            if let (true, Some(balance)) = (current, balance) {
+                if let (Ok((_, claims)), Some(_)) = (&balance, &self.pot_warned) {
+                    if *claims > 0 {
+                        self.status_line = "The fee pot is funded. Press Start to mine.".into();
+                    }
+                }
+                self.pot_balance = Some(balance);
+            }
+            self.pot_read = None;
+            self.pot_read_at = Some(Instant::now());
+        }
+        if !self.watching_pot()
+            || (self.pot_balance.is_some()
+                && self
+                    .pot_read_at
+                    .is_some_and(|at| at.elapsed() < POT_READ_INTERVAL))
+        {
+            return;
+        }
+        let (Some(path), Some((made_for, _))) = (self.profile_path.clone(), &self.electric_pot)
+        else {
+            return;
+        };
+        let (send, receive) = mpsc::channel();
+        let (config, read) = (self.config.clone(), self.pot_reader);
+        thread::spawn(move || {
+            let _ = send.send(read(&config, &path));
+        });
+        self.pot_read = Some((made_for.clone(), receive));
+    }
+
+    /// #### PR #61: ELECTRIC's fee pot shows on the settings page.
+    fn watching_pot(&self) -> bool {
+        self.electric_in_use()
+            && self.step == SetupStep::Settings
+            && matches!(self.electric_pot, Some((_, Ok(_))))
+    }
+
     /// Rows of the settings page for the chosen hardware.
     fn settings_rows(&self) -> Vec<SettingsRow> {
         match self.mode {
             // #### PR #40: a rig takes its jobs from its coordinator.
             // #### PR #42: its backup coordinators and name in Advanced.
             // #### PR #53: a split's rows: one share per token instead of
-            // the intensity; like ELECTRIC it saves no profile.
+            // the intensity.
+            // #### PR #61: ELECTRIC and the split save profiles too.
             MiningMode::Gpu if self.split => {
                 let mut rows = vec![SettingsRow::Gpu, SettingsRow::Address];
                 rows.extend((0..self.shares().len() as u8).map(SettingsRow::Share));
-                rows.push(SettingsRow::Advanced);
-                if self.advanced_open {
-                    rows.push(SettingsRow::TokenDonation);
-                }
-                rows.push(SettingsRow::Start);
-                rows
+                self.with_advanced(rows, vec![SettingsRow::TokenDonation])
             }
-            // #### PR #58: ELECTRIC saves no profile, so no name row.
-            MiningMode::Gpu if self.electric => {
-                let mut rows = vec![
+            MiningMode::Gpu if self.electric => self.with_advanced(
+                vec![
                     SettingsRow::Gpu,
                     SettingsRow::Address,
                     SettingsRow::Intensity,
-                    SettingsRow::Advanced,
-                ];
-                if self.advanced_open {
-                    rows.push(SettingsRow::TokenDonation);
-                }
-                rows.push(SettingsRow::Start);
-                rows
-            }
+                ],
+                vec![SettingsRow::TokenDonation],
+            ),
             MiningMode::Gpu if self.gpu_join => self.with_advanced(
                 vec![
                     SettingsRow::Gpu,
@@ -1580,22 +1757,62 @@ impl SetupFlow {
                     SettingsRow::Sv2Port,
                 ],
             ),
-            // #### PR #42: server options in the Advanced section.
-            MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => self.with_advanced(
-                vec![
+            // #### PR #61: P2Pool: your own P2Pool node with your node, or
+            // someone's P2Pool node to join; "Your templates" chooses.
+            MiningMode::Asic
+                if self.asic_mining == AsicMining::JoinPool
+                    && self.pool_kind == PoolKind::P2PoolV2 =>
+            {
+                let mut basic = vec![
                     SettingsRow::AsicTarget,
                     SettingsRow::Mining,
                     SettingsRow::PoolKind,
+                    SettingsRow::JobDeclaration,
+                ];
+                if self.own_p2pool {
+                    basic.extend([SettingsRow::Address, SettingsRow::Node]);
+                } else {
+                    basic.extend([
+                        SettingsRow::PoolAddress,
+                        SettingsRow::PoolKey,
+                        SettingsRow::Address,
+                    ]);
+                }
+                self.with_advanced(
+                    basic,
+                    if self.own_p2pool {
+                        vec![
+                            SettingsRow::NodeZmq,
+                            SettingsRow::Donation,
+                            SettingsRow::Sv1Port,
+                        ]
+                    } else {
+                        vec![
+                            SettingsRow::Backups,
+                            SettingsRow::Donation,
+                            SettingsRow::Sv1Port,
+                        ]
+                    },
+                )
+            }
+            // #### PR #42: server options in the Advanced section.
+            // #### PR #61: "Your templates" (Job Declaration) is in the main
+            // rows, with its node row while it is on.
+            MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => self.with_advanced(
+                [
+                    SettingsRow::AsicTarget,
+                    SettingsRow::Mining,
+                    SettingsRow::PoolKind,
+                    SettingsRow::JobDeclaration,
                     SettingsRow::PoolAddress,
                     SettingsRow::PoolKey,
                     SettingsRow::Address,
-                ],
-                // #### PR #42: Job Declaration builds jobs from this
-                // node, so its node row follows it while it is on.
+                ]
+                .into_iter()
+                .chain(self.job_declaration.map(|_| SettingsRow::Node))
+                .collect(),
                 [SettingsRow::Backups, SettingsRow::PoolUser]
                     .into_iter()
-                    .chain([SettingsRow::JobDeclaration])
-                    .chain(self.job_declaration.map(|_| SettingsRow::Node))
                     .chain(self.job_declaration.map(|_| SettingsRow::NodeZmq))
                     .chain([SettingsRow::Donation, SettingsRow::Sv1Port])
                     .collect(),
@@ -1812,6 +2029,25 @@ impl SetupFlow {
             MiningMode::Gpu => None,
             // #### PR #42: a token instead of BCH is mined by this server.
             MiningMode::Asic if self.asic_target == 1 => Some(ServerSetup::Solo),
+            // #### PR #61: P2Pool, joined or your own.
+            MiningMode::Asic
+                if self.asic_mining == AsicMining::JoinPool
+                    && self.pool_kind == PoolKind::P2PoolV2 =>
+            {
+                Some(if self.own_p2pool {
+                    ServerSetup::OwnP2Pool
+                } else {
+                    let payout = self.config.payout_address.trim();
+                    ServerSetup::JoinP2Pool {
+                        address: self.join_address.trim().to_owned(),
+                        key: self.join_key.trim().to_owned(),
+                        identity: match crate::tx::p2pool_share_address(payout) {
+                            Ok(share) => format!("{payout},p2p={share}"),
+                            Err(_) => payout.to_owned(),
+                        },
+                    }
+                })
+            }
             MiningMode::Asic if self.asic_mining == AsicMining::JoinPool => {
                 Some(ServerSetup::JoinPool {
                     address: self.join_address.trim().to_owned(),
@@ -1901,6 +2137,22 @@ impl SetupFlow {
                     .node_zmq
                     .clone()
                     .filter(|_| options.job_declaration.is_some()),
+                ..joining(SavedMode::AsicJoin)
+            },
+            // #### PR #61: P2Pool is saved as joining a pool, which every
+            // build reads; that it is P2Pool is kept in profile-choices.json.
+            ServerSetup::JoinP2Pool { .. } => SavedServer {
+                job_declaration: None,
+                pool_user: None,
+                ..joining(SavedMode::AsicJoin)
+            },
+            ServerSetup::OwnP2Pool => SavedServer {
+                join: None,
+                join_key: None,
+                backups: Vec::new(),
+                pool_user: None,
+                job_declaration: None,
+                node_zmq: options.node_zmq.clone(),
                 ..joining(SavedMode::AsicJoin)
             },
             ServerSetup::Solo => SavedServer {
@@ -2041,7 +2293,12 @@ impl SetupFlow {
         // Servers and nodes live in the shared per-network store.
         settings.fulcrum = None;
         settings.node_rpc = None;
-        settings.server = self.saved_server();
+        // #### PR #61: ELECTRIC and the split mine on this computer's GPUs.
+        settings.server = if self.mode == MiningMode::Gpu && (self.electric || self.split) {
+            None
+        } else {
+            self.saved_server()
+        };
         // A token's donation is measured against its own minimum, not the
         // GPU token's.
         if let Some(token) = self.chosen_asic_token().filter(|_| {
@@ -2106,6 +2363,58 @@ impl SetupFlow {
     }
 
     /// Loads a saved profile and opens its settings with Start selected.
+    /// #### PR #61: the choices this setup keeps beside its profile.
+    fn profile_choices(&self) -> ProfileChoices {
+        let p2pool = self.mode == MiningMode::Asic
+            && self.asic_target == 0
+            && self.asic_mining == AsicMining::JoinPool
+            && self.pool_kind == PoolKind::P2PoolV2;
+        let gpu = self.mode == MiningMode::Gpu;
+        ProfileChoices {
+            p2pool,
+            own_p2pool: p2pool && self.own_p2pool,
+            electric: gpu && self.electric,
+            split: if gpu && self.split {
+                self.shares()
+                    .iter()
+                    .filter(|(_, share)| *share > 0)
+                    .map(|(token, share)| format!("{}={share}", token.name()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// #### PR #61: puts a profile's kept choices back.
+    fn apply_choices(&mut self, choices: &ProfileChoices) {
+        self.electric = false;
+        self.split = false;
+        if self.mode == MiningMode::Gpu {
+            self.token_input.clear();
+            if choices.electric && self.electric_listed() {
+                self.electric = true;
+                self.token_selected = self.matching_tokens().len();
+            } else if !choices.split.is_empty() && self.split_listed() {
+                if let Ok(shares) =
+                    crate::hash_split::Shares::parse(&choices.split, self.config.network)
+                {
+                    self.split = true;
+                    self.split_shares = Some(shares);
+                    self.token_selected = self.split_index();
+                }
+            }
+        }
+        if choices.p2pool
+            && self.mode == MiningMode::Asic
+            && self.asic_mining == AsicMining::JoinPool
+        {
+            self.pool_kind = PoolKind::P2PoolV2;
+            self.own_p2pool = choices.own_p2pool;
+            self.job_declaration = None;
+        }
+    }
+
     fn open_profile(&mut self, index: usize) -> Result<(), String> {
         let profile = self
             .profiles
@@ -2141,6 +2450,13 @@ impl SetupFlow {
         self.apply_connections()?;
         // #### PR #42: the profile reopens in its own mode.
         self.apply_saved_server(profile.settings.server.as_ref());
+        // #### PR #61: and with the choices kept beside it.
+        if let Some(path) = self.profile_path.clone() {
+            let choices = ProfileChoices::load(&path)
+                .remove(&profile.name)
+                .unwrap_or_default();
+            self.apply_choices(&choices);
+        }
         self.active_profile = Some(index);
         self.profile_name_input = profile.name.clone();
         self.open_settings(SettingsRow::Start);
@@ -2273,6 +2589,9 @@ impl SetupFlow {
                     let result = updated.remove(self.profile_selected).and_then(|name| {
                         if let Some(path) = self.profile_path.as_deref() {
                             updated.save(path)?;
+                            // #### PR #61: its kept choices go with it.
+                            ProfileChoices::rename(path, &name, None)?;
+                            self.saved_choices = ProfileChoices::load(path);
                         }
                         Ok(name)
                     });
@@ -2527,6 +2846,10 @@ impl SetupFlow {
                             String::new()
                         };
                     }
+                    // #### PR #61: P2Pool's templates: your own P2Pool node or not.
+                    SettingsRow::JobDeclaration if self.pool_kind == PoolKind::P2PoolV2 => {
+                        self.own_p2pool = !self.own_p2pool;
+                    }
                     SettingsRow::JobDeclaration => self.cycle_job_declaration(forward),
                     SettingsRow::AcceptJd => self.cycle_accept_jd(forward),
                     // #### PR #42: the token, and its donation from its
@@ -2565,6 +2888,9 @@ impl SetupFlow {
                 SettingsRow::NodeZmq => {
                     let value = self.node_zmq.clone();
                     self.begin_edit(TextField::NodeZmq, value);
+                }
+                SettingsRow::JobDeclaration if self.pool_kind == PoolKind::P2PoolV2 => {
+                    self.own_p2pool = !self.own_p2pool;
                 }
                 SettingsRow::JobDeclaration => self.cycle_job_declaration(true),
                 SettingsRow::AcceptJd => self.cycle_accept_jd(true),
@@ -2705,16 +3031,60 @@ impl SetupFlow {
                         return SetupAction::Complete;
                     }
                 }
+                // #### PR #61: P2Pool pays shares to the payout's key (its
+                // share address), and your own P2Pool node takes its
+                // templates and block notices from your node.
+                SettingsRow::Start
+                    if self.mode == MiningMode::Asic
+                        && self.asic_mining == AsicMining::JoinPool
+                        && self.pool_kind == PoolKind::P2PoolV2 =>
+                {
+                    let payout = self.config.payout_address.trim();
+                    if crate::config::validate_payout_address(self.config.network, payout).is_err()
+                        || crate::tx::p2pool_share_address(payout).is_err()
+                    {
+                        self.status_line = format!(
+                            "P2Pool pays shares to a key: enter a {}q… payout address for this network.",
+                            match self.config.network {
+                                MiningNetwork::Mainnet => "bitcoincash:",
+                                MiningNetwork::Chipnet => "bchtest:",
+                            }
+                        );
+                        self.open_settings(SettingsRow::Address);
+                    } else if !self.own_p2pool && !self.join_address.contains(':') {
+                        self.status_line = "Enter the P2Pool node's address as HOST:PORT.".into();
+                        self.open_settings(SettingsRow::PoolAddress);
+                    } else if !self.own_p2pool && self.join_key.trim().is_empty() {
+                        self.status_line =
+                            "Enter the P2Pool node's authority key, as it publishes it.".into();
+                        self.open_settings(SettingsRow::PoolKey);
+                    } else if self.own_p2pool && self.config.custom_node_endpoints().is_empty() {
+                        self.connection_kind = ConnectionKind::Node;
+                        self.connection_selected = self
+                            .sources
+                            .list(self.config.network, ConnectionKind::Node)
+                            .len();
+                        self.step = SetupStep::Connections;
+                        self.check_local_node();
+                        self.status_line =
+                            "Your own P2Pool node takes its templates from your own BCH node: add it here."
+                                .into();
+                    } else if self.own_p2pool && self.node_zmq.trim().eq_ignore_ascii_case("off") {
+                        self.status_line =
+                            "P2Pool needs your node's ZMQ block notices; set them under Advanced."
+                                .into();
+                        self.open_settings(SettingsRow::NodeZmq);
+                    } else {
+                        return SetupAction::Complete;
+                    }
+                }
                 // #### PR #40
-                // Joining a pool needs the pool; P2Pool v2 is coming.
+                // Joining a pool needs the pool.
                 SettingsRow::Start
                     if self.mode == MiningMode::Asic
                         && self.asic_mining == AsicMining::JoinPool =>
                 {
-                    if self.pool_kind == PoolKind::P2PoolV2 {
-                        self.status_line =
-                            "P2Pool v2 is coming soon; choose a normal pool for now.".into();
-                    } else if !self.join_address.contains(':') {
+                    if !self.join_address.contains(':') {
                         self.status_line = "Enter the pool's address as HOST:PORT.".into();
                         self.open_settings(SettingsRow::PoolAddress);
                     } else if self.join_key.trim().is_empty() {
@@ -3023,9 +3393,14 @@ impl SetupFlow {
         match field {
             TextField::ProfileRename => {
                 let mut updated = self.profiles.clone();
+                let old = updated.profiles[self.profile_selected].name.clone();
                 updated.rename(self.profile_selected, &value)?;
                 if let Some(path) = self.profile_path.as_deref() {
                     updated.save(path)?;
+                    // #### PR #61: its kept choices follow the new name.
+                    let new = updated.profiles[self.profile_selected].name.clone();
+                    ProfileChoices::rename(path, &old, Some(&new))?;
+                    self.saved_choices = ProfileChoices::load(path);
                 }
                 self.profiles = updated;
                 Ok("Profile renamed".into())
@@ -3685,6 +4060,7 @@ pub fn run_setup(
     }
     state.profiles = profiles;
     state.profile_path = Some(profile_path.to_path_buf());
+    state.saved_choices = ProfileChoices::load(profile_path);
     state.sources = sources;
     state.sources_path = Some(sources_path.to_path_buf());
     // #### PR #42: the cookie files saved for nodes, read again each time
@@ -3702,6 +4078,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
     loop {
         state.poll_local_node();
         state.refresh_electric_pot();
+        state.poll_pot_balance();
         terminal
             .terminal
             .draw(|frame| render_setup(frame, &state))
@@ -3710,7 +4087,8 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
         // #### PR #40
         // While the check for a node on this computer runs, wake up to show
         // its result as soon as it is in.
-        if state.checking_local_node()
+        // #### PR #61: and while the fee pot shows, to show its balance.
+        if (state.checking_local_node() || state.watching_pot())
             && !event::poll(EVENT_POLL_INTERVAL)
                 .map_err(|error| format!("read mining setup input: {error}"))?
         {
@@ -3727,51 +4105,45 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
         match state.handle_key(key) {
             SetupAction::Continue => {}
             SetupAction::Cancel => return Ok(None),
-            // #### PR #53
-            SetupAction::Complete if state.split => {
-                return Ok(Some(SetupResult {
-                    config: state.config.clone(),
-                    gpus: state.chosen_gpus(),
-                    profile_name: "Hash split".into(),
-                    server: None,
-                    options: ServerOptions::default(),
-                    electric: false,
-                    split: Some(state.shares()),
-                }));
-            }
-            SetupAction::Complete if state.electric => {
-                return Ok(Some(SetupResult {
-                    config: state.config.clone(),
-                    gpus: state.chosen_gpus(),
-                    profile_name: "ELECTRIC".into(),
-                    server: None,
-                    options: ServerOptions::default(),
-                    electric: true,
-                    split: None,
-                }));
-            }
+            // #### PR #61: ELECTRIC and the hash split (#53) are saved as
+            // profiles too, with their choices beside them.
             SetupAction::Complete => {
                 let gpus = state.chosen_gpus();
                 // #### PR #42: the profile keeps its mode and pool values.
                 let settings = state.profile_settings();
                 let mut profiles = state.profiles.clone();
+                let before = state
+                    .active_profile
+                    .and_then(|index| profiles.profiles.get(index))
+                    .map(|profile| profile.name.clone());
                 let saved = profiles
                     .upsert(state.active_profile, &state.profile_name_input, settings)
                     .and_then(|name| {
-                        profiles
-                            .save(state.profile_path.as_deref().expect("setup profile path"))?;
+                        let path = state.profile_path.as_deref().expect("setup profile path");
+                        profiles.save(path)?;
+                        // #### PR #61: the choices kept beside the profile,
+                        // under its new name if the name row renamed it.
+                        if let Some(old) = before.filter(|old| *old != name) {
+                            ProfileChoices::rename(path, &old, None)?;
+                        }
+                        ProfileChoices::save(path, &name, &state.profile_choices())?;
                         Ok(name)
                     });
                 match saved {
                     Ok(profile_name) => {
+                        let own_gpus = state.electric || state.split;
                         return Ok(Some(SetupResult {
                             config: state.config.clone(),
                             gpus,
                             profile_name,
-                            server: state.server_setup(),
-                            options: state.server_options(),
-                            electric: false,
-                            split: None,
+                            server: if own_gpus { None } else { state.server_setup() },
+                            options: if own_gpus {
+                                ServerOptions::default()
+                            } else {
+                                state.server_options()
+                            },
+                            electric: state.electric,
+                            split: state.split.then(|| state.shares()),
                         }));
                     }
                     Err(error) => state.status_line = error,
@@ -4648,9 +5020,18 @@ fn edit_value(state: &SetupFlow, field: TextField, value: &str, hint: &str) -> S
 
 /// #### PR #42: a profile's line in the list names its mode. It never shows
 /// a pool's address or key, or any payout or fee address.
-fn profile_summary(settings: &SavedConfig, network: MiningNetwork, device: &str) -> String {
+fn profile_summary(
+    settings: &SavedConfig,
+    network: MiningNetwork,
+    device: &str,
+    choices: Option<&ProfileChoices>,
+) -> String {
     let network = network_label(network);
-    let token = settings.token.as_deref().unwrap_or("PHOTON");
+    // #### PR #61: ELECTRIC or a hash split instead of the saved token.
+    let label = choices.and_then(ProfileChoices::token_label);
+    let token = label
+        .as_deref()
+        .unwrap_or(settings.token.as_deref().unwrap_or("PHOTON"));
     let Some(server) = &settings.server else {
         return format!("GPU · {network} · {token} · {device}");
     };
@@ -4698,7 +5079,12 @@ fn render_setup_profiles(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             };
             Line::from(vec![
                 Span::raw(format!("{} {name:<18} ", selection_marker(selected))),
-                dim(profile_summary(settings, network, &device)),
+                dim(profile_summary(
+                    settings,
+                    network,
+                    &device,
+                    state.saved_choices.get(&profile.name),
+                )),
             ])
         })
         .collect::<Vec<_>>();
@@ -4738,7 +5124,7 @@ fn render_setup_hardware(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             choice(
                 MiningMode::Gpu,
                 "GPU mining",
-                "your GPUs; one PC or a farm of rigs",
+                "your GPUs; one PC or a farm of rigs (HiveOS, mmpOS, RaveOS, SimpleMining OS, ...)",
             ),
             choice(
                 MiningMode::Asic,
@@ -4801,7 +5187,7 @@ fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 POOL_TARGETS[0]
             )),
             Line::from(dim(
-                "    BCH + merge-mined tokens, for SHA-256 ASICs over SV1 and SV2.",
+                "    BCH + merge-mined CashTokens, for SHA-256 ASICs over SV1 and SV2.",
             )),
             Line::from(format!(
                 "{} {}",
@@ -4822,7 +5208,7 @@ fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 ASIC_TARGETS[0]
             ))),
             Line::from(dim(
-                "    Mines BCH and adds every merge-mined token automatically as each is supported.",
+                "    Mines BCH and adds every merge-mined CashToken automatically as each is supported.",
             )),
             // #### PR #42: the network's ASIC-exclusive tokens, or none.
             Line::from(Span::raw(format!(
@@ -5052,17 +5438,22 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 "Mining",
                 Span::raw(match (state.mode, state.gpu_join, state.asic_mining) {
                     (MiningMode::Gpu, false, _) => "Alone (claims to your address)",
-                    (MiningMode::Gpu, true, _) => "Join a GPU pool or farm",
+                    (MiningMode::Gpu, true, _) => {
+                        "Join a GPU pool or farm (rigs on HiveOS, mmpOS, RaveOS, ...)"
+                    }
                     (_, _, AsicMining::Solo) => "Solo (your BCH node)",
                     (_, _, AsicMining::JoinPool) => "Join a pool",
                 }),
                 "< >",
             ),
+            // #### PR #61: P2Pool is ready to join or run for ASICs; running
+            // a P2Pool for other miners is still to come.
             SettingsRow::PoolKind => (
                 "Pool type",
-                Span::raw(match state.pool_kind {
-                    PoolKind::Normal => "Normal pool",
-                    PoolKind::P2PoolV2 => "P2Pool v2  (coming soon)",
+                Span::raw(match (state.pool_kind, state.mode) {
+                    (PoolKind::Normal, _) => "Normal pool",
+                    (PoolKind::P2PoolV2, MiningMode::Pool) => "P2Pool v2  (coming soon)",
+                    (PoolKind::P2PoolV2, _) => "P2Pool",
                 }),
                 "< >",
             ),
@@ -5208,7 +5599,7 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 (
                     "Donation",
                     Span::raw(format!(
-                        "{} of BCH and merge-mined tokens ({reward} of rewards · {work} of work)",
+                        "{} of BCH and merge-mined CashTokens ({reward} of rewards · {work} of work)",
                         state.config.bch_donation
                     )),
                     "< >  0% to 100%",
@@ -5294,6 +5685,17 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     "your payout address (default)",
                 ),
                 "[Enter]",
+            ),
+            // #### PR #61: with P2Pool, your node's templates mean your own
+            // P2Pool node run with it.
+            SettingsRow::JobDeclaration if state.pool_kind == PoolKind::P2PoolV2 => (
+                "Your templates",
+                if state.own_p2pool {
+                    Span::raw("your node's: Pickaxe runs your own P2Pool node with it")
+                } else {
+                    dim("off; join a P2Pool node, which builds the jobs")
+                },
+                "< >",
             ),
             // #### PR #42: Job Declaration, accepting it, and fallback pools;
             // all off by default.
@@ -5426,9 +5828,9 @@ fn render_electric_pot(state: &SetupFlow) -> (Paragraph<'static>, u16) {
             lines.extend([
                 Line::from(format!("Refund key: {}", pot.key.display())),
                 Line::from(dim("Back it up; only it can refund the pot.")),
-                // #### PR #53: what Start read from the pot.
+                // #### PR #53: what was read from the pot.
                 match &state.pot_balance {
-                    None => Line::from(dim("Start reads its balance.")),
+                    None => Line::from(dim("Reading its balance…")),
                     Some(Ok((sats, 0))) => Line::from(Span::styled(
                         format!("Balance: {sats} sats · pays no claim yet"),
                         Style::default().fg(Color::Yellow),
@@ -7222,7 +7624,7 @@ mod tests {
     }
 
     #[test]
-    fn an_asic_can_join_a_pool_and_p2pool_v2_is_coming() {
+    fn an_asic_can_join_a_pool_or_a_p2pool_node() {
         let mut setup = setup_for(MiningMode::Asic);
         setup.open_settings(SettingsRow::Mining);
         setup.handle_key(key(KeyCode::Right));
@@ -7237,14 +7639,38 @@ mod tests {
         }
         assert!(!rows.contains(&SettingsRow::Node));
         assert!(setup_text(&setup).contains("Join a pool"));
-        // P2Pool v2 is listed but not yet startable.
+        // #### PR #61: a P2Pool node to join pays shares to the payout's
+        // share address.
         setup.open_settings(SettingsRow::PoolKind);
         setup.handle_key(key(KeyCode::Right));
-        assert!(setup_text(&setup).contains("P2Pool v2  (coming soon)"));
+        assert_eq!(setup.pool_kind, PoolKind::P2PoolV2);
+        let text = setup_text(&setup);
+        assert!(
+            text.contains("P2Pool") && !text.contains("coming soon"),
+            "{text}"
+        );
+        setup.config.payout_address = chipnet_payout(2);
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
-        assert!(setup.status_line.contains("P2Pool v2 is coming soon"));
+        assert!(setup.status_line.contains("P2Pool node's address"));
+        assert_eq!(setup.current_row(), SettingsRow::PoolAddress);
+        setup.join_address = "p2pool.example:3361".into();
+        setup.join_key = "9auqWEzQDVyLAAnYFbEqV2LDhYMyMEcuBJdJzkWW4GEk2Ss4Dnf".into();
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        let share = crate::tx::p2pool_share_address(&chipnet_payout(2)).unwrap();
+        assert_eq!(
+            setup.server_setup(),
+            Some(ServerSetup::JoinP2Pool {
+                address: "p2pool.example:3361".into(),
+                key: "9auqWEzQDVyLAAnYFbEqV2LDhYMyMEcuBJdJzkWW4GEk2Ss4Dnf".into(),
+                identity: format!("{},p2p={share}", chipnet_payout(2)),
+            })
+        );
         setup.pool_kind = PoolKind::Normal;
+        setup.join_address.clear();
+        setup.join_key.clear();
+        setup.config.payout_address.clear();
         // The pool's address and key are asked for, then the payout.
         setup.open_settings(SettingsRow::Start);
         setup.handle_key(key(KeyCode::Enter));
@@ -7348,8 +7774,9 @@ mod tests {
         }
         let screen = setup_text(&setup);
         assert!(
-            screen
-                .contains("1.50% of BCH and merge-mined tokens (1.00% of rewards · 0.50% of work)"),
+            screen.contains(
+                "1.50% of BCH and merge-mined CashTokens (1.00% of rewards · 0.50% of work)"
+            ),
             "{screen}"
         );
         assert!(screen.contains("4,096 (default"), "{screen}");
@@ -7632,7 +8059,8 @@ mod tests {
         setup.join_key = "KEY".into();
         setup.config.payout_address = chipnet_payout(3);
         setup.open_settings(SettingsRow::JobDeclaration);
-        assert!(setup.advanced_open);
+        // #### PR #61: a main row now, under the pool type.
+        assert!(!setup.advanced_open);
         assert!(setup_text(&setup).contains("off; devices mine the pool's own jobs"));
         assert!(!setup.settings_rows().contains(&SettingsRow::Node));
         assert_eq!(serve_parts(&setup).1, None);
@@ -7642,12 +8070,13 @@ mod tests {
             Some(crate::config::SavedDeclaration::Full)
         );
         assert_eq!(setup.current_row(), SettingsRow::JobDeclaration);
+        // #### PR #61: its node row is the last main row.
         let rows = setup.settings_rows();
-        let at = rows
+        let advanced = rows
             .iter()
-            .position(|row| *row == SettingsRow::JobDeclaration)
+            .position(|row| *row == SettingsRow::Advanced)
             .unwrap();
-        assert_eq!(rows[at + 1], SettingsRow::Node);
+        assert_eq!(rows[advanced - 1], SettingsRow::Node);
         assert!(setup_text(&setup).contains("full template: your node's templates"));
         setup.handle_key(key(KeyCode::Right));
         assert_eq!(
@@ -7982,7 +8411,7 @@ mod tests {
     // fee pot (address, QR code, saved recovery key) before mining starts,
     // and saves no profile.
     #[test]
-    fn electric_setup_shows_the_fee_pot_to_fund_and_saves_no_profile() {
+    fn electric_setup_shows_the_fee_pot_to_fund_and_saves_its_profile() {
         let dir = std::env::temp_dir().join(format!(
             "pickaxe-electric-setup-{:016x}",
             rand::random::<u64>()
@@ -8006,6 +8435,7 @@ mod tests {
                 SettingsRow::Address,
                 SettingsRow::Intensity,
                 SettingsRow::Advanced,
+                SettingsRow::ProfileName,
                 SettingsRow::Start
             ]
         );
@@ -8043,12 +8473,45 @@ mod tests {
             &pot.address[..36],
             "Refund key: ",
             "only it can refund the pot",
+            "Reading its balance…",
             "▀",
         ] {
             assert!(screen.contains(expected), "{expected}: {screen}");
         }
+        // #### PR #61: the balance is read while the pot shows, not only at
+        // Start.
+        assert!(setup.watching_pot());
+        setup.pot_reader = |_, _| Ok((5_000, 3));
+        setup.poll_pot_balance();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while setup.pot_balance.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the pot's balance was never read"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            setup.poll_pot_balance();
+        }
+        assert_eq!(setup.pot_balance, Some(Ok((5_000, 3))));
+        terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            screen.contains("Balance: 5000 sats · pays 3 claims"),
+            "{screen}"
+        );
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        // #### PR #61: its profile keeps ELECTRIC beside it.
+        let choices = setup.profile_choices();
+        assert!(choices.electric && choices.split.is_empty());
+        assert_eq!(choices.token_label().as_deref(), Some("ELECTRIC"));
+        assert_eq!(setup.profile_settings().server, None);
         // Choosing PHOTON again mines PHOTON.
         setup.step = SetupStep::Token;
         setup.token_input.clear();
@@ -8092,6 +8555,7 @@ mod tests {
                 SettingsRow::Share(0),
                 SettingsRow::Share(1),
                 SettingsRow::Advanced,
+                SettingsRow::ProfileName,
                 SettingsRow::Start
             ]
         );
@@ -8167,6 +8631,18 @@ mod tests {
         setup.pot_reader = |_, _| Err("no network in this test".into());
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        // #### PR #61: its profile keeps the shares, and reopens with them.
+        let choices = setup.profile_choices();
+        assert_eq!(choices.split, ["PHOTON=80"]);
+        assert_eq!(
+            choices.token_label().as_deref(),
+            Some("Hash split PHOTON 80%")
+        );
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_choices(&choices);
+        assert!(reopened.split && !reopened.electric);
+        assert_eq!(reopened.shares(), setup.shares());
+        assert_eq!(reopened.token_selected, reopened.split_index());
         // And with nothing at all, Start says so.
         setup.open_settings(SettingsRow::Share(0));
         for _ in 0..16 {
@@ -8175,6 +8651,140 @@ mod tests {
         setup.open_settings(SettingsRow::Start);
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
         assert!(setup.status_line.contains("at least one token"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // #### PR #61: your own P2Pool node: "Your templates" on, your node,
+    // and a server that runs P2Pool and mines at it.
+    #[test]
+    fn an_asic_can_mine_at_its_own_p2pool_node() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.asic_mining = AsicMining::JoinPool;
+        setup.pool_kind = PoolKind::P2PoolV2;
+        setup.config.payout_address = chipnet_payout(4);
+        setup.open_settings(SettingsRow::JobDeclaration);
+        assert!(setup_text(&setup).contains("join a P2Pool node, which builds the jobs"));
+        setup.handle_key(key(KeyCode::Right));
+        assert!(setup.own_p2pool);
+        assert!(setup_text(&setup).contains("Pickaxe runs your own P2Pool node"));
+        let rows = setup.settings_rows();
+        assert!(rows.contains(&SettingsRow::Node));
+        assert!(!rows.contains(&SettingsRow::PoolAddress) && !rows.contains(&SettingsRow::PoolKey));
+        // Your own P2Pool node needs your BCH node.
+        setup.config.node_url = None;
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert_eq!(setup.step, SetupStep::Connections);
+        assert!(setup.status_line.contains("your own BCH node"));
+        setup.config.node_url = Some("http://user:pass@127.0.0.1:48332".into());
+        setup.node_zmq = "off".into();
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert!(setup.status_line.contains("ZMQ block notices"));
+        setup.node_zmq.clear();
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        assert_eq!(setup.server_setup(), Some(ServerSetup::OwnP2Pool));
+        match asic_serve_command(&ServerSetup::OwnP2Pool, &setup.server_options()) {
+            Some(crate::cli::StratumV2Command::Serve {
+                own_p2pool,
+                upstream,
+                upstream_user,
+                tp_listen,
+                fallback_pool,
+                job_declaration,
+                start_difficulty,
+                sv1_listen,
+                ..
+            }) => {
+                assert!(own_p2pool);
+                assert!(upstream.is_empty() && upstream_user.is_none());
+                assert!(tp_listen.is_none() && fallback_pool.is_empty());
+                assert!(job_declaration.is_none() && start_difficulty.is_none());
+                assert!(sv1_listen.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+        // Joining someone's P2Pool node mines there under your share address.
+        let identity = "bchtest:q…,p2p=tp2pool:…".to_string();
+        match asic_serve_command(
+            &ServerSetup::JoinP2Pool {
+                address: "p2pool.example:3361".into(),
+                key: "KEY".into(),
+                identity: identity.clone(),
+            },
+            &setup.server_options(),
+        ) {
+            Some(crate::cli::StratumV2Command::Serve {
+                own_p2pool,
+                upstream,
+                upstream_user,
+                job_declaration,
+                ..
+            }) => {
+                assert!(!own_p2pool && job_declaration.is_none());
+                assert_eq!(upstream, ["stratum2+tcp://p2pool.example:3361/KEY"]);
+                assert_eq!(upstream_user, Some(identity));
+            }
+            other => panic!("{other:?}"),
+        }
+        // The profile saves as joining a pool, with P2Pool kept beside it,
+        // and reopens as your own P2Pool node.
+        let saved = setup.saved_server().unwrap();
+        assert_eq!(saved.mode, crate::config::SavedMode::AsicJoin);
+        assert_eq!(saved.join, None);
+        let choices = setup.profile_choices();
+        assert!(choices.p2pool && choices.own_p2pool);
+        let mut reopened = setup_for(MiningMode::Gpu);
+        reopened.apply_saved_server(Some(&saved));
+        reopened.apply_choices(&choices);
+        assert_eq!(reopened.pool_kind, PoolKind::P2PoolV2);
+        assert!(reopened.own_p2pool);
+        assert_eq!(reopened.server_setup(), Some(ServerSetup::OwnP2Pool));
+    }
+
+    // #### PR #61: the choices kept beside the profiles, by profile name.
+    #[test]
+    fn profile_choices_are_kept_renamed_and_dropped_with_their_profile() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-profile-choices-{:016x}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profiles = dir.join("config.profiles.json");
+        assert!(ProfileChoices::load(&profiles).is_empty());
+        let own = ProfileChoices {
+            p2pool: true,
+            own_p2pool: true,
+            ..ProfileChoices::default()
+        };
+        ProfileChoices::save(&profiles, "Antminer", &own).unwrap();
+        ProfileChoices::save(
+            &profiles,
+            "Rig",
+            &ProfileChoices {
+                split: vec!["PHOTON=80".into(), "ELECTRIC=20".into()],
+                ..ProfileChoices::default()
+            },
+        )
+        .unwrap();
+        // The defaults keep no entry.
+        ProfileChoices::save(&profiles, "Plain", &ProfileChoices::default()).unwrap();
+        let all = ProfileChoices::load(&profiles);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["Antminer"], own);
+        ProfileChoices::rename(&profiles, "Antminer", Some("S21")).unwrap();
+        ProfileChoices::rename(&profiles, "Rig", None).unwrap();
+        let all = ProfileChoices::load(&profiles);
+        assert_eq!(all.keys().collect::<Vec<_>>(), ["S21"]);
+        assert_eq!(all["S21"], own);
+        // A file from a newer build with more choices still opens.
+        std::fs::write(
+            ProfileChoices::path(&profiles),
+            r#"{"S21":{"p2pool":true,"own_p2pool":false,"later":1}}"#,
+        )
+        .unwrap();
+        assert!(ProfileChoices::load(&profiles)["S21"].p2pool);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8451,6 +9061,7 @@ mod tests {
             },
             MiningNetwork::Chipnet,
             "CUDA:0",
+            None,
         );
         assert_eq!(summary, "GPU farm · Chipnet · PHOTON · rigs :3350");
         let mut rig = setup_for(MiningMode::Gpu);
@@ -8547,7 +9158,7 @@ mod tests {
         let mut setup = setup_for(MiningMode::Asic);
         setup.step = SetupStep::Token;
         let screen = setup_text(&setup);
-        assert!(screen.contains("BCH + all merge-mined tokens"), "{screen}");
+        assert!(screen.contains("BCH + merge-mined CashTokens"), "{screen}");
         assert!(!screen.contains("coming soon"), "{screen}");
         // #### PR #42: none registered yet, said per network.
         assert!(
@@ -9009,8 +9620,8 @@ mod tests {
         setup.handle_key(key(KeyCode::Enter));
         assert_eq!(setup.step, SetupStep::Token);
         let token_screen = setup_text(&setup);
-        assert!(token_screen.contains("BCH + all merge-mined tokens"));
-        assert!(token_screen.contains("ASIC-exclusive token"));
+        assert!(token_screen.contains("BCH + merge-mined CashTokens"));
+        assert!(token_screen.contains("ASIC-exclusive CashTokens"));
         setup.handle_key(key(KeyCode::Down));
         assert_eq!(setup.asic_target, 1);
         setup.handle_key(key(KeyCode::Enter));
