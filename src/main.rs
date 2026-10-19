@@ -1550,6 +1550,26 @@ fn main() {
                 exit_after_error(1);
             }
         }
+        // #### PR #61: P2Pool as a managed dependency.
+        cli::Commands::P2pool { command } => {
+            use std::io::IsTerminal;
+            #[cfg(feature = "stratum-v2")]
+            let result = pickaxe_miner::p2pool::screen::command(
+                &cfg,
+                &command,
+                &config_path,
+                args.no_tui || !io::stdout().is_terminal(),
+            );
+            #[cfg(not(feature = "stratum-v2"))]
+            let result: Result<(), String> = {
+                let _ = (&command, io::stdout().is_terminal());
+                Err("this build has no stratum-v2 feature, which P2Pool needs".into())
+            };
+            if let Err(error) = result {
+                eprintln!("error: {error}");
+                exit_after_error(1);
+            }
+        }
         cli::Commands::Devices => {
             if let Err(error) = backend::print_devices(backend_kind) {
                 eprintln!("error: {error}");
