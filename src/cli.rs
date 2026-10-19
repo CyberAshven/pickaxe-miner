@@ -170,6 +170,15 @@ pub enum Commands {
         #[command(subcommand)]
         command: ElectricCommand,
     },
+    /// #### PR #60
+    /// Mine several GPU tokens on the selected GPUs, each for its share of
+    /// the time in 5% steps, for example `--share photon=80 --share
+    /// electric=20` (see docs/hash-split.md).
+    Split {
+        /// TOKEN=PERCENT, once per token; multiples of 5, at most 100 in all.
+        #[arg(long = "share", value_name = "TOKEN=PERCENT", required = true)]
+        shares: Vec<String>,
+    },
     #[command(hide = true)]
     Repl,
 }

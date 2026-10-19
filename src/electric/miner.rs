@@ -243,43 +243,123 @@ fn session(
     config_path: &Path,
     options: Session,
 ) -> Result<(), String> {
-    let deployment = select(cfg, args)?;
-    let (pot, addresses, key_path) =
-        pot_for(cfg, &deployment, args, config_path, options.create_key)?;
-    let mut engines = devices
-        .iter()
-        .map(super::gpu::Engine::new)
-        .collect::<Result<Vec<_>, _>>()?;
     use std::io::IsTerminal;
     let monitor = super::ui::Monitor::new(
         cfg.intensity,
         options.plain || !std::io::stdout().is_terminal(),
-        devices
-            .iter()
-            .map(|gpu| format!("{} ({})", gpu.name, gpu.backend.as_str()))
-            .collect::<Vec<_>>()
-            .join(", "),
+        device_names(devices),
     );
+    let mut ready = prepare(
+        cfg,
+        args,
+        devices,
+        config_path,
+        options.create_key,
+        &monitor,
+    )?;
+    super::ui::run(&monitor, || {
+        mine(
+            cfg,
+            &ready.deployment,
+            &mut ready.engines,
+            options.max_difficulty,
+            options.dry_run,
+            options.once,
+            &ready.pot,
+            &ready.addresses,
+            &ready.journal_path,
+            &monitor,
+        )
+    })
+}
+
+/// The GPUs as the ELECTRIC screen names them.
+pub fn device_names(devices: &[crate::backend::GpuDevice]) -> String {
+    devices
+        .iter()
+        .map(|gpu| format!("{} ({})", gpu.name, gpu.backend.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A session ready to mine: the deployment, its pot, the GPU engines and
+/// the pending-claim journal's path.
+struct Ready {
+    deployment: Deployment,
+    pot: Pot,
+    addresses: [String; 3],
+    engines: Vec<super::gpu::Engine>,
+    journal_path: PathBuf,
+}
+
+fn prepare(
+    cfg: &RuntimeConfig,
+    args: &ElectricDeploymentArgs,
+    devices: &[crate::backend::GpuDevice],
+    config_path: &Path,
+    create_key: bool,
+    monitor: &super::ui::Monitor,
+) -> Result<Ready, String> {
+    let deployment = select(cfg, args)?;
+    let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, create_key)?;
+    let engines = devices
+        .iter()
+        .map(super::gpu::Engine::new)
+        .collect::<Result<Vec<_>, _>>()?;
     monitor.set_pot(&pot.address(), key_path.as_deref());
     let journal_path = config_path.with_file_name(format!(
         "electric-{}-{}.pending.json",
         cfg.network.as_str(),
         hex::encode(crate::proof::hash256(&pot.redeem)),
     ));
-    super::ui::run(&monitor, || {
-        mine(
-            cfg,
-            &deployment,
-            &mut engines,
-            options.max_difficulty,
-            options.dry_run,
-            options.once,
-            &pot,
-            &addresses,
-            &journal_path,
-            &monitor,
-        )
+    Ok(Ready {
+        deployment,
+        pot,
+        addresses,
+        engines,
+        journal_path,
     })
+}
+
+/// #### PR #60: ELECTRIC as one token of a hash split: the setup's
+/// deployment and pot on `gpus`, reporting to `monitor`, whose `held` flag
+/// the split sets. The caller holds the GPU lock and the stop signal.
+pub fn run_in_split(
+    cfg: &RuntimeConfig,
+    gpus: &[crate::backend::GpuDevice],
+    config_path: &Path,
+    monitor: &super::ui::Monitor,
+) -> Result<(), String> {
+    let devices = crate::backend::electric_engines_for(gpus.to_vec())?;
+    let args = ElectricDeploymentArgs::default();
+    let mut ready = prepare(cfg, &args, &devices, config_path, true, monitor)?;
+    mine(
+        cfg,
+        &ready.deployment,
+        &mut ready.engines,
+        MAX_SEARCH_DIFFICULTY,
+        false,
+        false,
+        &ready.pot,
+        &ready.addresses,
+        &ready.journal_path,
+        monitor,
+    )
+}
+
+/// #### PR #60: what the setup's fee pot holds now, in plain-BCH sats, and
+/// the claims that pays at the current relay fee, read through Fulcrum.
+pub fn pot_balance(cfg: &RuntimeConfig, config_path: &Path) -> Result<(u64, u64), String> {
+    let args = ElectricDeploymentArgs::default();
+    let deployment = select(cfg, &args)?;
+    let (pot, _, _) = pot_for(cfg, &deployment, &args, config_path, false)?;
+    let mut session = connect(cfg)?;
+    let relay_fee = read_relay_fee(&mut session)?;
+    let coins = read_pot(&mut session, &pot)?;
+    Ok((
+        coins.iter().map(|coin| coin.value).sum(),
+        claims_paid(&coins, relay_fee),
+    ))
 }
 
 /// The setup's ELECTRIC choice: mine the network's deployment on the chosen
@@ -764,6 +844,16 @@ fn mine(
         let started = Instant::now();
         let before = monitor.hashes.load(Ordering::Relaxed);
         let mut moved = false;
+        // #### PR #60: the hash split gives ELECTRIC GPU time only while this
+        // search runs, so an empty pot or a wait leaves it to other tokens.
+        struct Searching<'a>(&'a AtomicBool);
+        impl Drop for Searching<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        monitor.searching.store(true, Ordering::Release);
+        let searching = Searching(&monitor.searching);
         let win = std::thread::scope(|scope| {
             let search = scope.spawn(|| {
                 super::gpu::search_all(engines, job, &schedule, &next_nonce, &stop, monitor)
@@ -793,7 +883,9 @@ fn mine(
             search
                 .join()
                 .map_err(|_| "ELECTRIC search thread panicked".to_string())?
-        })?;
+        });
+        drop(searching);
+        let win = win?;
         let rate = (monitor.hashes.load(Ordering::Relaxed) - before) as f64
             / started.elapsed().as_secs_f64().max(1e-3);
         if moved {
