@@ -217,7 +217,7 @@ claims it pays, and the QR code again whenever the pot cannot pay a claim
 (`f` shows or hides it). `--no-tui` prints the same address, QR code and
 key path once, then each state and event as a line.
 
-#### PR #60: Start first reads the pot's balance. A pot that cannot pay a
+#### PR #53: Start first reads the pot's balance. A pot that cannot pay a
 claim yet (or cannot be read) is reported, and the next Start press starts
 anyway. To mine ELECTRIC beside PHOTON on the same GPUs, each for a share of
 the time, choose Hash split instead ([hash-split.md](hash-split.md)).

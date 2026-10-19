@@ -1,6 +1,6 @@
 # Token hash split
 
-#### PR #60
+#### PR #53
 
 Status: one session mines several GPU tokens on the same GPUs, each for
 its share of the time in 5% steps, at most 100% together. From the setup

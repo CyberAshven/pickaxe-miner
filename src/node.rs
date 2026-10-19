@@ -1023,6 +1023,27 @@ fn select_node_rpc_basic_auth(
     }
 }
 
+/// #### PR #53: a node as another program needs it (BCH P2Pool): its URL
+/// without a login, and the login Pickaxe would send, from the URL, the
+/// environment or a cookie file, so that program needs no cookie support.
+pub fn rpc_endpoint_and_login(url: &str) -> Result<(String, Option<(String, String)>), String> {
+    let target = parse_node_rpc_target(url)?;
+    let login = node_rpc_basic_auth(&target)?.and_then(|auth| {
+        auth.split_once(':')
+            .map(|(user, password)| (user.to_owned(), password.to_owned()))
+    });
+    let scheme = match target.scheme {
+        NodeRpcScheme::Http => "http",
+        NodeRpcScheme::Https => "https",
+    };
+    let host = if target.host.contains(':') {
+        format!("[{}]", target.host)
+    } else {
+        target.host.clone()
+    };
+    Ok((format!("{scheme}://{host}:{}", target.port), login))
+}
+
 /// Builds the HTTP basic-auth header for a node request.
 fn node_rpc_basic_auth(target: &NodeRpcTarget) -> Result<Option<String>, String> {
     let env_user = std::env::var(NODE_RPC_USER_ENV).ok();

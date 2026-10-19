@@ -37,7 +37,7 @@ pub mod electric;
 #[allow(dead_code)]
 pub mod electrum;
 pub mod gpu_types;
-// #### PR #60: several GPU tokens on the same GPUs, each for its share of the time.
+// #### PR #53: several GPU tokens on the same GPUs, each for its share of the time.
 pub mod hash_split;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hip_photon;
@@ -61,6 +61,9 @@ pub mod node;
 pub mod node_find;
 #[cfg(all(feature = "opencl", not(target_arch = "wasm32")))]
 pub mod opencl_photon;
+// #### PR #53: BCH P2Pool as a dependency Pickaxe installs, updates and runs.
+#[cfg(all(feature = "stratum-v2", not(target_arch = "wasm32")))]
+pub mod p2pool;
 pub mod proof;
 #[allow(dead_code)]
 pub mod protocol;

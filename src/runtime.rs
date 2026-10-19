@@ -2618,7 +2618,7 @@ pub struct RuntimeSupervisor {
     shutdown: ShutdownSignal,
     worker: Option<JoinHandle<()>>,
     telemetry: LiveTelemetrySampler,
-    /// #### PR #60: the hash split's hold on this miner's GPU search.
+    /// #### PR #53: the hash split's hold on this miner's GPU search.
     hold: crate::search::SearchHold,
 }
 
@@ -2806,7 +2806,7 @@ impl RuntimeSupervisor {
         })
     }
 
-    /// #### PR #60: the hash split's hold on this miner's GPU search.
+    /// #### PR #53: the hash split's hold on this miner's GPU search.
     pub fn hold_handle(&self) -> crate::search::SearchHold {
         self.hold.clone()
     }

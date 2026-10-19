@@ -42,7 +42,7 @@ use crate::gpu_types::THROTTLED_BATCH_DIVISOR;
 pub(crate) const WINNER_BUFFER_CAP: u32 = 8;
 const WINNER_CHANNEL_CAP: usize = WINNER_BUFFER_CAP as usize;
 const PAUSE_POLL: Duration = Duration::from_millis(25);
-/// #### PR #60: how often a held GPU worker looks for its turn again.
+/// #### PR #53: how often a held GPU worker looks for its turn again.
 const HOLD_POLL: Duration = Duration::from_millis(2);
 
 pub(crate) enum PhotonEngine {
@@ -585,7 +585,7 @@ enum WorkerExit {
 #[derive(Clone)]
 struct SharedControl {
     paused: Arc<AtomicBool>,
-    /// #### PR #60: the hash split holds this token's GPU work while
+    /// #### PR #53: the hash split holds this token's GPU work while
     /// another token has the GPUs; unlike `paused`, nothing else clears it.
     held: Arc<AtomicBool>,
     intensity: Arc<AtomicU8>,
@@ -903,7 +903,7 @@ fn run_worker(
             pacer.reset(Instant::now());
             continue;
         }
-        // #### PR #60: another token's turn on the GPUs. A short poll keeps
+        // #### PR #53: another token's turn on the GPUs. A short poll keeps
         // the hand-over within a few milliseconds of the split's plan.
         if held.load(Ordering::Acquire) {
             batch_in_flight.store(false, Ordering::SeqCst);
@@ -1108,7 +1108,7 @@ impl SearchPauseHandle {
     }
 }
 
-/// #### PR #60: the hash split's grip on one search: hold its GPUs while
+/// #### PR #53: the hash split's grip on one search: hold its GPUs while
 /// another token mines, and see whether it wants them at all (not while a
 /// winner's claim or the user pauses it).
 #[derive(Clone)]
@@ -1130,7 +1130,7 @@ impl SearchHold {
 }
 
 impl SearchHandle {
-    /// #### PR #60: the hash split's hold on this search.
+    /// #### PR #53: the hash split's hold on this search.
     pub fn hold_handle(&self) -> SearchHold {
         SearchHold {
             held: Arc::clone(&self.shared.held),
@@ -2857,7 +2857,7 @@ mod tests {
     /// `backend:ordinal` (default `wgpu:0,wgpu:1`). With
     /// `PICKAXE_TEST_WGPU_ADAPTER` set, every wgpu entry opens that adapter,
     /// so two workers can share one GPU and no other GPU is touched.
-    // #### PR #60: the hash split's hold stops a search's GPU work without
+    // #### PR #53: the hash split's hold stops a search's GPU work without
     // pausing it, so the search still wants the GPUs; a pause is different.
     #[cfg(feature = "portable-wgpu")]
     #[test]

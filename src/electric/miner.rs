@@ -325,7 +325,7 @@ fn prepare(
     })
 }
 
-/// #### PR #60: ELECTRIC as one token of a hash split: the setup's
+/// #### PR #53: ELECTRIC as one token of a hash split: the setup's
 /// deployment and pot on `gpus`, reporting to `monitor`, whose `held` flag
 /// the split sets. The caller holds the GPU lock and the stop signal.
 pub fn run_in_split(
@@ -351,7 +351,7 @@ pub fn run_in_split(
     )
 }
 
-/// #### PR #60: what the setup's fee pot holds now, in plain-BCH sats, and
+/// #### PR #53: what the setup's fee pot holds now, in plain-BCH sats, and
 /// the claims that pays at the current relay fee, read through Fulcrum.
 pub fn pot_balance(cfg: &RuntimeConfig, config_path: &Path) -> Result<(u64, u64), String> {
     let args = ElectricDeploymentArgs::default();
@@ -848,7 +848,7 @@ fn mine(
         let started = Instant::now();
         let before = monitor.hashes.load(Ordering::Relaxed);
         let mut moved = false;
-        // #### PR #60: the hash split gives ELECTRIC GPU time only while this
+        // #### PR #53: the hash split gives ELECTRIC GPU time only while this
         // search runs, so an empty pot or a wait leaves it to other tokens.
         struct Searching<'a>(&'a AtomicBool);
         impl Drop for Searching<'_> {

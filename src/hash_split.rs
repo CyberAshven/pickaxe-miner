@@ -1,4 +1,4 @@
-//! #### PR #60: the token hash split. One session mines several GPU tokens
+//! #### PR #53: the token hash split. One session mines several GPU tokens
 //! on the same GPUs, each for its share of the time in 5% steps, the shares
 //! together at most 100% (the rest idles). Only one token's kernels run at a
 //! time: on one GPU two tokens' kernels queue behind each other anyway, and

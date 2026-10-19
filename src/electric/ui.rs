@@ -11,9 +11,9 @@ use std::{
 pub struct Monitor {
     pub stop: Arc<AtomicBool>,
     pub paused: AtomicBool,
-    /// #### PR #60: the hash split holds the GPUs for another token.
+    /// #### PR #53: the hash split holds the GPUs for another token.
     pub held: AtomicBool,
-    /// #### PR #60: a search is running: the pot can pay and the baton is
+    /// #### PR #53: a search is running: the pot can pay and the baton is
     /// minable, so ELECTRIC wants its share of the GPUs.
     pub searching: AtomicBool,
     pub intensity: AtomicU8,
@@ -23,7 +23,7 @@ pub struct Monitor {
     started: Instant,
 }
 
-/// #### PR #60: what the hash split's screen shows of the ELECTRIC session.
+/// #### PR #53: what the hash split's screen shows of the ELECTRIC session.
 #[derive(Debug, Clone, Default)]
 pub struct Summary {
     pub state: String,
@@ -173,7 +173,7 @@ impl Monitor {
             pot.claims = claims;
         }
     }
-    /// #### PR #60: the GPUs the session mines on, as its screen names them.
+    /// #### PR #53: the GPUs the session mines on, as its screen names them.
     pub fn devices(&self) -> String {
         self.view
             .lock()
@@ -181,7 +181,7 @@ impl Monitor {
             .devices
             .clone()
     }
-    /// #### PR #60: the session as the hash split's screen shows it.
+    /// #### PR #53: the session as the hash split's screen shows it.
     pub fn summary(&self) -> Summary {
         let view = self.view.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();

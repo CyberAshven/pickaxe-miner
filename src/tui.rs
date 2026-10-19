@@ -58,7 +58,7 @@ const BENCHMARK_TERMINAL_WIDTH: u16 = 120;
 const BENCHMARK_TERMINAL_HEIGHT: u16 = 40;
 
 type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
-/// #### PR #60: reads a fee pot's plain-BCH sats and the claims they pay.
+/// #### PR #53: reads a fee pot's plain-BCH sats and the claims they pay.
 type PotReader = fn(&RuntimeConfig, &std::path::Path) -> Result<(u64, u64), String>;
 
 #[derive(Debug, Clone)]
@@ -73,7 +73,7 @@ pub struct SetupResult {
     pub options: ServerOptions,
     /// #### PR #58: ELECTRIC was chosen; its own session mines it.
     pub electric: bool,
-    /// #### PR #60: a hash split was chosen, with each token's share.
+    /// #### PR #53: a hash split was chosen, with each token's share.
     pub split: Option<crate::hash_split::Shares>,
 }
 
@@ -534,7 +534,7 @@ enum SettingsRow {
     RigName,
     Address,
     Intensity,
-    /// #### PR #60: one token's share of the GPUs in a hash split, by its
+    /// #### PR #53: one token's share of the GPUs in a hash split, by its
     /// index in the split's token list.
     Share(u8),
     Fulcrum,
@@ -648,10 +648,10 @@ struct SetupFlow {
     /// its fee pot for the payout address entered (made once per address).
     electric: bool,
     electric_pot: Option<(String, Result<ElectricPot, String>)>,
-    /// #### PR #60: a hash split between every GPU token, and its shares.
+    /// #### PR #53: a hash split between every GPU token, and its shares.
     split: bool,
     split_shares: Option<crate::hash_split::Shares>,
-    /// #### PR #60: the fee pot's balance as Start read it (sats, claims
+    /// #### PR #53: the fee pot's balance as Start read it (sats, claims
     /// it pays), and the pot whose shortfall Start already warned about, so
     /// the next press starts anyway. Tests swap the reader.
     pot_balance: Option<Result<(u64, u64), String>>,
@@ -1404,7 +1404,7 @@ impl SetupFlow {
                     .is_ok_and(|deployment| deployment.category_hex() == query))
     }
 
-    /// #### PR #60: the hash split follows every token when the network has
+    /// #### PR #53: the hash split follows every token when the network has
     /// two or more GPU tokens and the search is empty or names it.
     fn split_listed(&self) -> bool {
         let query = self.token_input.trim().to_ascii_lowercase();
@@ -1418,7 +1418,7 @@ impl SetupFlow {
         self.matching_tokens().len() + usize::from(self.electric_listed())
     }
 
-    /// #### PR #60: the split's shares, every GPU token of the network in
+    /// #### PR #53: the split's shares, every GPU token of the network in
     /// order, evenly at first.
     fn shares(&self) -> crate::hash_split::Shares {
         let tokens = crate::hash_split::SplitToken::available(self.config.network);
@@ -1433,14 +1433,14 @@ impl SetupFlow {
         }
     }
 
-    /// #### PR #60: ELECTRIC mines, alone or with a share of a split, so its
+    /// #### PR #53: ELECTRIC mines, alone or with a share of a split, so its
     /// fee pot is made, shown and checked.
     fn electric_in_use(&self) -> bool {
         self.electric
             || (self.split && self.shares().get(crate::hash_split::SplitToken::Electric) > 0)
     }
 
-    /// #### PR #60: Start's check of the fee pot's balance: a pot that can
+    /// #### PR #53: Start's check of the fee pot's balance: a pot that can
     /// pay a claim starts at once; otherwise, or if it cannot be read, Start
     /// says so and the next press starts anyway.
     fn start_after_pot_check(&mut self, made_for: String) -> SetupAction {
@@ -1490,7 +1490,7 @@ impl SetupFlow {
         {
             return;
         }
-        // #### PR #60: a new pot's balance is read again at Start.
+        // #### PR #53: a new pot's balance is read again at Start.
         self.pot_balance = None;
         self.pot_warned = None;
         let Some(path) = self.profile_path.as_deref() else {
@@ -1511,7 +1511,7 @@ impl SetupFlow {
         match self.mode {
             // #### PR #40: a rig takes its jobs from its coordinator.
             // #### PR #42: its backup coordinators and name in Advanced.
-            // #### PR #60: a split's rows: one share per token instead of
+            // #### PR #53: a split's rows: one share per token instead of
             // the intensity; like ELECTRIC it saves no profile.
             MiningMode::Gpu if self.split => {
                 let mut rows = vec![SettingsRow::Gpu, SettingsRow::Address];
@@ -2363,7 +2363,7 @@ impl SetupFlow {
                 self.status_line.clear();
                 self.open_settings(SettingsRow::Gpu);
             }
-            // #### PR #60: the hash split mines every GPU token; the runtime's
+            // #### PR #53: the hash split mines every GPU token; the runtime's
             // settings (donation, connections) follow its first token.
             KeyCode::Enter if self.split_listed() && self.token_selected == self.split_index() => {
                 let first = crate::hash_split::SplitToken::available(self.config.network)
@@ -2475,7 +2475,7 @@ impl SetupFlow {
                         };
                         let _ = self.config.set_intensity(next);
                     }
-                    // #### PR #60: 5% steps, never past 100% in all.
+                    // #### PR #53: 5% steps, never past 100% in all.
                     SettingsRow::Share(index) => {
                         let mut shares = self.shares();
                         if let Err(error) = shares.step(usize::from(index), forward) {
@@ -2863,7 +2863,7 @@ impl SetupFlow {
                     self.status_line = "Enter a payout address first.".into();
                     self.open_settings(SettingsRow::Address);
                 }
-                // #### PR #60: a split starts with a token mining.
+                // #### PR #53: a split starts with a token mining.
                 SettingsRow::Start if self.split && self.shares().validate().is_err() => {
                     self.status_line = self.shares().validate().unwrap_err();
                 }
@@ -2876,7 +2876,7 @@ impl SetupFlow {
                 {
                     self.status_line = self.config.ensure_mining_supported().unwrap_err();
                 }
-                // #### PR #60: ELECTRIC (alone or in a split) checks its pot's
+                // #### PR #53: ELECTRIC (alone or in a split) checks its pot's
                 // balance before mining starts.
                 SettingsRow::Start if self.electric_in_use() => match &self.electric_pot {
                     Some((made_for, Ok(_))) => {
@@ -3727,7 +3727,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
         match state.handle_key(key) {
             SetupAction::Continue => {}
             SetupAction::Cancel => return Ok(None),
-            // #### PR #60
+            // #### PR #53
             SetupAction::Complete if state.split => {
                 return Ok(Some(SetupResult {
                     config: state.config.clone(),
@@ -4871,7 +4871,7 @@ fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 selection_marker(state.token_selected == matches.len())
             )));
         }
-        // #### PR #60
+        // #### PR #53
         if state.split_listed() {
             lines.push(Line::from(vec![
                 Span::raw(format!(
@@ -5154,7 +5154,7 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     "< >",
                 )
             }
-            // #### PR #60: one block a 5% step.
+            // #### PR #53: one block a 5% step.
             SettingsRow::Share(index) => {
                 let (token, share) = state
                     .shares()
@@ -5357,7 +5357,7 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             Span::raw("   "),
             dim(hint),
         ]));
-        // #### PR #60: the split's total under its last share.
+        // #### PR #53: the split's total under its last share.
         if let SettingsRow::Share(index) = row {
             let shares = state.shares();
             if usize::from(index) + 1 == shares.len() {
@@ -5426,7 +5426,7 @@ fn render_electric_pot(state: &SetupFlow) -> (Paragraph<'static>, u16) {
             lines.extend([
                 Line::from(format!("Refund key: {}", pot.key.display())),
                 Line::from(dim("Back it up; only it can refund the pot.")),
-                // #### PR #60: what Start read from the pot.
+                // #### PR #53: what Start read from the pot.
                 match &state.pot_balance {
                     None => Line::from(dim("Start reads its balance.")),
                     Some(Ok((sats, 0))) => Line::from(Span::styled(
@@ -7201,7 +7201,7 @@ mod tests {
         .unwrap();
         setup.config.set_network(MiningNetwork::Chipnet);
         setup.mode = mode;
-        // #### PR #60: Start's pot check reads no network in tests.
+        // #### PR #53: Start's pot check reads no network in tests.
         setup.pot_reader = |_, _| Ok((10_000, 5));
         setup
     }
@@ -8059,7 +8059,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    // #### PR #60: the hash split follows the GPU tokens. Its rows give each
+    // #### PR #53: the hash split follows the GPU tokens. Its rows give each
     // token a share in 5% steps, never past 100% in all; with ELECTRIC in
     // it the fee pot is made and shown, and Start reads the pot's balance:
     // an empty pot warns once, then the next press starts.
