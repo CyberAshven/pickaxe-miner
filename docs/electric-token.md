@@ -104,6 +104,10 @@ after the height. Stratum cannot aim the nonce field at this preimage, and
 both need a contract that accepts header work. This one does not, so the
 ASIC farm keeps mining BCH and the CPU searches ELECTRIC beside it.
 
+PHOTON cannot share work with it either; on one GPU the two split the time.
+A new ELECTRIC contract could be merge-mined with PHOTON as the parent,
+without changing PHOTON: see [photon-electric-auxpow.md](photon-electric-auxpow.md).
+
 ## Paying the fee with an owner-recoverable pot
 
 #### PR #51

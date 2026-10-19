@@ -15,6 +15,7 @@
 - [HiveOS, mmpOS and RaveOS](farm-os.md): the custom-miner packages for farm systems
 - [Merge-mining BCH tokens](merge-mining.md): the v1 draft specification for token authors
 - [ASIC-exclusive tokens](asic-tokens.md): header-shaped token jobs (SAFA layout v1, draft), the forwarder convention and findings for token authors
+- [PHOTON as an AuxPoW parent](photon-electric-auxpow.md): PHOTON's live contract can carry an ELECTRIC commitment in its payout; what ELECTRIC and Pickaxe would need
 - [Job Declaration](job-declaration.md): miners' own templates at a Pickaxe pool (Full-Template and Coinbase-only)
 
 ## Planning
