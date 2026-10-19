@@ -11,6 +11,7 @@
 - [Rust dependency security](rust-security.md)
 - [Incremental-k search](incremental-k.md) (optional CUDA build feature)
 - [Running a pool](pool.md): an ASIC or GPU pool for other miners, as a service
+- [BCH P2Pool, managed](p2pool.md): P2Pool installed from its releases, kept updated and run by Pickaxe, with lights for P2Pool and the node
 - [GPU farms](farm.md): rigs on many machines mining as one
 - [HiveOS, mmpOS and RaveOS](farm-os.md): the custom-miner packages for farm systems
 - [Merge-mining BCH tokens](merge-mining.md): the v1 draft specification for token authors
