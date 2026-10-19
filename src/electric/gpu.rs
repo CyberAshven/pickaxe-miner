@@ -42,6 +42,12 @@ pub fn search_all(
                             pacer.reset(started.elapsed());
                             continue;
                         }
+                        // #### PR #60: another token's turn on the GPUs.
+                        if monitor.held.load(std::sync::atomic::Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            pacer.reset(started.elapsed());
+                            continue;
+                        }
                         let (recipient, count) = {
                             let mut schedule = schedule.lock().unwrap_or_else(|e| e.into_inner());
                             let recipient = schedule.recipient();

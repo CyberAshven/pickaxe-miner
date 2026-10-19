@@ -37,6 +37,8 @@ pub mod electric;
 #[allow(dead_code)]
 pub mod electrum;
 pub mod gpu_types;
+// #### PR #60: several GPU tokens on the same GPUs, each for its share of the time.
+pub mod hash_split;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hip_photon;
 // #### PR #42: where GPU mining takes its jobs, and the way back to the node.
