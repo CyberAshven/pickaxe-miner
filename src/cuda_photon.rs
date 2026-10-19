@@ -128,7 +128,9 @@ fn resolve_ptx_path_in(
 }
 
 /// Finds the deployed PTX kernel for CUDA mining.
-fn resolve_ptx_path(name: &str) -> Result<PathBuf, String> {
+/// #### PR #58: ELECTRIC finds its own module here and loads it itself, so
+/// PHOTON's module mapping in `load_functions` stays as it is.
+pub(crate) fn resolve_ptx_path(name: &str) -> Result<PathBuf, String> {
     let executable = std::env::current_exe().ok();
     let executable_dir = executable.as_deref().and_then(Path::parent);
     resolve_ptx_path_in(name, executable_dir, Path::new(env!("CARGO_MANIFEST_DIR")))

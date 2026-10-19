@@ -1489,7 +1489,7 @@ fn read_compact_size(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
 }
 
 /// Extracts the first input outpoint from a raw transaction.
-fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
+pub(crate) fn first_input_outpoint(raw_tx_hex: &str) -> Result<(String, u32), String> {
     let raw = hex::decode(raw_tx_hex.trim())
         .map_err(|error| format!("decode PHOTON lineage transaction: {error}"))?;
     if raw.len() < 5 {

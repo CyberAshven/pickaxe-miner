@@ -1536,9 +1536,16 @@ fn main() {
             );
             exit_after_error(2);
         }
-        // #### PR #51: ELECTRIC on the CPU (no GPU lock; see `electric`).
+        // #### PR #58: ELECTRIC shares GPU selection and the session lock.
         cli::Commands::Electric { command } => {
-            if let Err(error) = electric::miner::run(&cfg, &command, &config_path) {
+            if let Err(error) = electric::miner::run(
+                &cfg,
+                &command,
+                &config_path,
+                backend_kind,
+                &effective_device,
+                args.no_tui,
+            ) {
                 eprintln!("error: {error}");
                 exit_after_error(1);
             }
@@ -1871,6 +1878,19 @@ fn main() {
                     // #### PR #42: the backup coordinators, the rig's name and
                     // the rigs' port from the Advanced section
                     // (`tui::gpu_launch`).
+                    // #### PR #58: ELECTRIC chosen in the setup mines in its
+                    // own session (fee pot, claims, its screen), not PHOTON's.
+                    if setup.electric {
+                        if let Err(error) = electric::miner::run_from_setup(
+                            &setup.config,
+                            &setup.gpus,
+                            &config_path,
+                        ) {
+                            eprintln!("error: {error}");
+                            exit_after_error(1);
+                        }
+                        return;
+                    }
                     let launch = tui::gpu_launch(setup.server.as_ref(), &setup.options);
                     if let Some(tui::GpuLaunch::Rig { coordinators, name }) = &launch {
                         println!(

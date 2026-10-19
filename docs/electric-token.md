@@ -1,11 +1,12 @@
 # ELECTRIC, as a second token
 
-Status: `pickaxe electric` mines the published mainnet contract as it is, on
-the CPU, with keyless fee-pot claims and a dedicated recovery key managed
-by Pickaxe (PR #51). No payout-wallet key or contract deploy is needed.
-The recovery redesign has no funded live validation yet. The design note
-of 2026-10-13 (PR #50) is revised below where the implementation or the
-chain changed it.
+Status: `pickaxe electric` mines the published mainnet contract as it is,
+with keyless fee-pot claims and a dedicated recovery key managed by Pickaxe
+(PR #51). Since PR #58 it searches on GPUs (CUDA, and the portable engine
+for integrated and other GPUs), is a token choice in the setup, and has
+Pickaxe's own Chipnet deployment, where it has claimed live (below). No
+payout-wallet key is needed. The design note of 2026-10-13 (PR #50) is
+revised below where the implementation or the chain changed it.
 
 Sources, read 2026-10-13 and 2026-10-15:
 
@@ -19,8 +20,8 @@ Sources, read 2026-10-13 and 2026-10-15:
 
 ## Decision
 
-Mine the published contract beside BCH and PHOTON, on a CPU search, without
-a key in Pickaxe. Document its replay weakness, never use it, and keep the
+Mine the published contract beside BCH and PHOTON, on a GPU search, without
+a payout key in Pickaxe. Document its replay weakness, never use it, and keep the
 deployment as data so a fixed contract is one new `Contract` variant.
 
 ## Replay
@@ -182,25 +183,70 @@ away. The work share needs neither.
 
 ## Racing
 
-The proof is cheap: 2^24 hashes at difficulty 3, 2^32 at 4. Pickaxe searches
-on the CPU (`--threads`, default all but one) with the hardware SHA
-instructions where the CPU has them. On a 32-thread desktop CPU, 31 threads
-searched the live baton at 268 to 285 MH/s in a dry run on 2026-10-15: a
-difficulty-4 proof in about 15 seconds on average, a difficulty-3 proof in
-well under one. GPU web miners can be faster still, so expect to win mostly
-when they are idle. `pickaxe electric mine --dry-run`
-searches without a funded pot and sends nothing, to show a computer's rate
-first. `--max-difficulty 3` searches only the cheap claims.
+The proof is cheap: 2^24 hashes at difficulty 3, 2^32 at 4. #### PR #58:
+Pickaxe searches on the selected GPUs: CUDA through its own module
+(`cuda/build/electric_rust.ptx`) and every other GPU through the portable
+engine (`reference/shared-electric`), both generated from the shared Rust
+proof in `rust-engine/src/electric.rs`. ELECTRIC's CUDA module is built
+separately from PHOTON's (`tools/build-rust-kernels.*`), so PHOTON's
+compiled kernels do not change: PHOTON's PTX built from this branch's
+sources is byte-identical to dev's (`243beaec…`, 2026-10-18). The host checks every returned nonce before a claim
+is built, and the donation share is assigned before each batch is hashed, as
+on the CPU before. (CPU-only results from 2026-10-15: 268 to 285 MH/s on 31
+desktop threads.) Web miners race for the same baton, so expect to win
+mostly when they are idle. `pickaxe electric mine --dry-run` searches
+without a funded pot and sends nothing, to show a computer's rate first.
+`--max-difficulty 3` searches only the cheap claims.
+
+## Mining from the setup
+
+#### PR #58: in the setup, Token lists ELECTRIC after the GPU tokens. Its
+settings are the GPUs, the payout address, intensity and, under Advanced,
+the donation. As soon as the payout address is in, the setup makes the fee
+pot and its recovery key (beside the configuration, owner-only) and shows
+the pot's address, a QR code of it and where the key is saved, so the miner
+can fund the pot from a wallet before starting. Start then opens the
+ELECTRIC screen: rate, accepted rewards, the pot's balance and how many
+claims it pays, and the QR code again whenever the pot cannot pay a claim
+(`f` shows or hides it). `--no-tui` prints the same address, QR code and
+key path once, then each state and event as a line.
+
+The ELECTRIC choice saves no profile. Profiles reject unknown fields, and
+an older Pickaxe reading the same file must keep working; pick ELECTRIC in
+the setup each time.
 
 ## Chipnet
 
-There is no published Chipnet deployment. Deploy the same contract with a
-wallet you already have, then pass `--chipnet --electric-category <id>` (and
-`--electric-reward`, `--electric-min-difficulty`, `--electric-max-difficulty`
-if they differ). Pickaxe will not generate the deploy key. On that
-deployment the CPU search, the pot, a won claim, a lost race that leaves the
-pot unspent, a held proof sent after a top-up, and a refund can be checked
-before mainnet.
+There is no published Chipnet deployment, so Pickaxe made one (PR #58),
+and `--chipnet` mines it with no other flag: category
+`39629630f3f5ba91c6e656e7b79c2c8de2fc6f776bfe085e1b7eaf70aa8a5e76`
+(genesis `6ba9682c719248f473ec6b3eb5efe3650b55439b751463ea1dec65c906163ee1`,
+2026-10-18), with the mainnet constructor values (60,000,000 units a claim,
+difficulty 3 to 4) and one million claims on the baton. Another deployment
+still takes `--electric-category` and its values.
+
+`pickaxe electric deploy --funding TXID:0 --funding-sats N` builds such a
+genesis: the coin at output 0 of its transaction becomes the category, the
+baton starts at the minimum difficulty and the chain tip with the whole
+supply, and the change goes to `--change` or `--address`. It prints the
+unsigned transaction; the funding coin's wallet signs and sends it, so
+Pickaxe never holds that key. The Chipnet genesis was funded with 10,000
+sats from a public Chipnet faucet and signed by the node wallet holding
+them.
+
+Live check, 2026-10-18, on the operator's PC (RTX 5070 Ti Laptop GPU over
+CUDA and the AMD integrated GPU over the portable engine, `--device 0,1`),
+with the PC's PHOTON miner stopped for the window and restarted after it:
+the pot was funded with 8,000 sats from a wallet, and the session found two
+proofs and claimed both. The first moved the baton to height 328452 at
+difficulty 3, and the second, the cheap claim after it, raised it to 4;
+each paid 60,000,000 units and 1,000 sats to the payout, and
+took 1,851 sats (1,000 plus an 851-sat fee) from the pot, which kept 4,298.
+Both confirmed in block 328453, and two public Chipnet Fulcrum servers
+agree on their outputs and the baton chain from the genesis. The pot pays
+two claims a block, and no block came in the rest of the window, so the
+session waited as designed. Still to show live: a lost race that leaves the pot
+unspent, a held proof sent after a top-up, and a signed refund.
 
 ## When the contract is fixed
 
@@ -228,12 +274,21 @@ the old pot to the payout first.
   the pot's input.
 - `pickaxe electric status` read the live baton through Fulcrum on
   2026-10-15 (claim 1412, difficulty 4, height 972908).
+- #### PR #58: `cargo test --lib electric` also checks the genesis builder
+  (output 0 only, the baton's state and supply, the fee for the signed
+  size), the Chipnet deployment's covenant, the fee pot's QR code module
+  for module, and the ELECTRIC screen showing an unfunded pot's QR code;
+  `tui::tests::electric_setup_shows_the_fee_pot_to_fund_and_saves_no_profile`
+  walks the setup. The ignored GPU tests
+  (`electric::gpu::tests`, `--ignored --test-threads=1`, miners stopped)
+  compare every hash and the first winning nonce with the CPU across nonce
+  boundaries; they passed on CUDA (RTX 5070 Ti) and on the portable engine
+  with the AMD integrated GPU and the NVIDIA GPU on 2026-10-18.
 
 ## Not in this change
 
-- No GPU search; the CPU only.
-- No setup-wizard screen; `pickaxe electric pot` prints the address.
 - Not inside `stratum-v2 serve`; run `pickaxe electric mine` beside it.
-- No `MiningToken` variant: that enum is the GPU tokens.
-- No deploy or funded live validation in this change; refunds are signed locally
-  and broadcast only with `--broadcast`.
+- No `MiningToken` variant: PHOTON's runtime matches on that enum; the
+  setup lists ELECTRIC beside it and starts ELECTRIC's own session.
+- No saved ELECTRIC profile (see "Mining from the setup").
+- Refunds are signed locally and broadcast only with `--broadcast`.

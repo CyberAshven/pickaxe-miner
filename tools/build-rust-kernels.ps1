@@ -12,6 +12,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Rust GPU compilation failed' }
     New-Item -ItemType Directory -Force -Path (Join-Path $repo 'cuda/build') | Out-Null
     Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'nvptx64-nvidia-cuda/release/pickaxe_rust_engine.ptx') -Destination (Join-Path $repo 'cuda/build/photon_rust.ptx')
+    cargo +nightly-2026-04-02 build --locked --release --manifest-path (Join-Path $repo 'rust-engine/electric-kernel/Cargo.toml') --target nvptx64-nvidia-cuda -Z build-std=core
+    if ($LASTEXITCODE -ne 0) { throw 'ELECTRIC GPU compilation failed' }
+    Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'nvptx64-nvidia-cuda/release/pickaxe_electric_kernel.ptx') -Destination (Join-Path $repo 'cuda/build/electric_rust.ptx')
 } finally {
     $env:RUSTFLAGS = $oldFlags
     $env:CARGO_TARGET_DIR = $oldTarget

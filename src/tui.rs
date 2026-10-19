@@ -69,6 +69,8 @@ pub struct SetupResult {
     pub server: Option<ServerSetup>,
     /// #### PR #42: the ASIC server's options from the Advanced section.
     pub options: ServerOptions,
+    /// #### PR #58: ELECTRIC was chosen; its own session mines it.
+    pub electric: bool,
 }
 
 /// #### PR #42: the ASIC server's options the setup's Advanced section
@@ -635,6 +637,10 @@ struct SetupFlow {
     node_zmq: String,
     token_input: String,
     token_selected: usize,
+    /// #### PR #58: the GPU token is ELECTRIC, mined by its own session, and
+    /// its fee pot for the payout address entered (made once per address).
+    electric: bool,
+    electric_pot: Option<(String, Result<ElectricPot, String>)>,
     settings_row: usize,
     editing: Option<TextField>,
     text_input: String,
@@ -811,6 +817,8 @@ impl SetupFlow {
             node_zmq: String::new(),
             token_input: String::new(),
             token_selected: 0,
+            electric: false,
+            electric_pot: None,
             settings_row: 0,
             editing: None,
             text_input: String::new(),
@@ -1364,11 +1372,65 @@ impl SetupFlow {
         tokens
     }
 
+    /// #### PR #58: ELECTRIC follows the GPU tokens when the search is empty
+    /// or names it (or its category).
+    fn electric_listed(&self) -> bool {
+        let query = self.token_input.trim().to_ascii_lowercase();
+        self.mode == MiningMode::Gpu
+            && (query.is_empty()
+                || "electric".contains(&query)
+                || crate::electric::Deployment::select(self.config.network, None, None, None, None)
+                    .is_ok_and(|deployment| deployment.category_hex() == query))
+    }
+
+    /// #### PR #58: once ELECTRIC has a payout address, its fee pot: made
+    /// with a recovery key beside the configuration, so the miner can fund it
+    /// before mining starts.
+    fn refresh_electric_pot(&mut self) {
+        let address = self.config.payout_address.trim();
+        if !self.electric || self.step != SetupStep::Settings || address.is_empty() {
+            return;
+        }
+        let made_for = format!("{}:{address}", self.config.network.as_str());
+        if self
+            .electric_pot
+            .as_ref()
+            .is_some_and(|(made, _)| *made == made_for)
+        {
+            return;
+        }
+        let Some(path) = self.profile_path.as_deref() else {
+            return;
+        };
+        let pot = crate::electric::miner::default_pot(&self.config, path).map(|(address, key)| {
+            ElectricPot {
+                qr: crate::electric::ui::qr_lines(&address).unwrap_or_default(),
+                address,
+                key,
+            }
+        });
+        self.electric_pot = Some((made_for, pot));
+    }
+
     /// Rows of the settings page for the chosen hardware.
     fn settings_rows(&self) -> Vec<SettingsRow> {
         match self.mode {
             // #### PR #40: a rig takes its jobs from its coordinator.
             // #### PR #42: its backup coordinators and name in Advanced.
+            // #### PR #58: ELECTRIC saves no profile, so no name row.
+            MiningMode::Gpu if self.electric => {
+                let mut rows = vec![
+                    SettingsRow::Gpu,
+                    SettingsRow::Address,
+                    SettingsRow::Intensity,
+                    SettingsRow::Advanced,
+                ];
+                if self.advanced_open {
+                    rows.push(SettingsRow::TokenDonation);
+                }
+                rows.push(SettingsRow::Start);
+                rows
+            }
             MiningMode::Gpu if self.gpu_join => self.with_advanced(
                 vec![
                     SettingsRow::Gpu,
@@ -2186,7 +2248,16 @@ impl SetupFlow {
                 self.step = SetupStep::Network;
                 self.status_line.clear();
             }
+            KeyCode::Enter
+                if self.electric_listed()
+                    && self.token_selected == self.matching_tokens().len() =>
+            {
+                self.electric = true;
+                self.status_line.clear();
+                self.open_settings(SettingsRow::Gpu);
+            }
             KeyCode::Enter => {
+                self.electric = false;
                 let matches = self.matching_tokens();
                 let query = matches
                     .get(self.token_selected)
@@ -2205,7 +2276,7 @@ impl SetupFlow {
                 }
             }
             KeyCode::Up | KeyCode::Down => {
-                let count = self.matching_tokens().len();
+                let count = self.matching_tokens().len() + usize::from(self.electric_listed());
                 if count > 0 {
                     self.token_selected = if key.code == KeyCode::Up {
                         (self.token_selected + count - 1) % count
@@ -2655,6 +2726,11 @@ impl SetupFlow {
                     self.status_line = "Enter a payout address first.".into();
                     self.open_settings(SettingsRow::Address);
                 }
+                SettingsRow::Start if self.electric => match &self.electric_pot {
+                    Some((_, Ok(_))) => return SetupAction::Complete,
+                    Some((_, Err(error))) => self.status_line = error.clone(),
+                    None => self.status_line = "Enter a payout address first.".into(),
+                },
                 SettingsRow::Start => match self.config.ensure_mining_supported() {
                     Ok(()) => return SetupAction::Complete,
                     Err(error) => self.status_line = error,
@@ -3469,6 +3545,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
     let mut terminal = TerminalSession::enter()?;
     loop {
         state.poll_local_node();
+        state.refresh_electric_pot();
         terminal
             .terminal
             .draw(|frame| render_setup(frame, &state))
@@ -3494,6 +3571,16 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
         match state.handle_key(key) {
             SetupAction::Continue => {}
             SetupAction::Cancel => return Ok(None),
+            SetupAction::Complete if state.electric => {
+                return Ok(Some(SetupResult {
+                    config: state.config.clone(),
+                    gpus: state.chosen_gpus(),
+                    profile_name: "ELECTRIC".into(),
+                    server: None,
+                    options: ServerOptions::default(),
+                    electric: true,
+                }));
+            }
             SetupAction::Complete => {
                 let gpus = state.chosen_gpus();
                 // #### PR #42: the profile keeps its mode and pool values.
@@ -3514,6 +3601,7 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
                             profile_name,
                             server: state.server_setup(),
                             options: state.server_options(),
+                            electric: false,
                         }));
                     }
                     Err(error) => state.status_line = error,
@@ -4286,6 +4374,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
         | SetupStep::Gpus
         | SetupStep::TailscalePeers => {
             let what = match state.mode {
+                MiningMode::Gpu if state.electric => format!("GPU · {network} · ELECTRIC"),
                 MiningMode::Gpu => format!("GPU · {network} · {}", state.config.token.as_str()),
                 MiningMode::Asic => {
                     format!("ASIC · {network} · {}", ASIC_TARGETS[state.asic_target])
@@ -4605,6 +4694,12 @@ fn render_setup_token(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 ))
             })
             .collect::<Vec<_>>();
+        if state.electric_listed() {
+            lines.push(Line::from(format!(
+                "{} ELECTRIC  GPU  available",
+                selection_marker(state.token_selected == matches.len())
+            )));
+        }
         if lines.is_empty() {
             lines.push(Line::from("No matching token"));
         }
@@ -5061,12 +5156,77 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
     lines.push(Line::from(dim(
         "Servers and nodes you add are saved once per network and shared by every profile.",
     )));
-    frame.render_widget(
+    let settings = Paragraph::new(lines)
+        .block(Block::default().title(" Settings ").borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    if !state.electric {
+        frame.render_widget(settings, area);
+        return;
+    }
+    let pot = render_electric_pot(state);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(40), Constraint::Length(pot.1)])
+        .split(area);
+    frame.render_widget(settings, columns[0]);
+    frame.render_widget(pot.0, columns[1]);
+}
+
+/// #### PR #58: ELECTRIC's fee pot, to fund before mining starts: its
+/// address, a QR code of it and where its recovery key is saved; and the
+/// panel's width.
+fn render_electric_pot(state: &SetupFlow) -> (Paragraph<'static>, u16) {
+    let block = Block::default()
+        .title(" ELECTRIC fee pot ")
+        .borders(Borders::ALL);
+    let (lines, width) = match &state.electric_pot {
+        None => (
+            vec![
+                Line::from("Enter your payout address."),
+                Line::from(dim("Pickaxe then makes your fee pot")),
+                Line::from(dim("and shows it here to fund.")),
+            ],
+            34,
+        ),
+        Some((_, Err(error))) => (vec![Line::from(error.clone())], 40),
+        Some((_, Ok(pot))) => {
+            let qr_width = pot.qr.first().map_or(0, |row| row.chars().count()) as u16;
+            let mut lines = vec![
+                Line::from("Send plain BCH here from your wallet."),
+                Line::from(dim("It pays each claim's 1,000 sats and fee;")),
+                Line::from(dim("the 1,000 sats come back with the tokens.")),
+                Line::from(Span::styled(
+                    pot.address.clone(),
+                    Style::default().fg(Color::Yellow),
+                )),
+            ];
+            lines.extend(pot.qr.iter().map(|row| {
+                Line::from(Span::styled(
+                    row.clone(),
+                    Style::default().fg(Color::White).bg(Color::Black),
+                ))
+            }));
+            lines.extend([
+                Line::from(format!("Refund key: {}", pot.key.display())),
+                Line::from(dim("Back it up; only it can refund the pot.")),
+            ]);
+            (lines, qr_width.max(42) + 2)
+        }
+    };
+    (
         Paragraph::new(lines)
-            .block(Block::default().title(" Settings ").borders(Borders::ALL))
+            .block(block)
             .wrap(Wrap { trim: false }),
-        area,
-    );
+        width,
+    )
+}
+
+/// #### PR #58: an ELECTRIC fee pot as the setup shows it.
+#[derive(Debug, Clone)]
+struct ElectricPot {
+    address: String,
+    key: PathBuf,
+    qr: Vec<String>,
 }
 
 /// The GPU list: one checkbox per GPU that can mine.
@@ -7583,6 +7743,87 @@ mod tests {
     // for BCH; a profile keeps the token and reopens on it.
     // Look here if: the token's Start check, asic_serve_command or the
     // saved token change.
+    // #### PR #58: ELECTRIC is a GPU token whose setup makes and shows the
+    // fee pot (address, QR code, saved recovery key) before mining starts,
+    // and saves no profile.
+    #[test]
+    fn electric_setup_shows_the_fee_pot_to_fund_and_saves_no_profile() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-electric-setup-{:016x}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.profile_path = Some(dir.join("config.profiles.json"));
+        setup.step = SetupStep::Token;
+        let screen = setup_text(&setup);
+        assert!(screen.contains("> PHOTON  GPU  available"), "{screen}");
+        assert!(screen.contains("  ELECTRIC  GPU  available"), "{screen}");
+        type_text(&mut setup, "elec");
+        assert!(setup.matching_tokens().is_empty() && setup.electric_listed());
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(setup.electric);
+        assert_eq!(setup.step, SetupStep::Settings);
+        assert_eq!(
+            setup.settings_rows(),
+            vec![
+                SettingsRow::Gpu,
+                SettingsRow::Address,
+                SettingsRow::Intensity,
+                SettingsRow::Advanced,
+                SettingsRow::Start
+            ]
+        );
+        let screen = setup_text(&setup);
+        assert!(screen.contains("· ELECTRIC"), "{screen}");
+        assert!(screen.contains("Enter your payout address."), "{screen}");
+        // No pot and no start without a payout address.
+        setup.refresh_electric_pot();
+        assert!(setup.electric_pot.is_none());
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        // With one, the pot and its key are made once, beside the
+        // configuration, where the mining session finds them.
+        setup.config.payout_address = chipnet_payout(5);
+        setup.refresh_electric_pot();
+        let pot = setup.electric_pot.clone().unwrap().1.unwrap();
+        assert!(pot.address.starts_with("bchtest:p"), "{}", pot.address);
+        assert!(pot.key.exists() && pot.key.parent() == Some(dir.as_path()));
+        assert_eq!(
+            crate::electric::miner::default_pot(&setup.config, &dir.join("config.json")).unwrap(),
+            (pot.address.clone(), pot.key.clone())
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+        terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            " ELECTRIC fee pot ",
+            "Send plain BCH here from your wallet.",
+            &pot.address[..36],
+            "Refund key: ",
+            "only it can refund the pot",
+            "▀",
+        ] {
+            assert!(screen.contains(expected), "{expected}: {screen}");
+        }
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        // Choosing PHOTON again mines PHOTON.
+        setup.step = SetupStep::Token;
+        setup.token_input.clear();
+        setup.token_selected = 0;
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(!setup.electric);
+        assert_ne!(setup.settings_rows()[1], SettingsRow::Address);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn token_mode_does_not_require_a_node() {
         let mut setup = setup_for(MiningMode::Asic);
