@@ -13,7 +13,63 @@ import unittest
 
 
 class ReleaseChannelTest(unittest.TestCase):
+    """Run workflow release gates against isolated Git histories and artifacts."""
+
+    def test_release_mode_skips_existing_versions_and_fails_on_lookup_errors(self):
+        """Require an explicit missing tag before a branch push can release."""
+        workflow = (Path(__file__).resolve().parents[1] /
+                    '.github/workflows/release.yml').read_text(encoding='utf-8')
+        block = re.search(
+            r'      - name: Resolve release tag\n.*?        run: \|\n'
+            r'((?:          [^\n]*\n|\n)+)', workflow, re.S)
+        self.assertIsNotNone(block)
+        script = textwrap.dedent(block[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(['git', 'init', '-b', 'master', str(root)],
+                           check=True, capture_output=True)
+            subprocess.run(
+                ['git', '-c', 'user.name=Release Test',
+                 '-c', 'user.email=release-test@example.invalid',
+                 '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'test'],
+                cwd=root, check=True, capture_output=True)
+            subprocess.run(['git', 'tag', 'pickaxe-miner-v0.0.3'],
+                           cwd=root, check=True, capture_output=True)
+            output = root / 'outputs'
+            cases = [
+                ('push', 'branch', '0.0.3', str(root), 'skip'),
+                ('push', 'branch', '0.0.4', str(root), 'create'),
+                ('push', 'branch', '0.0.3', str(root / 'missing-remote'), None),
+                ('pull_request', 'branch', '0.0.3', str(root), 'dry-run'),
+                ('push', 'tag', '0.0.3', str(root), 'publish'),
+                ('workflow_dispatch', 'branch', '0.0.3', str(root), 'publish'),
+            ]
+            for event, ref_type, version, remote, expected_mode in cases:
+                with self.subTest(event=event, ref_type=ref_type,
+                                  version=version, remote=remote):
+                    (root / 'Cargo.toml').write_text(
+                        f'[package]\nversion = "{version}"\n', encoding='utf-8')
+                    output.write_text('', encoding='utf-8')
+                    tag = f'pickaxe-miner-v{version}'
+                    result = subprocess.run(
+                        [shutil.which('bash'), '--noprofile', '--norc', '-c', script],
+                        cwd=root, capture_output=True, text=True,
+                        env=dict(os.environ, GITHUB_EVENT_NAME=event,
+                                 PUSH_REF_TYPE=ref_type, PUSH_TAG=tag, MANUAL_TAG=tag,
+                                 REPO_URL=remote, GITHUB_OUTPUT=str(output)))
+                    self.assertEqual(result.returncode == 0, expected_mode is not None,
+                                     result.stdout + result.stderr)
+                    values = dict(line.split('=', 1) for line in
+                                  output.read_text(encoding='utf-8').splitlines())
+                    if expected_mode is None:
+                        self.assertNotIn('mode', values)
+                        self.assertIn('refusing to release', result.stderr)
+                    else:
+                        self.assertEqual(values['mode'], expected_mode)
+                        self.assertEqual(values['tag'], tag)
+
     def test_portable_archives_require_the_same_source_commit(self):
+        """Reject a portable archive whose recorded source differs from the release."""
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
         block = re.search(
@@ -51,6 +107,7 @@ class ReleaseChannelTest(unittest.TestCase):
                     self.assertTrue((root / 'dist' / f'{tag}-browser.tar.gz').is_file())
 
     def test_download_replacement_never_creates_a_release(self):
+        """Keep explicit download replacement confined to an existing release."""
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
         block = re.search(
@@ -88,6 +145,7 @@ class ReleaseChannelTest(unittest.TestCase):
                     self.assertEqual('release edit ' in commands, not missing)
 
     def test_publication_and_promotion_channels(self):
+        """Enforce stable and prerelease ancestry plus replacement provenance."""
         workflow = (Path(__file__).resolve().parents[1] /
                     '.github/workflows/release.yml').read_text(encoding='utf-8')
         block = re.search(
@@ -101,6 +159,7 @@ class ReleaseChannelTest(unittest.TestCase):
             clone = root / 'clone'
 
             def git(cwd, *args):
+                """Run Git in a disposable repository and return its output."""
                 return subprocess.check_output(
                     ['git', *args], cwd=cwd, text=True,
                     stderr=subprocess.STDOUT).strip()

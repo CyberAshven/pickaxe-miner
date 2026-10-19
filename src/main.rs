@@ -2268,29 +2268,29 @@ mod tests {
     }
 
     #[test]
-    fn release_workflow_prepares_pickaxe_miner_v0_0_3() {
+    fn release_workflow_prepares_pickaxe_miner_v0_0_4() {
         let workflow = include_str!("../.github/workflows/release.yml");
         let version = cargo_package_version(include_str!("../Cargo.toml"));
-        assert_eq!(version, "0.0.3");
+        assert_eq!(version, "0.0.4");
 
         let pattern = release_tag_pattern(workflow);
         assert!(
-            release_tag_matches(&pattern, "pickaxe-miner-v0.0.3"),
+            release_tag_matches(&pattern, "pickaxe-miner-v0.0.4"),
             "{pattern}"
         );
-        assert!(!release_tag_matches(&pattern, "v0.0.3"), "{pattern}");
-        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.3-rc.1"));
+        assert!(!release_tag_matches(&pattern, "v0.0.4"), "{pattern}");
+        assert!(release_tag_matches(&pattern, "pickaxe-miner-v0.0.4-rc.1"));
         assert!(workflow.contains("pickaxe-miner-v*.*.*"));
         assert!(!workflow.lines().any(|line| line.trim() == "- \"v*.*.*\""));
         assert!(workflow.contains("if [[ \"pickaxe-miner-v${version}\" != \"${TAG}\" ]]; then"));
         let tag = format!("pickaxe-miner-v{version}");
-        assert_eq!(tag, "pickaxe-miner-v0.0.3");
+        assert_eq!(tag, "pickaxe-miner-v0.0.4");
         assert_ne!(tag, format!("v{version}"));
 
         assert!(workflow.contains("release_title=\"Pickaxe Miner v${version}\""));
         assert!(workflow.contains("--title \"${release_title}\""));
         let title = format!("Pickaxe Miner v{version}");
-        assert_eq!(title, "Pickaxe Miner v0.0.3");
+        assert_eq!(title, "Pickaxe Miner v0.0.4");
 
         // #### PR #32: Linux and Windows packages are named by the matrix's
         // arch, x86_64 and arm64.
