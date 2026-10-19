@@ -44,6 +44,8 @@ jobs:
             artifacts/shared-gpu-proof/filter/*.spv
             artifacts/shared-gpu-proof/stages/*.metal
             artifacts/shared-gpu-proof/stages/*.spv
+            artifacts/shared-gpu-proof/electric/*.metal
+            artifacts/shared-gpu-proof/electric/*.spv
           if-no-files-found: error
 
   software-vulkan:
@@ -73,6 +75,7 @@ jobs:
           cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
           # #### PR #22: the same oracle with the original hand-written WGSL stages.
           PICKAXE_WGPU_STAGES=wgsl cargo test --locked --release --lib --no-default-features --features portable-wgpu wgpu_photon::tests::t2_gpu_end_to_end_boundaries_and_rotations -- --ignored --exact --test-threads=1 --nocapture
+          cargo test --locked --release --lib --no-default-features --features portable-wgpu electric::gpu::tests::electric_portable_matches_independent_hashes_if_wgpu_present -- --ignored --exact --test-threads=1 --nocapture
 
   apple-silicon:
     name: macOS ARM64
@@ -93,7 +96,7 @@ jobs:
       - name: Compile generated shared Rust shader with Apple Metal
         run: |
           xcrun -sdk macosx metal -c artifacts/shared-gpu-proof/shared-t2-hash.metal -o artifacts/shared-gpu-proof/shared-t2-hash.air
-          for shader in artifacts/shared-gpu-proof/filter/*.metal artifacts/shared-gpu-proof/stages/*.metal; do
+          for shader in artifacts/shared-gpu-proof/filter/*.metal artifacts/shared-gpu-proof/stages/*.metal artifacts/shared-gpu-proof/electric/*.metal; do
             xcrun -sdk macosx metal -c "$shader" -o "${shader%.metal}.air"
           done
       - name: Check shared application and Metal backend
