@@ -38,6 +38,7 @@ pub mod electric;
 pub mod electrum;
 pub mod gpu_types;
 // #### PR #53: several GPU tokens on the same GPUs, each for its share of the time.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod hash_split;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hip_photon;

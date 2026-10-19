@@ -894,39 +894,49 @@ mod tests {
         );
     }
 
+    const FAKE: &str = "PICKAXE_TEST_FAKE_P2POOL";
+
+    /// Not a test of its own: the stand-in P2Pool of the supervisor tests,
+    /// this test binary run again with `FAKE` set. It prints its lines,
+    /// then exits with 3 or keeps running, and starts fast on every system
+    /// (PowerShell took over 20 s to start on CI's Windows runners).
+    #[test]
+    fn fake_p2pool() {
+        let Ok(spec) = std::env::var(FAKE) else {
+            return;
+        };
+        let (mode, lines) = spec.split_once('\n').unwrap_or((spec.as_str(), ""));
+        // The runner's "test ... " has no line end yet.
+        println!();
+        for line in lines.lines() {
+            println!("{line}");
+        }
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        if mode == "exit" {
+            std::process::exit(3);
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
     /// One process (as P2Pool is) that prints `lines` and then exits, or
     /// keeps running.
     fn script(lines: &[&str], keep_running: bool) -> Command {
-        let dir = std::env::temp_dir();
-        if cfg!(windows) {
-            let mut body: Vec<String> = lines
-                .iter()
-                .map(|line| format!("Write-Output '{line}'"))
-                .collect();
-            body.push(if keep_running {
-                "Start-Sleep -Seconds 30".into()
-            } else {
-                "exit 3".into()
-            });
-            Command {
-                program: "powershell".into(),
-                args: vec!["-NoProfile".into(), "-Command".into(), body.join("; ")],
-                env: vec![],
-                dir,
-            }
-        } else {
-            let mut body: Vec<String> = lines.iter().map(|line| format!("echo '{line}'")).collect();
-            body.push(if keep_running {
-                "exec sleep 30".into()
-            } else {
-                "exit 3".into()
-            });
-            Command {
-                program: "sh".into(),
-                args: vec!["-c".into(), body.join("; ")],
-                env: vec![],
-                dir,
-            }
+        let mut spec = if keep_running { "run" } else { "exit" }.to_owned();
+        for line in lines {
+            spec.push('\n');
+            spec.push_str(line);
+        }
+        Command {
+            program: std::env::current_exe().unwrap(),
+            args: vec![
+                "--exact".into(),
+                "p2pool::launch::tests::fake_p2pool".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into(),
+            ],
+            env: vec![(FAKE.into(), spec)],
+            dir: std::env::temp_dir(),
         }
     }
 
@@ -949,6 +959,8 @@ mod tests {
         let command = script(&[], true);
         let mut child = std::process::Command::new(&command.program)
             .args(&command.args)
+            .envs(command.env.iter().map(|(key, value)| (key, value)))
+            .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
         assert!(tie_to_pickaxe(&child));
@@ -986,9 +998,10 @@ mod tests {
         assert_eq!(reason, "the BCH node is not ready: no answer");
         assert!((1..=5).contains(&in_secs), "{in_secs}");
         assert_eq!(supervisor.restarts(), 1);
+        // The test runner's own "running 1 test" line comes first.
         assert_eq!(
-            supervisor.log(5),
-            vec!["Failed to verify Bitcoin node is ready: no answer".to_string()]
+            supervisor.log(5).last().map(String::as_str),
+            Some("Failed to verify Bitcoin node is ready: no answer")
         );
         supervisor.stop();
     }
