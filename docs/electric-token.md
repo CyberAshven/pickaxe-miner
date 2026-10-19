@@ -117,7 +117,8 @@ or store the payout wallet's key. Claims remain keyless; only refunds need
 the recovery signature. PHOTON and its runtime keys are unchanged.
 
 `pickaxe electric pot --address <payout>` creates the key before displaying
-the funding address, or reuses the existing key. Fund that P2SH32 address
+the funding address, or reuses the existing key. #### PR #53: it prints the
+address's QR code too, the same one the setup shows. Fund that P2SH32 address
 with plain BCH from any wallet. The default key file is beside the selected
 `--config`, named for the network and the pot's contract/payout parameters.
 `--pot-key <path>` selects a backed-up key explicitly; use it consistently

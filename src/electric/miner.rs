@@ -51,6 +51,10 @@ pub fn run(
             }
             print_deployment(cfg, &deployment, &addresses);
             println!("pot:        {}", pot.address());
+            // #### PR #53: the same QR code the setup shows, for a wallet to scan.
+            for line in super::ui::qr_lines(&pot.address())? {
+                println!("{line}");
+            }
             println!(
                 "Fund it with plain BCH from your wallet. Each claim takes {TOKEN_OUTPUT_SATS} sats \
                  (they arrive with the tokens) plus the relay fee, at most {} sats. \
