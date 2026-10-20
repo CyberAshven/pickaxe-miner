@@ -80,7 +80,8 @@ the tokens first; only the GPUs left over take turns:
 ## Using it
 
 In the setup, choose GPU mining, then **Hash split** at the token step. The
-settings show one row per token: Left/Right moves its share by 5%. Raising a
+settings show one row per token: Enter unlocks it, then Left/Right moves its
+share by 5%. Enter or Esc locks it again. Raising a
 share when the total is already 100% is refused with a note to lower another
 token first. Under the last token: the total and the idle part.
 
@@ -111,11 +112,53 @@ Tokens not named get 0%. `--device`, `--backend`, `--source`, `--fulcrum`
 and `--token-donation` apply as for `mine`; `--no-tui` prints each token's
 rate, rewards and state every 30 seconds instead of the screen.
 
-The screen lists each token's share, rate, rewards and state, the idle part,
-the fee pot's balance (with its QR code while it cannot pay, `f` toggles it)
-and recent events of every token. Up/Down picks a token and Left/Right (or
-+/-) moves its share by 5% while mining. `q`, Esc or Ctrl+C stops every
-token; pending claims are kept as they are without a split.
+#### PR #65: the shared mining dashboard
+
+ELECTRIC alone and hash-split sessions use the same chart, log and command
+widgets as PHOTON. The runtime lists each token's share, rate, accepted
+rewards and state, the GPU assignment and telemetry, ELECTRIC's active and
+wall-average rates, and the pot balance. Each token keeps a separate chart
+trace; their different proof workloads are not speed comparisons.
+
+| Key | While mining |
+| --- | --- |
+| `G` / `O` | Toggle charts / choose hashrate, temperature, power and other charts |
+| `L` | Open the full recent-event log |
+| `S` | Open shares; Up/Down selects, Enter unlocks, Left/Right moves by 5% |
+| `A` | Advanced settings; PHOTON's donation can change for this session |
+| `F` | Show ELECTRIC's funding address, complete QR and recovery-key file location |
+| `P` / `+` / `-` | Pause/resume all participating tokens / adjust their intensity |
+| `/` | Commands, including `/chart options`, `/split`, `/electric pot` |
+| Esc | Close a panel or lock the selected share; keep mining |
+| `Q` / Ctrl+C | Stop the session through the existing worker shutdown paths |
+
+The workflow is **profile → GPU/network → token or Hash split → payout and
+shares → fund the fee pot → Start**. Setup displays the fee pot once the
+payout is supplied; `F` reopens it during mining. A terminal too small for
+the full QR asks to be enlarged rather than displaying a clipped code.
+The QR encodes the pot's address, never its recovery key.
+
+Live split shares, intensity and PHOTON donation adjustments affect the
+current session. Use setup to save start values, change ELECTRIC's donation,
+or change a payout/network/server. Those bindings are not replaced under
+pending claims. Quitting still joins ELECTRIC and stops the owned PHOTON
+supervisors, preserving their existing journals.
+
+The saved profile's **Network** row switches Mainnet/Chipnet before Start.
+It reloads that network's saved servers, invalidates the previous pot
+balance and outstanding balance read, and requires a matching payout
+address. Existing pots and recovery-key files remain on their original
+network. Advanced settings name both PHOTON and ELECTRIC; ELECTRIC's live
+donation display comes from the policy used to create its mining schedule.
+
+**ELECTRIC at 0 H/s while waiting for a block:** its fee pot funds a claim
+that advances the baton height and the following minimum-difficulty claim.
+It refuses further same-height claims to prevent proof replay, including
+fresh proofs that ELECTRIC's token contract would otherwise accept. This
+is a restriction of Pickaxe's current fee pot, not a two-reward limit in
+ELECTRIC itself. When those opportunities are used, ELECTRIC waits for the
+next block and lends its allocation to PHOTON. That wait is distinct from an unfunded pot or a
+configured difficulty limit; each reason is shown in the state.
 
 ## Limits
 
@@ -148,7 +191,11 @@ day: PHOTON 1,688 MH/s (benchmark), ELECTRIC about 2,900 MH/s (dry run).
   (shares, a waiting token's time to the others, the idle part, nobody able
   to mine); the scheduler giving 80/20 within 5% over five rounds, PHOTON
   taking the round while ELECTRIC waits, and every hold released at stop;
-  the screen with an unfunded and a funded pot.
+  pot accounting and share limits.
+- #### PR #65: shared dashboard renders at 80×24 and 140×48, complete
+  funding QR at sufficient size, charts/options/Advanced, locked live
+  shares, Esc panel dismissal, and pause/intensity reaching the ELECTRIC
+  monitor. These are host/UI tests, not live GPU or network evidence.
 - #### PR #61: `a_rig_gives_whole_gpus_first_and_turns_only_on_the_rest`
   (the table above and a 3:1 pair of GPUs) and
   `the_scheduler_measures_a_rig_then_gives_it_whole_gpus` (five GPUs of one

@@ -1,3 +1,4 @@
+mod miners;
 use crate::{
     backend::{BackendKind, DeviceSelection, GpuDevice},
     config::{
@@ -13,6 +14,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use miners::Tokens;
+pub use miners::{run_electric, run_miners, Miners};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -605,6 +608,8 @@ enum SetupAction {
 /// One row of the settings page. Rows never change each other's options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsRow {
+    /// #### PR #65: saved profiles can change network before mining starts.
+    Network,
     /// #### PR #63: the token, which a saved profile can change here.
     Token,
     Gpu,
@@ -1900,6 +1905,7 @@ impl SetupFlow {
         advanced: Vec<SettingsRow>,
     ) -> Vec<SettingsRow> {
         let mut rows = basic;
+        rows.push(SettingsRow::Network);
         rows.push(SettingsRow::Advanced);
         if self.advanced_open {
             rows.extend(advanced);
@@ -1962,6 +1968,22 @@ impl SetupFlow {
                     token.donation_minimum,
                 )
             });
+        }
+        if self.electric || self.split {
+            let minimum = crate::electric::DONATION_MINIMUM;
+            return Some((
+                if self.split {
+                    "PHOTON + ELECTRIC"
+                } else {
+                    "ELECTRIC"
+                }
+                .into(),
+                self.config
+                    .token_donation
+                    .unwrap_or(minimum)
+                    .at_least(minimum),
+                minimum,
+            ));
         }
         Some((
             self.config.token.as_str().to_owned(),
@@ -2365,6 +2387,38 @@ impl SetupFlow {
         Ok(())
     }
 
+    /// #### PR #65: change only the setup draft. Do not reinterpret a payout
+    /// address or reuse a pot balance/read from the previous network.
+    fn toggle_network(&mut self) {
+        let next = match self.config.network {
+            MiningNetwork::Mainnet => MiningNetwork::Chipnet,
+            MiningNetwork::Chipnet => MiningNetwork::Mainnet,
+        };
+        self.config.set_network(next);
+        self.token_selected = 0;
+        self.token_input.clear();
+        self.asic_token = 0;
+        self.share_editing = false;
+        self.electric_pot = None;
+        self.pot_balance = None;
+        self.pot_warned = None;
+        self.pot_read = None;
+        self.pot_read_at = None;
+        // A manually selected different network must not carry CLI sources
+        // that were supplied for the old network into the new profile.
+        self.overrides.fulcrum = None;
+        self.overrides.node_rpc = None;
+        self.overrides.network = None;
+        self.status_line = match self.apply_connections() {
+            Err(error) => error,
+            Ok(()) => format!(
+                "{} selected. Check the payout address before starting; existing pot funds stay on their original network.",
+                network_label(next)
+            ),
+        };
+        self.refresh_electric_pot();
+    }
+
     fn begin_edit(&mut self, field: TextField, value: String) {
         self.editing = Some(field);
         self.text_input = value;
@@ -2556,16 +2610,8 @@ impl SetupFlow {
                 match key.code {
                     KeyCode::Esc => self.step = SetupStep::Hardware,
                     KeyCode::Up | KeyCode::Down => {
-                        let next = match self.config.network {
-                            MiningNetwork::Mainnet => MiningNetwork::Chipnet,
-                            MiningNetwork::Chipnet => MiningNetwork::Mainnet,
-                        };
-                        self.config.set_network(next);
-                        self.token_selected = 0;
-                        if let Err(error) = self.apply_connections() {
-                            self.status_line = error;
-                            return SetupAction::Continue;
-                        }
+                        self.toggle_network();
+                        return SetupAction::Continue;
                     }
                     KeyCode::Enter => {
                         self.step = SetupStep::Token;
@@ -2806,6 +2852,7 @@ impl SetupFlow {
             KeyCode::Left | KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('-') => {
                 let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
                 match row {
+                    SettingsRow::Network => self.toggle_network(),
                     // Left/Right moves a single choice to the next GPU; with
                     // several ticked, the list keeps them.
                     SettingsRow::Gpu
@@ -2925,6 +2972,7 @@ impl SetupFlow {
                 }
             }
             KeyCode::Enter => match row {
+                SettingsRow::Network => self.toggle_network(),
                 // #### PR #42: the Advanced section.
                 SettingsRow::Advanced => self.toggle_advanced(),
                 SettingsRow::Templates => self.toggle_templates(),
@@ -3713,6 +3761,12 @@ enum PaletteCommand {
     Backend,
     Benchmark,
     Charts(ChartRequest),
+    /// #### PR #65: the hash split's shares, rates and GPUs.
+    Split,
+    /// #### PR #65: ELECTRIC's rate, rewards, fee pot and state.
+    Electric,
+    /// #### PR #65: the fee pot's address and QR code.
+    Pot,
     Help,
     Quit,
 }
@@ -3816,6 +3870,8 @@ impl ChartMetric {
 struct HistorySample {
     rate: f64,
     gpu: crate::telemetry::GpuTelemetry,
+    /// #### PR #65: each token's rate in a hash split, in the split's order.
+    tokens: Vec<f64>,
 }
 
 /// A `/chart` request or chart key.
@@ -3869,13 +3925,21 @@ struct TuiState {
     chart_selection: Vec<ChartMetric>,
     /// Cursor row while the chart options menu is open.
     chart_options: Option<usize>,
+    /// #### PR #65: a hash split's tokens or ELECTRIC's session; `None`
+    /// while PHOTON mines alone.
+    tokens: Option<Tokens>,
 }
 
 impl TuiState {
     /// Creates a TuiState for the terminal interface.
     fn new(_snapshot: &RuntimeSnapshot) -> Self {
+        Self::starting("started; supervising PHOTON state".into())
+    }
+
+    /// A TuiState whose event log opens with `first`.
+    fn starting(first: String) -> Self {
         let mut events = VecDeque::with_capacity(EVENT_HISTORY_CAP);
-        events.push_back("started; supervising PHOTON state".into());
+        events.push_back(first);
         Self {
             command_mode: false,
             command_input: String::new(),
@@ -3895,12 +3959,53 @@ impl TuiState {
             charts: Vec::new(),
             chart_selection: DEFAULT_CHARTS.to_vec(),
             chart_options: None,
+            tokens: None,
         }
     }
 
     /// Records hash rate and GPU telemetry for the charts at most once per
     /// sample interval, whether or not charts are shown.
     fn record_sample(&mut self, snapshot: &RuntimeSnapshot, now: Instant) {
+        // A coordinator charts its whole farm: its own rate and its rigs'.
+        let rate =
+            snapshot.search.current_rate + snapshot.rigs.as_ref().map_or(0.0, |rigs| rigs.rate);
+        self.record(rate, Vec::new(), snapshot.gpu_telemetry.clone(), now);
+    }
+
+    /// #### PR #65: records this frame for the charts: PHOTON's runtime
+    /// alone, or a hash split's tokens each with its rate, or ELECTRIC.
+    /// The GPUs' telemetry comes from PHOTON's runtime when it mines.
+    fn record_frame(&mut self, photon: Option<&RuntimeSnapshot>, now: Instant) {
+        let Some(tokens) = self.tokens.as_ref() else {
+            if let Some(snapshot) = photon {
+                self.record_sample(snapshot, now);
+            }
+            return;
+        };
+        let rates: Vec<f64> = tokens.split.iter().map(|row| row.rate).collect();
+        let rate = if rates.is_empty() {
+            tokens
+                .electric
+                .as_ref()
+                .map_or(0.0, |electric| electric.rate)
+        } else {
+            rates.iter().sum()
+        };
+        let gpu = photon.map_or_else(
+            || tokens.telemetry.clone(),
+            |snapshot| snapshot.gpu_telemetry.clone(),
+        );
+        self.record(rate, rates, gpu, now);
+    }
+
+    /// Adds one chart sample unless the last is younger than the interval.
+    fn record(
+        &mut self,
+        rate: f64,
+        tokens: Vec<f64>,
+        gpu: crate::telemetry::GpuTelemetry,
+        now: Instant,
+    ) {
         if self
             .last_history_sample
             .is_some_and(|sampled| now.duration_since(sampled) < HISTORY_SAMPLE_INTERVAL)
@@ -3910,12 +4015,11 @@ impl TuiState {
         if self.history.len() == HISTORY_CAP {
             self.history.pop_front();
         }
-        // A coordinator charts its whole farm: its own rate and its rigs'.
-        let rate =
-            snapshot.search.current_rate + snapshot.rigs.as_ref().map_or(0.0, |rigs| rigs.rate);
+        let clean = |rate: f64| if rate.is_finite() { rate.max(0.0) } else { 0.0 };
         self.history.push_back(HistorySample {
-            rate: if rate.is_finite() { rate.max(0.0) } else { 0.0 },
-            gpu: snapshot.gpu_telemetry.clone(),
+            rate: clean(rate),
+            gpu,
+            tokens: tokens.into_iter().map(clean).collect(),
         });
         self.last_history_sample = Some(now);
     }
@@ -4833,6 +4937,9 @@ fn apply_palette_command(
             state.push_event(message.into());
         }
         PaletteCommand::Charts(request) => state.apply_chart_request(request),
+        PaletteCommand::Split | PaletteCommand::Electric | PaletteCommand::Pot => {
+            state.status_line = "Use setup to start ELECTRIC or a hash split.".into();
+        }
         PaletteCommand::Help => state.show_help = true,
         PaletteCommand::Quit => return Ok(true),
     }
@@ -4939,6 +5046,18 @@ fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
         "backend" => Ok(PaletteCommand::Backend),
         "benchmark" | "bench" => Ok(PaletteCommand::Benchmark),
         "chart" | "charts" | "graph" | "graphs" => parse_chart_request(argument),
+        // #### PR #65
+        "split" if argument.is_empty() => Ok(PaletteCommand::Split),
+        "split" => Err(
+            "usage: split. The shares change in [S] settings: Enter opens one, ←/→ moves it 5%."
+                .into(),
+        ),
+        "electric" => match argument.to_ascii_lowercase().as_str() {
+            "" | "status" => Ok(PaletteCommand::Electric),
+            "pot" | "qr" | "fund" => Ok(PaletteCommand::Pot),
+            _ => Err("usage: electric | electric pot".into()),
+        },
+        "pot" | "fee" | "feepot" | "qr" => Ok(PaletteCommand::Pot),
         "help" | "?" => Ok(PaletteCommand::Help),
         "quit" | "exit" => Ok(PaletteCommand::Quit),
         _ => Err(format!("unknown command {command}. Try help.")),
@@ -5397,6 +5516,11 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             continue;
         }
         let (name, value, hint) = match row {
+            SettingsRow::Network => (
+                "Network",
+                Span::raw(network_label(state.config.network)),
+                "[Enter] or < > change",
+            ),
             SettingsRow::Token => (
                 "Token",
                 Span::raw(if state.split {
@@ -7115,14 +7239,53 @@ fn render_metric_chart(
     } else {
         vec![Span::raw(metric.format(0.0)), Span::raw(metric.format(top))]
     };
-    let chart = Chart::new(vec![Dataset::default()
+    // #### PR #65: each token retains its own trace alongside the total.
+    // PHOTON and ELECTRIC rates are different proof workloads, not an A/B comparison.
+    let token_points: Vec<_> = if metric == ChartMetric::Hashrate {
+        state.tokens.as_ref().map_or_else(Vec::new, |tokens| {
+            tokens
+                .split
+                .iter()
+                .enumerate()
+                .map(|(token, row)| {
+                    let points = state
+                        .history
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, sample)| {
+                            sample
+                                .tokens
+                                .get(token)
+                                .map(|value| ((index as f64 - newest) * step, *value))
+                        })
+                        .collect::<Vec<_>>();
+                    (row.name.as_str(), points)
+                })
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    let mut datasets = vec![Dataset::default()
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Cyan))
-        .data(&points)])
-    .block(block)
-    .x_axis(x_axis)
-    .y_axis(
+        .data(&points)];
+    for (index, (name, points)) in token_points.iter().enumerate() {
+        datasets.push(
+            Dataset::default()
+                .name(*name)
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(if index % 2 == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Magenta
+                }))
+                .data(points),
+        );
+    }
+    let chart = Chart::new(datasets).block(block).x_axis(x_axis).y_axis(
         Axis::default()
             .style(Style::default().fg(Color::DarkGray))
             .bounds([0.0, top])
@@ -7187,6 +7350,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(state.command_input.as_str()),
         ])]
+    } else if state.tokens.is_some() {
+        vec![
+            Line::from("[P] pause  [+/-] intensity  [S] shares  [A] advanced  [F] pot/QR"),
+            Line::from("[/] command  [G] charts  [O] chart options  [L] logs  [?] help  [Q] quit"),
+            Line::from(state.status_line.as_str()),
+        ]
     } else {
         vec![
             Line::from(
@@ -7259,7 +7428,16 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
 /// #### PR #32
 /// Advanced settings: the token donation, a share of the mining work.
 fn render_advanced(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
-    let popup = centered_rect(82, 50, area);
+    render_advanced_with_scope(frame, area, snapshot, None);
+}
+
+fn render_advanced_with_scope(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &RuntimeSnapshot,
+    session_note: Option<&str>,
+) {
+    let popup = centered_rect(82, if session_note.is_some() { 70 } else { 50 }, area);
     frame.render_widget(Clear, popup);
     let dim = |text: String| Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
     let lines = vec![
@@ -7269,7 +7447,7 @@ fn render_advanced(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
         )),
         Line::from(""),
         Line::from(vec![
-            Span::raw(format!("Donation   {}   ", snapshot.token_donation)),
+            Span::raw(format!("{}   {}   ", if session_note.is_some() { "PHOTON donation" } else { "Donation" }, snapshot.token_donation)),
             Span::styled("[←/→] change", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(""),
@@ -7277,7 +7455,7 @@ fn render_advanced(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
             "A share of the mining work itself mines for the Pickaxe donation address. This token's minimum is {}; raise it in 0.5% steps.",
             snapshot.donation_minimum
         )),
-        dim("It applies to every GPU and rig at once and is saved to your profile when you stop.".into()),
+        dim(session_note.unwrap_or("It applies to every GPU and rig at once and is saved to your profile when you stop.").into()),
     ];
     // #### PR #42: a coordinator's start values, read-only.
     let mut lines = lines;
@@ -7587,7 +7765,7 @@ mod tests {
     }
 
     /// Returns synthetic runtime status for dashboard rendering tests.
-    fn test_snapshot() -> RuntimeSnapshot {
+    pub(super) fn test_snapshot() -> RuntimeSnapshot {
         RuntimeSnapshot {
             state: SupervisorState::Mining,
             gpu_backend: "cuda".into(),
@@ -7672,6 +7850,33 @@ mod tests {
         // #### PR #53: Start's pot check reads no network in tests.
         setup.pot_reader = |_, _| Ok((10_000, 5));
         setup
+    }
+
+    #[test]
+    fn preview_token_selection_and_split_setup() {
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.step = SetupStep::Token;
+        for name in ["06-token-selection", "07-split-setup"] {
+            if name == "07-split-setup" {
+                setup.split = true;
+                setup.advanced_open = true;
+                setup.open_settings(SettingsRow::Share(0));
+                setup.status_line =
+                    "UI preview only. Enter your own matching-network payout in a real session."
+                        .into();
+            }
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 48)).unwrap();
+            terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("PHOTON") && text.contains("ELECTRIC"));
+            miners::tests::export_preview(name, terminal.backend().buffer());
+        }
     }
 
     #[test]
@@ -8136,13 +8341,14 @@ mod tests {
             Some(crate::config::SavedDeclaration::Full)
         );
         assert_eq!(setup.current_row(), SettingsRow::JobDeclaration);
-        // #### PR #61: its node row is the last main row.
+        // The node remains a main row, before the common network selector.
         let rows = setup.settings_rows();
         let advanced = rows
             .iter()
             .position(|row| *row == SettingsRow::Advanced)
             .unwrap();
-        assert_eq!(rows[advanced - 1], SettingsRow::Node);
+        assert_eq!(rows[advanced - 2], SettingsRow::Node);
+        assert_eq!(rows[advanced - 1], SettingsRow::Network);
         assert!(setup_text(&setup).contains("full template: your node's templates"));
         setup.handle_key(key(KeyCode::Right));
         assert_eq!(
@@ -8501,6 +8707,7 @@ mod tests {
                 SettingsRow::Gpu,
                 SettingsRow::Address,
                 SettingsRow::Intensity,
+                SettingsRow::Network,
                 SettingsRow::Advanced,
                 SettingsRow::ProfileName,
                 SettingsRow::Start
@@ -8622,6 +8829,7 @@ mod tests {
                 SettingsRow::Address,
                 SettingsRow::Share(0),
                 SettingsRow::Share(1),
+                SettingsRow::Network,
                 SettingsRow::Advanced,
                 SettingsRow::ProfileName,
                 SettingsRow::Start
@@ -10307,8 +10515,10 @@ mod tests {
     fn setup_network_change_requires_a_matching_payout_before_start() {
         let (mut setup, saved) = setup_with_saved_profile();
         setup.handle_key(key(KeyCode::Enter));
-        setup.step = SetupStep::Network;
-        setup.handle_key(key(KeyCode::Down));
+        setup.open_settings(SettingsRow::Network);
+        setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(setup.step, SetupStep::Settings);
+        assert_eq!(setup.active_profile, Some(0));
         assert_eq!(setup.config.network, MiningNetwork::Chipnet);
         assert_eq!(setup.config.payout_address, saved.payout_address);
         setup.open_settings(SettingsRow::Start);
@@ -10319,6 +10529,85 @@ mod tests {
                 .unwrap();
         setup.config.set_payout(chipnet).unwrap();
         assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+    }
+
+    #[test]
+    fn profile_network_change_reloads_sources_and_invalidates_old_pot_reads() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-network-pot-{:016x}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.profile_path = Some(dir.join("profiles.json"));
+        setup.electric = true;
+        setup.config.payout_address = chipnet_payout(5);
+        setup.open_settings(SettingsRow::Network);
+        setup.refresh_electric_pot();
+        let old_pot = setup
+            .electric_pot
+            .as_ref()
+            .unwrap()
+            .1
+            .as_ref()
+            .unwrap()
+            .clone();
+        let old_key = std::fs::read(&old_pot.key).unwrap();
+        let old_binding = setup.electric_pot.as_ref().unwrap().0.clone();
+        setup.pot_balance = Some(Ok((10_000, 5)));
+        setup.pot_warned = Some(old_binding.clone());
+        let (send, receive) = mpsc::channel();
+        setup.pot_read = Some((old_binding, receive));
+        setup
+            .sources
+            .put(
+                MiningNetwork::Mainnet,
+                ConnectionKind::Fulcrum,
+                None,
+                "wss://main.example.test:50004",
+            )
+            .unwrap();
+        setup.overrides.fulcrum = Some("wss://old-chipnet.example.test:50004".into());
+        let payout = setup.config.payout_address.clone();
+
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(setup.config.network, MiningNetwork::Mainnet);
+        assert_eq!(setup.config.payout_address, payout);
+        assert_eq!(
+            setup.config.fulcrum_url.as_deref(),
+            Some("wss://main.example.test:50004")
+        );
+        assert!(setup.pot_balance.is_none() && setup.pot_warned.is_none());
+        assert!(setup.pot_read.is_none());
+        assert!(send.send(Ok((999_999, 999))).is_err());
+        assert!(setup.electric_pot.as_ref().unwrap().1.is_err());
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+
+        setup.config.payout_address =
+            crate::config::reprefix_p2pkh_payout(&payout, MiningNetwork::Mainnet).unwrap();
+        setup.refresh_electric_pot();
+        let new_pot = setup.electric_pot.as_ref().unwrap().1.as_ref().unwrap();
+        assert_ne!(new_pot.address, old_pot.address);
+        assert_ne!(new_pot.key, old_pot.key);
+        assert_eq!(std::fs::read(&old_pot.key).unwrap(), old_key);
+        // Both keys belong to this test's newly created directory only.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn electric_and_split_setup_name_the_donation_they_actually_use() {
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.electric = true;
+        setup.config.token_donation = Some(crate::donation::TokenDonation::from_bps(550));
+        setup.open_settings(SettingsRow::TokenDonation);
+        assert!(setup_text(&setup).contains("5.50% of ELECTRIC mining work"));
+        setup.split = true;
+        setup.electric = false;
+        setup.open_settings(SettingsRow::TokenDonation);
+        assert!(setup_text(&setup).contains("PHOTON + ELECTRIC"));
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.config.token_donation.unwrap().bps(), 500);
     }
 
     #[test]

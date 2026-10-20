@@ -238,7 +238,7 @@ struct Session {
     create_key: bool,
 }
 
-/// Mines the deployment on `devices` with the ELECTRIC screen (or plain
+/// Mines the deployment on `devices` on the mining dashboard (or plain
 /// lines), following the baton and claiming from the pot.
 fn session(
     cfg: &RuntimeConfig,
@@ -261,7 +261,7 @@ fn session(
         options.create_key,
         &monitor,
     )?;
-    super::ui::run(&monitor, || {
+    super::ui::run(&monitor, devices, cfg.network, || {
         mine(
             cfg,
             &ready.deployment,
@@ -277,7 +277,7 @@ fn session(
     })
 }
 
-/// The GPUs as the ELECTRIC screen names them.
+/// The GPUs as the dashboard names them for ELECTRIC.
 pub fn device_names(devices: &[crate::backend::GpuDevice]) -> String {
     devices
         .iter()
@@ -367,7 +367,7 @@ pub fn pot_balance(cfg: &RuntimeConfig, config_path: &Path) -> Result<(u64, u64)
 }
 
 /// The setup's ELECTRIC choice: mine the network's deployment on the chosen
-/// GPUs with the ELECTRIC screen, making the pot's recovery key if needed.
+/// GPUs on the mining dashboard, making the pot's recovery key if needed.
 pub fn run_from_setup(
     cfg: &RuntimeConfig,
     gpus: &[crate::backend::GpuDevice],
@@ -680,6 +680,7 @@ fn mine(
     }
     let policy = deployment.donation_policy(cfg.token_donation);
     let schedule = Mutex::new(Schedule::new(policy.scheme, SCHEDULE_UNIT, rand::random())?);
+    monitor.set_donation_display(policy.scheme);
     let next_nonce = AtomicU64::new(rand::random());
     let mut session: Option<ElectrumSession> = None;
     let mut spent: Option<(String, u32)> = None;
@@ -819,12 +820,20 @@ fn mine(
             monitor.wait(IDLE_POLL);
             continue;
         }
-        if claim_locktime(state, now.tip, deployment).is_none() || state.difficulty > max_difficulty
-        {
+        if claim_locktime(state, now.tip, deployment).is_none() {
             monitor.state(format!(
-                "Waiting for block {} · difficulty {}",
+                "Waiting for block {} · fee-pot replay protection",
                 state.last_height + 1,
-                state.difficulty
+            ));
+            monitor.wait(IDLE_POLL);
+            continue;
+        }
+        if state.difficulty > max_difficulty {
+            monitor.state(format!(
+                "Waiting for block {} · difficulty {} exceeds configured limit {}",
+                state.last_height + 1,
+                state.difficulty,
+                max_difficulty
             ));
             monitor.wait(IDLE_POLL);
             continue;
