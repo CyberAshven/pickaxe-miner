@@ -155,21 +155,21 @@ Keep the tab open while mining. Names: `wgpu` is the Rust GPU library inside Pic
 
 ## Install
 
-Download the archive for your operating system from the [v0.0.3 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.3). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
+Download the archive for your operating system from the [v0.0.4 release](https://github.com/CyberAshven/pickaxe-miner/releases/tag/pickaxe-miner-v0.0.4). The release includes `SHA256SUMS.txt` to verify your download. Extract the archive and start mining:
 
 Linux:
 
 ```bash
-tar -xzf pickaxe-miner-v0.0.3-linux-x86_64.tar.gz
-cd pickaxe-miner-v0.0.3-linux-x86_64
+tar -xzf pickaxe-miner-v0.0.4-linux-x86_64.tar.gz
+cd pickaxe-miner-v0.0.4-linux-x86_64
 ./pickaxe mine
 ```
 
 Windows PowerShell:
 
 ```powershell
-Expand-Archive pickaxe-miner-v0.0.3-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.3-windows-x86_64
-cd pickaxe-miner-v0.0.3-windows-x86_64
+Expand-Archive pickaxe-miner-v0.0.4-windows-x86_64.zip -DestinationPath pickaxe-miner-v0.0.4-windows-x86_64
+cd pickaxe-miner-v0.0.4-windows-x86_64
 .\pickaxe.exe mine
 ```
 
@@ -191,7 +191,7 @@ Without `--no-tui`, the miner opens a short setup:
 2. **What to do**: GPU mining, ASIC mining, or run a pool for other miners.
 3. **Network**: Mainnet or Chipnet.
 4. **Token**: the GPU tokens for that network (with ELECTRIC and a Hash split between them, [docs/hash-split.md](docs/hash-split.md)), or for ASIC, "BCH + merge-mined CashTokens" or "ASIC-exclusive CashTokens (SAFA, ...)". Choosing BCH starts the BCH ASIC server, which builds blocks from your own BCH node (see [docs/stratum-v2.md](docs/stratum-v2.md)); the BCH node list finds Bitcoin Cash Node on the same computer, which needs no password. ASIC-exclusive tokens come later.
-5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. GPU mining adds a Mining row: alone, or join a GPU pool or farm with its coordinator's address and key (its Connection info shows them), as a rig; a farm's rigs can run HiveOS, mmpOS, RaveOS, SimpleMining OS and the like. ASIC mining adds a Mining row: solo on your node, or join a pool: a normal SV2 pool's address and key, or P2Pool, either a P2Pool node to join or your own P2Pool node that Pickaxe runs with your BCH node ([docs/p2pool.md](docs/p2pool.md)). With ELECTRIC chosen, alone or in a hash split, the settings show its fee pot with a QR code to fund it and its balance as it comes in. Running a pool asks what miners will mine: an ASIC pool asks for the pool type, your node, the pool fee, where it comes from (coinbase, mining work or both) and its address, then starts a public pool; a GPU pool asks for the pool type, the token's servers, the fee (a share of each rig's mining time) and its address, then coordinates the pool's rigs ([docs/pool.md](docs/pool.md)). The Pool row of Join a pool takes the pool's address or its one-line `stratum2+tcp://HOST:PORT/KEY`, which fills the key.
+5. **Settings + Start**: GPU, payout address, intensity, Fulcrum servers, BCH node and profile name on one page. GPU mining adds a Token row to change the token and a Mining row: solo, or join a GPU pool or farm with its coordinator's address and key (its Connection info shows them), as a rig; a farm's rigs can run HiveOS, mmpOS, RaveOS, SimpleMining OS and the like. ASIC mining adds a Mining row: solo on your node, or join a pool: a normal SV2 pool's address and key, or P2Pool, either a P2Pool node to join or your own P2Pool node that Pickaxe runs with your BCH node ([docs/p2pool.md](docs/p2pool.md)). With ELECTRIC chosen, alone or in a hash split, the settings show its fee pot with a QR code to fund it and its balance as it comes in. Running a pool asks what miners will mine: an ASIC pool asks for the pool type, your node, the pool fee, where it comes from (coinbase, mining work or both) and its address, then starts a public pool; a GPU pool asks for the pool type, the token's servers, the fee (a share of each rig's mining time) and its address, then coordinates the pool's rigs ([docs/pool.md](docs/pool.md)). The Pool row of Join a pool takes the pool's address or its one-line `stratum2+tcp://HOST:PORT/KEY`, which fills the key.
 
 Fulcrum servers and nodes you add are saved once per network in `config.sources.json`, next to `config.profiles.json`, and shared by every profile on that network. Servers you add that are not built in are tried first; built-in servers, including ones you also saved, are ranked by health. Servers and nodes saved inside older profiles move there automatically. Press `S` while mining to change the address or intensity, or to use another server for the session; `A` opens Advanced settings.
 
@@ -273,7 +273,7 @@ The legacy CUDA C++ backend remains available with
 `cargo build --release --locked --no-default-features --features tail-grind`.
 Use a separate output directory when comparing the two builds.
 
-The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.3`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
+The binary is `target/release/pickaxe_miner` (`pickaxe_miner.exe` on Windows). `--version` prints `pickaxe 0.0.4`. Keep the supplied `cuda/build` directory beside the executable. The release archives include the required GPU files.
 
 The release CUDA files target NVIDIA `sm_120`. AMD HIP retains its existing backend. Other NVIDIA architectures require compatible CUDA files and separate validation.
 

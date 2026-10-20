@@ -25,6 +25,8 @@ on:
       - dev
     paths:
       - ".github/workflows/release.yml"
+      - ".github/workflows/scanner-docker.yml"
+      - ".oss-scanner/**"
       - ".github/workflows/portable.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -122,7 +124,13 @@ jobs:
                 mode="skip"
                 echo "::notice::${tag} already exists; bump Cargo.toml version to publish a new release."
               else
-                mode="create"
+                status=$?
+                if [[ "${status}" -eq 2 ]]; then
+                  mode="create"
+                else
+                  echo "Cannot verify whether ${tag} exists; refusing to release." >&2
+                  exit "${status}"
+                fi
               fi
               ;;
             pull_request:*)
@@ -206,6 +214,16 @@ jobs:
             fi
             git merge-base --is-ancestor "refs/tags/${TAG}" "${SHA}"
           fi
+
+  # Verify the audit image from the same immutable revision used for all release
+  # assets. Release publishing depends on this job; no GPU is required.
+  scanner-docker:
+    name: Verify scanner Docker image
+    needs: validate
+    if: needs.validate.outputs.mode != 'skip'
+    uses: ./.github/workflows/scanner-docker.yml
+    with:
+      source-ref: ${{ needs.validate.outputs.sha }}
 
   hip-gfx1036:
     name: Build HIP gfx1036 code objects
@@ -950,6 +968,7 @@ jobs:
     needs:
       - validate
       - checksums
+      - scanner-docker
     if: needs.validate.outputs.mode == 'publish' || needs.validate.outputs.mode == 'create'
     runs-on: ubuntu-latest
     timeout-minutes: 15
