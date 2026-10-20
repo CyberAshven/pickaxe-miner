@@ -119,6 +119,8 @@ widgets as PHOTON. The runtime lists each token's share, rate, accepted
 rewards and state, the GPU assignment and telemetry, ELECTRIC's active and
 wall-average rates, and the pot balance. Each token keeps a separate chart
 trace; their different proof workloads are not speed comparisons.
+All charts start hidden. Press `G` to show the selected charts or hide them
+again; `O` opens the chart picker.
 
 | Key | While mining |
 | --- | --- |

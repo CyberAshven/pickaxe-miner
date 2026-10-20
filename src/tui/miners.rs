@@ -36,6 +36,17 @@ pub(super) struct Tokens {
     photon: Option<RuntimeSnapshot>,
 }
 
+/// The event source may already name its token; label it only once.
+fn label_event(token: &str, message: &str) -> String {
+    if message.strip_prefix(token).is_some_and(|tail| {
+        tail.is_empty() || tail.starts_with(char::is_whitespace) || tail.starts_with(':')
+    }) {
+        message.to_owned()
+    } else {
+        format!("{token} {message}")
+    }
+}
+
 pub fn run_electric(
     monitor: &Monitor,
     gpus: &[GpuDevice],
@@ -128,12 +139,12 @@ pub fn run_miners(
                 ) {
                     rewards[i] += 1;
                 }
-                state.push_event(format!("{} {}", token.name(), event_log_text(&event)));
+                state.push_event(label_event(token.name(), &event_log_text(&event)));
             }
         }
         if let Some(electric) = miners.electric {
             for event in electric.drain_events() {
-                state.push_event(format!("ELECTRIC {event}"));
+                state.push_event(label_event("ELECTRIC", &event));
             }
         }
         let electric = miners.electric.map(Monitor::summary);
@@ -512,7 +523,7 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(" Runtime ")),
+            .block(Block::bordered().title(" Mining session ")),
         runtime_areas[0],
     );
     if let Some(snapshot) = &tokens.photon {
@@ -736,7 +747,8 @@ pub(super) mod tests {
                 },
             });
         }
-        state.apply_chart_request(ChartRequest::On);
+        state.push_event(label_event("ELECTRIC", "ELECTRIC sample connection"));
+        state.push_event(label_event("ELECTRIC", "Sample reward event"));
         state
     }
 
@@ -759,6 +771,11 @@ pub(super) mod tests {
         let mut state = fixture();
         state.tokens.as_mut().unwrap().split.remove(0);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(state.charts.is_empty(), "all charts start hidden");
+        token_key(key(KeyCode::Char('G')), &miners, &mut state).unwrap();
+        assert_eq!(state.charts, DEFAULT_CHARTS);
+        token_key(key(KeyCode::Char('g')), &miners, &mut state).unwrap();
+        assert!(state.charts.is_empty(), "G hides them again");
         assert!(!token_key(key(KeyCode::Char('s')), &miners, &mut state).unwrap());
         token_key(key(KeyCode::Right), &miners, &mut state).unwrap();
         assert_eq!(slots[0].share.load(Ordering::Relaxed), 30);
@@ -785,11 +802,16 @@ pub(super) mod tests {
     fn shared_dashboard_carries_charts_options_advanced_and_complete_qr() {
         let mut state = fixture();
         for (name, expected) in [
-            ("02-split-dashboard", "Hashrate"),
+            ("02-split-dashboard", "Mining session"),
+            ("08-charts-after-g", "Hashrate"),
             ("03-chart-options", "Chart options"),
             ("04-advanced", "Advanced settings"),
             ("05-pot-funding", "PREVIEW ONLY - DO NOT PAY"),
         ] {
+            state.apply_chart_request(ChartRequest::Off);
+            if name == "08-charts-after-g" {
+                state.apply_chart_request(ChartRequest::Toggle);
+            }
             // Exercise the existing PHOTON advanced controls in a split, not
             // just the ELECTRIC-only explanation.
             state.tokens.as_mut().unwrap().photon =
@@ -811,7 +833,14 @@ pub(super) mod tests {
                     text.contains(expected),
                     "{name} at {width}x{height}: {text}"
                 );
+                if name == "02-split-dashboard" && width == 140 {
+                    assert!(!text.contains("Hashrate"));
+                    assert!(text.contains("ELECTRIC sample connection"));
+                    assert!(text.contains("ELECTRIC Sample reward event"));
+                    assert!(!text.contains("ELECTRIC ELECTRIC"));
+                }
                 if name == "04-advanced" && width == 140 {
+                    assert_eq!(text.matches("Advanced settings").count(), 1);
                     assert!(text.contains("for this session"));
                     assert!(text.contains("ELECTRIC donation 4.00%"));
                     assert!(!text.contains("saved to your profile when you stop"));

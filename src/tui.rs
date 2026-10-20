@@ -7441,11 +7441,6 @@ fn render_advanced_with_scope(
     frame.render_widget(Clear, popup);
     let dim = |text: String| Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
     let lines = vec![
-        Line::from(Span::styled(
-            "Advanced settings",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
         Line::from(vec![
             Span::raw(format!("{}   {}   ", if session_note.is_some() { "PHOTON donation" } else { "Donation" }, snapshot.token_donation)),
             Span::styled("[←/→] change", Style::default().fg(Color::DarkGray)),
