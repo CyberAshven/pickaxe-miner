@@ -4576,6 +4576,9 @@ struct ThroughputTracker {
     current_rate: f64,
     peak_rate: f64,
     was_mining: bool,
+    /// When a pause began whose history is still kept. A claim pauses the GPU
+    /// for a moment while the next baton loads; that should not read 0.
+    paused_since: Option<Instant>,
 }
 
 impl ThroughputTracker {
@@ -4591,6 +4594,7 @@ impl ThroughputTracker {
             current_rate: 0.0,
             peak_rate: 0.0,
             was_mining: mining,
+            paused_since: None,
         }
     }
 
@@ -4598,18 +4602,34 @@ impl ThroughputTracker {
     fn observe(&mut self, stats: &mut SearchStats, now: Instant) {
         let mining = stats.state == MiningState::Mining;
         if !mining {
-            self.samples.clear();
-            self.samples.push_back((now, stats.candidates));
-            self.last_sample = now;
-            self.last_progress_at = now;
-            self.last_progress_candidates = stats.candidates;
-            self.current_rate = 0.0;
-            self.was_mining = false;
-            stats.current_rate = 0.0;
+            if self.was_mining {
+                self.paused_since = Some(now);
+                self.was_mining = false;
+            }
+            // Hold the last rate through a short pause such as a claim, and
+            // read 0 once the pause lasts the whole current window.
+            let short = self.paused_since.is_some_and(|since| {
+                now.saturating_duration_since(since) < THROUGHPUT_CURRENT_WINDOW
+            });
+            if !short {
+                self.samples.clear();
+                self.samples.push_back((now, stats.candidates));
+                self.last_sample = now;
+                self.last_progress_at = now;
+                self.last_progress_candidates = stats.candidates;
+                self.current_rate = 0.0;
+                self.paused_since = None;
+            }
+            stats.current_rate = self.current_rate;
             stats.peak_rate = self.peak_rate;
             return;
         }
 
+        if !self.was_mining && self.paused_since.take().is_some() {
+            // Back from a short pause: keep the history, so the rate dips by
+            // the time the GPU lost instead of starting again from 0.
+            self.was_mining = true;
+        }
         if !self.was_mining {
             self.samples.clear();
             self.samples.push_back((now, stats.candidates));
@@ -4823,8 +4843,8 @@ mod tests {
     }
 
     #[test]
-    /// Checks that shared throughput tracks current average peak and resets after pause.
-    fn shared_throughput_tracks_current_average_peak_and_resets_after_pause() {
+    /// Checks that shared throughput tracks current average peak and resets after a long pause.
+    fn shared_throughput_tracks_current_average_peak_and_resets_after_a_long_pause() {
         let start = Instant::now();
         let mut tracker = ThroughputTracker::new(start, 0, true);
 
@@ -4841,17 +4861,51 @@ mod tests {
 
         let mut paused = throughput_stats(3_000, MiningState::Paused, 1_200.0);
         tracker.observe(&mut paused, start + Duration::from_millis(2_100));
+        assert!((paused.current_rate - 1_500.0).abs() < 0.01);
+
+        tracker.observe(&mut paused, start + Duration::from_millis(4_100));
         assert_eq!(paused.current_rate, 0.0);
         assert!((paused.peak_rate - 1_500.0).abs() < 0.01);
 
         let mut resumed = throughput_stats(3_000, MiningState::Mining, 1_100.0);
-        tracker.observe(&mut resumed, start + Duration::from_secs(3));
+        tracker.observe(&mut resumed, start + Duration::from_secs(5));
         assert_eq!(resumed.current_rate, 0.0);
 
         resumed.candidates = 4_000;
-        tracker.observe(&mut resumed, start + Duration::from_secs(4));
+        tracker.observe(&mut resumed, start + Duration::from_secs(6));
         assert!((resumed.current_rate - 1_000.0).abs() < 0.01);
         assert!((resumed.peak_rate - 1_500.0).abs() < 0.01);
+    }
+
+    #[test]
+    /// Checks that the short pause while a win is claimed keeps the rate instead of reading 0.
+    fn shared_throughput_holds_through_the_short_pause_of_a_claim() {
+        let start = Instant::now();
+        let mut tracker = ThroughputTracker::new(start, 0, true);
+        let mut stats = throughput_stats(0, MiningState::Mining, 0.0);
+        for tick in 1..=8_u64 {
+            stats.candidates = tick * 250;
+            tracker.observe(
+                &mut stats,
+                start + Duration::from_millis(tick.saturating_mul(250)),
+            );
+        }
+        assert!((stats.current_rate - 1_000.0).abs() < 0.01);
+
+        stats.state = MiningState::Paused;
+        tracker.observe(&mut stats, start + Duration::from_millis(2_100));
+        assert!((stats.current_rate - 1_000.0).abs() < 0.01);
+
+        stats.state = MiningState::Mining;
+        tracker.observe(&mut stats, start + Duration::from_millis(2_150));
+        assert!((stats.current_rate - 1_000.0).abs() < 0.01);
+
+        // The window now spans the 150 ms the GPU lost, so the rate dips a
+        // little rather than starting again from 0.
+        stats.candidates = 2_100;
+        tracker.observe(&mut stats, start + Duration::from_millis(2_250));
+        assert!(stats.current_rate > 900.0 && stats.current_rate < 1_000.0);
+        assert!((stats.peak_rate - 1_000.0).abs() < 0.01);
     }
 
     #[test]
