@@ -547,12 +547,16 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
     let tokens = state.tokens.as_ref().expect("session view");
     let area = frame.area();
     let available = area.height.saturating_sub(11);
+    // Charts must not consume a participating token's hashrate row. Reserve
+    // every token row and the selected token's three compact statistics.
+    let minimum_session = tokens.split.len() as u16 + 2;
+    let minimum_body = minimum_session.saturating_add(5);
     let charts = if state.charts.is_empty() {
         0
     } else {
         charts_min_height(state)
             .max(available / 2)
-            .min(available.saturating_sub(8))
+            .min(available.saturating_sub(minimum_body))
     };
     let parts = Layout::vertical([
         Constraint::Length(3),
@@ -624,7 +628,11 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
         }));
     }
     let runtime_areas = Layout::vertical([
-        Constraint::Length((lines.len() as u16 + 2).min(body[0].height.saturating_sub(5))),
+        Constraint::Length(
+            (lines.len() as u16 + 2)
+                .min(body[0].height.saturating_sub(5))
+                .max(minimum_session.min(body[0].height)),
+        ),
         Constraint::Min(0),
     ])
     .split(body[0]);
@@ -637,7 +645,7 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
     if let Some(row) = tokens.split.get(tokens.selected) {
         if runtime_areas[1].height >= 4 {
             let details = if let Some(snapshot) = &row.runtime {
-                vec![
+                let mut details = vec![
                     Line::from(format!(
                         "Wins       {} accepted · {} pending",
                         row.rewards, snapshot.pending_winners
@@ -652,7 +660,31 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
                         },
                     ),
                     Line::from(format!("Work       {} hashes", snapshot.search.candidates)),
-                ]
+                ];
+                let extra = runtime_areas[1].height.saturating_sub(5) as usize;
+                let fields = runtime_field_groups(snapshot, runtime_areas[1].width)
+                    .into_iter()
+                    .filter(|field| {
+                        field
+                            .lines
+                            .first()
+                            .and_then(|line| line.spans.first())
+                            .is_some_and(|span| {
+                                matches!(
+                                    span.content.trim(),
+                                    "Target"
+                                        | "Chain"
+                                        | "Baton"
+                                        | "Endpoint"
+                                        | "Network"
+                                        | "Source"
+                                        | "Last error"
+                                )
+                            })
+                    })
+                    .collect();
+                details.extend(fit_runtime_fields(fields, extra));
+                details
             } else if let Some(e) = &tokens.electric {
                 let expected = e.difficulty.map(|d| 256f64.powi(i32::from(d)));
                 vec![
@@ -960,6 +992,30 @@ pub(super) mod tests {
         }
         assert_eq!(text.matches("Hashrate").count(), 2);
         assert!(state.charts.is_empty());
+    }
+
+    #[test]
+    fn charts_never_hide_a_participating_tokens_hashrate() {
+        for (width, height) in [(80, 24), (120, 32), (140, 48)] {
+            let mut state = fixture();
+            state.apply_chart_request(ChartRequest::Toggle);
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render_miners(frame, &state)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            for expected in ["Hashrate PHOTON", "Hashrate ELECTRIC"] {
+                assert!(
+                    text.contains(expected),
+                    "{width}x{height}: missing {expected}"
+                );
+            }
+        }
     }
 
     fn fixture() -> TuiState {
