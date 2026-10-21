@@ -220,13 +220,13 @@ impl MiningToken {
 pub const SHREC_DONATION_ADDRESS: &str = "bitcoincash:zqqpfwsvht3uaf4y5sm53me90edmtx8cmyd0xx3fv3";
 
 /// Preferred network transport for explicit submission/diagnostic operations.
-/// PHOTON mining jobs come from the covenant CashToken baton through Fulcrum
-/// until an equivalent node-native indexed query is implemented.
+/// PHOTON and ELECTRIC can follow their covenant batons through native BCH
+/// RPC or Fulcrum. ELECTRIC's explicit Node mode does not fall back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JobSource {
     /// Native BCH node RPC for validation/broadcast and BCH block tooling.
     Node,
-    /// Fulcrum/Electrum, including the current PHOTON baton index.
+    /// Fulcrum/Electrum; a saved node is tried first for token jobs.
     #[default]
     Fulcrum,
 }

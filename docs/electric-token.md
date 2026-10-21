@@ -26,6 +26,40 @@ the payout wallet's key in Pickaxe. A separate pot-only key protects claims
 and refunds. Document its replay weakness, never use it, and keep the
 deployment as data so a fixed contract is one new `Contract` variant.
 
+## Node or Fulcrum source
+
+#### PR #65
+
+ELECTRIC and hash-split setup show **BCH node** and **Fulcrum** connection
+controls. Their saved endpoints remain specific to Mainnet or Chipnet. A saved
+BCHN RPC endpoint is tried first; without a working node the ordinary mode
+uses Fulcrum and reports the reason. For node-only operation:
+
+```text
+pickaxe --network chipnet --node-rpc http://127.0.0.1:48332 --source node electric status
+pickaxe --network mainnet --node-rpc http://127.0.0.1:8332 --source node electric mine
+```
+
+`status` is read-only. `mine` uses the configured payout and funded pot; native
+RPC does not remove the reward's BCH output or network fees. Use the existing
+RPC cookie or `PICKAXE_NODE_RPC_USER` and `PICKAXE_NODE_RPC_PASSWORD` for login;
+keep credentials out of command history. Explicit `--source node` stops on a
+node error instead of silently using Fulcrum.
+
+The node source scans the confirmed UTXOs of the exact baton and pot scripts
+once, follows subsequent blocks and overlays unconfirmed transactions. Mempool
+eviction/replacement restores the confirmed base; a reorg or a gap over 24
+blocks rebuilds it. No wallet import, payout key or `txindex` is needed. A
+pruned node must retain the newly followed blocks. Discovery is bounded to
+4,096 mempool transactions and three attempts at a stable snapshot; an error
+leaves pending signed claims intact. Large/busy nodes can use Fulcrum instead.
+The same claim builder, donation schedule, signatures, journals and Max/send
+authorization are used for both sources.
+
+RPC references: [UTXO scan](https://docs.bitcoincashnode.org/doc/json-rpc/scantxoutset/),
+[mempool](https://docs.bitcoincashnode.org/doc/json-rpc/getrawmempool/),
+[decoded blocks](https://docs.bitcoincashnode.org/doc/json-rpc/getblock/).
+
 ## Replay
 
 The proof is `hash256(lastHeight || recipientPkh || nonce)`. It does not

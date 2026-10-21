@@ -24,7 +24,8 @@ runs one token's kernels at a time.
 - One process, one GPU lock and one Ctrl+C handler for every token. Each
   PHOTON-runtime token runs its own supervisor (its own Fulcrum or node
   connection, claim journal and donation schedule) at the session's intensity;
-  ELECTRIC runs its own session with its fee pot and pending-claim journal.
+  ELECTRIC runs its own BCHN RPC or Fulcrum session with its fee pot and
+  pending-claim journal. Both connection lists are available in split setup.
 - A scheduler hands the GPUs to one token at a time in 2-second rounds: a
   5% share is 100 ms of a round. The others are held at their next batch
   boundary (a few milliseconds: a PHOTON batch is about 10 ms on this GPU,

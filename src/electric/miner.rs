@@ -1,21 +1,21 @@
 //! #### PR #51
 //! What: `pickaxe electric`: the fee pot's address, the baton's state, the
-//! GPU miner that follows the baton through Fulcrum and claims from the pot, and
+//! GPU miner that follows the baton through BCHN or Fulcrum and claims from the pot, and
 //! owner-authorized recovery (legacy pots remain explicitly selectable).
 //! Why: ELECTRIC shares GPU hashing and device selection with PHOTON.
 //! Check: the tests in `electric` and `tools/reward-policy-vm/electric.mjs`
-//! cover what is broadcast; this file only reads Fulcrum and sends.
+//! cover what is broadcast; both sources share the same claim and recovery path.
 
 use super::recovery::RecoveryKey;
+use super::source::Session as SourceSession;
 use super::{
-    build_authorized_claim, build_refund, script_hash_hex, Baton, Coin, Deployment, Pot, SearchJob,
+    build_authorized_claim, build_refund, Baton, Coin, Deployment, Pot, SearchJob,
     POT_MIN_CHANGE_SATS, TOKEN_OUTPUT_SATS,
 };
 use crate::cli::{ElectricCommand, ElectricDeploymentArgs};
-use crate::config::{MiningToken, RuntimeConfig};
+use crate::config::RuntimeConfig;
 use crate::donation::{Recipient, Schedule};
-use crate::electrum::ElectrumSession;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -83,7 +83,12 @@ pub fn run(
         ElectricCommand::Status { deployment } => {
             let args = deployment;
             let deployment = select(cfg, args)?;
-            let mut session = connect(cfg)?;
+            let pot = if cfg.payout_address.trim().is_empty() {
+                None
+            } else {
+                Some(pot_for(cfg, &deployment, args, config_path, false)?.0)
+            };
+            let mut session = connect(cfg, Some(&deployment), pot.as_ref())?;
             let tip = read_tip(&mut session)?;
             let baton = read_baton(&mut session, &deployment)?;
             println!("server:     {}", session.url);
@@ -94,8 +99,7 @@ pub fn run(
                 tip,
                 args.restricted_pot || args.legacy_pot,
             );
-            if !cfg.payout_address.trim().is_empty() {
-                let (pot, _, _) = pot_for(cfg, &deployment, args, config_path, false)?;
+            if let Some(pot) = pot {
                 let coins = read_pot(&mut session, &pot)?;
                 println!(
                     "pot:        {} ({} sats in {} coin{})",
@@ -145,7 +149,7 @@ pub fn run(
                 return Err("recover the approved Max/send in the TUI before refunding".into());
             }
             let refund_lock = crate::tx::cashaddr_to_p2pkh_locking(&addresses[0])?;
-            let mut session = connect(cfg)?;
+            let mut session = connect(cfg, Some(&deployment), Some(&pot))?;
             let fee = read_relay_fee(&mut session)?;
             let coins = read_pot(&mut session, &pot)?;
             if coins.is_empty() {
@@ -208,7 +212,7 @@ pub fn run(
             let change_lock = crate::tx::cashaddr_to_p2pkh_locking(
                 &crate::config::validate_payout_address(cfg.network, &change)?,
             )?;
-            let mut session = connect(cfg)?;
+            let mut session = connect(cfg, None, None)?;
             let height = match height {
                 Some(height) => *height,
                 None => read_tip(&mut session)?,
@@ -457,12 +461,12 @@ pub fn run_in_split_with_pot_mode(
 }
 
 /// #### PR #53: what the setup's fee pot holds now, in plain-BCH sats, and
-/// the claims that pays at the current relay fee, read through Fulcrum.
+/// the claims that pays at the current relay fee, read through BCHN or Fulcrum.
 pub fn pot_balance(cfg: &RuntimeConfig, config_path: &Path) -> Result<(u64, u64), String> {
     let args = ElectricDeploymentArgs::default();
     let deployment = select(cfg, &args)?;
     let (pot, _, _) = pot_for(cfg, &deployment, &args, config_path, false)?;
-    let mut session = connect(cfg)?;
+    let mut session = connect(cfg, None, Some(&pot))?;
     let relay_fee = read_relay_fee(&mut session)?;
     let coins = read_pot(&mut session, &pot)?;
     Ok((
@@ -629,33 +633,29 @@ fn print_baton(deployment: &Deployment, baton: &Baton, tip: u32, restricted: boo
     }
 }
 
-fn connect(cfg: &RuntimeConfig) -> Result<ElectrumSession, String> {
-    ElectrumSession::connect_failover_for_deployment(
-        &cfg.electrum_endpoints(),
-        MiningToken::Photon.photon_deployment(cfg.network),
-    )
+fn connect(
+    cfg: &RuntimeConfig,
+    deployment: Option<&Deployment>,
+    pot: Option<&Pot>,
+) -> Result<SourceSession, String> {
+    let scripts: Vec<_> = deployment
+        .map(Deployment::locking_bytecode)
+        .into_iter()
+        .chain(pot.map(Pot::locking_bytecode))
+        .collect();
+    SourceSession::connect(cfg, &scripts)
 }
 
-fn read_tip(session: &mut ElectrumSession) -> Result<u32, String> {
-    let header = session.rpc("blockchain.headers.subscribe", json!([]))?;
-    header["height"]
-        .as_u64()
-        .and_then(|height| u32::try_from(height).ok())
-        .ok_or_else(|| "Fulcrum's tip has no height".into())
+fn read_tip(session: &mut SourceSession) -> Result<u32, String> {
+    session.tip()
 }
 
-fn read_relay_fee(session: &mut ElectrumSession) -> Result<u64, String> {
-    crate::fee::bch_value_to_sats(&session.rpc("blockchain.relayfee", json!([]))?)
+fn read_relay_fee(session: &mut SourceSession) -> Result<u64, String> {
+    session.relay_fee()
 }
 
-fn unspent(session: &mut ElectrumSession, locking: &[u8]) -> Result<Vec<Value>, String> {
-    match session.rpc(
-        "blockchain.scripthash.listunspent",
-        json!([script_hash_hex(locking), "include_tokens"]),
-    )? {
-        Value::Array(items) => Ok(items),
-        _ => Err("Fulcrum's listunspent is not a list".into()),
-    }
+fn unspent(session: &mut SourceSession, locking: &[u8]) -> Result<Vec<Value>, String> {
+    session.unspent(locking)
 }
 
 fn outpoint(item: &Value) -> Result<(String, u32, u64), String> {
@@ -673,7 +673,7 @@ fn outpoint(item: &Value) -> Result<(String, u32, u64), String> {
 }
 
 /// The one unspent mutable NFT of the deployment's category at its covenant.
-fn read_baton(session: &mut ElectrumSession, deployment: &Deployment) -> Result<Baton, String> {
+fn read_baton(session: &mut SourceSession, deployment: &Deployment) -> Result<Baton, String> {
     let category = deployment.category_hex();
     let mut batons = Vec::new();
     for item in unspent(session, &deployment.locking_bytecode())? {
@@ -707,7 +707,7 @@ fn read_baton(session: &mut ElectrumSession, deployment: &Deployment) -> Result<
 }
 
 /// The pot's plain-BCH coins, largest first.
-fn read_pot(session: &mut ElectrumSession, pot: &Pot) -> Result<Vec<Coin>, String> {
+fn read_pot(session: &mut SourceSession, pot: &Pot) -> Result<Vec<Coin>, String> {
     let mut coins = Vec::new();
     for item in unspent(session, &pot.locking_bytecode())? {
         if !item["token_data"].is_null() {
@@ -721,7 +721,7 @@ fn read_pot(session: &mut ElectrumSession, pot: &Pot) -> Result<Vec<Coin>, Strin
 }
 
 struct WithdrawalLink<'a> {
-    session: &'a mut ElectrumSession,
+    session: &'a mut SourceSession,
     pot: &'a Pot,
 }
 impl super::withdrawal::Link for WithdrawalLink<'_> {
@@ -732,11 +732,8 @@ impl super::withdrawal::Link for WithdrawalLink<'_> {
         read_relay_fee(self.session)
     }
     fn published(&mut self, txid: &str, raw: &str) -> Result<bool, String> {
-        match self
-            .session
-            .rpc("blockchain.transaction.get", json!([txid, false]))
-        {
-            Ok(value) if value.as_str().is_some_and(|v| v.eq_ignore_ascii_case(raw)) => Ok(true),
+        match self.session.transaction(txid) {
+            Ok(value) if value.eq_ignore_ascii_case(raw) => Ok(true),
             Ok(_) => Err("server returned different send transaction bytes".into()),
             Err(error)
                 if error
@@ -779,7 +776,7 @@ fn claims_paid(coins: &[Coin], relay_fee_sats_per_kb: u64) -> u64 {
 }
 
 fn snapshot(
-    session: &mut ElectrumSession,
+    session: &mut SourceSession,
     deployment: &Deployment,
     pot: &Pot,
 ) -> Result<Snapshot, String> {
@@ -863,20 +860,23 @@ fn mine(
     let schedule = Mutex::new(Schedule::new(policy.scheme, SCHEDULE_UNIT, rand::random())?);
     monitor.set_donation_display(policy.scheme);
     let next_nonce = AtomicU64::new(rand::random());
-    let mut session: Option<ElectrumSession> = None;
+    let mut session: Option<SourceSession> = None;
     let mut spent: Option<(String, u32)> = None;
     while !monitor.stopped() {
         let link = match session.as_mut() {
             Some(link) => link,
-            None => match connect(cfg) {
+            None => match connect(cfg, Some(deployment), Some(pot)) {
                 Ok(link) => {
+                    if let Some(reason) = &link.fallback_reason {
+                        monitor.event(format!("Node unavailable; using Fulcrum: {reason}"));
+                    }
                     monitor.connected(&link.url);
                     monitor.event(format!("Connected: {}", link.url));
                     session.insert(link)
                 }
                 Err(error) => {
                     monitor.state("Reconnecting");
-                    monitor.event(format!("Fulcrum: {error}"));
+                    monitor.event(format!("Source: {error}"));
                     monitor.wait(IDLE_POLL);
                     continue;
                 }
@@ -917,7 +917,7 @@ fn mine(
             }
             Err(error) => {
                 monitor.state("Reconnecting; pending proof retained");
-                monitor.event(format!("Fulcrum: {error}"));
+                monitor.event(format!("Source: {error}"));
                 session = None;
                 monitor.wait(IDLE_POLL);
                 continue;
@@ -931,10 +931,7 @@ fn mine(
                     &hex::decode(&prepared.raw).map_err(|_| "invalid saved claim")?,
                 );
                 let outcome = claim_outcome(&now.baton, &pending.baton, &expected, |txid| {
-                    link.rpc("blockchain.transaction.get", json!([txid, false]))?
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| "server returned invalid transaction data".into())
+                    link.transaction(txid)
                 });
                 match outcome {
                     Ok(ClaimOutcome::Accepted) => {
@@ -1110,7 +1107,7 @@ fn mine(
                         stop.store(true, Ordering::Relaxed);
                     }
                     Err(error) => {
-                        monitor.event(format!("Fulcrum: {error}"));
+                        monitor.event(format!("Source: {error}"));
                         stop.store(true, Ordering::Relaxed);
                     }
                 }

@@ -1739,6 +1739,8 @@ impl SetupFlow {
             MiningMode::Gpu if self.split => {
                 let mut rows = vec![SettingsRow::Token, SettingsRow::Gpu, SettingsRow::Address];
                 rows.extend((0..self.shares().len() as u8).map(SettingsRow::Share));
+                // #### PR #65: both token workers use these saved sources.
+                rows.extend([SettingsRow::Fulcrum, SettingsRow::Node]);
                 self.with_advanced(rows, vec![SettingsRow::TokenDonation])
             }
             MiningMode::Gpu if self.electric => self.with_advanced(
@@ -1747,6 +1749,8 @@ impl SetupFlow {
                     SettingsRow::Gpu,
                     SettingsRow::Address,
                     SettingsRow::Intensity,
+                    SettingsRow::Fulcrum,
+                    SettingsRow::Node,
                 ],
                 vec![SettingsRow::TokenDonation],
             ),
@@ -5922,7 +5926,7 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 Span::raw(format!("{builtin} built-in + {fulcrum} yours ({label})")),
                 "[Enter]",
             ),
-            // #### PR #40: GPU mining takes its PHOTON jobs from a saved
+            // #### PR #65: GPU mining takes its token jobs from a saved
             // node first, and from the Fulcrum servers without one.
             SettingsRow::Node => (
                 "BCH node",
@@ -8885,6 +8889,8 @@ mod tests {
                 SettingsRow::Gpu,
                 SettingsRow::Address,
                 SettingsRow::Intensity,
+                SettingsRow::Fulcrum,
+                SettingsRow::Node,
                 SettingsRow::Network,
                 SettingsRow::Advanced,
                 SettingsRow::ProfileName,
@@ -9007,6 +9013,8 @@ mod tests {
                 SettingsRow::Address,
                 SettingsRow::Share(0),
                 SettingsRow::Share(1),
+                SettingsRow::Fulcrum,
+                SettingsRow::Node,
                 SettingsRow::Network,
                 SettingsRow::Advanced,
                 SettingsRow::ProfileName,

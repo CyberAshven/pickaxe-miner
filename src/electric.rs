@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod miner;
 mod pending;
 mod recovery;
+mod source;
 pub(crate) mod ui;
 mod wallet;
 pub(crate) mod withdrawal;

@@ -71,12 +71,14 @@ block templates. The server preflights its configured source before serving
 local jobs, and checks the selected network, synchronization and template
 validity. Required-own-template modes do not silently adopt pool-selected jobs.
 
-GPU covenant-token mining has a different source requirement. PHOTON can use
-its native BCH RPC source or Electrum/Fulcrum. ELECTRIC currently needs the
-Electrum indexed-UTXO path for its baton and pot; configuring a BCH RPC URL
-does not implement that index or switch ELECTRIC to native RPC. A node still
-validates the chain behind a Fulcrum service; using a public service removes
-the requirement to operate that node yourself, not the underlying dependency.
+GPU covenant-token mining has a different source requirement. PHOTON and
+ELECTRIC can use native BCH RPC or Electrum/Fulcrum. ELECTRIC watches its baton
+and pot scripts with a confirmed UTXO scan, subsequent blocks and a mempool
+overlay; it needs no node wallet imports or `txindex`. A configured node is
+tried first. `--source node` requires that node to work; otherwise an unavailable
+node falls back to Fulcrum with the reason shown. A node still validates the
+chain behind a Fulcrum service; using a public service removes the requirement
+to operate that node yourself, not the underlying dependency.
 
 The setup regression matrix exercises both networks, with and without a node,
 across PHOTON, GPU pools, BCH solo, public pools, all four Job Declaration
