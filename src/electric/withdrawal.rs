@@ -130,7 +130,9 @@ impl Control {
 /// The same per-pot OS lock covers claims and refunds, including CLI refunds.
 /// Keep the file: unlinking a locked inode permits another process to bypass it.
 pub(super) fn lock(path: &Path) -> Result<fs::File, String> {
-    let path = path.with_extension("lock");
+    let path =
+        crate::mining_lock::pot_journal_path(path.file_name().ok_or("pot lock has no name")?)?
+            .with_extension("lock");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|_| "cannot create pot journal directory")?;
     }
@@ -652,6 +654,7 @@ mod tests {
         let lock_path = f.dir.join("claim.json");
         let first = lock(&lock_path).unwrap();
         assert!(lock(&lock_path).is_err());
+        assert!(lock(&f.dir.join("another-config/claim.json")).is_err());
         drop(first);
         assert!(lock(&lock_path).is_ok());
     }

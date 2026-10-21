@@ -154,7 +154,9 @@ transfers are saved privately before broadcast, restored after restart and
 counted as propagated only after fetching identical transaction bytes. A
 timeout or conflicting spend retains the journal and keeps its inputs reserved.
 Approved transfers cannot be cancelled by closing the panel. The same pot's
-claim and refund commands take an OS lock; files are retained for recovery.
+claim and refund commands take an OS lock. New owner pots share one journal
+location per OS account and pot identity, even across different config folders;
+older pots retain their existing journal locations. Files are retained for recovery.
 Keep the original key and journal backups until all transfers are settled.
 
 The receiving-wallet key and pot key are separate. A newly created empty pot

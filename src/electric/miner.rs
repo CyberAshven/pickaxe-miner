@@ -118,7 +118,7 @@ pub fn run(
                 .as_deref()
                 .map(|path| RecoveryKey::load(path, false))
                 .transpose()?;
-            let journal_path = claim_journal_path(cfg, &pot, config_path);
+            let journal_path = claim_journal_path(cfg, &pot, config_path)?;
             let _pot_lock = super::withdrawal::lock(&journal_path)?;
             let mut pkhs = [[0u8; 20]; 3];
             for (pkh, address) in pkhs.iter_mut().zip(&addresses) {
@@ -373,7 +373,7 @@ fn prepare(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .enabled = pot.owner_destination;
-    let journal_path = claim_journal_path(cfg, &pot, config_path);
+    let journal_path = claim_journal_path(cfg, &pot, config_path)?;
     Ok(Ready {
         deployment,
         pot,
@@ -384,12 +384,21 @@ fn prepare(
     })
 }
 
-fn claim_journal_path(cfg: &RuntimeConfig, pot: &Pot, config_path: &Path) -> PathBuf {
-    config_path.with_file_name(format!(
+fn claim_journal_path(
+    cfg: &RuntimeConfig,
+    pot: &Pot,
+    config_path: &Path,
+) -> Result<PathBuf, String> {
+    let path = config_path.with_file_name(format!(
         "electric-{}-{}.pending.json",
         cfg.network.as_str(),
         hex::encode(crate::proof::hash256(&pot.redeem)),
-    ))
+    ));
+    if pot.owner_destination {
+        crate::mining_lock::pot_journal_path(path.file_name().ok_or("pot journal has no name")?)
+    } else {
+        Ok(path)
+    }
 }
 
 /// #### PR #53: ELECTRIC as one token of a hash split: the setup's
@@ -1238,6 +1247,15 @@ mod tests {
         assert_ne!(controlled.address(), pot.address());
         assert_ne!(controlled_path.unwrap(), key_path);
         assert_ne!(controlled.recovery_public_key, pot.recovery_public_key);
+        let alternate_config = dir.join("other-profile/config.json");
+        assert_eq!(
+            claim_journal_path(&cfg, &controlled, &config).unwrap(),
+            claim_journal_path(&cfg, &controlled, &alternate_config).unwrap()
+        );
+        assert_ne!(
+            claim_journal_path(&cfg, &pot, &config).unwrap(),
+            claim_journal_path(&cfg, &pot, &alternate_config).unwrap()
+        );
         assert_eq!(
             controlled,
             pot_for(&cfg, &deploy, &owner_args, &config, false)
