@@ -178,6 +178,10 @@ pub enum Commands {
         /// TOKEN=PERCENT, once per token; multiples of 5, at most 100 in all.
         #[arg(long = "share", value_name = "TOKEN=PERCENT", required = true)]
         shares: Vec<String>,
+        /// Keep mining the previous funded ELECTRIC pot until its owner
+        /// migrates the BCH to a signed-claim pot.
+        #[arg(long)]
+        restricted_electric_pot: bool,
     },
     /// #### PR #53
     /// BCH P2Pool as a dependency Pickaxe installs from P2Pool's releases,
@@ -461,6 +465,10 @@ pub enum StratumV2Command {
             requires = "upstream"
         )]
         job_declaration: Option<JobDeclarationMode>,
+        /// Verified P2Pool node's read-only /jd_prepare URL. Payout and share
+        /// commitments are prepared there, using the allocated pool token.
+        #[arg(long, value_name = "URL", requires = "job_declaration")]
+        p2pool_prepare_api: Option<String>,
         /// #### PR #42
         /// Take templates from an SV2 Template Provider, tried before your
         /// node: sv2tp://HOST:PORT/KEY, such as another Pickaxe's
@@ -534,6 +542,16 @@ pub enum JobDeclarationMode {
     /// Coinbase-only: custom jobs from tokens; the pool never sees the
     /// transactions, and this node submits the blocks.
     Coinbase,
+    /// Full-Template with no fallback to the pool's transaction selection.
+    FullRequired,
+    /// Coinbase-only with no fallback to the pool's transaction selection.
+    CoinbaseRequired,
+}
+
+impl JobDeclarationMode {
+    pub fn requires_own_templates(self) -> bool {
+        matches!(self, Self::FullRequired | Self::CoinbaseRequired)
+    }
 }
 
 /// #### PR #42: the Job Declaration modes a public pool accepts.

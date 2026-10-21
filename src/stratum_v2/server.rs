@@ -807,6 +807,7 @@ pub fn run_with(
                     stats.jd_client = uplink.status.summary.lock().ok().map(|s| s.clone());
                 }
                 current_plan(uplink).map(|plan| plan.serial) != offered.plan
+                    || donation_plan(uplink).map(|plan| plan.serial) != offered.donation_plan
             });
             if node_tokens.as_ref().is_some_and(|hub| hub.take_changed()) || plan_changed {
                 let slot = sources[0].0;
@@ -1331,7 +1332,14 @@ fn device_ended(shared: &Shared, id: u64, error: Option<&str>) {
 
 /// #### PR #42: the Job Declaration plan the uplink holds now.
 fn current_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
+    if uplink.donation.is_some() && donation_plan(uplink).is_none() {
+        return None;
+    }
     uplink.status.plan.read().ok().and_then(|plan| plan.clone())
+}
+
+fn donation_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
+    uplink.donation.as_ref()?.status.plan.read().ok()?.clone()
 }
 
 // #### PR #42: the JD plan gates local jobs
@@ -1349,6 +1357,9 @@ fn current_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
 struct Offered {
     /// The plan serial jobs were last published with.
     plan: Option<u64>,
+    donation_plan: Option<u64>,
+    cohort: u32,
+    issued: u32,
     /// The parent, bits and plan of the last template sent to the uplink,
     /// and when.
     last: Option<(Hash, u32, u64, Instant)>,
@@ -1396,7 +1407,19 @@ fn offer(
         return;
     };
     let plan = current_plan(uplink);
-    offered.plan = plan.as_ref().map(|plan| plan.serial);
+    let personal_serial = plan.as_ref().map(|plan| plan.serial);
+    let donation = donation_plan(uplink);
+    let donation_serial = donation.as_ref().map(|plan| plan.serial);
+    if offered.plan != personal_serial || offered.donation_plan != donation_serial {
+        offered.last = None;
+        let Some(cohort) = offered.cohort.checked_add(1) else {
+            publish(shared, None);
+            return;
+        };
+        offered.cohort = cohort;
+        offered.plan = personal_serial;
+        offered.donation_plan = donation_serial;
+    }
     let Some(plan) = plan else {
         publish(shared, None);
         return;
@@ -1416,17 +1439,72 @@ fn offer(
     if offered.coalesce(&template, plan_serial, Instant::now()) {
         return;
     }
+    let mut donation_template = donation.map(|plan| {
+        let mut own = template.clone();
+        own.declare(plan);
+        own
+    });
     template.declare(plan);
+    if let Err(error) = template.prepare_p2pool() {
+        if let Ok(mut summary) = uplink.status.summary.lock() {
+            summary.state = "preparing";
+            summary.last_error = Some(error);
+        }
+        publish(shared, None);
+        return;
+    }
+    if let Some(own) = donation_template.as_mut() {
+        if let Err(error) = own.prepare_p2pool() {
+            if let Ok(mut summary) = uplink.status.summary.lock() {
+                summary.state = "preparing";
+                summary.last_error = Some(error);
+            }
+            publish(shared, None);
+            return;
+        }
+    }
+    let declaration = if template.is_p2pool() {
+        let Some(issued) = offered.issued.checked_add(1) else {
+            publish(shared, None);
+            return;
+        };
+        offered.issued = issued;
+        template.set_declaration_id(u64::from(issued));
+        if let Some(own) = donation_template.as_mut() {
+            own.set_declaration_id(u64::from(issued));
+        }
+        u64::from(issued)
+    } else {
+        generation
+    };
+    if let (Some(own), Some(donation)) = (donation_template, uplink.donation.as_ref()) {
+        if donation
+            .events
+            .try_send(UplinkEvent::Published {
+                serial: declaration,
+                template: Arc::new(own.clone()),
+            })
+            .is_err()
+        {
+            publish(shared, None);
+            return;
+        }
+        template.set_p2pool_donation(own);
+    }
     let template = Arc::new(template);
     let _ = uplink.events.try_send(UplinkEvent::Published {
-        serial: generation,
+        serial: declaration,
         template: template.clone(),
     });
     publish(
         shared,
         Some(PublishedJob {
             generation,
-            serial: (plan_serial << 32) | (serial & 0xffff_ffff),
+            serial: if template.is_p2pool() {
+                (u64::from(offered.cohort) << 32) | declaration
+            } else {
+                (plan_serial << 32) | (serial & 0xffff_ffff)
+            },
             template,
             valid_until,
         }),
@@ -1474,6 +1552,7 @@ fn publish(shared: &Shared, job: Option<PublishedJob>) {
 #[derive(Clone, Copy, Debug)]
 enum JobDonation {
     Bch(BchDonation),
+    P2Pool(BchDonation),
     Token(crate::donation::TokenDonation),
 }
 
@@ -1485,6 +1564,7 @@ struct JobAvailability {
     serial: Option<u64>,
     parent: Option<(Hash, u32)>,
     unavailable_since: Option<Instant>,
+    issued_until: Option<Instant>,
     payout: Option<BchPayout>,
     next_id: u32,
     allocation: WorkAllocation,
@@ -1497,6 +1577,7 @@ impl JobAvailability {
             serial: None,
             parent: None,
             unavailable_since: None,
+            issued_until: None,
             payout: None,
             next_id: 0,
             allocation: WorkAllocation::new(phase),
@@ -1514,12 +1595,32 @@ impl JobAvailability {
         fee: Option<crate::donation::bch::PoolFee>,
         acknowledged: Option<u64>,
     ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
-        if let Some(job) = current.filter(|job| now < job.valid_until) {
+        if let Some(job) = current.as_ref().filter(|job| {
+            job.template.is_p2pool()
+                && acknowledged.is_none_or(|ack| ack < job.template.declaration_id(job.generation))
+        }) {
+            // Keep already accepted same-parent work during preparation, but
+            // never extend its original lease or use a replaced pool session.
+            if self.parent == Some((job.template.previous_hash, job.template.bits))
+                && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
+                && self.issued_until.is_some_and(|until| now < until)
+            {
+                return Ok(Vec::new());
+            }
+        }
+        if let Some(mut job) = current.filter(|job| {
+            now < job.valid_until
+                && (!job.template.is_p2pool()
+                    || acknowledged
+                        .is_some_and(|ack| ack >= job.template.declaration_id(job.generation)))
+        }) {
             self.allocation.update(now, !mining.channels.is_empty());
             // #### PR #42: a token's donation is all work (see
             // `WorkAllocation::token_donation_work`).
+            let p2pool = matches!(donation, JobDonation::P2Pool(_));
             let (donation, donation_work) = match donation {
                 JobDonation::Bch(rate) => (rate, self.allocation.donation_work(rate)),
+                JobDonation::P2Pool(rate) => (rate, self.allocation.pool_donation_work(rate)),
                 JobDonation::Token(rate) => (
                     BchDonation::try_from(0)?,
                     self.allocation.token_donation_work(rate),
@@ -1533,6 +1634,13 @@ impl JobAvailability {
                 fee_work: !donation_work
                     && fee.is_some_and(|fee| self.allocation.fee_work(donation, fee)),
             };
+            if donation_work && p2pool {
+                job.template = job
+                    .template
+                    .p2pool_donation()
+                    .cloned()
+                    .ok_or("P2Pool donation job is not available")?;
+            }
             self.unavailable_since = None;
             if self.generation == Some(job.generation)
                 && self.serial == Some(job.serial)
@@ -1552,12 +1660,14 @@ impl JobAvailability {
             // #### PR #48: new bits on the parent (Chipnet's limit at the
             // 20-minute point) go at once too: the job devices have can no
             // longer make a block (see `BchTemplate::stale_bits`).
-            if acknowledged.is_some_and(|acknowledged| {
-                self.generation.is_some()
-                    && self.parent == Some((job.template.previous_hash, job.template.bits))
-                    && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
-                    && job.generation > acknowledged
-            }) {
+            if !job.template.is_p2pool()
+                && acknowledged.is_some_and(|acknowledged| {
+                    self.generation.is_some()
+                        && self.parent == Some((job.template.previous_hash, job.template.bits))
+                        && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
+                        && job.generation > acknowledged
+                })
+            {
                 return Ok(Vec::new());
             }
             // Policy rotations need unique search space even with the same
@@ -1568,6 +1678,7 @@ impl JobAvailability {
                 .checked_add(1)
                 .ok_or("job identifiers exhausted")?;
             let parent = (job.template.previous_hash, job.template.bits);
+            self.issued_until = Some(job.valid_until);
             let frames =
                 mining.set_job_with_payout(self.next_id, job.generation, job.template, payout)?;
             self.generation = Some(job.generation);
@@ -1578,6 +1689,7 @@ impl JobAvailability {
         }
         self.allocation.update(now, false);
         if self.generation.take().is_some() {
+            self.issued_until = None;
             self.serial = None;
             mining.revoke_job();
         }
@@ -1800,6 +1912,17 @@ fn serve_device(
                 if let Some(rate) = config.token_donation {
                     return Ok(JobDonation::Token(rate));
                 }
+                if config
+                    .uplink
+                    .as_ref()
+                    .is_some_and(|uplink| uplink.donation.is_some())
+                {
+                    return config
+                        .donation
+                        .read()
+                        .map(|value| JobDonation::P2Pool(*value))
+                        .map_err(|_| "donation setting unavailable".to_owned());
+                }
                 if config.uplink.is_some() {
                     return BchDonation::try_from(0).map(JobDonation::Bch);
                 }
@@ -1809,12 +1932,7 @@ fn serve_device(
                     .map(|value| JobDonation::Bch(*value))
                     .map_err(|_| "donation setting unavailable".to_owned())
             };
-            let acknowledged = || {
-                config
-                    .uplink
-                    .as_ref()
-                    .map(|uplink| uplink.status.acknowledged.load(Ordering::Relaxed))
-            };
+            let acknowledged = || config.uplink.as_ref().map(UplinkHandle::acknowledged);
             for frame in availability.update(
                 &mut mining,
                 current_job()?,
@@ -1865,7 +1983,19 @@ fn serve_device(
                 // #### PR #48: validated BCH work repays the original job's quota.
                 if config.token_donation.is_none() {
                     if let Some((target, payout)) = responses.accepted_work {
-                        availability.allocation.accepted(&target, payout);
+                        if config
+                            .uplink
+                            .as_ref()
+                            .is_some_and(|uplink| uplink.donation.is_some())
+                        {
+                            availability.allocation.pool_accepted(
+                                &target,
+                                payout.donation,
+                                payout.donation_work,
+                            );
+                        } else {
+                            availability.allocation.accepted(&target, payout);
+                        }
                         if config.uplink.is_none() {
                             if let Ok(mut stats) = shared.stats.lock() {
                                 stats
@@ -1879,7 +2009,7 @@ fn serve_device(
                 // waiting (see `jd::client::forward`).
                 if let Some(uplink) = config.uplink.as_ref() {
                     for share in &responses.forward {
-                        let _ = uplink.events.try_send(UplinkEvent::Share(share.clone()));
+                        uplink.forward(share.clone());
                     }
                 }
                 // #### PR #42: header-token wins go to the token worker,

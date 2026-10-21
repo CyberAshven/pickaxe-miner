@@ -353,8 +353,21 @@ pub fn run_in_split(
     config_path: &Path,
     monitor: &super::ui::Monitor,
 ) -> Result<(), String> {
+    run_in_split_with_pot_mode(cfg, gpus, config_path, monitor, false)
+}
+
+pub fn run_in_split_with_pot_mode(
+    cfg: &RuntimeConfig,
+    gpus: &[crate::backend::GpuDevice],
+    config_path: &Path,
+    monitor: &super::ui::Monitor,
+    restricted_pot: bool,
+) -> Result<(), String> {
     let devices = crate::backend::electric_engines_for(gpus.to_vec())?;
-    let args = ElectricDeploymentArgs::default();
+    let args = ElectricDeploymentArgs {
+        restricted_pot,
+        ..Default::default()
+    };
     let mut ready = prepare(cfg, &args, &devices, config_path, true, monitor)?;
     mine(
         cfg,

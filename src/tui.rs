@@ -104,6 +104,7 @@ pub struct ServerOptions {
     /// Join a pool declares this node's templates to the pool (SV2 Job
     /// Declaration); `None` mines the pool's own jobs.
     pub job_declaration: Option<crate::config::SavedDeclaration>,
+    pub p2pool_prepare_api: Option<String>,
     /// The Job Declaration modes an ASIC pool accepts; `None` accepts none.
     pub accept_job_declaration: Option<crate::config::SavedAccept>,
     /// Pools solo mining falls back on while the node gives no work, each a
@@ -132,6 +133,7 @@ impl Default for ServerOptions {
             pool_user: None,
             template_port: None,
             job_declaration: None,
+            p2pool_prepare_api: None,
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
             asic_token: None,
@@ -333,17 +335,31 @@ pub fn asic_serve_command(
                 crate::config::SavedAccept::Coinbase => crate::cli::AcceptJobDeclaration::Coinbase,
                 crate::config::SavedAccept::Both => crate::cli::AcceptJobDeclaration::Both,
             }),
-        // #### PR #61: P2Pool takes no Job Declaration yet.
+        // #### PR #65: a public P2Pool node can accept prepared declarations.
         job_declaration: options
             .job_declaration
-            .filter(|_| matches!(server, ServerSetup::JoinPool { .. }))
+            .filter(|_| {
+                matches!(
+                    server,
+                    ServerSetup::JoinPool { .. } | ServerSetup::JoinP2Pool { .. }
+                )
+            })
             .map(|mode| match mode {
                 crate::config::SavedDeclaration::Full => crate::cli::JobDeclarationMode::Full,
                 crate::config::SavedDeclaration::Coinbase => {
                     crate::cli::JobDeclarationMode::Coinbase
                 }
+                crate::config::SavedDeclaration::FullRequired => {
+                    crate::cli::JobDeclarationMode::FullRequired
+                }
+                crate::config::SavedDeclaration::CoinbaseRequired => {
+                    crate::cli::JobDeclarationMode::CoinbaseRequired
+                }
             }),
         template_provider: Vec::new(),
+        p2pool_prepare_api: options.p2pool_prepare_api.clone().filter(|_| {
+            matches!(server, ServerSetup::JoinP2Pool { .. }) && options.job_declaration.is_some()
+        }),
         fallback_pool: if solo && options.asic_token.is_none() {
             options.fallback_pools.clone()
         } else {
@@ -620,6 +636,7 @@ enum SettingsRow {
     PoolKind,
     PoolAddress,
     PoolKey,
+    P2PoolApi,
     PoolFee,
     FeeFrom,
     FeeAddress,
@@ -677,6 +694,7 @@ enum TextField {
     Connection,
     PoolAddress,
     PoolKey,
+    P2PoolApi,
     FeeAddress,
     PoolName,
     /// #### PR #42: the Advanced section's text rows.
@@ -750,6 +768,7 @@ struct SetupFlow {
     pool_user: String,
     /// #### PR #42: Join a pool's Job Declaration; `None` is off.
     job_declaration: Option<crate::config::SavedDeclaration>,
+    p2pool_prepare_api: String,
     /// #### PR #61: with P2Pool as the pool type, run your own P2Pool node
     /// with your node (true) or join someone's P2Pool node (false).
     own_p2pool: bool,
@@ -961,6 +980,7 @@ impl SetupFlow {
             backups: Vec::new(),
             pool_user: String::new(),
             job_declaration: None,
+            p2pool_prepare_api: String::new(),
             own_p2pool: false,
             accept_jd: None,
             fallback_pools: Vec::new(),
@@ -1791,6 +1811,9 @@ impl SetupFlow {
                         SettingsRow::Address,
                     ]);
                 }
+                if !self.own_p2pool && self.job_declaration.is_some() {
+                    basic.extend([SettingsRow::Node, SettingsRow::P2PoolApi]);
+                }
                 self.with_advanced(
                     basic,
                     if self.own_p2pool {
@@ -1938,6 +1961,12 @@ impl SetupFlow {
             template_port: self.template_port,
             node_zmq: Some(self.node_zmq.trim().to_owned()).filter(|value| !value.is_empty()),
             job_declaration: self.job_declaration,
+            p2pool_prepare_api: Some(self.p2pool_prepare_api.trim().to_owned()).filter(|v| {
+                !v.is_empty()
+                    && self.pool_kind == PoolKind::P2PoolV2
+                    && !self.own_p2pool
+                    && self.job_declaration.is_some()
+            }),
             accept_job_declaration: self.accept_jd,
             fallback_pools: self.fallback_pools.clone(),
             asic_token: self
@@ -2008,14 +2037,22 @@ impl SetupFlow {
             .at_least(token.donation_minimum)
     }
 
-    /// Job Declaration off, Full-Template, then Coinbase-only, in turn.
+    /// Job Declaration mode and whether the miner permits pool templates.
     fn cycle_job_declaration(&mut self, forward: bool) {
-        use crate::config::SavedDeclaration::{Coinbase, Full};
-        self.job_declaration = match (self.job_declaration, forward) {
-            (None, true) | (Some(Coinbase), false) => Some(Full),
-            (Some(Full), true) | (None, false) => Some(Coinbase),
-            (Some(Coinbase), true) | (Some(Full), false) => None,
-        };
+        use crate::config::SavedDeclaration::{Coinbase, CoinbaseRequired, Full, FullRequired};
+        const ORDER: [Option<crate::config::SavedDeclaration>; 5] = [
+            None,
+            Some(Full),
+            Some(Coinbase),
+            Some(FullRequired),
+            Some(CoinbaseRequired),
+        ];
+        let index = ORDER
+            .iter()
+            .position(|mode| *mode == self.job_declaration)
+            .unwrap_or(0);
+        self.job_declaration =
+            ORDER[(index + if forward { 1 } else { ORDER.len() - 1 }) % ORDER.len()];
     }
 
     /// Accepting miners' templates off, in both modes, Full-Template only,
@@ -2134,6 +2171,10 @@ impl SetupFlow {
             job_declaration: options
                 .job_declaration
                 .filter(|_| mode == SavedMode::AsicJoin),
+            p2pool_prepare_api: options
+                .p2pool_prepare_api
+                .clone()
+                .filter(|_| mode == SavedMode::AsicJoin),
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
             asic_token: None,
@@ -2172,7 +2213,6 @@ impl SetupFlow {
             // #### PR #61: P2Pool is saved as joining a pool, which every
             // build reads; that it is P2Pool is kept in profile-choices.json.
             ServerSetup::JoinP2Pool { .. } => SavedServer {
-                job_declaration: None,
                 pool_user: None,
                 ..joining(SavedMode::AsicJoin)
             },
@@ -2255,6 +2295,7 @@ impl SetupFlow {
         self.backups.clear();
         self.pool_user.clear();
         self.job_declaration = None;
+        self.p2pool_prepare_api.clear();
         self.accept_jd = None;
         self.fallback_pools.clear();
         self.asic_target = 0;
@@ -2301,6 +2342,7 @@ impl SetupFlow {
         self.backups = server.backups.clone();
         self.pool_user = server.pool_user.clone().unwrap_or_default();
         self.job_declaration = server.job_declaration;
+        self.p2pool_prepare_api = server.p2pool_prepare_api.clone().unwrap_or_default();
         self.accept_jd = server.accept_job_declaration;
         self.fallback_pools = server.fallback_pools.clone();
         self.node_zmq = server.node_zmq.clone().unwrap_or_default();
@@ -2474,7 +2516,9 @@ impl SetupFlow {
         {
             self.pool_kind = PoolKind::P2PoolV2;
             self.own_p2pool = choices.own_p2pool;
-            self.job_declaration = None;
+            if self.own_p2pool {
+                self.job_declaration = None;
+            }
         }
     }
 
@@ -2938,7 +2982,15 @@ impl SetupFlow {
                     }
                     // #### PR #61: P2Pool's templates: your own P2Pool node or not.
                     SettingsRow::JobDeclaration if self.pool_kind == PoolKind::P2PoolV2 => {
-                        self.own_p2pool = !self.own_p2pool;
+                        if self.own_p2pool {
+                            self.own_p2pool = false;
+                            self.job_declaration =
+                                Some(crate::config::SavedDeclaration::FullRequired);
+                        } else if self.job_declaration.is_some() {
+                            self.job_declaration = None;
+                        } else {
+                            self.own_p2pool = true;
+                        }
                     }
                     SettingsRow::JobDeclaration => self.cycle_job_declaration(forward),
                     SettingsRow::AcceptJd => self.cycle_accept_jd(forward),
@@ -2981,7 +3033,14 @@ impl SetupFlow {
                     self.begin_edit(TextField::NodeZmq, value);
                 }
                 SettingsRow::JobDeclaration if self.pool_kind == PoolKind::P2PoolV2 => {
-                    self.own_p2pool = !self.own_p2pool;
+                    if self.own_p2pool {
+                        self.own_p2pool = false;
+                        self.job_declaration = Some(crate::config::SavedDeclaration::FullRequired);
+                    } else if self.job_declaration.is_some() {
+                        self.job_declaration = None;
+                    } else {
+                        self.own_p2pool = true;
+                    }
                 }
                 SettingsRow::JobDeclaration => self.cycle_job_declaration(true),
                 SettingsRow::AcceptJd => self.cycle_accept_jd(true),
@@ -3034,6 +3093,9 @@ impl SetupFlow {
                 SettingsRow::PoolKey => {
                     let value = self.join_key.clone();
                     self.begin_edit(TextField::PoolKey, value);
+                }
+                SettingsRow::P2PoolApi => {
+                    self.begin_edit(TextField::P2PoolApi, self.p2pool_prepare_api.clone())
                 }
                 SettingsRow::FeeAddress => {
                     let value = self.pool_fee_address.clone();
@@ -3149,7 +3211,9 @@ impl SetupFlow {
                         self.status_line =
                             "Enter the P2Pool node's authority key, as it publishes it.".into();
                         self.open_settings(SettingsRow::PoolKey);
-                    } else if self.own_p2pool && self.config.custom_node_endpoints().is_empty() {
+                    } else if (self.own_p2pool || self.job_declaration.is_some())
+                        && self.config.custom_node_endpoints().is_empty()
+                    {
                         self.connection_kind = ConnectionKind::Node;
                         self.connection_selected = self
                             .sources
@@ -3160,6 +3224,13 @@ impl SetupFlow {
                         self.status_line =
                             "Your own P2Pool node takes its templates from your own BCH node: add it here."
                                 .into();
+                    } else if !self.own_p2pool
+                        && self.job_declaration.is_some()
+                        && crate::config::validate_p2pool_preparation_url(&self.p2pool_prepare_api)
+                            .is_err()
+                    {
+                        self.status_line = "Enter the P2Pool node's preparation URL; its version must support /jd_prepare.".into();
+                        self.open_settings(SettingsRow::P2PoolApi);
                     } else if self.own_p2pool && self.node_zmq.trim().eq_ignore_ascii_case("off") {
                         self.status_line =
                             "P2Pool needs your node's ZMQ block notices; set them under Advanced."
@@ -3532,6 +3603,11 @@ impl SetupFlow {
             }
             TextField::PoolKey => {
                 self.join_key = value;
+                Ok(String::new())
+            }
+            TextField::P2PoolApi => {
+                crate::config::validate_p2pool_preparation_url(&value)?;
+                self.p2pool_prepare_api = value;
                 Ok(String::new())
             }
             TextField::FeeAddress => {
@@ -5653,6 +5729,11 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 ),
                 "[Enter]",
             ),
+            SettingsRow::P2PoolApi => (
+                "P2Pool preparation",
+                edit_value(state, TextField::P2PoolApi, &state.p2pool_prepare_api, "HTTPS URL of the node's /jd_prepare"),
+                "[Enter]",
+            ),
             SettingsRow::PoolKey => (
                 "Pool key",
                 edit_value(
@@ -5882,6 +5963,8 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 "Your templates",
                 if state.own_p2pool {
                     Span::raw("your node's: Pickaxe runs your own P2Pool node with it")
+                } else if state.job_declaration.is_some() {
+                    Span::raw("public P2Pool; your node's templates required (SV2)")
                 } else {
                     dim("off; join a P2Pool node, which builds the jobs")
                 },
@@ -5898,6 +5981,12 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                     ),
                     Some(crate::config::SavedDeclaration::Coinbase) => Span::raw(
                         "coinbase only: your node's templates; the pool sees the coinbase",
+                    ),
+                    Some(crate::config::SavedDeclaration::FullRequired) => Span::raw(
+                        "full template required: wait or try another pool; never use pool templates",
+                    ),
+                    Some(crate::config::SavedDeclaration::CoinbaseRequired) => Span::raw(
+                        "coinbase only required: wait or try another pool; never use pool templates",
                     ),
                 },
                 "< > [Enter]  a Pickaxe pool",
@@ -8351,9 +8440,18 @@ mod tests {
             Some(crate::config::SavedDeclaration::Coinbase)
         );
         setup.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            setup.job_declaration,
+            Some(crate::config::SavedDeclaration::FullRequired)
+        );
+        setup.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            setup.job_declaration,
+            Some(crate::config::SavedDeclaration::CoinbaseRequired)
+        );
+        setup.handle_key(key(KeyCode::Right));
         assert_eq!(setup.job_declaration, None);
-        setup.handle_key(key(KeyCode::Left));
-        setup.handle_key(key(KeyCode::Left));
+        setup.handle_key(key(KeyCode::Right));
         assert_eq!(
             setup.job_declaration,
             Some(crate::config::SavedDeclaration::Full)
@@ -9038,6 +9136,62 @@ mod tests {
         assert_eq!(reopened.pool_kind, PoolKind::P2PoolV2);
         assert!(reopened.own_p2pool);
         assert_eq!(reopened.server_setup(), Some(ServerSetup::OwnP2Pool));
+    }
+
+    #[test]
+    fn public_p2pool_own_templates_keep_the_node_and_helper_in_the_profile() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.asic_mining = AsicMining::JoinPool;
+        setup.pool_kind = PoolKind::P2PoolV2;
+        setup.config.payout_address = chipnet_payout(4);
+        setup.join_address = "pool.example:3336".into();
+        setup.join_key = "KEY".into();
+        setup.open_settings(SettingsRow::JobDeclaration);
+        setup.handle_key(key(KeyCode::Right));
+        setup.handle_key(key(KeyCode::Right));
+        assert!(!setup.own_p2pool);
+        assert_eq!(
+            setup.job_declaration,
+            Some(crate::config::SavedDeclaration::FullRequired)
+        );
+        assert!(setup.settings_rows().contains(&SettingsRow::Node));
+        assert!(setup.settings_rows().contains(&SettingsRow::P2PoolApi));
+        setup.config.node_url = Some("http://user:pass@127.0.0.1:48332".into());
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert_eq!(setup.current_row(), SettingsRow::P2PoolApi);
+        setup.p2pool_prepare_api = "https://pool.example/jd_prepare".into();
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        let saved = setup.saved_server().unwrap();
+        assert!(saved.validate(setup.config.network).is_ok());
+        let choices = setup.profile_choices();
+        let mut reopened = setup_for(MiningMode::Asic);
+        reopened.apply_saved_server(Some(&saved));
+        reopened.apply_choices(&choices);
+        assert_eq!(reopened.p2pool_prepare_api, setup.p2pool_prepare_api);
+        assert_eq!(reopened.job_declaration, setup.job_declaration);
+        match asic_serve_command(
+            &reopened.server_setup().unwrap(),
+            &reopened.server_options(),
+        )
+        .unwrap()
+        {
+            crate::cli::StratumV2Command::Serve {
+                job_declaration,
+                p2pool_prepare_api,
+                own_p2pool,
+                ..
+            } => {
+                assert!(!own_p2pool);
+                assert_eq!(
+                    job_declaration,
+                    Some(crate::cli::JobDeclarationMode::FullRequired)
+                );
+                assert_eq!(p2pool_prepare_api, saved.p2pool_prepare_api);
+            }
+            _ => panic!("wrong command"),
+        }
     }
 
     // #### PR #61: the choices kept beside the profiles, by profile name.

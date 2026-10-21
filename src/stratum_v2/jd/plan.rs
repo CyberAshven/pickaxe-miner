@@ -29,6 +29,8 @@ pub struct JdPlan {
     pub rates: PoolRates,
     /// Shares meeting this go to the pool.
     pub pool_target: Hash,
+    /// PPLNS construction belongs to the independently verified P2Pool node.
+    pub p2pool: Option<std::sync::Arc<crate::p2pool::jd::Plan>>,
 }
 
 impl JdPlan {
@@ -98,6 +100,9 @@ impl JdPlan {
     /// donation and fee within the list; #### PR #42: and its rates are at
     /// most 100%, so the payout never underflows and a token split fits.
     pub fn is_valid(&self) -> bool {
+        if self.p2pool.is_some() {
+            return self.upstream_prefix.len() + self.rollable() == 12 && !self.scripts.is_empty();
+        }
         let within = |index: Option<u8>| {
             index.is_none_or(|index| usize::from(index) < self.scripts.len() && index > 0)
         };
@@ -134,6 +139,7 @@ mod tests {
                 fee_output: Some(1),
             },
             pool_target: [0xff; 32],
+            p2pool: None,
         };
         assert!(plan.is_valid());
         assert_eq!(plan.rollable(), 16);

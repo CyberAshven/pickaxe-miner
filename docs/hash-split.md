@@ -220,3 +220,12 @@ day: PHOTON 1,688 MH/s (benchmark), ELECTRIC about 2,900 MH/s (dry run).
 - #### PR #61: `tui::tests::electric_setup_shows_the_fee_pot_to_fund_and_saves_its_profile`
   (the balance read while the pot shows) and
   `tui::tests::profile_choices_are_kept_renamed_and_dropped_with_their_profile`.
+
+#### PR #65: retaining a previously funded ELECTRIC pot
+
+`split --restricted-electric-pot` explicitly uses the previous owner-recoverable
+ELECTRIC covenant with the same key file and journal binding. Its original
+height rule remains part of that existing on-chain covenant. The default uses
+the signed-claim pot. Funding cannot transfer between those covenant versions
+automatically: refund the previous pot to its original payout wallet, then fund
+the new pot from that wallet. No payout-wallet key is imported by Pickaxe.

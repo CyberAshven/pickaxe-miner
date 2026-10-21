@@ -555,6 +555,17 @@ pub fn run(
     config_path: &Path,
     plain: bool,
 ) -> Result<(), String> {
+    run_with_pot_mode(cfg, gpus, shares, config_path, plain, false)
+}
+
+pub fn run_with_pot_mode(
+    cfg: &RuntimeConfig,
+    gpus: &[GpuDevice],
+    shares: &Shares,
+    config_path: &Path,
+    plain: bool,
+    restricted_electric_pot: bool,
+) -> Result<(), String> {
     shares.validate()?;
     if gpus.is_empty() {
         return Err("no GPU selected for mining".into());
@@ -620,7 +631,13 @@ pub fn run(
     let outcome = std::thread::scope(|scope| {
         let electric = electric.then(|| {
             scope.spawn(|| {
-                let mined = crate::electric::miner::run_in_split(cfg, gpus, config_path, &monitor);
+                let mined = crate::electric::miner::run_in_split_with_pot_mode(
+                    cfg,
+                    gpus,
+                    config_path,
+                    &monitor,
+                    restricted_electric_pot,
+                );
                 if let Err(error) = &mined {
                     // The other tokens keep the GPUs; ELECTRIC no longer asks.
                     monitor.state(format!("Stopped: {error}"));

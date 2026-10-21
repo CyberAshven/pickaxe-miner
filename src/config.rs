@@ -846,6 +846,10 @@ pub enum SavedDeclaration {
     Full,
     /// Coinbase-only: the coinbase alone; this node submits the blocks.
     Coinbase,
+    #[serde(rename = "full-required")]
+    FullRequired,
+    #[serde(rename = "coinbase-required")]
+    CoinbaseRequired,
 }
 
 /// #### PR #42: the Job Declaration modes a profile's ASIC pool accepts.
@@ -901,6 +905,8 @@ pub struct SavedServer {
     /// (SV2 Job Declaration); left out, devices mine the pool's own jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_declaration: Option<SavedDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2pool_prepare_api: Option<String>,
     /// #### PR #42: the Job Declaration modes an ASIC pool accepts from its
     /// miners; left out, it accepts none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -930,9 +936,72 @@ pub struct SavedServer {
     pub node_zmq: Option<String>,
 }
 
+/// Shared profile validation also runs in browser and portable-only builds.
+/// Credentials and control characters are refused without echoing the URL.
+pub fn validate_p2pool_preparation_url(url: &str) -> Result<(), String> {
+    let invalid = || "use an HTTPS preparation URL, or HTTP on a loopback address".to_owned();
+    if url
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        || url.contains(['@', '#'])
+    {
+        return Err(invalid());
+    }
+    let (scheme, rest) = url.split_once("://").ok_or_else(invalid)?;
+    if !matches!(scheme, "http" | "https") {
+        return Err(invalid());
+    }
+    let authority = rest.split(['/', '?']).next().ok_or_else(invalid)?;
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, after) = bracketed.split_once(']').ok_or_else(invalid)?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(invalid());
+        }
+        (
+            host,
+            if after.is_empty() {
+                None
+            } else {
+                Some(after.strip_prefix(':').ok_or_else(invalid)?)
+            },
+        )
+    } else {
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(h, p)| (h, Some(p)));
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        {
+            return Err(invalid());
+        }
+        (host, port)
+    };
+    if port.is_some_and(|port| port.parse::<u16>().map_or(true, |port| port == 0)) {
+        return Err(invalid());
+    }
+    if scheme == "http"
+        && !host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 impl SavedServer {
     /// Rejects values the setup would refuse for this mode on `network`.
     pub fn validate(&self, network: MiningNetwork) -> Result<(), String> {
+        if let Some(api) = &self.p2pool_prepare_api {
+            if self.mode != SavedMode::AsicJoin || self.job_declaration.is_none() {
+                return Err(
+                    "P2Pool preparation needs an ASIC pool profile with own templates".into(),
+                );
+            }
+            validate_p2pool_preparation_url(api)?;
+        }
         // #### PR #42: block notices only where the server has a node.
         if let Some(value) = &self.node_zmq {
             parse_node_zmq(value)?;
@@ -2363,6 +2432,7 @@ mod tests {
             pool_user: None,
             tp_port: Some(48442),
             job_declaration: None,
+            p2pool_prepare_api: None,
             accept_job_declaration: Some(SavedAccept::Both),
             fallback_pools: Vec::new(),
             asic_token: None,
@@ -2391,6 +2461,7 @@ mod tests {
             pool_user: Some("rig-owner".into()),
             tp_port: None,
             job_declaration: Some(SavedDeclaration::Full),
+            p2pool_prepare_api: None,
             accept_job_declaration: None,
             fallback_pools: Vec::new(),
             asic_token: None,

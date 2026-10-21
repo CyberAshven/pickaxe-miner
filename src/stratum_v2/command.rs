@@ -243,6 +243,7 @@ pub fn run(
         tp_listen,
         accept_job_declaration,
         job_declaration,
+        p2pool_prepare_api,
         ..
     } = action
     else {
@@ -258,6 +259,12 @@ pub fn run(
         }
         return Ok(());
     };
+    if let Some(api) = &p2pool_prepare_api {
+        crate::p2pool::http::validate_preparation_url(api)?;
+        if !declaring || pools.is_empty() || !fallbacks.is_empty() {
+            return Err("P2Pool own templates need an upstream, Job Declaration and no pool-template fallback".into());
+        }
+    }
     // #### PR #40: where each device's difficulty starts.
     let share_target = match start_difficulty {
         None => compact_target(0x1b0ffff0)?,
@@ -391,10 +398,17 @@ pub fn run(
             }))];
             // #### PR #42: under Job Declaration the pools' own jobs follow;
             // in solo mining, the fallback pools.
-            if declaring {
+            if declaring
+                && p2pool_prepare_api.is_none()
+                && !job_declaration.is_some_and(|mode| mode.requires_own_templates())
+            {
                 list.extend(pools.iter().cloned());
             }
-            list.extend(fallbacks.iter().cloned());
+            if p2pool_prepare_api.is_none()
+                && !job_declaration.is_some_and(|mode| mode.requires_own_templates())
+            {
+                list.extend(fallbacks.iter().cloned());
+            }
             list
         }
         _ => return Err("mining server unavailable".into()),
@@ -458,23 +472,34 @@ pub fn run(
     let stats = Arc::new(Mutex::new(ServerStats::default()));
     // #### PR #42: the Job Declaration uplink, to the pools in order.
     let mode = match job_declaration {
-        Some(crate::cli::JobDeclarationMode::Coinbase) => super::jd::JdMode::CoinbaseOnly,
+        Some(
+            crate::cli::JobDeclarationMode::Coinbase
+            | crate::cli::JobDeclarationMode::CoinbaseRequired,
+        ) => super::jd::JdMode::CoinbaseOnly,
         _ => super::jd::JdMode::FullTemplate,
     };
     let uplink = (declaring && !pools.is_empty()).then(|| {
-        super::jd::client::spawn(
-            pools
-                .iter()
-                .map(|pool| super::jd::client::JdTarget {
-                    address: pool.address.clone(),
-                    authority: pool.authority,
-                    identity: pool.identity.clone(),
-                    retry: Duration::from_secs(30),
-                    mode,
-                })
-                .collect(),
-            stop.clone(),
-        )
+        let targets = pools
+            .iter()
+            .map(|pool| super::jd::client::JdTarget {
+                address: pool.address.clone(),
+                authority: pool.authority,
+                identity: pool.identity.clone(),
+                retry: Duration::from_secs(30),
+                mode,
+                p2pool_prepare_api: p2pool_prepare_api.clone(),
+                required: p2pool_prepare_api.is_some()
+                    || job_declaration.is_some_and(|mode| mode.requires_own_templates()),
+            })
+            .collect();
+        if p2pool_prepare_api.is_some() {
+            let address = crate::donation::bch::address(config.network);
+            let share = crate::tx::p2pool_share_address(address)
+                .expect("the configured donation address is a network-checked P2PKH");
+            super::jd::client::spawn_p2pool(targets, format!("{address},p2p={share}"), stop.clone())
+        } else {
+            super::jd::client::spawn(targets, stop.clone())
+        }
     });
     let uplink_handle = uplink.as_ref().map(|(handle, _)| handle.clone());
     // #### PR #42: the server's work: the nodes' (or providers') templates,
@@ -1281,6 +1306,12 @@ fn started_text(started: &Started) -> String {
         let mode = match mode {
             crate::cli::JobDeclarationMode::Full => "Full-Template",
             crate::cli::JobDeclarationMode::Coinbase => "Coinbase-only",
+            crate::cli::JobDeclarationMode::FullRequired => {
+                "Full-Template required (no pool-template fallback)"
+            }
+            crate::cli::JobDeclarationMode::CoinbaseRequired => {
+                "Coinbase-only required (no pool-template fallback)"
+            }
         };
         text.push_str(&format!(
             "Your templates  {mode} Job Declaration at the first pool, from your node; devices \

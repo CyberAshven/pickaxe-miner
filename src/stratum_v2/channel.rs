@@ -792,7 +792,8 @@ impl Channel {
         let forward = job.template.jd_plan().map(|plan| {
             let start = job.parts.prefix.len() - plan.pad.len() - plan.layout().0;
             super::jd::ForwardShare {
-                serial: job.generation,
+                donation: job.payout.donation_work,
+                serial: job.template.declaration_id(job.generation),
                 version: share.version,
                 ntime: share.time,
                 nonce: share.nonce,
@@ -1943,6 +1944,7 @@ mod tests {
                 fee_output: Some(1),
             },
             pool_target: [0xff; 32],
+            p2pool: None,
         };
         template.declare(Arc::new(plan.clone()));
         let template = Arc::new(template);
@@ -2029,8 +2031,10 @@ mod tests {
                 fee_output: Some(1),
             },
             pool_target: [0xff; 32],
+            p2pool: None,
         };
         template.declare(Arc::new(plan.clone()));
+        template.set_declaration_id(73);
         let template = Arc::new(template);
         let lane = |kind, compact| {
             let mut channel = Channel::new(
@@ -2081,6 +2085,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(share.coinbase.bytes, coinbase);
+        assert_eq!(share.generation, 11);
+        assert_eq!(share.forward.as_ref().unwrap().serial, 73);
         assert_eq!(
             share.forward.unwrap().extranonce,
             [5, 0, 7, 0, 0x42, 0x42, 0x42, 0x42]

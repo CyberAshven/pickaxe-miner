@@ -13,9 +13,10 @@ Pickaxe has both sides, in both of the spec's modes:
 - **Coinbase-only**: the miner declares only the coinbase. The pool never
   sees the transactions, and only the miner's node submits the blocks.
 
-No other BCH pool offers Job Declaration today. SRI's and ckpool's Job
-Declaration servers validate through Bitcoin Core's IPC, which BCH nodes do
-not have, so a Pickaxe client's counterpart is a Pickaxe pool.
+A Pickaxe pool accepts both modes. BCH P2Pool requires the preparation adapter
+described below because its coinbase pays a share-chain window rather than one
+miner. Bitcoin-only JD servers still require their own compatible BCH validation
+path.
 
 ### Who works with whom
 
@@ -353,3 +354,55 @@ while your templates are mined".
   client's own jobs when every pool is down.
 - A live run against BCHN on Chipnet, and SRI's Job Declaration client against
   a Pickaxe pool.
+
+## Public BCH P2Pool with your own BCH node
+
+#### PR #65
+
+The optional **Your templates** setting now has three P2Pool choices: public
+node jobs, a managed local P2Pool node, and a public P2Pool connection with your
+own BCH node's templates required. The last choice saves both your node and the
+public node's preparation URL with the profile. The managed node option remains
+available without Job Declaration.
+
+The public node must run a version with the read-only `/jd_prepare` API as well
+as BCH SV2 Job Declaration. An older binary cannot supply this mode. For CLI
+use, add `--job-declaration full-required --p2pool-prepare-api
+https://POOL/jd_prepare` to the normal `stratum-v2 serve` configuration with its
+upstream authority and a separately configured BCH node. `coinbase-required`
+keeps the transaction list private. Generic Pickaxe pools also support these
+required variants without the preparation API. Required modes do not append
+pool-template fallback routes; a refused declaration waits or tries the next
+configured JD pool. Preparation APIs use HTTPS, or literal loopback HTTP for a
+local helper, and never follow redirects.
+
+P2Pool constructs its exact PPLNS coinbase using the allocated token's anchor
+and the selected block's difficulty and fee revenue. Pickaxe preserves its own
+transaction set and merkle branch, checks the returned revenue, header layout,
+12-byte extranonce and reserved auxiliary commitment, and submits standard SV2
+Job Declaration messages. The pool's independent validation must acknowledge
+both beneficiary jobs before devices use them. Each preparation has a distinct
+publication ID so a late share retains the job and coinbase it actually hashed.
+An accepted same-parent job can continue during refresh only for its original
+freshness lease. Reconnecting either beneficiary revokes readiness.
+
+As for other remote pools, the configured BCH donation is allocated as validated
+mining work on a separately authorized donation channel. It never deducts from
+other PPLNS participants' coinbase outputs. Both channels use the miner's own
+transaction selection. Block-only and late shares keep their original recipient.
+P2Pool's own operator cuts, when configured, are independent of this allocation.
+
+The Chipnet interoperability check used a separate P2Pool process and Start9
+BCHN: Full-Template and Coinbase-only custom jobs were accepted for both
+recipients at height 328754, without hashing or broadcasting a block. This
+proves preparation and acknowledgement, not a live PPLNS reward or an ASIC run.
+The dependency's 1,872 workspace tests passed; the Pickaxe regression and live
+checks are recorded in the PR. The helper is introduced in
+[the companion P2Pool change](https://github.com/CyberAshven/BitcoinCash-p2poolv2/pull/7);
+public nodes need that implementation installed before this option can connect.
+
+PHOTON/ELECTRIC GPU hash splitting is separate from BCH auxiliary proof-of-work.
+No production BCH merge-mined CashToken is registered here. The P2Pool adapter
+refuses Pickaxe's existing test-token proof format until a token-specific proof
+adapter is validated; it never silently drops a requested commitment. The
+P2Pool preparation API can represent an auxiliary root, tree size and nonce.

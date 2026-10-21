@@ -1551,16 +1551,20 @@ fn main() {
             }
         }
         // #### PR #53: several GPU tokens on the selected GPUs, by share.
-        cli::Commands::Split { shares } => {
+        cli::Commands::Split {
+            shares,
+            restricted_electric_pot,
+        } => {
             use std::io::IsTerminal;
             let result = hash_split::Shares::parse(&shares, cfg.network).and_then(|shares| {
                 let gpus = backend::resolve_mining_devices(backend_kind, &effective_device)?;
-                hash_split::run(
+                hash_split::run_with_pot_mode(
                     &cfg,
                     &gpus,
                     &shares,
                     &config_path,
                     args.no_tui || !io::stdout().is_terminal(),
+                    restricted_electric_pot,
                 )
             });
             if let Err(error) = result {

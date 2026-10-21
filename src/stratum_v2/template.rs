@@ -60,6 +60,9 @@ pub struct BchTemplate {
     /// jobs built from this template pay the pool's outputs and nest their
     /// extranonce inside the pool channel's.
     jd: Option<Arc<JdPlan>>,
+    p2pool: Option<Arc<crate::p2pool::jd::Prepared>>,
+    p2pool_donation: Option<Arc<BchTemplate>>,
+    declaration_id: Option<u64>,
     /// #### PR #42: a BCH block, or an ASIC-exclusive token's header.
     work: Work,
 }
@@ -248,6 +251,9 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::Own,
             jd: None,
+            p2pool: None,
+            p2pool_donation: None,
+            declaration_id: None,
             work: Work::Block,
         })
     }
@@ -339,6 +345,9 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::Own,
             jd: None,
+            p2pool: None,
+            p2pool_donation: None,
+            declaration_id: None,
             work: Work::Block,
         })
     }
@@ -373,6 +382,9 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::HeaderOnly,
             jd: None,
+            p2pool: None,
+            p2pool_donation: None,
+            declaration_id: None,
             work: Work::Block,
         }
     }
@@ -408,6 +420,9 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::Declared,
             jd: None,
+            p2pool: None,
+            p2pool_donation: None,
+            declaration_id: None,
             work: Work::Block,
         }
     }
@@ -446,6 +461,9 @@ impl BchTemplate {
             tokens: None,
             origin: Origin::Own,
             jd: None,
+            p2pool: None,
+            p2pool_donation: None,
+            declaration_id: None,
             work: Work::Token(job),
         }
     }
@@ -575,6 +593,61 @@ impl BchTemplate {
         self.jd.as_ref()
     }
 
+    /// #### PR #65: obtain P2Pool's exact PPLNS coinbase before publishing.
+    /// It cannot change the independently sourced transaction list or revenue.
+    pub fn prepare_p2pool(&mut self) -> Result<(), String> {
+        self.p2pool = None;
+        if let Some(plan) = self.jd.as_ref().and_then(|plan| plan.p2pool.as_ref()) {
+            if self.tokens.is_some() {
+                return Err(
+                    "this token set does not yet have a P2Pool-compatible aux proof adapter".into(),
+                );
+            }
+            self.p2pool = Some(Arc::new(plan.prepare(
+                self.height,
+                self.bits,
+                &self.previous_hash,
+                self.coinbase_value,
+                &self.script_head(),
+                None,
+            )?));
+        }
+        Ok(())
+    }
+
+    pub fn p2pool_token(&self) -> Option<&[u8]> {
+        self.p2pool
+            .as_ref()
+            .map(|prepared| prepared.token.as_slice())
+    }
+
+    pub fn is_p2pool(&self) -> bool {
+        self.jd.as_ref().is_some_and(|plan| plan.p2pool.is_some())
+    }
+
+    pub fn set_declaration_id(&mut self, id: u64) {
+        self.declaration_id = Some(id);
+    }
+
+    pub fn declaration_id(&self, generation: u64) -> u64 {
+        self.declaration_id.unwrap_or(generation)
+    }
+
+    fn check_p2pool_prepared(&self) -> Result<(), String> {
+        if self.is_p2pool() && self.p2pool.is_none() {
+            return Err("P2Pool coinbase has not been prepared".into());
+        }
+        Ok(())
+    }
+
+    pub fn set_p2pool_donation(&mut self, template: BchTemplate) {
+        self.p2pool_donation = Some(Arc::new(template));
+    }
+
+    pub fn p2pool_donation(&self) -> Option<&Arc<BchTemplate>> {
+        self.p2pool_donation.as_ref()
+    }
+
     /// #### PR #42: the coinbase script's head: the BIP34 height push, the
     /// node's flags and the pool's name; a custom job's `coinbase_prefix`.
     pub fn script_head(&self) -> Vec<u8> {
@@ -618,6 +691,14 @@ impl BchTemplate {
     /// client roll), as DeclareMiningJob carries it: the same bytes as the
     /// local channels' coinbases, merge-mining outputs included.
     pub fn declared_parts(&self) -> Result<CoinbaseParts, String> {
+        self.check_p2pool_prepared()?;
+        if let Some(prepared) = &self.p2pool {
+            return Ok(CoinbaseParts {
+                prefix: prepared.coinbase.prefix.clone(),
+                suffix: prepared.coinbase.suffix.clone(),
+                merkle_path: self.merkle_path.to_vec(),
+            });
+        }
         let plan = self.jd.as_ref().ok_or("not a Job Declaration template")?;
         let extranonce = plan.upstream_prefix.len() + plan.rollable();
         let aux = self.declared_aux()?;
@@ -659,6 +740,10 @@ impl BchTemplate {
     /// the commitment first when tokens are merge-mined, the pool's outputs,
     /// then the tickets.
     pub fn declared_outputs(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        self.check_p2pool_prepared()?;
+        if let Some(prepared) = &self.p2pool {
+            return Ok(prepared.coinbase.outputs.clone());
+        }
         let plan = self.jd.as_ref().ok_or("not a Job Declaration template")?;
         let mut outputs = plan.outputs(self.coinbase_value);
         if let Some(aux) = self.declared_aux()? {
@@ -766,6 +851,21 @@ impl BchTemplate {
         policy: crate::donation::bch::BchPayout,
         aux: Option<&AuxOutputs>,
     ) -> Result<Coinbase, String> {
+        self.check_p2pool_prepared()?;
+        if let Some(prepared) = &self.p2pool {
+            if aux.is_some() {
+                return Err("P2Pool coinbase does not carry this token proof format".into());
+            }
+            let bytes = prepared
+                .coinbase
+                .coinbase(extranonce)
+                .ok_or("P2Pool extranonce length changed")?;
+            self.check_block_size(bytes.len())?;
+            return Ok(Coinbase {
+                merkle_root: fold(double_sha256(&bytes), &self.merkle_path),
+                bytes,
+            });
+        }
         // #### PR #42: the script coinbase
         // What: on a SAFA job the coinbase is the forwarder: a push of the
         // tag and the extranonce, OP_DROP, and the rule that forwards the
