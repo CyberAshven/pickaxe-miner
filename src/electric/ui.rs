@@ -66,6 +66,12 @@ pub struct Summary {
     pub donation: Option<crate::donation::TokenDonation>,
     pub difficulty: Option<u8>,
     pub pending: bool,
+    pub endpoint: Option<String>,
+    /// Successful connections after the first, for ELECTRIC alone.
+    pub reconnects: u64,
+    pub height: Option<u32>,
+    /// Conservative transaction-fee estimate, excluding the token output's BCH.
+    pub claim_fee_estimate: Option<u64>,
 }
 
 /// #### PR #65: events kept for the dashboard to take, at most.
@@ -83,6 +89,10 @@ struct View {
     donation: Option<crate::donation::TokenDonation>,
     difficulty: Option<u8>,
     pending: bool,
+    endpoint: Option<String>,
+    connections: u64,
+    height: Option<u32>,
+    claim_fee_estimate: Option<u64>,
 }
 
 /// The fee pot the miner funds, as the screen shows it.
@@ -152,6 +162,10 @@ impl Monitor {
                 donation: None,
                 difficulty: None,
                 pending: false,
+                endpoint: None,
+                connections: 0,
+                height: None,
+                claim_fee_estimate: None,
             }),
             plain,
             started: Instant::now(),
@@ -212,11 +226,19 @@ impl Monitor {
         Ok(())
     }
 
-    pub(super) fn job(&self, difficulty: u8) {
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .difficulty = Some(difficulty);
+    /// #### PR #65: connection and claim-cost details belong to ELECTRIC,
+    /// including while it lends its GPU time to another token.
+    pub(super) fn connected(&self, endpoint: &str) {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.endpoint = Some(crate::node::redact_url(endpoint));
+        view.connections = view.connections.saturating_add(1);
+    }
+
+    pub(super) fn job(&self, height: u32, difficulty: u8, fee_estimate: u64) {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.height = Some(height);
+        view.difficulty = Some(difficulty);
+        view.claim_fee_estimate = Some(fee_estimate);
     }
 
     pub(super) fn pending(&self, pending: bool) {
@@ -401,6 +423,10 @@ impl Monitor {
             donation: view.donation,
             difficulty: view.difficulty,
             pending: view.pending,
+            endpoint: view.endpoint.clone(),
+            reconnects: view.connections.saturating_sub(1),
+            height: view.height,
+            claim_fee_estimate: view.claim_fee_estimate,
         }
     }
     pub fn record(&self, device: usize, count: u32, duration: Duration) {
@@ -548,6 +574,28 @@ mod tests {
         let plain = Monitor::new(80, true, "RTX (cuda)".into());
         plain.event("Connected: wss://example");
         assert!(plain.drain_events().is_empty());
+    }
+
+    #[test]
+    fn electric_connection_and_cost_details_do_not_invent_a_first_reconnect() {
+        let monitor = Monitor::new(80, false, "test".into());
+        assert!(monitor.summary().endpoint.is_none());
+        assert_eq!(monitor.summary().reconnects, 0);
+        monitor.connected("wss://user:example-secret@electric.invalid:50004");
+        let initial = monitor.summary();
+        assert_eq!(initial.reconnects, 0);
+        assert!(!initial.endpoint.unwrap().contains("example-secret"));
+        monitor.connected("wss://electric-other.invalid:50004");
+        monitor.job(973893, 4, 1234);
+        let next = monitor.summary();
+        assert_eq!(
+            next.endpoint.as_deref(),
+            Some("wss://electric-other.invalid:50004")
+        );
+        assert_eq!(next.reconnects, 1);
+        assert_eq!(next.height, Some(973893));
+        assert_eq!(next.difficulty, Some(4));
+        assert_eq!(next.claim_fee_estimate, Some(1234));
     }
 
     #[test]

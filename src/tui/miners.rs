@@ -31,6 +31,7 @@ pub(super) struct Tokens {
     pub(super) telemetry: GpuTelemetry,
     layout: String,
     selected: usize,
+    detail_page: i32,
     editing: bool,
     show_pot: bool,
     intensity: u8,
@@ -135,6 +136,7 @@ pub fn run_miners(
         .then(|| LiveTelemetrySampler::start(crate::telemetry::telemetry_sources(gpus)));
     let mut rewards = vec![0u64; miners.runtimes.len()];
     let mut selected = 0;
+    let mut detail_page = 0;
     let mut editing = false;
     let mut show_pot = false;
     let mut paused = false;
@@ -232,6 +234,7 @@ pub fn run_miners(
                 layout.lock().unwrap_or_else(|e| e.into_inner()).clone()
             }),
             selected,
+            detail_page,
             editing,
             show_pot,
             intensity,
@@ -273,6 +276,7 @@ pub fn run_miners(
         }
         let tokens = state.tokens.as_ref().expect("session view");
         selected = tokens.selected;
+        detail_page = tokens.detail_page;
         editing = tokens.editing;
         show_pot = tokens.show_pot;
         paused = tokens.paused;
@@ -318,10 +322,18 @@ fn token_command(
             state.status_line = "Current state and rates are shown for each token.".into()
         }
         PaletteCommand::Reconnect => {
-            for (_, runtime) in &miners.runtimes {
+            let token = state.tokens.as_ref().and_then(|t| t.split.get(t.selected));
+            if let Some((_, runtime)) = token.and_then(|row| {
+                miners
+                    .runtimes
+                    .iter()
+                    .find(|(token, _)| *token == row.token)
+            }) {
                 runtime.reconnect()?;
+                state.status_line = "Selected token reconnect requested.".into();
+            } else {
+                state.status_line = "ELECTRIC reconnects automatically on transport errors.".into();
             }
-            state.status_line = "PHOTON reconnect requested; ELECTRIC reconnects automatically on transport errors.".into();
         }
         PaletteCommand::SetPayout(_) | PaletteCommand::SetEndpoint(_) => {
             state.status_line = "Stop and use setup to change this session's address or servers; its fee pot and pending claims remain bound to their recipients.".into();
@@ -414,6 +426,7 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
             } else {
                 (tokens.selected + 1) % count
             };
+            tokens.detail_page = 0;
             return Ok(false);
         }
         if matches!(
@@ -467,6 +480,7 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
             KeyCode::Esc | KeyCode::Char('s' | 'S') => {
                 state.settings_mode = false;
                 tokens.editing = false;
+                tokens.detail_page = 0;
             }
             KeyCode::Up => {
                 tokens.selected = tokens
@@ -474,10 +488,12 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
                     .checked_sub(1)
                     .unwrap_or(tokens.split.len() - 1);
                 tokens.editing = false;
+                tokens.detail_page = 0;
             }
             KeyCode::Down => {
                 tokens.selected = (tokens.selected + 1) % tokens.split.len();
                 tokens.editing = false;
+                tokens.detail_page = 0;
             }
             KeyCode::Enter if miners.split.is_some() => tokens.editing = !tokens.editing,
             KeyCode::Left | KeyCode::Right | KeyCode::Char('+' | '-') if tokens.editing => {
@@ -514,11 +530,15 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
             return Ok(false);
         }
         KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
-            tokens.selected = (tokens.selected + 1) % tokens.split.len()
+            tokens.selected = (tokens.selected + 1) % tokens.split.len();
+            tokens.detail_page = 0;
         }
         KeyCode::Up | KeyCode::Left => {
-            tokens.selected = (tokens.selected + tokens.split.len() - 1) % tokens.split.len()
+            tokens.selected = (tokens.selected + tokens.split.len() - 1) % tokens.split.len();
+            tokens.detail_page = 0;
         }
+        KeyCode::PageDown => tokens.detail_page = tokens.detail_page.wrapping_add(1),
+        KeyCode::PageUp => tokens.detail_page = tokens.detail_page.wrapping_sub(1),
         KeyCode::Char('g' | 'G') => state.apply_chart_request(ChartRequest::Toggle),
         KeyCode::Char('o' | 'O') => state.apply_chart_request(ChartRequest::Options),
         KeyCode::Char('s' | 'S') => state.settings_mode = true,
@@ -541,6 +561,119 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
         _ => {}
     }
     Ok(false)
+}
+
+/// #### PR #65: only the selected token owns these fields. All rows are
+/// wrapped before paging, so even a long recovery path remains readable.
+fn token_details(tokens: &Tokens, row: &TokenRow, width: u16) -> Vec<Line<'static>> {
+    let value_width = (width.saturating_sub(2) as usize).saturating_sub(RUNTIME_LABEL_WIDTH);
+    let field =
+        |name: &str, value: String| RuntimeField::new(name, wrap_value(&value, value_width), 0);
+    let (pending, odds, hashes, donation) = if let Some(snapshot) = &row.runtime {
+        (
+            snapshot.pending_winners,
+            win_probability(&snapshot.photon_target_le, snapshot.network).map(|p| 1.0 / p),
+            snapshot.search.candidates,
+            Some(snapshot.token_donation),
+        )
+    } else if row.token == SplitToken::Electric {
+        let Some(e) = &tokens.electric else {
+            return Vec::new();
+        };
+        (
+            u64::from(e.pending),
+            e.difficulty.map(|d| 256f64.powi(i32::from(d))),
+            e.hashes,
+            e.donation,
+        )
+    } else {
+        return Vec::new();
+    };
+    let mut fields = vec![
+        field(
+            "Wins",
+            format!("{} accepted · {pending} pending", row.rewards),
+        ),
+        field(
+            "Odds",
+            odds.map_or_else(
+                || "Reading current target".into(),
+                |hashes| format!("1 win per {} hashes", format_si_count(hashes)),
+            ),
+        ),
+        field("Work", format!("{hashes} hashes")),
+        field(
+            "Donation",
+            donation.map_or_else(|| "Reading policy".into(), |d| d.to_string()),
+        ),
+    ];
+    if let Some(snapshot) = &row.runtime {
+        fields.extend(
+            runtime_field_groups(snapshot, width)
+                .into_iter()
+                .filter(|field| {
+                    field
+                        .lines
+                        .first()
+                        .and_then(|line| line.spans.first())
+                        .is_some_and(|span| {
+                            matches!(
+                                span.content.trim(),
+                                "Target"
+                                    | "Payout"
+                                    | "Chain"
+                                    | "Baton"
+                                    | "Endpoint"
+                                    | "Network"
+                                    | "Source"
+                                    | "Last error"
+                            )
+                        })
+                }),
+        );
+    } else if let Some(e) = tokens
+        .electric
+        .as_ref()
+        .filter(|_| row.token == SplitToken::Electric)
+    {
+        let reward_sats = crate::electric::TOKEN_OUTPUT_SATS;
+        fields.push(field(
+            "Endpoint",
+            e.endpoint.clone().unwrap_or_else(|| "Connecting".into()),
+        ));
+        fields.push(field(
+            "Network",
+            format!("reconnects {} · ELECTRIC connection", e.reconnects),
+        ));
+        fields.push(field(
+            "Chain",
+            e.height
+                .map_or_else(|| "Reading height".into(), |h| format!("height {h}")),
+        ));
+        fields.push(field(
+            "Fee pot",
+            e.pot.map_or_else(
+                || "Reading balance · F fund / QR".into(),
+                |(sats, claims)| format!("{sats} sats · about {claims} claims · F fund / QR"),
+            ),
+        ));
+        fields.push(field(
+            "Claim cost",
+            e.claim_fee_estimate.map_or_else(
+                || format!("Reading fee estimate; each reward also carries {reward_sats} sats BCH"),
+                |fee| {
+                    format!(
+                        "~{} sats: {reward_sats} reward BCH + ~{fee} fee",
+                        reward_sats + fee
+                    )
+                },
+            ),
+        ));
+        if let Some(key) = &e.pot_key {
+            fields.push(field("Pot key", key.clone()));
+        }
+    }
+    fields.into_iter().flat_map(|field| field.lines).collect()
 }
 
 fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
@@ -619,14 +752,6 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
         format_metric(tokens.telemetry.temperature_c, " C"),
         format_metric(tokens.telemetry.power_watts, " W")
     )));
-    if let Some(electric) = &tokens.electric {
-        lines.push(Line::from(match electric.pot {
-            Some((sats, claims)) => {
-                format!("Fee pot  {sats} sats · {claims} claims · [F] fund / QR")
-            }
-            None => "Fee pot  reading balance · [F] fund / QR".into(),
-        }));
-    }
     let runtime_areas = Layout::vertical([
         Constraint::Length(
             (lines.len() as u16 + 2)
@@ -644,70 +769,30 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
     );
     if let Some(row) = tokens.split.get(tokens.selected) {
         if runtime_areas[1].height >= 4 {
-            let details = if let Some(snapshot) = &row.runtime {
-                let mut details = vec![
-                    Line::from(format!(
-                        "Wins       {} accepted · {} pending",
-                        row.rewards, snapshot.pending_winners
-                    )),
-                    Line::from(
-                        match win_probability(&snapshot.photon_target_le, snapshot.network) {
-                            Some(probability) => format!(
-                                "Odds       1 win per {} hashes",
-                                format_si_count(1.0 / probability)
-                            ),
-                            None => "Odds       Reading current target".into(),
-                        },
-                    ),
-                    Line::from(format!("Work       {} hashes", snapshot.search.candidates)),
-                ];
-                let extra = runtime_areas[1].height.saturating_sub(5) as usize;
-                let fields = runtime_field_groups(snapshot, runtime_areas[1].width)
-                    .into_iter()
-                    .filter(|field| {
-                        field
-                            .lines
-                            .first()
-                            .and_then(|line| line.spans.first())
-                            .is_some_and(|span| {
-                                matches!(
-                                    span.content.trim(),
-                                    "Target"
-                                        | "Chain"
-                                        | "Baton"
-                                        | "Endpoint"
-                                        | "Network"
-                                        | "Source"
-                                        | "Last error"
-                                )
-                            })
-                    })
-                    .collect();
-                details.extend(fit_runtime_fields(fields, extra));
-                details
-            } else if let Some(e) = &tokens.electric {
-                let expected = e.difficulty.map(|d| 256f64.powi(i32::from(d)));
-                vec![
-                    Line::from(format!(
-                        "Wins       {} accepted · {} pending",
-                        row.rewards,
-                        u8::from(e.pending)
-                    )),
-                    Line::from(match expected {
-                        Some(hashes) => {
-                            format!("Odds       1 win per {} hashes", format_si_count(hashes))
-                        }
-                        None => "Odds       Reading current target".into(),
-                    }),
-                    Line::from(format!("Work       {} hashes", e.hashes)),
-                ]
+            let details = token_details(tokens, row, runtime_areas[1].width);
+            let page_height = runtime_areas[1].height.saturating_sub(2).max(1) as usize;
+            let pages = details.len().div_ceil(page_height).max(1);
+            let page = tokens.detail_page.rem_euclid(pages as i32) as usize;
+            let title = if pages > 1 {
+                format!(
+                    " {} details {}/{} · PgUp/PgDn · {} ",
+                    row.name,
+                    page + 1,
+                    pages,
+                    row.state
+                )
             } else {
-                Vec::new()
+                format!(" {} details · {} ", row.name, row.state)
             };
             frame.render_widget(
-                Paragraph::new(details).block(
-                    Block::bordered().title(format!(" {} details · {} ", row.name, row.state)),
-                ),
+                Paragraph::new(
+                    details
+                        .into_iter()
+                        .skip(page * page_height)
+                        .take(page_height)
+                        .collect::<Vec<_>>(),
+                )
+                .block(Block::bordered().title(title)),
                 runtime_areas[1],
             );
         }
@@ -765,7 +850,7 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
             Line::from("Changes apply to future mining work for this session."),
             Line::from("B on the dashboard saves this session and returns to profiles."),
             Line::from("Existing proofs, payouts and the fee pot keep their recipients."),
-            Line::from("A / Esc closes; mining continues."),
+            Line::from("A / Esc closes; mining continues. PgUp/PgDn pages token details."),
         ]);
         if !tokens.layout.is_empty() {
             lines.push(Line::from(format!("GPU allocation: {}", tokens.layout)));
@@ -883,12 +968,13 @@ fn render_pot(
                 .unwrap_or_else(|| "Preparing pot address…".into()),
         ),
         Line::from(""),
-        Line::from("Send plain BCH on the same network. The pot pays claim fees."),
+        Line::from("The pot pays 1000 sats BCH per token output, plus network fees."),
         Line::from(match e.pot {
             Some((s, c)) => format!("{s} sats · enough for {c} claims"),
             None => "Reading balance…".into(),
         }),
         Line::from("Tokens go directly to each winning recipient."),
+        Line::from("Reward BCH stays with those tokens; it does not refill the pot."),
     ];
     lines.push(Line::from(""));
     if send.enabled {
@@ -1018,6 +1104,115 @@ pub(super) mod tests {
         }
     }
 
+    #[test]
+    fn selected_details_keep_pot_key_donation_and_connections_with_their_token() {
+        let mut state = fixture();
+        let tokens = state.tokens.as_mut().unwrap();
+        let photon = tokens.split[0].runtime.as_mut().unwrap();
+        photon.endpoint = "wss://photon.invalid:50004".into();
+        photon.reconnects = 7;
+        photon.token_donation = crate::donation::TokenDonation::from_bps(500);
+        let electric = tokens.electric.as_mut().unwrap();
+        electric.endpoint = Some("wss://electric.invalid:50004".into());
+        electric.reconnects = 2;
+        electric.claim_fee_estimate = Some(1234);
+        electric.pot_key = Some("C:/keys/only-electric.pot-key".into());
+        let text = |lines: Vec<Line<'static>>| {
+            lines
+                .into_iter()
+                .flat_map(|line| line.spans)
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        };
+        let photon = text(token_details(tokens, &tokens.split[0], 70));
+        for expected in ["photon.invalid", "reconnects 7", "5.00%"] {
+            assert!(photon.contains(expected), "{expected}: {photon}");
+        }
+        assert!(!photon.contains("Fee pot") && !photon.contains("Pot key"));
+        assert!(!photon.contains("electric.invalid"));
+        let electric = text(token_details(tokens, &tokens.split[1], 70));
+        for expected in [
+            "electric.invalid",
+            "reconnects 2",
+            "4.00%",
+            "Fee pot",
+            "only-electric.pot-key",
+            "~2234 sats",
+            "1000 reward BCH",
+            "~1234 fee",
+        ] {
+            assert!(electric.contains(expected), "{expected}: {electric}");
+        }
+        assert!(!electric.contains("photon.invalid"));
+        // The shared pane never contains another token's pot, even when ELECTRIC
+        // is running. A long path can be read without mixing it with QR cells.
+        for selected in [0, 1] {
+            state.tokens.as_mut().unwrap().selected = selected;
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|frame| render_miners(frame, &state)).unwrap();
+            let shared = (7..11)
+                .map(|y| {
+                    (1..70)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<String>();
+            assert!(shared.contains("Hashrate PHOTON") && shared.contains("Hashrate ELECTRIC"));
+            assert!(shared.contains("GPU utilization"));
+            assert!(!shared.contains("Fee pot") && !shared.contains("Pot key"));
+        }
+    }
+
+    #[test]
+    fn small_terminal_pages_the_entire_recovery_path_and_resets_on_token_selection() {
+        let mut state = fixture();
+        let tokens = state.tokens.as_mut().unwrap();
+        tokens.selected = 1;
+        let path = "C:/Users/example/AppData/Roaming/Pickaxe/electric-mainnet-owner-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pot-key";
+        tokens.electric.as_mut().unwrap().pot_key = Some(path.into());
+        let monitor = Monitor::new(80, false, "test".into());
+        let miners = Miners {
+            network: MiningNetwork::Chipnet,
+            runtimes: vec![],
+            electric: Some(&monitor),
+            split: None,
+            stop: None,
+        };
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut all = String::new();
+        for _ in 0..16 {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| render_miners(frame, &state)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("Hashrate PHOTON") && text.contains("Hashrate ELECTRIC"));
+            assert!(
+                !text.contains("fund the fee pot"),
+                "no funding QR panel in selected details"
+            );
+            all.push_str(&text);
+            token_key(key(KeyCode::PageDown), &miners, &mut state).unwrap();
+        }
+        for part in [
+            "Pot key",
+            "C:/Users/example/",
+            "AppData/Roaming/",
+            ".pot-key",
+        ] {
+            assert!(all.contains(part), "missing path part {part}");
+        }
+        token_key(key(KeyCode::Up), &miners, &mut state).unwrap();
+        assert_eq!(state.tokens.as_ref().unwrap().selected, 0);
+        assert_eq!(state.tokens.as_ref().unwrap().detail_page, 0);
+        assert!(!monitor.stopped());
+        assert!(!state.settings_mode);
+    }
+
     fn fixture() -> TuiState {
         let monitor = Monitor::new(80, false, "Preview GPU".into());
         // Deliberately not a usable payment destination.
@@ -1054,6 +1249,7 @@ pub(super) mod tests {
             telemetry: GpuTelemetry::default(),
             layout: "GPU 0 takes turns · PHOTON 70% / ELECTRIC 30%".into(),
             selected: 0,
+            detail_page: 0,
             editing: false,
             show_pot: false,
             intensity: 80,

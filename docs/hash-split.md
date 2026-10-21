@@ -119,9 +119,14 @@ rate, rewards and state every 30 seconds instead of the screen.
 
 ELECTRIC alone and hash-split sessions use the same chart, log and command
 widgets as PHOTON. The runtime lists one hashrate and work share per token,
-then GPU count, utilization, temperature, power and pot balance. `Tab` or
-the arrows select the token whose own wins, odds and work appear below;
-its state names search, submission and funding waits. Each token keeps a separate chart
+then shared GPU count, utilization, temperature and power. `Tab` or
+the arrows select the token whose own wins, odds, work, donation and connection
+details appear below. ELECTRIC's balance, per-claim BCH cost and pot recovery
+file belong to its details; they are never displayed as PHOTON or session-wide
+properties. Each token tracks its own reconnects, even if both use the same
+server. `PgUp`/`PgDn` pages all details in smaller terminals, including the
+complete recovery path without QR characters beside it.
+Its state names search, submission and funding waits. Each token keeps a separate chart
 trace; their different proof workloads are not speed comparisons.
 All charts start hidden. Press `G` to show the selected charts or hide them
 again; `O` opens the chart picker.
@@ -133,6 +138,7 @@ again; `O` opens the chart picker.
 | `S` | Open shares; Up/Down selects, Enter unlocks, Left/Right moves by 5% |
 | `A` | Advanced settings; Up/Down selects a token, Left/Right adjusts its donation |
 | `Tab` / arrows | Select the token's wins, odds and completed work |
+| `PgUp` / `PgDn` | Page through the selected token's complete details |
 | `F` | Show ELECTRIC's funding address, complete QR and recovery-key file location |
 | `P` / `+` / `-` | Pause/resume all participating tokens / adjust their intensity |
 | `/` | Commands, including `/chart options`, `/split`, `/electric pot` |

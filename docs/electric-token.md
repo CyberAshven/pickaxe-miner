@@ -111,6 +111,22 @@ without changing PHOTON: see [photon-electric-auxpow.md](photon-electric-auxpow.
 
 ## Signed fee-pot claims
 
+#### PR #65: funding cost
+
+The pot pays **1,000 sats attached to each token reward, plus that claim's
+network fee**. The 1,000 sats remain in the recipient's token output; they
+are not a network fee and do not automatically return to the pot. Donation
+work wins also use a token output and network fee from the pot. Moving token
+outputs later needs another transaction and fee; their BCH must not be
+recycled by burning the tokens.
+
+A signed pot can pay multiple claims within one BCH block. Removing the older
+pot's wait therefore increases both the possible reward count and the rate of
+BCH spending. Funding is a number of affordable claims, not a guaranteed
+duration or profit. The dashboard shows ELECTRIC's remaining pot balance and
+a conservative per-claim estimate, separately from the shared GPU information.
+The actual fee comes from the serialized claim and the server's relay fee.
+
 ### Pickaxe-controlled receiving wallet and owner pot
 
 #### PR #65

@@ -870,6 +870,7 @@ fn mine(
             Some(link) => link,
             None => match connect(cfg) {
                 Ok(link) => {
+                    monitor.connected(&link.url);
                     monitor.event(format!("Connected: {}", link.url));
                     session.insert(link)
                 }
@@ -907,6 +908,11 @@ fn mine(
         let now = match snapshot(link, deployment, pot) {
             Ok(now) => {
                 monitor.pot_balance(now.pot_sats, now.pot_claims);
+                monitor.job(
+                    now.tip,
+                    now.baton.state.difficulty,
+                    (CLAIM_BYTES_ESTIMATE * now.relay_fee.max(1_000)).div_ceil(1_000),
+                );
                 now
             }
             Err(error) => {
@@ -1056,7 +1062,6 @@ fn mine(
             "Mining · height {} · difficulty {}",
             now.tip, state.difficulty
         ));
-        monitor.job(state.difficulty);
         let job = SearchJob {
             last_height: state.last_height,
             difficulty: state.difficulty,
