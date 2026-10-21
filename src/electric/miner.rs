@@ -805,8 +805,7 @@ fn snapshot(
 fn recipient_name(recipient: Recipient) -> &'static str {
     match recipient {
         Recipient::Miner => "you",
-        Recipient::Project => "the project donation",
-        Recipient::Collaborator => "the collaborator donation",
+        Recipient::Project | Recipient::Collaborator => "donation",
     }
 }
 
