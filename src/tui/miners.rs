@@ -499,16 +499,12 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
             None => "Fee pot  reading balance · [F] fund / QR".into(),
         }));
         lines.push(Line::from(format!(
-            "ELECTRIC active {} · wall avg {}",
-            crate::telemetry::format_hash_rate(electric.active_rate),
-            crate::telemetry::format_hash_rate(
-                electric.hashes as f64 / electric.uptime.as_secs_f64().max(1e-3)
-            ),
+            "ELECTRIC work {} hashes",
+            electric.hashes,
         )));
         lines.push(Line::from(format!(
-            "ELECTRIC work {} hashes · uptime {}s",
-            electric.hashes,
-            electric.uptime.as_secs()
+            "Uptime  {}",
+            format_duration(electric.uptime.as_secs_f64())
         )));
     }
     let runtime_areas = Layout::vertical([
@@ -528,7 +524,27 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
     );
     if let Some(snapshot) = &tokens.photon {
         if runtime_areas[1].height >= 4 {
-            render_stats(frame, runtime_areas[1], snapshot);
+            // The token rows above already show current hashrates and GPU
+            // telemetry. Keep PHOTON's remaining details without a second
+            // copy of those numbers.
+            let fields = runtime_field_groups(snapshot, runtime_areas[1].width)
+                .into_iter()
+                .filter(|field| {
+                    !field
+                        .lines
+                        .first()
+                        .and_then(|line| line.spans.first())
+                        .is_some_and(|span| {
+                            matches!(span.content.trim(), "Hashrate" | "GPU" | "Uptime")
+                        })
+                })
+                .collect();
+            let details =
+                fit_runtime_fields(fields, runtime_areas[1].height.saturating_sub(2) as usize);
+            frame.render_widget(
+                Paragraph::new(details).block(Block::bordered().title(" PHOTON details ")),
+                runtime_areas[1],
+            );
         }
     }
     render_events(frame, body[1], state);

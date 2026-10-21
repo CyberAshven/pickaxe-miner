@@ -1,8 +1,9 @@
 # ELECTRIC, as a second token
 
 Status: `pickaxe electric` mines the published mainnet contract as it is,
-with keyless fee-pot claims and a dedicated recovery key managed by Pickaxe
-(PR #51). Since PR #58 it searches on GPUs (CUDA, and the portable engine
+with a dedicated fee-pot key managed by Pickaxe. PR #65 signs both claims
+and refunds, allowing fresh same-height proofs without the former keyless
+pot's height gate. Since PR #58 it searches on GPUs (CUDA, and the portable engine
 for integrated and other GPUs), is a token choice in the setup, and has
 Pickaxe's own Chipnet deployment, where it has claimed live (below). No
 payout-wallet key is needed. The design note of 2026-10-13 (PR #50) is
@@ -21,8 +22,8 @@ Sources, read 2026-10-13 and 2026-10-15:
 ## Decision
 
 Mine the published contract beside BCH and PHOTON, on a GPU search, without
-the payout wallet's key in Pickaxe. A separate pot-only recovery key protects
-refunds. Document its replay weakness, never use it, and keep the
+the payout wallet's key in Pickaxe. A separate pot-only key protects claims
+and refunds. Document its replay weakness, never use it, and keep the
 deployment as data so a fixed contract is one new `Contract` variant.
 
 ## Replay
@@ -108,7 +109,43 @@ PHOTON cannot share work with it either; on one GPU the two split the time.
 A new ELECTRIC contract could be merge-mined with PHOTON as the parent,
 without changing PHOTON: see [photon-electric-auxpow.md](photon-electric-auxpow.md).
 
-## Paying the fee with an owner-recoverable pot
+## Signed fee-pot claims
+
+#### PR #65
+
+New pots require the dedicated pot key to sign each claim and refund.
+Fresh proofs can be mined repeatedly at the same block height, up to the
+token contract's difficulty limit. The old height gate is unnecessary for
+these pots: a public ELECTRIC proof alone cannot authorize spending their BCH.
+The signature commits to both input outpoints, the spent pot amount and all
+outputs. The covenant still restricts the reward recipients, exact transaction
+shape, change to the same pot and the maximum fee. Pending signed claims are
+saved before broadcast and rebuilt with the same key on recovery.
+
+**Existing funded pots:** their scripts and addresses cannot change in place.
+The same recovery-key file is reused; it is never replaced. `electric status
+--restricted-pot` and `electric refund --restricted-pot` select the previous
+owner-recoverable pot. Refunds still return BCH only to the original payout
+wallet. Use that wallet to fund the new signed pot shown in setup or by
+`electric pot`. Review the refund transaction preview before
+adding `--broadcast`. Pickaxe never moves these funds automatically or imports
+the payout wallet's key. `--legacy-pot` continues to select the oldest pot
+without a recovery key. Each version keeps its own pending journal.
+
+The following historical keyless-claim description applies only to those
+older funded pots. Their protection is retained for recovery and compatibility.
+
+Live Chipnet check (2026-10-21): a separately funded signed pot completed four
+claims at height 328750. Start9 BCHN independently returned all four exact
+transactions; three were same-height continuations, two above the minimum
+difficulty. They paid 938 sats each for 938 bytes (3,752 sats total fees),
+and delivered 4,000 sats alongside their token rewards. The miner then waited
+for more pot funding, with no pending claim. Mainnet pot funds were untouched.
+The independent standard/consensus BCH VM suite covers 33 valid and refused
+claims/refunds, including wrong-key/unsigned claims, changed outpoints and
+amounts, duplicate pots, and all permitted recipients.
+
+## Previous owner-recoverable pots
 
 #### PR #51
 

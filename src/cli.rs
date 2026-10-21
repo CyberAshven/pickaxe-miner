@@ -308,6 +308,10 @@ pub struct ElectricDeploymentArgs {
     /// Use an already-funded keyless pot from the original ELECTRIC build.
     #[arg(long)]
     pub legacy_pot: bool,
+    /// Use the previous recovery-key pot, whose keyless claims wait between heights.
+    /// Its funding address and refund key remain available for existing funds.
+    #[arg(long, conflicts_with = "legacy_pot")]
+    pub restricted_pot: bool,
     /// The deployment's token category ID.
     #[arg(long, value_name = "HEX")]
     pub electric_category: Option<String>,

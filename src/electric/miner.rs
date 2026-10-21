@@ -8,8 +8,8 @@
 
 use super::recovery::RecoveryKey;
 use super::{
-    build_claim, build_refund, claim_locktime, script_hash_hex, Baton, Coin, Deployment, Pot,
-    SearchJob, POT_MIN_CHANGE_SATS, TOKEN_OUTPUT_SATS,
+    build_authorized_claim, build_refund, script_hash_hex, Baton, Coin, Deployment, Pot, SearchJob,
+    POT_MIN_CHANGE_SATS, TOKEN_OUTPUT_SATS,
 };
 use crate::cli::{ElectricCommand, ElectricDeploymentArgs};
 use crate::config::{MiningToken, RuntimeConfig};
@@ -42,6 +42,9 @@ pub fn run(
             let args = deployment;
             let deployment = select(cfg, args)?;
             let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, true)?;
+            if pot.authorized_claims {
+                println!("Signed claim pot: fresh same-height proofs are allowed. Older funded pots retain their address and key; select --restricted-pot on status/refund to recover their BCH. No funds are moved automatically.");
+            }
             if let Some(path) = key_path {
                 println!(
                     "Recovery key saved: {}. Back up this private file before funding.",
@@ -72,7 +75,12 @@ pub fn run(
             let baton = read_baton(&mut session, &deployment)?;
             println!("server:     {}", session.url);
             println!("tip:        {tip}");
-            print_baton(&deployment, &baton, tip);
+            print_baton(
+                &deployment,
+                &baton,
+                tip,
+                args.restricted_pot || args.legacy_pot,
+            );
             if !cfg.payout_address.trim().is_empty() {
                 let (pot, _, _) = pot_for(cfg, &deployment, args, config_path, false)?;
                 let coins = read_pot(&mut session, &pot)?;
@@ -272,6 +280,7 @@ fn session(
             &ready.pot,
             &ready.addresses,
             &ready.journal_path,
+            ready.claim_key.as_ref(),
             &monitor,
         )
     })
@@ -294,6 +303,7 @@ struct Ready {
     addresses: [String; 3],
     engines: Vec<super::gpu::Engine>,
     journal_path: PathBuf,
+    claim_key: Option<RecoveryKey>,
 }
 
 fn prepare(
@@ -306,6 +316,14 @@ fn prepare(
 ) -> Result<Ready, String> {
     let deployment = select(cfg, args)?;
     let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, create_key)?;
+    let claim_key = if pot.authorized_claims {
+        Some(RecoveryKey::load(
+            key_path.as_deref().ok_or("pot claim key unavailable")?,
+            false,
+        )?)
+    } else {
+        None
+    };
     let engines = devices
         .iter()
         .map(super::gpu::Engine::new)
@@ -322,6 +340,7 @@ fn prepare(
         addresses,
         engines,
         journal_path,
+        claim_key,
     })
 }
 
@@ -347,6 +366,7 @@ pub fn run_in_split(
         &ready.pot,
         &ready.addresses,
         &ready.journal_path,
+        ready.claim_key.as_ref(),
         monitor,
     )
 }
@@ -449,8 +469,11 @@ fn pot_for(
         ))
     });
     let key = RecoveryKey::load(&path, create)?;
-    let pot = Pot::with_recovery(deployment, &locks, Some(key.public()))?;
-    // Only the public key reaches the mining loop; the secret is for refunds.
+    let pot = if args.restricted_pot {
+        Pot::with_recovery(deployment, &locks, Some(key.public()))?
+    } else {
+        Pot::with_authorized_claims(deployment, &locks, key.public())?
+    };
     Ok((pot, addresses, Some(path)))
 }
 
@@ -471,7 +494,7 @@ fn print_deployment(cfg: &RuntimeConfig, deployment: &Deployment, addresses: &[S
     );
 }
 
-fn print_baton(deployment: &Deployment, baton: &Baton, tip: u32) {
+fn print_baton(deployment: &Deployment, baton: &Baton, tip: u32, restricted: bool) {
     let state = baton.state;
     println!(
         "baton:      {}:{} difficulty {} height {} claims {} left {} units",
@@ -482,19 +505,22 @@ fn print_baton(deployment: &Deployment, baton: &Baton, tip: u32) {
         state.mine_count,
         baton.token_amount
     );
-    match claim_locktime(state, tip, deployment) {
+    match if restricted {
+        super::claim_locktime(state, tip, deployment)
+    } else {
+        (tip >= state.last_height).then_some(tip)
+    } {
         Some(locktime) if locktime > state.last_height => println!(
             "next:       a claim at difficulty {} moves the baton to height {locktime}",
             state.difficulty
         ),
         Some(_) => println!(
-            "next:       the cheap claim at difficulty {} on this height",
+            "next:       a same-height claim at difficulty {} (authorized pot)",
             state.difficulty
         ),
         None => println!(
-            "next:       waiting for block {} (the pot pays no claim above difficulty {} on one height)",
-            state.last_height + 1,
-            deployment.min_difficulty
+            "next:       waiting for the tip to reach height {}",
+            state.last_height
         ),
     }
 }
@@ -602,7 +628,7 @@ struct Snapshot {
 }
 
 /// About the size of a claim, for counting the claims a pot pays.
-const CLAIM_BYTES_ESTIMATE: u64 = 850;
+const CLAIM_BYTES_ESTIMATE: u64 = 1_000;
 
 /// The claims `coins` pay, each claim taking its 1,000 sats and fee from one
 /// coin and leaving at least the pot's minimum change.
@@ -659,6 +685,7 @@ fn mine(
     pot: &Pot,
     addresses: &[String; 3],
     journal_path: &Path,
+    claim_key: Option<&RecoveryKey>,
     monitor: &super::ui::Monitor,
 ) -> Result<(), String> {
     use super::pending::{Journal, Pending, Prepared};
@@ -666,7 +693,13 @@ fn mine(
     for (pkh, address) in pkhs.iter_mut().zip(addresses) {
         pkh.copy_from_slice(&crate::tx::cashaddr_to_p2pkh_locking(address)?[3..23]);
     }
-    let mut journal = Journal::open(journal_path, deployment, pot, &pkhs)?;
+    let mut journal = Journal::open_with_key(
+        journal_path,
+        deployment,
+        pot,
+        &pkhs,
+        claim_key.map(RecoveryKey::secret),
+    )?;
     if dry_run && journal.pending().is_some() {
         return Err("a pending ELECTRIC claim needs recovery; run without --dry-run".into());
     }
@@ -764,9 +797,10 @@ fn mine(
                     monitor.wait(IDLE_POLL);
                     continue;
                 };
-                let locktime = claim_locktime(now.baton.state, now.tip, deployment)
+                let locktime = pot
+                    .claim_locktime(now.baton.state, now.tip, deployment)
                     .ok_or("saved proof is not currently eligible for the pot")?;
-                let built = build_claim(
+                let built = build_authorized_claim(
                     deployment,
                     pot,
                     &pending.baton,
@@ -774,6 +808,7 @@ fn mine(
                     &pending.win,
                     locktime,
                     now.relay_fee,
+                    claim_key.map(RecoveryKey::secret),
                 )?;
                 pending.prepared = Some(Prepared {
                     coin: coin.clone(),
@@ -820,7 +855,7 @@ fn mine(
             monitor.wait(IDLE_POLL);
             continue;
         }
-        if claim_locktime(state, now.tip, deployment).is_none() {
+        if pot.claim_locktime(state, now.tip, deployment).is_none() {
             monitor.state(format!(
                 "Waiting for block {} · fee-pot replay protection",
                 state.last_height + 1,

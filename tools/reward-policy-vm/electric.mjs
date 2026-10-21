@@ -107,6 +107,32 @@ try {
               `${sample.name}: signature commits to the spent value`);
           }
         }
+        if (!refund && sample.authorized_claim) {
+          // Both outpoints, the spent pot value, signature mode and every
+          // output are authenticated, even when a fresh same-height proof
+          // would independently satisfy ELECTRIC's public covenant.
+          for (const change of [
+            t => { t.inputs[0].outpointIndex += 1; },
+            t => { t.inputs[1].outpointIndex += 1; },
+            t => { t.inputs[1].sequenceNumber -= 1; },
+            t => { t.inputs[1].unlockingBytecode[1] ^= 1; },
+            t => { t.inputs[1].unlockingBytecode[65] = 0x42; },
+            t => { t.outputs[2].valueSatoshis -= 1n; },
+            t => { t.outputs[2].lockingBytecode[3] ^= 1; },
+            t => { t.locktime += 1; },
+          ]) {
+            const tampered = structuredClone(tx);
+            change(tampered);
+            assert.notEqual(vm.verify({ sourceOutputs, transaction: tampered }), true, sample.name);
+          }
+          const duplicate = structuredClone(tx);
+          duplicate.inputs.push({ ...structuredClone(tx.inputs[1]), outpointIndex: 999 });
+          const extraPot = { ...pot, valueSatoshis: pot.valueSatoshis + 5000n };
+          assert.notEqual(vm.verify({ sourceOutputs: [...sourceOutputs, extraPot], transaction: duplicate }), true,
+            `${sample.name}: one authorization cannot cover two pot inputs`);
+          assert.notEqual(vm.verify({ sourceOutputs: [sourceOutputs[0], extraPot], transaction: tx }), true,
+            `${sample.name}: signed pot amount cannot change`);
+        }
       } else {
         // The pot (input 1 of a claim, input 0 of a refund) is what refuses,
         // so for a claim the ELECTRIC covenant at input 0 accepted it.
@@ -116,9 +142,10 @@ try {
       }
     }
   }
-  assert.equal(valid, 2 * 10);
-  assert.equal(refused, 2 * 10);
-  console.log(`PASS ELECTRIC: the contract body matches the live mainnet covenant; ${proof.samples.length} claims and refunds in standard and consensus VMs: the pot pays claims to the payout and both donation addresses and the cheap same-height claim, refunds only to the payout, and refuses replay-shaped claims, other recipients, fees above its cap, and unsigned or wrong-key recovery of owner pots.`);
+  assert.equal(proof.samples.length, 33);
+  assert.equal(valid, 2 * 16);
+  assert.equal(refused, 2 * 17);
+  console.log(`PASS ELECTRIC: ${proof.samples.length} claims/refunds in standard and consensus VMs; authorized fresh same-height claims pass; unsigned/wrong-key claims, altered outpoints/outputs/amounts, duplicate pots, excessive fees and unauthorized refunds fail. Previous funded pot scripts retain their restrictions.`);
 } finally {
   rmSync(temp, { recursive: true });
 }

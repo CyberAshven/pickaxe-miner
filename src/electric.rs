@@ -1,7 +1,7 @@
 //! #### PR #51
 //! What: ELECTRIC (`PoWMineStateful`), a CashToken whose `mine` claim needs a
 //! SHA-256d proof over 32 bytes, searched on CUDA or portable GPUs. The relay fee comes from
-//! a pot covenant with keyless claims and owner-authorized refunds. Pickaxe
+//! a pot covenant with owner-authorized claims and refunds. Pickaxe
 //! stores a separate recovery key; it never imports the payout wallet's key.
 //! Why: the operator asked (2026-10-15) to mine the published contract as it
 //! is, document its replay weakness, and be ready for a fixed contract. A
@@ -446,6 +446,7 @@ pub struct Pot {
     pub redeem: Vec<u8>,
     pub network: MiningNetwork,
     recovery_public_key: Option<secp256k1::PublicKey>,
+    authorized_claims: bool,
 }
 
 impl Pot {
@@ -473,10 +474,41 @@ impl Pot {
                 recipients,
                 &recipients[0],
                 recovery_public_key.as_ref(),
+                false,
             ),
             network: deployment.network,
             recovery_public_key,
+            authorized_claims: false,
         })
+    }
+
+    /// #### PR #65: authorize every spend with the pot-only key. A public
+    /// ELECTRIC proof alone cannot spend this pot, so fresh same-height work
+    /// needs no height restriction. Existing pots keep their original script.
+    pub fn with_authorized_claims(
+        deployment: &Deployment,
+        recipients: &[Vec<u8>; 3],
+        public: secp256k1::PublicKey,
+    ) -> Result<Self, String> {
+        let mut pot = Self::with_recovery(deployment, recipients, Some(public))?;
+        pot.redeem = pot_redeem(
+            &deployment.locking_bytecode(),
+            deployment.min_difficulty,
+            recipients,
+            &recipients[0],
+            Some(&public),
+            true,
+        );
+        pot.authorized_claims = true;
+        Ok(pot)
+    }
+
+    pub fn claim_locktime(&self, state: State, tip: u32, deployment: &Deployment) -> Option<u32> {
+        if self.authorized_claims {
+            (tip >= state.last_height).then_some(tip)
+        } else {
+            claim_locktime(state, tip, deployment)
+        }
     }
 
     pub fn locking_bytecode(&self) -> Vec<u8> {
@@ -509,6 +541,7 @@ fn pot_redeem(
     recipients: &[Vec<u8>; 3],
     refund: &[u8],
     recovery_public_key: Option<&secp256k1::PublicKey>,
+    authorized_claims: bool,
 ) -> Vec<u8> {
     const OP_0: u8 = 0x00;
     const OP_1: u8 = 0x51;
@@ -546,6 +579,12 @@ fn pot_redeem(
 
     let mut s = vec![OP_INPUTINDEX, OP_1, OP_NUMEQUAL, OP_IF];
     // Claim.
+    if authorized_claims {
+        s.extend(push_bytes(
+            &recovery_public_key.expect("authorized pot key").serialize(),
+        ));
+        s.push(0xad); // CHECKSIGVERIFY: SIGHASH_ALL binds both outpoints and all outputs.
+    }
     s.extend([OP_TXINPUTCOUNT, OP_2, OP_NUMEQUALVERIFY]);
     s.extend([OP_0, OP_UTXOBYTECODE]);
     s.extend(push_bytes(electric_lock));
@@ -570,18 +609,23 @@ fn pot_redeem(
     s.extend([OP_2, OP_OUTPUTVALUE, OP_1, OP_UTXOVALUE]);
     s.extend(push_number((TOKEN_OUTPUT_SATS + POT_MAX_FEE_SATS) as i64));
     s.extend([OP_SUB, OP_GREATERTHANOREQUAL, OP_VERIFY]);
-    // Baton height below the locktime, or the minimum difficulty.
-    s.extend([OP_0, OP_UTXOTOKENCOMMITMENT, OP_1, OP_SPLIT, OP_4, OP_SPLIT]);
-    s.extend([
-        OP_DROP,
-        OP_BIN2NUM,
-        OP_TXLOCKTIME,
-        OP_LESSTHAN,
-        OP_SWAP,
-        OP_BIN2NUM,
-    ]);
-    s.extend(push_number(i64::from(min_difficulty)));
-    s.extend([OP_NUMEQUAL, OP_BOOLOR, OP_ELSE]);
+    if authorized_claims {
+        s.push(OP_1);
+    } else {
+        // Preserve already-funded keyless claim scripts byte for byte.
+        s.extend([OP_0, OP_UTXOTOKENCOMMITMENT, OP_1, OP_SPLIT, OP_4, OP_SPLIT]);
+        s.extend([
+            OP_DROP,
+            OP_BIN2NUM,
+            OP_TXLOCKTIME,
+            OP_LESSTHAN,
+            OP_SWAP,
+            OP_BIN2NUM,
+        ]);
+        s.extend(push_number(i64::from(min_difficulty)));
+        s.extend([OP_NUMEQUAL, OP_BOOLOR]);
+    }
+    s.push(OP_ELSE);
     // Refund.
     if let Some(key) = recovery_public_key {
         s.extend(push_bytes(&key.serialize()));
@@ -611,6 +655,36 @@ pub fn build_claim(
     locktime: u32,
     relay_fee_sats_per_kb: u64,
 ) -> Result<Built, String> {
+    build_authorized_claim(
+        deployment,
+        pot,
+        baton,
+        coin,
+        win,
+        locktime,
+        relay_fee_sats_per_kb,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_authorized_claim(
+    deployment: &Deployment,
+    pot: &Pot,
+    baton: &Baton,
+    coin: &Coin,
+    win: &Win,
+    locktime: u32,
+    relay_fee_sats_per_kb: u64,
+    claim_secret: Option<&secp256k1::SecretKey>,
+) -> Result<Built, String> {
+    if pot.authorized_claims
+        && !claim_secret.is_some_and(|key| {
+            Some(secp256k1::PublicKey::from_secret_key(key)) == pot.recovery_public_key
+        })
+    {
+        return Err("the pot claim key is missing or does not match".into());
+    }
     if baton.token_amount < deployment.reward {
         return Err("the ELECTRIC baton holds less than one reward".into());
     }
@@ -618,7 +692,6 @@ pub fn build_claim(
     let mut baton_unlock = push_bytes(&win.nonce.to_le_bytes());
     baton_unlock.extend(push_bytes(&win.pkh));
     baton_unlock.extend(push_data(&deployment.redeem_script())?);
-    let pot_unlock = push_data(&pot.redeem)?;
     let category = deployment.category_le();
     let reward_lock = p2pkh(&win.pkh);
     let mut reward_token = vec![0xef];
@@ -633,7 +706,19 @@ pub fn build_claim(
     baton_token.extend(compact_uint(baton.token_amount - deployment.reward));
     let pot_lock = pot.locking_bytecode();
 
-    let assemble = |change: u64| -> Result<Vec<u8>, String> {
+    let outputs = |change| {
+        let mut out = output(TOKEN_OUTPUT_SATS, &reward_token, &reward_lock);
+        out.extend(output(
+            baton.value,
+            &baton_token,
+            &deployment.locking_bytecode(),
+        ));
+        out.extend(output(change, &[], &pot_lock));
+        out
+    };
+    let assemble = |change: u64, signature: Option<&[u8]>| -> Result<Vec<u8>, String> {
+        let mut pot_unlock = signature.map(push_data).transpose()?.unwrap_or_default();
+        pot_unlock.extend(push_data(&pot.redeem)?);
         let mut tx = 2u32.to_le_bytes().to_vec();
         tx.extend(compact_uint(2));
         tx.extend(input(
@@ -644,17 +729,15 @@ pub fn build_claim(
         )?);
         tx.extend(input(&coin.txid, coin.vout, &pot_unlock, CLAIM_SEQUENCE)?);
         tx.extend(compact_uint(3));
-        tx.extend(output(TOKEN_OUTPUT_SATS, &reward_token, &reward_lock));
-        tx.extend(output(
-            baton.value,
-            &baton_token,
-            &deployment.locking_bytecode(),
-        ));
-        tx.extend(output(change, &[], &pot_lock));
+        tx.extend(outputs(change));
         tx.extend(locktime.to_le_bytes());
         Ok(tx)
     };
-    let fee = relay_fee(assemble(0)?.len(), relay_fee_sats_per_kb);
+    let placeholder = pot.authorized_claims.then_some([0u8; 65]);
+    let fee = relay_fee(
+        assemble(0, placeholder.as_ref().map(|s| &s[..]))?.len(),
+        relay_fee_sats_per_kb,
+    );
     if fee > POT_MAX_FEE_SATS {
         return Err(format!(
             "the relay fee ({fee} sats) is above what the pot pays ({POT_MAX_FEE_SATS})"
@@ -665,7 +748,39 @@ pub fn build_claim(
         .checked_sub(TOKEN_OUTPUT_SATS + fee)
         .filter(|change| *change >= POT_MIN_CHANGE_SATS)
         .ok_or("the pot cannot cover this claim; send it more BCH")?;
-    let raw = assemble(change)?;
+    let signature = if pot.authorized_claims {
+        let mut baton_outpoint = parse_txid_display(&baton.txid)?.to_vec();
+        baton_outpoint.reverse();
+        baton_outpoint.extend(baton.vout.to_le_bytes());
+        let mut pot_outpoint = parse_txid_display(&coin.txid)?.to_vec();
+        pot_outpoint.reverse();
+        pot_outpoint.extend(coin.vout.to_le_bytes());
+        let mut outpoints = baton_outpoint;
+        outpoints.extend(&pot_outpoint);
+        let mut sequences = CLAIM_SEQUENCE.to_le_bytes().to_vec();
+        sequences.extend(CLAIM_SEQUENCE.to_le_bytes());
+        let mut preimage = 2u32.to_le_bytes().to_vec();
+        preimage.extend(hash256(&outpoints));
+        preimage.extend(hash256(&sequences));
+        preimage.extend(pot_outpoint);
+        preimage.extend(compact_uint(pot.redeem.len() as u64));
+        preimage.extend(&pot.redeem);
+        preimage.extend(coin.value.to_le_bytes());
+        preimage.extend(CLAIM_SEQUENCE.to_le_bytes());
+        preimage.extend(hash256(&outputs(change)));
+        preimage.extend(locktime.to_le_bytes());
+        preimage.extend(0x41u32.to_le_bytes());
+        let mut sig = crate::crypto::bch_schnorr_sign(
+            &claim_secret.expect("validated claim key").to_secret_bytes(),
+            &hash256(&preimage),
+        )?
+        .to_vec();
+        sig.push(0x41);
+        Some(sig)
+    } else {
+        None
+    };
+    let raw = assemble(change, signature.as_deref())?;
     Ok(Built {
         txid: transaction_id(&raw),
         raw,
@@ -1287,21 +1402,55 @@ mod tests {
             value: 20_000,
         };
         let mut samples = Vec::new();
-        for owner in [
-            None,
-            Some(secp256k1::SecretKey::from_secret_bytes([0x31; 32]).unwrap()),
+        for (owner, authorized) in [
+            (None, false),
+            (
+                Some(secp256k1::SecretKey::from_secret_bytes([0x31; 32]).unwrap()),
+                false,
+            ),
+            (
+                Some(secp256k1::SecretKey::from_secret_bytes([0x31; 32]).unwrap()),
+                true,
+            ),
         ] {
-            let pot = Pot::with_recovery(
+            let mut pot = Pot::with_recovery(
                 &deployment,
                 &locks,
                 owner.as_ref().map(secp256k1::PublicKey::from_secret_key),
             )
             .unwrap();
+            if authorized {
+                pot = Pot::with_authorized_claims(
+                    &deployment,
+                    &locks,
+                    secp256k1::PublicKey::from_secret_key(owner.as_ref().unwrap()),
+                )
+                .unwrap();
+            }
+            let claim = |deployment: &Deployment,
+                         pot: &Pot,
+                         baton: &Baton,
+                         coin: &Coin,
+                         win: &Win,
+                         locktime: u32,
+                         fee: u64| {
+                build_authorized_claim(
+                    deployment,
+                    pot,
+                    baton,
+                    coin,
+                    win,
+                    locktime,
+                    fee,
+                    authorized.then(|| owner.as_ref().unwrap()),
+                )
+            };
             let mut sample = |name: &str, expect: &str, baton: &Baton, built: &Built| {
                 samples.push(serde_json::json!({
-                    "name": format!("{}: {name}", if owner.is_some() { "owner" } else { "legacy" }),
+                    "name": format!("{}: {name}", if authorized { "authorized" } else if owner.is_some() { "owner" } else { "legacy" }),
                     "pot_lock": hex::encode(pot.locking_bytecode()),
                     "owner": owner.is_some(),
+                    "authorized_claim": authorized,
                     "expect": expect,
                     "raw": hex::encode(&built.raw),
                     "fee": built.fee,
@@ -1335,8 +1484,7 @@ mod tests {
             for (recipient, lock) in locks.iter().enumerate() {
                 let baton = baton_at(2, 1_000);
                 let win = find(baton.state, pkh(lock), recipient);
-                let built =
-                    build_claim(&deployment, &pot, &baton, &coin, &win, 1_001, 1_000).unwrap();
+                let built = claim(&deployment, &pot, &baton, &coin, &win, 1_001, 1_000).unwrap();
                 sample(
                     &format!("new height to recipient {recipient}"),
                     "valid",
@@ -1346,7 +1494,7 @@ mod tests {
             }
             let cheap = baton_at(1, 1_000);
             let win = find(cheap.state, pkh(&locks[0]), 0);
-            let built = build_claim(&deployment, &pot, &cheap, &coin, &win, 1_000, 1_000).unwrap();
+            let built = claim(&deployment, &pot, &cheap, &coin, &win, 1_000, 1_000).unwrap();
             sample(
                 "minimum difficulty at the same height",
                 "valid",
@@ -1356,8 +1504,13 @@ mod tests {
             // The contract accepts these; the pot does not pay for them.
             let replay = baton_at(2, 1_000);
             let win = find(replay.state, pkh(&locks[0]), 0);
-            let built = build_claim(&deployment, &pot, &replay, &coin, &win, 1_000, 1_000).unwrap();
-            sample("same height above the minimum", "pot", &replay, &built);
+            let built = claim(&deployment, &pot, &replay, &coin, &win, 1_000, 1_000).unwrap();
+            sample(
+                "same height above the minimum",
+                if authorized { "valid" } else { "pot" },
+                &replay,
+                &built,
+            );
             let stranger = find(
                 State {
                     difficulty: 2,
@@ -1368,11 +1521,10 @@ mod tests {
                 0,
             );
             let baton = baton_at(2, 1_000);
-            let built =
-                build_claim(&deployment, &pot, &baton, &coin, &stranger, 1_001, 1_000).unwrap();
+            let built = claim(&deployment, &pot, &baton, &coin, &stranger, 1_001, 1_000).unwrap();
             sample("another recipient", "pot", &baton, &built);
             let win = find(baton.state, pkh(&locks[0]), 0);
-            let valid = build_claim(&deployment, &pot, &baton, &coin, &win, 1_001, 1_000).unwrap();
+            let valid = claim(&deployment, &pot, &baton, &coin, &win, 1_001, 1_000).unwrap();
             let mut greedy = valid.clone();
             let change_at = greedy.raw.len() - 4 - 44;
             let change =
@@ -1380,6 +1532,28 @@ mod tests {
             greedy.raw[change_at..change_at + 8]
                 .copy_from_slice(&(change - POT_MAX_FEE_SATS).to_le_bytes());
             sample("fee above the cap", "pot", &baton, &greedy);
+            if authorized {
+                let mut unsigned = pot.clone();
+                unsigned.authorized_claims = false;
+                let built =
+                    build_claim(&deployment, &unsigned, &baton, &coin, &win, 1_001, 1_000).unwrap();
+                sample("claim without a signature", "pot", &baton, &built);
+                let attacker = secp256k1::SecretKey::from_secret_bytes([0x32; 32]).unwrap();
+                let mut forged = pot.clone();
+                forged.recovery_public_key = Some(secp256k1::PublicKey::from_secret_key(&attacker));
+                let built = build_authorized_claim(
+                    &deployment,
+                    &forged,
+                    &baton,
+                    &coin,
+                    &win,
+                    1_001,
+                    1_000,
+                    Some(&attacker),
+                )
+                .unwrap();
+                sample("claim signed by another key", "pot", &baton, &built);
+            }
             let refund = build_refund(&pot, &coin, &locks[0], 1_000, owner.as_ref()).unwrap();
             sample("refund", "valid", &baton, &refund);
             let elsewhere = build_refund(&pot, &coin, &locks[1], 1_000, owner.as_ref()).unwrap();

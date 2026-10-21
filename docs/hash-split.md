@@ -42,6 +42,9 @@ runs one token's kernels at a time.
   the round to end.
 - Each token keeps its own donation: 4% of that token's work for PHOTON and
   ELECTRIC, decided before each of its batches as without a split.
+- #### PR #65: signed ELECTRIC pots allow fresh same-height proofs. A wait
+  for a new block can still come from an older restricted pot or a configured
+  search-difficulty limit; see [pot migration](electric-token.md#signed-fee-pot-claims).
 
 ## Several GPUs
 
