@@ -575,17 +575,13 @@ pub fn run_with_pot_mode(
     let names: Vec<String> = gpus.iter().map(|gpu| gpu.name.clone()).collect();
     let electric_devices = crate::backend::electric_engines_for(gpus.to_vec())?;
     let monitor = Arc::new(Monitor::new(
-        100,
+        cfg.intensity,
         plain,
         crate::electric::miner::device_names(&electric_devices),
     ));
     // ELECTRIC's monitor carries the session's stop signal for every token.
     let stop = Arc::clone(&monitor.stop);
-    {
-        let stop = Arc::clone(&stop);
-        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))
-            .map_err(|error| error.to_string())?;
-    }
+    crate::session_control::install_stop(&stop)?;
     let mut runtimes = Vec::new();
     let mut slots = Vec::new();
     for (token, share) in shares.iter().filter(|(_, share)| *share > 0) {
@@ -593,8 +589,14 @@ pub fn run_with_pot_mode(
             SplitToken::Gpu(mining_token) => {
                 let mut token_cfg = cfg.clone();
                 token_cfg.set_token(mining_token.as_str())?;
-                // The split decides how much of the time each token mines.
-                token_cfg.set_intensity(100)?;
+                token_cfg.token_donation = cfg
+                    .token_donations
+                    .get(mining_token.as_str())
+                    .copied()
+                    .or(cfg.token_donation);
+                // Shares choose the token; intensity controls work while it
+                // has the GPU, including a saved live-session setting.
+                token_cfg.set_intensity(cfg.intensity)?;
                 let supervisor = RuntimeSupervisor::start_on_gpus(token_cfg, gpus)?;
                 // Every GPU waits for the scheduler's first turn.
                 let hold = supervisor.hold_handle();
@@ -678,8 +680,39 @@ pub fn run_with_pot_mode(
         };
         shown.and(electric)
     });
+    let mut final_cfg = cfg.clone();
+    final_cfg.intensity = monitor.summary().intensity;
     for runtime in runtimes {
-        runtime.supervisor.stop();
+        let snapshot = runtime.supervisor.stop();
+        final_cfg.intensity = snapshot.search.intensity;
+        final_cfg
+            .token_donations
+            .insert(runtime.token.name().into(), snapshot.token_donation);
+    }
+    if let Some(donation) = monitor.summary().donation {
+        final_cfg
+            .token_donations
+            .insert("ELECTRIC".into(), donation);
+    }
+    if crate::session_control::profiles_requested() {
+        final_cfg.electric_pot_mode = if owner_electric_pot {
+            crate::config::ElectricPotMode::Owner
+        } else if restricted_electric_pot {
+            crate::config::ElectricPotMode::Restricted
+        } else {
+            cfg.electric_pot_mode
+        };
+        let pairs = slots
+            .iter()
+            .map(|slot| {
+                format!(
+                    "{}={}",
+                    slot.token.name(),
+                    slot.share.load(Ordering::Relaxed)
+                )
+            })
+            .collect();
+        crate::tui::remember_token_session(&final_cfg, gpus, config_path, pairs, false)?;
     }
     outcome
 }

@@ -203,6 +203,20 @@ pub struct Schedule {
     position: u64,
 }
 impl Schedule {
+    /// #### PR #65: change future work without resetting the nonce allocation
+    /// or changing the recipient of an already reserved GPU batch.
+    pub fn set_scheme(&mut self, scheme: Scheme) -> Result<(), String> {
+        let old_cycle = self.weights.iter().sum::<u64>() * self.unit;
+        let mut next = Self::new(scheme, self.unit, 0)?;
+        let new_cycle = next.weights.iter().sum::<u64>() * next.unit;
+        // Preserve progress through the cycle when a different GCD changes
+        // its length; toggling rates must not restart the personal-work part.
+        next.position =
+            (u128::from(self.position) * u128::from(new_cycle) / u128::from(old_cycle)) as u64;
+        *self = next;
+        Ok(())
+    }
+
     pub fn new(scheme: Scheme, unit: u64, random: u64) -> Result<Self, String> {
         scheme.validate()?;
         let [a, b] = scheme.work().map(u64::from);

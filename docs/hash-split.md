@@ -23,7 +23,7 @@ runs one token's kernels at a time.
 
 - One process, one GPU lock and one Ctrl+C handler for every token. Each
   PHOTON-runtime token runs its own supervisor (its own Fulcrum or node
-  connection, claim journal and donation schedule) at intensity 100;
+  connection, claim journal and donation schedule) at the session's intensity;
   ELECTRIC runs its own session with its fee pot and pending-claim journal.
 - A scheduler hands the GPUs to one token at a time in 2-second rounds: a
   5% share is 100 ms of a round. The others are held at their next batch
@@ -118,9 +118,10 @@ rate, rewards and state every 30 seconds instead of the screen.
 #### PR #65: the shared mining dashboard
 
 ELECTRIC alone and hash-split sessions use the same chart, log and command
-widgets as PHOTON. The runtime lists each token's share, rate, accepted
-rewards and state, the GPU assignment and telemetry, ELECTRIC's active and
-wall-average rates, and the pot balance. Each token keeps a separate chart
+widgets as PHOTON. The runtime lists one hashrate and work share per token,
+then GPU count, utilization, temperature, power and pot balance. `Tab` or
+the arrows select the token whose own wins, odds and work appear below;
+its state names search, submission and funding waits. Each token keeps a separate chart
 trace; their different proof workloads are not speed comparisons.
 All charts start hidden. Press `G` to show the selected charts or hide them
 again; `O` opens the chart picker.
@@ -130,11 +131,13 @@ again; `O` opens the chart picker.
 | `G` / `O` | Toggle charts / choose hashrate, temperature, power and other charts |
 | `L` | Open the full recent-event log |
 | `S` | Open shares; Up/Down selects, Enter unlocks, Left/Right moves by 5% |
-| `A` | Advanced settings; PHOTON's donation can change for this session |
+| `A` | Advanced settings; Up/Down selects a token, Left/Right adjusts its donation |
+| `Tab` / arrows | Select the token's wins, odds and completed work |
 | `F` | Show ELECTRIC's funding address, complete QR and recovery-key file location |
 | `P` / `+` / `-` | Pause/resume all participating tokens / adjust their intensity |
 | `/` | Commands, including `/chart options`, `/split`, `/electric pot` |
 | Esc | Close a panel or lock the selected share; keep mining |
+| `B` | Pause fresh work, settle pending claims/sends, save the token session and return to profiles |
 | `Q` / Ctrl+C | Stop the session through the existing worker shutdown paths |
 
 The workflow is **profile → GPU/network → token or Hash split → payout and
@@ -143,11 +146,15 @@ payout is supplied; `F` reopens it during mining. A terminal too small for
 the full QR asks to be enlarged rather than displaying a clipped code.
 The QR encodes the pot's address, never its recovery key.
 
-Live split shares, intensity and PHOTON donation adjustments affect the
-current session. Use setup to save start values, change ELECTRIC's donation,
-or change a payout/network/server. Those bindings are not replaced under
-pending claims. Quitting still joins ELECTRIC and stops the owned PHOTON
-supervisors, preserving their existing journals.
+Live split shares, intensity and each token's donation adjust the current
+session. A donation change affects future GPU batches; existing proofs and
+signed claims retain their recipients. `B` records the final shares, intensity,
+per-token donations and ELECTRIC pot mode in a profile before returning to
+the picker in the same app process. Esc can cancel the return while rewards
+are settling. Owner pots reopen with the same key and address. Older profile
+files keep their schema; the extra choices stay in `profile-choices.json`.
+Use a profile to change payout, network or servers. Quitting still joins
+ELECTRIC and stops PHOTON's supervisors, preserving their journals.
 
 The saved profile's **Network** row switches Mainnet/Chipnet before Start.
 It reloads that network's saved servers, invalidates the previous pot
@@ -156,11 +163,11 @@ address. Existing pots and recovery-key files remain on their original
 network. Advanced settings name both PHOTON and ELECTRIC; ELECTRIC's live
 donation display comes from the policy used to create its mining schedule.
 
-**ELECTRIC at 0 H/s while waiting for a block:** its fee pot funds a claim
+**Older restricted pot at 0 H/s while waiting for a block:** its fee pot funds a claim
 that advances the baton height and the following minimum-difficulty claim.
 It refuses further same-height claims to prevent proof replay, including
 fresh proofs that ELECTRIC's token contract would otherwise accept. This
-is a restriction of Pickaxe's current fee pot, not a two-reward limit in
+is a restriction of that previous fee pot, not a two-reward limit in
 ELECTRIC itself. When those opportunities are used, ELECTRIC waits for the
 next block and lends its allocation to PHOTON. That wait is distinct from an unfunded pot or a
 configured difficulty limit; each reason is shown in the state.

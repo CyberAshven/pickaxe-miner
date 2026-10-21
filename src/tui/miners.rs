@@ -15,11 +15,13 @@ pub struct Miners<'a> {
 }
 
 pub(super) struct TokenRow {
+    token: SplitToken,
     pub(super) name: String,
     share: Option<u8>,
     pub(super) rate: f64,
     rewards: u64,
     state: String,
+    runtime: Option<RuntimeSnapshot>,
 }
 
 pub(super) struct Tokens {
@@ -157,6 +159,13 @@ pub fn run_miners(
             }
         }
         let electric = miners.electric.map(Monitor::summary);
+        let pending = snapshots.iter().any(|s| s.pending_winners > 0)
+            || electric.as_ref().is_some_and(|e| {
+                e.pending || e.withdrawal.phase == crate::electric::withdrawal::Phase::Sending
+            });
+        if state.profiles_ready(pending, Instant::now()) {
+            break;
+        }
         let tokens: Vec<_> = match miners.split {
             Some((slots, _)) => slots.iter().map(|s| s.token).collect(),
             None => vec![SplitToken::Electric],
@@ -188,11 +197,17 @@ pub fn run_miners(
                     }
                 };
                 TokenRow {
+                    token: *token,
                     name: token.name().into(),
                     share,
                     rate,
                     rewards,
                     state: status,
+                    runtime: miners
+                        .runtimes
+                        .iter()
+                        .position(|(t, _)| t == token)
+                        .map(|i| snapshots[i].clone()),
                 }
             })
             .collect();
@@ -262,6 +277,9 @@ pub fn run_miners(
         show_pot = tokens.show_pot;
         paused = tokens.paused;
     }
+    if state.profiles_requested {
+        crate::session_control::request_profiles();
+    }
     Ok(())
 }
 
@@ -318,6 +336,14 @@ fn token_command(
 fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result<bool, String> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
+    }
+    if state.profiles_requested && key.code == KeyCode::Esc {
+        state.profiles_requested = false;
+        state.profile_idle_since = None;
+        state.status_line.clear();
+        miners.pause(state.profile_was_paused)?;
+        state.tokens.as_mut().unwrap().paused = state.profile_was_paused;
+        return Ok(false);
     }
     if state.tokens.as_ref().is_some_and(|t| t.show_pot) {
         if let Some(monitor) = miners.electric {
@@ -379,27 +405,49 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
     if matches!(key.code, KeyCode::Char('q' | 'Q')) {
         return Ok(true);
     }
-    if state.advanced_mode
-        && matches!(
+    if state.advanced_mode {
+        let tokens = state.tokens.as_mut().unwrap();
+        if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab) {
+            let count = tokens.split.len();
+            tokens.selected = if key.code == KeyCode::Up {
+                (tokens.selected + count - 1) % count
+            } else {
+                (tokens.selected + 1) % count
+            };
+            return Ok(false);
+        }
+        if matches!(
             key.code,
             KeyCode::Left | KeyCode::Right | KeyCode::Char('+' | '-')
-        )
-    {
-        if let Some((_, runtime)) = miners.runtimes.first() {
-            let snapshot = runtime.snapshot();
+        ) {
+            let token = tokens.split[tokens.selected].token;
             let up = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
-            let next = snapshot
-                .token_donation
-                .adjusted(up, snapshot.donation_minimum);
-            apply_result(
-                runtime.set_donation(next),
-                &format!("Donation {next}"),
-                state,
-            );
-        } else {
-            state.status_line = "ELECTRIC donation is set in setup before mining.".into();
+            if let Some((_, runtime)) = miners.runtimes.iter().find(|(t, _)| *t == token) {
+                let snapshot = runtime.snapshot();
+                let next = snapshot
+                    .token_donation
+                    .adjusted(up, snapshot.donation_minimum);
+                apply_result(
+                    runtime.set_donation(next),
+                    &format!("Donation {next}"),
+                    state,
+                );
+            } else if token == SplitToken::Electric {
+                if let Some(monitor) = miners.electric {
+                    let current = monitor
+                        .summary()
+                        .donation
+                        .unwrap_or(crate::electric::DONATION_MINIMUM);
+                    let next = current.adjusted(up, crate::electric::DONATION_MINIMUM);
+                    apply_result(
+                        monitor.request_donation(miners.network, next),
+                        &format!("ELECTRIC donation {next}"),
+                        state,
+                    );
+                }
+            }
+            return Ok(false);
         }
-        return Ok(false);
     }
     if state.show_help || state.logs_mode || state.advanced_mode {
         if matches!(
@@ -452,6 +500,25 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
         return Ok(false);
     }
     match key.code {
+        KeyCode::Char('b' | 'B') => {
+            if tokens.split.iter().all(|row| row.share == Some(0)) {
+                state.status_line =
+                    "Give a token a nonzero share before saving its profile; P pauses mining."
+                        .into();
+                return Ok(false);
+            }
+            let paused = tokens.paused;
+            miners.pause(true)?;
+            tokens.paused = true;
+            state.request_profiles(paused);
+            return Ok(false);
+        }
+        KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            tokens.selected = (tokens.selected + 1) % tokens.split.len()
+        }
+        KeyCode::Up | KeyCode::Left => {
+            tokens.selected = (tokens.selected + tokens.split.len() - 1) % tokens.split.len()
+        }
         KeyCode::Char('g' | 'G') => state.apply_chart_request(ChartRequest::Toggle),
         KeyCode::Char('o' | 'O') => state.apply_chart_request(ChartRequest::Options),
         KeyCode::Char('s' | 'S') => state.settings_mode = true,
@@ -503,9 +570,13 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
         .join(" + ");
     frame.render_widget(
         Paragraph::new(format!(
-            " PICKAXE   {title} · {}{}",
+            " PICKAXE   {title} · {}{} · Uptime {}",
             network_label(tokens.network),
-            if tokens.paused { " · PAUSED" } else { "" }
+            if tokens.paused { " · PAUSED" } else { "" },
+            format_duration(tokens.electric.as_ref().map_or_else(
+                || tokens.photon.as_ref().map_or(0, |s| s.search.elapsed_secs) as f64,
+                |e| e.uptime.as_secs_f64()
+            ))
         ))
         .block(Block::bordered()),
         parts[0],
@@ -521,25 +592,25 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
     let body = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(parts[2]);
     let mut lines = Vec::new();
-    for row in &tokens.split {
+    for (index, row) in tokens.split.iter().enumerate() {
         lines.push(Line::from(Span::styled(
             format!(
-                "{}   {}   {} accepted{}",
+                "{} Hashrate {:<8} {}{}",
+                if index == tokens.selected { ">" } else { " " },
                 row.name,
                 crate::telemetry::format_hash_rate(row.rate),
-                row.rewards,
                 row.share
                     .map_or_else(String::new, |share| format!("   {share}% work"))
             ),
             Style::default().fg(Color::Cyan),
         )));
-        lines.push(Line::from(row.state.clone()));
-    }
-    if !tokens.layout.is_empty() {
-        lines.push(Line::from(format!("GPUs  {}", tokens.layout)));
     }
     lines.push(Line::from(format!(
-        "GPU   {} · {} · {}",
+        "GPUs  {} selected · /devices lists them",
+        state.devices.len()
+    )));
+    lines.push(Line::from(format!(
+        "GPU utilization {} · {} · {}",
         format_metric(tokens.telemetry.gpu_utilization_percent, "%"),
         format_metric(tokens.telemetry.temperature_c, " C"),
         format_metric(tokens.telemetry.power_watts, " W")
@@ -551,21 +622,9 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
             }
             None => "Fee pot  reading balance · [F] fund / QR".into(),
         }));
-        lines.push(Line::from(format!(
-            "ELECTRIC work {} hashes",
-            electric.hashes,
-        )));
-        lines.push(Line::from(format!(
-            "Uptime  {}",
-            format_duration(electric.uptime.as_secs_f64())
-        )));
     }
     let runtime_areas = Layout::vertical([
-        Constraint::Length(if tokens.photon.is_some() {
-            lines.len() as u16 + 2
-        } else {
-            body[0].height
-        }),
+        Constraint::Length((lines.len() as u16 + 2).min(body[0].height.saturating_sub(5))),
         Constraint::Min(0),
     ])
     .split(body[0]);
@@ -575,27 +634,48 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
             .block(Block::bordered().title(" Mining session ")),
         runtime_areas[0],
     );
-    if let Some(snapshot) = &tokens.photon {
+    if let Some(row) = tokens.split.get(tokens.selected) {
         if runtime_areas[1].height >= 4 {
-            // The token rows above already show current hashrates and GPU
-            // telemetry. Keep PHOTON's remaining details without a second
-            // copy of those numbers.
-            let fields = runtime_field_groups(snapshot, runtime_areas[1].width)
-                .into_iter()
-                .filter(|field| {
-                    !field
-                        .lines
-                        .first()
-                        .and_then(|line| line.spans.first())
-                        .is_some_and(|span| {
-                            matches!(span.content.trim(), "Hashrate" | "GPU" | "Uptime")
-                        })
-                })
-                .collect();
-            let details =
-                fit_runtime_fields(fields, runtime_areas[1].height.saturating_sub(2) as usize);
+            let details = if let Some(snapshot) = &row.runtime {
+                vec![
+                    Line::from(format!(
+                        "Wins       {} accepted · {} pending",
+                        row.rewards, snapshot.pending_winners
+                    )),
+                    Line::from(
+                        match win_probability(&snapshot.photon_target_le, snapshot.network) {
+                            Some(probability) => format!(
+                                "Odds       1 win per {} hashes",
+                                format_si_count(1.0 / probability)
+                            ),
+                            None => "Odds       Reading current target".into(),
+                        },
+                    ),
+                    Line::from(format!("Work       {} hashes", snapshot.search.candidates)),
+                ]
+            } else if let Some(e) = &tokens.electric {
+                let expected = e.difficulty.map(|d| 256f64.powi(i32::from(d)));
+                vec![
+                    Line::from(format!(
+                        "Wins       {} accepted · {} pending",
+                        row.rewards,
+                        u8::from(e.pending)
+                    )),
+                    Line::from(match expected {
+                        Some(hashes) => {
+                            format!("Odds       1 win per {} hashes", format_si_count(hashes))
+                        }
+                        None => "Odds       Reading current target".into(),
+                    }),
+                    Line::from(format!("Work       {} hashes", e.hashes)),
+                ]
+            } else {
+                Vec::new()
+            };
             frame.render_widget(
-                Paragraph::new(details).block(Block::bordered().title(" PHOTON details ")),
+                Paragraph::new(details).block(
+                    Block::bordered().title(format!(" {} details · {} ", row.name, row.state)),
+                ),
                 runtime_areas[1],
             );
         }
@@ -631,43 +711,34 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
         popup(frame, area, " Settings · hash split ", lines);
     }
     if state.advanced_mode {
-        if let Some(snapshot) = &tokens.photon {
-            let electric = tokens.electric.as_ref().map(|e| match e.donation {
-                Some(value) => format!("ELECTRIC donation {value} of its own work (set in setup)."),
-                None => "ELECTRIC donation: loading the mining schedule.".into(),
-            });
-            let note = format!(
-                "PHOTON changes apply for this session; use setup to save start values. {}",
-                electric.unwrap_or_default()
-            );
-            render_advanced_with_scope(frame, area, snapshot, Some(&note));
-        } else {
-            let donation = tokens
-                .electric
+        let mut lines = vec![
+            Line::from("↑/↓ or Tab selects a token · ←/→ changes its donation"),
+            Line::from(""),
+        ];
+        for (i, row) in tokens.split.iter().enumerate() {
+            let donation = row
+                .runtime
                 .as_ref()
-                .and_then(|e| e.donation)
-                .map_or_else(|| "loading the mining schedule".into(), |d| d.to_string());
-            popup(
-                frame,
-                area,
-                " Advanced settings ",
-                vec![
-                    Line::from(format!(
-                        "ELECTRIC donation: {donation} of its own mining work."
-                    )),
-                    Line::from(
-                        "Change the donation in setup before starting this combined session.",
-                    ),
-                    Line::from(
-                        "Payout, network, servers and fee-pot recovery are bound at startup.",
-                    ),
-                    Line::from("Charts: G toggle · O choose · /chart hash temp power"),
-                    Line::from("Intensity: +/- live, across every participating token."),
-                    Line::from("F opens the ELECTRIC funding QR. Back up its recovery-key file."),
-                    Line::from("Esc closes this panel; mining continues."),
-                ],
-            );
+                .map(|s| s.token_donation)
+                .or_else(|| tokens.electric.as_ref().and_then(|e| e.donation));
+            lines.push(Line::from(format!(
+                "{} {} donation {}",
+                if i == tokens.selected { ">" } else { " " },
+                row.name,
+                donation.map_or_else(|| "loading".into(), |d| d.to_string())
+            )));
         }
+        lines.extend([
+            Line::from(""),
+            Line::from("Changes apply to future mining work for this session."),
+            Line::from("B on the dashboard saves this session and returns to profiles."),
+            Line::from("Existing proofs, payouts and the fee pot keep their recipients."),
+            Line::from("A / Esc closes; mining continues."),
+        ]);
+        if !tokens.layout.is_empty() {
+            lines.push(Line::from(format!("GPU allocation: {}", tokens.layout)));
+        }
+        popup(frame, area, " Advanced settings ", lines);
     }
     if state.logs_mode {
         render_logs(frame, area, state);
@@ -825,6 +896,72 @@ pub(super) mod tests {
     use super::*;
     use std::sync::atomic::AtomicU8;
 
+    #[test]
+    fn electric_donation_is_editable_and_profile_navigation_is_explicit() {
+        let monitor = Monitor::new(80, false, "test".into());
+        monitor.set_donation_display(crate::donation::Scheme::Work([400, 0]));
+        let miners = Miners {
+            network: MiningNetwork::Chipnet,
+            runtimes: vec![],
+            electric: Some(&monitor),
+            split: None,
+            stop: None,
+        };
+        let mut state = fixture();
+        state.tokens.as_mut().unwrap().split.remove(0);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        token_key(key(KeyCode::Char('a')), &miners, &mut state).unwrap();
+        token_key(key(KeyCode::Right), &miners, &mut state).unwrap();
+        assert_eq!(monitor.summary().donation.unwrap().bps(), 450);
+        token_key(key(KeyCode::Left), &miners, &mut state).unwrap();
+        token_key(key(KeyCode::Left), &miners, &mut state).unwrap();
+        assert_eq!(monitor.summary().donation.unwrap().bps(), 400);
+        assert!(!monitor.stopped());
+        token_key(key(KeyCode::Esc), &miners, &mut state).unwrap();
+        assert!(!token_key(key(KeyCode::Char('b')), &miners, &mut state).unwrap());
+        assert!(state.profiles_requested);
+        let now = Instant::now();
+        assert!(!state.profiles_ready(true, now));
+        assert!(!state.profiles_ready(false, now + Duration::from_secs(1)));
+        assert!(!state.profiles_ready(true, now + Duration::from_secs(2)));
+        assert!(!state.profiles_ready(false, now + Duration::from_secs(3)));
+        assert!(state.profiles_ready(false, now + Duration::from_secs(4)));
+        token_key(key(KeyCode::Esc), &miners, &mut state).unwrap();
+        assert!(!state.profiles_requested);
+        assert!(!monitor.paused.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn small_dashboard_selects_each_tokens_statistics_without_duplicate_rates() {
+        let mut state = fixture();
+        let tokens = state.tokens.as_mut().unwrap();
+        tokens.selected = 1;
+        tokens.electric.as_mut().unwrap().difficulty = Some(4);
+        tokens.electric.as_mut().unwrap().hashes = 123456;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render_miners(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for expected in [
+            "ELECTRIC details",
+            "Wins",
+            "Odds",
+            "Work",
+            "123456",
+            "GPU utilization",
+            "[B] profiles",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert_eq!(text.matches("Hashrate").count(), 2);
+        assert!(state.charts.is_empty());
+    }
+
     fn fixture() -> TuiState {
         let monitor = Monitor::new(80, false, "Preview GPU".into());
         // Deliberately not a usable payment destination.
@@ -839,18 +976,22 @@ pub(super) mod tests {
             network: MiningNetwork::Chipnet,
             split: vec![
                 TokenRow {
+                    token: SplitToken::Gpu(MiningToken::Photon),
                     name: "PHOTON".into(),
                     share: Some(70),
                     rate: 700e6,
                     rewards: 0,
                     state: "Sample PHOTON data".into(),
+                    runtime: Some(super::super::tests::test_snapshot()),
                 },
                 TokenRow {
+                    token: SplitToken::Electric,
                     name: "ELECTRIC".into(),
                     share: Some(30),
                     rate: 200e6,
                     rewards: 0,
                     state: "Sample ELECTRIC data".into(),
+                    runtime: None,
                 },
             ],
             electric: Some(monitor.summary()),
@@ -1033,7 +1174,7 @@ pub(super) mod tests {
                     "{name} at {width}x{height}: {text}"
                 );
                 if name == "02-split-dashboard" && width == 140 {
-                    assert!(!text.contains("Hashrate"));
+                    assert_eq!(text.matches("Hashrate").count(), 2);
                     assert!(text.contains("ELECTRIC sample connection"));
                     assert!(text.contains("ELECTRIC Sample reward event"));
                     assert!(!text.contains("ELECTRIC ELECTRIC"));

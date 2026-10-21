@@ -16,6 +16,7 @@ use crossterm::{
 };
 use miners::Tokens;
 pub use miners::{run_electric, run_miners, Miners};
+mod session_preferences;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -28,6 +29,7 @@ use ratatui::{
     },
     Frame, Terminal, TerminalOptions, Viewport,
 };
+pub use session_preferences::remember_token_session;
 use std::{
     collections::VecDeque,
     io::{self, Stdout},
@@ -461,6 +463,8 @@ pub enum ServerSetup {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct ProfileChoices {
+    electric_pot_mode: crate::config::ElectricPotMode,
+    token_donations: std::collections::BTreeMap<String, crate::donation::TokenDonation>,
     /// The pool to join is a BCH P2Pool node.
     p2pool: bool,
     /// With P2Pool: your own P2Pool node, run with your node.
@@ -2008,7 +2012,14 @@ impl SetupFlow {
                 }
                 .into(),
                 self.config
-                    .token_donation
+                    .token_donations
+                    .get(if self.electric {
+                        "ELECTRIC"
+                    } else {
+                        self.config.token.as_str()
+                    })
+                    .copied()
+                    .or(self.config.token_donation)
                     .unwrap_or(minimum)
                     .at_least(minimum),
                 minimum,
@@ -2476,6 +2487,8 @@ impl SetupFlow {
             && self.pool_kind == PoolKind::P2PoolV2;
         let gpu = self.mode == MiningMode::Gpu;
         ProfileChoices {
+            electric_pot_mode: self.config.electric_pot_mode,
+            token_donations: self.config.token_donations.clone(),
             p2pool,
             own_p2pool: p2pool && self.own_p2pool,
             electric: gpu && self.electric,
@@ -2493,6 +2506,14 @@ impl SetupFlow {
 
     /// #### PR #61: puts a profile's kept choices back.
     fn apply_choices(&mut self, choices: &ProfileChoices) {
+        self.config.electric_pot_mode = choices.electric_pot_mode;
+        self.config.token_donations = choices.token_donations.clone();
+        self.config.token_donation = self
+            .config
+            .token_donations
+            .get(self.config.token.as_str())
+            .copied()
+            .or(self.config.token_donation);
         self.electric = false;
         self.split = false;
         if self.mode == MiningMode::Gpu {
@@ -3004,7 +3025,21 @@ impl SetupFlow {
                     }
                     SettingsRow::TokenDonation => {
                         if let Some((_, donation, minimum)) = self.token_donation_terms() {
-                            self.config.token_donation = Some(donation.adjusted(forward, minimum));
+                            let next = donation.adjusted(forward, minimum);
+                            self.config.token_donation = Some(next);
+                            if self.split {
+                                for (token, _) in self.shares().iter() {
+                                    self.config
+                                        .token_donations
+                                        .insert(token.name().into(), next);
+                                }
+                            } else if self.electric {
+                                self.config.token_donations.insert("ELECTRIC".into(), next);
+                            } else if self.mode == MiningMode::Gpu {
+                                self.config
+                                    .token_donations
+                                    .insert(self.config.token.as_str().into(), next);
+                            }
                         }
                     }
                     // #### PR #42: a farm's rigs on and off; a pool always
@@ -3986,6 +4021,9 @@ struct TuiState {
     settings_mode: bool,
     /// #### PR #32: Advanced settings (`a`), where the donation is set.
     advanced_mode: bool,
+    profiles_requested: bool,
+    profile_idle_since: Option<Instant>,
+    profile_was_paused: bool,
     logs_mode: bool,
     /// #### PR #40: Connection info (`i`): the command each rig runs, one per
     /// address, found when the page opens.
@@ -4007,6 +4045,25 @@ struct TuiState {
 }
 
 impl TuiState {
+    fn request_profiles(&mut self, was_paused: bool) {
+        self.profiles_requested = true;
+        self.profile_was_paused = was_paused;
+        self.profile_idle_since = None;
+        self.status_line =
+            "Finishing pending rewards before profiles; Esc keeps this session.".into();
+    }
+
+    fn profiles_ready(&mut self, pending: bool, now: Instant) -> bool {
+        if !self.profiles_requested {
+            return false;
+        }
+        if pending {
+            self.profile_idle_since = None;
+            return false;
+        }
+        now.duration_since(*self.profile_idle_since.get_or_insert(now))
+            >= Duration::from_millis(500)
+    }
     /// Creates a TuiState for the terminal interface.
     fn new(_snapshot: &RuntimeSnapshot) -> Self {
         Self::starting("started; supervising PHOTON state".into())
@@ -4025,6 +4082,9 @@ impl TuiState {
             show_help: false,
             settings_mode: false,
             advanced_mode: false,
+            profiles_requested: false,
+            profile_idle_since: None,
+            profile_was_paused: false,
             logs_mode: false,
             connect: None,
             status_line: String::new(),
@@ -4521,6 +4581,9 @@ pub fn run(
     let mut last_status_log: Option<Instant> = None;
     while !quit {
         let snapshot = supervisor.snapshot();
+        if state.profiles_ready(snapshot.pending_winners > 0, Instant::now()) {
+            break;
+        }
         state.record_sample(&snapshot, Instant::now());
 
         for event in supervisor.drain_events() {
@@ -4555,6 +4618,9 @@ pub fn run(
     }
 
     drop(terminal);
+    if state.profiles_requested {
+        crate::session_control::request_profiles();
+    }
     Ok(supervisor.stop())
 }
 
@@ -4656,6 +4722,15 @@ fn handle_key(
 ) -> Result<bool, String> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
+    }
+    if state.profiles_requested && key.code == KeyCode::Esc {
+        state.profiles_requested = false;
+        state.profile_idle_since = None;
+        state.status_line.clear();
+        if !state.profile_was_paused {
+            supervisor.resume()?;
+        }
+        return Ok(false);
     }
 
     if state.command_mode {
@@ -4780,6 +4855,11 @@ fn handle_key(
     }
 
     match key.code {
+        KeyCode::Char('b') | KeyCode::Char('B') => {
+            state.request_profiles(snapshot.state == SupervisorState::Paused);
+            supervisor.pause()?;
+            Ok(false)
+        }
         KeyCode::Char('q') | KeyCode::Char('Q') => Ok(true),
         KeyCode::Char('?') => {
             state.show_help = true;
@@ -7442,13 +7522,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else if state.tokens.is_some() {
         vec![
             Line::from("[P] pause  [+/-] intensity  [S] shares  [A] advanced  [F] pot/QR"),
-            Line::from("[/] command  [G] charts  [O] chart options  [L] logs  [?] help  [Q] quit"),
+            Line::from(
+                "[Tab] token  [G] charts  [O] charts options  [L] logs  [B] profiles  [Q] quit",
+            ),
             Line::from(state.status_line.as_str()),
         ]
     } else {
         vec![
             Line::from(
-                "[/] command  [P] pause  [+/-] intensity  [R] reconnect  [S] settings  [G] charts  [O] pick charts  [?] help  [Q] quit",
+                "[/] command  [P] pause  [+/-] intensity  [R] reconnect  [S] settings  [G] charts  [B] profiles  [Q] quit",
             ),
             Line::from(state.status_line.as_str()),
         ]

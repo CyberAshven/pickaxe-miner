@@ -26,6 +26,9 @@ pub struct Monitor {
     /// minable, so ELECTRIC wants its share of the GPUs.
     pub searching: AtomicBool,
     pub intensity: AtomicU8,
+    /// A UI change is consumed while reserving the next GPU batch.
+    donation_change: Mutex<Option<crate::donation::Scheme>>,
+    donation_changed: AtomicBool,
     pub hashes: AtomicU64,
     view: Mutex<View>,
     plain: bool,
@@ -61,6 +64,8 @@ pub struct Summary {
     pub paused: bool,
     /// Effective donation of the schedule created by the mining loop.
     pub donation: Option<crate::donation::TokenDonation>,
+    pub difficulty: Option<u8>,
+    pub pending: bool,
 }
 
 /// #### PR #65: events kept for the dashboard to take, at most.
@@ -76,6 +81,8 @@ struct View {
     claims: u64,
     pot: Option<PotView>,
     donation: Option<crate::donation::TokenDonation>,
+    difficulty: Option<u8>,
+    pending: bool,
 }
 
 /// The fee pot the miner funds, as the screen shows it.
@@ -131,6 +138,8 @@ impl Monitor {
             held_gpus: (0..MAX_HELD_GPUS).map(|_| AtomicBool::new(false)).collect(),
             searching: AtomicBool::new(false),
             intensity: AtomicU8::new(intensity),
+            donation_change: Mutex::new(None),
+            donation_changed: AtomicBool::new(false),
             hashes: AtomicU64::new(0),
             view: Mutex::new(View {
                 state: "Connecting".into(),
@@ -141,6 +150,8 @@ impl Monitor {
                 claims: 0,
                 pot: None,
                 donation: None,
+                difficulty: None,
+                pending: false,
             }),
             plain,
             started: Instant::now(),
@@ -152,8 +163,64 @@ impl Monitor {
 
     pub fn set_donation_display(&self, scheme: crate::donation::Scheme) {
         let total: u16 = scheme.work().into_iter().sum();
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .donation
+            .get_or_insert(crate::donation::TokenDonation::from_bps(total));
+    }
+
+    /// #### PR #65: only future mining work changes; saved claims keep their
+    /// original recipient and signed transaction.
+    pub fn request_donation(
+        &self,
+        network: crate::config::MiningNetwork,
+        value: crate::donation::TokenDonation,
+    ) -> Result<(), String> {
+        let deployment = super::Deployment::select(network, None, None, None, None)?;
+        let scheme = deployment.donation_policy(Some(value)).scheme;
+        *self
+            .donation_change
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(scheme);
+        self.donation_changed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let total = scheme.work().into_iter().sum();
         self.view.lock().unwrap_or_else(|e| e.into_inner()).donation =
             Some(crate::donation::TokenDonation::from_bps(total));
+        Ok(())
+    }
+
+    pub(super) fn apply_donation(
+        &self,
+        schedule: &mut crate::donation::Schedule,
+    ) -> Result<(), String> {
+        if !self
+            .donation_changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        if let Some(scheme) = self
+            .donation_change
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            schedule.set_scheme(scheme)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn job(&self, difficulty: u8) {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .difficulty = Some(difficulty);
+    }
+
+    pub(super) fn pending(&self, pending: bool) {
+        self.view.lock().unwrap_or_else(|e| e.into_inner()).pending = pending;
     }
 
     /// #### PR #61: holds or releases the GPU at `device` alone.
@@ -244,7 +311,9 @@ impl Monitor {
             .collect()
     }
     pub fn accepted(&self) {
-        self.view.lock().unwrap_or_else(|e| e.into_inner()).claims += 1;
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.claims += 1;
+        view.pending = false;
     }
     /// The pot to fund, and where its recovery key is saved.
     pub fn set_pot(&self, address: &str, key: Option<&std::path::Path>) {
@@ -330,6 +399,8 @@ impl Monitor {
             intensity: self.intensity.load(Relaxed),
             paused,
             donation: view.donation,
+            difficulty: view.difficulty,
+            pending: view.pending,
         }
     }
     pub fn record(&self, device: usize, count: u32, duration: Duration) {
@@ -356,11 +427,7 @@ pub fn run(
     network: crate::config::MiningNetwork,
     mine: impl FnOnce() -> Result<(), String> + Send,
 ) -> Result<(), String> {
-    let stop = Arc::clone(&monitor.stop);
-    ctrlc::set_handler(move || {
-        stop.store(true, Relaxed);
-    })
-    .map_err(|e| e.to_string())?;
+    crate::session_control::install_stop(&monitor.stop)?;
     if monitor.plain {
         return mine();
     }
@@ -406,6 +473,39 @@ fn rates(samples: &VecDeque<(Instant, usize, u32, Duration)>, now: Instant) -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn donation_changes_keep_reserved_recipients_and_apply_to_future_batches() {
+        use crate::donation::{Recipient, Schedule, Scheme, TokenDonation};
+        let monitor = Monitor::new(100, false, "test".into());
+        let mut schedule = Schedule::new(Scheme::Work([200, 200]), 7, 48 * 7).unwrap();
+        let reserved_recipient = schedule.recipient();
+        let reserved_count = schedule.limit_batch(100);
+        schedule.record(reserved_count).unwrap();
+        monitor
+            .request_donation(
+                crate::config::MiningNetwork::Mainnet,
+                TokenDonation::from_bps(450),
+            )
+            .unwrap();
+        // Initialization must not overwrite a UI change made while connecting.
+        monitor.set_donation_display(Scheme::Work([200, 200]));
+        assert_eq!(monitor.summary().donation.unwrap().bps(), 450);
+        monitor.apply_donation(&mut schedule).unwrap();
+        assert_eq!(reserved_recipient, Recipient::Project);
+        assert_eq!(reserved_count, 7);
+        let mut counts = [0u64; 3];
+        let mut remaining = 200 * 7;
+        while remaining > 0 {
+            let count = schedule.limit_batch(remaining);
+            counts[schedule.recipient() as usize] += u64::from(count);
+            schedule.record(count).unwrap();
+            remaining -= count;
+        }
+        assert_eq!(counts, [191 * 7, 5 * 7, 4 * 7]);
+        monitor.pending(true);
+        monitor.accepted();
+        assert!(!monitor.summary().pending);
+    }
     // #### PR #65: what the dashboard reads of the session.
     #[test]
     fn the_summary_carries_the_pot_its_key_and_events_for_the_dashboard() {

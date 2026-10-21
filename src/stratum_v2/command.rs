@@ -472,9 +472,7 @@ pub fn run(
         }),
     });
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_signal = stop.clone();
-    ctrlc::set_handler(move || stop_signal.store(true, Ordering::Relaxed))
-        .map_err(|_| "cannot install clean shutdown handler")?;
+    crate::session_control::install_stop(&stop)?;
     let mut terminal = if no_tui || json {
         None
     } else {

@@ -308,7 +308,7 @@ fn session(
         options.create_key,
         &monitor,
     )?;
-    super::ui::run(&monitor, devices, cfg.network, || {
+    let result = super::ui::run(&monitor, devices, cfg.network, || {
         mine(
             cfg,
             &ready.deployment,
@@ -322,7 +322,20 @@ fn session(
             ready.claim_key.as_ref(),
             &monitor,
         )
-    })
+    });
+    if crate::session_control::profiles_requested() {
+        let mut final_cfg = cfg.clone();
+        if args.owner_pot {
+            final_cfg.electric_pot_mode = crate::config::ElectricPotMode::Owner;
+        } else if args.restricted_pot {
+            final_cfg.electric_pot_mode = crate::config::ElectricPotMode::Restricted;
+        }
+        if let Some(value) = monitor.summary().donation {
+            final_cfg.token_donations.insert("ELECTRIC".into(), value);
+        }
+        crate::tui::remember_token_session(&final_cfg, devices, config_path, Vec::new(), true)?;
+    }
+    result
 }
 
 /// The GPUs as the dashboard names them for ELECTRIC.
@@ -533,18 +546,22 @@ fn pot_for(
     if args.legacy_pot {
         return Ok((legacy, addresses, None));
     }
+    let owner_pot = args.owner_pot
+        || (!args.restricted_pot && cfg.electric_pot_mode == crate::config::ElectricPotMode::Owner);
+    let restricted_pot = args.restricted_pot
+        || (!args.owner_pot && cfg.electric_pot_mode == crate::config::ElectricPotMode::Restricted);
     let path = args.pot_key.clone().unwrap_or_else(|| {
         config_path.with_file_name(format!(
             "electric-{}-{}{}.pot-key",
             cfg.network.as_str(),
-            if args.owner_pot { "owner-" } else { "" },
+            if owner_pot { "owner-" } else { "" },
             hex::encode(crate::proof::hash256(&legacy.redeem))
         ))
     });
     let key = RecoveryKey::load(&path, create)?;
-    let pot = if args.owner_pot {
+    let pot = if owner_pot {
         Pot::with_owner_destination(deployment, &locks, key.public())?
-    } else if args.restricted_pot {
+    } else if restricted_pot {
         Pot::with_recovery(deployment, &locks, Some(key.public()))?
     } else {
         Pot::with_authorized_claims(deployment, &locks, key.public())?
@@ -553,7 +570,12 @@ fn pot_for(
 }
 
 fn print_deployment(cfg: &RuntimeConfig, deployment: &Deployment, addresses: &[String; 3]) {
-    let policy = deployment.donation_policy(cfg.token_donation);
+    let policy = deployment.donation_policy(
+        cfg.token_donations
+            .get("ELECTRIC")
+            .copied()
+            .or(cfg.token_donation),
+    );
     println!("ELECTRIC on {}", cfg.network.as_str());
     println!("category:   {}", deployment.category_hex());
     println!(
@@ -821,6 +843,7 @@ fn mine(
         &pkhs,
         claim_key.map(RecoveryKey::secret),
     )?;
+    monitor.pending(journal.pending().is_some());
     if transfers.active() && journal.pending().is_some() {
         return Err(
             "both a claim and a send need recovery; journals preserved, no inputs spent".into(),
@@ -896,6 +919,7 @@ fn mine(
             }
         };
         if let Some(mut pending) = journal.pending() {
+            monitor.pending(true);
             monitor.state("Submitting saved claim");
             if let Some(prepared) = &pending.prepared {
                 let expected = crate::reward::transaction_id(
@@ -993,6 +1017,7 @@ fn mine(
             monitor.wait(BATON_POLL);
             continue;
         }
+        monitor.pending(false);
         if monitor.paused.load(Ordering::Relaxed) {
             monitor.state("Paused");
             monitor.wait(Duration::from_millis(100));
@@ -1032,6 +1057,7 @@ fn mine(
             "Mining · height {} · difficulty {}",
             now.tip, state.difficulty
         ));
+        monitor.job(state.difficulty);
         let job = SearchJob {
             last_height: state.last_height,
             difficulty: state.difficulty,
@@ -1112,6 +1138,7 @@ fn mine(
                     win,
                     prepared: None,
                 }))?;
+                monitor.pending(true);
             }
         }
     }
@@ -1254,6 +1281,29 @@ mod tests {
         assert_ne!(controlled.address(), pot.address());
         assert_ne!(controlled_path.unwrap(), key_path);
         assert_ne!(controlled.recovery_public_key, pot.recovery_public_key);
+        // A profile return retains the exact funded owner address and key;
+        // an explicitly selected older pot still overrides the saved mode.
+        cfg.electric_pot_mode = crate::config::ElectricPotMode::Owner;
+        assert_eq!(
+            controlled,
+            pot_for(&cfg, &deploy, &args, &config, false).unwrap().0
+        );
+        let restricted_args = ElectricDeploymentArgs {
+            restricted_pot: true,
+            ..Default::default()
+        };
+        let restricted = pot_for(&cfg, &deploy, &restricted_args, &config, false)
+            .unwrap()
+            .0;
+        assert!(!restricted.owner_destination && !restricted.authorized_claims);
+        cfg.electric_pot_mode = crate::config::ElectricPotMode::Restricted;
+        assert_eq!(
+            controlled,
+            pot_for(&cfg, &deploy, &owner_args, &config, false)
+                .unwrap()
+                .0
+        );
+        cfg.electric_pot_mode = crate::config::ElectricPotMode::Signed;
         let alternate_config = dir.join("other-profile/config.json");
         assert_eq!(
             claim_journal_path(&cfg, &controlled, &config).unwrap(),

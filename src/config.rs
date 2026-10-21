@@ -250,8 +250,20 @@ impl JobSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ElectricPotMode {
+    Restricted,
+    #[default]
+    Signed,
+    Owner,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    /// Per-token start values kept in the compatible profile-choices sidecar.
+    pub token_donations: std::collections::BTreeMap<String, crate::donation::TokenDonation>,
+    pub electric_pot_mode: ElectricPotMode,
     /// BCH ASIC policy only. Token policies are selected separately.
     pub bch_donation: crate::donation::bch::BchDonation,
     /// #### PR #32: the token donation a miner chose in Advanced settings;
@@ -287,6 +299,8 @@ impl Default for RuntimeConfig {
     /// Creates the default runtime configuration.
     fn default() -> Self {
         Self {
+            token_donations: Default::default(),
+            electric_pot_mode: Default::default(),
             bch_donation: Default::default(),
             token_donation: None,
             network: MiningNetwork::Mainnet,
