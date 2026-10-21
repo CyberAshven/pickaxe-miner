@@ -20,7 +20,7 @@ pub(crate) enum Phase {
     Error,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct View {
     pub enabled: bool,
     pub phase: Phase,
@@ -36,6 +36,7 @@ pub(crate) struct Control {
     pub enabled: bool,
     view: View,
     request: Option<Request>,
+    preview_presented: bool,
 }
 
 enum Request {
@@ -59,6 +60,7 @@ impl Control {
     }
     pub fn edit(&mut self) {
         if self.enabled && !self.holding() {
+            self.preview_presented = false;
             self.view = View {
                 phase: Phase::Editing,
                 ..View::default()
@@ -103,15 +105,24 @@ impl Control {
                 self.view.phase = Phase::Preparing;
                 Some(Request::Prepare(self.view.destination.clone()))
             }
-            Phase::Preview => {
-                self.view.phase = Phase::Sending;
-                Some(Request::Confirm)
-            }
             _ => None,
         };
     }
+    /// The terminal acknowledges the exact quote only after a successful draw.
+    pub fn presented(&mut self, view: &View) {
+        if self.view.phase == Phase::Preview && self.view() == *view {
+            self.preview_presented = true;
+        }
+    }
+    pub fn confirm(&mut self) {
+        if self.view.phase == Phase::Preview && self.preview_presented && self.request.is_none() {
+            self.view.phase = Phase::Sending;
+            self.request = Some(Request::Confirm);
+        }
+    }
     pub fn cancel(&mut self) {
         if self.view.phase != Phase::Sending {
+            self.preview_presented = false;
             self.view.phase = Phase::Idle;
             self.request = Some(Request::Cancel);
         }
@@ -124,6 +135,7 @@ impl Control {
         };
         self.view.message = message;
         self.request = None;
+        self.preview_presented = false;
     }
 }
 
@@ -342,15 +354,15 @@ impl Transfers {
                     }
                     match prepared {
                         Ok(plan) => {
+                            c.preview_presented = false;
                             c.view = View {
                                 phase: Phase::Preview,
                                 destination: plan.destination.clone(),
                                 amount: plan.amount,
                                 fee: plan.fee,
                                 count: plan.raw.len(),
-                                message:
-                                    "Enter sends Max; Esc cancels. Quote expires in 60 seconds."
-                                        .into(),
+                                message: "Y sends Max; Esc cancels. Quote expires in 60 seconds."
+                                    .into(),
                                 ..View::default()
                             };
                             self.quote = Some((plan, Instant::now()));
@@ -536,6 +548,12 @@ mod tests {
             }
         }
     }
+    fn approve(c: &Mutex<Control>) {
+        let mut c = c.lock().unwrap();
+        let view = c.view();
+        c.presented(&view);
+        c.confirm();
+    }
     impl Link for Fake {
         fn coins(&mut self) -> Result<Vec<Coin>, String> {
             Ok(self.coins.clone())
@@ -569,7 +587,14 @@ mod tests {
         assert_eq!(view.count, 2);
         assert!(link.attempts.is_empty());
         assert!(!f.path().exists());
+        // Holding/repeating Enter cannot accept the quote, nor can an unseen
+        // quote be accepted by the distinct confirmation key.
         c.lock().unwrap().enter();
+        c.lock().unwrap().enter();
+        c.lock().unwrap().confirm();
+        assert_eq!(c.lock().unwrap().view.phase, Phase::Preview);
+        assert!(!f.path().exists());
+        approve(&c);
         c.lock().unwrap().cancel(); // Confirmation already submitted: cannot discard it.
         link.lost_reply = true;
         assert!(txs.poll(&f.pot, Some(&f.key), &mut link, &c).is_err());
@@ -608,7 +633,7 @@ mod tests {
                     continue;
                 }
             }
-            c.lock().unwrap().enter();
+            approve(&c);
             assert!(txs.poll(&f.pot, Some(&f.key), &mut link, &c).is_err());
             assert!(link.attempts.is_empty());
             assert!(!f.path().exists());
@@ -634,7 +659,7 @@ mod tests {
         let mut txs = f.transfers();
         let mut link = Fake::new(&f);
         txs.poll(&f.pot, Some(&f.key), &mut link, &c).unwrap();
-        c.lock().unwrap().enter();
+        approve(&c);
         txs.poll(&f.pot, Some(&f.key), &mut link, &c).unwrap();
         let original = fs::read(f.path()).unwrap();
         let mut bad: serde_json::Value = serde_json::from_slice(&original).unwrap();

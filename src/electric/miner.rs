@@ -589,9 +589,16 @@ fn print_baton(deployment: &Deployment, baton: &Baton, tip: u32, restricted: boo
             "next:       a claim at difficulty {} moves the baton to height {locktime}",
             state.difficulty
         ),
+        Some(_) if restricted => {
+            println!("next:       a minimum-difficulty same-height claim (restricted pot)")
+        }
         Some(_) => println!(
             "next:       a same-height claim at difficulty {} (authorized pot)",
             state.difficulty
+        ),
+        None if restricted && tip >= state.last_height => println!(
+            "next:       waiting for block {} (restricted pot)",
+            state.last_height.saturating_add(1)
         ),
         None => println!(
             "next:       waiting for the tip to reach height {}",

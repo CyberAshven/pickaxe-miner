@@ -331,6 +331,17 @@ pub fn run(
             })
             .collect()
     };
+    // #### PR #65: the TUI supplies a bare payout. Both JD recipients need
+    // the explicit share-owner identity before connecting to BCH P2Pool.
+    let pools = pools
+        .into_iter()
+        .map(|mut pool| {
+            if p2pool_prepare_api.is_some() {
+                pool.identity = p2pool_jd_identity(config.network, &pool.identity)?;
+            }
+            Ok(pool)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let pools = at_pools(pools);
     let fallbacks = at_pools(fallbacks);
     let listener = serving
@@ -1042,6 +1053,24 @@ pub fn run(
 // donation at every P2Pool pool of that kind. P2Pool's own block donation
 // is the pool's and separate from Pickaxe's.
 // Look here if: the donation channel is refused at a P2Pool node.
+fn p2pool_jd_identity(
+    network: crate::config::MiningNetwork,
+    identity: &str,
+) -> Result<String, String> {
+    let (payout, supplied_share) = match identity.split_once(",p2p=") {
+        Some((payout, share)) => (payout, Some(share)),
+        None => (identity, None),
+    };
+    let payout = crate::config::validate_payout_address(network, payout)
+        .map_err(|_| "P2Pool own templates need a payout CashAddr on the selected network")?;
+    let share = match supplied_share {
+        Some(share) if !share.is_empty() && !share.contains([',', ' ']) => share.to_owned(),
+        Some(_) => return Err("invalid P2Pool share-owner identity".into()),
+        None => crate::tx::p2pool_share_address(&payout)?,
+    };
+    Ok(format!("{payout},p2p={share}"))
+}
+
 fn donation_route(
     network: crate::config::MiningNetwork,
     identity: &str,
@@ -3931,6 +3960,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("needs --job-declaration"), "{error}");
+    }
+
+    #[test]
+    fn p2pool_jd_bare_payout_from_setup_gets_a_share_owner_for_both_networks() {
+        for network in [
+            crate::config::MiningNetwork::Mainnet,
+            crate::config::MiningNetwork::Chipnet,
+        ] {
+            let payout = crate::tx::cashaddr_with_version(0, &[0x29; 20], network);
+            let share = crate::tx::p2pool_share_address(&payout).unwrap();
+            let identity = p2pool_jd_identity(network, &payout).unwrap();
+            assert_eq!(
+                identity.split_once(",p2p="),
+                Some((payout.as_str(), share.as_str()))
+            );
+            assert_eq!(p2pool_jd_identity(network, &identity).unwrap(), identity);
+            let other_network = if network == crate::config::MiningNetwork::Mainnet {
+                crate::config::MiningNetwork::Chipnet
+            } else {
+                crate::config::MiningNetwork::Mainnet
+            };
+            assert!(p2pool_jd_identity(other_network, &payout).is_err());
+            assert!(p2pool_jd_identity(network, &format!("{payout},p2p=")).is_err());
+            assert!(p2pool_jd_identity(network, "named-worker").is_err());
+        }
     }
 
     #[test]

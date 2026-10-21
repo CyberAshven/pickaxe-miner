@@ -141,7 +141,8 @@ need that wallet's spending key to move again.
 
 In the owner-pot TUI, **F** opens funding, **M** selects Max/send. Enter the
 destination, press **Enter** to preview the total amount, fee and transaction
-count, then **Enter** again to send. **Esc** cancels an unapproved quote.
+count, then **Y** to send after the quote is displayed. Holding or repeating
+Enter cannot confirm a transfer. **Esc** cancels an unapproved quote.
 Addresses are checked against the session's network. A quote expires after
 60 seconds and is invalidated if coins change or the relay fee rises. Max
 sends each pot coin separately, each within the covenant fee cap; an

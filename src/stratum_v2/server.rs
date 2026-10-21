@@ -1450,7 +1450,7 @@ fn offer(
             summary.state = "preparing";
             summary.last_error = Some(error);
         }
-        publish(shared, None);
+        failed_offer(shared, offered, &template, plan_serial);
         return;
     }
     if let Some(own) = donation_template.as_mut() {
@@ -1459,7 +1459,7 @@ fn offer(
                 summary.state = "preparing";
                 summary.last_error = Some(error);
             }
-            publish(shared, None);
+            failed_offer(shared, offered, &template, plan_serial);
             return;
         }
     }
@@ -1486,16 +1486,23 @@ fn offer(
             })
             .is_err()
         {
-            publish(shared, None);
+            failed_offer(shared, offered, &template, plan_serial);
             return;
         }
         template.set_p2pool_donation(own);
     }
     let template = Arc::new(template);
-    let _ = uplink.events.try_send(UplinkEvent::Published {
-        serial: declaration,
-        template: template.clone(),
-    });
+    if uplink
+        .events
+        .try_send(UplinkEvent::Published {
+            serial: declaration,
+            template: template.clone(),
+        })
+        .is_err()
+    {
+        failed_offer(shared, offered, &template, plan_serial);
+        return;
+    }
     publish(
         shared,
         Some(PublishedJob {
@@ -1511,6 +1518,31 @@ fn offer(
     );
 }
 // #### end PR #42 ####
+
+/// #### PR #65: a failed refresh cannot revoke still-fresh work on the same
+/// parent and sessions. Its original lease and ACK checks remain authoritative.
+fn failed_offer(shared: &Shared, offered: &mut Offered, incoming: &BchTemplate, plan: u64) {
+    offered.last = None; // Failed preparation was not a declaration; retry immediately.
+    let keep = shared
+        .job
+        .read()
+        .ok()
+        .and_then(|job| job.clone())
+        .is_some_and(|job| {
+            job.template.previous_hash == incoming.previous_hash
+                && job.template.bits == incoming.bits
+                && job.serial >> 32
+                    == if job.template.is_p2pool() {
+                        u64::from(offered.cohort)
+                    } else {
+                        plan
+                    }
+                && Instant::now() < job.valid_until
+        });
+    if !keep {
+        publish(shared, None);
+    }
+}
 
 fn publish(shared: &Shared, job: Option<PublishedJob>) {
     // #### PR #42: devices on a fallback pool come back while this server
@@ -2531,6 +2563,232 @@ mod retry_tests {
     // offered less than 5 s ago is skipped; new bits on the same parent go
     // at once, as a new parent or plan does.
     // Look here if: Offered::coalesce changes.
+    #[test]
+    fn failed_p2pool_prepare_keeps_the_original_lease_but_revokes_changed_or_expired_work() {
+        use super::super::jd::{
+            client::{JdClientSummary, JdStatus},
+            plan::JdPlan,
+            token::PoolRates,
+        };
+        let dir = super::super::journal::TestDirectory::new();
+        let plan = Arc::new(JdPlan {
+            serial: 1,
+            upstream_prefix: vec![0; 4],
+            pad: Vec::new(),
+            compact: false,
+            scripts: vec![vec![0x51]],
+            rates: PoolRates {
+                donation_bps: 0,
+                fee_bps: 0,
+                donation_output: None,
+                fee_output: None,
+            },
+            pool_target: [255; 32],
+            p2pool: Some(Arc::new(crate::p2pool::jd::Plan {
+                api: "http://127.0.0.1:1/jd_prepare".into(),
+                payout: String::new(),
+                share_owner: String::new(),
+                tokens: Mutex::new(VecDeque::new()),
+                consumed: std::sync::atomic::AtomicUsize::new(0),
+            })),
+        });
+        let (events, _receive) = mpsc::sync_channel(1);
+        let status = Arc::new(JdStatus {
+            plan: RwLock::new(Some(plan.clone())),
+            summary: Mutex::new(JdClientSummary::default()),
+            acknowledged: std::sync::atomic::AtomicU64::new(1),
+        });
+        let uplink = UplinkHandle {
+            events,
+            status,
+            donation: None,
+        };
+        let shared = Shared {
+            job: RwLock::new(None),
+            stats: Arc::default(),
+            wake: mpsc::sync_channel(1).0,
+            journal: Mutex::new(
+                Journal::open_declared(&dir.0.join("blocks.json"), MiningNetwork::Chipnet).unwrap(),
+            ),
+            fatal: Mutex::new(None),
+            stop: Arc::default(),
+            solved: Mutex::default(),
+            claims: None,
+            relay: None,
+            lanes: Arc::default(),
+            declared: None,
+            recent: None,
+            preferred: None,
+        };
+        let mut template =
+            BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
+        template.declare(plan.clone());
+        template.set_declaration_id(1);
+        for case in 0..5 {
+            let until = if case == 3 {
+                Instant::now() - Duration::from_secs(1)
+            } else {
+                Instant::now() + Duration::from_secs(30)
+            };
+            let previous = PublishedJob {
+                generation: 1,
+                serial: (1u64 << 32) | 1,
+                template: Arc::new(template.clone()),
+                valid_until: until,
+            };
+            *shared.job.write().unwrap() = Some(previous.clone());
+            let mut offered = Offered {
+                plan: Some(1),
+                cohort: 1,
+                issued: 1,
+                ..Default::default()
+            };
+            let mut next = template.clone();
+            if case == 1 {
+                next.previous_hash[0] ^= 1;
+            }
+            if case == 2 {
+                next.bits ^= 1;
+            }
+            if case == 4 {
+                offered.cohort = 2;
+            }
+            offer(&shared, Some(&uplink), &mut offered, 2, 2, next);
+            let current = shared.job.read().unwrap();
+            if case == 0 {
+                let retained = current
+                    .as_ref()
+                    .expect("accepted same-parent work must remain");
+                assert_eq!(retained.serial, previous.serial);
+                assert_eq!(
+                    retained.valid_until, until,
+                    "a failed refresh cannot extend its lease"
+                );
+                assert!(Arc::ptr_eq(&retained.template, &previous.template));
+            } else {
+                assert!(current.is_none(), "case {case} must revoke unsafe work");
+            }
+            assert!(
+                offered.last.is_none(),
+                "failed preparation must not coalesce the retry"
+            );
+        }
+    }
+
+    #[test]
+    fn full_personal_or_donation_queues_do_not_drop_fresh_accepted_work() {
+        use super::super::jd::{
+            client::{JdClientSummary, JdStatus},
+            plan::JdPlan,
+            token::PoolRates,
+        };
+        for donation_full in [false, true] {
+            let dir = super::super::journal::TestDirectory::new();
+            let plan = Arc::new(JdPlan {
+                serial: 1,
+                upstream_prefix: vec![0; 4],
+                pad: Vec::new(),
+                compact: false,
+                scripts: vec![vec![0x51]],
+                rates: PoolRates {
+                    donation_bps: 0,
+                    fee_bps: 0,
+                    donation_output: None,
+                    fee_output: None,
+                },
+                pool_target: [255; 32],
+                p2pool: None,
+            });
+            let mut template =
+                BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
+            template.declare(plan.clone());
+            let template = Arc::new(template);
+            let status = || {
+                Arc::new(JdStatus {
+                    plan: RwLock::new(Some(plan.clone())),
+                    summary: Mutex::new(JdClientSummary::default()),
+                    acknowledged: std::sync::atomic::AtomicU64::new(1),
+                })
+            };
+            let (events, _receive) = mpsc::sync_channel(1);
+            let (donation_events, _donation_receive) = mpsc::sync_channel(1);
+            let donation = donation_full.then(|| {
+                Arc::new(UplinkHandle {
+                    events: donation_events.clone(),
+                    status: status(),
+                    donation: None,
+                })
+            });
+            let uplink = UplinkHandle {
+                events,
+                status: status(),
+                donation,
+            };
+            if donation_full {
+                donation_events
+                    .send(UplinkEvent::Published {
+                        serial: 0,
+                        template: template.clone(),
+                    })
+                    .unwrap();
+            } else {
+                uplink
+                    .events
+                    .send(UplinkEvent::Published {
+                        serial: 0,
+                        template: template.clone(),
+                    })
+                    .unwrap();
+            }
+            let until = Instant::now() + Duration::from_secs(30);
+            let shared = Shared {
+                job: RwLock::new(Some(PublishedJob {
+                    generation: 1,
+                    serial: (1u64 << 32) | 1,
+                    template: template.clone(),
+                    valid_until: until,
+                })),
+                stats: Arc::default(),
+                wake: mpsc::sync_channel(1).0,
+                journal: Mutex::new(
+                    Journal::open_declared(&dir.0.join("blocks.json"), MiningNetwork::Chipnet)
+                        .unwrap(),
+                ),
+                fatal: Mutex::new(None),
+                stop: Arc::default(),
+                solved: Mutex::default(),
+                claims: None,
+                relay: None,
+                lanes: Arc::default(),
+                declared: None,
+                recent: None,
+                preferred: None,
+            };
+            let mut offered = Offered {
+                plan: Some(1),
+                donation_plan: donation_full.then_some(1),
+                cohort: 1,
+                issued: 1,
+                ..Default::default()
+            };
+            offer(
+                &shared,
+                Some(&uplink),
+                &mut offered,
+                2,
+                2,
+                (*template).clone(),
+            );
+            let current = shared.job.read().unwrap();
+            let current = current
+                .as_ref()
+                .expect("backpressure must not erase the accepted job");
+            assert_eq!(current.generation, 1);
+            assert_eq!(current.valid_until, until);
+            assert!(offered.last.is_none());
+        }
+    }
+
     #[test]
     fn offers_coalesce_by_parent_bits_and_plan() {
         let template =

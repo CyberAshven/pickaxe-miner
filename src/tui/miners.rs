@@ -229,6 +229,15 @@ pub fn run_miners(
                 .terminal
                 .draw(|frame| render_miners(frame, &state))
                 .map_err(|error| format!("draw token dashboard: {error}"))?;
+            if let (Some(monitor), Some(tokens)) = (miners.electric, state.tokens.as_ref()) {
+                if let Some(electric) = tokens.electric.as_ref().filter(|_| tokens.show_pot) {
+                    monitor
+                        .withdrawal
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .presented(&electric.withdrawal);
+                }
+            }
             last_draw = Instant::now();
         }
         if event::poll(EVENT_POLL_INTERVAL).map_err(|e| e.to_string())? {
@@ -323,6 +332,12 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
                 KeyCode::Enter => send.enter(),
                 KeyCode::Backspace => send.backspace(),
                 KeyCode::Char(c) if editing => send.character(c),
+                KeyCode::Char('y' | 'Y')
+                    if key.kind == KeyEventKind::Press
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+                {
+                    send.confirm()
+                }
                 KeyCode::Char('m' | 'M') => send.edit(),
                 KeyCode::Char('f' | 'F') => {
                     send.cancel();
@@ -959,7 +974,7 @@ pub(super) mod tests {
             amount: 12345,
             fee: 456,
             count: 2,
-            message: "Enter sends Max; Esc cancels. Quote expires in 60 seconds.".into(),
+            message: "Y sends Max; Esc cancels. Quote expires in 60 seconds.".into(),
         };
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| render_miners(frame, &state)).unwrap();
@@ -975,7 +990,7 @@ pub(super) mod tests {
             "Receive: 12345 sats",
             "Total fee: 456 sats",
             "2 transaction(s)",
-            "Enter sends Max",
+            "Y sends Max",
             "Esc cancels",
         ] {
             assert!(text.contains(expected), "missing {expected}");
