@@ -3256,9 +3256,12 @@ impl SetupFlow {
                             .len();
                         self.step = SetupStep::Connections;
                         self.check_local_node();
-                        self.status_line =
+                        self.status_line = if self.own_p2pool {
                             "Your own P2Pool node takes its templates from your own BCH node: add it here."
-                                .into();
+                        } else {
+                            "Your templates at public P2Pool require your own BCH node: add it here."
+                        }
+                        .into();
                     } else if !self.own_p2pool
                         && self.job_declaration.is_some()
                         && crate::config::validate_p2pool_preparation_url(&self.p2pool_prepare_api)
@@ -9218,6 +9221,129 @@ mod tests {
         assert_eq!(reopened.pool_kind, PoolKind::P2PoolV2);
         assert!(reopened.own_p2pool);
         assert_eq!(reopened.server_setup(), Some(ServerSetup::OwnP2Pool));
+    }
+
+    /// #### PR #65: a public upstream supplies jobs without a local node;
+    /// building BCH jobs ourselves must never mistake Fulcrum for a node.
+    #[test]
+    fn mining_source_requirement_matrix_separates_token_pool_and_own_template_jobs() {
+        use crate::config::SavedDeclaration as Declaration;
+        #[derive(Clone, Copy, Debug)]
+        enum Scenario {
+            Photon,
+            GpuPool,
+            SoloBch,
+            PublicPool,
+            PublicPoolJd(Declaration),
+            PublicP2Pool,
+            PublicP2PoolJd,
+            OwnP2Pool,
+            RunBchPool,
+        }
+        let cases = [
+            (Scenario::Photon, false),
+            (Scenario::GpuPool, false),
+            (Scenario::SoloBch, true),
+            (Scenario::PublicPool, false),
+            (Scenario::PublicPoolJd(Declaration::Full), true),
+            (Scenario::PublicPoolJd(Declaration::Coinbase), true),
+            (Scenario::PublicPoolJd(Declaration::FullRequired), true),
+            (Scenario::PublicPoolJd(Declaration::CoinbaseRequired), true),
+            (Scenario::PublicP2Pool, false),
+            (Scenario::PublicP2PoolJd, true),
+            (Scenario::OwnP2Pool, true),
+            (Scenario::RunBchPool, true),
+        ];
+        for network in [MiningNetwork::Mainnet, MiningNetwork::Chipnet] {
+            for (scenario, needs_node) in cases {
+                for with_node in [false, true] {
+                    let mode = match scenario {
+                        Scenario::Photon => MiningMode::Gpu,
+                        Scenario::GpuPool | Scenario::RunBchPool => MiningMode::Pool,
+                        _ => MiningMode::Asic,
+                    };
+                    let mut setup = setup_for(mode);
+                    setup.config.set_network(network);
+                    setup.config.payout_address =
+                        crate::config::reprefix_p2pkh_payout(&chipnet_payout(4), network).unwrap();
+                    setup.config.fulcrum_url = Some("wss://fulcrum.invalid:50004".into());
+                    setup.config.node_url = with_node.then(|| "http://node.invalid:8332".into());
+                    setup.pool_target = if matches!(scenario, Scenario::GpuPool) {
+                        1
+                    } else {
+                        0
+                    };
+                    setup.asic_mining = if matches!(
+                        scenario,
+                        Scenario::PublicPool
+                            | Scenario::PublicPoolJd(_)
+                            | Scenario::PublicP2Pool
+                            | Scenario::PublicP2PoolJd
+                            | Scenario::OwnP2Pool
+                    ) {
+                        AsicMining::JoinPool
+                    } else {
+                        AsicMining::Solo
+                    };
+                    setup.pool_kind = if matches!(
+                        scenario,
+                        Scenario::PublicP2Pool | Scenario::PublicP2PoolJd | Scenario::OwnP2Pool
+                    ) {
+                        PoolKind::P2PoolV2
+                    } else {
+                        PoolKind::Normal
+                    };
+                    setup.own_p2pool = matches!(scenario, Scenario::OwnP2Pool);
+                    setup.job_declaration = match scenario {
+                        Scenario::PublicPoolJd(mode) => Some(mode),
+                        Scenario::PublicP2PoolJd => Some(Declaration::FullRequired),
+                        _ => None,
+                    };
+                    setup.join_address = "pool.invalid:3336".into();
+                    setup.join_key = "KEY".into();
+                    setup.p2pool_prepare_api = "https://pool.invalid/jd_prepare".into();
+                    setup.open_settings(SettingsRow::Start);
+                    let action = setup.handle_key(key(KeyCode::Enter));
+                    let missing = needs_node && !with_node;
+                    assert_eq!(
+                        action,
+                        if missing {
+                            SetupAction::Continue
+                        } else {
+                            SetupAction::Complete
+                        },
+                        "{scenario:?} {network:?} node={with_node}: {}",
+                        setup.status_line
+                    );
+                    if missing {
+                        assert_eq!(setup.step, SetupStep::Connections, "{scenario:?}");
+                        assert_eq!(setup.connection_kind, ConnectionKind::Node);
+                        if matches!(scenario, Scenario::PublicP2PoolJd) {
+                            assert!(setup.status_line.contains("public P2Pool"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn leaving_public_pool_mode_cannot_bypass_bch_node_setup() {
+        let mut setup = setup_for(MiningMode::Asic);
+        setup.config.payout_address = chipnet_payout(4);
+        setup.config.node_url = None;
+        setup.asic_mining = AsicMining::JoinPool;
+        setup.join_address = "pool.invalid:3336".into();
+        setup.join_key = "KEY".into();
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Complete);
+        setup.open_settings(SettingsRow::Mining);
+        setup.handle_key(key(KeyCode::Left));
+        assert_eq!(setup.asic_mining, AsicMining::Solo);
+        setup.open_settings(SettingsRow::Start);
+        assert_eq!(setup.handle_key(key(KeyCode::Enter)), SetupAction::Continue);
+        assert_eq!(setup.connection_kind, ConnectionKind::Node);
+        assert_eq!(setup.step, SetupStep::Connections);
     }
 
     #[test]

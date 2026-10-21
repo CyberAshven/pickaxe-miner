@@ -55,6 +55,40 @@ assumptions baked into some SV2 examples:
 
 ## Template sources
 
+#### PR #65: when a node is required
+
+| Mining mode | Source of BCH block templates | Own BCH node required in setup |
+| --- | --- | --- |
+| BCH solo / running a BCH pool | Your node | Yes |
+| Embedded P2Pool | Your node feeding your P2Pool instance | Yes |
+| Joining a public pool or public P2Pool with its jobs | The upstream pool/node | No |
+| Joining a pool with Your templates / Job Declaration | Your node; the pool admits the declared work | Yes |
+
+The CLI also accepts an SV2 Template Provider as a full template source, so
+RPC itself is not the only possible transport. A Fulcrum address does not
+satisfy that requirement: it supplies indexed transactions and UTXOs, not BCH
+block templates. The server preflights its configured source before serving
+local jobs, and checks the selected network, synchronization and template
+validity. Required-own-template modes do not silently adopt pool-selected jobs.
+
+GPU covenant-token mining has a different source requirement. PHOTON can use
+its native BCH RPC source or Electrum/Fulcrum. ELECTRIC currently needs the
+Electrum indexed-UTXO path for its baton and pot; configuring a BCH RPC URL
+does not implement that index or switch ELECTRIC to native RPC. A node still
+validates the chain behind a Fulcrum service; using a public service removes
+the requirement to operate that node yourself, not the underlying dependency.
+
+The setup regression matrix exercises both networks, with and without a node,
+across PHOTON, GPU pools, BCH solo, public pools, all four Job Declaration
+modes, public P2Pool and embedded P2Pool. It explicitly keeps Fulcrum configured
+when refusing a missing BCH node, and checks switching from a public pool back
+to solo. Provider regressions separately cover RPC failure, the wrong network,
+initial sync, lagging headers and a tip change during template construction.
+
+Protocol references: [BCHN block templates](https://docs.bitcoincashnode.org/doc/json-rpc/getblocktemplate/),
+[SV2 Job Declaration](https://stratumprotocol.org/specification/06-job-declaration-protocol/),
+and [Electrum indexed-UTXO methods](https://electrum-cash-protocol.readthedocs.io/en/latest/protocol-methods.html#blockchain-scripthash-listunspent).
+
 | Source | Notes |
 |---|---|
 | **bchn-sv2-bridge** | External AGPL TP for unmodified BCHN over JSON-RPC; tested on mainnet; keeps JD off because unordered JD breaks CTOR. |

@@ -3228,6 +3228,28 @@ pub(crate) fn load_authority(path: &Path) -> Result<[u8; 32], String> {
 mod tests {
     use super::*;
 
+    /// #### PR #65: the CLI has the same source requirement as setup;
+    /// Electrum headers/UTXOs never stand in for a BCH block template.
+    #[test]
+    fn fulcrum_cannot_replace_a_bch_node_or_template_provider_at_preflight() {
+        for network in [
+            config::MiningNetwork::Mainnet,
+            config::MiningNetwork::Chipnet,
+        ] {
+            let mut cfg = RuntimeConfig::default();
+            cfg.set_network(network);
+            cfg.fulcrum_url = Some("wss://fulcrum.invalid:50004".into());
+            assert!(cfg.custom_node_endpoints().is_empty());
+            let error = preflight_sources(&cfg, &[], 0)
+                .err()
+                .expect("no BCH template source");
+            assert!(
+                error.contains("configure your BCHN RPC connection"),
+                "{error}"
+            );
+        }
+    }
+
     // #### PR #42
     // What: merge-mined token wins show on the dashboard's records line and
     // in the status file (token, case, height, worker; never an address),
