@@ -142,9 +142,9 @@ try {
       }
     }
   }
-  assert.equal(proof.samples.length, 33);
-  assert.equal(valid, 2 * 16);
-  assert.equal(refused, 2 * 17);
+  assert.equal(proof.samples.length, 46);
+  assert.equal(valid, 2 * 23);
+  assert.equal(refused, 2 * 23);
   console.log(`PASS ELECTRIC: ${proof.samples.length} claims/refunds in standard and consensus VMs; authorized fresh same-height claims pass; unsigned/wrong-key claims, altered outpoints/outputs/amounts, duplicate pots, excessive fees and unauthorized refunds fail. Previous funded pot scripts retain their restrictions.`);
 } finally {
   rmSync(temp, { recursive: true });

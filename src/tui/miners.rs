@@ -115,6 +115,15 @@ pub fn run_miners(
     }
     let _stop = StopOnExit(miners);
     let mut terminal = TerminalSession::enter()?;
+    crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)
+        .map_err(|e| format!("enable address paste: {e}"))?;
+    struct PasteMode;
+    impl Drop for PasteMode {
+        fn drop(&mut self) {
+            let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+        }
+    }
+    let _paste = PasteMode;
     let mut state = TuiState::starting("Mining session started".into());
     state.set_devices(gpus.to_vec());
     // PHOTON already samples the same devices. ELECTRIC alone needs a sampler.
@@ -223,10 +232,19 @@ pub fn run_miners(
             last_draw = Instant::now();
         }
         if event::poll(EVENT_POLL_INTERVAL).map_err(|e| e.to_string())? {
-            if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
-                if key.kind != KeyEventKind::Release && token_key(key, miners, &mut state)? {
-                    break;
+            match event::read().map_err(|e| e.to_string())? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if token_key(key, miners, &mut state)? {
+                        break;
+                    }
                 }
+                Event::Paste(text) if show_pot => {
+                    if let Some(monitor) = miners.electric {
+                        let mut send = monitor.withdrawal.lock().unwrap_or_else(|e| e.into_inner());
+                        send.paste(&text);
+                    }
+                }
+                _ => {}
             }
         }
         let tokens = state.tokens.as_ref().expect("session view");
@@ -292,6 +310,32 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
+    if state.tokens.as_ref().is_some_and(|t| t.show_pot) {
+        if let Some(monitor) = miners.electric {
+            use crate::electric::withdrawal::Phase;
+            let mut send = monitor.withdrawal.lock().unwrap_or_else(|e| e.into_inner());
+            let editing = send.view().phase == Phase::Editing;
+            match key.code {
+                KeyCode::Esc => {
+                    send.cancel();
+                    state.tokens.as_mut().unwrap().show_pot = false;
+                }
+                KeyCode::Enter => send.enter(),
+                KeyCode::Backspace => send.backspace(),
+                KeyCode::Char(c) if editing => send.character(c),
+                KeyCode::Char('m' | 'M') => send.edit(),
+                KeyCode::Char('f' | 'F') => {
+                    send.cancel();
+                    state.tokens.as_mut().unwrap().show_pot = false;
+                }
+                KeyCode::Char('q' | 'Q') => return Ok(true),
+                _ => {}
+            }
+        } else if matches!(key.code, KeyCode::Esc | KeyCode::Char('f' | 'F')) {
+            state.tokens.as_mut().unwrap().show_pot = false;
+        }
+        return Ok(false);
+    }
     if state.command_mode {
         match key.code {
             KeyCode::Esc => state.cancel_command(),
@@ -354,12 +398,6 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
         return Ok(false);
     }
     let tokens = state.tokens.as_mut().expect("session view");
-    if tokens.show_pot {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('f' | 'F')) {
-            tokens.show_pot = false;
-        }
-        return Ok(false);
-    }
     if state.settings_mode {
         match key.code {
             KeyCode::Esc if tokens.editing => tokens.editing = false,
@@ -637,7 +675,7 @@ fn render_miners(frame: &mut Frame<'_>, state: &TuiState) {
         render_chart_options(frame, area, state, cursor);
     }
     if tokens.show_pot {
-        render_pot(frame, area, tokens.electric.as_ref());
+        render_pot(frame, area, tokens.electric.as_ref(), tokens.network);
     }
 }
 
@@ -652,7 +690,12 @@ fn popup(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'static
     );
 }
 
-fn render_pot(frame: &mut Frame<'_>, area: Rect, electric: Option<&Summary>) {
+fn render_pot(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    electric: Option<&Summary>,
+    network: MiningNetwork,
+) {
     let Some(e) = electric else {
         popup(
             frame,
@@ -669,6 +712,46 @@ fn render_pot(frame: &mut Frame<'_>, area: Rect, electric: Option<&Summary>) {
     let block = Block::bordered().title(" ELECTRIC · fund the fee pot · F/Esc closes ");
     let inner = block.inner(panel);
     frame.render_widget(block, panel);
+    use crate::electric::withdrawal::Phase;
+    let send = &e.withdrawal;
+    if send.enabled && send.phase != Phase::Idle {
+        let mut lines = vec![
+            Line::from(format!(
+                "Max/send · {} · plain BCH from this fee pot",
+                network.as_str()
+            )),
+            Line::from(""),
+            Line::from("Destination:"),
+            Line::from(format!(
+                "{}{}",
+                send.destination,
+                if send.phase == Phase::Editing {
+                    "_"
+                } else {
+                    ""
+                }
+            )),
+            Line::from(""),
+        ];
+        if send.count > 0 {
+            lines.push(Line::from(format!("Receive: {} sats", send.amount)));
+            lines.push(Line::from(format!(
+                "Total fee: {} sats · {} transaction(s)",
+                send.fee, send.count
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(match send.phase {
+            Phase::Editing => "Type/paste a BCH address; Enter previews, Esc cancels.".into(),
+            Phase::Preparing => "Finishing any pending claim; preparing Max/send…".into(),
+            _ => send.message.clone(),
+        }));
+        if send.phase == Phase::Error || send.phase == Phase::Complete {
+            lines.push(Line::from("M prepares a new Max/send. Esc closes."));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        return;
+    }
     let qr_width = e
         .pot_qr
         .first()
@@ -689,6 +772,20 @@ fn render_pot(frame: &mut Frame<'_>, area: Rect, electric: Option<&Summary>) {
         }),
         Line::from("Tokens go directly to each winning recipient."),
     ];
+    lines.push(Line::from(""));
+    if send.enabled {
+        lines.push(Line::from(format!(
+            "Owner-controlled pot · {} · M Max/send",
+            network.as_str()
+        )));
+    } else {
+        lines.push(Line::from(
+            "This funded pot refunds only to its original payout wallet.",
+        ));
+        lines.push(Line::from(
+            "New owner pots support Max/send; old funds are not moved.",
+        ));
+    }
     if let Some(key) = &e.pot_key {
         lines.push(Line::from(format!("Recovery key file: {key}")));
         lines.push(Line::from("Back up this file; it authorizes refunds."));
@@ -812,6 +909,77 @@ pub(super) mod tests {
         assert!(!token_key(key(KeyCode::Esc), &miners, &mut state).unwrap());
         assert!(!monitor.stopped());
         assert!(token_key(key(KeyCode::Char('q')), &miners, &mut state).unwrap());
+    }
+
+    #[test]
+    fn pot_send_address_editing_does_not_trigger_mining_shortcuts() {
+        let monitor = Monitor::new(100, false, "Preview GPU".into());
+        monitor.withdrawal.lock().unwrap().enabled = true;
+        let miners = Miners {
+            network: MiningNetwork::Mainnet,
+            runtimes: vec![],
+            electric: Some(&monitor),
+            split: None,
+            stop: None,
+        };
+        let mut state = fixture();
+        state.tokens.as_mut().unwrap().show_pot = true;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        token_key(key(KeyCode::Char('m')), &miners, &mut state).unwrap();
+        for ch in "bitcoincash:qfrq".chars() {
+            assert!(!token_key(key(KeyCode::Char(ch)), &miners, &mut state).unwrap());
+        }
+        assert_eq!(
+            monitor.withdrawal.lock().unwrap().view().destination,
+            "bitcoincash:qfrq"
+        );
+        assert!(state.tokens.as_ref().unwrap().show_pot);
+        assert!(!monitor.stopped());
+        token_key(key(KeyCode::Esc), &miners, &mut state).unwrap();
+        assert!(!monitor.withdrawal.lock().unwrap().holding());
+        assert!(!state.tokens.as_ref().unwrap().show_pot);
+    }
+
+    #[test]
+    fn max_send_confirmation_shows_network_amount_and_fee_in_a_small_terminal() {
+        let mut state = fixture();
+        state.tokens.as_mut().unwrap().network = MiningNetwork::Mainnet;
+        state.tokens.as_mut().unwrap().show_pot = true;
+        state
+            .tokens
+            .as_mut()
+            .unwrap()
+            .electric
+            .as_mut()
+            .unwrap()
+            .withdrawal = crate::electric::withdrawal::View {
+            enabled: true,
+            phase: crate::electric::withdrawal::Phase::Preview,
+            destination: "PREVIEW ONLY - DO NOT PAY".into(),
+            amount: 12345,
+            fee: 456,
+            count: 2,
+            message: "Enter sends Max; Esc cancels. Quote expires in 60 seconds.".into(),
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render_miners(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for expected in [
+            "mainnet",
+            "Receive: 12345 sats",
+            "Total fee: 456 sats",
+            "2 transaction(s)",
+            "Enter sends Max",
+            "Esc cancels",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
     }
 
     #[test]

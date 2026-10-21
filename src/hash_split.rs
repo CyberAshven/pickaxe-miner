@@ -555,7 +555,7 @@ pub fn run(
     config_path: &Path,
     plain: bool,
 ) -> Result<(), String> {
-    run_with_pot_mode(cfg, gpus, shares, config_path, plain, false)
+    run_with_pot_mode(cfg, gpus, shares, config_path, plain, false, false)
 }
 
 pub fn run_with_pot_mode(
@@ -565,6 +565,7 @@ pub fn run_with_pot_mode(
     config_path: &Path,
     plain: bool,
     restricted_electric_pot: bool,
+    owner_electric_pot: bool,
 ) -> Result<(), String> {
     shares.validate()?;
     if gpus.is_empty() {
@@ -637,6 +638,7 @@ pub fn run_with_pot_mode(
                     config_path,
                     &monitor,
                     restricted_electric_pot,
+                    owner_electric_pot,
                 );
                 if let Err(error) = &mined {
                     // The other tokens keep the GPUs; ELECTRIC no longer asks.

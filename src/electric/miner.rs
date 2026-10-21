@@ -38,10 +38,23 @@ pub fn run(
     no_tui: bool,
 ) -> Result<(), String> {
     match command {
+        ElectricCommand::Wallet => {
+            let wallet = super::wallet::create(cfg.network, config_path)?;
+            println!("Pickaxe payout wallet on {}", cfg.network.as_str());
+            println!("{}", wallet.address);
+            for row in super::ui::qr_lines(&wallet.address)? {
+                println!("{row}");
+            }
+            println!("Private backup: {}. Back up this file before receiving rewards. Creating this wallet does not move old funds or change the current profile.", wallet.key_path.display());
+            Ok(())
+        }
         ElectricCommand::Pot { deployment } => {
             let args = deployment;
             let deployment = select(cfg, args)?;
             let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, true)?;
+            if pot.owner_destination {
+                println!("Owner-controlled pot: its saved key controls Max/send to a chosen BCH address. This is a separate new pot; old pot funds are not moved.");
+            }
             if pot.authorized_claims {
                 println!("Signed claim pot: fresh same-height proofs are allowed. Older funded pots retain their address and key; select --restricted-pot on status/refund to recover their BCH. No funds are moved automatically.");
             }
@@ -105,6 +118,32 @@ pub fn run(
                 .as_deref()
                 .map(|path| RecoveryKey::load(path, false))
                 .transpose()?;
+            let journal_path = claim_journal_path(cfg, &pot, config_path);
+            let _pot_lock = super::withdrawal::lock(&journal_path)?;
+            let mut pkhs = [[0u8; 20]; 3];
+            for (pkh, address) in pkhs.iter_mut().zip(&addresses) {
+                pkh.copy_from_slice(&crate::tx::cashaddr_to_p2pkh_locking(address)?[3..23]);
+            }
+            if super::pending::Journal::open_with_key(
+                &journal_path,
+                &deployment,
+                &pot,
+                &pkhs,
+                key.as_ref().map(RecoveryKey::secret),
+            )?
+            .pending()
+            .is_some()
+            {
+                return Err("recover the pending ELECTRIC claim before refunding its pot".into());
+            }
+            let sends = super::withdrawal::Transfers::open(
+                &journal_path.with_extension("send.json"),
+                &pot,
+                key.as_ref(),
+            )?;
+            if sends.active() {
+                return Err("recover the approved Max/send in the TUI before refunding".into());
+            }
             let refund_lock = crate::tx::cashaddr_to_p2pkh_locking(&addresses[0])?;
             let mut session = connect(cfg)?;
             let fee = read_relay_fee(&mut session)?;
@@ -329,11 +368,12 @@ fn prepare(
         .map(super::gpu::Engine::new)
         .collect::<Result<Vec<_>, _>>()?;
     monitor.set_pot(&pot.address(), key_path.as_deref());
-    let journal_path = config_path.with_file_name(format!(
-        "electric-{}-{}.pending.json",
-        cfg.network.as_str(),
-        hex::encode(crate::proof::hash256(&pot.redeem)),
-    ));
+    monitor
+        .withdrawal
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .enabled = pot.owner_destination;
+    let journal_path = claim_journal_path(cfg, &pot, config_path);
     Ok(Ready {
         deployment,
         pot,
@@ -342,6 +382,14 @@ fn prepare(
         journal_path,
         claim_key,
     })
+}
+
+fn claim_journal_path(cfg: &RuntimeConfig, pot: &Pot, config_path: &Path) -> PathBuf {
+    config_path.with_file_name(format!(
+        "electric-{}-{}.pending.json",
+        cfg.network.as_str(),
+        hex::encode(crate::proof::hash256(&pot.redeem)),
+    ))
 }
 
 /// #### PR #53: ELECTRIC as one token of a hash split: the setup's
@@ -353,7 +401,7 @@ pub fn run_in_split(
     config_path: &Path,
     monitor: &super::ui::Monitor,
 ) -> Result<(), String> {
-    run_in_split_with_pot_mode(cfg, gpus, config_path, monitor, false)
+    run_in_split_with_pot_mode(cfg, gpus, config_path, monitor, false, false)
 }
 
 pub fn run_in_split_with_pot_mode(
@@ -362,10 +410,12 @@ pub fn run_in_split_with_pot_mode(
     config_path: &Path,
     monitor: &super::ui::Monitor,
     restricted_pot: bool,
+    owner_pot: bool,
 ) -> Result<(), String> {
     let devices = crate::backend::electric_engines_for(gpus.to_vec())?;
     let args = ElectricDeploymentArgs {
         restricted_pot,
+        owner_pot,
         ..Default::default()
     };
     let mut ready = prepare(cfg, &args, &devices, config_path, true, monitor)?;
@@ -476,13 +526,16 @@ fn pot_for(
     }
     let path = args.pot_key.clone().unwrap_or_else(|| {
         config_path.with_file_name(format!(
-            "electric-{}-{}.pot-key",
+            "electric-{}-{}{}.pot-key",
             cfg.network.as_str(),
+            if args.owner_pot { "owner-" } else { "" },
             hex::encode(crate::proof::hash256(&legacy.redeem))
         ))
     });
     let key = RecoveryKey::load(&path, create)?;
-    let pot = if args.restricted_pot {
+    let pot = if args.owner_pot {
+        Pot::with_owner_destination(deployment, &locks, key.public())?
+    } else if args.restricted_pot {
         Pot::with_recovery(deployment, &locks, Some(key.public()))?
     } else {
         Pot::with_authorized_claims(deployment, &locks, key.public())?
@@ -629,6 +682,39 @@ fn read_pot(session: &mut ElectrumSession, pot: &Pot) -> Result<Vec<Coin>, Strin
     Ok(coins)
 }
 
+struct WithdrawalLink<'a> {
+    session: &'a mut ElectrumSession,
+    pot: &'a Pot,
+}
+impl super::withdrawal::Link for WithdrawalLink<'_> {
+    fn coins(&mut self) -> Result<Vec<Coin>, String> {
+        read_pot(self.session, self.pot)
+    }
+    fn relay_fee(&mut self) -> Result<u64, String> {
+        read_relay_fee(self.session)
+    }
+    fn published(&mut self, txid: &str, raw: &str) -> Result<bool, String> {
+        match self
+            .session
+            .rpc("blockchain.transaction.get", json!([txid, false]))
+        {
+            Ok(value) if value.as_str().is_some_and(|v| v.eq_ignore_ascii_case(raw)) => Ok(true),
+            Ok(_) => Err("server returned different send transaction bytes".into()),
+            Err(error)
+                if error
+                    .to_ascii_lowercase()
+                    .contains("no such mempool or blockchain transaction") =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn broadcast(&mut self, raw: &str) -> Result<String, String> {
+        self.session.broadcast_raw(raw)
+    }
+}
+
 /// What the miner reads each round.
 struct Snapshot {
     tip: u32,
@@ -702,6 +788,12 @@ fn mine(
     monitor: &super::ui::Monitor,
 ) -> Result<(), String> {
     use super::pending::{Journal, Pending, Prepared};
+    let _pot_lock = super::withdrawal::lock(journal_path)?;
+    let mut transfers = super::withdrawal::Transfers::open(
+        &journal_path.with_extension("send.json"),
+        pot,
+        claim_key,
+    )?;
     let mut pkhs = [[0u8; 20]; 3];
     for (pkh, address) in pkhs.iter_mut().zip(addresses) {
         pkh.copy_from_slice(&crate::tx::cashaddr_to_p2pkh_locking(address)?[3..23]);
@@ -713,7 +805,12 @@ fn mine(
         &pkhs,
         claim_key.map(RecoveryKey::secret),
     )?;
-    if dry_run && journal.pending().is_some() {
+    if transfers.active() && journal.pending().is_some() {
+        return Err(
+            "both a claim and a send need recovery; journals preserved, no inputs spent".into(),
+        );
+    }
+    if dry_run && (journal.pending().is_some() || transfers.active()) {
         return Err("a pending ELECTRIC claim needs recovery; run without --dry-run".into());
     }
     monitor.event(format!(
@@ -746,6 +843,29 @@ fn mine(
                 }
             },
         };
+        // Owner withdrawals do not need a live ELECTRIC baton. They do wait
+        // for any already-verified claim, which owns its reserved pot coin.
+        if !dry_run && journal.pending().is_none() {
+            let mut transfer_link = WithdrawalLink { session: link, pot };
+            match transfers.poll(pot, claim_key, &mut transfer_link, &monitor.withdrawal) {
+                Ok(true) => {
+                    monitor.state("ELECTRIC pot reserved for Max/send");
+                    monitor.wait(Duration::from_millis(500));
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    monitor
+                        .withdrawal
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .failure(error, transfers.active());
+                    session = None;
+                    monitor.wait(BATON_POLL);
+                    continue;
+                }
+            }
+        }
         let now = match snapshot(link, deployment, pot) {
             Ok(now) => {
                 monitor.pot_balance(now.pot_sats, now.pot_claims);
@@ -925,6 +1045,14 @@ fn mine(
                 if monitor.stopped() {
                     stop.store(true, Ordering::Relaxed);
                 }
+                if monitor
+                    .withdrawal
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .holding()
+                {
+                    stop.store(true, Ordering::Relaxed);
+                }
                 if polled.elapsed() < BATON_POLL || monitor.stopped() {
                     continue;
                 }
@@ -1098,6 +1226,23 @@ mod tests {
         assert_eq!(
             pot,
             pot_for(&cfg, &deploy, &args, &config, false).unwrap().0
+        );
+        let owner_args = ElectricDeploymentArgs {
+            owner_pot: true,
+            ..Default::default()
+        };
+        let (controlled, _, controlled_path) =
+            pot_for(&cfg, &deploy, &owner_args, &config, true).unwrap();
+        assert!(controlled.owner_destination);
+        assert!(controlled.authorized_claims);
+        assert_ne!(controlled.address(), pot.address());
+        assert_ne!(controlled_path.unwrap(), key_path);
+        assert_ne!(controlled.recovery_public_key, pot.recovery_public_key);
+        assert_eq!(
+            controlled,
+            pot_for(&cfg, &deploy, &owner_args, &config, false)
+                .unwrap()
+                .0
         );
         let backup = dir.join("backup.pot-key");
         std::fs::copy(&key_path, &backup).unwrap();

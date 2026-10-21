@@ -14,6 +14,7 @@ use std::{
 pub const MAX_HELD_GPUS: usize = 64;
 
 pub struct Monitor {
+    pub(crate) withdrawal: Mutex<super::withdrawal::Control>,
     pub stop: Arc<AtomicBool>,
     pub paused: AtomicBool,
     /// #### PR #53: the hash split holds the GPUs for another token.
@@ -35,6 +36,7 @@ pub struct Monitor {
 /// #### PR #65: and the mining dashboard, for a split or ELECTRIC alone.
 #[derive(Debug, Clone, Default)]
 pub struct Summary {
+    pub(crate) withdrawal: super::withdrawal::View,
     pub state: String,
     /// Hashes a second over the last two seconds.
     pub rate: f64,
@@ -122,6 +124,7 @@ pub fn qr_lines(text: &str) -> Result<Vec<String>, String> {
 impl Monitor {
     pub fn new(intensity: u8, plain: bool, devices: String) -> Self {
         Self {
+            withdrawal: Mutex::new(super::withdrawal::Control::default()),
             stop: Arc::new(AtomicBool::new(false)),
             paused: AtomicBool::new(false),
             held: AtomicBool::new(false),
@@ -294,6 +297,11 @@ impl Monitor {
         let elapsed = now.duration_since(self.started).min(window);
         let paused = self.paused.load(Relaxed);
         Summary {
+            withdrawal: self
+                .withdrawal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .view(),
             state: if self.stopped() {
                 "Stopping; preserving pending claim".into()
             } else if paused {

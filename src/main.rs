@@ -1554,6 +1554,7 @@ fn main() {
         cli::Commands::Split {
             shares,
             restricted_electric_pot,
+            owner_electric_pot,
         } => {
             use std::io::IsTerminal;
             let result = hash_split::Shares::parse(&shares, cfg.network).and_then(|shares| {
@@ -1565,6 +1566,7 @@ fn main() {
                     &config_path,
                     args.no_tui || !io::stdout().is_terminal(),
                     restricted_electric_pot,
+                    owner_electric_pot,
                 )
             });
             if let Err(error) = result {

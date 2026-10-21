@@ -15,6 +15,8 @@ pub mod miner;
 mod pending;
 mod recovery;
 pub(crate) mod ui;
+mod wallet;
+pub(crate) mod withdrawal;
 
 use crate::config::{
     MiningNetwork, CHIPNET_DONATION_ADDRESS, DONATION_ADDRESS, SHREC_DONATION_ADDRESS,
@@ -447,6 +449,7 @@ pub struct Pot {
     pub network: MiningNetwork,
     recovery_public_key: Option<secp256k1::PublicKey>,
     authorized_claims: bool,
+    owner_destination: bool,
 }
 
 impl Pot {
@@ -475,10 +478,12 @@ impl Pot {
                 &recipients[0],
                 recovery_public_key.as_ref(),
                 false,
+                false,
             ),
             network: deployment.network,
             recovery_public_key,
             authorized_claims: false,
+            owner_destination: false,
         })
     }
 
@@ -498,8 +503,30 @@ impl Pot {
             &recipients[0],
             Some(&public),
             true,
+            false,
         );
         pot.authorized_claims = true;
+        Ok(pot)
+    }
+
+    /// #### PR #65: a new pot whose saved owner key authorizes the refund
+    /// destination too. Previous constructors retain their funded scripts.
+    pub fn with_owner_destination(
+        deployment: &Deployment,
+        recipients: &[Vec<u8>; 3],
+        public: secp256k1::PublicKey,
+    ) -> Result<Self, String> {
+        let mut pot = Self::with_authorized_claims(deployment, recipients, public)?;
+        pot.redeem = pot_redeem(
+            &deployment.locking_bytecode(),
+            deployment.min_difficulty,
+            recipients,
+            &recipients[0],
+            Some(&public),
+            true,
+            true,
+        );
+        pot.owner_destination = true;
         Ok(pot)
     }
 
@@ -542,6 +569,7 @@ fn pot_redeem(
     refund: &[u8],
     recovery_public_key: Option<&secp256k1::PublicKey>,
     authorized_claims: bool,
+    owner_destination: bool,
 ) -> Vec<u8> {
     const OP_0: u8 = 0x00;
     const OP_1: u8 = 0x51;
@@ -633,9 +661,11 @@ fn pot_redeem(
     }
     s.extend([OP_TXINPUTCOUNT, OP_1, OP_NUMEQUALVERIFY]);
     s.extend([OP_TXOUTPUTCOUNT, OP_1, OP_NUMEQUALVERIFY]);
-    s.extend([OP_0, OP_OUTPUTBYTECODE]);
-    s.extend(push_bytes(refund));
-    s.push(OP_EQUALVERIFY);
+    if !owner_destination {
+        s.extend([OP_0, OP_OUTPUTBYTECODE]);
+        s.extend(push_bytes(refund));
+        s.push(OP_EQUALVERIFY);
+    }
     s.extend([OP_0, OP_OUTPUTTOKENCATEGORY, OP_0, OP_EQUALVERIFY]);
     s.extend([OP_0, OP_OUTPUTVALUE, OP_0, OP_UTXOVALUE]);
     s.extend(push_number(POT_MAX_FEE_SATS as i64));
@@ -1402,14 +1432,21 @@ mod tests {
             value: 20_000,
         };
         let mut samples = Vec::new();
-        for (owner, authorized) in [
-            (None, false),
+        for (owner, authorized, owner_destination) in [
+            (None, false, false),
             (
                 Some(secp256k1::SecretKey::from_secret_bytes([0x31; 32]).unwrap()),
+                false,
                 false,
             ),
             (
                 Some(secp256k1::SecretKey::from_secret_bytes([0x31; 32]).unwrap()),
+                true,
+                false,
+            ),
+            (
+                Some(secp256k1::SecretKey::from_secret_bytes([0x31; 32]).unwrap()),
+                true,
                 true,
             ),
         ] {
@@ -1421,6 +1458,14 @@ mod tests {
             .unwrap();
             if authorized {
                 pot = Pot::with_authorized_claims(
+                    &deployment,
+                    &locks,
+                    secp256k1::PublicKey::from_secret_key(owner.as_ref().unwrap()),
+                )
+                .unwrap();
+            }
+            if owner_destination {
+                pot = Pot::with_owner_destination(
                     &deployment,
                     &locks,
                     secp256k1::PublicKey::from_secret_key(owner.as_ref().unwrap()),
@@ -1447,7 +1492,7 @@ mod tests {
             };
             let mut sample = |name: &str, expect: &str, baton: &Baton, built: &Built| {
                 samples.push(serde_json::json!({
-                    "name": format!("{}: {name}", if authorized { "authorized" } else if owner.is_some() { "owner" } else { "legacy" }),
+                    "name": format!("{}: {name}", if owner_destination { "owner destination" } else if authorized { "authorized" } else if owner.is_some() { "owner" } else { "legacy" }),
                     "pot_lock": hex::encode(pot.locking_bytecode()),
                     "owner": owner.is_some(),
                     "authorized_claim": authorized,
@@ -1557,7 +1602,12 @@ mod tests {
             let refund = build_refund(&pot, &coin, &locks[0], 1_000, owner.as_ref()).unwrap();
             sample("refund", "valid", &baton, &refund);
             let elsewhere = build_refund(&pot, &coin, &locks[1], 1_000, owner.as_ref()).unwrap();
-            sample("refund to a donation address", "pot", &baton, &elsewhere);
+            sample(
+                "refund to a donation address",
+                if owner_destination { "valid" } else { "pot" },
+                &baton,
+                &elsewhere,
+            );
             if owner.is_some() {
                 let mut unsigned = pot.clone();
                 unsigned.recovery_public_key = None;

@@ -62,7 +62,7 @@ What Pickaxe does about it:
 
 - It never sends a proof twice (a set of sent proofs per run), and every
   search starts from fresh work on the current baton.
-- The pot pays only for a claim that moves the baton to a new height, or
+- Older restricted pots pay only for a claim that moves the baton to a new height, or
   for the claim right after it at the minimum difficulty. Those are the two
   claims per height that cannot be a replay of an earlier claim on that
   height. A later claim on the same height is the shape replays take, and
@@ -103,13 +103,62 @@ hashes an 80-byte header. ELECTRIC hashes 32 bytes with the recipient right
 after the height. Stratum cannot aim the nonce field at this preimage, and
 [merge-mining.md](merge-mining.md) Case A and [asic-tokens.md](asic-tokens.md)
 both need a contract that accepts header work. This one does not, so the
-ASIC farm keeps mining BCH and the CPU searches ELECTRIC beside it.
+ASIC farm keeps mining BCH and GPUs search ELECTRIC beside it.
 
 PHOTON cannot share work with it either; on one GPU the two split the time.
 A new ELECTRIC contract could be merge-mined with PHOTON as the parent,
 without changing PHOTON: see [photon-electric-auxpow.md](photon-electric-auxpow.md).
 
 ## Signed fee-pot claims
+
+### Pickaxe-controlled receiving wallet and owner pot
+
+#### PR #65
+
+`pickaxe electric wallet` creates or reopens a dedicated payout key beside
+the configuration, separately for each network. It prints the public receiving
+address and QR, plus the private backup file's path. The key itself is never
+printed. Back it up before using the address. The existing payout wallet,
+profile and pot keys are not imported or overwritten. This is a separate
+receiving wallet, not a recovery key for previous payouts.
+
+To prepare a new owner-controlled fee pot for the selected receiving address:
+
+```text
+pickaxe --address YOUR_RECEIVING_ADDRESS electric pot --owner-pot
+pickaxe --address YOUR_RECEIVING_ADDRESS electric mine --owner-pot
+pickaxe --address YOUR_RECEIVING_ADDRESS split --share photon=80 --share electric=20 --owner-electric-pot
+```
+
+These flags are explicit: existing startup commands retain the previous pot.
+The owner pot uses its own key file and funding address. Its claims remain
+signed and keep the same recipient, change and fee constraints. Its refund
+branch allows a chosen destination only with the committed owner's signature;
+it still permits exactly one input and one plain-BCH output with a capped fee.
+It does not redirect funds held by an older covenant. Those funds can refund
+only to the destination permanently committed by that older covenant, then
+need that wallet's spending key to move again.
+
+In the owner-pot TUI, **F** opens funding, **M** selects Max/send. Enter the
+destination, press **Enter** to preview the total amount, fee and transaction
+count, then **Enter** again to send. **Esc** cancels an unapproved quote.
+Addresses are checked against the session's network. A quote expires after
+60 seconds and is invalidated if coins change or the relay fee rises. Max
+sends each pot coin separately, each within the covenant fee cap; an
+uneconomic coin prevents the whole quote rather than silently burning it.
+This transfers plain BCH from the pot, not token rewards from the payout wallet.
+
+The supervisor finishes any pending reward claim before quoting, then holds
+ELECTRIC's pot while editing or sending; PHOTON can continue. Exact approved
+transfers are saved privately before broadcast, restored after restart and
+counted as propagated only after fetching identical transaction bytes. A
+timeout or conflicting spend retains the journal and keeps its inputs reserved.
+Approved transfers cannot be cancelled by closing the panel. The same pot's
+claim and refund commands take an OS lock; files are retained for recovery.
+Keep the original key and journal backups until all transfers are settled.
+
+The receiving-wallet key and pot key are separate. A newly created empty pot
+must be funded before mining can use it; creating keys moves no existing BCH.
 
 #### PR #65
 
