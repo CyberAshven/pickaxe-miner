@@ -385,6 +385,10 @@ both beneficiary jobs before devices use them. Each preparation has a distinct
 publication ID so a late share retains the job and coinbase it actually hashed.
 An accepted same-parent job can continue during refresh only for its original
 freshness lease. Reconnecting either beneficiary revokes readiness.
+Personal and donation declarations enter their queues through one shared
+admission gate. If either queue is full or disconnected, neither event reaches
+the pool, the publication ID is not consumed, and fresh accepted work retains
+only its original lease while the failed refresh retries.
 
 As for other remote pools, the configured BCH donation is allocated as validated
 mining work on a separately authorized donation channel. It never deducts from

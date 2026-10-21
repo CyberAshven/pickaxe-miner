@@ -143,9 +143,25 @@ pub enum UplinkEvent {
     Published {
         serial: u64,
         template: Arc<BchTemplate>,
+        /// Paired sessions admit the event only after both queues accept it.
+        admission: Option<Arc<Mutex<bool>>>,
     },
     /// An accepted local share on a declared job.
     Share(ForwardShare),
+}
+
+impl UplinkEvent {
+    fn published(serial: u64, template: Arc<BchTemplate>) -> Self {
+        Self::Published {
+            serial,
+            template,
+            admission: None,
+        }
+    }
+}
+
+fn publication_admitted(admission: Option<Arc<Mutex<bool>>>) -> bool {
+    admission.is_none_or(|admission| admission.lock().is_ok_and(|committed| *committed))
 }
 
 #[derive(Clone)]
@@ -158,6 +174,44 @@ pub struct UplinkHandle {
 }
 
 impl UplinkHandle {
+    // #### PR #65: queue personal and donation declarations as one admission.
+    // A receiver may dequeue immediately, but cannot declare until both sends
+    // succeed. A full/disconnected peer cancels the other event before it can
+    // consume a token or replace an accepted job. No network I/O holds the gate.
+    pub fn publish(&self, serial: u64, template: Arc<BchTemplate>) -> Result<(), &'static str> {
+        let Some(donation) = self.donation.as_ref() else {
+            return self
+                .events
+                .try_send(UplinkEvent::published(serial, template))
+                .map_err(|_| "personal declaration queue unavailable");
+        };
+        let own = template
+            .p2pool_donation()
+            .cloned()
+            .ok_or("donation declaration missing")?;
+        let admission = Arc::new(Mutex::new(false));
+        let mut committed = admission
+            .lock()
+            .map_err(|_| "declaration admission unavailable")?;
+        donation
+            .events
+            .try_send(UplinkEvent::Published {
+                serial,
+                template: own,
+                admission: Some(admission.clone()),
+            })
+            .map_err(|_| "donation declaration queue unavailable")?;
+        self.events
+            .try_send(UplinkEvent::Published {
+                serial,
+                template,
+                admission: Some(admission.clone()),
+            })
+            .map_err(|_| "personal declaration queue unavailable")?;
+        *committed = true;
+        Ok(())
+    }
+
     pub fn acknowledged(&self) -> u64 {
         let personal = self.status.acknowledged.load(Ordering::Relaxed);
         self.donation.as_ref().map_or(personal, |donation| {
@@ -686,7 +740,14 @@ fn uplink(
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
         match event {
-            UplinkEvent::Published { serial, template } => {
+            UplinkEvent::Published {
+                serial,
+                template,
+                admission,
+            } => {
+                if !publication_admitted(admission) {
+                    continue;
+                }
                 if template.jd_plan().map(|plan| plan.serial) != Some(plan.serial) {
                     continue;
                 }
@@ -1126,6 +1187,119 @@ mod tests {
     }
 
     #[test]
+    fn paired_declarations_are_all_admitted_or_all_cancelled_and_retry_the_same_id() {
+        for (personal_full, donation_full, disconnected) in [
+            (true, false, None),
+            (false, true, None),
+            (false, false, Some(false)),
+            (false, false, Some(true)),
+        ] {
+            let status = || {
+                Arc::new(JdStatus {
+                    plan: RwLock::new(None),
+                    summary: Mutex::default(),
+                    acknowledged: AtomicU64::new(0),
+                })
+            };
+            let (personal_events, personal_receive) = mpsc::sync_channel(1);
+            let (donation_events, donation_receive) = mpsc::sync_channel(1);
+            let donation = Arc::new(UplinkHandle {
+                events: donation_events,
+                status: status(),
+                donation: None,
+            });
+            let handle = UplinkHandle {
+                events: personal_events,
+                status: status(),
+                donation: Some(donation.clone()),
+            };
+            let own = Arc::new(template());
+            let mut personal = template();
+            personal.set_p2pool_donation((*own).clone());
+            let personal = Arc::new(personal);
+            if personal_full {
+                handle
+                    .events
+                    .send(UplinkEvent::published(0, personal.clone()))
+                    .unwrap();
+            }
+            if donation_full {
+                donation
+                    .events
+                    .send(UplinkEvent::published(0, own.clone()))
+                    .unwrap();
+            }
+            let personal_receive = (disconnected != Some(false)).then_some(personal_receive);
+            let donation_receive = (disconnected != Some(true)).then_some(donation_receive);
+            assert!(handle.publish(9, personal.clone()).is_err());
+            for receive in [&personal_receive, &donation_receive].into_iter().flatten() {
+                while let Ok(event) = receive.try_recv() {
+                    let UplinkEvent::Published {
+                        serial, admission, ..
+                    } = event
+                    else {
+                        panic!("unexpected share");
+                    };
+                    if serial == 9 {
+                        assert!(
+                            !publication_admitted(admission),
+                            "an unmatched declaration must be discarded before touching the pool"
+                        );
+                    }
+                }
+            }
+            assert_eq!(handle.acknowledged(), 0);
+            if disconnected.is_some() {
+                continue;
+            }
+            handle.publish(9, personal.clone()).unwrap();
+            for (receive, expected) in [
+                (personal_receive.unwrap(), &personal),
+                (
+                    donation_receive.unwrap(),
+                    personal.p2pool_donation().unwrap(),
+                ),
+            ] {
+                match receive.try_recv().unwrap() {
+                    UplinkEvent::Published {
+                        serial,
+                        template,
+                        admission,
+                    } => {
+                        assert_eq!(serial, 9, "queue failures must allow the same ID to retry");
+                        assert!(Arc::ptr_eq(&template, expected));
+                        assert!(publication_admitted(admission));
+                    }
+                    _ => panic!("expected matching declarations"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dequeued_publication_cannot_reach_the_pool_until_pair_admission_finishes() {
+        for committed in [false, true] {
+            let admission = Arc::new(Mutex::new(false));
+            let mut gate = admission.lock().unwrap();
+            let receive_gate = admission.clone();
+            let (started, start) = mpsc::channel();
+            let (finished, finish) = mpsc::channel();
+            let receiver = thread::spawn(move || {
+                started.send(()).unwrap();
+                finished
+                    .send(publication_admitted(Some(receive_gate)))
+                    .unwrap();
+            });
+            start.recv().unwrap();
+            assert!(matches!(finish.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            *gate = committed;
+            drop(gate);
+            assert_eq!(finish.recv().unwrap(), committed);
+            receiver.join().unwrap();
+        }
+    }
+
+    #[test]
     fn both_recipients_must_acknowledge_and_block_only_donation_work_keeps_its_route() {
         let status = || {
             Arc::new(JdStatus {
@@ -1264,20 +1438,8 @@ mod tests {
                 donation.declared_outputs().unwrap(),
                 "share ownership must be committed to the recipient"
             );
-            handles
-                .events
-                .send(UplinkEvent::Published {
-                    serial: 1,
-                    template: Arc::new(personal),
-                })
-                .unwrap();
-            donor
-                .events
-                .send(UplinkEvent::Published {
-                    serial: 1,
-                    template: Arc::new(donation),
-                })
-                .unwrap();
+            personal.set_p2pool_donation(donation);
+            handles.publish(1, Arc::new(personal)).unwrap();
             while handles.acknowledged() < 1 {
                 assert!(
                     Instant::now() < deadline,

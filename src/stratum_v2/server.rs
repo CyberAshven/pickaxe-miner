@@ -5,7 +5,7 @@
 use super::{
     channel::TokenWin,
     jd::{
-        client::{JdClientSummary, UplinkEvent, UplinkHandle},
+        client::{JdClientSummary, UplinkHandle},
         server::{Context, Declarator, DeclaratorSession},
     },
     journal::{Journal, PendingBlock},
@@ -1468,7 +1468,6 @@ fn offer(
             publish(shared, None);
             return;
         };
-        offered.issued = issued;
         template.set_declaration_id(u64::from(issued));
         if let Some(own) = donation_template.as_mut() {
             own.set_declaration_id(u64::from(issued));
@@ -1477,31 +1476,16 @@ fn offer(
     } else {
         generation
     };
-    if let (Some(own), Some(donation)) = (donation_template, uplink.donation.as_ref()) {
-        if donation
-            .events
-            .try_send(UplinkEvent::Published {
-                serial: declaration,
-                template: Arc::new(own.clone()),
-            })
-            .is_err()
-        {
-            failed_offer(shared, offered, &template, plan_serial);
-            return;
-        }
+    if let Some(own) = donation_template {
         template.set_p2pool_donation(own);
     }
     let template = Arc::new(template);
-    if uplink
-        .events
-        .try_send(UplinkEvent::Published {
-            serial: declaration,
-            template: template.clone(),
-        })
-        .is_err()
-    {
+    if uplink.publish(declaration, template.clone()).is_err() {
         failed_offer(shared, offered, &template, plan_serial);
         return;
+    }
+    if template.is_p2pool() {
+        offered.issued = declaration as u32;
     }
     publish(
         shared,
@@ -2712,33 +2696,30 @@ mod retry_tests {
             };
             let (events, _receive) = mpsc::sync_channel(1);
             let (donation_events, _donation_receive) = mpsc::sync_channel(1);
-            let donation = donation_full.then(|| {
-                Arc::new(UplinkHandle {
-                    events: donation_events.clone(),
-                    status: status(),
-                    donation: None,
-                })
-            });
+            let donation = Some(Arc::new(UplinkHandle {
+                events: donation_events.clone(),
+                status: status(),
+                donation: None,
+            }));
             let uplink = UplinkHandle {
                 events,
                 status: status(),
                 donation,
             };
+            let queued = super::super::jd::ForwardShare {
+                donation: donation_full,
+                serial: 0,
+                version: 2,
+                ntime: 1,
+                nonce: 2,
+                extranonce: vec![0; 8],
+                hash: [0; 32],
+                block: false,
+            };
             if donation_full {
-                donation_events
-                    .send(UplinkEvent::Published {
-                        serial: 0,
-                        template: template.clone(),
-                    })
-                    .unwrap();
+                uplink.donation.as_ref().unwrap().forward(queued);
             } else {
-                uplink
-                    .events
-                    .send(UplinkEvent::Published {
-                        serial: 0,
-                        template: template.clone(),
-                    })
-                    .unwrap();
+                uplink.forward(queued);
             }
             let until = Instant::now() + Duration::from_secs(30);
             let shared = Shared {
@@ -2766,7 +2747,7 @@ mod retry_tests {
             };
             let mut offered = Offered {
                 plan: Some(1),
-                donation_plan: donation_full.then_some(1),
+                donation_plan: Some(1),
                 cohort: 1,
                 issued: 1,
                 ..Default::default()
