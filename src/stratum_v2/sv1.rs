@@ -89,6 +89,20 @@ pub struct DonationRoute {
 }
 
 impl DonationRoute {
+    /// #### PR #67: the route at a P2Pool node that needs each miner's share
+    /// address, once the device's own channel needed one: the donation names
+    /// its share address too, with the bare address as its fallback.
+    fn naming_share(&self) -> Self {
+        match crate::tx::p2pool_share_address(&self.identity) {
+            Ok(share) if !self.identity.contains(",p2p=") => Self {
+                identity: format!("{},p2p={share}", self.identity),
+                rate: self.rate.clone(),
+                fallback: Some(self.identity.clone()),
+            },
+            _ => self.clone(),
+        }
+    }
+
     fn rate(&self) -> BchDonation {
         *self
             .rate
@@ -427,37 +441,63 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
             local,
         });
     }
-    let open = sv1_to_sv2::build_sv2_open_extended_mining_channel(
-        1,
-        upstream.identity.clone(),
-        if upstream.remote {
-            REMOTE_NOMINAL_HASHRATE
-        } else {
-            1.0
-        },
-        Target::from_le_bytes([255; 32]),
-        // #### PR #56: the local server grants 8, or 4 on a compact Job
-        // Declaration lane; a remote pool must grant the adapter's 8.
-        if upstream.remote {
-            8
-        } else {
-            super::jd::COMPACT_DEVICE_EXTRANONCE as u16
-        },
-    )
-    .map_err(|_| "cannot open firmware channel")?;
-    send.send(encoded(
-        open,
-        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
-        false,
-    )?)?;
-    let mut reply = receive.receive(DEADLINE)?.ok_or("SV2 channel timed out")?;
-    if reply.header().msg_type() != MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS {
-        return Err(channel_refusal(&mut reply));
-    }
+    let mut identity = upstream.identity.clone();
+    let mut retried = false;
+    let mut reply = loop {
+        // The refused request was answered, so the retry reuses its id;
+        // `Bridge::new` expects the channel of request 1.
+        let open = sv1_to_sv2::build_sv2_open_extended_mining_channel(
+            1,
+            identity.clone(),
+            if upstream.remote {
+                REMOTE_NOMINAL_HASHRATE
+            } else {
+                1.0
+            },
+            Target::from_le_bytes([255; 32]),
+            // #### PR #56: the local server grants 8, or 4 on a compact Job
+            // Declaration lane; a remote pool must grant the adapter's 8.
+            if upstream.remote {
+                8
+            } else {
+                super::jd::COMPACT_DEVICE_EXTRANONCE as u16
+            },
+        )
+        .map_err(|_| "cannot open firmware channel")?;
+        send.send(encoded(
+            open,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+            false,
+        )?)?;
+        let mut reply = receive.receive(DEADLINE)?.ok_or("SV2 channel timed out")?;
+        if reply.header().msg_type() == MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS {
+            break reply;
+        }
+        let (code, refusal) = channel_refusal(&mut reply);
+        // #### PR #67: a BCH P2Pool node refused the identity's share
+        // address (or its lack of one): asked once more the other way.
+        match (upstream.remote && !retried)
+            .then(|| p2pool_retry_identity(&identity, code.as_deref()))
+            .flatten()
+        {
+            Some(next) => {
+                identity = next;
+                retried = true;
+            }
+            None => return Err(refusal),
+        }
+    };
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
+    let donation = upstream.donation.as_ref().map(|route| {
+        if identity.contains(",p2p=") && !upstream.identity.contains(",p2p=") {
+            route.naming_share()
+        } else {
+            route.clone()
+        }
+    });
     Ok(Opened {
-        bridge: Bridge::new(opened, upstream.remote, upstream.donation.clone())?
+        bridge: Bridge::new(opened, upstream.remote, donation)?
             .with_fixed_version(upstream.fixed_version),
         send,
         receive,
@@ -465,10 +505,34 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     })
 }
 
+/// #### PR #67
+/// What: the identity asked for once more after a BCH P2Pool node refused a
+/// bare payout login because it has no share address of its own: the same
+/// login with the payout's share address (`,p2p=`). `None` for any other
+/// refusal, or an identity whose payout is not a P2PKH CashAddr.
+/// Why: a pool login without `,p2p=` dropped every device at a P2Pool node
+/// that pays shares to each miner's share address; the setup adds it, the
+/// command line did not. A node that refuses a `,p2p=` (it has a share
+/// address of its own) is never asked again without it: there its
+/// operator's address would own the device's shares.
+/// Look here if: devices are refused at a P2Pool node, or loop on refusals.
+fn p2pool_retry_identity(identity: &str, code: Option<&str>) -> Option<String> {
+    match code? {
+        "share-address-required" if !identity.contains(',') => {
+            // `<payout>[.<worker>]`: CashAddrs have no dot.
+            let payout = identity.split('.').next()?;
+            let share = crate::tx::p2pool_share_address(payout).ok()?;
+            Some(format!("{identity},p2p={share}"))
+        }
+        _ => None,
+    }
+}
+
 /// #### PR #61: why a pool refused the device's channel, from its error
-/// code. A BCH P2Pool node with no share address of its own needs one from
-/// each miner, and one that has its own refuses a different one.
-fn channel_refusal(reply: &mut SerializedFrame) -> String {
+/// code, and the code. A BCH P2Pool node with no share address of its own
+/// needs one from each miner, and one that has its own refuses a different
+/// one.
+fn channel_refusal(reply: &mut SerializedFrame) -> (Option<String>, String) {
     let code = (reply.header().msg_type() == MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR)
         .then(|| binary_sv2::from_bytes::<OpenMiningChannelError>(reply.payload()).ok())
         .flatten()
@@ -478,17 +542,19 @@ fn channel_refusal(reply: &mut SerializedFrame) -> String {
                 .filter(|character| !character.is_control())
                 .collect::<String>()
         });
-    match code.as_deref() {
+    let refusal = match code.as_deref() {
         Some("share-address-required") => "the pool needs a share address: add \
             ,p2p=<share address> to --upstream-user (`pickaxe stratum-v2 share-address` \
             prints one)"
             .into(),
         Some("invalid-share-address") => "the pool refused the share address in \
-            --upstream-user: it has one of its own, so remove ,p2p=, or correct it"
+            --upstream-user: it is invalid, or the node gives every share to its \
+            operator's own share address (remove ,p2p= only to mine for the operator)"
             .into(),
         Some(code) if !code.is_empty() => format!("SV2 channel rejected: {code}"),
         _ => "SV2 channel rejected".into(),
-    }
+    };
+    (code, refusal)
 }
 
 fn serve_session(
@@ -2460,6 +2526,46 @@ mod tests {
 
     // #### PR #61: a refused donation identity is followed once by the
     // fallback; a second refusal drops the donation.
+    // #### PR #67: a P2Pool node that needs a share address is asked once
+    // more with it, and the donation names its share address too; a refused
+    // share address is never dropped.
+    #[test]
+    fn a_p2pool_login_is_asked_again_with_its_share_address_only() {
+        let payout = crate::donation::bch::address(crate::config::MiningNetwork::Chipnet);
+        let share = crate::tx::p2pool_share_address(payout).unwrap();
+        let needs = Some("share-address-required");
+        assert_eq!(
+            p2pool_retry_identity(payout, needs),
+            Some(format!("{payout},p2p={share}"))
+        );
+        assert_eq!(
+            p2pool_retry_identity(&format!("{payout}.rig"), needs),
+            Some(format!("{payout}.rig,p2p={share}"))
+        );
+        assert_eq!(p2pool_retry_identity(&format!("{payout},d=8"), needs), None);
+        assert_eq!(p2pool_retry_identity("account.worker", needs), None);
+        // Never without the share address: the node's operator would own
+        // the shares.
+        let refused = Some("invalid-share-address");
+        assert_eq!(
+            p2pool_retry_identity(&format!("{payout},p2p={share}"), refused),
+            None
+        );
+        assert_eq!(p2pool_retry_identity(payout, refused), None);
+        assert_eq!(p2pool_retry_identity(payout, Some("unknown-user")), None);
+        assert_eq!(p2pool_retry_identity(payout, None), None);
+
+        let route = DonationRoute {
+            identity: payout.into(),
+            rate: Arc::new(RwLock::new(BchDonation::default())),
+            fallback: None,
+        };
+        let named = route.naming_share();
+        assert_eq!(named.identity, format!("{payout},p2p={share}"));
+        assert_eq!(named.fallback.as_deref(), Some(payout));
+        assert_eq!(named.naming_share().identity, named.identity);
+    }
+
     #[test]
     fn a_refused_donation_identity_retries_once_under_the_fallback() {
         let mut bridge = Bridge::new(
