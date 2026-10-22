@@ -2,9 +2,14 @@
 //! downloads, which redirect to a file host) and for the node's local API.
 //! HTTPS goes through rustls with the system's certificates (`tls`), as for
 //! Fulcrum servers and https nodes; no HTTP library is added for this.
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Redirects followed before giving up.
 const MAX_REDIRECTS: usize = 6;
@@ -138,23 +143,155 @@ pub fn get(url: &str, accept: &str, limit: usize, timeout: Duration) -> Result<R
 }
 
 fn get_once(url: &str, accept: &str, limit: usize, timeout: Duration) -> Result<Response, String> {
-    request_once(url, "GET", accept, None, limit, timeout)
+    request_once(url, "GET", accept, None, limit, Budget::Each(timeout))
 }
 
 /// POST a bounded preparation request. No redirect can forward its identity
 /// or token to another service. Authentication remains the API's responsibility.
+/// `budget` is the whole request's: the name lookup, the connection, TLS,
+/// the request and every read of the reply end within it.
 pub fn post_json(
     url: &str,
     body: &[u8],
     limit: usize,
-    timeout: Duration,
+    budget: Duration,
 ) -> Result<Response, String> {
     validate_preparation_url(url)?;
     if body.len() > 8192 {
         return Err("P2Pool preparation request is too large".into());
     }
-    request_once(url, "POST", "application/json", Some(body), limit, timeout)
-        .map_err(|_| "P2Pool preparation connection or response failed".to_owned())
+    request_once(
+        url,
+        "POST",
+        "application/json",
+        Some(body),
+        limit,
+        Budget::Until(Instant::now() + budget),
+    )
+    .map_err(|_| "P2Pool preparation connection or response failed".to_owned())
+}
+
+// #### PR #65: one deadline for a preparation request
+// What: a P2Pool preparation request has one deadline for all of it: the
+// name lookup (on its own thread, abandoned when the deadline passes), the
+// connection, the TLS handshake, the request and every read of the reply.
+// Downloads and the node's local API keep their wait per step.
+// Why: a slow or silent helper held the miner's offer for 3 s per read, and
+// the name lookup had no limit at all.
+// Look here if: a preparation takes longer than its budget, or lookups fail
+// with "still running".
+#[derive(Clone, Copy)]
+enum Budget {
+    /// Each step (the connection, a read, a write) may take this long.
+    Each(Duration),
+    /// Everything ends by then.
+    Until(Instant),
+}
+
+impl Budget {
+    /// How long the next step may wait; nothing once the deadline passed.
+    fn step(self) -> Option<Duration> {
+        match self {
+            Self::Each(timeout) => Some(timeout),
+            Self::Until(deadline) => Some(deadline.saturating_duration_since(Instant::now()))
+                .filter(|left| !left.is_zero()),
+        }
+    }
+}
+
+/// A stream whose reads and writes wait at most for the budget's next step.
+struct Bounded {
+    stream: TcpStream,
+    budget: Budget,
+}
+
+impl Bounded {
+    fn arm(&self, read: bool) -> io::Result<()> {
+        if let Budget::Until(_) = self.budget {
+            let left = self
+                .budget
+                .step()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+            if read {
+                self.stream.set_read_timeout(Some(left))?;
+            } else {
+                self.stream.set_write_timeout(Some(left))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Read for Bounded {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.arm(true)?;
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for Bounded {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.arm(false)?;
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// Lookups that may still run past their deadline; beyond this many, new
+/// ones are refused.
+const MAX_LOOKUPS: usize = 4;
+static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+
+/// `host`'s addresses; under a deadline the lookup runs on its own thread.
+fn addresses(host: &str, port: u16, budget: Budget) -> Result<Vec<SocketAddr>, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    match budget {
+        Budget::Each(_) => (host, port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .map_err(|error| format!("{host}: {error}")),
+        Budget::Until(deadline) => {
+            let name = host.to_owned();
+            lookup_within(deadline, move || {
+                (name.as_str(), port)
+                    .to_socket_addrs()
+                    .map(Iterator::collect)
+            })
+            .map_err(|error| format!("{host}: {error}"))
+        }
+    }
+}
+
+/// Runs `lookup` on its own thread, waiting for it until `deadline`.
+fn lookup_within<F>(deadline: Instant, lookup: F) -> Result<Vec<SocketAddr>, String>
+where
+    F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    if LOOKUPS.fetch_add(1, Ordering::SeqCst) >= MAX_LOOKUPS {
+        LOOKUPS.fetch_sub(1, Ordering::SeqCst);
+        return Err("earlier name lookups are still running".into());
+    }
+    let (send, receive) = mpsc::sync_channel(1);
+    let started = thread::Builder::new()
+        .name("pickaxe-lookup".into())
+        .spawn(move || {
+            let found = lookup();
+            LOOKUPS.fetch_sub(1, Ordering::SeqCst);
+            let _ = send.send(found);
+        });
+    if started.is_err() {
+        LOOKUPS.fetch_sub(1, Ordering::SeqCst);
+        return Err("cannot start the name lookup".into());
+    }
+    match receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(found) => found.map_err(|error| error.to_string()),
+        Err(_) => Err("the name lookup did not finish in time".into()),
+    }
 }
 
 /// Remote preparation carries job tokens and identities; require authenticated
@@ -169,16 +306,18 @@ fn request_once(
     accept: &str,
     body: Option<&[u8]>,
     limit: usize,
-    timeout: Duration,
+    budget: Budget,
 ) -> Result<Response, String> {
     let target = parse_url(url)?;
-    let stream = (target.host.as_str(), target.port)
-        .to_socket_addrs()
-        .map_err(|error| format!("{}: {error}", target.host))?
-        .find_map(|address| TcpStream::connect_timeout(&address, timeout).ok())
+    let stream = addresses(&target.host, target.port, budget)?
+        .into_iter()
+        .find_map(|address| TcpStream::connect_timeout(&address, budget.step()?).ok())
         .ok_or_else(|| format!("nothing answers at {}:{}", target.host, target.port))?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    if let Budget::Each(timeout) = budget {
+        let _ = stream.set_read_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(timeout));
+    }
+    let stream = Bounded { stream, budget };
     let host = if target.host.contains(':') {
         format!("[{}]", target.host)
     } else {
@@ -456,5 +595,80 @@ mod preparation_tests {
         )
         .unwrap_err()
         .contains("too large"));
+    }
+
+    /// A helper on 127.0.0.1 that reads one request, then either says
+    /// nothing or sends a byte every 50 ms, for 3 s.
+    fn slow_helper(trickle: bool) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let until = Instant::now() + Duration::from_secs(3);
+            if trickle {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n");
+            }
+            while Instant::now() < until {
+                if trickle && stream.write_all(b"X").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        port
+    }
+
+    // #### PR #65
+    // What: a helper that answers nothing, or a byte at a time, fails the
+    // preparation at its one deadline, not a wait per read.
+    // Look here if: Budget or Bounded changes.
+    #[test]
+    fn a_silent_or_trickling_helper_fails_at_the_one_deadline() {
+        for trickle in [false, true] {
+            let port = slow_helper(trickle);
+            let start = Instant::now();
+            let error = post_json(
+                &format!("http://127.0.0.1:{port}/jd_prepare"),
+                b"{}",
+                100_000,
+                Duration::from_millis(400),
+            )
+            .unwrap_err();
+            let took = start.elapsed();
+            assert!(error.contains("failed"), "{error}");
+            assert!(
+                took >= Duration::from_millis(350) && took < Duration::from_millis(2500),
+                "trickle={trickle}: {took:?}"
+            );
+        }
+    }
+
+    // #### PR #65
+    // What: a name lookup that hangs is abandoned at the request's deadline;
+    // a literal address needs no lookup.
+    // Look here if: lookup_within or addresses changes.
+    #[test]
+    fn a_hung_name_lookup_ends_at_the_deadline() {
+        let start = Instant::now();
+        let error = lookup_within(start + Duration::from_millis(150), || {
+            thread::sleep(Duration::from_secs(2));
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+        assert!(error.contains("in time"), "{error}");
+        assert!(start.elapsed() < Duration::from_millis(1500));
+        let found = lookup_within(Instant::now() + Duration::from_secs(1), || {
+            Ok(vec!["127.0.0.1:9".parse().unwrap()])
+        })
+        .unwrap();
+        assert_eq!(found, vec!["127.0.0.1:9".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(
+            addresses("::1", 80, Budget::Until(Instant::now())).unwrap(),
+            vec!["[::1]:80".parse::<SocketAddr>().unwrap()]
+        );
     }
 }

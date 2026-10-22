@@ -302,6 +302,9 @@ pub(super) struct Shared {
     recent: Option<Mutex<VecDeque<Arc<BchTemplate>>>>,
     /// #### PR #42: see `ServerConfig::preferred`.
     preferred: Option<Arc<super::sv1::Preferred>>,
+    /// #### PR #65: under P2Pool's own templates, until when devices
+    /// without work wait for a failing preparation, connected.
+    hold: Mutex<Option<Instant>>,
 }
 
 /// #### PR #42: the JD journal and one block per parent.
@@ -652,6 +655,7 @@ pub fn run_with(
         declared,
         recent: full_template.then(|| Mutex::new(VecDeque::new())),
         preferred: config.preferred.clone(),
+        hold: Mutex::new(None),
     });
     update_journal_stats(&shared)?;
     update_relay_stats(&shared)?;
@@ -662,6 +666,7 @@ pub fn run_with(
     let node_tokens = config.tokens.clone();
     let node_uplink = config.uplink.clone();
     let node_notices = notices.clone();
+    let node_donation = config.donation.clone();
     let node = thread::spawn(move || -> Result<(), String> {
         // #### PR #42: what was last offered under Job Declaration.
         let mut offered = Offered::default();
@@ -802,14 +807,22 @@ pub fn run_with(
                     stats.header_token = Some(work.summary());
                 }
             }
+            // #### PR #65: the donation setting can change while serving.
+            let donating = node_donation.read().is_ok_and(|rate| u16::from(*rate) != 0);
             let plan_changed = node_uplink.as_ref().is_some_and(|uplink| {
                 if let Ok(mut stats) = node_shared.stats.lock() {
                     stats.jd_client = uplink.status.summary.lock().ok().map(|s| s.clone());
                 }
                 current_plan(uplink).map(|plan| plan.serial) != offered.plan
-                    || donation_plan(uplink).map(|plan| plan.serial) != offered.donation_plan
+                    || donation_plan(uplink, donating).map(|plan| plan.serial)
+                        != offered.donation_plan
             });
-            if node_tokens.as_ref().is_some_and(|hub| hub.take_changed()) || plan_changed {
+            // #### PR #65: a finished P2Pool preparation is published, and a
+            // failed one offered again when due (see `finish_preparations`).
+            let retry = node_uplink.as_ref().is_some_and(|uplink| {
+                finish_preparations(&node_shared, uplink, &mut offered, Instant::now())
+            });
+            if node_tokens.as_ref().is_some_and(|hub| hub.take_changed()) || plan_changed || retry {
                 let slot = sources[0].0;
                 if let Some((generation, template)) = sources[0].1.current() {
                     let generation = generations.of(slot, generation);
@@ -822,6 +835,7 @@ pub fn run_with(
                         generation,
                         serial,
                         template,
+                        donating,
                     );
                 }
             }
@@ -868,6 +882,7 @@ pub fn run_with(
                             generation,
                             serial,
                             template,
+                            donating,
                         );
                         refreshed = Instant::now();
                     }
@@ -1331,14 +1346,18 @@ fn device_ended(shared: &Shared, id: u64, error: Option<&str>) {
 }
 
 /// #### PR #42: the Job Declaration plan the uplink holds now.
+/// #### PR #65: the miner's own session's; the donation session's state
+/// never gates it (see `donation_plan`).
 fn current_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
-    if uplink.donation.is_some() && donation_plan(uplink).is_none() {
-        return None;
-    }
     uplink.status.plan.read().ok().and_then(|plan| plan.clone())
 }
 
-fn donation_plan(uplink: &UplinkHandle) -> Option<Arc<super::jd::plan::JdPlan>> {
+/// #### PR #65: the P2Pool donation session's plan, while the donation is
+/// above 0% (`donating`).
+fn donation_plan(uplink: &UplinkHandle, donating: bool) -> Option<Arc<super::jd::plan::JdPlan>> {
+    if !donating {
+        return None;
+    }
     uplink.donation.as_ref()?.status.plan.read().ok()?.clone()
 }
 
@@ -1363,6 +1382,16 @@ struct Offered {
     /// The parent, bits and plan of the last template sent to the uplink,
     /// and when.
     last: Option<(Hash, u32, u64, Instant)>,
+    /// #### PR #65: the P2Pool preparation running, and the newest offer
+    /// waiting for it (see `start_preparation`).
+    preparing: Option<mpsc::Receiver<Prepared>>,
+    waiting: Option<Preparation>,
+    /// #### PR #65: failed P2Pool preparations in a row, when the next try
+    /// is due, and until when devices wait for one to succeed (the first
+    /// failed offer's lease).
+    failures: u32,
+    retry: Option<Instant>,
+    hold: Option<Instant>,
 }
 
 impl Offered {
@@ -1385,6 +1414,7 @@ impl Offered {
 const COALESCE: Duration = Duration::from_secs(5);
 
 /// Publishes a refreshed template, or under Job Declaration offers it.
+/// `donating`: the donation setting is above 0%.
 fn offer(
     shared: &Shared,
     uplink: Option<&UplinkHandle>,
@@ -1392,8 +1422,9 @@ fn offer(
     generation: u64,
     serial: u64,
     mut template: BchTemplate,
+    donating: bool,
 ) {
-    let valid_until = Instant::now() + Duration::from_secs(30);
+    let valid_until = Instant::now() + JOB_LEASE;
     let Some(uplink) = uplink else {
         publish(
             shared,
@@ -1408,9 +1439,13 @@ fn offer(
     };
     let plan = current_plan(uplink);
     let personal_serial = plan.as_ref().map(|plan| plan.serial);
-    let donation = donation_plan(uplink);
+    let donation = donation_plan(uplink, donating);
     let donation_serial = donation.as_ref().map(|plan| plan.serial);
-    if offered.plan != personal_serial || offered.donation_plan != donation_serial {
+    // #### PR #65: only a new personal session starts a new cohort; a
+    // donation session that comes or goes leaves the miner's accepted work
+    // alone (its donation jobs pause, see `donation_readiness`), and its
+    // next declaration goes at once.
+    if offered.plan != personal_serial {
         offered.last = None;
         let Some(cohort) = offered.cohort.checked_add(1) else {
             publish(shared, None);
@@ -1418,9 +1453,17 @@ fn offer(
         };
         offered.cohort = cohort;
         offered.plan = personal_serial;
+    }
+    if offered.donation_plan != donation_serial {
+        offered.last = None;
         offered.donation_plan = donation_serial;
     }
     let Some(plan) = plan else {
+        offered.waiting = None;
+        offered.failures = 0;
+        offered.retry = None;
+        offered.hold = None;
+        set_hold(shared, None);
         publish(shared, None);
         return;
     };
@@ -1439,63 +1482,40 @@ fn offer(
     if offered.coalesce(&template, plan_serial, Instant::now()) {
         return;
     }
-    let mut donation_template = donation.map(|plan| {
+    let donation_template = donation.map(|plan| {
         let mut own = template.clone();
         own.declare(plan);
         own
     });
     template.declare(plan);
-    if let Err(error) = template.prepare_p2pool() {
-        if let Ok(mut summary) = uplink.status.summary.lock() {
-            summary.state = "preparing";
-            summary.last_error = Some(error);
-        }
-        failed_offer(shared, offered, &template, plan_serial);
+    // #### PR #65: P2Pool coinbases are prepared off this thread (see
+    // `start_preparation`); the offer ends when they are.
+    if template.is_p2pool() {
+        offered.retry = None;
+        offered.waiting = Some(Preparation {
+            generation,
+            plan: plan_serial,
+            cohort: offered.cohort,
+            valid_until,
+            personal: template,
+            donation: donation_template,
+        });
+        start_preparation(shared, uplink, offered);
         return;
     }
-    if let Some(own) = donation_template.as_mut() {
-        if let Err(error) = own.prepare_p2pool() {
-            if let Ok(mut summary) = uplink.status.summary.lock() {
-                summary.state = "preparing";
-                summary.last_error = Some(error);
-            }
-            failed_offer(shared, offered, &template, plan_serial);
-            return;
-        }
-    }
-    let declaration = if template.is_p2pool() {
-        let Some(issued) = offered.issued.checked_add(1) else {
-            publish(shared, None);
-            return;
-        };
-        template.set_declaration_id(u64::from(issued));
-        if let Some(own) = donation_template.as_mut() {
-            own.set_declaration_id(u64::from(issued));
-        }
-        u64::from(issued)
-    } else {
-        generation
-    };
     if let Some(own) = donation_template {
         template.set_p2pool_donation(own);
     }
     let template = Arc::new(template);
-    if uplink.publish(declaration, template.clone()).is_err() {
+    if uplink.publish(generation, template.clone()).is_err() {
         failed_offer(shared, offered, &template, plan_serial);
         return;
-    }
-    if template.is_p2pool() {
-        offered.issued = declaration as u32;
     }
     publish(
         shared,
         Some(PublishedJob {
             generation,
-            serial: if template.is_p2pool() {
-                (u64::from(offered.cohort) << 32) | declaration
-            } else {
-                (plan_serial << 32) | (serial & 0xffff_ffff)
-            },
+            serial: (plan_serial << 32) | (serial & 0xffff_ffff),
             template,
             valid_until,
         }),
@@ -1503,10 +1523,256 @@ fn offer(
 }
 // #### end PR #42 ####
 
+/// How long a published job may be issued to devices.
+const JOB_LEASE: Duration = Duration::from_secs(30);
+
+// #### PR #65: P2Pool preparation off the node thread
+// What: an offer under P2Pool's own templates hands its templates to a
+// preparation thread, which asks the helper for the personal and donation
+// coinbases at once (each request within its 2 s deadline) and wakes the
+// node thread; the node thread finishes the offer (declaration id, uplink,
+// publication) in `finish_preparations`. One preparation runs at a time; a
+// newer offer waits for it, replacing an older waiting one, and a result
+// on another parent than the one waiting is dropped. A personal preparation
+// that fails is offered again after 0.5, 1, 2, then every 5 s, and devices
+// wait for it connected for the first failed offer's lease; a donation
+// preparation that fails publishes the miner's own job alone.
+// Why: blocks found by devices waited behind the helper's HTTP calls on
+// the node thread, a failed preparation was retried only at the next
+// 15-second refresh, and a failing donation stopped the miner's own work.
+// Look here if: blocks wait while the helper is slow, devices idle long
+// after the helper recovers, or donation jobs stop while the personal ones
+// go on.
+/// An offer whose P2Pool coinbases are being prepared.
+struct Preparation {
+    generation: u64,
+    /// The personal plan's serial and the cohort it was offered in.
+    plan: u64,
+    cohort: u32,
+    valid_until: Instant,
+    personal: BchTemplate,
+    donation: Option<BchTemplate>,
+}
+
+/// A preparation and how each of its coinbases went.
+struct Prepared {
+    preparation: Preparation,
+    personal: Result<(), String>,
+    donation: Option<Result<(), String>>,
+}
+
+/// The waits before offering again after failed preparations in a row.
+const PREPARE_RETRY: [Duration; 4] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+
+fn prepare_retry(failures: u32) -> Duration {
+    PREPARE_RETRY[(failures.max(1) - 1).min(3) as usize]
+}
+
+/// Asks the helper for both coinbases at once.
+fn prepare(mut preparation: Preparation) -> Prepared {
+    let Preparation {
+        personal, donation, ..
+    } = &mut preparation;
+    let (personal, donation) = thread::scope(|scope| {
+        let donation = donation
+            .as_mut()
+            .map(|own| scope.spawn(move || own.prepare_p2pool()));
+        let personal = personal.prepare_p2pool();
+        let donation = donation.map(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|_| Err("P2Pool donation preparation failed".into()))
+        });
+        (personal, donation)
+    });
+    Prepared {
+        preparation,
+        personal,
+        donation,
+    }
+}
+
+/// Starts the waiting preparation when none is running.
+fn start_preparation(shared: &Shared, uplink: &UplinkHandle, offered: &mut Offered) {
+    if offered.preparing.is_some() {
+        return;
+    }
+    let Some(preparation) = offered.waiting.take() else {
+        return;
+    };
+    let (send, receive) = mpsc::sync_channel(1);
+    let wake = shared.wake.clone();
+    let started = thread::Builder::new()
+        .name("p2pool-prepare".into())
+        .spawn(move || {
+            let _ = send.send(prepare(preparation));
+            let _ = wake.try_send(());
+        });
+    match started {
+        Ok(_) => offered.preparing = Some(receive),
+        Err(_) => {
+            if let Ok(mut summary) = uplink.status.summary.lock() {
+                summary.state = "preparing";
+                summary.last_error = Some("cannot start the P2Pool preparation".into());
+            }
+            offered.failures = offered.failures.saturating_add(1);
+            offered.retry = Some(Instant::now() + prepare_retry(offered.failures));
+        }
+    }
+}
+
+/// Finishes the preparation that is done and starts the waiting one; true
+/// when a failed one is due to be offered again (the caller offers the
+/// current template).
+fn finish_preparations(
+    shared: &Shared,
+    uplink: &UplinkHandle,
+    offered: &mut Offered,
+    now: Instant,
+) -> bool {
+    if let Some(receive) = offered.preparing.as_ref() {
+        match receive.try_recv() {
+            Ok(prepared) => {
+                offered.preparing = None;
+                let superseded = offered.waiting.as_ref().is_some_and(|waiting| {
+                    let done = &prepared.preparation.personal;
+                    (waiting.personal.previous_hash, waiting.personal.bits)
+                        != (done.previous_hash, done.bits)
+                });
+                if !superseded {
+                    finish_offer(shared, uplink, offered, prepared);
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => (),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                offered.preparing = None;
+                offered.failures = offered.failures.saturating_add(1);
+                offered.retry = Some(now + prepare_retry(offered.failures));
+            }
+        }
+    }
+    start_preparation(shared, uplink, offered);
+    let due = offered.preparing.is_none()
+        && offered.waiting.is_none()
+        && offered.retry.is_some_and(|at| now >= at);
+    if due {
+        offered.retry = None;
+    }
+    due
+}
+
+/// The rest of `offer` once the coinbases are prepared.
+fn finish_offer(shared: &Shared, uplink: &UplinkHandle, offered: &mut Offered, prepared: Prepared) {
+    let Prepared {
+        preparation,
+        personal,
+        donation,
+    } = prepared;
+    let Preparation {
+        generation,
+        plan,
+        cohort,
+        valid_until,
+        personal: mut template,
+        donation: own,
+    } = preparation;
+    // A new session since; its own offer follows.
+    if cohort != offered.cohort || current_plan(uplink).map(|plan| plan.serial) != Some(plan) {
+        return;
+    }
+    if let Err(error) = personal {
+        if let Ok(mut summary) = uplink.status.summary.lock() {
+            summary.state = "preparing";
+            summary.last_error = Some(error);
+        }
+        failed_preparation(shared, offered, &template, plan, valid_until);
+        return;
+    }
+    let own = match (own, donation) {
+        (Some(own), Some(Ok(()))) => Some(own),
+        (Some(_), Some(Err(error))) => {
+            if let Some(donation) = uplink.donation.as_ref() {
+                if let Ok(mut summary) = donation.status.summary.lock() {
+                    summary.last_error = Some(error);
+                }
+            }
+            None
+        }
+        _ => None,
+    };
+    let Some(issued) = offered.issued.checked_add(1) else {
+        publish(shared, None);
+        return;
+    };
+    let declaration = u64::from(issued);
+    template.set_declaration_id(declaration);
+    let alone = Arc::new(template.clone());
+    let paired = own.map(|mut own| {
+        own.set_declaration_id(declaration);
+        let mut paired = template;
+        paired.set_p2pool_donation(own);
+        Arc::new(paired)
+    });
+    // A donation queue that refuses the pair leaves the miner's own job to
+    // go alone.
+    let template = match paired.filter(|paired| uplink.publish(declaration, paired.clone()).is_ok())
+    {
+        Some(paired) => paired,
+        None if uplink.publish(declaration, alone.clone()).is_ok() => alone,
+        None => {
+            failed_preparation(shared, offered, &alone, plan, valid_until);
+            return;
+        }
+    };
+    offered.issued = issued;
+    offered.failures = 0;
+    offered.retry = None;
+    offered.hold = None;
+    set_hold(shared, None);
+    publish(
+        shared,
+        Some(PublishedJob {
+            generation,
+            serial: (u64::from(cohort) << 32) | declaration,
+            template,
+            valid_until,
+        }),
+    );
+}
+
+/// A preparation (or its queueing) failed: `failed_offer`, then a retry
+/// soon, and devices wait for it within the first failed offer's lease.
+fn failed_preparation(
+    shared: &Shared,
+    offered: &mut Offered,
+    incoming: &BchTemplate,
+    plan: u64,
+    valid_until: Instant,
+) {
+    failed_offer(shared, offered, incoming, plan);
+    offered.failures = offered.failures.saturating_add(1);
+    offered.retry = Some(Instant::now() + prepare_retry(offered.failures));
+    let hold = *offered.hold.get_or_insert(valid_until);
+    set_hold(shared, Some(hold));
+}
+
+/// #### PR #65: until when devices without work wait for P2Pool
+/// preparations, connected (see `JobAvailability::update`).
+fn set_hold(shared: &Shared, until: Option<Instant>) {
+    if let Ok(mut hold) = shared.hold.lock() {
+        *hold = until;
+    }
+}
+
 /// #### PR #65: a failed refresh cannot revoke still-fresh work on the same
 /// parent and sessions. Its original lease and ACK checks remain authoritative.
 fn failed_offer(shared: &Shared, offered: &mut Offered, incoming: &BchTemplate, plan: u64) {
-    offered.last = None; // Failed preparation was not a declaration; retry immediately.
+    offered.last = None; // Not a declaration: its retry must not be coalesced.
     let keep = shared
         .job
         .read()
@@ -1572,6 +1838,49 @@ enum JobDonation {
     Token(crate::donation::TokenDonation),
 }
 
+/// #### PR #65: under Job Declaration, what the pools accepted so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Acknowledged {
+    /// The newest declaration the miner's own session's pool accepted.
+    personal: u64,
+    /// P2Pool: the donation session's plan serial and newest accepted
+    /// declaration, while it holds a plan.
+    donation: Option<(u64, u64)>,
+    /// P2Pool: until when a device without work waits for a failing
+    /// preparation, connected (see `failed_preparation`).
+    hold: Option<Instant>,
+}
+
+#[cfg(test)]
+impl Acknowledged {
+    fn personal(personal: u64) -> Self {
+        Self {
+            personal,
+            ..Self::default()
+        }
+    }
+}
+
+// #### PR #65: P2Pool donation work follows its own session
+// What: a P2Pool job's donation job is mined only once the donation
+// session accepted it. While that session still has to, donation work is
+// done on the miner's own job and stays owed (it is repaid once accepted);
+// while the donation is paused (0%, its session down, a session that
+// replaced the one it was declared on, or its preparation failed) the job
+// carries no donation, so nothing is owed for that time.
+// Why: the miner's own work stopped whenever the donation session did, and
+// a donation that is down must neither stop mining nor pile up a debt that
+// would take more than the configured share once it is back.
+// Look here if: donation jobs reach devices before their session accepted
+// them, or the donation's share drifts after a donation outage.
+/// Some(true) when `job`'s donation job may be mined, Some(false) while its
+/// session has yet to accept it, None while the donation is paused.
+fn donation_readiness(job: &PublishedJob, acknowledged: Option<Acknowledged>) -> Option<bool> {
+    let own = job.template.p2pool_donation()?;
+    let (plan, accepted) = acknowledged?.donation?;
+    (own.jd_plan()?.serial == plan).then(|| accepted >= own.declaration_id(job.generation))
+}
+
 struct JobAvailability {
     generation: Option<u64>,
     /// #### PR #42: the token set's serial of the job issued last (and the
@@ -1580,7 +1889,8 @@ struct JobAvailability {
     serial: Option<u64>,
     parent: Option<(Hash, u32)>,
     unavailable_since: Option<Instant>,
-    issued_until: Option<Instant>,
+    /// #### PR #65: the published job issued last, until it is revoked.
+    held: Option<PublishedJob>,
     payout: Option<BchPayout>,
     next_id: u32,
     allocation: WorkAllocation,
@@ -1593,50 +1903,78 @@ impl JobAvailability {
             serial: None,
             parent: None,
             unavailable_since: None,
-            issued_until: None,
+            held: None,
             payout: None,
             next_id: 0,
             allocation: WorkAllocation::new(phase),
         }
     }
 
-    /// `acknowledged`: under Job Declaration, the newest generation whose
-    /// custom job the pool accepted.
+    /// `acknowledged`: under Job Declaration, the newest declarations whose
+    /// custom jobs the pools accepted.
     fn update(
         &mut self,
         mining: &mut MiningSession,
-        current: Option<PublishedJob>,
+        mut current: Option<PublishedJob>,
         now: Instant,
         donation: JobDonation,
         fee: Option<crate::donation::bch::PoolFee>,
-        acknowledged: Option<u64>,
+        acknowledged: Option<Acknowledged>,
     ) -> Result<Vec<stratum_core::codec_sv2::SerializedFrame>, String> {
-        if let Some(job) = current.as_ref().filter(|job| {
-            job.template.is_p2pool()
-                && acknowledged.is_none_or(|ack| ack < job.template.declaration_id(job.generation))
-        }) {
+        let personal = acknowledged.map(|acknowledged| acknowledged.personal);
+        let accepted = |job: &PublishedJob| {
+            personal.is_some_and(|ack| ack >= job.template.declaration_id(job.generation))
+        };
+        if let Some(job) = current
+            .as_ref()
+            .filter(|job| job.template.is_p2pool() && !accepted(job))
+        {
             // Keep already accepted same-parent work during preparation, but
             // never extend its original lease or use a replaced pool session.
-            if self.parent == Some((job.template.previous_hash, job.template.bits))
-                && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
-                && self.issued_until.is_some_and(|until| now < until)
-            {
-                return Ok(Vec::new());
+            let held = self
+                .held
+                .as_ref()
+                .filter(|held| {
+                    (held.template.previous_hash, held.template.bits)
+                        == (job.template.previous_hash, job.template.bits)
+                        && held.serial >> 32 == job.serial >> 32
+                        && now < held.valid_until
+                })
+                .cloned();
+            match held {
+                Some(held) => current = Some(held),
+                // #### PR #65: waiting for the pool's acceptance
+                // What: a device whose work the new job replaces (a new
+                // block, or a new session) waits idle on its connection
+                // until the pool accepts the job or the job's lease ends.
+                // Why: devices were disconnected at every new block unless
+                // the pool answered within the 3 s grace.
+                // Look here if: devices reconnect at new blocks, or mine
+                // a job its session has not accepted.
+                None if now < job.valid_until => {
+                    self.allocation.update(now, false);
+                    self.revoke(mining);
+                    self.unavailable_since = None;
+                    return Ok(Vec::new());
+                }
+                None => current = None,
             }
         }
-        if let Some(mut job) = current.filter(|job| {
-            now < job.valid_until
-                && (!job.template.is_p2pool()
-                    || acknowledged
-                        .is_some_and(|ack| ack >= job.template.declaration_id(job.generation)))
-        }) {
+        if let Some(mut job) = current
+            .filter(|job| now < job.valid_until && (!job.template.is_p2pool() || accepted(job)))
+        {
             self.allocation.update(now, !mining.channels.is_empty());
             // #### PR #42: a token's donation is all work (see
             // `WorkAllocation::token_donation_work`).
             let p2pool = matches!(donation, JobDonation::P2Pool(_));
             let (donation, donation_work) = match donation {
                 JobDonation::Bch(rate) => (rate, self.allocation.donation_work(rate)),
-                JobDonation::P2Pool(rate) => (rate, self.allocation.pool_donation_work(rate)),
+                // #### PR #65: see `donation_readiness`.
+                JobDonation::P2Pool(rate) => match donation_readiness(&job, acknowledged) {
+                    Some(true) => (rate, self.allocation.pool_donation_work(rate)),
+                    Some(false) => (rate, false),
+                    None => (BchDonation::try_from(0)?, false),
+                },
                 JobDonation::Token(rate) => (
                     BchDonation::try_from(0)?,
                     self.allocation.token_donation_work(rate),
@@ -1650,6 +1988,7 @@ impl JobAvailability {
                 fee_work: !donation_work
                     && fee.is_some_and(|fee| self.allocation.fee_work(donation, fee)),
             };
+            let published = job.clone();
             if donation_work && p2pool {
                 job.template = job
                     .template
@@ -1677,7 +2016,7 @@ impl JobAvailability {
             // 20-minute point) go at once too: the job devices have can no
             // longer make a block (see `BchTemplate::stale_bits`).
             if !job.template.is_p2pool()
-                && acknowledged.is_some_and(|acknowledged| {
+                && personal.is_some_and(|acknowledged| {
                     self.generation.is_some()
                         && self.parent == Some((job.template.previous_hash, job.template.bits))
                         && self.serial.map(|serial| serial >> 32) == Some(job.serial >> 32)
@@ -1694,26 +2033,41 @@ impl JobAvailability {
                 .checked_add(1)
                 .ok_or("job identifiers exhausted")?;
             let parent = (job.template.previous_hash, job.template.bits);
-            self.issued_until = Some(job.valid_until);
             let frames =
                 mining.set_job_with_payout(self.next_id, job.generation, job.template, payout)?;
             self.generation = Some(job.generation);
             self.serial = Some(job.serial);
             self.parent = Some(parent);
             self.payout = Some(payout);
+            self.held = Some(published);
             return Ok(frames);
         }
         self.allocation.update(now, false);
-        if self.generation.take().is_some() {
-            self.issued_until = None;
-            self.serial = None;
-            mining.revoke_job();
+        self.revoke(mining);
+        // #### PR #65: under P2Pool's own templates a failing preparation
+        // is retried within moments; devices wait for it connected, until
+        // the first failed offer's lease ends.
+        if acknowledged
+            .and_then(|acknowledged| acknowledged.hold)
+            .is_some_and(|until| now < until)
+        {
+            self.unavailable_since = None;
+            return Ok(Vec::new());
         }
         let since = *self.unavailable_since.get_or_insert(now);
         if now.saturating_duration_since(since) >= TEMPLATE_RECOVERY_GRACE {
             return Err("template source unavailable; reconnect when healthy".into());
         }
         Ok(Vec::new())
+    }
+
+    /// Revokes the job issued last, if any.
+    fn revoke(&mut self, mining: &mut MiningSession) {
+        if self.generation.take().is_some() {
+            self.held = None;
+            self.serial = None;
+            mining.revoke_job();
+        }
     }
 }
 
@@ -1948,7 +2302,13 @@ fn serve_device(
                     .map(|value| JobDonation::Bch(*value))
                     .map_err(|_| "donation setting unavailable".to_owned())
             };
-            let acknowledged = || config.uplink.as_ref().map(UplinkHandle::acknowledged);
+            let acknowledged = || {
+                config.uplink.as_ref().map(|uplink| Acknowledged {
+                    personal: uplink.acknowledged(),
+                    donation: uplink.donation_acknowledged(),
+                    hold: shared.hold.lock().ok().and_then(|hold| *hold),
+                })
+            };
             for frame in availability.update(
                 &mut mining,
                 current_job()?,
@@ -2460,7 +2820,7 @@ mod retry_tests {
                     start,
                     JobDonation::Bch(none),
                     None,
-                    acknowledged,
+                    acknowledged.map(Acknowledged::personal),
                 )
                 .unwrap();
             mining.channels[&1].job().unwrap().generation
@@ -2542,6 +2902,20 @@ mod retry_tests {
         assert_eq!(template.stale_from(), None);
     }
 
+    /// #### PR #65: the node thread's part of P2Pool preparations, until the
+    /// one running and the one waiting are done.
+    fn settle(shared: &Shared, uplink: &UplinkHandle, offered: &mut Offered) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while offered.preparing.is_some() || offered.waiting.is_some() {
+            assert!(
+                !finish_preparations(shared, uplink, offered, Instant::now()),
+                "no retry is due while a preparation runs"
+            );
+            assert!(Instant::now() < deadline, "the preparation must end");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     // #### PR #48
     // What: under Job Declaration, a template on the parent, bits and plan
     // offered less than 5 s ago is skipped; new bits on the same parent go
@@ -2603,6 +2977,7 @@ mod retry_tests {
             declared: None,
             recent: None,
             preferred: None,
+            hold: Mutex::new(None),
         };
         let mut template =
             BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
@@ -2637,7 +3012,16 @@ mod retry_tests {
             if case == 4 {
                 offered.cohort = 2;
             }
-            offer(&shared, Some(&uplink), &mut offered, 2, 2, next);
+            let started = Instant::now();
+            offer(&shared, Some(&uplink), &mut offered, 2, 2, next, true);
+            settle(&shared, &uplink, &mut offered);
+            assert!(
+                offered
+                    .retry
+                    .is_some_and(|at| at <= started + Duration::from_secs(1)),
+                "a failed preparation is retried within a second"
+            );
+            assert!(shared.hold.lock().unwrap().is_some());
             let current = shared.job.read().unwrap();
             if case == 0 {
                 let retained = current
@@ -2744,6 +3128,7 @@ mod retry_tests {
                 declared: None,
                 recent: None,
                 preferred: None,
+                hold: Mutex::new(None),
             };
             let mut offered = Offered {
                 plan: Some(1),
@@ -2759,6 +3144,7 @@ mod retry_tests {
                 2,
                 2,
                 (*template).clone(),
+                true,
             );
             let current = shared.job.read().unwrap();
             let current = current
@@ -2804,5 +3190,476 @@ mod retry_tests {
         }
         schedule.next(&["new".to_owned()], now);
         assert!(!schedule.is_retry("old"));
+    }
+}
+
+// #### PR #65: P2Pool own templates: preparation, retries, the donation
+// session and acknowledgement waits.
+#[cfg(test)]
+mod p2pool_tests {
+    use super::super::{
+        channel::{Channel, ChannelKind, Job},
+        jd::{
+            client::{JdStatus, UplinkEvent},
+            plan::JdPlan,
+            token::PoolRates,
+        },
+        journal::TestDirectory,
+        template_tests::{payout, rpc_template},
+    };
+    use super::*;
+    use crate::p2pool::jd::{
+        fake::{serve, Answer},
+        PREPARE_DEADLINE,
+    };
+
+    /// A P2Pool plan whose helper is at `url`, for `owner`.
+    fn p2pool_plan(serial: u64, url: &str, owner: &str, tokens: usize) -> Arc<JdPlan> {
+        Arc::new(JdPlan {
+            serial,
+            upstream_prefix: vec![0; 4],
+            pad: Vec::new(),
+            compact: true,
+            scripts: vec![vec![0x51]],
+            rates: PoolRates {
+                donation_bps: 0,
+                fee_bps: 0,
+                donation_output: None,
+                fee_output: None,
+            },
+            pool_target: [255; 32],
+            p2pool: Some(Arc::new(crate::p2pool::jd::fake::plan(url, owner, tokens))),
+        })
+    }
+
+    /// A session holding `plan`, without a donation session; its queue.
+    fn handle(plan: Option<Arc<JdPlan>>) -> (UplinkHandle, mpsc::Receiver<UplinkEvent>) {
+        let (events, receive) = mpsc::sync_channel(16);
+        let handle = UplinkHandle {
+            events,
+            status: Arc::new(JdStatus {
+                plan: RwLock::new(plan),
+                summary: Mutex::default(),
+                acknowledged: AtomicU64::new(0),
+            }),
+            donation: None,
+        };
+        (handle, receive)
+    }
+
+    fn shared(dir: &TestDirectory) -> (Shared, mpsc::Receiver<()>) {
+        let (wake, woken) = mpsc::sync_channel(1);
+        let shared = Shared {
+            job: RwLock::new(None),
+            stats: Arc::default(),
+            wake,
+            journal: Mutex::new(
+                Journal::open_declared(&dir.0.join("blocks.json"), MiningNetwork::Chipnet).unwrap(),
+            ),
+            fatal: Mutex::new(None),
+            stop: Arc::default(),
+            solved: Mutex::default(),
+            claims: None,
+            relay: None,
+            lanes: Arc::default(),
+            declared: None,
+            recent: None,
+            preferred: None,
+            hold: Mutex::new(None),
+        };
+        (shared, woken)
+    }
+
+    /// The node thread's part of preparations, until none runs or waits.
+    fn settle(shared: &Shared, uplink: &UplinkHandle, offered: &mut Offered) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while offered.preparing.is_some() || offered.waiting.is_some() {
+            finish_preparations(shared, uplink, offered, Instant::now());
+            assert!(Instant::now() < deadline, "the preparation must end");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A published P2Pool job on parent `[parent; 32]`, prepared through the
+    /// fake helper, with its donation job when `donation` is given.
+    fn p2pool_job(
+        plan: &Arc<JdPlan>,
+        donation: Option<&Arc<JdPlan>>,
+        parent: u8,
+        declaration: u64,
+        valid_until: Instant,
+    ) -> PublishedJob {
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        template.previous_hash = [parent; 32];
+        let own = donation.map(|plan| {
+            let mut own = template.clone();
+            own.declare(plan.clone());
+            own.prepare_p2pool().unwrap();
+            own.set_declaration_id(declaration);
+            own
+        });
+        template.declare(plan.clone());
+        template.prepare_p2pool().unwrap();
+        template.set_declaration_id(declaration);
+        if let Some(own) = own {
+            template.set_p2pool_donation(own);
+        }
+        PublishedJob {
+            generation: declaration,
+            serial: (1 << 32) | declaration,
+            template: Arc::new(template),
+            valid_until,
+        }
+    }
+
+    /// A device on one standard channel in the compact P2Pool layout.
+    struct Device {
+        availability: JobAvailability,
+        mining: MiningSession,
+    }
+
+    impl Device {
+        fn new() -> Self {
+            let mut mining =
+                MiningSession::new(MiningNetwork::Chipnet, payout(), [17; 12], [255; 32]).unwrap();
+            let mut channel = Channel::new(
+                1,
+                ChannelKind::Standard,
+                [255; 32],
+                [17; 12],
+                MiningNetwork::Chipnet,
+                &payout(),
+            )
+            .unwrap();
+            channel.set_lane(7, true);
+            mining.insert_channel(channel, [255; 32]);
+            Self {
+                availability: JobAvailability::new(0),
+                mining,
+            }
+        }
+
+        fn update(
+            &mut self,
+            job: Option<&PublishedJob>,
+            now: Instant,
+            rate: u16,
+            acknowledged: Acknowledged,
+        ) -> Result<usize, String> {
+            self.availability
+                .update(
+                    &mut self.mining,
+                    job.cloned(),
+                    now,
+                    JobDonation::P2Pool(BchDonation::try_from(rate)?),
+                    None,
+                    Some(acknowledged),
+                )
+                .map(|frames| frames.len())
+        }
+
+        fn job(&self) -> Option<&Job> {
+            self.mining.channels[&1].job()
+        }
+    }
+
+    // #### PR #65
+    // What: an offer under P2Pool's own templates returns at once while the
+    // helper hangs; the preparation ends at its deadline on its own thread
+    // and wakes the node thread, which counts it as a failure to retry.
+    // Look here if: offer, start_preparation or PREPARE_DEADLINE changes.
+    #[test]
+    fn a_hung_helper_never_holds_the_node_thread() {
+        let dir = TestDirectory::new();
+        let (url, requests) = serve(vec![Answer::Hang]);
+        let (uplink, _events) = handle(Some(p2pool_plan(1, &url, "owner", 4)));
+        let (shared, woken) = shared(&dir);
+        let mut offered = Offered::default();
+        let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let start = Instant::now();
+        offer(&shared, Some(&uplink), &mut offered, 1, 0, template, true);
+        let returned = start.elapsed();
+        assert!(returned < Duration::from_millis(500), "{returned:?}");
+        assert!(offered.preparing.is_some());
+        woken
+            .recv_timeout(PREPARE_DEADLINE + Duration::from_secs(2))
+            .expect("the preparation wakes the node thread");
+        let took = start.elapsed();
+        assert!(took < PREPARE_DEADLINE + Duration::from_secs(1), "{took:?}");
+        assert!(!finish_preparations(
+            &shared,
+            &uplink,
+            &mut offered,
+            Instant::now()
+        ));
+        assert!(offered.preparing.is_none());
+        assert_eq!(offered.failures, 1);
+        assert!(offered.retry.is_some());
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(shared.job.read().unwrap().is_none());
+    }
+
+    // #### PR #65
+    // What: a preparation the helper refuses is offered again within a
+    // second, as the node thread does, and that one is published and
+    // queued for the pool; the waits are 0.5, 1, 2, then 5 s.
+    // Look here if: finish_preparations or PREPARE_RETRY changes.
+    #[test]
+    fn a_failed_preparation_is_offered_again_within_a_second() {
+        let dir = TestDirectory::new();
+        let (url, requests) = serve(vec![Answer::Refuse, Answer::Valid]);
+        let (uplink, events) = handle(Some(p2pool_plan(1, &url, "owner", 4)));
+        let (shared, _woken) = shared(&dir);
+        let mut offered = Offered::default();
+        let template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        offer(
+            &shared,
+            Some(&uplink),
+            &mut offered,
+            1,
+            0,
+            template.clone(),
+            true,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.job.read().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the retry must be published");
+            if finish_preparations(&shared, &uplink, &mut offered, Instant::now()) {
+                offer(
+                    &shared,
+                    Some(&uplink),
+                    &mut offered,
+                    1,
+                    0,
+                    template.clone(),
+                    true,
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let gap = requests[1].0 - requests[0].0;
+        assert!(
+            gap >= Duration::from_millis(400) && gap < Duration::from_secs(1),
+            "{gap:?}"
+        );
+        let job = shared.job.read().unwrap().clone().unwrap();
+        assert!(job.template.is_p2pool());
+        assert_eq!(job.template.declaration_id(job.generation), 1);
+        assert_eq!(job.serial, (1 << 32) | 1);
+        assert_eq!(offered.failures, 0);
+        assert!(shared.hold.lock().unwrap().is_none());
+        match events.try_recv().unwrap() {
+            UplinkEvent::Published { serial, .. } => assert_eq!(serial, 1),
+            UplinkEvent::Share(_) => panic!("expected the declaration"),
+        }
+        let waits: Vec<Duration> = (1..=6).map(prepare_retry).collect();
+        assert_eq!(
+            waits,
+            [500, 1000, 2000, 5000, 5000, 5000].map(Duration::from_millis)
+        );
+    }
+
+    // #### PR #65
+    // What: with the donation session down the miner's own job is published
+    // alone; at 0% nothing is prepared or declared for the donation even
+    // with its session up; above 0% both coinbases are prepared, each for
+    // its own share owner, and declared together; a donation preparation
+    // that fails publishes the miner's own job alone.
+    // Look here if: offer, finish_offer or donation_plan changes.
+    #[test]
+    fn the_donation_never_gates_the_miners_own_job() {
+        let dir = TestDirectory::new();
+        let (url, requests) = serve(vec![Answer::Valid]);
+        let (refusing, _) = serve(vec![Answer::Refuse]);
+        let (mut uplink, events) = handle(Some(p2pool_plan(1, &url, "owner", 8)));
+        let (donor, donor_events) = handle(None);
+        uplink.donation = Some(Arc::new(donor));
+        let donor = uplink.donation.clone().unwrap();
+        let (shared, _woken) = shared(&dir);
+        let mut offered = Offered::default();
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        let mut published = |offered: &mut Offered, donating: bool| {
+            template.previous_hash[0] = template.previous_hash[0].wrapping_add(1);
+            offer(
+                &shared,
+                Some(&uplink),
+                offered,
+                1,
+                0,
+                template.clone(),
+                donating,
+            );
+            settle(&shared, &uplink, offered);
+            shared
+                .job
+                .read()
+                .unwrap()
+                .clone()
+                .expect("the miner's own job is published")
+        };
+        let owners = || -> Vec<String> {
+            let mut owners: Vec<String> = requests
+                .lock()
+                .unwrap()
+                .drain(..)
+                .map(|(_, owner)| owner)
+                .collect();
+            owners.sort();
+            owners
+        };
+        // The donation session is down.
+        let job = published(&mut offered, true);
+        assert!(job.template.p2pool_donation().is_none());
+        assert_eq!(owners(), ["owner"]);
+        assert!(events.try_recv().is_ok());
+        assert!(donor_events.try_recv().is_err());
+        // At 0%, with its session up.
+        *donor.status.plan.write().unwrap() = Some(p2pool_plan(5, &url, "donation", 8));
+        let job = published(&mut offered, false);
+        assert!(job.template.p2pool_donation().is_none());
+        assert_eq!(owners(), ["owner"]);
+        assert!(events.try_recv().is_ok());
+        assert!(donor_events.try_recv().is_err());
+        // Above 0%.
+        let job = published(&mut offered, true);
+        let own = job.template.p2pool_donation().expect("the donation job");
+        assert_eq!(owners(), ["donation", "owner"]);
+        assert_ne!(
+            job.template.declared_outputs().unwrap(),
+            own.declared_outputs().unwrap()
+        );
+        assert_eq!(
+            own.declaration_id(0),
+            job.template.declaration_id(job.generation)
+        );
+        assert!(events.try_recv().is_ok());
+        match donor_events.try_recv().unwrap() {
+            UplinkEvent::Published { template, .. } => assert!(Arc::ptr_eq(&template, own)),
+            UplinkEvent::Share(_) => panic!("expected the donation declaration"),
+        }
+        // The donation's preparation fails.
+        *donor.status.plan.write().unwrap() = Some(p2pool_plan(6, &refusing, "donation", 8));
+        let job = published(&mut offered, true);
+        assert!(job.template.p2pool_donation().is_none());
+        assert_eq!(owners(), ["owner"]);
+        assert!(events.try_recv().is_ok());
+        assert!(donor_events.try_recv().is_err());
+        assert!(donor.status.summary.lock().unwrap().last_error.is_some());
+        assert_eq!(offered.failures, 0, "the miner's own job went out");
+    }
+
+    // #### PR #65
+    // What: on a P2Pool job with a donation job, a donation session that is
+    // down (or replaced) leaves the device on the miner's own job with no
+    // donation owed; one that has yet to accept leaves it there with the
+    // donation owed; once accepted the donation job is mined. A newer job
+    // waiting for the pool keeps the accepted one, still re-evaluated.
+    // Look here if: donation_readiness or JobAvailability::update changes.
+    #[test]
+    fn a_donation_outage_keeps_personal_work_and_pauses_only_donation_work() {
+        let (url, _requests) = serve(vec![Answer::Valid]);
+        let personal = p2pool_plan(1, &url, "owner", 8);
+        let donation = p2pool_plan(5, &url, "donation", 8);
+        let start = Instant::now();
+        let lease = start + Duration::from_secs(30);
+        let job = p2pool_job(&personal, Some(&donation), 0x11, 1, lease);
+        let own = job.template.p2pool_donation().unwrap().clone();
+        let mut device = Device::new();
+        let all = 10_000;
+        let ack = |personal: u64, donation: Option<(u64, u64)>| Acknowledged {
+            personal,
+            donation,
+            hold: None,
+        };
+        let mined = |device: &Device| {
+            let current = device.job().expect("the device has work");
+            (
+                Arc::ptr_eq(&current.template, &own),
+                u16::from(current.payout.donation),
+                current.payout.donation_work,
+            )
+        };
+        device.update(Some(&job), start, all, ack(1, None)).unwrap();
+        assert_eq!(mined(&device), (false, 0, false), "donation down");
+        device
+            .update(Some(&job), start, all, ack(1, Some((5, 0))))
+            .unwrap();
+        assert_eq!(mined(&device), (false, all, false), "not accepted yet");
+        device
+            .update(Some(&job), start, all, ack(1, Some((5, 1))))
+            .unwrap();
+        assert_eq!(mined(&device), (true, all, true), "accepted");
+        device
+            .update(Some(&job), start, all, ack(1, Some((6, 9))))
+            .unwrap();
+        assert_eq!(mined(&device), (false, 0, false), "a replaced session");
+        device
+            .update(Some(&job), start, all, ack(1, Some((5, 1))))
+            .unwrap();
+        assert_eq!(mined(&device), (true, all, true));
+        let newer = p2pool_job(&personal, Some(&donation), 0x11, 2, lease);
+        device
+            .update(Some(&newer), start, all, ack(1, None))
+            .unwrap();
+        assert_eq!(
+            mined(&device),
+            (false, 0, false),
+            "the held job, re-evaluated"
+        );
+        assert_eq!(device.job().unwrap().generation, 1);
+        device
+            .update(Some(&newer), start, all, ack(2, Some((5, 2))))
+            .unwrap();
+        assert_eq!(device.job().unwrap().generation, 2);
+        assert!(device.job().unwrap().payout.donation_work);
+    }
+
+    // #### PR #65
+    // What: at a new block the device waits connected for the pool's
+    // acceptance far past the 3 s grace, until the job's lease ends, then
+    // mines the job at once; a job never accepted ends with its lease and
+    // then the grace. Without a job, a failing preparation's hold keeps the
+    // device connected until it ends.
+    // Look here if: JobAvailability::update or the hold changes.
+    #[test]
+    fn a_slow_acknowledgement_keeps_devices_connected_until_the_lease_ends() {
+        let (url, _requests) = serve(vec![Answer::Valid]);
+        let plan = p2pool_plan(1, &url, "owner", 8);
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let ack = |personal: u64| Acknowledged::personal(personal);
+        let on_a = p2pool_job(&plan, None, 0xa1, 1, at(30));
+        let on_b = p2pool_job(&plan, None, 0xb2, 2, at(30));
+        let on_c = p2pool_job(&plan, None, 0xc3, 3, at(40));
+        let mut device = Device::new();
+        device.update(Some(&on_a), at(0), 0, ack(1)).unwrap();
+        assert_eq!(device.job().unwrap().generation, 1);
+        for seconds in [1, 4, 10, 29] {
+            device
+                .update(Some(&on_b), at(seconds), 0, ack(1))
+                .expect("waiting for the pool is not a failure");
+            assert!(device.job().is_none(), "the old block's work is revoked");
+        }
+        assert!(device.update(Some(&on_b), at(29), 0, ack(2)).unwrap() > 0);
+        assert_eq!(device.job().unwrap().generation, 2);
+        device.update(Some(&on_c), at(30), 0, ack(2)).unwrap();
+        device.update(Some(&on_c), at(39), 0, ack(2)).unwrap();
+        device.update(Some(&on_c), at(40), 0, ack(2)).unwrap();
+        assert!(
+            device.update(Some(&on_c), at(43), 0, ack(2)).is_err(),
+            "a job never accepted ends with its lease, then the grace"
+        );
+        let mut device = Device::new();
+        let hold = Acknowledged {
+            hold: Some(at(60)),
+            ..ack(2)
+        };
+        for seconds in [50, 55, 59] {
+            device.update(None, at(seconds), 0, hold).unwrap();
+        }
+        device.update(None, at(60), 0, hold).unwrap();
+        assert!(device.update(None, at(63), 0, hold).is_err());
     }
 }
