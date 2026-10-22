@@ -506,13 +506,15 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
 }
 
 /// #### PR #67
-/// What: the identity asked for once more after a BCH P2Pool node refused
-/// the device's channel: with the payout's share address (`,p2p=`) when the
-/// node needs one, without it when the node has its own. `None` for any
-/// other refusal, or an identity whose payout is not a P2PKH CashAddr.
+/// What: the identity asked for once more after a BCH P2Pool node refused a
+/// bare payout login because it has no share address of its own: the same
+/// login with the payout's share address (`,p2p=`). `None` for any other
+/// refusal, or an identity whose payout is not a P2PKH CashAddr.
 /// Why: a pool login without `,p2p=` dropped every device at a P2Pool node
 /// that pays shares to each miner's share address; the setup adds it, the
-/// command line did not.
+/// command line did not. A node that refuses a `,p2p=` (it has a share
+/// address of its own) is never asked again without it: there its
+/// operator's address would own the device's shares.
 /// Look here if: devices are refused at a P2Pool node, or loop on refusals.
 fn p2pool_retry_identity(identity: &str, code: Option<&str>) -> Option<String> {
     match code? {
@@ -521,14 +523,6 @@ fn p2pool_retry_identity(identity: &str, code: Option<&str>) -> Option<String> {
             let payout = identity.split('.').next()?;
             let share = crate::tx::p2pool_share_address(payout).ok()?;
             Some(format!("{identity},p2p={share}"))
-        }
-        "invalid-share-address" => {
-            let (base, rest) = identity.split_once(",p2p=")?;
-            let rest = rest
-                .split_once(',')
-                .map(|(_, rest)| format!(",{rest}"))
-                .unwrap_or_default();
-            Some(format!("{base}{rest}"))
         }
         _ => None,
     }
@@ -554,7 +548,8 @@ fn channel_refusal(reply: &mut SerializedFrame) -> (Option<String>, String) {
             prints one)"
             .into(),
         Some("invalid-share-address") => "the pool refused the share address in \
-            --upstream-user: it has one of its own, so remove ,p2p=, or correct it"
+            --upstream-user: it is invalid, or the node gives every share to its \
+            operator's own share address (remove ,p2p= only to mine for the operator)"
             .into(),
         Some(code) if !code.is_empty() => format!("SV2 channel rejected: {code}"),
         _ => "SV2 channel rejected".into(),
@@ -2531,10 +2526,11 @@ mod tests {
 
     // #### PR #61: a refused donation identity is followed once by the
     // fallback; a second refusal drops the donation.
-    // #### PR #67: a P2Pool node's refusal of the pool login is asked once
-    // more the other way, and the donation names its share address too.
+    // #### PR #67: a P2Pool node that needs a share address is asked once
+    // more with it, and the donation names its share address too; a refused
+    // share address is never dropped.
     #[test]
-    fn a_p2pool_login_is_asked_again_with_or_without_its_share_address() {
+    fn a_p2pool_login_is_asked_again_with_its_share_address_only() {
         let payout = crate::donation::bch::address(crate::config::MiningNetwork::Chipnet);
         let share = crate::tx::p2pool_share_address(payout).unwrap();
         let needs = Some("share-address-required");
@@ -2548,14 +2544,12 @@ mod tests {
         );
         assert_eq!(p2pool_retry_identity(&format!("{payout},d=8"), needs), None);
         assert_eq!(p2pool_retry_identity("account.worker", needs), None);
+        // Never without the share address: the node's operator would own
+        // the shares.
         let refused = Some("invalid-share-address");
         assert_eq!(
             p2pool_retry_identity(&format!("{payout},p2p={share}"), refused),
-            Some(payout.to_string())
-        );
-        assert_eq!(
-            p2pool_retry_identity(&format!("{payout},p2p={share},d=8"), refused),
-            Some(format!("{payout},d=8"))
+            None
         );
         assert_eq!(p2pool_retry_identity(payout, refused), None);
         assert_eq!(p2pool_retry_identity(payout, Some("unknown-user")), None);

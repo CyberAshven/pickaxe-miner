@@ -435,8 +435,10 @@ node with no share address of its own refuses a bare payout login
 (`share-address-required`); the adapter then asks once more under
 `<payout>[.<worker>],p2p=<share address>`, the share address of that payout.
 A node with a share address of its own refuses another one
-(`invalid-share-address`); the adapter then asks once more without `,p2p=`.
-The donation channel names its share address the same way. A refusal the
+(`invalid-share-address`); the adapter does not ask again without `,p2p=`,
+because at such a node every share belongs to the operator's address, and
+the workers page says so. The donation channel names its share address the
+same way as the device's. A refusal the
 adapter cannot answer shows on the workers page, for example "upstream needs
 a P2Pool share address", instead of a generic connection failure. The
 setup's Join P2Pool fills in `,p2p=` itself.

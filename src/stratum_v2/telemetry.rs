@@ -824,7 +824,7 @@ pub fn connection_reason(error: &str) -> &'static str {
             "upstream needs a P2Pool share address: add ,p2p=<share address> to the pool login"
         }
         error if error.starts_with("the pool refused the share address") => {
-            "upstream refused the P2Pool share address in the pool login"
+            "upstream refused the P2Pool share address: invalid, or the node gives every share to its operator"
         }
         error if error.starts_with("SV2 channel rejected: ") => {
             "upstream refused the channel; check the pool identity"
@@ -848,7 +848,7 @@ mod tests {
         );
         assert_eq!(
             connection_reason("the pool refused the share address in --upstream-user: …"),
-            "upstream refused the P2Pool share address in the pool login"
+            "upstream refused the P2Pool share address: invalid, or the node gives every share to its operator"
         );
         assert_eq!(
             connection_reason("SV2 channel rejected: unknown-user"),
