@@ -819,6 +819,16 @@ pub fn connection_reason(error: &str) -> &'static str {
         }
         "SV2 upstream closed the channel" => "upstream closed the channel",
         "invalid SV2 authority key" => "upstream key is not an SV2 authority key",
+        // #### PR #67: a BCH P2Pool node's refusals of the pool login.
+        error if error.starts_with("the pool needs a share address") => {
+            "upstream needs a P2Pool share address: add ,p2p=<share address> to the pool login"
+        }
+        error if error.starts_with("the pool refused the share address") => {
+            "upstream refused the P2Pool share address in the pool login"
+        }
+        error if error.starts_with("SV2 channel rejected: ") => {
+            "upstream refused the channel; check the pool identity"
+        }
         "SV2 certificate version unsupported" => {
             "upstream certificate version is not SV2's; the pool must fix it"
         }
@@ -829,6 +839,26 @@ pub fn connection_reason(error: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_p2pool_login_refusal_names_the_share_address() {
+        assert_eq!(
+            connection_reason("the pool needs a share address: add ,p2p=<share address> to …"),
+            "upstream needs a P2Pool share address: add ,p2p=<share address> to the pool login"
+        );
+        assert_eq!(
+            connection_reason("the pool refused the share address in --upstream-user: …"),
+            "upstream refused the P2Pool share address in the pool login"
+        );
+        assert_eq!(
+            connection_reason("SV2 channel rejected: unknown-user"),
+            "upstream refused the channel; check the pool identity"
+        );
+        assert_eq!(
+            connection_reason("something else"),
+            "protocol or connection failure"
+        );
+    }
 
     // #### PR #42
     // What: a device's reconnect replaces its own offline row, not another

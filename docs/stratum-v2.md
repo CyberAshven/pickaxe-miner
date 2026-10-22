@@ -430,6 +430,17 @@ is the configured payout address. The identity is never printed or saved in
 the status file. The channel declares 1 TH/s, and pools set their first
 difficulty from that.
 
+#### PR #67: at a BCH P2Pool node, the login decides who owns the shares. A
+node with no share address of its own refuses a bare payout login
+(`share-address-required`); the adapter then asks once more under
+`<payout>[.<worker>],p2p=<share address>`, the share address of that payout.
+A node with a share address of its own refuses another one
+(`invalid-share-address`); the adapter then asks once more without `,p2p=`.
+The donation channel names its share address the same way. A refusal the
+adapter cannot answer shows on the workers page, for example "upstream needs
+a P2Pool share address", instead of a generic connection failure. The
+setup's Join P2Pool fills in `,p2p=` itself.
+
 Pools may acknowledge shares in batches, so in pool mode a device gets its
 reply once the adapter has checked and forwarded the share, and the workers
 page counts the pool's own verdicts as they arrive. A pool that changes a
