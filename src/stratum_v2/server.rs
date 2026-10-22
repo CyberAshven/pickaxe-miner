@@ -892,6 +892,13 @@ pub fn run_with(
                             stats.last_template_error = Some(template_reason(&error));
                         }
                         publish(&node_shared, None);
+                        // #### PR #65: a preparation still running was for a
+                        // template this node no longer serves; it must not
+                        // publish an old parent once it finishes.
+                        offered.preparing = None;
+                        offered.in_flight = None;
+                        offered.waiting = None;
+                        offered.last = None;
                         // #### PR #40
                         // What: with more than one node, move to the next in
                         // failover order when this one gives no template, and
@@ -1385,6 +1392,9 @@ struct Offered {
     /// #### PR #65: the P2Pool preparation running, and the newest offer
     /// waiting for it (see `start_preparation`).
     preparing: Option<mpsc::Receiver<Prepared>>,
+    /// The running preparation's template, plan and lease, so a worker that
+    /// never reports (a failed spawn or a panic) fails like any other.
+    in_flight: Option<(BchTemplate, u64, Instant)>,
     waiting: Option<Preparation>,
     /// #### PR #65: failed P2Pool preparations in a row, when the next try
     /// is due, and until when devices wait for one to succeed (the first
@@ -1605,6 +1615,11 @@ fn start_preparation(shared: &Shared, uplink: &UplinkHandle, offered: &mut Offer
     let Some(preparation) = offered.waiting.take() else {
         return;
     };
+    let key = (
+        preparation.personal.clone(),
+        preparation.plan,
+        preparation.valid_until,
+    );
     let (send, receive) = mpsc::sync_channel(1);
     let wake = shared.wake.clone();
     let started = thread::Builder::new()
@@ -1614,14 +1629,17 @@ fn start_preparation(shared: &Shared, uplink: &UplinkHandle, offered: &mut Offer
             let _ = wake.try_send(());
         });
     match started {
-        Ok(_) => offered.preparing = Some(receive),
+        Ok(_) => {
+            offered.preparing = Some(receive);
+            offered.in_flight = Some(key);
+        }
         Err(_) => {
             if let Ok(mut summary) = uplink.status.summary.lock() {
                 summary.state = "preparing";
                 summary.last_error = Some("cannot start the P2Pool preparation".into());
             }
-            offered.failures = offered.failures.saturating_add(1);
-            offered.retry = Some(Instant::now() + prepare_retry(offered.failures));
+            let (incoming, plan, valid_until) = key;
+            failed_preparation(shared, offered, &incoming, plan, valid_until);
         }
     }
 }
@@ -1639,6 +1657,7 @@ fn finish_preparations(
         match receive.try_recv() {
             Ok(prepared) => {
                 offered.preparing = None;
+                offered.in_flight = None;
                 let superseded = offered.waiting.as_ref().is_some_and(|waiting| {
                     let done = &prepared.preparation.personal;
                     (waiting.personal.previous_hash, waiting.personal.bits)
@@ -1651,8 +1670,12 @@ fn finish_preparations(
             Err(mpsc::TryRecvError::Empty) => (),
             Err(mpsc::TryRecvError::Disconnected) => {
                 offered.preparing = None;
-                offered.failures = offered.failures.saturating_add(1);
-                offered.retry = Some(now + prepare_retry(offered.failures));
+                if let Some((incoming, plan, valid_until)) = offered.in_flight.take() {
+                    failed_preparation(shared, offered, &incoming, plan, valid_until);
+                } else {
+                    offered.failures = offered.failures.saturating_add(1);
+                    offered.retry = Some(now + prepare_retry(offered.failures));
+                }
             }
         }
     }
@@ -1874,12 +1897,29 @@ impl Acknowledged {
 // Look here if: donation jobs reach devices before their session accepted
 // them, or the donation's share drifts after a donation outage.
 /// Some(true) when `job`'s donation job may be mined, Some(false) while its
-/// session has yet to accept it, None while the donation is paused.
-fn donation_readiness(job: &PublishedJob, acknowledged: Option<Acknowledged>) -> Option<bool> {
+/// session has yet to accept it, None while the donation is paused. A
+/// donation not accepted within `DONATION_ACK_WAIT` of the job (one the pool
+/// refused while its session stays up) is paused too, so it owes nothing.
+fn donation_readiness(
+    job: &PublishedJob,
+    acknowledged: Option<Acknowledged>,
+    now: Instant,
+) -> Option<bool> {
     let own = job.template.p2pool_donation()?;
     let (plan, accepted) = acknowledged?.donation?;
-    (own.jd_plan()?.serial == plan).then(|| accepted >= own.declaration_id(job.generation))
+    if own.jd_plan()?.serial != plan {
+        return None;
+    }
+    if accepted >= own.declaration_id(job.generation) {
+        return Some(true);
+    }
+    let published = job.valid_until.checked_sub(JOB_LEASE)?;
+    (now.saturating_duration_since(published) < DONATION_ACK_WAIT).then_some(false)
 }
+
+/// How long a P2Pool job's donation may wait for its session's acceptance
+/// while the miner's own work counts as owed to it.
+const DONATION_ACK_WAIT: Duration = Duration::from_secs(5);
 
 struct JobAvailability {
     generation: Option<u64>,
@@ -1970,7 +2010,7 @@ impl JobAvailability {
             let (donation, donation_work) = match donation {
                 JobDonation::Bch(rate) => (rate, self.allocation.donation_work(rate)),
                 // #### PR #65: see `donation_readiness`.
-                JobDonation::P2Pool(rate) => match donation_readiness(&job, acknowledged) {
+                JobDonation::P2Pool(rate) => match donation_readiness(&job, acknowledged, now) {
                     Some(true) => (rate, self.allocation.pool_donation_work(rate)),
                     Some(false) => (rate, false),
                     None => (BchDonation::try_from(0)?, false),
@@ -3614,6 +3654,19 @@ mod p2pool_tests {
             .unwrap();
         assert_eq!(device.job().unwrap().generation, 2);
         assert!(device.job().unwrap().payout.donation_work);
+        // A donation the pool never accepts (refused while its session stays
+        // up) stops counting as owed after DONATION_ACK_WAIT.
+        let refused = p2pool_job(&personal, Some(&donation), 0x11, 3, lease);
+        device
+            .update(
+                Some(&refused),
+                start + Duration::from_secs(6),
+                all,
+                ack(3, Some((5, 2))),
+            )
+            .unwrap();
+        assert_eq!(device.job().unwrap().generation, 3);
+        assert_eq!(mined(&device), (false, 0, false), "never accepted");
     }
 
     // #### PR #65
