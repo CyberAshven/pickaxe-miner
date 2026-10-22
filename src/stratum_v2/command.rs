@@ -505,7 +505,14 @@ pub fn run(
             let address = crate::donation::bch::address(config.network);
             let share = crate::tx::p2pool_share_address(address)
                 .expect("the configured donation address is a network-checked P2PKH");
-            super::jd::client::spawn_p2pool(targets, format!("{address},p2p={share}"), stop.clone())
+            // #### PR #65: the donation session runs only above 0% (see
+            // `spawn_p2pool`).
+            super::jd::client::spawn_p2pool(
+                targets,
+                format!("{address},p2p={share}"),
+                donation.clone(),
+                stop.clone(),
+            )
         } else {
             super::jd::client::spawn(targets, stop.clone())
         }

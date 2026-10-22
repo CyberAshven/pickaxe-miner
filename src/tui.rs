@@ -69,6 +69,10 @@ type PickaxeTerminal = Terminal<CrosstermBackend<Stdout>>;
 type PotReader = fn(&RuntimeConfig, &std::path::Path) -> Result<(u64, u64), String>;
 /// #### PR #61: a fee pot's balance as read: sats and the claims it pays.
 type PotBalance = Result<(u64, u64), String>;
+/// #### PR #65: reads the balance of the pot mining will use and, when that
+/// is the previous funded pot rather than the signed-claim pot, its address.
+type PotChooser =
+    fn(&RuntimeConfig, &std::path::Path) -> Result<((u64, u64), Option<String>), String>;
 
 #[derive(Debug, Clone)]
 pub struct SetupResult {
@@ -464,6 +468,10 @@ pub enum ServerSetup {
 #[serde(default)]
 struct ProfileChoices {
     electric_pot_mode: crate::config::ElectricPotMode,
+    /// #### PR #65: the pot mode was chosen explicitly. Earlier files also
+    /// saved `signed` as the default, so `signed` alone stays the default.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    electric_pot_chosen: bool,
     token_donations: std::collections::BTreeMap<String, crate::donation::TokenDonation>,
     /// The pool to join is a BCH P2Pool node.
     p2pool: bool,
@@ -477,6 +485,13 @@ struct ProfileChoices {
 }
 
 impl ProfileChoices {
+    /// #### PR #65: the explicitly chosen pot mode, `None` for the default.
+    fn electric_pot(&self) -> Option<crate::config::ElectricPotMode> {
+        (self.electric_pot_chosen
+            || self.electric_pot_mode != crate::config::ElectricPotMode::Signed)
+            .then_some(self.electric_pot_mode)
+    }
+
     fn path(profiles: &Path) -> PathBuf {
         profiles.with_file_name("profile-choices.json")
     }
@@ -813,6 +828,10 @@ struct SetupFlow {
     pot_balance: Option<Result<(u64, u64), String>>,
     pot_warned: Option<String>,
     pot_reader: PotReader,
+    /// #### PR #65: used instead of `pot_reader` while a previous funded pot
+    /// may be mined, with the address of the pot it read.
+    pot_chooser: PotChooser,
+    pot_address: Option<mpsc::Receiver<Option<String>>>,
     /// #### PR #61: the balance read in the background while the pot
     /// shows, for the pot it was read for, and when the last one finished.
     pot_read: Option<(String, mpsc::Receiver<PotBalance>)>,
@@ -1004,6 +1023,8 @@ impl SetupFlow {
             pot_balance: None,
             pot_warned: None,
             pot_reader: crate::electric::miner::pot_balance,
+            pot_chooser: crate::electric::miner::pot_reading,
+            pot_address: None,
             pot_read: None,
             pot_read_at: None,
             settings_row: 0,
@@ -1662,13 +1683,21 @@ impl SetupFlow {
         let Some(path) = self.profile_path.as_deref() else {
             return;
         };
+        // #### PR #65: checked before a new key is made, which no previous
+        // pot can have used.
+        let fallback = crate::electric::miner::previous_pot_possible(&self.config, path);
         let pot = crate::electric::miner::default_pot(&self.config, path).map(|(address, key)| {
             ElectricPot {
                 qr: crate::electric::ui::qr_lines(&address).unwrap_or_default(),
+                signed: address.clone(),
                 address,
                 key,
+                fallback,
+                checking: fallback,
+                previous: false,
             }
         });
+        self.pot_address = None;
         self.electric_pot = Some((made_for, pot));
     }
 
@@ -1690,11 +1719,22 @@ impl SetupFlow {
                 .electric_pot
                 .as_ref()
                 .is_some_and(|(made, _)| made == made_for);
+            // #### PR #65: sent before the balance by the same read.
+            let address = self
+                .pot_address
+                .take()
+                .and_then(|receive| receive.try_recv().ok());
             if let (true, Some(balance)) = (current, balance) {
                 if let (Ok((_, claims)), Some(_)) = (&balance, &self.pot_warned) {
                     if *claims > 0 {
                         self.status_line = "The fee pot is funded. Press Start to mine.".into();
                     }
+                }
+                if let Some((_, Ok(pot))) = &mut self.electric_pot {
+                    if let Some(previous) = address {
+                        pot.show(previous);
+                    }
+                    pot.checking = false;
                 }
                 self.pot_balance = Some(balance);
             }
@@ -1713,12 +1753,23 @@ impl SetupFlow {
         else {
             return;
         };
+        let fallback = matches!(&self.electric_pot, Some((_, Ok(pot))) if pot.fallback);
         let (send, receive) = mpsc::channel();
-        let (config, read) = (self.config.clone(), self.pot_reader);
+        let (address_send, address_receive) = mpsc::channel();
+        let (config, read, choose) = (self.config.clone(), self.pot_reader, self.pot_chooser);
         thread::spawn(move || {
-            let _ = send.send(read(&config, &path));
+            let balance = if fallback {
+                choose(&config, &path).map(|(balance, previous)| {
+                    let _ = address_send.send(previous);
+                    balance
+                })
+            } else {
+                read(&config, &path)
+            };
+            let _ = send.send(balance);
         });
         self.pot_read = Some((made_for.clone(), receive));
+        self.pot_address = fallback.then_some(address_receive);
     }
 
     /// #### PR #61: ELECTRIC's fee pot shows on the settings page.
@@ -2460,6 +2511,7 @@ impl SetupFlow {
         self.pot_balance = None;
         self.pot_warned = None;
         self.pot_read = None;
+        self.pot_address = None;
         self.pot_read_at = None;
         // A manually selected different network must not carry CLI sources
         // that were supplied for the old network into the new profile.
@@ -2492,6 +2544,7 @@ impl SetupFlow {
         let gpu = self.mode == MiningMode::Gpu;
         ProfileChoices {
             electric_pot_mode: self.config.electric_pot_mode,
+            electric_pot_chosen: self.config.electric_pot_choice().is_some(),
             token_donations: self.config.token_donations.clone(),
             p2pool,
             own_p2pool: p2pool && self.own_p2pool,
@@ -2510,7 +2563,7 @@ impl SetupFlow {
 
     /// #### PR #61: puts a profile's kept choices back.
     fn apply_choices(&mut self, choices: &ProfileChoices) {
-        self.config.electric_pot_mode = choices.electric_pot_mode;
+        self.config.choose_electric_pot(choices.electric_pot());
         self.config.token_donations = choices.token_donations.clone();
         self.config.token_donation = self
             .config
@@ -4594,12 +4647,16 @@ pub fn run(
     state.set_devices(devices);
     let mut terminal = TerminalSession::enter()?;
     let mut quit = false;
+    // Only a finished B request opens profiles; q, Ctrl+C or a signal while
+    // pending rewards settle still quit.
+    let mut to_profiles = false;
     let mut last_draw = Instant::now() - DRAW_INTERVAL;
 
     let mut last_status_log: Option<Instant> = None;
     while !quit && !stop.load(Ordering::Relaxed) {
         let snapshot = supervisor.snapshot();
         if state.profiles_ready(snapshot.pending_winners > 0, Instant::now()) {
+            to_profiles = true;
             break;
         }
         state.record_sample(&snapshot, Instant::now());
@@ -4636,7 +4693,7 @@ pub fn run(
     }
 
     drop(terminal);
-    if state.profiles_requested && !stop.load(Ordering::Relaxed) {
+    if to_profiles && !stop.load(Ordering::Relaxed) {
         crate::session_control::request_profiles();
     }
     Ok(supervisor.stop())
@@ -6185,9 +6242,28 @@ fn render_electric_pot(state: &SetupFlow) -> (Paragraph<'static>, u16) {
             34,
         ),
         Some((_, Err(error))) => (vec![Line::from(error.clone())], 40),
+        // #### PR #65: no address to fund until it is known which pot mines.
+        Some((_, Ok(pot))) if pot.checking => (
+            vec![
+                Line::from("Checking which fee pot mines…"),
+                Line::from(dim("A previous funded pot with this key")),
+                Line::from(dim("is mined until it is migrated.")),
+                Line::from(format!("Refund key: {}", pot.key.display())),
+            ],
+            42,
+        ),
         Some((_, Ok(pot))) => {
             let qr_width = pot.qr.first().map_or(0, |row| row.chars().count()) as u16;
-            let mut lines = vec![
+            let mut lines = Vec::new();
+            if pot.previous {
+                let note = Style::default().fg(Color::Yellow);
+                lines.extend([
+                    Line::from(Span::styled("Mining the previous funded pot", note)),
+                    Line::from(Span::styled("until it is migrated.", note)),
+                    Line::from(dim("Refund it to fund the signed-claim pot.")),
+                ]);
+            }
+            lines.extend([
                 Line::from("Send plain BCH here from your wallet."),
                 Line::from(dim("It pays each claim's 1,000 sats and fee;")),
                 Line::from(dim("the 1,000 sats come back with the tokens.")),
@@ -6195,7 +6271,7 @@ fn render_electric_pot(state: &SetupFlow) -> (Paragraph<'static>, u16) {
                     pot.address.clone(),
                     Style::default().fg(Color::Yellow),
                 )),
-            ];
+            ]);
             lines.extend(pot.qr.iter().map(|row| {
                 Line::from(Span::styled(
                     row.clone(),
@@ -6239,6 +6315,27 @@ struct ElectricPot {
     address: String,
     key: PathBuf,
     qr: Vec<String>,
+    /// #### PR #65: the signed-claim pot made for this payout.
+    signed: String,
+    /// The previous funded pot with the same key may be mined instead.
+    fallback: bool,
+    /// Its first read has not said which pot mines yet.
+    checking: bool,
+    /// The previous funded pot is shown, because mining uses it.
+    previous: bool,
+}
+
+impl ElectricPot {
+    /// #### PR #65: shows the pot a read found mining uses: the previous
+    /// funded pot's address, or the signed-claim pot's (`None`).
+    fn show(&mut self, previous: Option<String>) {
+        self.previous = previous.is_some();
+        let address = previous.unwrap_or_else(|| self.signed.clone());
+        if address != self.address {
+            self.qr = crate::electric::ui::qr_lines(&address).unwrap_or_default();
+            self.address = address;
+        }
+    }
 }
 
 /// The GPU list: one checkbox per GPU that can mine.
@@ -10967,6 +11064,121 @@ mod tests {
         assert_ne!(new_pot.address, old_pot.address);
         assert_ne!(new_pot.key, old_pot.key);
         assert_eq!(std::fs::read(&old_pot.key).unwrap(), old_key);
+        // Both keys belong to this test's newly created directory only.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // #### PR #65
+    #[test]
+    fn saved_signed_pot_mode_without_its_marker_remains_the_default() {
+        use crate::config::ElectricPotMode;
+        let dir =
+            std::env::temp_dir().join(format!("pickaxe-pot-choice-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profiles = dir.join("config.profiles.json");
+        // Earlier builds wrote `signed` for every profile that kept choices.
+        std::fs::write(
+            ProfileChoices::path(&profiles),
+            r#"{"Old":{"electric_pot_mode":"signed","split":["PHOTON=80","ELECTRIC=20"]},
+                "Kept":{"electric_pot_mode":"restricted"},
+                "Chosen":{"electric_pot_mode":"signed","electric_pot_chosen":true}}"#,
+        )
+        .unwrap();
+        let all = ProfileChoices::load(&profiles);
+        assert_eq!(all["Old"].electric_pot(), None);
+        assert_eq!(
+            all["Kept"].electric_pot(),
+            Some(ElectricPotMode::Restricted)
+        );
+        assert_eq!(all["Chosen"].electric_pot(), Some(ElectricPotMode::Signed));
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.apply_choices(&all["Chosen"]);
+        assert_eq!(
+            setup.config.electric_pot_choice(),
+            Some(ElectricPotMode::Signed)
+        );
+        assert_eq!(
+            setup.profile_choices().electric_pot(),
+            Some(ElectricPotMode::Signed)
+        );
+        setup.apply_choices(&all["Old"]);
+        assert_eq!(setup.config.electric_pot_choice(), None);
+        let saved = serde_json::to_string(&setup.profile_choices()).unwrap();
+        assert!(!saved.contains("electric_pot_chosen"), "{saved}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn electric_setup_shows_the_previous_funded_pot_that_mining_uses() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-previous-pot-setup-{:016x}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profiles = dir.join("config.profiles.json");
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.profile_path = Some(profiles.clone());
+        setup.electric = true;
+        setup.config.payout_address = chipnet_payout(5);
+        setup.open_settings(SettingsRow::Network);
+        // An existing user: the recovery key is already there.
+        let (signed, key) = crate::electric::miner::default_pot(&setup.config, &profiles).unwrap();
+        setup.refresh_electric_pot();
+        let pot = setup.electric_pot.clone().unwrap().1.unwrap();
+        assert!(pot.fallback && pot.checking && pot.key == key);
+        let screen = setup_text(&setup);
+        assert!(screen.contains("Checking which fee pot mines"), "{screen}");
+        assert!(!screen.contains(&signed[..30]), "{screen}");
+        setup.pot_reader = |_, _| Err("the chooser reads this pot".into());
+        setup.pot_chooser = |_, _| Ok(((50_000, 12), Some("bchtest:previous-funded-pot".into())));
+        let read = |setup: &mut SetupFlow| {
+            setup.pot_balance = None;
+            setup.poll_pot_balance();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while setup.pot_balance.is_none() {
+                assert!(Instant::now() < deadline, "the pot was never read");
+                std::thread::sleep(Duration::from_millis(5));
+                setup.poll_pot_balance();
+            }
+        };
+        read(&mut setup);
+        let pot = setup.electric_pot.clone().unwrap().1.unwrap();
+        assert_eq!(pot.address, "bchtest:previous-funded-pot");
+        assert!(pot.previous && !pot.checking && !pot.qr.is_empty());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+        terminal.draw(|frame| render_setup(frame, &setup)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "Mining the previous funded pot",
+            "until it is migrated.",
+            "bchtest:previous-funded-pot",
+            "Balance: 50000 sats",
+        ] {
+            assert!(screen.contains(expected), "{expected}: {screen}");
+        }
+        // Once the signed-claim pot mines again, it is shown.
+        setup.pot_chooser = |_, _| Ok(((0, 0), None));
+        read(&mut setup);
+        let pot = setup.electric_pot.clone().unwrap().1.unwrap();
+        assert_eq!(pot.address, signed);
+        assert!(!pot.previous && !pot.checking);
+        // A new user's pot has no previous pot to check for.
+        let fresh = dir.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let mut new_user = setup_for(MiningMode::Gpu);
+        new_user.profile_path = Some(fresh.join("config.profiles.json"));
+        new_user.electric = true;
+        new_user.config.payout_address = chipnet_payout(6);
+        new_user.open_settings(SettingsRow::Network);
+        new_user.refresh_electric_pot();
+        let pot = new_user.electric_pot.clone().unwrap().1.unwrap();
+        assert!(!pot.fallback && !pot.checking && !pot.previous);
         // Both keys belong to this test's newly created directory only.
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -178,17 +178,18 @@ impl UplinkHandle {
     // A receiver may dequeue immediately, but cannot declare until both sends
     // succeed. A full/disconnected peer cancels the other event before it can
     // consume a token or replace an accepted job. No network I/O holds the gate.
+    // A template without a donation job (the donation at 0%, its session
+    // down or its preparation failed) is declared on the personal session
+    // alone.
     pub fn publish(&self, serial: u64, template: Arc<BchTemplate>) -> Result<(), &'static str> {
-        let Some(donation) = self.donation.as_ref() else {
+        let (Some(donation), Some(own)) =
+            (self.donation.as_ref(), template.p2pool_donation().cloned())
+        else {
             return self
                 .events
                 .try_send(UplinkEvent::published(serial, template))
                 .map_err(|_| "personal declaration queue unavailable");
         };
-        let own = template
-            .p2pool_donation()
-            .cloned()
-            .ok_or("donation declaration missing")?;
         let admission = Arc::new(Mutex::new(false));
         let mut committed = admission
             .lock()
@@ -212,11 +213,25 @@ impl UplinkHandle {
         Ok(())
     }
 
+    // #### PR #65: each session's acceptance gates its own work
+    // What: the miner's own jobs wait only for the personal session's
+    // acknowledgement; donation jobs wait for the donation session's, which
+    // counts only while that session holds a plan.
+    // Why: personal mining waited for min(personal, donation), so a donation
+    // session that was down (or slow) stopped the miner's own work.
+    // Look here if: devices idle while the personal session is active, or
+    // mine donation jobs that session never accepted.
+    /// The newest declaration the personal session's pool accepted.
     pub fn acknowledged(&self) -> u64 {
-        let personal = self.status.acknowledged.load(Ordering::Relaxed);
-        self.donation.as_ref().map_or(personal, |donation| {
-            personal.min(donation.status.acknowledged.load(Ordering::Relaxed))
-        })
+        self.status.acknowledged.load(Ordering::Relaxed)
+    }
+
+    /// The donation session's plan serial and the newest declaration its
+    /// pool accepted, while it holds a plan.
+    pub fn donation_acknowledged(&self) -> Option<(u64, u64)> {
+        let donation = self.donation.as_ref()?;
+        let plan = donation.status.plan.read().ok()?.as_ref()?.serial;
+        Some((plan, donation.status.acknowledged.load(Ordering::Relaxed)))
     }
 
     pub fn forward(&self, share: ForwardShare) {
@@ -229,11 +244,23 @@ impl UplinkHandle {
     }
 }
 
+/// Whether a session should run now (see `spawn_p2pool`).
+type Wanted = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// A P2Pool beneficiary needs its own channel, token and declared coinbase.
 /// Never subtract a software donation from other participants' PPLNS outputs.
+// #### PR #65: no donation session at 0%
+// What: the donation session connects only while the donation setting is
+// above 0%; set to 0% it ends (its plan goes) and waits, without a
+// connection, a token or a preparation, until the setting rises again.
+// Why: at 0% it still took tokens and helper calls, and its failures
+// stopped the miner's own work.
+// Look here if: a donation session connects at 0%, or not after the
+// setting rises.
 pub fn spawn_p2pool(
     targets: Vec<JdTarget>,
     donation_identity: String,
+    donation_rate: Arc<RwLock<crate::donation::bch::BchDonation>>,
     stop: Arc<AtomicBool>,
 ) -> (UplinkHandle, thread::JoinHandle<()>) {
     let donation_targets = targets
@@ -245,7 +272,9 @@ pub fn spawn_p2pool(
         })
         .collect();
     let (mut personal, personal_worker) = spawn(targets, stop.clone());
-    let (donation, donation_worker) = spawn(donation_targets, stop);
+    let wanted: Wanted =
+        Arc::new(move || donation_rate.read().is_ok_and(|rate| u16::from(*rate) != 0));
+    let (donation, donation_worker) = spawn_with(donation_targets, stop, Some(wanted));
     personal.donation = Some(Arc::new(donation));
     let worker = thread::spawn(move || {
         let _ = personal_worker.join();
@@ -260,6 +289,16 @@ pub fn spawn(
     targets: Vec<JdTarget>,
     stop: Arc<AtomicBool>,
 ) -> (UplinkHandle, thread::JoinHandle<()>) {
+    spawn_with(targets, stop, None)
+}
+
+/// `spawn`, connecting only while `wanted` says so (always without it).
+fn spawn_with(
+    targets: Vec<JdTarget>,
+    stop: Arc<AtomicBool>,
+    wanted: Option<Wanted>,
+) -> (UplinkHandle, thread::JoinHandle<()>) {
+    let paused = move || wanted.as_ref().is_some_and(|wanted| !wanted());
     let (events, receive) = mpsc::sync_channel(EVENTS);
     let status = Arc::new(JdStatus {
         plan: RwLock::new(None),
@@ -282,6 +321,20 @@ pub fn spawn(
             let Some(target) = targets.get(next) else {
                 return;
             };
+            // #### PR #65: a paused session waits without a connection (see
+            // `spawn_p2pool`).
+            if paused() {
+                shared.update(|summary| {
+                    summary.state = "off";
+                    summary.last_error = None;
+                });
+                if let Err(RecvTimeoutError::Disconnected) =
+                    receive.recv_timeout(Duration::from_millis(100))
+                {
+                    return;
+                }
+                continue;
+            }
             serial += 1;
             let custom_jobs = || {
                 shared
@@ -290,10 +343,14 @@ pub fn spawn(
                     .map_or(0, |summary| summary.custom_jobs)
             };
             let before = custom_jobs();
-            let result = uplink(target, &shared, &receive, &stop, serial);
+            let result = uplink(target, &shared, &receive, &stop, serial, &paused);
             shared.set_plan(None);
             if stop.load(Ordering::Relaxed) {
                 break;
+            }
+            if paused() {
+                failures = 0;
+                continue;
             }
             // #### PR #42: retries back off across the pools
             // What: after a failure the uplink tries the next pool in order
@@ -388,13 +445,15 @@ struct Declaring {
     sent: Instant,
 }
 
-/// One pool session: Ok when the server stops, otherwise why it ended.
+/// One pool session: Ok when the server stops or `paused` says so (see
+/// `spawn_p2pool`), otherwise why it ended.
 fn uplink(
     target: &JdTarget,
     status: &JdStatus,
     events: &Events<UplinkEvent>,
     stop: &AtomicBool,
     serial: u64,
+    paused: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let full = target.mode == JdMode::FullTemplate;
     let (mut jd, mut jd_replies) = connect(target, if full { Limits::JD } else { Limits::DEVICE })?;
@@ -529,6 +588,10 @@ fn uplink(
     let mut next_request = 1u32;
     let mut next_declaration = 1u32;
     while !stop.load(Ordering::Relaxed) {
+        // #### PR #65: the donation set to 0% ends its session.
+        if paused() {
+            return Ok(());
+        }
         if let Some(p2pool) = &plan.p2pool {
             for _ in 0..p2pool.consumed.swap(0, Ordering::Relaxed) {
                 allocate(target, &mut jd, &mut requests)?;
@@ -1299,8 +1362,15 @@ mod tests {
         }
     }
 
+    // #### PR #65
+    // What: the personal session's acknowledgement stands on its own; the
+    // donation session's counts only while it holds a plan, and a
+    // reconnecting donation session revokes only donation readiness. Block
+    // and donation shares keep their route.
+    // Look here if: UplinkHandle::acknowledged or donation_acknowledged
+    // changes.
     #[test]
-    fn both_recipients_must_acknowledge_and_block_only_donation_work_keeps_its_route() {
+    fn each_recipient_acknowledges_its_own_work_and_block_only_donation_work_keeps_its_route() {
         let status = || {
             Arc::new(JdStatus {
                 plan: RwLock::new(None),
@@ -1321,9 +1391,26 @@ mod tests {
             donation: Some(donor.clone()),
         };
         handle.status.acknowledged.store(7, Ordering::Relaxed);
-        assert_eq!(handle.acknowledged(), 0);
+        assert_eq!(handle.acknowledged(), 7, "a down donation never gates");
+        assert_eq!(handle.donation_acknowledged(), None);
+        donor.status.set_plan(Some(Arc::new(JdPlan {
+            serial: 4,
+            upstream_prefix: vec![0; 4],
+            pad: Vec::new(),
+            compact: true,
+            scripts: Vec::new(),
+            rates: super::super::token::PoolRates {
+                donation_bps: 0,
+                fee_bps: 0,
+                donation_output: None,
+                fee_output: None,
+            },
+            pool_target: [255; 32],
+            p2pool: None,
+        })));
         donor.status.acknowledged.store(6, Ordering::Relaxed);
-        assert_eq!(handle.acknowledged(), 6);
+        assert_eq!(handle.acknowledged(), 7);
+        assert_eq!(handle.donation_acknowledged(), Some((4, 6)));
         let share = ForwardShare {
             donation: true,
             serial: 7,
@@ -1340,12 +1427,13 @@ mod tests {
             UplinkEvent::Share(found) => assert_eq!(found, share),
             _ => panic!("share route"),
         };
-        donor.status.acknowledged.store(0, Ordering::Relaxed);
+        donor.status.set_plan(None);
         assert_eq!(
-            handle.acknowledged(),
-            0,
-            "reconnecting recipient revokes readiness"
+            handle.donation_acknowledged(),
+            None,
+            "a reconnecting donation session revokes donation readiness"
         );
+        assert_eq!(handle.acknowledged(), 7, "and only that");
         let personal_share = ForwardShare {
             donation: false,
             ..share
@@ -1355,6 +1443,102 @@ mod tests {
             UplinkEvent::Share(found) => assert_eq!(found, personal_share),
             _ => panic!("share route"),
         };
+        assert!(donation.try_recv().is_err());
+    }
+
+    // #### PR #65
+    // What: at 0% the donation session never connects (only the personal
+    // one does) and shows "off"; raised above 0% it connects at once.
+    // Look here if: spawn_p2pool's gate changes.
+    #[test]
+    fn the_donation_session_connects_only_above_zero_percent() {
+        use crate::donation::bch::BchDonation;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let count = accepted.clone();
+        thread::spawn(move || {
+            // Silent: each handshake waits for an answer that never comes.
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                count.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let rate = Arc::new(RwLock::new(BchDonation::try_from(0).unwrap()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let target = JdTarget {
+            address: address.to_string(),
+            authority: crate::stratum_v2::server::authority_public(&[7; 32]).unwrap(),
+            identity: "personal,p2p=owner".into(),
+            retry: Duration::from_secs(30),
+            mode: JdMode::CoinbaseOnly,
+            p2pool_prepare_api: Some("http://127.0.0.1:1/jd_prepare".into()),
+            required: true,
+        };
+        let (handle, _worker) = spawn_p2pool(
+            vec![target],
+            "donation,p2p=owner".into(),
+            rate.clone(),
+            stop.clone(),
+        );
+        let reach = |connections: u64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while accepted.load(Ordering::SeqCst) < connections {
+                assert!(Instant::now() < deadline, "{connections} connections");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        reach(1);
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "no donation session at 0%"
+        );
+        let donor = handle.donation.as_ref().unwrap();
+        assert_eq!(donor.status.summary.lock().unwrap().state, "off");
+        assert!(donor.status.plan.read().unwrap().is_none());
+        *rate.write().unwrap() = BchDonation::default();
+        reach(2);
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    // #### PR #65
+    // What: a template without a donation job is declared on the personal
+    // session alone, even where a donation session exists.
+    // Look here if: UplinkHandle::publish changes.
+    #[test]
+    fn a_template_without_a_donation_job_is_declared_on_the_personal_session_alone() {
+        let status = || {
+            Arc::new(JdStatus {
+                plan: RwLock::new(None),
+                summary: Mutex::default(),
+                acknowledged: AtomicU64::new(0),
+            })
+        };
+        let (personal_events, personal) = mpsc::sync_channel(1);
+        let (donation_events, donation) = mpsc::sync_channel(1);
+        let handle = UplinkHandle {
+            events: personal_events,
+            status: status(),
+            donation: Some(Arc::new(UplinkHandle {
+                events: donation_events,
+                status: status(),
+                donation: None,
+            })),
+        };
+        handle.publish(3, Arc::new(template())).unwrap();
+        match personal.try_recv().unwrap() {
+            UplinkEvent::Published {
+                serial, admission, ..
+            } => {
+                assert_eq!(serial, 3);
+                assert!(admission.is_none());
+            }
+            UplinkEvent::Share(_) => panic!("expected a declaration"),
+        }
         assert!(donation.try_recv().is_err());
     }
 
@@ -1404,6 +1588,7 @@ mod tests {
             let (handles, worker) = spawn_p2pool(
                 vec![target],
                 format!("{donation},p2p={donation_share}"),
+                Arc::new(RwLock::new(crate::donation::bch::BchDonation::default())),
                 session_stop.clone(),
             );
             let donor = handles.donation.as_ref().unwrap();
@@ -1440,7 +1625,11 @@ mod tests {
             );
             personal.set_p2pool_donation(donation);
             handles.publish(1, Arc::new(personal)).unwrap();
-            while handles.acknowledged() < 1 {
+            while handles.acknowledged() < 1
+                || handles
+                    .donation_acknowledged()
+                    .is_none_or(|(_, acknowledged)| acknowledged < 1)
+            {
                 assert!(
                     Instant::now() < deadline,
                     "BCHN-validated custom jobs must both be acknowledged"

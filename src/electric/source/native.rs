@@ -13,6 +13,8 @@ type Coins = BTreeMap<Outpoint, Value>;
 const MAX_MEMPOOL: usize = 4_096;
 const MAX_BLOCK_GAP: u32 = 24;
 const VIEW_LIFETIME: Duration = Duration::from_millis(250);
+/// #### PR #65: recent blocks searched for what spent a watched output.
+const SPEND_SEARCH_BLOCKS: u32 = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Tip {
@@ -97,6 +99,47 @@ impl Watch {
             .collect())
     }
 
+    /// #### PR #65: what spent `target`: the current mempool, then the
+    /// active chain's recent blocks. A spend found in a block is reported only
+    /// while that block remains on the node's active chain.
+    pub fn spender(&mut self, target: &Outpoint) -> Result<super::Spender, String> {
+        self.refresh()?;
+        if self.index.view.contains_key(target) {
+            return Ok(super::Spender::Unspent);
+        }
+        for (id, tx) in &self.index.mempool {
+            if spends(tx, target)? {
+                return Ok(super::Spender::Mempool(id.clone()));
+            }
+        }
+        let tip = self.index.tip.clone().ok_or("node has no tip")?;
+        let mut block_hash = tip.hash;
+        for depth in 0..SPEND_SEARCH_BLOCKS.min(tip.height.saturating_add(1)) {
+            let height = tip.height - depth;
+            let block = rpc_call(&self.url, "getblock", json!([block_hash, 2]))?;
+            if block["hash"].as_str() != Some(&block_hash)
+                || block["height"].as_u64() != Some(u64::from(height))
+            {
+                return Err("node changed chain while searching ELECTRIC blocks".into());
+            }
+            for tx in block["tx"].as_array().ok_or("block has no transactions")? {
+                if spends(tx, target)? {
+                    if rpc_call(&self.url, "getblockhash", json!([height]))?.as_str()
+                        != Some(&block_hash)
+                    {
+                        return Err("node changed chain while searching ELECTRIC blocks".into());
+                    }
+                    return Ok(super::Spender::Confirmed(hash(&tx["txid"])?));
+                }
+            }
+            match block["previousblockhash"].as_str() {
+                Some(previous) => block_hash = hash(&Value::String(previous.into()))?,
+                None => break,
+            }
+        }
+        Ok(super::Spender::Unknown)
+    }
+
     pub fn relay_fee(&self) -> Result<u64, String> {
         let relay = rpc_call(&self.url, "getnetworkinfo", json!([]))?;
         let mempool = rpc_call(&self.url, "getmempoolinfo", json!([]))?;
@@ -165,7 +208,13 @@ impl Index {
                         return Err("node scan returned an unwatched script".into());
                     }
                     let key = outpoint(&item["txid"], &item["vout"])?;
-                    let coin = coin(&key, script, &item["amount"], &item["tokenData"])?;
+                    // The scan is pinned to `tip`, so every result is confirmed.
+                    let height = item["height"]
+                        .as_u64()
+                        .and_then(|h| u32::try_from(h).ok())
+                        .filter(|h| (1..=tip.height).contains(h))
+                        .unwrap_or(tip.height.max(1));
+                    let coin = coin(&key, script, &item["amount"], &item["tokenData"], height)?;
                     if base.insert(key, coin).is_some() {
                         return Err("node scan returned a duplicate outpoint".into());
                     }
@@ -183,7 +232,7 @@ impl Index {
                     return Err("node changed chain while reading ELECTRIC blocks".into());
                 }
                 let transactions = block["tx"].as_array().ok_or("block has no transactions")?;
-                apply_transactions(&mut base, transactions.iter(), scripts)?;
+                apply_transactions(&mut base, transactions.iter(), scripts, height)?;
                 previous = hash.as_str().ok_or("block hash is not a string")?.into();
             }
         }
@@ -220,7 +269,7 @@ impl Index {
                 continue;
             }
             let mut view = base.clone();
-            apply_transactions(&mut view, mempool.values(), scripts)?;
+            apply_transactions(&mut view, mempool.values(), scripts, 0)?;
             // Publish only a complete view; failed reads preserve old state.
             self.tip = Some(tip);
             self.confirmed = base;
@@ -263,15 +312,35 @@ fn outpoint(txid: &Value, vout: &Value) -> Result<Outpoint, String> {
     ))
 }
 
-fn coin(key: &Outpoint, script: &str, value: &Value, token: &Value) -> Result<Value, String> {
+/// #### PR #65: `height` is the confirming block's, 0 in the mempool, as
+/// Fulcrum reports it.
+fn coin(
+    key: &Outpoint,
+    script: &str,
+    value: &Value,
+    token: &Value,
+    height: u32,
+) -> Result<Value, String> {
     hex::decode(script).map_err(|_| "node script is not hex")?;
     if !token.is_null() && !token.is_object() {
         return Err("node tokenData is not an object".into());
     }
     Ok(
         json!({"tx_hash":key.0, "tx_pos":key.1, "value":bch_value_to_sats(value)?,
-        "script":script.to_ascii_lowercase(), "token_data":token}),
+        "script":script.to_ascii_lowercase(), "token_data":token, "height":height}),
     )
+}
+
+fn spends(tx: &Value, target: &Outpoint) -> Result<bool, String> {
+    for input in tx["vin"]
+        .as_array()
+        .ok_or("node transaction has no inputs")?
+    {
+        if input.get("coinbase").is_none() && outpoint(&input["txid"], &input["vout"])? == *target {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn mempool_ids(value: Value) -> Result<BTreeSet<String>, String> {
@@ -292,6 +361,7 @@ fn apply_transactions<'a>(
     coins: &mut Coins,
     transactions: impl Iterator<Item = &'a Value>,
     scripts: &BTreeSet<String>,
+    height: u32,
 ) -> Result<(), String> {
     let mut spent = BTreeSet::new();
     let mut added = Coins::new();
@@ -317,7 +387,7 @@ fn apply_transactions<'a>(
                 .ok_or("node output has no script")?;
             if scripts.contains(&script.to_ascii_lowercase()) {
                 let key = outpoint(&Value::String(txid.clone()), &output["n"])?;
-                let value = coin(&key, script, &output["value"], &output["tokenData"])?;
+                let value = coin(&key, script, &output["value"], &output["tokenData"], height)?;
                 if added.insert(key, value).is_some() {
                     return Err("node transaction repeats an output".into());
                 }
@@ -447,6 +517,29 @@ mod tests {
         assert_eq!(index.confirmed[&(id(3), 1)]["value"], 9000);
         assert!(!index.confirmed.contains_key(&(id(1), 0)));
         assert!(index.mempool.is_empty());
+    }
+
+    // #### PR #65
+    #[test]
+    fn coins_carry_their_confirmation_height_like_fulcrum() {
+        let mut index = Index::default();
+        let funding = tx(8, 7, 0, vec![output(0, SCRIPT, "0.00001000", Value::Null)]);
+        update(
+            &mut index,
+            tip(100, 10),
+            scan(),
+            vec![funding.clone()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(index.view[&(id(1), 0)]["height"], 100);
+        assert_eq!(index.view[&(id(8), 0)]["height"], 0);
+        let block = json!({"hash":id(11),"height":101,"previousblockhash":id(10),"tx":[funding]});
+        update(&mut index, tip(101, 11), scan(), vec![], Some(block)).unwrap();
+        assert_eq!(index.view[&(id(8), 0)]["height"], 101);
+        assert_eq!(index.view[&(id(1), 0)]["height"], 100);
+        assert!(spends(&tx(3, 1, 0, vec![]), &(id(1), 0)).unwrap());
+        assert!(!spends(&tx(3, 1, 1, vec![]), &(id(1), 0)).unwrap());
     }
 
     #[test]

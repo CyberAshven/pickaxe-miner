@@ -380,21 +380,33 @@ P2Pool constructs its exact PPLNS coinbase using the allocated token's anchor
 and the selected block's difficulty and fee revenue. Pickaxe preserves its own
 transaction set and merkle branch, checks the returned revenue, header layout,
 12-byte extranonce and reserved auxiliary commitment, and submits standard SV2
-Job Declaration messages. The pool's independent validation must acknowledge
-both beneficiary jobs before devices use them. Each preparation has a distinct
-publication ID so a late share retains the job and coinbase it actually hashed.
-An accepted same-parent job can continue during refresh only for its original
-freshness lease. Reconnecting either beneficiary revokes readiness.
-Personal and donation declarations enter their queues through one shared
-admission gate. If either queue is full or disconnected, neither event reaches
-the pool, the publication ID is not consumed, and fresh accepted work retains
-only its original lease while the failed refresh retries.
+Job Declaration messages. Each beneficiary's job is used only after the pool's
+independent validation acknowledged it on that beneficiary's own session. Each
+preparation has a distinct publication ID so a late share retains the job and
+coinbase it actually hashed. An accepted same-parent job can continue during
+refresh only for its original freshness lease. Reconnecting the personal
+session revokes all readiness; reconnecting the donation session revokes only
+donation readiness. Personal and donation declarations enter their queues
+through one shared admission gate; if the donation's queue refuses the pair,
+the miner's own declaration goes alone, and if the personal queue refuses it,
+neither event reaches the pool and the publication ID is not consumed.
+
+Preparation runs off the thread that submits found blocks. Each helper request
+has one 2-second deadline for the name lookup, connection, TLS and every read.
+A failed preparation is offered again after 0.5, 1, 2, then every 5 seconds.
+While a new job waits for preparation or for the pool's acknowledgement,
+devices stay connected (keeping accepted same-parent work, or idle) until it is
+accepted or its lease ends; they never receive pool-selected transactions.
 
 As for other remote pools, the configured BCH donation is allocated as validated
 mining work on a separately authorized donation channel. It never deducts from
 other PPLNS participants' coinbase outputs. Both channels use the miner's own
 transaction selection. Block-only and late shares keep their original recipient.
 P2Pool's own operator cuts, when configured, are independent of this allocation.
+At 0% no donation session is started, and no donation token or helper call is
+spent. While the donation session is down or its preparation fails, the miner's
+own work continues and donation work pauses without accruing a debt, so the
+configured share holds whenever both sessions are up.
 
 The Chipnet interoperability check used a separate P2Pool process and Start9
 BCHN: Full-Template and Coinbase-only custom jobs were accepted for both

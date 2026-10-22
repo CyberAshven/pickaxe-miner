@@ -141,6 +141,9 @@ pub fn run_miners(
     let mut show_pot = false;
     let mut paused = false;
     let mut last_draw = Instant::now() - DRAW_INTERVAL;
+    // Only a finished B request opens profiles; q, Ctrl+C or a signal while
+    // pending rewards settle still quit.
+    let mut to_profiles = false;
     while !finished() {
         let snapshots: Vec<_> = miners.runtimes.iter().map(|(_, r)| r.snapshot()).collect();
         for (i, (token, runtime)) in miners.runtimes.iter().enumerate() {
@@ -166,6 +169,7 @@ pub fn run_miners(
                 e.pending || e.withdrawal.phase == crate::electric::withdrawal::Phase::Sending
             });
         if state.profiles_ready(pending, Instant::now()) {
+            to_profiles = true;
             break;
         }
         let tokens: Vec<_> = match miners.split {
@@ -281,7 +285,7 @@ pub fn run_miners(
         show_pot = tokens.show_pot;
         paused = tokens.paused;
     }
-    if state.profiles_requested {
+    if to_profiles && !finished() {
         crate::session_control::request_profiles();
     }
     Ok(())

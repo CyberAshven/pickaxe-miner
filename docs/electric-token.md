@@ -180,7 +180,21 @@ pickaxe --address YOUR_RECEIVING_ADDRESS electric mine --owner-pot
 pickaxe --address YOUR_RECEIVING_ADDRESS split --share photon=80 --share electric=20 --owner-electric-pot
 ```
 
-These flags are explicit: existing startup commands retain the previous pot.
+These flags are explicit. Startup commands without a pot flag
+(`--restricted-pot`, `--legacy-pot`, `--owner-pot`, `--signed-pot`, or
+`--restricted-electric-pot`, `--owner-electric-pot`, `--signed-electric-pot`
+for `split`) and without an explicitly saved choice use the signed-claim pot,
+except for an existing user's previous funded pot: while the signed-claim pot
+cannot pay a claim and the previous restricted pot with the same recovery key
+can, `electric mine`, `electric status`, `split` and the setup use that previous
+pot and say "mining the previous funded pot until it is migrated". The setup's
+fee-pot panel, QR code and balance then show the previous pot. Once it can no
+longer pay a claim, mining moves to the signed-claim pot by itself. `electric
+refund` without a flag refunds the previous pot while the signed-claim pot holds
+nothing. A new user, with no recovery key yet, always gets the signed-claim pot.
+`--signed-pot` (or `--signed-electric-pot`) keeps the signed-claim pot even
+while the previous one is funded, and is remembered for a profile; a profile
+saved earlier with the default is still treated as the default.
 The owner pot uses its own key file and funding address. Its claims remain
 signed and keep the same recipient, change and fee constraints. Its refund
 branch allows a chosen destination only with the committed owner's signature;
@@ -194,16 +208,28 @@ destination, press **Enter** to preview the total amount, fee and transaction
 count, then **Y** to send after the quote is displayed. Holding or repeating
 Enter cannot confirm a transfer. **Esc** cancels an unapproved quote.
 Addresses are checked against the session's network. A quote expires after
-60 seconds and is invalidated if coins change or the relay fee rises. Max
-sends each pot coin separately, each within the covenant fee cap; an
-uneconomic coin prevents the whole quote rather than silently burning it.
+60 seconds and is invalidated if coins change or the relay fee rises. Quotes
+include confirmed pot coins only; the preview says how many unconfirmed sats
+wait for a confirmation. Max sends each pot coin separately, each within the
+covenant fee cap; an uneconomic coin prevents the whole quote rather than
+silently burning it. An expired or changed quote does not drop the server
+connection.
 This transfers plain BCH from the pot, not token rewards from the payout wallet.
 
 The supervisor finishes any pending reward claim before quoting, then holds
 ELECTRIC's pot while editing or sending; PHOTON can continue. Exact approved
 transfers are saved privately before broadcast, restored after restart and
-counted as propagated only after fetching identical transaction bytes. A
-timeout or conflicting spend retains the journal and keeps its inputs reserved.
+counted as propagated only after fetching identical transaction bytes (or
+finding that exact transaction in a block). A timeout, an unconfirmed
+conflicting spend or an input the server cannot account for retains the journal
+and keeps its inputs reserved, since the approved transfer might still confirm.
+Two cases release the pot instead: another transaction that spends the
+transfer's input confirms (the journal is kept, renamed `*.superseded.json`),
+or the network refuses the transfer's fee while none of the unsent transfers is
+in the mempool or chain (renamed `*.abandoned.json`). Earlier transfers that
+already propagated stay sent. Mining and refunds then resume, and moving the
+rest needs a fresh quote and **Y**. `electric refund` settles a send this way
+without broadcasting it, and otherwise still asks for the TUI to finish it.
 Approved transfers cannot be cancelled by closing the panel. The same pot's
 claim and refund commands take an OS lock. New owner pots share one journal
 location per OS account and pot identity, even across different config folders;
@@ -225,10 +251,12 @@ shape, change to the same pot and the maximum fee. Pending signed claims are
 saved before broadcast and rebuilt with the same key on recovery.
 
 **Existing funded pots:** their scripts and addresses cannot change in place.
-The same recovery-key file is reused; it is never replaced. `electric status
---restricted-pot` and `electric refund --restricted-pot` select the previous
-owner-recoverable pot. Refunds still return BCH only to the original payout
-wallet. Use that wallet to fund the new signed pot shown in setup or by
+The same recovery-key file is reused; it is never replaced. Without a pot flag
+or saved choice, a previous pot that still pays claims keeps being mined until
+it is migrated (see the owner-pot section above). `electric status
+--restricted-pot` and `electric refund --restricted-pot` always select the
+previous owner-recoverable pot. Refunds still return BCH only to the original
+payout wallet. Use that wallet to fund the new signed pot shown in setup or by
 `electric pot`. Review the refund transaction preview before
 adding `--broadcast`. Pickaxe never moves these funds automatically or imports
 the payout wallet's key. `--legacy-pot` continues to select the oldest pot

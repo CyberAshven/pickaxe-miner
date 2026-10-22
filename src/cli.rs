@@ -185,6 +185,10 @@ pub enum Commands {
         /// New owner-controlled pot with Max/send; old funded pots remain separate.
         #[arg(long, conflicts_with = "restricted_electric_pot")]
         owner_electric_pot: bool,
+        /// #### PR #65: the signed-claim ELECTRIC pot even while a previous
+        /// funded pot with the same key could still be mined.
+        #[arg(long, conflicts_with_all = ["restricted_electric_pot", "owner_electric_pot"])]
+        signed_electric_pot: bool,
     },
     /// #### PR #53
     /// BCH P2Pool as a dependency Pickaxe installs from P2Pool's releases,
@@ -326,6 +330,11 @@ pub struct ElectricDeploymentArgs {
     /// valid BCH address. This does not migrate funds from previous pots.
     #[arg(long, conflicts_with_all = ["legacy_pot", "restricted_pot"])]
     pub owner_pot: bool,
+    /// #### PR #65: the signed-claim pot even while the previous funded pot
+    /// with the same key could still be mined (the default mines that one
+    /// until it is migrated).
+    #[arg(long, conflicts_with_all = ["legacy_pot", "restricted_pot", "owner_pot"])]
+    pub signed_pot: bool,
     /// The deployment's token category ID.
     #[arg(long, value_name = "HEX")]
     pub electric_category: Option<String>,
@@ -1447,6 +1456,38 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["pickaxe", "stratum-v2", "check-node", "--chipnet"]).is_ok());
+    }
+
+    // #### PR #65
+    #[test]
+    fn the_signed_pot_can_be_chosen_explicitly_but_not_with_another_pot() {
+        assert!(Cli::try_parse_from(["pickaxe", "electric", "mine", "--signed-pot"]).is_ok());
+        assert!(Cli::try_parse_from(["pickaxe", "electric", "refund", "--signed-pot"]).is_ok());
+        for other in ["--restricted-pot", "--owner-pot", "--legacy-pot"] {
+            assert!(
+                Cli::try_parse_from(["pickaxe", "electric", "mine", "--signed-pot", other])
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "split",
+            "--share",
+            "electric=100",
+            "--signed-electric-pot"
+        ])
+        .is_ok());
+        for other in ["--restricted-electric-pot", "--owner-electric-pot"] {
+            assert!(Cli::try_parse_from([
+                "pickaxe",
+                "split",
+                "--share",
+                "electric=100",
+                "--signed-electric-pot",
+                other
+            ])
+            .is_err());
+        }
     }
 
     #[test]

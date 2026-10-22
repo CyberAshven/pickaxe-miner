@@ -51,7 +51,16 @@ pub fn run(
         ElectricCommand::Pot { deployment } => {
             let args = deployment;
             let deployment = select(cfg, args)?;
-            let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, true)?;
+            let choice = pot_choice(cfg, &deployment, args, config_path, true)?;
+            if choice.previous.is_some() {
+                println!("Until it is migrated, Pickaxe keeps mining the previous funded pot with this recovery key while the pot below cannot pay a claim; `pickaxe electric status` shows which pot is mined.");
+            }
+            let Choice {
+                pot,
+                addresses,
+                key_path,
+                ..
+            } = choice;
             if pot.owner_destination {
                 println!("Owner-controlled pot: its saved key controls Max/send to a chosen BCH address. This is a separate new pot; old pot funds are not moved.");
             }
@@ -83,12 +92,19 @@ pub fn run(
         ElectricCommand::Status { deployment } => {
             let args = deployment;
             let deployment = select(cfg, args)?;
-            let pot = if cfg.payout_address.trim().is_empty() {
+            let choice = if cfg.payout_address.trim().is_empty() {
                 None
             } else {
-                Some(pot_for(cfg, &deployment, args, config_path, false)?.0)
+                Some(pot_choice(cfg, &deployment, args, config_path, false)?)
             };
-            let mut session = connect(cfg, Some(&deployment), pot.as_ref())?;
+            let pots = choice.as_ref().map(Choice::pots).unwrap_or_default();
+            let mut session = connect_pots(cfg, Some(&deployment), &pots)?;
+            // #### PR #65: the pot mining would use.
+            let read = choice
+                .as_ref()
+                .map(|choice| read_choice(&mut session, choice, false))
+                .transpose()?;
+            let previous = read.as_ref().is_some_and(|read| read.previous);
             let tip = read_tip(&mut session)?;
             let baton = read_baton(&mut session, &deployment)?;
             println!("server:     {}", session.url);
@@ -97,17 +113,29 @@ pub fn run(
                 &deployment,
                 &baton,
                 tip,
-                args.restricted_pot || args.legacy_pot,
+                args.restricted_pot || args.legacy_pot || previous,
             );
-            if let Some(pot) = pot {
-                let coins = read_pot(&mut session, &pot)?;
+            if let (Some(choice), Some(read)) = (&choice, &read) {
+                let pot = choice.chosen(read.previous);
                 println!(
                     "pot:        {} ({} sats in {} coin{})",
                     pot.address(),
-                    coins.iter().map(|coin| coin.value).sum::<u64>(),
-                    coins.len(),
-                    if coins.len() == 1 { "" } else { "s" }
+                    read.coins.iter().map(|coin| coin.value).sum::<u64>(),
+                    read.coins.len(),
+                    if read.coins.len() == 1 { "" } else { "s" }
                 );
+                if read.previous {
+                    println!(
+                        "note:       {PREVIOUS_POT}; the signed-claim pot {} cannot pay a claim yet",
+                        choice.pot.address()
+                    );
+                } else if let (Some(old), false) = (&choice.previous, read.other.is_empty()) {
+                    println!(
+                        "previous:   {} ({} sats; select --restricted-pot to refund it)",
+                        old.address(),
+                        read.other.iter().map(|coin| coin.value).sum::<u64>()
+                    );
+                }
             }
             Ok(())
         }
@@ -117,21 +145,34 @@ pub fn run(
         } => {
             let args = deployment;
             let deployment = select(cfg, args)?;
-            let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, false)?;
-            let key = key_path
+            let choice = pot_choice(cfg, &deployment, args, config_path, false)?;
+            let addresses = &choice.addresses;
+            let key = choice
+                .key_path
                 .as_deref()
                 .map(|path| RecoveryKey::load(path, false))
                 .transpose()?;
-            let journal_path = claim_journal_path(cfg, &pot, config_path)?;
+            let mut session = connect_pots(cfg, Some(&deployment), &choice.pots())?;
+            // #### PR #65: with no pot chosen, an empty signed-claim pot
+            // refunds the previous funded pot instead.
+            let read = read_choice(&mut session, &choice, true)?;
+            let pot = choice.chosen(read.previous);
+            if read.previous {
+                println!(
+                    "The signed-claim pot {} holds nothing; refunding the previous funded pot ({PREVIOUS_POT}).",
+                    choice.pot.address()
+                );
+            }
+            let journal_path = claim_journal_path(cfg, pot, config_path)?;
             let _pot_lock = super::withdrawal::lock(&journal_path)?;
             let mut pkhs = [[0u8; 20]; 3];
-            for (pkh, address) in pkhs.iter_mut().zip(&addresses) {
+            for (pkh, address) in pkhs.iter_mut().zip(addresses) {
                 pkh.copy_from_slice(&crate::tx::cashaddr_to_p2pkh_locking(address)?[3..23]);
             }
             if super::pending::Journal::open_with_key(
                 &journal_path,
                 &deployment,
-                &pot,
+                pot,
                 &pkhs,
                 key.as_ref().map(RecoveryKey::secret),
             )?
@@ -140,24 +181,41 @@ pub fn run(
             {
                 return Err("recover the pending ELECTRIC claim before refunding its pot".into());
             }
-            let sends = super::withdrawal::Transfers::open(
+            let mut sends = super::withdrawal::Transfers::open(
                 &journal_path.with_extension("send.json"),
-                &pot,
+                pot,
                 key.as_ref(),
             )?;
             if sends.active() {
-                return Err("recover the approved Max/send in the TUI before refunding".into());
+                // #### PR #65: a send that propagated or can never confirm
+                // no longer holds the pot; this never broadcasts it.
+                let mut link = WithdrawalLink {
+                    session: &mut session,
+                    pot,
+                };
+                match sends.settle(&mut link) {
+                    Ok(Some(message)) => println!("{message}"),
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "{}; recover the approved Max/send in the TUI before refunding",
+                            error.message
+                        ))
+                    }
+                }
+                if sends.active() {
+                    return Err("recover the approved Max/send in the TUI before refunding".into());
+                }
             }
             let refund_lock = crate::tx::cashaddr_to_p2pkh_locking(&addresses[0])?;
-            let mut session = connect(cfg, Some(&deployment), Some(&pot))?;
             let fee = read_relay_fee(&mut session)?;
-            let coins = read_pot(&mut session, &pot)?;
+            let coins = read_pot(&mut session, pot)?;
             if coins.is_empty() {
                 println!("The pot {} holds nothing.", pot.address());
             }
             for coin in coins {
                 let refund = build_refund(
-                    &pot,
+                    pot,
                     &coin,
                     &refund_lock,
                     fee,
@@ -180,6 +238,15 @@ pub fn run(
             }
             if !broadcast {
                 println!("Nothing was sent; add --broadcast to send these.");
+            }
+            if let (Some(old), false, false) =
+                (&choice.previous, read.previous, read.other.is_empty())
+            {
+                println!(
+                    "The previous pot {} also holds {} sats; add --restricted-pot to refund it.",
+                    old.address(),
+                    read.other.iter().map(|coin| coin.value).sum::<u64>()
+                );
             }
             Ok(())
         }
@@ -304,40 +371,32 @@ fn session(
         options.plain || !std::io::stdout().is_terminal(),
         device_names(devices),
     );
-    let mut ready = prepare(
-        cfg,
-        args,
-        devices,
-        config_path,
-        options.create_key,
-        &monitor,
-    )?;
+    let mut ready = prepare(cfg, args, devices, config_path, options.create_key)?;
     let result = super::ui::run(&monitor, devices, cfg.network, || {
-        mine(
+        mine_choice(
             cfg,
-            &ready.deployment,
-            &mut ready.engines,
+            &mut ready,
+            config_path,
             options.max_difficulty,
             options.dry_run,
             options.once,
-            &ready.pot,
-            &ready.addresses,
-            &ready.journal_path,
-            ready.claim_key.as_ref(),
             &monitor,
         )
     });
     if crate::session_control::profiles_requested() {
         let mut final_cfg = cfg.clone();
+        // #### PR #65: a pot flag is an explicit choice.
         if args.owner_pot {
-            final_cfg.electric_pot_mode = crate::config::ElectricPotMode::Owner;
+            final_cfg.choose_electric_pot(Some(crate::config::ElectricPotMode::Owner));
         } else if args.restricted_pot {
-            final_cfg.electric_pot_mode = crate::config::ElectricPotMode::Restricted;
+            final_cfg.choose_electric_pot(Some(crate::config::ElectricPotMode::Restricted));
+        } else if args.signed_pot {
+            final_cfg.choose_electric_pot(Some(crate::config::ElectricPotMode::Signed));
         }
         if let Some(value) = monitor.summary().donation {
             final_cfg.token_donations.insert("ELECTRIC".into(), value);
         }
-        crate::tui::remember_token_session(&final_cfg, devices, config_path, Vec::new(), true)?;
+        crate::tui::remember_token_session(&final_cfg, devices, config_path, Vec::new(), true);
     }
     result
 }
@@ -351,15 +410,12 @@ pub fn device_names(devices: &[crate::backend::GpuDevice]) -> String {
         .join(", ")
 }
 
-/// A session ready to mine: the deployment, its pot, the GPU engines and
-/// the pending-claim journal's path.
+/// A session ready to mine: the deployment, its pot choice and the GPU
+/// engines. Which pot mines is settled once the source answers.
 struct Ready {
     deployment: Deployment,
-    pot: Pot,
-    addresses: [String; 3],
+    choice: Choice,
     engines: Vec<super::gpu::Engine>,
-    journal_path: PathBuf,
-    claim_key: Option<RecoveryKey>,
 }
 
 fn prepare(
@@ -368,37 +424,127 @@ fn prepare(
     devices: &[crate::backend::GpuDevice],
     config_path: &Path,
     create_key: bool,
-    monitor: &super::ui::Monitor,
 ) -> Result<Ready, String> {
     let deployment = select(cfg, args)?;
-    let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, create_key)?;
-    let claim_key = if pot.authorized_claims {
-        Some(RecoveryKey::load(
-            key_path.as_deref().ok_or("pot claim key unavailable")?,
+    let choice = pot_choice(cfg, &deployment, args, config_path, create_key)?;
+    if choice.pot.authorized_claims {
+        RecoveryKey::load(
+            choice
+                .key_path
+                .as_deref()
+                .ok_or("pot claim key unavailable")?,
             false,
-        )?)
-    } else {
-        None
-    };
+        )?;
+    }
     let engines = devices
         .iter()
         .map(super::gpu::Engine::new)
         .collect::<Result<Vec<_>, _>>()?;
-    monitor.set_pot(&pot.address(), key_path.as_deref());
-    monitor
-        .withdrawal
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .enabled = pot.owner_destination;
-    let journal_path = claim_journal_path(cfg, &pot, config_path)?;
     Ok(Ready {
         deployment,
-        pot,
-        addresses,
+        choice,
         engines,
-        journal_path,
-        claim_key,
     })
+}
+
+/// #### PR #65: what `pot_choice` mines while no pot was chosen: the
+/// previous restricted pot with the same recovery key while it alone can pay
+/// a claim, and after it can no longer pay one, the signed-claim pot.
+fn mine_choice(
+    cfg: &RuntimeConfig,
+    ready: &mut Ready,
+    config_path: &Path,
+    max_difficulty: u8,
+    dry_run: bool,
+    once: bool,
+    monitor: &super::ui::Monitor,
+) -> Result<(), String> {
+    loop {
+        // A claim saved on either pot is recovered on that pot before the
+        // balances decide; a journal whose claim settled holds none.
+        let pending = |pot: &Pot| {
+            claim_journal_path(cfg, pot, config_path)
+                .is_ok_and(|path| super::pending::holds_claim(&path))
+        };
+        let previous = match ready.choice.previous.as_ref() {
+            Some(previous) if pending(previous) => true,
+            Some(_) if pending(&ready.choice.pot) => false,
+            Some(_) => match choose_previous(cfg, &ready.choice, monitor) {
+                Some(previous) => previous,
+                None => return Ok(()),
+            },
+            None => false,
+        };
+        let pot = ready.choice.chosen(previous).clone();
+        monitor.set_pot(&pot.address(), ready.choice.key_path.as_deref());
+        monitor
+            .withdrawal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enabled = pot.owner_destination;
+        if previous {
+            monitor.event(format!(
+                "Mining the previous funded pot until it is migrated; the signed-claim pot {} \
+                 takes over once this one cannot pay a claim.",
+                ready.choice.pot.address()
+            ));
+        }
+        let claim_key = if pot.authorized_claims {
+            Some(RecoveryKey::load(
+                ready
+                    .choice
+                    .key_path
+                    .as_deref()
+                    .ok_or("pot claim key unavailable")?,
+                false,
+            )?)
+        } else {
+            None
+        };
+        let journal_path = claim_journal_path(cfg, &pot, config_path)?;
+        let ended = mine(
+            cfg,
+            &ready.deployment,
+            &mut ready.engines,
+            max_difficulty,
+            dry_run,
+            once,
+            &pot,
+            &ready.choice.addresses,
+            &journal_path,
+            claim_key.as_ref(),
+            previous,
+            monitor,
+        )?;
+        if ended != Ended::Drained {
+            return Ok(());
+        }
+        monitor.event(
+            "The previous funded pot can no longer pay a claim; choosing the fee pot again.",
+        );
+    }
+}
+
+/// Whether mining uses the previous pot, read as soon as the source answers;
+/// `None` once the session stops.
+fn choose_previous(
+    cfg: &RuntimeConfig,
+    choice: &Choice,
+    monitor: &super::ui::Monitor,
+) -> Option<bool> {
+    while !monitor.stopped() {
+        match connect_pots(cfg, None, &choice.pots())
+            .and_then(|mut session| read_choice(&mut session, choice, false))
+        {
+            Ok(read) => return Some(read.previous),
+            Err(error) => {
+                monitor.state("Reconnecting");
+                monitor.event(format!("Source: {error}"));
+                monitor.wait(IDLE_POLL);
+            }
+        }
+    }
+    None
 }
 
 fn claim_journal_path(
@@ -444,35 +590,54 @@ pub fn run_in_split_with_pot_mode(
         owner_pot,
         ..Default::default()
     };
-    let mut ready = prepare(cfg, &args, &devices, config_path, true, monitor)?;
-    mine(
+    let mut ready = prepare(cfg, &args, &devices, config_path, true)?;
+    mine_choice(
         cfg,
-        &ready.deployment,
-        &mut ready.engines,
+        &mut ready,
+        config_path,
         MAX_SEARCH_DIFFICULTY,
         false,
         false,
-        &ready.pot,
-        &ready.addresses,
-        &ready.journal_path,
-        ready.claim_key.as_ref(),
         monitor,
     )
 }
 
 /// #### PR #53: what the setup's fee pot holds now, in plain-BCH sats, and
 /// the claims that pays at the current relay fee, read through BCHN or Fulcrum.
+/// #### PR #65: of the pot mining will use.
 pub fn pot_balance(cfg: &RuntimeConfig, config_path: &Path) -> Result<(u64, u64), String> {
+    pot_reading(cfg, config_path).map(|(balance, _)| balance)
+}
+
+/// #### PR #65: the balance of the pot mining will use, and that pot's
+/// address when it is the previous funded pot instead of the signed-claim pot.
+pub fn pot_reading(
+    cfg: &RuntimeConfig,
+    config_path: &Path,
+) -> Result<((u64, u64), Option<String>), String> {
     let args = ElectricDeploymentArgs::default();
     let deployment = select(cfg, &args)?;
-    let (pot, _, _) = pot_for(cfg, &deployment, &args, config_path, false)?;
-    let mut session = connect(cfg, None, Some(&pot))?;
-    let relay_fee = read_relay_fee(&mut session)?;
-    let coins = read_pot(&mut session, &pot)?;
+    let choice = pot_choice(cfg, &deployment, &args, config_path, false)?;
+    let mut session = connect_pots(cfg, None, &choice.pots())?;
+    let read = read_choice(&mut session, &choice, false)?;
     Ok((
-        coins.iter().map(|coin| coin.value).sum(),
-        claims_paid(&coins, relay_fee),
+        (
+            read.coins.iter().map(|coin| coin.value).sum(),
+            claims_paid(&read.coins, read.relay_fee),
+        ),
+        read.previous.then(|| choice.chosen(true).address()),
     ))
+}
+
+/// #### PR #65: whether the setup's pot could be an existing user's previous
+/// funded pot: no pot was chosen and the recovery key already exists.
+pub fn previous_pot_possible(cfg: &RuntimeConfig, config_path: &Path) -> bool {
+    let args = ElectricDeploymentArgs::default();
+    cfg.electric_pot_choice().is_none()
+        && select(cfg, &args)
+            .and_then(|deployment| recipients(cfg, &deployment).map(|r| (deployment, r)))
+            .and_then(|(deployment, (_, locks))| Pot::new(&deployment, &locks))
+            .is_ok_and(|legacy| key_file(cfg, &legacy, false, &args, config_path).exists())
 }
 
 /// The setup's ELECTRIC choice: mine the network's deployment on the chosen
@@ -534,52 +699,208 @@ fn pot_for(
     config_path: &Path,
     create: bool,
 ) -> Result<(Pot, [String; 3], Option<PathBuf>), String> {
+    pot_choice(cfg, deployment, args, config_path, create)
+        .map(|choice| (choice.pot, choice.addresses, choice.key_path))
+}
+
+/// #### PR #65: `pot_for`'s pot and, while no pot was chosen (no pot flag
+/// and no explicit saved choice), the previous restricted pot with the same
+/// recovery key, which an existing user may still have funded.
+struct Choice {
+    pot: Pot,
+    addresses: [String; 3],
+    key_path: Option<PathBuf>,
+    previous: Option<Pot>,
+}
+
+impl Choice {
+    fn pots(&self) -> Vec<&Pot> {
+        std::iter::once(&self.pot)
+            .chain(self.previous.as_ref())
+            .collect()
+    }
+
+    fn chosen(&self, previous: bool) -> &Pot {
+        match &self.previous {
+            Some(old) if previous => old,
+            _ => &self.pot,
+        }
+    }
+}
+
+/// Shown wherever the previous funded pot is used instead of the signed one.
+const PREVIOUS_POT: &str = "mining the previous funded pot until it is migrated";
+
+/// The recipients' addresses and P2PKH locking bytecodes.
+fn recipients(
+    cfg: &RuntimeConfig,
+    deployment: &Deployment,
+) -> Result<([String; 3], [Vec<u8>; 3]), String> {
     if cfg.payout_address.trim().is_empty() {
         return Err("set a payout address with --address (a P2PKH CashAddr)".into());
     }
     let payout = crate::config::validate_payout_address(cfg.network, &cfg.payout_address)?;
     let addresses = deployment
-        .donation_policy(cfg.token_donation)
+        .donation_policy(electric_donation(cfg))
         .payouts(cfg.network, &payout)?;
     let mut locks = Vec::with_capacity(3);
     for address in &addresses {
         locks.push(crate::tx::cashaddr_to_p2pkh_locking(address)?);
     }
     let locks: [Vec<u8>; 3] = locks.try_into().map_err(|_| "three recipients")?;
-    let legacy = Pot::new(deployment, &locks)?;
-    if args.legacy_pot {
-        return Ok((legacy, addresses, None));
-    }
-    let owner_pot = args.owner_pot
-        || (!args.restricted_pot && cfg.electric_pot_mode == crate::config::ElectricPotMode::Owner);
-    let restricted_pot = args.restricted_pot
-        || (!args.owner_pot && cfg.electric_pot_mode == crate::config::ElectricPotMode::Restricted);
-    let path = args.pot_key.clone().unwrap_or_else(|| {
+    Ok((addresses, locks))
+}
+
+/// The recovery key's file: given, or beside the configuration per network
+/// and pot version.
+fn key_file(
+    cfg: &RuntimeConfig,
+    legacy: &Pot,
+    owner_pot: bool,
+    args: &ElectricDeploymentArgs,
+    config_path: &Path,
+) -> PathBuf {
+    args.pot_key.clone().unwrap_or_else(|| {
         config_path.with_file_name(format!(
             "electric-{}-{}{}.pot-key",
             cfg.network.as_str(),
             if owner_pot { "owner-" } else { "" },
             hex::encode(crate::proof::hash256(&legacy.redeem))
         ))
-    });
-    let key = RecoveryKey::load(&path, create)?;
-    let pot = if owner_pot {
-        Pot::with_owner_destination(deployment, &locks, key.public())?
-    } else if restricted_pot {
-        Pot::with_recovery(deployment, &locks, Some(key.public()))?
+    })
+}
+
+fn pot_choice(
+    cfg: &RuntimeConfig,
+    deployment: &Deployment,
+    args: &ElectricDeploymentArgs,
+    config_path: &Path,
+    create: bool,
+) -> Result<Choice, String> {
+    use crate::config::ElectricPotMode;
+    let (addresses, locks) = recipients(cfg, deployment)?;
+    let legacy = Pot::new(deployment, &locks)?;
+    if args.legacy_pot {
+        return Ok(Choice {
+            pot: legacy,
+            addresses,
+            key_path: None,
+            previous: None,
+        });
+    }
+    let mode = if args.owner_pot {
+        Some(ElectricPotMode::Owner)
+    } else if args.restricted_pot {
+        Some(ElectricPotMode::Restricted)
+    } else if args.signed_pot {
+        Some(ElectricPotMode::Signed)
     } else {
-        Pot::with_authorized_claims(deployment, &locks, key.public())?
+        cfg.electric_pot_choice()
     };
-    Ok((pot, addresses, Some(path)))
+    let path = key_file(
+        cfg,
+        &legacy,
+        mode == Some(ElectricPotMode::Owner),
+        args,
+        config_path,
+    );
+    let key = RecoveryKey::load(&path, create)?;
+    let (pot, previous) = match mode {
+        Some(ElectricPotMode::Owner) => (
+            Pot::with_owner_destination(deployment, &locks, key.public())?,
+            None,
+        ),
+        Some(ElectricPotMode::Restricted) => (
+            Pot::with_recovery(deployment, &locks, Some(key.public()))?,
+            None,
+        ),
+        Some(ElectricPotMode::Signed) => (
+            Pot::with_authorized_claims(deployment, &locks, key.public())?,
+            None,
+        ),
+        None => (
+            Pot::with_authorized_claims(deployment, &locks, key.public())?,
+            Some(Pot::with_recovery(deployment, &locks, Some(key.public()))?),
+        ),
+    };
+    Ok(Choice {
+        pot,
+        addresses,
+        key_path: Some(path),
+        previous,
+    })
+}
+
+/// #### PR #65: what a choice's pots hold, and which one is used.
+struct PotRead {
+    /// The previous funded pot is used instead of the signed-claim pot.
+    previous: bool,
+    /// The used pot's coins.
+    coins: Vec<Coin>,
+    /// The other pot's coins (none without a previous pot).
+    other: Vec<Coin>,
+    relay_fee: u64,
+}
+
+fn read_choice(
+    session: &mut SourceSession,
+    choice: &Choice,
+    refund: bool,
+) -> Result<PotRead, String> {
+    let relay_fee = read_relay_fee(session)?;
+    let signed = read_pot(session, &choice.pot)?;
+    let old = match &choice.previous {
+        Some(old) => read_pot(session, old)?,
+        None => Vec::new(),
+    };
+    let previous = uses_previous(&signed, &old, relay_fee, refund);
+    let (coins, other) = if previous {
+        (old, signed)
+    } else {
+        (signed, old)
+    };
+    Ok(PotRead {
+        previous,
+        coins,
+        other,
+        relay_fee,
+    })
+}
+
+/// #### PR #65: an implicit choice uses the previous pot while the
+/// signed-claim pot cannot pay a claim and it can; a refund uses it while the
+/// signed-claim pot holds nothing and it holds BCH.
+fn uses_previous(signed: &[Coin], previous: &[Coin], relay_fee: u64, refund: bool) -> bool {
+    if refund {
+        signed.is_empty() && !previous.is_empty()
+    } else {
+        !pays_claim(signed, relay_fee) && pays_claim(previous, relay_fee)
+    }
+}
+
+/// The least one pot coin holds to pay a claim.
+fn claim_minimum(relay_fee: u64) -> u64 {
+    // A claim is about 800 bytes; a coin that cannot pay one is skipped.
+    TOKEN_OUTPUT_SATS + POT_MIN_CHANGE_SATS + relay_fee.max(1_000)
+}
+
+fn pays_claim(coins: &[Coin], relay_fee: u64) -> bool {
+    coins
+        .iter()
+        .any(|coin| coin.value >= claim_minimum(relay_fee))
+}
+
+/// #### PR #65: ELECTRIC's own saved donation, else the session's, for
+/// ELECTRIC alone and its share of a split.
+fn electric_donation(cfg: &RuntimeConfig) -> Option<crate::donation::TokenDonation> {
+    cfg.token_donations
+        .get("ELECTRIC")
+        .copied()
+        .or(cfg.token_donation)
 }
 
 fn print_deployment(cfg: &RuntimeConfig, deployment: &Deployment, addresses: &[String; 3]) {
-    let policy = deployment.donation_policy(
-        cfg.token_donations
-            .get("ELECTRIC")
-            .copied()
-            .or(cfg.token_donation),
-    );
+    let policy = deployment.donation_policy(electric_donation(cfg));
     println!("ELECTRIC on {}", cfg.network.as_str());
     println!("category:   {}", deployment.category_hex());
     println!(
@@ -638,10 +959,19 @@ fn connect(
     deployment: Option<&Deployment>,
     pot: Option<&Pot>,
 ) -> Result<SourceSession, String> {
+    connect_pots(cfg, deployment, &pot.into_iter().collect::<Vec<_>>())
+}
+
+/// #### PR #65: one source session watching several pots.
+fn connect_pots(
+    cfg: &RuntimeConfig,
+    deployment: Option<&Deployment>,
+    pots: &[&Pot],
+) -> Result<SourceSession, String> {
     let scripts: Vec<_> = deployment
         .map(Deployment::locking_bytecode)
         .into_iter()
-        .chain(pot.map(Pot::locking_bytecode))
+        .chain(pots.iter().map(|pot| pot.locking_bytecode()))
         .collect();
     SourceSession::connect(cfg, &scripts)
 }
@@ -708,15 +1038,25 @@ fn read_baton(session: &mut SourceSession, deployment: &Deployment) -> Result<Ba
 
 /// The pot's plain-BCH coins, largest first.
 fn read_pot(session: &mut SourceSession, pot: &Pot) -> Result<Vec<Coin>, String> {
+    Ok(read_pot_coins(session, pot)?
+        .into_iter()
+        .map(|(coin, _)| coin)
+        .collect())
+}
+
+/// #### PR #65: the pot's plain-BCH coins, largest first, and whether each
+/// is confirmed (a positive height, as both sources report it).
+fn read_pot_coins(session: &mut SourceSession, pot: &Pot) -> Result<Vec<(Coin, bool)>, String> {
     let mut coins = Vec::new();
     for item in unspent(session, &pot.locking_bytecode())? {
         if !item["token_data"].is_null() {
             continue;
         }
         let (txid, vout, value) = outpoint(&item)?;
-        coins.push(Coin { txid, vout, value });
+        let confirmed = item["height"].as_i64().is_some_and(|height| height > 0);
+        coins.push((Coin { txid, vout, value }, confirmed));
     }
-    coins.sort_by_key(|coin| std::cmp::Reverse(coin.value));
+    coins.sort_by_key(|(coin, _)| std::cmp::Reverse(coin.value));
     Ok(coins)
 }
 
@@ -725,11 +1065,20 @@ struct WithdrawalLink<'a> {
     pot: &'a Pot,
 }
 impl super::withdrawal::Link for WithdrawalLink<'_> {
-    fn coins(&mut self) -> Result<Vec<Coin>, String> {
-        read_pot(self.session, self.pot)
+    fn coins(&mut self) -> Result<Vec<(Coin, bool)>, String> {
+        read_pot_coins(self.session, self.pot)
     }
     fn relay_fee(&mut self) -> Result<u64, String> {
         read_relay_fee(self.session)
+    }
+    fn tip(&mut self) -> Result<u32, String> {
+        read_tip(self.session)
+    }
+    fn spender(&mut self, coin: &Coin) -> Result<super::withdrawal::Spender, String> {
+        self.session.spender(
+            &self.pot.locking_bytecode(),
+            &(coin.txid.to_ascii_lowercase(), coin.vout),
+        )
     }
     fn published(&mut self, txid: &str, raw: &str) -> Result<bool, String> {
         match self.session.transaction(txid) {
@@ -783,8 +1132,7 @@ fn snapshot(
     let tip = read_tip(session)?;
     let baton = read_baton(session, deployment)?;
     let relay_fee = read_relay_fee(session)?;
-    // A claim is about 800 bytes; a coin that cannot pay one is skipped.
-    let least = TOKEN_OUTPUT_SATS + POT_MIN_CHANGE_SATS + relay_fee.max(1_000);
+    let least = claim_minimum(relay_fee);
     let coins = read_pot(session, pot)?;
     let pot_sats = coins.iter().map(|coin| coin.value).sum();
     let pot_claims = claims_paid(&coins, relay_fee);
@@ -806,7 +1154,20 @@ fn recipient_name(recipient: Recipient) -> &'static str {
     }
 }
 
+/// How a mining run ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    Done,
+    /// #### PR #65: the previous funded pot kept failing to pay a claim.
+    Drained,
+}
+
+/// Snapshots in a row in which the previous pot pays no claim before the
+/// signed-claim pot takes over.
+const DRAINED_READS: u8 = 3;
+
 // #### PR #58: save completed proofs and exact claims before network submission.
+// #### PR #65: `previous` marks the previous funded pot, mined until it is migrated.
 #[allow(clippy::too_many_arguments)]
 fn mine(
     cfg: &RuntimeConfig,
@@ -819,8 +1180,9 @@ fn mine(
     addresses: &[String; 3],
     journal_path: &Path,
     claim_key: Option<&RecoveryKey>,
+    previous: bool,
     monitor: &super::ui::Monitor,
-) -> Result<(), String> {
+) -> Result<Ended, String> {
     use super::pending::{Journal, Pending, Prepared};
     let _pot_lock = super::withdrawal::lock(journal_path)?;
     let mut transfers = super::withdrawal::Transfers::open(
@@ -856,12 +1218,13 @@ fn mine(
     if dry_run {
         monitor.event("Dry run: no transactions will be sent.");
     }
-    let policy = deployment.donation_policy(cfg.token_donation);
+    let policy = deployment.donation_policy(electric_donation(cfg));
     let schedule = Mutex::new(Schedule::new(policy.scheme, SCHEDULE_UNIT, rand::random())?);
     monitor.set_donation_display(policy.scheme);
     let next_nonce = AtomicU64::new(rand::random());
     let mut session: Option<SourceSession> = None;
     let mut spent: Option<(String, u32)> = None;
+    let mut drained = 0;
     while !monitor.stopped() {
         let link = match session.as_mut() {
             Some(link) => link,
@@ -894,16 +1257,18 @@ fn mine(
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    let retry_snapshot = link.retry_snapshot(&error);
+                    // #### PR #65: an expired or changed quote, or a send
+                    // still waiting, is not a source failure.
+                    let reconnect = error.source && !link.retry_snapshot(&error.message);
                     monitor
                         .withdrawal
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .failure(error, transfers.active());
+                        .failure(error.message, transfers.active());
                     // Preserve a native watcher's confirmed/mempool cache on
                     // snapshot churn; stale state is never returned as work.
                     // Other failures retain the existing failover behavior.
-                    if !retry_snapshot {
+                    if reconnect {
                         session = None;
                     }
                     monitor.wait(BATON_POLL);
@@ -951,7 +1316,7 @@ fn mine(
                             recipient_name(pending.win.recipient)
                         ));
                         if once {
-                            return Ok(());
+                            return Ok(Ended::Done);
                         }
                         continue;
                     }
@@ -1034,6 +1399,14 @@ fn mine(
             continue;
         }
         let state = now.baton.state;
+        if now.coin.is_some() {
+            drained = 0;
+        } else if previous && !dry_run {
+            drained += 1;
+            if drained >= DRAINED_READS {
+                return Ok(Ended::Drained);
+            }
+        }
         if now.coin.is_none() && !dry_run {
             monitor.state(format!("Waiting for BCH in the fee pot {}", pot.address()));
             monitor.wait(IDLE_POLL);
@@ -1139,7 +1512,7 @@ fn mine(
             ));
             if dry_run {
                 if once {
-                    return Ok(());
+                    return Ok(Ended::Done);
                 }
             } else if !moved {
                 journal.save(Some(Pending {
@@ -1151,7 +1524,7 @@ fn mine(
             }
         }
     }
-    Ok(())
+    Ok(Ended::Done)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1255,6 +1628,190 @@ mod tests {
         assert!(
             claim_outcome(&competitor, &old, &won.txid, |_| Err("disconnected".into())).is_err()
         );
+    }
+
+    // #### PR #65
+    #[test]
+    fn electric_mines_its_own_saved_donation_alone_and_in_a_split() {
+        use crate::donation::TokenDonation;
+        let deployment = Deployment::mainnet();
+        let mut cfg = RuntimeConfig {
+            token_donation: Some(TokenDonation::from_bps(450)),
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(electric_donation(&cfg), cfg.token_donation);
+        cfg.token_donations
+            .insert("PHOTON".into(), TokenDonation::from_bps(500));
+        assert_eq!(electric_donation(&cfg), cfg.token_donation);
+        cfg.token_donations
+            .insert("ELECTRIC".into(), TokenDonation::from_bps(550));
+        assert_eq!(electric_donation(&cfg), Some(TokenDonation::from_bps(550)));
+        // `mine` builds its schedule from this, for ELECTRIC alone and for
+        // its share of a split, which passes the split's configuration.
+        let scheme = deployment.donation_policy(electric_donation(&cfg)).scheme;
+        assert_eq!(
+            scheme,
+            deployment
+                .donation_policy(Some(TokenDonation::from_bps(550)))
+                .scheme
+        );
+        assert_ne!(
+            scheme,
+            deployment.donation_policy(cfg.token_donation).scheme
+        );
+    }
+
+    #[test]
+    fn only_an_implicit_choice_offers_the_previous_pot_with_the_same_key() {
+        use crate::config::ElectricPotMode;
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-previous-pot-{:016x}",
+            rand::random::<u64>()
+        ));
+        let config = dir.join("config.json");
+        let mut cfg = RuntimeConfig {
+            payout_address: crate::tx::cashaddr_with_version(
+                0,
+                &[0x11; 20],
+                MiningNetwork::Mainnet,
+            ),
+            ..RuntimeConfig::default()
+        };
+        let deploy = Deployment::mainnet();
+        let args = ElectricDeploymentArgs::default();
+        // A new user has no key yet, so no previous pot can hold BCH.
+        assert!(!previous_pot_possible(&cfg, &config));
+        let choice = pot_choice(&cfg, &deploy, &args, &config, true).unwrap();
+        assert!(previous_pot_possible(&cfg, &config));
+        let restricted = ElectricDeploymentArgs {
+            restricted_pot: true,
+            ..Default::default()
+        };
+        let restricted = pot_for(&cfg, &deploy, &restricted, &config, false)
+            .unwrap()
+            .0;
+        assert!(choice.pot.authorized_claims && !choice.pot.owner_destination);
+        assert_eq!(choice.previous.as_ref(), Some(&restricted));
+        assert_eq!(choice.chosen(true), &restricted);
+        assert_eq!(choice.chosen(false), &choice.pot);
+        assert_eq!(choice.pots(), vec![&choice.pot, &restricted]);
+        for flag in [
+            ElectricDeploymentArgs {
+                signed_pot: true,
+                ..Default::default()
+            },
+            ElectricDeploymentArgs {
+                restricted_pot: true,
+                ..Default::default()
+            },
+            ElectricDeploymentArgs {
+                owner_pot: true,
+                ..Default::default()
+            },
+            ElectricDeploymentArgs {
+                legacy_pot: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(pot_choice(&cfg, &deploy, &flag, &config, true)
+                .unwrap()
+                .previous
+                .is_none());
+        }
+        // An explicitly saved signed choice stays on the signed pot.
+        cfg.choose_electric_pot(Some(ElectricPotMode::Signed));
+        let explicit = pot_choice(&cfg, &deploy, &args, &config, false).unwrap();
+        assert_eq!(explicit.pot, choice.pot);
+        assert!(explicit.previous.is_none() && !previous_pot_possible(&cfg, &config));
+        // `signed` saved by earlier builds without the marker is the default.
+        cfg.electric_pot_chosen = false;
+        assert!(pot_choice(&cfg, &deploy, &args, &config, false)
+            .unwrap()
+            .previous
+            .is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_previous_pot_is_used_only_while_it_alone_can_pay() {
+        let coin = |value| Coin {
+            txid: "11".repeat(32),
+            vout: 0,
+            value,
+        };
+        let fee = 2_000;
+        let least = claim_minimum(fee);
+        let (empty, dust, funded) = (Vec::new(), vec![coin(least - 1)], vec![coin(least)]);
+        assert!(uses_previous(&empty, &funded, fee, false));
+        assert!(uses_previous(&dust, &funded, fee, false));
+        assert!(!uses_previous(&funded, &funded, fee, false));
+        // A drained previous pot (change dust only) hands over.
+        assert!(!uses_previous(&empty, &dust, fee, false));
+        assert!(!uses_previous(&empty, &empty, fee, false));
+        // A refund takes any BCH, but only while the signed pot holds none.
+        assert!(uses_previous(&empty, &dust, fee, true));
+        assert!(!uses_previous(&dust, &funded, fee, true));
+        assert!(!uses_previous(&empty, &empty, fee, true));
+    }
+
+    #[test]
+    fn an_implicit_choice_reads_and_shows_the_previous_funded_pot_until_it_is_migrated() {
+        use crate::electric::source::tests::Node;
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-migrating-pot-{:016x}",
+            rand::random::<u64>()
+        ));
+        let config = dir.join("config.json");
+        let base = RuntimeConfig {
+            payout_address: crate::tx::cashaddr_with_version(
+                0,
+                &[0x11; 20],
+                MiningNetwork::Mainnet,
+            ),
+            ..RuntimeConfig::default()
+        };
+        let deploy = Deployment::mainnet();
+        let choice = pot_choice(
+            &base,
+            &deploy,
+            &ElectricDeploymentArgs::default(),
+            &config,
+            true,
+        )
+        .unwrap();
+        let previous = choice.previous.clone().unwrap();
+        // Only the previous pot holds BCH; the signed-claim pot is empty.
+        let scan = serde_json::json!({"success":true,"unspents":[{"txid":"22".repeat(32),
+            "vout":0,"scriptPubKey":hex::encode(previous.locking_bytecode()),
+            "amount":"0.00050000"}]});
+        let node = Node::start(MiningNetwork::Mainnet, scan, false);
+        let cfg = RuntimeConfig {
+            node_url: Some(node.url.clone()),
+            source: crate::config::JobSource::Node,
+            fulcrum_url: Some("wss://unreachable.invalid".into()),
+            ..base
+        };
+        let mut session = connect_pots(&cfg, None, &choice.pots()).unwrap();
+        let mining = read_choice(&mut session, &choice, false).unwrap();
+        assert!(mining.previous && mining.other.is_empty());
+        assert_eq!(mining.coins[0].value, 50_000);
+        assert!(read_choice(&mut session, &choice, true).unwrap().previous);
+        assert!(read_pot_coins(&mut session, &previous).unwrap()[0].1);
+        // The setup reads and shows the pot that mining uses.
+        let ((sats, claims), shown) = pot_reading(&cfg, &config).unwrap();
+        assert_eq!(sats, 50_000);
+        assert!(claims > 0);
+        assert_eq!(shown, Some(previous.address()));
+        assert_eq!(pot_balance(&cfg, &config).unwrap(), (sats, claims));
+        // The setup's offline pot stays the signed-claim pot for a new deposit.
+        assert_eq!(default_pot(&cfg, &config).unwrap().0, choice.pot.address());
+        assert!(!node
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == "sendrawtransaction"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

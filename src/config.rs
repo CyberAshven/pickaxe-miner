@@ -264,6 +264,10 @@ pub struct RuntimeConfig {
     /// Per-token start values kept in the compatible profile-choices sidecar.
     pub token_donations: std::collections::BTreeMap<String, crate::donation::TokenDonation>,
     pub electric_pot_mode: ElectricPotMode,
+    /// #### PR #65: `electric_pot_mode` was chosen by a flag or saved as an
+    /// explicit choice. `Signed` without it is only the default, which keeps
+    /// mining an existing user's previous funded pot until it is migrated.
+    pub electric_pot_chosen: bool,
     /// BCH ASIC policy only. Token policies are selected separately.
     pub bch_donation: crate::donation::bch::BchDonation,
     /// #### PR #32: the token donation a miner chose in Advanced settings;
@@ -301,6 +305,7 @@ impl Default for RuntimeConfig {
         Self {
             token_donations: Default::default(),
             electric_pot_mode: Default::default(),
+            electric_pot_chosen: false,
             bch_donation: Default::default(),
             token_donation: None,
             network: MiningNetwork::Mainnet,
@@ -364,6 +369,19 @@ pub fn parse_node_zmq(value: &str) -> Result<NodeZmq, String> {
 }
 
 impl RuntimeConfig {
+    /// #### PR #65: the explicitly chosen ELECTRIC pot mode, or `None` for the
+    /// default. Restricted and owner pots are only ever chosen explicitly.
+    pub fn electric_pot_choice(&self) -> Option<ElectricPotMode> {
+        (self.electric_pot_chosen || self.electric_pot_mode != ElectricPotMode::Signed)
+            .then_some(self.electric_pot_mode)
+    }
+
+    /// #### PR #65: records an explicit ELECTRIC pot choice, or the default.
+    pub fn choose_electric_pot(&mut self, mode: Option<ElectricPotMode>) {
+        self.electric_pot_mode = mode.unwrap_or_default();
+        self.electric_pot_chosen = mode.is_some();
+    }
+
     /// #### PR #32: the token donation in effect, never below the minimum.
     pub fn token_donation(&self) -> crate::donation::TokenDonation {
         let minimum = self.token.donation_minimum();

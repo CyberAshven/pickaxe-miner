@@ -33,10 +33,12 @@ pub fn client_config() -> Result<Arc<rustls::ClientConfig>, String> {
 }
 
 /// A TLS stream to `host` over `stream`, with its handshake done.
-pub fn connect(
+/// #### PR #65: over any stream, so a P2Pool preparation's handshake keeps
+/// its request's deadline.
+pub fn connect<S: std::io::Read + std::io::Write>(
     host: &str,
-    stream: TcpStream,
-) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
+    stream: S,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, S>, String> {
     let name = rustls::pki_types::ServerName::try_from(host.to_owned())
         .map_err(|_| format!("tls: {host} is not a server name"))?;
     let connection = rustls::ClientConnection::new(client_config()?, name)

@@ -6,14 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-struct Node {
-    url: String,
+pub(crate) struct Node {
+    pub url: String,
     stop: Arc<AtomicBool>,
-    requests: Arc<Mutex<Vec<String>>>,
+    pub requests: Arc<Mutex<Vec<String>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 impl Node {
-    fn start(network: MiningNetwork, scan: Value, wrong_chain: bool) -> Self {
+    pub fn start(network: MiningNetwork, scan: Value, wrong_chain: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!(
@@ -79,6 +79,12 @@ impl Node {
                     "getrawtransaction" => Value::Null,
                     "gettxout" => Value::Null,
                     "sendrawtransaction" => json!(txid),
+                    // #### PR #65: the tip block, whose one transaction
+                    // spends an output that no scan returns.
+                    "getblock" => json!({"hash":network.fork_block().1,
+                        "height":network.fork_block().0 + 100,"previousblockhash":null,
+                        "tx":[{"txid":"cd".repeat(32),"vin":[{"txid":"33".repeat(32),"vout":1}],
+                            "vout":[]}]}),
                     other => panic!("unexpected RPC {other}"),
                 };
                 let error = (method == "getrawtransaction" && result.is_null()).then(
@@ -178,6 +184,72 @@ fn node_only_adapter_reads_both_networks_and_shares_recovery_and_broadcast_trans
             1
         );
     }
+}
+
+// #### PR #65
+#[test]
+fn node_spender_tells_unspent_confirmed_and_unknown_outputs_apart() {
+    let scan = json!({"success":true,"unspents":[
+        {"txid":"22".repeat(32),"vout":0,"scriptPubKey":"52","amount":"0.00010000"}]});
+    let node = Node::start(MiningNetwork::Mainnet, scan, false);
+    let cfg = RuntimeConfig {
+        node_url: Some(node.url.clone()),
+        source: JobSource::Node,
+        fulcrum_url: Some("wss://unreachable.invalid".into()),
+        ..Default::default()
+    };
+    let mut session = Session::connect(&cfg, &[vec![0x52]]).unwrap();
+    // Scanned coins are confirmed, as Fulcrum's positive heights say.
+    assert!(
+        session.unspent(&[0x52]).unwrap()[0]["height"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        session.spender(&[0x52], &("22".repeat(32), 0)).unwrap(),
+        Spender::Unspent
+    );
+    assert_eq!(
+        session.spender(&[0x52], &("33".repeat(32), 1)).unwrap(),
+        Spender::Confirmed("cd".repeat(32))
+    );
+    assert_eq!(
+        session.spender(&[0x52], &("44".repeat(32), 0)).unwrap(),
+        Spender::Unknown
+    );
+    assert!(!node
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s == "sendrawtransaction"));
+}
+
+#[test]
+fn spent_outpoints_reads_every_input_of_a_serialized_transaction() {
+    let mut raw = 2u32.to_le_bytes().to_vec();
+    raw.push(2);
+    for (byte, vout, script) in [(0x11u8, 0u32, vec![0x51]), (0x22, 7, vec![0u8; 300])] {
+        raw.extend([byte; 32]);
+        raw.extend(vout.to_le_bytes());
+        if script.len() < 0xfd {
+            raw.push(script.len() as u8);
+        } else {
+            raw.push(0xfd);
+            raw.extend((script.len() as u16).to_le_bytes());
+        }
+        raw.extend(&script);
+        raw.extend(0xffff_ffffu32.to_le_bytes());
+    }
+    raw.push(0);
+    raw.extend(0u32.to_le_bytes());
+    assert_eq!(
+        spent_outpoints(&raw).unwrap(),
+        vec![("11".repeat(32), 0), ("22".repeat(32), 7)]
+    );
+    assert!(spent_outpoints(&raw[..60]).is_err());
+    assert!(spent_outpoints(&[2, 0, 0, 0, 0xff]).is_err());
 }
 
 #[test]

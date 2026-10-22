@@ -39,6 +39,20 @@ fn handle_signal(target: &StopTarget) {
     target.lock().unwrap_or_else(|e| e.into_inner()).signal();
 }
 
+/// The saved profile the running session was started from, so returning to
+/// profiles updates that profile and no other. `None` for a command-line start.
+static ACTIVE_PROFILE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_active_profile(name: Option<String>) {
+    *ACTIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner()) = name;
+}
+pub fn active_profile() -> Option<String> {
+    ACTIVE_PROFILE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 pub fn request_profiles() {
     PROFILES.store(true, Ordering::Release);
 }
