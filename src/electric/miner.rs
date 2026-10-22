@@ -894,12 +894,18 @@ fn mine(
                 }
                 Ok(false) => {}
                 Err(error) => {
+                    let retry_snapshot = link.retry_snapshot(&error);
                     monitor
                         .withdrawal
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .failure(error, transfers.active());
-                    session = None;
+                    // Preserve a native watcher's confirmed/mempool cache on
+                    // snapshot churn; stale state is never returned as work.
+                    // Other failures retain the existing failover behavior.
+                    if !retry_snapshot {
+                        session = None;
+                    }
                     monitor.wait(BATON_POLL);
                     continue;
                 }
@@ -918,7 +924,9 @@ fn mine(
             Err(error) => {
                 monitor.state("Reconnecting; pending proof retained");
                 monitor.event(format!("Source: {error}"));
-                session = None;
+                if !link.retry_snapshot(&error) {
+                    session = None;
+                }
                 monitor.wait(IDLE_POLL);
                 continue;
             }

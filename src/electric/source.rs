@@ -22,6 +22,13 @@ pub(super) struct Session {
 }
 
 impl Session {
+    pub fn retry_snapshot(&mut self, error: &str) -> bool {
+        match &mut self.link {
+            Link::Node(watch) => watch.retry_snapshot(error),
+            Link::Fulcrum(_) => false,
+        }
+    }
+
     pub fn connect(cfg: &RuntimeConfig, scripts: &[Vec<u8>]) -> Result<Self, String> {
         let mut failures = Vec::new();
         for url in cfg.node_endpoints() {

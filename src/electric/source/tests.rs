@@ -33,6 +33,10 @@ impl Node {
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 };
+                // #### PR #65: macOS inherits the listener's nonblocking mode.
+                // Accept remains interruptible; complete requests use bounded
+                // blocking reads on every platform.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
@@ -132,6 +136,26 @@ fn node_only_adapter_reads_both_networks_and_shares_recovery_and_broadcast_trans
         assert!(coins[0]["token_data"].is_null());
         assert_eq!(session.relay_fee().unwrap(), 2000);
         assert!(session.unspent(&[0x53]).is_err());
+        let before = node
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.as_str() == "getblockchaininfo")
+            .count();
+        assert!(session.retry_snapshot("node tip changed during ELECTRIC snapshot"));
+        assert_eq!(session.unspent(&[0x52]).unwrap()[0]["value"], 10_000);
+        assert!(
+            node.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.as_str() == "getblockchaininfo")
+                .count()
+                > before
+        );
+        assert!(!session.retry_snapshot("node hash is not 32-byte hex"));
+        assert!(!session.retry_snapshot("connect: connection refused"));
         assert!(!node
             .requests
             .lock()

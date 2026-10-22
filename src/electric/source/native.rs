@@ -36,6 +36,22 @@ pub(super) struct Watch {
 }
 
 impl Watch {
+    pub fn retry_snapshot(&mut self, error: &str) -> bool {
+        // This transport opens a fresh HTTP connection per call. Expected
+        // snapshot races need another read, not a new watcher or UTXO scan.
+        let retry = matches!(
+            error,
+            "node tip changed during ELECTRIC snapshot"
+                | "node changed chain while reading ELECTRIC blocks"
+                | "node tip changed during ELECTRIC UTXO scan"
+                | "node mempool kept changing during ELECTRIC snapshot"
+        );
+        if retry {
+            self.refreshed = None;
+        }
+        retry
+    }
+
     pub fn connect(url: &str, scripts: &[Vec<u8>]) -> Result<Self, String> {
         let mut watch = Self {
             url: url.into(),
@@ -481,6 +497,12 @@ mod tests {
                 .is_err());
             assert_eq!(index.view, saved);
             assert_eq!(index.tip.as_ref().unwrap().hash, id(10));
+            // Keeping this watcher across the failed snapshot recovers using
+            // the proven confirmed base, without a second full UTXO scan.
+            assert_eq!(
+                update(&mut index, tip(100, 10), scan(), vec![], None).unwrap(),
+                0
+            );
         }
     }
 

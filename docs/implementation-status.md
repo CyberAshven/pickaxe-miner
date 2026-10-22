@@ -21,6 +21,29 @@ is the current index, not a new scope.
 - Treat credentials and private mining state as secrets. Keep logs redacted.
 - No releases, tags or merges as part of this implementation.
 
+## Release readiness (2026-10-22, PR #65)
+
+PR #65 targets `dev`; it is not a completed master promotion. Its hosted
+checks and review findings must be clear on the final commit. The macOS RPC
+fixture now explicitly uses blocking accepted sockets, Ctrl+C terminates when
+no mining session remains, and transient ELECTRIC snapshot races retain the
+native node index without publishing stale work. Focused regressions cover
+these fixes; the hosted macOS run is the platform check.
+
+The following live evidence remains open, even if CI passes:
+
+- Owner-pot Max/send broadcast and restart/lost-reply recovery with real
+  transactions; VM and durable-send tests do not establish this live result.
+- ELECTRIC mining and propagation through the new native RPC source. The
+  Mainnet/Chipnet RPC integration fixtures are not real-node claims.
+- Physical ASIC/block/PPLNS payout evidence for public P2Pool using the
+  miner's own templates. Previous narrower ASIC runs do not prove this mode.
+
+Do not describe the complete new feature set as release-validated until those
+items have evidence. The author's undeployed merge-token contracts and missing
+hardware interoperability listed below remain explicitly unsupported or
+unverified; an empty token registry is not an implemented live contract.
+
 ## Requirements and completion evidence
 
 | ID | Requirement | Evidence needed | Current state |
