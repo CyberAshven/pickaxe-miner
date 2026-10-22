@@ -241,6 +241,11 @@ struct Record {
     binding: String,
     plan: Plan,
     next: usize,
+    /// #### PR #65: an attempt to broadcast transfer `next` ended without a
+    /// definite refusal (a lost reply, a dropped connection), so the network
+    /// may hold it; a later fee refusal elsewhere must not abandon it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    uncertain: bool,
 }
 
 pub(super) use super::source::Spender;
@@ -290,6 +295,16 @@ fn source(message: String) -> PollError {
 
 /// #### PR #65: a broadcast refused for paying too little. The transaction's
 /// fee is fixed, so retrying the same bytes cannot succeed.
+/// A server's own refusal of a transaction, as opposed to a broadcast whose
+/// outcome is unknown (a lost reply or a dropped connection).
+fn definite_refusal(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    fee_rejected(error)
+        || ["rejected", "bad-txns", "txn-mempool-conflict", "(code "]
+            .iter()
+            .any(|known| lower.contains(known))
+}
+
 fn fee_rejected(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     [
@@ -453,12 +468,30 @@ impl Transfers {
                 if !broadcast {
                     return Ok(Step::Pending);
                 }
+                // Recorded before sending: the reply can be lost after the
+                // network took the transfer.
+                let uncertain = record.uncertain;
+                if !uncertain {
+                    self.mark_uncertain(true)?;
+                }
                 return match link.broadcast(&raw) {
                     Ok(id) if id.eq_ignore_ascii_case(&txid) => Ok(Step::Pending),
                     Ok(_) => Err(source(
                         "server returned another send transaction id; journal retained".into(),
                     )),
-                    Err(error) if fee_rejected(&error) => self.abandon_unsent(link, index),
+                    Err(error) if definite_refusal(&error) => {
+                        if !uncertain {
+                            self.mark_uncertain(false)?;
+                        }
+                        if !fee_rejected(&error) {
+                            Err(source(error))
+                        } else if uncertain {
+                            Err("the network refused an approved transfer's fee after an earlier                                  attempt may have sent it; journal retained until it confirms                                  or its coin is spent elsewhere"
+                                .into())
+                        } else {
+                            self.abandon_unsent(link, index)
+                        }
+                    }
                     Err(error) => Err(source(error)),
                 };
             }
@@ -496,11 +529,21 @@ impl Transfers {
             binding: record.binding.clone(),
             plan: record.plan.clone(),
             next: index + 1,
+            uncertain: false,
         };
         self.save(&next)?;
         self.approved = Some(next);
         self.searched = None;
         Ok(Step::Advanced)
+    }
+
+    /// Saves whether transfer `next` may already be on the network.
+    fn mark_uncertain(&mut self, uncertain: bool) -> Result<(), PollError> {
+        let record = self.approved.as_mut().ok_or("no approved Max/send")?;
+        record.uncertain = uncertain;
+        let record = self.approved.as_ref().ok_or("no approved Max/send")?;
+        self.save(record)?;
+        Ok(())
     }
 
     /// The network refused transfer `index`'s fee. Its input is still
@@ -633,6 +676,7 @@ impl Transfers {
                         binding: self.binding.clone(),
                         plan,
                         next: 0,
+                        uncertain: false,
                     };
                     self.save(&record)?; // Durable approval before the first network side effect.
                     self.approved = Some(record);
@@ -1110,6 +1154,33 @@ mod tests {
     }
 
     #[test]
+    fn a_fee_refusal_never_abandons_a_transfer_an_earlier_attempt_may_have_sent() {
+        let f = Fixture::new();
+        let c = f.control();
+        let mut txs = f.transfers();
+        let mut link = Fake::new(&f);
+        poll(&mut txs, &f, &mut link, &c).unwrap();
+        approve(&c);
+        // The first server takes the transfer but the reply is lost, and
+        // the connection fails over to a server with a higher fee floor.
+        link.lost_reply = true;
+        assert!(poll(&mut txs, &f, &mut link, &c).is_err());
+        assert!(txs.approved.as_ref().unwrap().uncertain);
+        link.lost_reply = false;
+        link.published.clear();
+        link.reject = Some("min relay fee not met, 200 < 226 (code 66)".into());
+        for _ in 0..3 {
+            let error = poll(&mut txs, &f, &mut link, &c).unwrap_err();
+            assert!(!error.source);
+            assert!(txs.active() && f.path().exists());
+        }
+        assert!(archived(&f, "abandoned").is_empty());
+        // The journal remembers the attempt across a restart.
+        let reopened = f.transfers();
+        assert!(reopened.approved.as_ref().unwrap().uncertain);
+    }
+
+    #[test]
     fn a_fee_refusal_abandons_only_a_send_with_nothing_in_the_mempool_or_chain() {
         let f = Fixture::new();
         let c = f.control();
@@ -1118,7 +1189,7 @@ mod tests {
         poll(&mut txs, &f, &mut link, &c).unwrap();
         approve(&c);
         // Any other refusal keeps the approved send for retry.
-        link.reject = Some("connection reset by peer".into());
+        link.reject = Some("txn-mempool-conflict (code 18)".into());
         assert!(poll(&mut txs, &f, &mut link, &c).unwrap_err().source);
         assert!(txs.active() && f.path().exists());
         let refusal = "the transaction was rejected by network rules.\n\n\

@@ -460,13 +460,18 @@ fn mine_choice(
     monitor: &super::ui::Monitor,
 ) -> Result<(), String> {
     loop {
-        let previous = if ready.choice.previous.is_some() {
-            match choose_previous(cfg, &ready.choice, monitor) {
+        // A claim saved on either pot is recovered on that pot before the
+        // balances decide.
+        let pending =
+            |pot: &Pot| claim_journal_path(cfg, pot, config_path).is_ok_and(|path| path.exists());
+        let previous = match ready.choice.previous.as_ref() {
+            Some(previous) if pending(previous) => true,
+            Some(_) if pending(&ready.choice.pot) => false,
+            Some(_) => match choose_previous(cfg, &ready.choice, monitor) {
                 Some(previous) => previous,
                 None => return Ok(()),
-            }
-        } else {
-            false
+            },
+            None => false,
         };
         let pot = ready.choice.chosen(previous).clone();
         monitor.set_pot(&pot.address(), ready.choice.key_path.as_deref());
