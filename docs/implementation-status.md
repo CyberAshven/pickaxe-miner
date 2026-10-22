@@ -25,9 +25,9 @@ is the current index, not a new scope.
 
 PR #65 targets `dev`; it is not a completed master promotion. Its hosted
 checks and review findings must be clear on the final commit. The macOS RPC
-fixture now explicitly uses blocking accepted sockets, Ctrl+C terminates when
-no mining session remains, and transient ELECTRIC snapshot races retain the
-native node index without publishing stale work. Focused regressions cover
+fixture now explicitly uses blocking accepted sockets, Ctrl+C follows the
+current screen/session through graceful cleanup, and transient ELECTRIC snapshot
+races retain the native node index without publishing stale work. Focused regressions cover
 these fixes; the hosted macOS run is the platform check.
 
 The following live evidence remains open, even if CI passes:

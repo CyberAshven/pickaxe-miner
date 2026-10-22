@@ -4372,8 +4372,13 @@ pub fn run_setup(
 
 /// Draws and processes setup screens in the terminal.
 fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    crate::session_control::install_stop(&stop)?;
     let mut terminal = TerminalSession::enter()?;
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         state.poll_local_node();
         state.refresh_electric_pot();
         state.poll_pot_balance();
@@ -4386,10 +4391,14 @@ fn run_setup_terminal(mut state: SetupFlow) -> Result<Option<SetupResult>, Strin
         // While the check for a node on this computer runs, wake up to show
         // its result as soon as it is in.
         // #### PR #61: and while the fee pot shows, to show its balance.
-        if (state.checking_local_node() || state.watching_pot())
-            && !event::poll(EVENT_POLL_INTERVAL)
-                .map_err(|error| format!("read mining setup input: {error}"))?
-        {
+        // Always bound the input wait: a console signal may not produce a
+        // crossterm key event, especially on Windows after a profile return.
+        let wait = if state.checking_local_node() || state.watching_pot() {
+            EVENT_POLL_INTERVAL
+        } else {
+            DRAW_INTERVAL
+        };
+        if !event::poll(wait).map_err(|error| format!("read mining setup input: {error}"))? {
             continue;
         }
         let input = event::read().map_err(|error| format!("read mining setup input: {error}"))?;
@@ -4578,6 +4587,8 @@ pub fn run(
     supervisor: RuntimeSupervisor,
     devices: Vec<GpuDevice>,
 ) -> Result<RuntimeSnapshot, String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    crate::session_control::install_stop(&stop)?;
     let initial = supervisor.snapshot();
     let mut state = TuiState::new(&initial);
     state.set_devices(devices);
@@ -4586,7 +4597,7 @@ pub fn run(
     let mut last_draw = Instant::now() - DRAW_INTERVAL;
 
     let mut last_status_log: Option<Instant> = None;
-    while !quit {
+    while !quit && !stop.load(Ordering::Relaxed) {
         let snapshot = supervisor.snapshot();
         if state.profiles_ready(snapshot.pending_winners > 0, Instant::now()) {
             break;
@@ -4625,7 +4636,7 @@ pub fn run(
     }
 
     drop(terminal);
-    if state.profiles_requested {
+    if state.profiles_requested && !stop.load(Ordering::Relaxed) {
         crate::session_control::request_profiles();
     }
     Ok(supervisor.stop())
