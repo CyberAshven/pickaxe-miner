@@ -461,9 +461,11 @@ fn mine_choice(
 ) -> Result<(), String> {
     loop {
         // A claim saved on either pot is recovered on that pot before the
-        // balances decide.
-        let pending =
-            |pot: &Pot| claim_journal_path(cfg, pot, config_path).is_ok_and(|path| path.exists());
+        // balances decide; a journal whose claim settled holds none.
+        let pending = |pot: &Pot| {
+            claim_journal_path(cfg, pot, config_path)
+                .is_ok_and(|path| super::pending::holds_claim(&path))
+        };
         let previous = match ready.choice.previous.as_ref() {
             Some(previous) if pending(previous) => true,
             Some(_) if pending(&ready.choice.pot) => false,

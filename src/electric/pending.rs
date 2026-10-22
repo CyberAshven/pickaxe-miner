@@ -159,10 +159,53 @@ impl Journal {
     }
 }
 
+/// #### PR #66: whether the journal at `path` holds a claim still to
+/// recover. The file stays after a claim settles, with no claim in it; one
+/// that cannot be read counts as holding one, so its pot reports it.
+pub(super) fn holds_claim(path: &Path) -> bool {
+    match fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(record) => record.get("pending").is_some_and(|p| !p.is_null()),
+            Err(_) => true,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{config::MiningNetwork, donation::Recipient};
+
+    #[test]
+    fn only_a_journal_with_a_claim_in_it_holds_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "pickaxe-holds-claim-{:016x}",
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("electric-chipnet-x.pending.json");
+        assert!(!holds_claim(&path), "no journal");
+        fs::write(
+            &path,
+            br#"{"version":1,"binding":"chipnet:x","pending":null}"#,
+        )
+        .unwrap();
+        assert!(!holds_claim(&path), "a settled claim leaves the file");
+        fs::write(
+            &path,
+            br#"{"version":1,"binding":"chipnet:x","pending":{"baton":{}}}"#,
+        )
+        .unwrap();
+        assert!(holds_claim(&path));
+        fs::write(&path, b"not json").unwrap();
+        assert!(
+            holds_claim(&path),
+            "an unreadable journal is reported on its pot"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn completed_proof_and_exact_transaction_survive_restart_and_invalid_files_are_preserved() {
