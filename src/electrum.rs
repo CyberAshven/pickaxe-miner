@@ -135,7 +135,7 @@ fn node_rpc(endpoint: &str, method: &str, params: &Value) -> Result<Value, Strin
 /// A transaction's bytes from a node without a transaction index: from its
 /// mempool; else from the block holding one of its unspent outputs; else from
 /// one of the last blocks. `None` when none of them has it.
-fn node_raw_transaction(endpoint: &str, txid: &str) -> Result<Option<String>, String> {
+pub(crate) fn node_raw_transaction(endpoint: &str, txid: &str) -> Result<Option<String>, String> {
     use crate::node::rpc_call;
     match rpc_call(endpoint, "getrawtransaction", json!([txid, false])) {
         Ok(Value::String(raw)) => return Ok(Some(raw)),

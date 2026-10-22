@@ -243,6 +243,7 @@ pub fn run(
         tp_listen,
         accept_job_declaration,
         job_declaration,
+        p2pool_prepare_api,
         ..
     } = action
     else {
@@ -258,6 +259,12 @@ pub fn run(
         }
         return Ok(());
     };
+    if let Some(api) = &p2pool_prepare_api {
+        crate::p2pool::http::validate_preparation_url(api)?;
+        if !declaring || pools.is_empty() || !fallbacks.is_empty() {
+            return Err("P2Pool own templates need an upstream, Job Declaration and no pool-template fallback".into());
+        }
+    }
     // #### PR #40: where each device's difficulty starts.
     let share_target = match start_difficulty {
         None => compact_target(0x1b0ffff0)?,
@@ -324,6 +331,17 @@ pub fn run(
             })
             .collect()
     };
+    // #### PR #65: the TUI supplies a bare payout. Both JD recipients need
+    // the explicit share-owner identity before connecting to BCH P2Pool.
+    let pools = pools
+        .into_iter()
+        .map(|mut pool| {
+            if p2pool_prepare_api.is_some() {
+                pool.identity = p2pool_jd_identity(config.network, &pool.identity)?;
+            }
+            Ok(pool)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let pools = at_pools(pools);
     let fallbacks = at_pools(fallbacks);
     let listener = serving
@@ -391,10 +409,17 @@ pub fn run(
             }))];
             // #### PR #42: under Job Declaration the pools' own jobs follow;
             // in solo mining, the fallback pools.
-            if declaring {
+            if declaring
+                && p2pool_prepare_api.is_none()
+                && !job_declaration.is_some_and(|mode| mode.requires_own_templates())
+            {
                 list.extend(pools.iter().cloned());
             }
-            list.extend(fallbacks.iter().cloned());
+            if p2pool_prepare_api.is_none()
+                && !job_declaration.is_some_and(|mode| mode.requires_own_templates())
+            {
+                list.extend(fallbacks.iter().cloned());
+            }
             list
         }
         _ => return Err("mining server unavailable".into()),
@@ -447,9 +472,7 @@ pub fn run(
         }),
     });
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_signal = stop.clone();
-    ctrlc::set_handler(move || stop_signal.store(true, Ordering::Relaxed))
-        .map_err(|_| "cannot install clean shutdown handler")?;
+    crate::session_control::install_stop(&stop)?;
     let mut terminal = if no_tui || json {
         None
     } else {
@@ -458,23 +481,34 @@ pub fn run(
     let stats = Arc::new(Mutex::new(ServerStats::default()));
     // #### PR #42: the Job Declaration uplink, to the pools in order.
     let mode = match job_declaration {
-        Some(crate::cli::JobDeclarationMode::Coinbase) => super::jd::JdMode::CoinbaseOnly,
+        Some(
+            crate::cli::JobDeclarationMode::Coinbase
+            | crate::cli::JobDeclarationMode::CoinbaseRequired,
+        ) => super::jd::JdMode::CoinbaseOnly,
         _ => super::jd::JdMode::FullTemplate,
     };
     let uplink = (declaring && !pools.is_empty()).then(|| {
-        super::jd::client::spawn(
-            pools
-                .iter()
-                .map(|pool| super::jd::client::JdTarget {
-                    address: pool.address.clone(),
-                    authority: pool.authority,
-                    identity: pool.identity.clone(),
-                    retry: Duration::from_secs(30),
-                    mode,
-                })
-                .collect(),
-            stop.clone(),
-        )
+        let targets = pools
+            .iter()
+            .map(|pool| super::jd::client::JdTarget {
+                address: pool.address.clone(),
+                authority: pool.authority,
+                identity: pool.identity.clone(),
+                retry: Duration::from_secs(30),
+                mode,
+                p2pool_prepare_api: p2pool_prepare_api.clone(),
+                required: p2pool_prepare_api.is_some()
+                    || job_declaration.is_some_and(|mode| mode.requires_own_templates()),
+            })
+            .collect();
+        if p2pool_prepare_api.is_some() {
+            let address = crate::donation::bch::address(config.network);
+            let share = crate::tx::p2pool_share_address(address)
+                .expect("the configured donation address is a network-checked P2PKH");
+            super::jd::client::spawn_p2pool(targets, format!("{address},p2p={share}"), stop.clone())
+        } else {
+            super::jd::client::spawn(targets, stop.clone())
+        }
     });
     let uplink_handle = uplink.as_ref().map(|(handle, _)| handle.clone());
     // #### PR #42: the server's work: the nodes' (or providers') templates,
@@ -1017,6 +1051,24 @@ pub fn run(
 // donation at every P2Pool pool of that kind. P2Pool's own block donation
 // is the pool's and separate from Pickaxe's.
 // Look here if: the donation channel is refused at a P2Pool node.
+fn p2pool_jd_identity(
+    network: crate::config::MiningNetwork,
+    identity: &str,
+) -> Result<String, String> {
+    let (payout, supplied_share) = match identity.split_once(",p2p=") {
+        Some((payout, share)) => (payout, Some(share)),
+        None => (identity, None),
+    };
+    let payout = crate::config::validate_payout_address(network, payout)
+        .map_err(|_| "P2Pool own templates need a payout CashAddr on the selected network")?;
+    let share = match supplied_share {
+        Some(share) if !share.is_empty() && !share.contains([',', ' ']) => share.to_owned(),
+        Some(_) => return Err("invalid P2Pool share-owner identity".into()),
+        None => crate::tx::p2pool_share_address(&payout)?,
+    };
+    Ok(format!("{payout},p2p={share}"))
+}
+
 fn donation_route(
     network: crate::config::MiningNetwork,
     identity: &str,
@@ -1281,6 +1333,12 @@ fn started_text(started: &Started) -> String {
         let mode = match mode {
             crate::cli::JobDeclarationMode::Full => "Full-Template",
             crate::cli::JobDeclarationMode::Coinbase => "Coinbase-only",
+            crate::cli::JobDeclarationMode::FullRequired => {
+                "Full-Template required (no pool-template fallback)"
+            }
+            crate::cli::JobDeclarationMode::CoinbaseRequired => {
+                "Coinbase-only required (no pool-template fallback)"
+            }
         };
         text.push_str(&format!(
             "Your templates  {mode} Job Declaration at the first pool, from your node; devices \
@@ -3170,6 +3228,28 @@ pub(crate) fn load_authority(path: &Path) -> Result<[u8; 32], String> {
 mod tests {
     use super::*;
 
+    /// #### PR #65: the CLI has the same source requirement as setup;
+    /// Electrum headers/UTXOs never stand in for a BCH block template.
+    #[test]
+    fn fulcrum_cannot_replace_a_bch_node_or_template_provider_at_preflight() {
+        for network in [
+            config::MiningNetwork::Mainnet,
+            config::MiningNetwork::Chipnet,
+        ] {
+            let mut cfg = RuntimeConfig::default();
+            cfg.set_network(network);
+            cfg.fulcrum_url = Some("wss://fulcrum.invalid:50004".into());
+            assert!(cfg.custom_node_endpoints().is_empty());
+            let error = preflight_sources(&cfg, &[], 0)
+                .err()
+                .expect("no BCH template source");
+            assert!(
+                error.contains("configure your BCHN RPC connection"),
+                "{error}"
+            );
+        }
+    }
+
     // #### PR #42
     // What: merge-mined token wins show on the dashboard's records line and
     // in the status file (token, case, height, worker; never an address),
@@ -3900,6 +3980,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("needs --job-declaration"), "{error}");
+    }
+
+    #[test]
+    fn p2pool_jd_bare_payout_from_setup_gets_a_share_owner_for_both_networks() {
+        for network in [
+            crate::config::MiningNetwork::Mainnet,
+            crate::config::MiningNetwork::Chipnet,
+        ] {
+            let payout = crate::tx::cashaddr_with_version(0, &[0x29; 20], network);
+            let share = crate::tx::p2pool_share_address(&payout).unwrap();
+            let identity = p2pool_jd_identity(network, &payout).unwrap();
+            assert_eq!(
+                identity.split_once(",p2p="),
+                Some((payout.as_str(), share.as_str()))
+            );
+            assert_eq!(p2pool_jd_identity(network, &identity).unwrap(), identity);
+            let other_network = if network == crate::config::MiningNetwork::Mainnet {
+                crate::config::MiningNetwork::Chipnet
+            } else {
+                crate::config::MiningNetwork::Mainnet
+            };
+            assert!(p2pool_jd_identity(other_network, &payout).is_err());
+            assert!(p2pool_jd_identity(network, &format!("{payout},p2p=")).is_err());
+            assert!(p2pool_jd_identity(network, "named-worker").is_err());
+        }
     }
 
     #[test]

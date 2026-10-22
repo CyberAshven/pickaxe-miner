@@ -87,6 +87,8 @@ pub struct JdTarget {
     /// The wait before trying again after the pool refused or failed.
     pub retry: Duration,
     pub mode: JdMode,
+    pub p2pool_prepare_api: Option<String>,
+    pub required: bool,
 }
 
 /// What the dashboard shows of the client; never an identity or token.
@@ -141,15 +143,115 @@ pub enum UplinkEvent {
     Published {
         serial: u64,
         template: Arc<BchTemplate>,
+        /// Paired sessions admit the event only after both queues accept it.
+        admission: Option<Arc<Mutex<bool>>>,
     },
     /// An accepted local share on a declared job.
     Share(ForwardShare),
+}
+
+impl UplinkEvent {
+    fn published(serial: u64, template: Arc<BchTemplate>) -> Self {
+        Self::Published {
+            serial,
+            template,
+            admission: None,
+        }
+    }
+}
+
+fn publication_admitted(admission: Option<Arc<Mutex<bool>>>) -> bool {
+    admission.is_none_or(|admission| admission.lock().is_ok_and(|committed| *committed))
 }
 
 #[derive(Clone)]
 pub struct UplinkHandle {
     pub events: SyncSender<UplinkEvent>,
     pub status: Arc<JdStatus>,
+    /// P2Pool credits donation work to a separate authorized share owner.
+    /// Both sessions declare the same independently sourced transactions.
+    pub donation: Option<Arc<UplinkHandle>>,
+}
+
+impl UplinkHandle {
+    // #### PR #65: queue personal and donation declarations as one admission.
+    // A receiver may dequeue immediately, but cannot declare until both sends
+    // succeed. A full/disconnected peer cancels the other event before it can
+    // consume a token or replace an accepted job. No network I/O holds the gate.
+    pub fn publish(&self, serial: u64, template: Arc<BchTemplate>) -> Result<(), &'static str> {
+        let Some(donation) = self.donation.as_ref() else {
+            return self
+                .events
+                .try_send(UplinkEvent::published(serial, template))
+                .map_err(|_| "personal declaration queue unavailable");
+        };
+        let own = template
+            .p2pool_donation()
+            .cloned()
+            .ok_or("donation declaration missing")?;
+        let admission = Arc::new(Mutex::new(false));
+        let mut committed = admission
+            .lock()
+            .map_err(|_| "declaration admission unavailable")?;
+        donation
+            .events
+            .try_send(UplinkEvent::Published {
+                serial,
+                template: own,
+                admission: Some(admission.clone()),
+            })
+            .map_err(|_| "donation declaration queue unavailable")?;
+        self.events
+            .try_send(UplinkEvent::Published {
+                serial,
+                template,
+                admission: Some(admission.clone()),
+            })
+            .map_err(|_| "personal declaration queue unavailable")?;
+        *committed = true;
+        Ok(())
+    }
+
+    pub fn acknowledged(&self) -> u64 {
+        let personal = self.status.acknowledged.load(Ordering::Relaxed);
+        self.donation.as_ref().map_or(personal, |donation| {
+            personal.min(donation.status.acknowledged.load(Ordering::Relaxed))
+        })
+    }
+
+    pub fn forward(&self, share: ForwardShare) {
+        let route = if share.donation {
+            self.donation.as_deref().unwrap_or(self)
+        } else {
+            self
+        };
+        let _ = route.events.try_send(UplinkEvent::Share(share));
+    }
+}
+
+/// A P2Pool beneficiary needs its own channel, token and declared coinbase.
+/// Never subtract a software donation from other participants' PPLNS outputs.
+pub fn spawn_p2pool(
+    targets: Vec<JdTarget>,
+    donation_identity: String,
+    stop: Arc<AtomicBool>,
+) -> (UplinkHandle, thread::JoinHandle<()>) {
+    let donation_targets = targets
+        .iter()
+        .cloned()
+        .map(|mut target| {
+            target.identity = donation_identity.clone();
+            target
+        })
+        .collect();
+    let (mut personal, personal_worker) = spawn(targets, stop.clone());
+    let (donation, donation_worker) = spawn(donation_targets, stop);
+    personal.donation = Some(Arc::new(donation));
+    let worker = thread::spawn(move || {
+        let _ = personal_worker.join();
+        let _ = donation_worker.join();
+    });
+    (personal, worker)
 }
 
 /// Starts the uplink to the first of `targets` (the pools in order); it
@@ -218,8 +320,12 @@ pub fn spawn(
             // Look here if: devices stay idle while the pool is up, or the
             // dashboard keeps counting fallbacks.
             shared.update(|summary| {
-                summary.state = "fallback";
-                summary.fallbacks += 1;
+                summary.state = if target.required {
+                    "waiting"
+                } else {
+                    "fallback"
+                };
+                summary.fallbacks += u64::from(!target.required);
                 summary.last_error = result.err();
             });
             let until = Instant::now() + retry_after(target.retry, failures);
@@ -233,7 +339,14 @@ pub fn spawn(
             shared.update(|summary| summary.state = "connecting");
         }
     });
-    (UplinkHandle { events, status }, worker)
+    (
+        UplinkHandle {
+            events,
+            status,
+            donation: None,
+        },
+        worker,
+    )
 }
 
 /// The wait before the next try after `failures` failures in a row.
@@ -353,7 +466,28 @@ fn uplink(
         allocate(target, &mut jd, &mut requests)?;
     }
     let mut tokens: VecDeque<Vec<u8>> = VecDeque::new();
-    let (first, scripts) = token(&mut answer(&mut jd_replies, stop)?)?;
+    let (first, mut scripts) = token_for(
+        &mut answer(&mut jd_replies, stop)?,
+        target.p2pool_prepare_api.is_some(),
+    )?;
+    let p2pool = target
+        .p2pool_prepare_api
+        .as_ref()
+        .map(|api| {
+            let (payout, share_owner) = target
+                .identity
+                .split_once(",p2p=")
+                .ok_or("P2Pool own-template mode needs both payout and share-owner identities")?;
+            scripts = vec![crate::tx::cashaddr_to_p2pkh_locking(payout)?];
+            Ok::<_, String>(Arc::new(crate::p2pool::jd::Plan {
+                api: api.clone(),
+                payout: payout.to_owned(),
+                share_owner: share_owner.to_owned(),
+                tokens: std::sync::Mutex::new(VecDeque::from([first.0.clone()])),
+                consumed: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        })
+        .transpose()?;
     let plan = Arc::new(JdPlan {
         serial,
         upstream_prefix: prefix,
@@ -370,11 +504,14 @@ fn uplink(
         scripts,
         rates: first.1,
         pool_target,
+        p2pool,
     });
     if !plan.is_valid() {
         return Err("the pool's token names outputs it does not list, or rates over 100%".into());
     }
-    tokens.push_back(first.0);
+    if plan.p2pool.is_none() {
+        tokens.push_back(first.0);
+    }
     status.acknowledged.store(0, Ordering::Relaxed);
     status.set_plan(Some(plan.clone()));
     status.update(|summary| {
@@ -392,10 +529,26 @@ fn uplink(
     let mut next_request = 1u32;
     let mut next_declaration = 1u32;
     while !stop.load(Ordering::Relaxed) {
+        if let Some(p2pool) = &plan.p2pool {
+            for _ in 0..p2pool.consumed.swap(0, Ordering::Relaxed) {
+                allocate(target, &mut jd, &mut requests)?;
+            }
+        }
         while let Some(mut frame) = jd_replies.receive(Duration::from_millis(5))? {
             match frame.header().msg_type() {
                 MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS => {
-                    let ((bytes, rates), scripts) = token(&mut frame)?;
+                    let ((bytes, rates), scripts) = token_for(&mut frame, plan.p2pool.is_some())?;
+                    if let Some(p2pool) = &plan.p2pool {
+                        let mut queued = p2pool
+                            .tokens
+                            .lock()
+                            .map_err(|_| "P2Pool token queue unavailable")?;
+                        if queued.len() >= TOKENS_AHEAD {
+                            return Err("unsolicited P2Pool job tokens".into());
+                        }
+                        queued.push_back(bytes);
+                        continue;
+                    }
                     if rates != plan.rates || scripts != plan.scripts {
                         return Err("the pool's fee or donation changed".into());
                     }
@@ -504,7 +657,11 @@ fn uplink(
                         jobs.pop_front();
                     }
                     status.acknowledged.fetch_max(serial, Ordering::Relaxed);
-                    status.update(|summary| summary.custom_jobs += 1);
+                    status.update(|summary| {
+                        summary.custom_jobs += 1;
+                        summary.state = "active";
+                        summary.last_error = None;
+                    });
                     for share in cache.remove(&serial).unwrap_or_default() {
                         forward(
                             &mut pool,
@@ -583,7 +740,14 @@ fn uplink(
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
         match event {
-            UplinkEvent::Published { serial, template } => {
+            UplinkEvent::Published {
+                serial,
+                template,
+                admission,
+            } => {
+                if !publication_admitted(admission) {
+                    continue;
+                }
                 if template.jd_plan().map(|plan| plan.serial) != Some(plan.serial) {
                     continue;
                 }
@@ -599,11 +763,17 @@ fn uplink(
                     status.update(|summary| summary.dropped += 1);
                     continue;
                 }
-                let Some(token) = tokens.pop_front() else {
+                let Some(token) = template
+                    .p2pool_token()
+                    .map(<[u8]>::to_vec)
+                    .or_else(|| tokens.pop_front())
+                else {
                     status.update(|summary| summary.refused += 1);
                     continue;
                 };
-                allocate(target, &mut jd, &mut requests)?;
+                if plan.p2pool.is_none() {
+                    allocate(target, &mut jd, &mut requests)?;
+                }
                 if full {
                     let request = next_declaration;
                     next_declaration = next_declaration.wrapping_add(1);
@@ -792,8 +962,9 @@ fn allocate(target: &JdTarget, jd: &mut Sender, requests: &mut u32) -> Result<()
 
 /// A token's bytes and rates, and the pool's output scripts in its order.
 #[allow(clippy::type_complexity)]
-fn token(
+fn token_for(
     frame: &mut SerializedFrame,
+    p2pool: bool,
 ) -> Result<((Vec<u8>, super::token::PoolRates), Vec<Vec<u8>>), String> {
     if frame.header().msg_type() != MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS {
         return Err("the pool did not allocate a token".into());
@@ -804,13 +975,26 @@ fn token(
     // A Pickaxe pool's token carries its rates; another pool's is opaque,
     // and its fee and donation cannot be known, so its custom jobs could
     // not pay them.
-    let token = PxToken::decode(&bytes)
-        .ok_or("the pool's tokens are not a Pickaxe pool's; Job Declaration needs one")?;
+    let rates = if p2pool {
+        if bytes.first() != Some(&1) || !(65..=255).contains(&bytes.len()) {
+            return Err("unsupported BCH P2Pool token format".into());
+        }
+        super::token::PoolRates {
+            donation_bps: 0,
+            fee_bps: 0,
+            donation_output: None,
+            fee_output: None,
+        }
+    } else {
+        PxToken::decode(&bytes)
+            .ok_or("the pool's tokens are not a Pickaxe pool's; Job Declaration needs one")?
+            .rates
+    };
     let scripts = parse_outputs(success.coinbase_outputs.as_ref())?
         .into_iter()
         .map(|(_, script)| script)
         .collect();
-    Ok(((bytes, token.rates), scripts))
+    Ok(((bytes, rates), scripts))
 }
 
 /// DeclareMiningJob for `template`: the local jobs' coinbase around the
@@ -940,12 +1124,20 @@ fn declare(
         nbits: template.bits,
         coinbase_tx_version: 2,
         coinbase_prefix: head.as_slice().try_into().map_err(|_| "prefix too long")?,
-        coinbase_tx_input_n_sequence: u32::MAX,
+        coinbase_tx_input_n_sequence: if template.p2pool_token().is_some() {
+            0xffff_fffe
+        } else {
+            u32::MAX
+        },
         coinbase_tx_outputs: outputs
             .as_slice()
             .try_into()
             .map_err(|_| "outputs too long")?,
-        coinbase_tx_locktime: 0,
+        coinbase_tx_locktime: if template.p2pool_token().is_some() {
+            template.height.saturating_sub(1)
+        } else {
+            0
+        },
         merkle_path: path.try_into().map_err(|_| "merkle path too long")?,
     }))?)
 }
@@ -992,6 +1184,277 @@ mod tests {
 
     fn template() -> BchTemplate {
         BchTemplate::from_rpc(&rpc_template()).unwrap()
+    }
+
+    #[test]
+    fn paired_declarations_are_all_admitted_or_all_cancelled_and_retry_the_same_id() {
+        for (personal_full, donation_full, disconnected) in [
+            (true, false, None),
+            (false, true, None),
+            (false, false, Some(false)),
+            (false, false, Some(true)),
+        ] {
+            let status = || {
+                Arc::new(JdStatus {
+                    plan: RwLock::new(None),
+                    summary: Mutex::default(),
+                    acknowledged: AtomicU64::new(0),
+                })
+            };
+            let (personal_events, personal_receive) = mpsc::sync_channel(1);
+            let (donation_events, donation_receive) = mpsc::sync_channel(1);
+            let donation = Arc::new(UplinkHandle {
+                events: donation_events,
+                status: status(),
+                donation: None,
+            });
+            let handle = UplinkHandle {
+                events: personal_events,
+                status: status(),
+                donation: Some(donation.clone()),
+            };
+            let own = Arc::new(template());
+            let mut personal = template();
+            personal.set_p2pool_donation((*own).clone());
+            let personal = Arc::new(personal);
+            if personal_full {
+                handle
+                    .events
+                    .send(UplinkEvent::published(0, personal.clone()))
+                    .unwrap();
+            }
+            if donation_full {
+                donation
+                    .events
+                    .send(UplinkEvent::published(0, own.clone()))
+                    .unwrap();
+            }
+            let personal_receive = (disconnected != Some(false)).then_some(personal_receive);
+            let donation_receive = (disconnected != Some(true)).then_some(donation_receive);
+            assert!(handle.publish(9, personal.clone()).is_err());
+            for receive in [&personal_receive, &donation_receive].into_iter().flatten() {
+                while let Ok(event) = receive.try_recv() {
+                    let UplinkEvent::Published {
+                        serial, admission, ..
+                    } = event
+                    else {
+                        panic!("unexpected share");
+                    };
+                    if serial == 9 {
+                        assert!(
+                            !publication_admitted(admission),
+                            "an unmatched declaration must be discarded before touching the pool"
+                        );
+                    }
+                }
+            }
+            assert_eq!(handle.acknowledged(), 0);
+            if disconnected.is_some() {
+                continue;
+            }
+            handle.publish(9, personal.clone()).unwrap();
+            for (receive, expected) in [
+                (personal_receive.unwrap(), &personal),
+                (
+                    donation_receive.unwrap(),
+                    personal.p2pool_donation().unwrap(),
+                ),
+            ] {
+                match receive.try_recv().unwrap() {
+                    UplinkEvent::Published {
+                        serial,
+                        template,
+                        admission,
+                    } => {
+                        assert_eq!(serial, 9, "queue failures must allow the same ID to retry");
+                        assert!(Arc::ptr_eq(&template, expected));
+                        assert!(publication_admitted(admission));
+                    }
+                    _ => panic!("expected matching declarations"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dequeued_publication_cannot_reach_the_pool_until_pair_admission_finishes() {
+        for committed in [false, true] {
+            let admission = Arc::new(Mutex::new(false));
+            let mut gate = admission.lock().unwrap();
+            let receive_gate = admission.clone();
+            let (started, start) = mpsc::channel();
+            let (finished, finish) = mpsc::channel();
+            let receiver = thread::spawn(move || {
+                started.send(()).unwrap();
+                finished
+                    .send(publication_admitted(Some(receive_gate)))
+                    .unwrap();
+            });
+            start.recv().unwrap();
+            assert!(matches!(finish.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            *gate = committed;
+            drop(gate);
+            assert_eq!(finish.recv().unwrap(), committed);
+            receiver.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn both_recipients_must_acknowledge_and_block_only_donation_work_keeps_its_route() {
+        let status = || {
+            Arc::new(JdStatus {
+                plan: RwLock::new(None),
+                summary: Mutex::new(JdClientSummary::default()),
+                acknowledged: AtomicU64::new(0),
+            })
+        };
+        let (personal_events, personal) = mpsc::sync_channel(2);
+        let (donation_events, donation) = mpsc::sync_channel(2);
+        let donor = Arc::new(UplinkHandle {
+            events: donation_events,
+            status: status(),
+            donation: None,
+        });
+        let handle = UplinkHandle {
+            events: personal_events,
+            status: status(),
+            donation: Some(donor.clone()),
+        };
+        handle.status.acknowledged.store(7, Ordering::Relaxed);
+        assert_eq!(handle.acknowledged(), 0);
+        donor.status.acknowledged.store(6, Ordering::Relaxed);
+        assert_eq!(handle.acknowledged(), 6);
+        let share = ForwardShare {
+            donation: true,
+            serial: 7,
+            version: 2,
+            ntime: 1,
+            nonce: 2,
+            extranonce: vec![0; 8],
+            hash: [0; 32],
+            block: true,
+        };
+        handle.forward(share.clone());
+        assert!(personal.try_recv().is_err());
+        match donation.try_recv().unwrap() {
+            UplinkEvent::Share(found) => assert_eq!(found, share),
+            _ => panic!("share route"),
+        };
+        donor.status.acknowledged.store(0, Ordering::Relaxed);
+        assert_eq!(
+            handle.acknowledged(),
+            0,
+            "reconnecting recipient revokes readiness"
+        );
+        let personal_share = ForwardShare {
+            donation: false,
+            ..share
+        };
+        handle.forward(personal_share.clone());
+        match personal.try_recv().unwrap() {
+            UplinkEvent::Share(found) => assert_eq!(found, personal_share),
+            _ => panic!("share route"),
+        };
+        assert!(donation.try_recv().is_err());
+    }
+
+    /// Reads only a locally supplied private config; does not hash or broadcast.
+    #[test]
+    #[ignore = "requires an isolated updated P2Pool node and a synced BCHN on Chipnet"]
+    fn live_p2pool_prepares_both_recipients_on_own_bchn_templates() {
+        use crate::config::MiningNetwork;
+        use crate::stratum_v2::provider::{NativeNodeRpc, TemplateProvider};
+        let path =
+            std::env::var("PICKAXE_P2POOL_JD_TEST_CONFIG").expect("private test config path");
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("private test config"))
+                .expect("valid test config");
+        let authority: [u8; 32] =
+            serde_json::from_value(config["authority"].clone()).expect("public authority");
+        let payout = config["payout"].as_str().expect("payout");
+        let share = crate::tx::p2pool_share_address(payout).expect("Chipnet payout");
+        let mut source = TemplateProvider::new(
+            NativeNodeRpc::new(config["node"].as_str().expect("saved RPC").to_owned()),
+            MiningNetwork::Chipnet,
+        );
+        let (_, original) = source.refresh().expect("synced Chipnet full template");
+        let original = original.clone();
+        let donation = crate::donation::bch::address(MiningNetwork::Chipnet);
+        let donation_share = crate::tx::p2pool_share_address(donation).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _stop = Stop(stop.clone());
+        for mode in [JdMode::FullTemplate, JdMode::CoinbaseOnly] {
+            let target = JdTarget {
+                address: config["pool"].as_str().unwrap().into(),
+                authority,
+                identity: format!("{payout},p2p={share}"),
+                retry: Duration::from_secs(2),
+                mode,
+                p2pool_prepare_api: Some(config["api"].as_str().unwrap().into()),
+                required: true,
+            };
+            let session_stop = Arc::new(AtomicBool::new(false));
+            let guard = Stop(session_stop.clone());
+            let (handles, worker) = spawn_p2pool(
+                vec![target],
+                format!("{donation},p2p={donation_share}"),
+                session_stop.clone(),
+            );
+            let donor = handles.donation.as_ref().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (personal_plan, donation_plan) = loop {
+                let personal = handles.status.plan.read().unwrap().clone();
+                let donation = donor.status.plan.read().unwrap().clone();
+                if let (Some(personal), Some(donation)) = (personal, donation) {
+                    break (personal, donation);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "both native P2Pool channels must authorize"
+                );
+                thread::sleep(Duration::from_millis(20));
+            };
+            let mut personal = original.clone();
+            personal.tag(b"Pickaxe JD test");
+            personal.declare(personal_plan);
+            personal
+                .prepare_p2pool()
+                .expect("personal PPLNS bytes must prepare");
+            let mut donation = original.clone();
+            donation.tag(b"Pickaxe JD test");
+            donation.declare(donation_plan);
+            donation
+                .prepare_p2pool()
+                .expect("donation PPLNS bytes must prepare");
+            assert_eq!(personal.transaction_ids(), donation.transaction_ids());
+            assert_ne!(
+                personal.declared_outputs().unwrap(),
+                donation.declared_outputs().unwrap(),
+                "share ownership must be committed to the recipient"
+            );
+            personal.set_p2pool_donation(donation);
+            handles.publish(1, Arc::new(personal)).unwrap();
+            while handles.acknowledged() < 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "BCHN-validated custom jobs must both be acknowledged"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            let personal = handles.status.summary.lock().unwrap().clone();
+            let donation = donor.status.summary.lock().unwrap().clone();
+            assert_eq!((personal.refused, donation.refused), (0, 0));
+            assert_eq!((personal.custom_jobs, donation.custom_jobs), (1, 1));
+            println!("mode={} Chipnet height={} personal_custom_jobs={} donation_custom_jobs={} rejected=0",mode.as_str(),original.height,personal.custom_jobs,donation.custom_jobs);
+            drop(guard);
+            worker.join().unwrap();
+        }
     }
 
     // #### PR #42

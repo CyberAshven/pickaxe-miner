@@ -1164,6 +1164,7 @@ fn run_headless_mining(
     use_tui: bool,
     rigs: Option<rigs::RigHub>,
     status_file: Option<std::path::PathBuf>,
+    config_path: &std::path::Path,
 ) -> Result<Option<SessionSettings>, String> {
     cfg.ensure_mining_supported()?;
     // #### PR #40
@@ -1187,9 +1188,19 @@ fn run_headless_mining(
     } else {
         Vec::new()
     };
+    let mut profile_cfg = cfg.clone();
     let supervisor = runtime::RuntimeSupervisor::start_on_gpus_with_rigs(cfg, gpus, rigs)?;
     if use_tui {
         let final_snapshot = tui::run(supervisor, tui_devices)?;
+        if pickaxe_miner::session_control::profiles_requested() {
+            profile_cfg.payout_address = final_snapshot.payout_address.clone();
+            profile_cfg.intensity = final_snapshot.search.intensity;
+            profile_cfg.token_donations.insert(
+                profile_cfg.token.as_str().into(),
+                final_snapshot.token_donation,
+            );
+            tui::remember_token_session(&profile_cfg, gpus, config_path, Vec::new(), false)?;
+        }
         print_runtime_snapshot(&final_snapshot, false);
         return Ok(Some(SessionSettings {
             intensity: final_snapshot.search.intensity,
@@ -1202,9 +1213,7 @@ fn run_headless_mining(
     }
     let intensity_rx = spawn_intensity_commands();
     let stop = Arc::new(AtomicBool::new(false));
-    let signal_stop = Arc::clone(&stop);
-    ctrlc::set_handler(move || signal_stop.store(true, Ordering::Relaxed))
-        .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
+    pickaxe_miner::session_control::install_stop(&stop)?;
 
     let mut last_status = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
@@ -1299,9 +1308,7 @@ fn run_as_rig(
     let result = (|| {
         let _gpu_lock = mining_lock::acquire_gpu_lock()?;
         let stop = Arc::new(AtomicBool::new(false));
-        let signal = Arc::clone(&stop);
-        ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
-            .map_err(|error| format!("install Ctrl+C handler: {error}"))?;
+        pickaxe_miner::session_control::install_stop(&stop)?;
         rigs::run_rig(
             coordinators,
             name,
@@ -1440,9 +1447,28 @@ fn relaunch_in_terminal() {
 fn main() {
     #[cfg(target_os = "linux")]
     relaunch_in_terminal();
-    let args = cli::parse();
     // #### PR #52: tells this process from an old miner (see `mining_lock`).
     let _mark = mining_lock::register_process();
+    let mut profiles = false;
+    loop {
+        run_application(profiles);
+        if !pickaxe_miner::session_control::take_profiles_request() {
+            break;
+        }
+        profiles = true;
+    }
+}
+
+fn run_application(open_profiles: bool) {
+    let mut args = cli::parse();
+    if open_profiles {
+        // A profile can change networks, devices and servers; CLI overrides
+        // from the session being left must not silently pin the next one.
+        use clap::Parser;
+        let config = args.config.clone();
+        args = cli::Cli::parse_from(["pickaxe", "mine"]);
+        args.config = config;
+    }
     let config_path = match config::config_path(args.config.as_deref()) {
         Ok(path) => path,
         Err(error) => {
@@ -1551,16 +1577,22 @@ fn main() {
             }
         }
         // #### PR #53: several GPU tokens on the selected GPUs, by share.
-        cli::Commands::Split { shares } => {
+        cli::Commands::Split {
+            shares,
+            restricted_electric_pot,
+            owner_electric_pot,
+        } => {
             use std::io::IsTerminal;
             let result = hash_split::Shares::parse(&shares, cfg.network).and_then(|shares| {
                 let gpus = backend::resolve_mining_devices(backend_kind, &effective_device)?;
-                hash_split::run(
+                hash_split::run_with_pot_mode(
                     &cfg,
                     &gpus,
                     &shares,
                     &config_path,
                     args.no_tui || !io::stdout().is_terminal(),
+                    restricted_electric_pot,
+                    owner_electric_pot,
                 )
             });
             if let Err(error) = result {
@@ -2103,7 +2135,15 @@ fn main() {
                 }
             };
             let status_file = (!use_tui).then(|| mine_watch::status_path(&config_path));
-            match run_headless_mining(cfg, &gpus, args.json, use_tui, rig_hub, status_file) {
+            match run_headless_mining(
+                cfg,
+                &gpus,
+                args.json,
+                use_tui,
+                rig_hub,
+                status_file,
+                &config_path,
+            ) {
                 Ok(Some(session)) => {
                     if let Some(name) = profile_name {
                         if let Err(error) = persist_session_profile(&profiles_path, &name, &session)

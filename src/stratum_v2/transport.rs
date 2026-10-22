@@ -509,6 +509,11 @@ mod tests {
     // Look here if: Limits or the receive budget changes.
     #[test]
     fn device_sessions_keep_1_mib_each_way_and_template_sessions_carry_16_mib() {
+        // #### PR #65: this exercises size limits, not wall-clock throughput.
+        // Debug Noise decryption of 4 MiB can exceed a minute on a busy
+        // Windows runner. Production Limits keep their original deadlines;
+        // partial_frame_deadline_closes_the_session checks timeout handling.
+        let test_deadline = Duration::from_secs(180);
         fn big(data: &[u8]) -> MessageFrame<binary_sv2::B016M<'_>> {
             MessageFrame::from_message(data.try_into().unwrap(), 0x74, 0, false).unwrap()
         }
@@ -516,12 +521,20 @@ mod tests {
         let (client, server) = pair();
         let (mut sender, _) = client.split();
         let (_, mut receiver) = server.split();
+        sender.set_limits(Limits {
+            frame_deadline: test_deadline,
+            ..Limits::DEVICE
+        });
+        receiver.set_limits(Limits {
+            frame_deadline: test_deadline,
+            ..Limits::DEVICE
+        });
         let writer = thread::spawn(move || {
             sender.send(big(&vec![7u8; MAX_FRAME_BYTES - 9])).unwrap();
             sender
         });
         // Debug builds encrypt slowly under a loaded test run.
-        let frame = receiver.receive(Duration::from_secs(60)).unwrap().unwrap();
+        let frame = receiver.receive(test_deadline).unwrap().unwrap();
         assert_eq!(frame.encoded_length(), MAX_FRAME_BYTES);
         // One byte over: refused on send.
         assert!(writer
@@ -568,16 +581,47 @@ mod tests {
         .unwrap();
         let (mut to_server, mut from_server) = client.split();
         let (mut to_client, _) = accepted.join().unwrap().split();
+        to_client.set_limits(Limits {
+            frame_deadline: test_deadline,
+            ..Limits::TDP_SERVER
+        });
+        from_server.set_limits(Limits {
+            frame_deadline: test_deadline,
+            ..Limits::TDP_CLIENT
+        });
         let sent = thread::spawn(move || to_client.send(big(&vec![7u8; 4 << 20])));
-        let frame = from_server
-            .receive(Duration::from_secs(60))
-            .unwrap()
-            .unwrap();
+        let frame = from_server.receive(test_deadline).unwrap().unwrap();
         assert_eq!(frame.encoded_length(), 6 + 3 + (4 << 20));
         sent.join().unwrap().unwrap();
         assert!(to_server
             .send(big(&vec![7u8; Limits::TDP_CLIENT.max_out]))
             .is_err());
+    }
+
+    #[test]
+    fn partial_frame_deadline_closes_the_session() {
+        let (client, server) = pair();
+        let (mut sender, _) = client.split();
+        let (_, mut receiver) = server.split();
+        receiver.set_limits(Limits {
+            frame_deadline: Duration::from_millis(20),
+            ..Limits::DEVICE
+        });
+        let wire = sender
+            .encoder
+            .encode_transport(message(7), sender.state.as_mut().unwrap())
+            .unwrap();
+        // Keep the peer open after only the first encrypted byte.
+        sender.stream.write_all(&wire[..1]).unwrap();
+        let error = receiver
+            .receive(Duration::from_secs(5))
+            .expect_err("partial frame must time out");
+        assert!(
+            error.contains("timed out") || error.contains("deadline"),
+            "{error}"
+        );
+        assert!(receiver.state.is_none());
+        assert!(receiver.receive(Duration::from_millis(10)).is_err());
     }
 
     #[test]

@@ -266,11 +266,7 @@ fn run(
         .map(|node| (*node).to_owned())
         .ok_or("P2Pool needs your BCH node: give --node-rpc http://HOST:PORT")?;
     let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))
-            .map_err(|error| error.to_string())?;
-    }
+    crate::session_control::install_stop(&stop)?;
     let node_watch = NodeWatch::start(node, cfg.network);
     loop {
         let plan = launch::plan(cfg, &home, &installed, &settings)?;

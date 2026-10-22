@@ -545,14 +545,27 @@ struct Runtime {
 }
 
 /// Mines `shares` on `gpus` until Ctrl+C or `q`: each runtime token with a
-/// share on its own supervisor, ELECTRIC in its own session, one screen
-/// (or status lines with `plain`), and one GPU lock for all of them.
+/// share on its own supervisor, ELECTRIC in its own session, the mining
+/// dashboard (or status lines with `plain`), and one GPU lock for all of
+/// them.
 pub fn run(
     cfg: &RuntimeConfig,
     gpus: &[GpuDevice],
     shares: &Shares,
     config_path: &Path,
     plain: bool,
+) -> Result<(), String> {
+    run_with_pot_mode(cfg, gpus, shares, config_path, plain, false, false)
+}
+
+pub fn run_with_pot_mode(
+    cfg: &RuntimeConfig,
+    gpus: &[GpuDevice],
+    shares: &Shares,
+    config_path: &Path,
+    plain: bool,
+    restricted_electric_pot: bool,
+    owner_electric_pot: bool,
 ) -> Result<(), String> {
     shares.validate()?;
     if gpus.is_empty() {
@@ -562,17 +575,13 @@ pub fn run(
     let names: Vec<String> = gpus.iter().map(|gpu| gpu.name.clone()).collect();
     let electric_devices = crate::backend::electric_engines_for(gpus.to_vec())?;
     let monitor = Arc::new(Monitor::new(
-        100,
+        cfg.intensity,
         plain,
         crate::electric::miner::device_names(&electric_devices),
     ));
     // ELECTRIC's monitor carries the session's stop signal for every token.
     let stop = Arc::clone(&monitor.stop);
-    {
-        let stop = Arc::clone(&stop);
-        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))
-            .map_err(|error| error.to_string())?;
-    }
+    crate::session_control::install_stop(&stop)?;
     let mut runtimes = Vec::new();
     let mut slots = Vec::new();
     for (token, share) in shares.iter().filter(|(_, share)| *share > 0) {
@@ -580,8 +589,14 @@ pub fn run(
             SplitToken::Gpu(mining_token) => {
                 let mut token_cfg = cfg.clone();
                 token_cfg.set_token(mining_token.as_str())?;
-                // The split decides how much of the time each token mines.
-                token_cfg.set_intensity(100)?;
+                token_cfg.token_donation = cfg
+                    .token_donations
+                    .get(mining_token.as_str())
+                    .copied()
+                    .or(cfg.token_donation);
+                // Shares choose the token; intensity controls work while it
+                // has the GPU, including a saved live-session setting.
+                token_cfg.set_intensity(cfg.intensity)?;
                 let supervisor = RuntimeSupervisor::start_on_gpus(token_cfg, gpus)?;
                 // Every GPU waits for the scheduler's first turn.
                 let hold = supervisor.hold_handle();
@@ -619,7 +634,14 @@ pub fn run(
     let outcome = std::thread::scope(|scope| {
         let electric = electric.then(|| {
             scope.spawn(|| {
-                let mined = crate::electric::miner::run_in_split(cfg, gpus, config_path, &monitor);
+                let mined = crate::electric::miner::run_in_split_with_pot_mode(
+                    cfg,
+                    gpus,
+                    config_path,
+                    &monitor,
+                    restricted_electric_pot,
+                    owner_electric_pot,
+                );
                 if let Err(error) = &mined {
                     // The other tokens keep the GPUs; ELECTRIC no longer asks.
                     monitor.state(format!("Stopped: {error}"));
@@ -632,7 +654,22 @@ pub fn run(
         let shown = if plain {
             report(&stop, &mut runtimes, &monitor, &slots, &layout)
         } else {
-            screen(&stop, &mut runtimes, &monitor, &slots, cfg.network, &layout)
+            // #### PR #65: the split uses the main dashboard. On exit the
+            // caller below joins ELECTRIC and stops the owned supervisors.
+            let miners = crate::tui::Miners {
+                network: cfg.network,
+                runtimes: runtimes
+                    .iter()
+                    .map(|runtime| (runtime.token, &runtime.supervisor))
+                    .collect(),
+                electric: electric.is_some().then_some(&*monitor),
+                split: Some((&slots, &layout)),
+                stop: Some(&stop),
+            };
+            crate::tui::run_miners(&miners, gpus, &|| {
+                stop.load(Ordering::Relaxed)
+                    && electric.as_ref().is_none_or(|worker| worker.is_finished())
+            })
         };
         stop.store(true, Ordering::SeqCst);
         let _ = scheduler.join();
@@ -643,8 +680,39 @@ pub fn run(
         };
         shown.and(electric)
     });
+    let mut final_cfg = cfg.clone();
+    final_cfg.intensity = monitor.summary().intensity;
     for runtime in runtimes {
-        runtime.supervisor.stop();
+        let snapshot = runtime.supervisor.stop();
+        final_cfg.intensity = snapshot.search.intensity;
+        final_cfg
+            .token_donations
+            .insert(runtime.token.name().into(), snapshot.token_donation);
+    }
+    if let Some(donation) = monitor.summary().donation {
+        final_cfg
+            .token_donations
+            .insert("ELECTRIC".into(), donation);
+    }
+    if crate::session_control::profiles_requested() {
+        final_cfg.electric_pot_mode = if owner_electric_pot {
+            crate::config::ElectricPotMode::Owner
+        } else if restricted_electric_pot {
+            crate::config::ElectricPotMode::Restricted
+        } else {
+            cfg.electric_pot_mode
+        };
+        let pairs = slots
+            .iter()
+            .map(|slot| {
+                format!(
+                    "{}={}",
+                    slot.token.name(),
+                    slot.share.load(Ordering::Relaxed)
+                )
+            })
+            .collect();
+        crate::tui::remember_token_session(&final_cfg, gpus, config_path, pairs, false)?;
     }
     outcome
 }
@@ -659,19 +727,32 @@ struct Row {
     state: String,
 }
 
-fn runtime_state(supervisor: &RuntimeSupervisor) -> (f64, String) {
-    let snapshot = supervisor.snapshot();
-    let state = match snapshot.state {
+/// What a PHOTON-runtime token is doing, as the split shows it.
+pub fn runtime_state(snapshot: &crate::runtime::RuntimeSnapshot) -> String {
+    match snapshot.state {
         SupervisorState::Mining => format!("Mining · height {}", snapshot.height),
         SupervisorState::Paused if snapshot.pending_winners > 0 => "Claiming a winner".into(),
         SupervisorState::Paused => "Paused".into(),
         SupervisorState::Reconnecting => "Reconnecting".into(),
         SupervisorState::Error => snapshot
             .last_error
+            .as_ref()
             .map_or_else(|| "Error".into(), |error| format!("Error: {error}")),
         SupervisorState::Stopped => "Stopped".into(),
-    };
-    (snapshot.search.current_rate, state)
+    }
+}
+
+/// #### PR #65: moves the share of `slots[index]` one step up or down while
+/// mining, as `Shares::step` does; up is refused when the shares already add
+/// up to 100%. Returns the new share.
+pub fn step_share(slots: &[Slot], index: usize, up: bool) -> Result<u8, String> {
+    let total = total(slots.iter().map(|slot| slot.share.load(Ordering::Relaxed)));
+    let slot = slots
+        .get(index)
+        .ok_or("no token at that place in the split")?;
+    let next = step(slot.share.load(Ordering::Relaxed), total, up)?;
+    slot.share.store(next, Ordering::Relaxed);
+    Ok(next)
 }
 
 /// Counts accepted rewards and keeps the newest events, newest last.
@@ -712,7 +793,10 @@ fn rows(runtimes: &[Runtime], electric: &crate::electric::ui::Summary, slots: &[
                 token => {
                     let runtime = runtimes.iter().find(|runtime| runtime.token == token);
                     let (rate, state) = runtime
-                        .map(|runtime| runtime_state(&runtime.supervisor))
+                        .map(|runtime| {
+                            let snapshot = runtime.supervisor.snapshot();
+                            (snapshot.search.current_rate, runtime_state(&snapshot))
+                        })
                         .unwrap_or_default();
                     Row {
                         token: token.name(),
@@ -788,249 +872,6 @@ fn report(
         }
     }
     Ok(())
-}
-
-/// The split's screen until `q`, Esc or Ctrl+C. Up/Down picks a token and
-/// Left/Right (or +/-) moves its share by 5%, live.
-fn screen(
-    stop: &AtomicBool,
-    runtimes: &mut [Runtime],
-    monitor: &Monitor,
-    slots: &[Slot],
-    network: MiningNetwork,
-    layout: &std::sync::Mutex<String>,
-) -> Result<(), String> {
-    use crossterm::{
-        event::{self, Event, KeyCode, KeyEventKind},
-        execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    };
-    use ratatui::{backend::CrosstermBackend, Terminal};
-    enable_raw_mode().map_err(|e| e.to_string())?;
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-        }
-    }
-    let _restore = Restore;
-    execute!(std::io::stdout(), EnterAlternateScreen).map_err(|e| e.to_string())?;
-    let mut terminal =
-        Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
-    let started = Instant::now();
-    let mut events = VecDeque::new();
-    let mut view = View {
-        selected: 0,
-        show_qr: None,
-        status: String::new(),
-    };
-    while !stop.load(Ordering::Relaxed) {
-        take_events(runtimes, &mut events);
-        let electric = monitor.summary();
-        let rows = rows(runtimes, &electric, slots);
-        let layout = layout.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        terminal
-            .draw(|frame| {
-                draw(
-                    frame,
-                    &Shown {
-                        network,
-                        uptime: started.elapsed(),
-                        devices: &monitor.devices(),
-                        layout: &layout,
-                        rows: &rows,
-                        electric: slots
-                            .iter()
-                            .any(|slot| slot.token == SplitToken::Electric)
-                            .then_some(&electric),
-                        events: &events,
-                        view: &view,
-                    },
-                )
-            })
-            .map_err(|e| e.to_string())?;
-        if !event::poll(Duration::from_millis(250)).map_err(|e| e.to_string())? {
-            continue;
-        }
-        let Event::Key(key) = event::read().map_err(|e| e.to_string())? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        view.status.clear();
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => stop.store(true, Ordering::SeqCst),
-            KeyCode::Up => view.selected = (view.selected + slots.len() - 1) % slots.len(),
-            KeyCode::Down => view.selected = (view.selected + 1) % slots.len(),
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('-') => {
-                let up = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
-                let total = total(slots.iter().map(|slot| slot.share.load(Ordering::Relaxed)));
-                let slot = &slots[view.selected];
-                match step(slot.share.load(Ordering::Relaxed), total, up) {
-                    Ok(next) => slot.share.store(next, Ordering::Relaxed),
-                    Err(error) => view.status = error,
-                }
-            }
-            KeyCode::Char('f') => {
-                let funded = electric.pot.is_some_and(|(_, claims)| claims > 0);
-                view.show_qr = Some(!view.show_qr.unwrap_or(!funded));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// The screen's own state: the picked token, the QR choice (`None`: shown
-/// while the pot cannot pay a claim) and a status line.
-struct View {
-    selected: usize,
-    show_qr: Option<bool>,
-    status: String,
-}
-
-/// Everything one frame draws.
-struct Shown<'a> {
-    network: MiningNetwork,
-    uptime: Duration,
-    devices: &'a str,
-    /// #### PR #61: which GPUs mine which token.
-    layout: &'a str,
-    rows: &'a [Row],
-    electric: Option<&'a crate::electric::ui::Summary>,
-    events: &'a VecDeque<String>,
-    view: &'a View,
-}
-
-fn draw(frame: &mut ratatui::Frame<'_>, state: &Shown<'_>) {
-    use ratatui::{
-        layout::{Constraint, Layout},
-        style::{Color, Modifier, Style},
-        text::{Line, Span},
-        widgets::{Block, Paragraph, Wrap},
-    };
-    let total: u32 = state.rows.iter().map(|row| u32::from(row.share)).sum();
-    let mut lines = vec![
-        Line::from(format!("GPU        {}", state.devices)),
-        Line::from(format!(
-            "Uptime     {}m {:02}s",
-            state.uptime.as_secs() / 60,
-            state.uptime.as_secs() % 60
-        )),
-        Line::from(format!("Split      {}", state.layout)),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!(
-                "  {:<10} {:>5}  {:>11}  {:>7}  State",
-                "Token", "Share", "Rate", "Rewards"
-            ),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    ];
-    for (index, row) in state.rows.iter().enumerate() {
-        let marker = if index == state.view.selected {
-            '▶'
-        } else {
-            ' '
-        };
-        lines.push(Line::from(format!(
-            "{marker} {:<10} {:>4}%  {:>11}  {:>7}  {}",
-            row.token,
-            row.share,
-            rate_text(row.rate),
-            row.rewards,
-            row.state
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  {:<10} {:>4}%",
-            "Idle",
-            100u32.saturating_sub(total.min(100))
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
-    let mut qr: &[String] = &[];
-    if let Some(electric) = state.electric {
-        lines.push(Line::from(""));
-        if let Some(address) = &electric.pot_address {
-            lines.push(Line::from(format!("Fee pot    {address}")));
-        }
-        lines.push(Line::from(match electric.pot {
-            Some((sats, 0)) => format!(
-                "           {sats} sats · pays no claim · the others mine its time until funded"
-            ),
-            Some((sats, claims)) => format!(
-                "           {sats} sats · pays {claims} claim{}",
-                if claims == 1 { "" } else { "s" }
-            ),
-            None => "           reading the pot…".into(),
-        }));
-        let unfunded = electric.pot.is_none_or(|(_, claims)| claims == 0);
-        if state.view.show_qr.unwrap_or(unfunded) {
-            qr = &electric.pot_qr;
-        }
-    }
-    if !state.view.status.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            state.view.status.clone(),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-    let top = (lines.len() as u16 + 2).max(if qr.is_empty() {
-        0
-    } else {
-        qr.len() as u16 + 2
-    });
-    let areas = Layout::vertical([
-        Constraint::Length(top),
-        Constraint::Min(4),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
-    let title = format!(" Pickaxe · hash split · {} ", state.network.as_str());
-    let stats = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(title));
-    if qr.is_empty() {
-        frame.render_widget(stats, areas[0]);
-    } else {
-        let width = qr[0].chars().count() as u16 + 2;
-        let columns =
-            Layout::horizontal([Constraint::Min(40), Constraint::Length(width)]).split(areas[0]);
-        frame.render_widget(stats, columns[0]);
-        frame.render_widget(
-            Paragraph::new(qr.join("\n"))
-                .style(Style::default().fg(Color::White).bg(Color::Black))
-                .block(Block::bordered().title(" Fund the pot ")),
-            columns[1],
-        );
-    }
-    let mut recent: Vec<String> = state.events.iter().cloned().collect();
-    if let Some(electric) = state.electric {
-        recent.extend(
-            electric
-                .events
-                .iter()
-                .map(|event| format!("ELECTRIC {event}")),
-        );
-    }
-    let shown = recent
-        .len()
-        .saturating_sub(usize::from(areas[1].height.saturating_sub(2)));
-    frame.render_widget(
-        Paragraph::new(recent[shown..].join("\n"))
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(" Recent events ")),
-        areas[1],
-    );
-    frame.render_widget(
-        Paragraph::new("↑/↓ token · ←/→ share ±5% · f fee pot QR · q quit (pending claims saved)"),
-        areas[2],
-    );
 }
 
 #[cfg(test)]
@@ -1292,6 +1133,26 @@ mod tests {
         ]
     }
 
+    // #### PR #65: the dashboard's settings move a running split's share.
+    #[test]
+    fn a_running_share_steps_by_five_and_never_past_100() {
+        let (photon, electric) = (Fake::new(true, 1), Fake::new(true, 1));
+        let slots = slots_of(&photon, &electric);
+        let shares = |slots: &[Slot]| {
+            (
+                slots[0].share.load(Ordering::Relaxed),
+                slots[1].share.load(Ordering::Relaxed),
+            )
+        };
+        assert!(step_share(&slots, 0, true).unwrap_err().contains("100%"));
+        assert_eq!(step_share(&slots, 0, false), Ok(75));
+        assert_eq!(step_share(&slots, 1, true), Ok(25));
+        assert_eq!(shares(&slots), (75, 25));
+        assert!(step_share(&slots, 1, true).is_err());
+        assert!(step_share(&slots, 2, true).is_err());
+        assert_eq!(shares(&slots), (75, 25));
+    }
+
     #[test]
     fn the_scheduler_gives_each_token_its_share_and_releases_every_hold_at_stop() {
         let (photon, electric) = (Fake::new(true, 1), Fake::new(true, 1));
@@ -1344,87 +1205,5 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
         });
         assert!(photon.released() && electric.released());
-    }
-
-    fn screen_text(state: &Shown<'_>) -> String {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|frame| draw(frame, state)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
-    }
-
-    #[test]
-    fn the_screen_shows_each_tokens_share_rate_and_an_unfunded_pot_with_its_qr() {
-        let rows = [
-            Row {
-                token: "PHOTON",
-                share: 80,
-                rate: 1.35e9,
-                rewards: 2,
-                state: "Mining · height 973600".into(),
-            },
-            Row {
-                token: "ELECTRIC",
-                share: 20,
-                rate: 0.0,
-                rewards: 0,
-                state: "Waiting for BCH in the fee pot".into(),
-            },
-        ];
-        let address = "bitcoincash:pdemoaddressforthesplitscreenonlyqqqqqqqqqqqqqqqqqqqqqqqq";
-        let mut electric = crate::electric::ui::Summary {
-            pot_address: Some(address.into()),
-            pot_qr: crate::electric::ui::qr_lines(address).unwrap(),
-            pot: Some((500, 0)),
-            events: vec!["Connected: wss://example".into()],
-            ..Default::default()
-        };
-        let mut events = VecDeque::new();
-        events.push_back("PHOTON job g=1 h=973600 ab:0".to_string());
-        let view = View {
-            selected: 1,
-            show_qr: None,
-            status: String::new(),
-        };
-        let text = |electric: &crate::electric::ui::Summary| {
-            screen_text(&Shown {
-                network: MiningNetwork::Mainnet,
-                uptime: Duration::from_secs(75),
-                devices: "RTX 5070 Ti (cuda)",
-                layout: "The GPU takes turns: PHOTON 80% · ELECTRIC 20%",
-                rows: &rows,
-                electric: Some(electric),
-                events: &events,
-                view: &view,
-            })
-        };
-        let unfunded = text(&electric);
-        for expected in [
-            " Pickaxe · hash split · mainnet ".to_string(),
-            "Split      The GPU takes turns: PHOTON 80% · ELECTRIC 20%".into(),
-            format!(
-                "  {:<10} {:>4}%  {:>11}  {:>7}  Mining · height 973600",
-                "PHOTON", 80, "1.35 GH/s", 2
-            ),
-            format!("▶ {:<10} {:>4}%  {:>11}", "ELECTRIC", 20, "0 MH/s"),
-            format!("  {:<10} {:>4}%", "Idle", 0),
-            "500 sats · pays no claim · the others mine its time until funded".into(),
-            " Fund the pot ".into(),
-            "PHOTON job g=1".into(),
-            "ELECTRIC Connected: wss://example".into(),
-            "←/→ share ±5%".into(),
-        ] {
-            assert!(unfunded.contains(&expected), "{expected}: {unfunded}");
-        }
-        electric.pot = Some((717_383, 380));
-        let funded = text(&electric);
-        assert!(funded.contains("717383 sats · pays 380 claims"), "{funded}");
-        assert!(!funded.contains(" Fund the pot "));
     }
 }

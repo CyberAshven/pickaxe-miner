@@ -37,11 +37,12 @@ pub(super) struct Journal {
 }
 
 impl Journal {
-    pub fn open(
+    pub fn open_with_key(
         path: &Path,
         deployment: &Deployment,
         pot: &Pot,
         pkhs: &[[u8; 20]; 3],
+        key: Option<&secp256k1::SecretKey>,
     ) -> Result<Self, String> {
         let binding = format!(
             "{}:{}",
@@ -82,7 +83,7 @@ impl Journal {
                         return Err("invalid saved ELECTRIC proof; journal preserved".into());
                     }
                     if let Some(prepared) = &pending.prepared {
-                        let built = super::build_claim(
+                        let built = super::build_authorized_claim(
                             deployment,
                             pot,
                             &pending.baton,
@@ -90,6 +91,7 @@ impl Journal {
                             &pending.win,
                             prepared.locktime,
                             prepared.relay_fee,
+                            key,
                         )?;
                         if hex::encode(built.raw) != prepared.raw {
                             return Err(
@@ -164,6 +166,12 @@ mod tests {
 
     #[test]
     fn completed_proof_and_exact_transaction_survive_restart_and_invalid_files_are_preserved() {
+        for authorized in [false, true] {
+            journal_roundtrip(authorized);
+        }
+    }
+
+    fn journal_roundtrip(authorized: bool) {
         let dir =
             std::env::temp_dir().join(format!("electric-journal-{:016x}", rand::random::<u64>()));
         let path = dir.join("pending.json");
@@ -184,7 +192,18 @@ mod tests {
             ))
             .unwrap()
         });
-        let pot = Pot::new(&deployment, &locks).unwrap();
+        let key = secp256k1::SecretKey::from_secret_bytes([0x31; 32]).unwrap();
+        let secret = authorized.then_some(&key);
+        let pot = if authorized {
+            Pot::with_authorized_claims(
+                &deployment,
+                &locks,
+                secp256k1::PublicKey::from_secret_key(&key),
+            )
+            .unwrap()
+        } else {
+            Pot::new(&deployment, &locks).unwrap()
+        };
         let nonce = super::super::search(123, &pkhs[0], 1, u64::MAX - 100, 100_000).unwrap();
         let mut pending = Pending {
             baton: Baton {
@@ -205,17 +224,17 @@ mod tests {
             },
             prepared: None,
         };
-        let mut journal = Journal::open(&path, &deployment, &pot, &pkhs).unwrap();
+        let mut journal = Journal::open_with_key(&path, &deployment, &pot, &pkhs, secret).unwrap();
         journal.save(Some(pending.clone())).unwrap();
         drop(journal);
-        let mut journal = Journal::open(&path, &deployment, &pot, &pkhs).unwrap();
+        let mut journal = Journal::open_with_key(&path, &deployment, &pot, &pkhs, secret).unwrap();
         assert_eq!(journal.pending().unwrap().win, pending.win);
         let coin = Coin {
             txid: "55".repeat(32),
             vout: 1,
             value: 50_000,
         };
-        let built = super::super::build_claim(
+        let built = super::super::build_authorized_claim(
             &deployment,
             &pot,
             &pending.baton,
@@ -223,6 +242,7 @@ mod tests {
             &pending.win,
             124,
             1000,
+            secret,
         )
         .unwrap();
         let raw = hex::encode(built.raw);
@@ -234,13 +254,19 @@ mod tests {
         });
         journal.save(Some(pending)).unwrap();
         drop(journal);
-        let mut reopened = Journal::open(&path, &deployment, &pot, &pkhs).unwrap();
+        let mut reopened = Journal::open_with_key(&path, &deployment, &pot, &pkhs, secret).unwrap();
         assert_eq!(reopened.pending().unwrap().prepared.unwrap().raw, raw);
         let bytes = fs::read(&path).unwrap();
         let mut other = pkhs;
         other[0][0] ^= 1;
-        assert!(Journal::open(&path, &deployment, &pot, &other).is_err());
+        assert!(Journal::open_with_key(&path, &deployment, &pot, &other, secret).is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes);
+        if authorized {
+            let wrong = secp256k1::SecretKey::from_secret_bytes([0x32; 32]).unwrap();
+            assert!(Journal::open_with_key(&path, &deployment, &pot, &pkhs, Some(&wrong)).is_err());
+            assert!(Journal::open_with_key(&path, &deployment, &pot, &pkhs, None).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
         // A failed replacement must leave the durable claim untouched.
         let blocking_path = dir.join("blocked");
         fs::create_dir(&blocking_path).unwrap();
@@ -252,7 +278,7 @@ mod tests {
         corrupt["pending"]["prepared"]["raw"] = "00".into();
         let bad = serde_json::to_vec(&corrupt).unwrap();
         fs::write(&path, &bad).unwrap();
-        assert!(Journal::open(&path, &deployment, &pot, &pkhs).is_err());
+        assert!(Journal::open_with_key(&path, &deployment, &pot, &pkhs, secret).is_err());
         assert_eq!(fs::read(&path).unwrap(), bad);
         fs::remove_dir_all(dir).unwrap();
     }

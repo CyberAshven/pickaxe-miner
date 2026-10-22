@@ -1,4 +1,6 @@
 //! #### PR #58: terminal controls for the ELECTRIC GPU session.
+//! #### PR #65: its state, rates, fee pot and events, which the mining
+//! dashboard shows and steers (`tui::run_electric`).
 use std::{
     collections::VecDeque,
     sync::{
@@ -12,6 +14,7 @@ use std::{
 pub const MAX_HELD_GPUS: usize = 64;
 
 pub struct Monitor {
+    pub(crate) withdrawal: Mutex<super::withdrawal::Control>,
     pub stop: Arc<AtomicBool>,
     pub paused: AtomicBool,
     /// #### PR #53: the hash split holds the GPUs for another token.
@@ -23,6 +26,9 @@ pub struct Monitor {
     /// minable, so ELECTRIC wants its share of the GPUs.
     pub searching: AtomicBool,
     pub intensity: AtomicU8,
+    /// A UI change is consumed while reserving the next GPU batch.
+    donation_change: Mutex<Option<crate::donation::Scheme>>,
+    donation_changed: AtomicBool,
     pub hashes: AtomicU64,
     view: Mutex<View>,
     plain: bool,
@@ -30,26 +36,63 @@ pub struct Monitor {
 }
 
 /// #### PR #53: what the hash split's screen shows of the ELECTRIC session.
+/// #### PR #65: and the mining dashboard, for a split or ELECTRIC alone.
 #[derive(Debug, Clone, Default)]
 pub struct Summary {
+    pub(crate) withdrawal: super::withdrawal::View,
     pub state: String,
     /// Hashes a second over the last two seconds.
     pub rate: f64,
+    /// #### PR #65: the GPUs' hashes a second while they mine (not while
+    /// paused or held for another token).
+    pub active_rate: f64,
+    /// #### PR #65: every hash since the session started, and how long ago
+    /// that was.
+    pub hashes: u64,
+    pub uptime: Duration,
     pub claims: u64,
     pub pot_address: Option<String>,
     pub pot_qr: Vec<String>,
     /// Plain-BCH sats in the pot and the claims they pay, once read.
     pub pot: Option<(u64, u64)>,
+    /// #### PR #65: where the pot's recovery key is saved.
+    pub pot_key: Option<String>,
     pub events: Vec<String>,
+    /// #### PR #65: the GPUs, their intensity and whether mining is paused.
+    pub devices: String,
+    pub intensity: u8,
+    pub paused: bool,
+    /// Effective donation of the schedule created by the mining loop.
+    pub donation: Option<crate::donation::TokenDonation>,
+    pub difficulty: Option<u8>,
+    pub pending: bool,
+    pub endpoint: Option<String>,
+    /// Successful connections after the first, for ELECTRIC alone.
+    pub reconnects: u64,
+    pub height: Option<u32>,
+    /// Conservative transaction-fee estimate, excluding the token output's BCH.
+    pub claim_fee_estimate: Option<u64>,
 }
+
+/// #### PR #65: events kept for the dashboard to take, at most.
+const FRESH_EVENTS: usize = 96;
 
 struct View {
     state: String,
     events: VecDeque<String>,
+    /// #### PR #65: events the dashboard has not taken yet.
+    fresh: VecDeque<String>,
     samples: VecDeque<(Instant, usize, u32, Duration)>,
     devices: String,
     claims: u64,
     pot: Option<PotView>,
+    donation: Option<crate::donation::TokenDonation>,
+    difficulty: Option<u8>,
+    pending: bool,
+    endpoint: Option<String>,
+    connections: u64,
+    height: Option<u32>,
+    claim_fee_estimate: Option<u64>,
 }
 
 /// The fee pot the miner funds, as the screen shows it.
@@ -98,20 +141,31 @@ pub fn qr_lines(text: &str) -> Result<Vec<String>, String> {
 impl Monitor {
     pub fn new(intensity: u8, plain: bool, devices: String) -> Self {
         Self {
+            withdrawal: Mutex::new(super::withdrawal::Control::default()),
             stop: Arc::new(AtomicBool::new(false)),
             paused: AtomicBool::new(false),
             held: AtomicBool::new(false),
             held_gpus: (0..MAX_HELD_GPUS).map(|_| AtomicBool::new(false)).collect(),
             searching: AtomicBool::new(false),
             intensity: AtomicU8::new(intensity),
+            donation_change: Mutex::new(None),
+            donation_changed: AtomicBool::new(false),
             hashes: AtomicU64::new(0),
             view: Mutex::new(View {
                 state: "Connecting".into(),
                 events: VecDeque::new(),
+                fresh: VecDeque::new(),
                 samples: VecDeque::new(),
                 devices,
                 claims: 0,
                 pot: None,
+                donation: None,
+                difficulty: None,
+                pending: false,
+                endpoint: None,
+                connections: 0,
+                height: None,
+                claim_fee_estimate: None,
             }),
             plain,
             started: Instant::now(),
@@ -119,6 +173,76 @@ impl Monitor {
     }
     pub fn stopped(&self) -> bool {
         self.stop.load(Relaxed)
+    }
+
+    pub fn set_donation_display(&self, scheme: crate::donation::Scheme) {
+        let total: u16 = scheme.work().into_iter().sum();
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .donation
+            .get_or_insert(crate::donation::TokenDonation::from_bps(total));
+    }
+
+    /// #### PR #65: only future mining work changes; saved claims keep their
+    /// original recipient and signed transaction.
+    pub fn request_donation(
+        &self,
+        network: crate::config::MiningNetwork,
+        value: crate::donation::TokenDonation,
+    ) -> Result<(), String> {
+        let deployment = super::Deployment::select(network, None, None, None, None)?;
+        let scheme = deployment.donation_policy(Some(value)).scheme;
+        *self
+            .donation_change
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(scheme);
+        self.donation_changed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let total = scheme.work().into_iter().sum();
+        self.view.lock().unwrap_or_else(|e| e.into_inner()).donation =
+            Some(crate::donation::TokenDonation::from_bps(total));
+        Ok(())
+    }
+
+    pub(super) fn apply_donation(
+        &self,
+        schedule: &mut crate::donation::Schedule,
+    ) -> Result<(), String> {
+        if !self
+            .donation_changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        if let Some(scheme) = self
+            .donation_change
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            schedule.set_scheme(scheme)?;
+        }
+        Ok(())
+    }
+
+    /// #### PR #65: connection and claim-cost details belong to ELECTRIC,
+    /// including while it lends its GPU time to another token.
+    pub(super) fn connected(&self, endpoint: &str) {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.endpoint = Some(crate::node::redact_url(endpoint));
+        view.connections = view.connections.saturating_add(1);
+    }
+
+    pub(super) fn job(&self, height: u32, difficulty: u8, fee_estimate: u64) {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.height = Some(height);
+        view.difficulty = Some(difficulty);
+        view.claim_fee_estimate = Some(fee_estimate);
+    }
+
+    pub(super) fn pending(&self, pending: bool) {
+        self.view.lock().unwrap_or_else(|e| e.into_inner()).pending = pending;
     }
 
     /// #### PR #61: holds or releases the GPU at `device` alone.
@@ -187,13 +311,31 @@ impl Monitor {
             println!("{text}");
         }
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.plain {
+            view.fresh.push_back(text.clone());
+            while view.fresh.len() > FRESH_EVENTS {
+                view.fresh.pop_front();
+            }
+        }
         view.events.push_back(text);
         while view.events.len() > 12 {
             view.events.pop_front();
         }
     }
+    /// #### PR #65: the events since the dashboard last took them, oldest
+    /// first.
+    pub fn drain_events(&self) -> Vec<String> {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fresh
+            .drain(..)
+            .collect()
+    }
     pub fn accepted(&self) {
-        self.view.lock().unwrap_or_else(|e| e.into_inner()).claims += 1;
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.claims += 1;
+        view.pending = false;
     }
     /// The pot to fund, and where its recovery key is saved.
     pub fn set_pot(&self, address: &str, key: Option<&std::path::Path>) {
@@ -244,13 +386,24 @@ impl Monitor {
             .map(|&(_, _, count, _)| u64::from(count))
             .sum();
         let elapsed = now.duration_since(self.started).min(window);
+        let paused = self.paused.load(Relaxed);
         Summary {
+            withdrawal: self
+                .withdrawal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .view(),
             state: if self.stopped() {
                 "Stopping; preserving pending claim".into()
+            } else if paused {
+                "Paused".into()
             } else {
                 view.state.clone()
             },
             rate: recent as f64 / elapsed.as_secs_f64().max(1e-3),
+            active_rate: rates(&view.samples, now).1 * 1e6,
+            hashes: self.hashes.load(Relaxed),
+            uptime: now.duration_since(self.started),
             claims: view.claims,
             pot_address: view.pot.as_ref().map(|pot| pot.address.clone()),
             pot_qr: view
@@ -262,7 +415,18 @@ impl Monitor {
                 .pot
                 .as_ref()
                 .and_then(|pot| pot.sats.map(|sats| (sats, pot.claims))),
+            pot_key: view.pot.as_ref().and_then(|pot| pot.key.clone()),
             events: view.events.iter().cloned().collect(),
+            devices: view.devices.clone(),
+            intensity: self.intensity.load(Relaxed),
+            paused,
+            donation: view.donation,
+            difficulty: view.difficulty,
+            pending: view.pending,
+            endpoint: view.endpoint.clone(),
+            reconnects: view.connections.saturating_sub(1),
+            height: view.height,
+            claim_fee_estimate: view.claim_fee_estimate,
         }
     }
     pub fn record(&self, device: usize, count: u32, duration: Duration) {
@@ -280,21 +444,22 @@ impl Monitor {
     }
 }
 
+/// Mines with `mine` until it ends: on the mining dashboard (#### PR #65),
+/// or printing each state and event with `plain`. `gpus` are the GPUs it
+/// mines, for their telemetry.
 pub fn run(
     monitor: &Monitor,
+    gpus: &[crate::backend::GpuDevice],
+    network: crate::config::MiningNetwork,
     mine: impl FnOnce() -> Result<(), String> + Send,
 ) -> Result<(), String> {
-    let stop = Arc::clone(&monitor.stop);
-    ctrlc::set_handler(move || {
-        stop.store(true, Relaxed);
-    })
-    .map_err(|e| e.to_string())?;
+    crate::session_control::install_stop(&monitor.stop)?;
     if monitor.plain {
         return mine();
     }
     std::thread::scope(|scope| {
         let worker = scope.spawn(mine);
-        let displayed = display(monitor, || worker.is_finished());
+        let displayed = crate::tui::run_electric(monitor, gpus, network, &|| worker.is_finished());
         monitor.stop.store(true, Relaxed);
         let mined = worker
             .join()
@@ -303,166 +468,8 @@ pub fn run(
     })
 }
 
-fn display(monitor: &Monitor, finished: impl Fn() -> bool) -> Result<(), String> {
-    use crossterm::{
-        event::{self, Event, KeyCode, KeyEventKind},
-        execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    };
-    use ratatui::{backend::CrosstermBackend, Terminal};
-    enable_raw_mode().map_err(|e| e.to_string())?;
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-        }
-    }
-    let _restore = Restore;
-    execute!(std::io::stdout(), EnterAlternateScreen).map_err(|e| e.to_string())?;
-    let mut terminal =
-        Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
-    // None: show the QR code while the pot cannot pay a claim; `f` toggles.
-    let mut show_qr: Option<bool> = None;
-    while !finished() {
-        terminal
-            .draw(|frame| draw(frame, monitor, show_qr))
-            .map_err(|e| e.to_string())?;
-        if event::poll(Duration::from_millis(250)).map_err(|e| e.to_string())? {
-            if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => monitor.stop.store(true, Relaxed),
-                    KeyCode::Char('f') => {
-                        let funded = monitor
-                            .view
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .pot
-                            .as_ref()
-                            .is_some_and(|pot| pot.claims > 0);
-                        show_qr = Some(!show_qr.unwrap_or(!funded));
-                    }
-                    KeyCode::Char('p') => {
-                        monitor.paused.fetch_xor(true, Relaxed);
-                    }
-                    // Only this thread changes the intensity; the miner reads it.
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        let now = monitor.intensity.load(Relaxed);
-                        monitor.intensity.store((now + 5).min(100), Relaxed);
-                    }
-                    KeyCode::Char('-') => {
-                        let now = monitor.intensity.load(Relaxed);
-                        monitor
-                            .intensity
-                            .store(now.saturating_sub(5).max(10), Relaxed);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// One frame of the ELECTRIC screen: the session's state and rates, the
-/// fee pot with its QR code while it cannot pay a claim (or as `f` set
-/// it), recent events and the keys.
-fn draw(frame: &mut ratatui::Frame<'_>, monitor: &Monitor, show_qr: Option<bool>) {
-    use ratatui::{
-        layout::{Constraint, Layout},
-        style::{Color, Style},
-        widgets::{Block, Paragraph, Wrap},
-    };
-    let view = monitor.view.lock().unwrap_or_else(|e| e.into_inner());
-    let (current, active) = rates(&view.samples, Instant::now());
-    let total = monitor.hashes.load(Relaxed);
-    let elapsed = monitor.started.elapsed().as_secs_f64();
-    let state = if monitor.stopped() {
-        "Stopping; preserving pending claim"
-    } else if monitor.paused.load(Relaxed) {
-        "Paused"
-    } else {
-        &view.state
-    };
-    let mut stats = format!(
-        "State      {state}\nGPU        {}\nHashrate   now {:.2} MH/s · active {:.2} MH/s · wall avg {:.2} MH/s\nWork       {total} hashes\nRewards    {} accepted\nIntensity  {}%\nUptime     {:.0}s",
-        view.devices,
-        current,
-        active,
-        total as f64 / elapsed.max(1e-6) / 1e6,
-        view.claims,
-        monitor.intensity.load(Relaxed),
-        elapsed
-    );
-    let mut qr: &[String] = &[];
-    if let Some(pot) = &view.pot {
-        stats.push_str(&format!("\nFee pot    {}", pot.address));
-        stats.push_str(&match pot.sats {
-            Some(sats) => format!(
-                "\n           {sats} sats · pays {} claim{}{}",
-                pot.claims,
-                if pot.claims == 1 { "" } else { "s" },
-                if pot.claims == 0 {
-                    " · send BCH to this address"
-                } else {
-                    ""
-                }
-            ),
-            None => "\n           reading the pot…".to_string(),
-        });
-        if let Some(key) = &pot.key {
-            stats.push_str(&format!("\nRefund key {key} (back it up)"));
-        }
-        if show_qr.unwrap_or(pot.claims == 0) {
-            qr = &pot.qr;
-        }
-    }
-    let lines = stats.lines().count() as u16 + 2;
-    let top = lines.max(if qr.is_empty() {
-        0
-    } else {
-        qr.len() as u16 + 2
-    });
-    let areas = Layout::vertical([
-        Constraint::Length(top),
-        Constraint::Min(4),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
-    let stats = Paragraph::new(stats)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(" Pickaxe · ELECTRIC "));
-    if qr.is_empty() {
-        frame.render_widget(stats, areas[0]);
-    } else {
-        let width = qr[0].chars().count() as u16 + 2;
-        let columns =
-            Layout::horizontal([Constraint::Min(30), Constraint::Length(width)]).split(areas[0]);
-        frame.render_widget(stats, columns[0]);
-        frame.render_widget(
-            Paragraph::new(qr.join("\n"))
-                .style(Style::default().fg(Color::White).bg(Color::Black))
-                .block(Block::bordered().title(" Fund the pot ")),
-            columns[1],
-        );
-    }
-    frame.render_widget(
-        Paragraph::new(view.events.iter().cloned().collect::<Vec<_>>().join("\n"))
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(" Recent events ")),
-        areas[1],
-    );
-    frame.render_widget(
-        Paragraph::new(
-            "p pause/resume · +/- intensity · f fee pot QR · q quit (pending claims saved)",
-        ),
-        areas[2],
-    );
-}
-
+/// Each GPU's hashes a second over its recent batches, in MH/s: those that
+/// mined in the last two seconds, and all of them while busy.
 fn rates(samples: &VecDeque<(Instant, usize, u32, Duration)>, now: Instant) -> (f64, f64) {
     let mut devices = std::collections::BTreeMap::new();
     for &(time, device, count, duration) in samples {
@@ -493,44 +500,102 @@ fn rates(samples: &VecDeque<(Instant, usize, u32, Duration)>, now: Instant) -> (
 mod tests {
     use super::*;
     #[test]
-    fn the_screen_shows_an_unfunded_pot_with_its_qr_code_until_it_pays_a_claim() {
+    fn donation_changes_keep_reserved_recipients_and_apply_to_future_batches() {
+        use crate::donation::{Recipient, Schedule, Scheme, TokenDonation};
+        let monitor = Monitor::new(100, false, "test".into());
+        let mut schedule = Schedule::new(Scheme::Work([200, 200]), 7, 48 * 7).unwrap();
+        let reserved_recipient = schedule.recipient();
+        let reserved_count = schedule.limit_batch(100);
+        schedule.record(reserved_count).unwrap();
+        monitor
+            .request_donation(
+                crate::config::MiningNetwork::Mainnet,
+                TokenDonation::from_bps(450),
+            )
+            .unwrap();
+        // Initialization must not overwrite a UI change made while connecting.
+        monitor.set_donation_display(Scheme::Work([200, 200]));
+        assert_eq!(monitor.summary().donation.unwrap().bps(), 450);
+        monitor.apply_donation(&mut schedule).unwrap();
+        assert_eq!(reserved_recipient, Recipient::Project);
+        assert_eq!(reserved_count, 7);
+        let mut counts = [0u64; 3];
+        let mut remaining = 200 * 7;
+        while remaining > 0 {
+            let count = schedule.limit_batch(remaining);
+            counts[schedule.recipient() as usize] += u64::from(count);
+            schedule.record(count).unwrap();
+            remaining -= count;
+        }
+        assert_eq!(counts, [191 * 7, 5 * 7, 4 * 7]);
+        monitor.pending(true);
+        monitor.accepted();
+        assert!(!monitor.summary().pending);
+    }
+    // #### PR #65: what the dashboard reads of the session.
+    #[test]
+    fn the_summary_carries_the_pot_its_key_and_events_for_the_dashboard() {
         let monitor = Monitor::new(80, false, "RTX (cuda)".into());
         let address = "bchtest:p0ssibledemoaddressforthescreenonlyqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
         monitor.set_pot(address, Some(std::path::Path::new("C:/keys/e.pot-key")));
-        let screen = |show_qr| {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
-            terminal
-                .draw(|frame| draw(frame, &monitor, show_qr))
-                .unwrap();
-            terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        };
-        let unread = screen(None);
-        for expected in [
-            address,
-            " Fund the pot ",
-            "reading the pot",
-            "C:/keys/e.pot-key (back it up)",
-            "f fee pot QR",
-        ] {
-            assert!(unread.contains(expected), "{expected}: {unread}");
-        }
-        monitor.pot_balance(500, 0);
-        let empty = screen(None);
-        assert!(empty.contains("500 sats · pays 0 claims · send BCH to this address"));
-        assert!(empty.contains(" Fund the pot "));
-        monitor.pot_balance(8_000, 3);
-        let funded = screen(None);
-        assert!(funded.contains("8000 sats · pays 3 claims"), "{funded}");
-        assert!(!funded.contains(" Fund the pot "));
-        assert!(screen(Some(true)).contains(" Fund the pot "));
-        assert!(!screen(Some(false)).contains(" Fund the pot "));
+        monitor.event("Connected: wss://example");
+        monitor.event("Verified proof for you · 120.00 MH/s");
+        monitor.record(0, 1_000_000, Duration::from_millis(10));
+        monitor.set_donation_display(crate::donation::Scheme::Work([350, 200]));
+        let summary = monitor.summary();
+        assert_eq!(summary.pot_address.as_deref(), Some(address));
+        assert_eq!(summary.pot_key.as_deref(), Some("C:/keys/e.pot-key"));
+        assert_eq!(summary.pot, None, "not read yet");
+        assert!(!summary.pot_qr.is_empty());
+        assert_eq!((summary.intensity, summary.paused), (80, false));
+        assert_eq!(summary.hashes, 1_000_000);
+        assert_eq!(summary.active_rate, 100e6);
+        assert_eq!(summary.devices, "RTX (cuda)");
+        assert_eq!(summary.donation.map(|d| d.bps()), Some(550));
+        monitor.pot_balance(717_383, 380);
+        assert_eq!(monitor.summary().pot, Some((717_383, 380)));
+        // The dashboard takes each event once, oldest first.
+        assert_eq!(
+            monitor.drain_events(),
+            [
+                "Connected: wss://example",
+                "Verified proof for you · 120.00 MH/s"
+            ]
+        );
+        assert!(monitor.drain_events().is_empty());
+        monitor.paused.store(true, Relaxed);
+        assert_eq!(monitor.summary().state, "Paused");
+        monitor.stop.store(true, Relaxed);
+        assert_eq!(
+            monitor.summary().state,
+            "Stopping; preserving pending claim"
+        );
+        // Printed lines (`--no-tui`) are not kept for a dashboard.
+        let plain = Monitor::new(80, true, "RTX (cuda)".into());
+        plain.event("Connected: wss://example");
+        assert!(plain.drain_events().is_empty());
+    }
+
+    #[test]
+    fn electric_connection_and_cost_details_do_not_invent_a_first_reconnect() {
+        let monitor = Monitor::new(80, false, "test".into());
+        assert!(monitor.summary().endpoint.is_none());
+        assert_eq!(monitor.summary().reconnects, 0);
+        monitor.connected("wss://user:example-secret@electric.invalid:50004");
+        let initial = monitor.summary();
+        assert_eq!(initial.reconnects, 0);
+        assert!(!initial.endpoint.unwrap().contains("example-secret"));
+        monitor.connected("wss://electric-other.invalid:50004");
+        monitor.job(973893, 4, 1234);
+        let next = monitor.summary();
+        assert_eq!(
+            next.endpoint.as_deref(),
+            Some("wss://electric-other.invalid:50004")
+        );
+        assert_eq!(next.reconnects, 1);
+        assert_eq!(next.height, Some(973893));
+        assert_eq!(next.difficulty, Some(4));
+        assert_eq!(next.claim_fee_estimate, Some(1234));
     }
 
     #[test]

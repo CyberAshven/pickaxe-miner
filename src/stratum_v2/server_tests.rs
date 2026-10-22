@@ -365,6 +365,8 @@ impl Running {
             None,
             None,
             Some(super::jd::client::JdTarget {
+                p2pool_prepare_api: None,
+                required: false,
                 address: pool.address.to_string(),
                 authority: pool.authority,
                 identity: payout(),
@@ -392,6 +394,8 @@ impl Running {
             None,
             None,
             Some(super::jd::client::JdTarget {
+                p2pool_prepare_api: None,
+                required: false,
                 address: pool.address.to_string(),
                 authority: pool.authority,
                 identity: payout(),
@@ -3283,6 +3287,8 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
     let stop = Arc::new(AtomicBool::new(false));
     let (handle, thread) = super::jd::client::spawn(
         vec![super::jd::client::JdTarget {
+            p2pool_prepare_api: None,
+            required: false,
             address: pool.address.to_string(),
             authority: pool.authority,
             identity: payout(),

@@ -1,21 +1,21 @@
 //! #### PR #51
 //! What: `pickaxe electric`: the fee pot's address, the baton's state, the
-//! GPU miner that follows the baton through Fulcrum and claims from the pot, and
+//! GPU miner that follows the baton through BCHN or Fulcrum and claims from the pot, and
 //! owner-authorized recovery (legacy pots remain explicitly selectable).
 //! Why: ELECTRIC shares GPU hashing and device selection with PHOTON.
 //! Check: the tests in `electric` and `tools/reward-policy-vm/electric.mjs`
-//! cover what is broadcast; this file only reads Fulcrum and sends.
+//! cover what is broadcast; both sources share the same claim and recovery path.
 
 use super::recovery::RecoveryKey;
+use super::source::Session as SourceSession;
 use super::{
-    build_claim, build_refund, claim_locktime, script_hash_hex, Baton, Coin, Deployment, Pot,
-    SearchJob, POT_MIN_CHANGE_SATS, TOKEN_OUTPUT_SATS,
+    build_authorized_claim, build_refund, Baton, Coin, Deployment, Pot, SearchJob,
+    POT_MIN_CHANGE_SATS, TOKEN_OUTPUT_SATS,
 };
 use crate::cli::{ElectricCommand, ElectricDeploymentArgs};
-use crate::config::{MiningToken, RuntimeConfig};
+use crate::config::RuntimeConfig;
 use crate::donation::{Recipient, Schedule};
-use crate::electrum::ElectrumSession;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -38,10 +38,26 @@ pub fn run(
     no_tui: bool,
 ) -> Result<(), String> {
     match command {
+        ElectricCommand::Wallet => {
+            let wallet = super::wallet::create(cfg.network, config_path)?;
+            println!("Pickaxe payout wallet on {}", cfg.network.as_str());
+            println!("{}", wallet.address);
+            for row in super::ui::qr_lines(&wallet.address)? {
+                println!("{row}");
+            }
+            println!("Private backup: {}. Back up this file before receiving rewards. Creating this wallet does not move old funds or change the current profile.", wallet.key_path.display());
+            Ok(())
+        }
         ElectricCommand::Pot { deployment } => {
             let args = deployment;
             let deployment = select(cfg, args)?;
             let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, true)?;
+            if pot.owner_destination {
+                println!("Owner-controlled pot: its saved key controls Max/send to a chosen BCH address. This is a separate new pot; old pot funds are not moved.");
+            }
+            if pot.authorized_claims {
+                println!("Signed claim pot: fresh same-height proofs are allowed. Older funded pots retain their address and key; select --restricted-pot on status/refund to recover their BCH. No funds are moved automatically.");
+            }
             if let Some(path) = key_path {
                 println!(
                     "Recovery key saved: {}. Back up this private file before funding.",
@@ -67,14 +83,23 @@ pub fn run(
         ElectricCommand::Status { deployment } => {
             let args = deployment;
             let deployment = select(cfg, args)?;
-            let mut session = connect(cfg)?;
+            let pot = if cfg.payout_address.trim().is_empty() {
+                None
+            } else {
+                Some(pot_for(cfg, &deployment, args, config_path, false)?.0)
+            };
+            let mut session = connect(cfg, Some(&deployment), pot.as_ref())?;
             let tip = read_tip(&mut session)?;
             let baton = read_baton(&mut session, &deployment)?;
             println!("server:     {}", session.url);
             println!("tip:        {tip}");
-            print_baton(&deployment, &baton, tip);
-            if !cfg.payout_address.trim().is_empty() {
-                let (pot, _, _) = pot_for(cfg, &deployment, args, config_path, false)?;
+            print_baton(
+                &deployment,
+                &baton,
+                tip,
+                args.restricted_pot || args.legacy_pot,
+            );
+            if let Some(pot) = pot {
                 let coins = read_pot(&mut session, &pot)?;
                 println!(
                     "pot:        {} ({} sats in {} coin{})",
@@ -97,8 +122,34 @@ pub fn run(
                 .as_deref()
                 .map(|path| RecoveryKey::load(path, false))
                 .transpose()?;
+            let journal_path = claim_journal_path(cfg, &pot, config_path)?;
+            let _pot_lock = super::withdrawal::lock(&journal_path)?;
+            let mut pkhs = [[0u8; 20]; 3];
+            for (pkh, address) in pkhs.iter_mut().zip(&addresses) {
+                pkh.copy_from_slice(&crate::tx::cashaddr_to_p2pkh_locking(address)?[3..23]);
+            }
+            if super::pending::Journal::open_with_key(
+                &journal_path,
+                &deployment,
+                &pot,
+                &pkhs,
+                key.as_ref().map(RecoveryKey::secret),
+            )?
+            .pending()
+            .is_some()
+            {
+                return Err("recover the pending ELECTRIC claim before refunding its pot".into());
+            }
+            let sends = super::withdrawal::Transfers::open(
+                &journal_path.with_extension("send.json"),
+                &pot,
+                key.as_ref(),
+            )?;
+            if sends.active() {
+                return Err("recover the approved Max/send in the TUI before refunding".into());
+            }
             let refund_lock = crate::tx::cashaddr_to_p2pkh_locking(&addresses[0])?;
-            let mut session = connect(cfg)?;
+            let mut session = connect(cfg, Some(&deployment), Some(&pot))?;
             let fee = read_relay_fee(&mut session)?;
             let coins = read_pot(&mut session, &pot)?;
             if coins.is_empty() {
@@ -161,7 +212,7 @@ pub fn run(
             let change_lock = crate::tx::cashaddr_to_p2pkh_locking(
                 &crate::config::validate_payout_address(cfg.network, &change)?,
             )?;
-            let mut session = connect(cfg)?;
+            let mut session = connect(cfg, None, None)?;
             let height = match height {
                 Some(height) => *height,
                 None => read_tip(&mut session)?,
@@ -238,7 +289,7 @@ struct Session {
     create_key: bool,
 }
 
-/// Mines the deployment on `devices` with the ELECTRIC screen (or plain
+/// Mines the deployment on `devices` on the mining dashboard (or plain
 /// lines), following the baton and claiming from the pot.
 fn session(
     cfg: &RuntimeConfig,
@@ -261,7 +312,7 @@ fn session(
         options.create_key,
         &monitor,
     )?;
-    super::ui::run(&monitor, || {
+    let result = super::ui::run(&monitor, devices, cfg.network, || {
         mine(
             cfg,
             &ready.deployment,
@@ -272,12 +323,26 @@ fn session(
             &ready.pot,
             &ready.addresses,
             &ready.journal_path,
+            ready.claim_key.as_ref(),
             &monitor,
         )
-    })
+    });
+    if crate::session_control::profiles_requested() {
+        let mut final_cfg = cfg.clone();
+        if args.owner_pot {
+            final_cfg.electric_pot_mode = crate::config::ElectricPotMode::Owner;
+        } else if args.restricted_pot {
+            final_cfg.electric_pot_mode = crate::config::ElectricPotMode::Restricted;
+        }
+        if let Some(value) = monitor.summary().donation {
+            final_cfg.token_donations.insert("ELECTRIC".into(), value);
+        }
+        crate::tui::remember_token_session(&final_cfg, devices, config_path, Vec::new(), true)?;
+    }
+    result
 }
 
-/// The GPUs as the ELECTRIC screen names them.
+/// The GPUs as the dashboard names them for ELECTRIC.
 pub fn device_names(devices: &[crate::backend::GpuDevice]) -> String {
     devices
         .iter()
@@ -294,6 +359,7 @@ struct Ready {
     addresses: [String; 3],
     engines: Vec<super::gpu::Engine>,
     journal_path: PathBuf,
+    claim_key: Option<RecoveryKey>,
 }
 
 fn prepare(
@@ -306,23 +372,50 @@ fn prepare(
 ) -> Result<Ready, String> {
     let deployment = select(cfg, args)?;
     let (pot, addresses, key_path) = pot_for(cfg, &deployment, args, config_path, create_key)?;
+    let claim_key = if pot.authorized_claims {
+        Some(RecoveryKey::load(
+            key_path.as_deref().ok_or("pot claim key unavailable")?,
+            false,
+        )?)
+    } else {
+        None
+    };
     let engines = devices
         .iter()
         .map(super::gpu::Engine::new)
         .collect::<Result<Vec<_>, _>>()?;
     monitor.set_pot(&pot.address(), key_path.as_deref());
-    let journal_path = config_path.with_file_name(format!(
-        "electric-{}-{}.pending.json",
-        cfg.network.as_str(),
-        hex::encode(crate::proof::hash256(&pot.redeem)),
-    ));
+    monitor
+        .withdrawal
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .enabled = pot.owner_destination;
+    let journal_path = claim_journal_path(cfg, &pot, config_path)?;
     Ok(Ready {
         deployment,
         pot,
         addresses,
         engines,
         journal_path,
+        claim_key,
     })
+}
+
+fn claim_journal_path(
+    cfg: &RuntimeConfig,
+    pot: &Pot,
+    config_path: &Path,
+) -> Result<PathBuf, String> {
+    let path = config_path.with_file_name(format!(
+        "electric-{}-{}.pending.json",
+        cfg.network.as_str(),
+        hex::encode(crate::proof::hash256(&pot.redeem)),
+    ));
+    if pot.owner_destination {
+        crate::mining_lock::pot_journal_path(path.file_name().ok_or("pot journal has no name")?)
+    } else {
+        Ok(path)
+    }
 }
 
 /// #### PR #53: ELECTRIC as one token of a hash split: the setup's
@@ -334,8 +427,23 @@ pub fn run_in_split(
     config_path: &Path,
     monitor: &super::ui::Monitor,
 ) -> Result<(), String> {
+    run_in_split_with_pot_mode(cfg, gpus, config_path, monitor, false, false)
+}
+
+pub fn run_in_split_with_pot_mode(
+    cfg: &RuntimeConfig,
+    gpus: &[crate::backend::GpuDevice],
+    config_path: &Path,
+    monitor: &super::ui::Monitor,
+    restricted_pot: bool,
+    owner_pot: bool,
+) -> Result<(), String> {
     let devices = crate::backend::electric_engines_for(gpus.to_vec())?;
-    let args = ElectricDeploymentArgs::default();
+    let args = ElectricDeploymentArgs {
+        restricted_pot,
+        owner_pot,
+        ..Default::default()
+    };
     let mut ready = prepare(cfg, &args, &devices, config_path, true, monitor)?;
     mine(
         cfg,
@@ -347,17 +455,18 @@ pub fn run_in_split(
         &ready.pot,
         &ready.addresses,
         &ready.journal_path,
+        ready.claim_key.as_ref(),
         monitor,
     )
 }
 
 /// #### PR #53: what the setup's fee pot holds now, in plain-BCH sats, and
-/// the claims that pays at the current relay fee, read through Fulcrum.
+/// the claims that pays at the current relay fee, read through BCHN or Fulcrum.
 pub fn pot_balance(cfg: &RuntimeConfig, config_path: &Path) -> Result<(u64, u64), String> {
     let args = ElectricDeploymentArgs::default();
     let deployment = select(cfg, &args)?;
     let (pot, _, _) = pot_for(cfg, &deployment, &args, config_path, false)?;
-    let mut session = connect(cfg)?;
+    let mut session = connect(cfg, None, Some(&pot))?;
     let relay_fee = read_relay_fee(&mut session)?;
     let coins = read_pot(&mut session, &pot)?;
     Ok((
@@ -367,7 +476,7 @@ pub fn pot_balance(cfg: &RuntimeConfig, config_path: &Path) -> Result<(u64, u64)
 }
 
 /// The setup's ELECTRIC choice: mine the network's deployment on the chosen
-/// GPUs with the ELECTRIC screen, making the pot's recovery key if needed.
+/// GPUs on the mining dashboard, making the pot's recovery key if needed.
 pub fn run_from_setup(
     cfg: &RuntimeConfig,
     gpus: &[crate::backend::GpuDevice],
@@ -441,21 +550,36 @@ fn pot_for(
     if args.legacy_pot {
         return Ok((legacy, addresses, None));
     }
+    let owner_pot = args.owner_pot
+        || (!args.restricted_pot && cfg.electric_pot_mode == crate::config::ElectricPotMode::Owner);
+    let restricted_pot = args.restricted_pot
+        || (!args.owner_pot && cfg.electric_pot_mode == crate::config::ElectricPotMode::Restricted);
     let path = args.pot_key.clone().unwrap_or_else(|| {
         config_path.with_file_name(format!(
-            "electric-{}-{}.pot-key",
+            "electric-{}-{}{}.pot-key",
             cfg.network.as_str(),
+            if owner_pot { "owner-" } else { "" },
             hex::encode(crate::proof::hash256(&legacy.redeem))
         ))
     });
     let key = RecoveryKey::load(&path, create)?;
-    let pot = Pot::with_recovery(deployment, &locks, Some(key.public()))?;
-    // Only the public key reaches the mining loop; the secret is for refunds.
+    let pot = if owner_pot {
+        Pot::with_owner_destination(deployment, &locks, key.public())?
+    } else if restricted_pot {
+        Pot::with_recovery(deployment, &locks, Some(key.public()))?
+    } else {
+        Pot::with_authorized_claims(deployment, &locks, key.public())?
+    };
     Ok((pot, addresses, Some(path)))
 }
 
 fn print_deployment(cfg: &RuntimeConfig, deployment: &Deployment, addresses: &[String; 3]) {
-    let policy = deployment.donation_policy(cfg.token_donation);
+    let policy = deployment.donation_policy(
+        cfg.token_donations
+            .get("ELECTRIC")
+            .copied()
+            .or(cfg.token_donation),
+    );
     println!("ELECTRIC on {}", cfg.network.as_str());
     println!("category:   {}", deployment.category_hex());
     println!(
@@ -471,7 +595,7 @@ fn print_deployment(cfg: &RuntimeConfig, deployment: &Deployment, addresses: &[S
     );
 }
 
-fn print_baton(deployment: &Deployment, baton: &Baton, tip: u32) {
+fn print_baton(deployment: &Deployment, baton: &Baton, tip: u32, restricted: bool) {
     let state = baton.state;
     println!(
         "baton:      {}:{} difficulty {} height {} claims {} left {} units",
@@ -482,50 +606,56 @@ fn print_baton(deployment: &Deployment, baton: &Baton, tip: u32) {
         state.mine_count,
         baton.token_amount
     );
-    match claim_locktime(state, tip, deployment) {
+    match if restricted {
+        super::claim_locktime(state, tip, deployment)
+    } else {
+        (tip >= state.last_height).then_some(tip)
+    } {
         Some(locktime) if locktime > state.last_height => println!(
             "next:       a claim at difficulty {} moves the baton to height {locktime}",
             state.difficulty
         ),
+        Some(_) if restricted => {
+            println!("next:       a minimum-difficulty same-height claim (restricted pot)")
+        }
         Some(_) => println!(
-            "next:       the cheap claim at difficulty {} on this height",
+            "next:       a same-height claim at difficulty {} (authorized pot)",
             state.difficulty
         ),
+        None if restricted && tip >= state.last_height => println!(
+            "next:       waiting for block {} (restricted pot)",
+            state.last_height.saturating_add(1)
+        ),
         None => println!(
-            "next:       waiting for block {} (the pot pays no claim above difficulty {} on one height)",
-            state.last_height + 1,
-            deployment.min_difficulty
+            "next:       waiting for the tip to reach height {}",
+            state.last_height
         ),
     }
 }
 
-fn connect(cfg: &RuntimeConfig) -> Result<ElectrumSession, String> {
-    ElectrumSession::connect_failover_for_deployment(
-        &cfg.electrum_endpoints(),
-        MiningToken::Photon.photon_deployment(cfg.network),
-    )
+fn connect(
+    cfg: &RuntimeConfig,
+    deployment: Option<&Deployment>,
+    pot: Option<&Pot>,
+) -> Result<SourceSession, String> {
+    let scripts: Vec<_> = deployment
+        .map(Deployment::locking_bytecode)
+        .into_iter()
+        .chain(pot.map(Pot::locking_bytecode))
+        .collect();
+    SourceSession::connect(cfg, &scripts)
 }
 
-fn read_tip(session: &mut ElectrumSession) -> Result<u32, String> {
-    let header = session.rpc("blockchain.headers.subscribe", json!([]))?;
-    header["height"]
-        .as_u64()
-        .and_then(|height| u32::try_from(height).ok())
-        .ok_or_else(|| "Fulcrum's tip has no height".into())
+fn read_tip(session: &mut SourceSession) -> Result<u32, String> {
+    session.tip()
 }
 
-fn read_relay_fee(session: &mut ElectrumSession) -> Result<u64, String> {
-    crate::fee::bch_value_to_sats(&session.rpc("blockchain.relayfee", json!([]))?)
+fn read_relay_fee(session: &mut SourceSession) -> Result<u64, String> {
+    session.relay_fee()
 }
 
-fn unspent(session: &mut ElectrumSession, locking: &[u8]) -> Result<Vec<Value>, String> {
-    match session.rpc(
-        "blockchain.scripthash.listunspent",
-        json!([script_hash_hex(locking), "include_tokens"]),
-    )? {
-        Value::Array(items) => Ok(items),
-        _ => Err("Fulcrum's listunspent is not a list".into()),
-    }
+fn unspent(session: &mut SourceSession, locking: &[u8]) -> Result<Vec<Value>, String> {
+    session.unspent(locking)
 }
 
 fn outpoint(item: &Value) -> Result<(String, u32, u64), String> {
@@ -543,7 +673,7 @@ fn outpoint(item: &Value) -> Result<(String, u32, u64), String> {
 }
 
 /// The one unspent mutable NFT of the deployment's category at its covenant.
-fn read_baton(session: &mut ElectrumSession, deployment: &Deployment) -> Result<Baton, String> {
+fn read_baton(session: &mut SourceSession, deployment: &Deployment) -> Result<Baton, String> {
     let category = deployment.category_hex();
     let mut batons = Vec::new();
     for item in unspent(session, &deployment.locking_bytecode())? {
@@ -577,7 +707,7 @@ fn read_baton(session: &mut ElectrumSession, deployment: &Deployment) -> Result<
 }
 
 /// The pot's plain-BCH coins, largest first.
-fn read_pot(session: &mut ElectrumSession, pot: &Pot) -> Result<Vec<Coin>, String> {
+fn read_pot(session: &mut SourceSession, pot: &Pot) -> Result<Vec<Coin>, String> {
     let mut coins = Vec::new();
     for item in unspent(session, &pot.locking_bytecode())? {
         if !item["token_data"].is_null() {
@@ -588,6 +718,36 @@ fn read_pot(session: &mut ElectrumSession, pot: &Pot) -> Result<Vec<Coin>, Strin
     }
     coins.sort_by_key(|coin| std::cmp::Reverse(coin.value));
     Ok(coins)
+}
+
+struct WithdrawalLink<'a> {
+    session: &'a mut SourceSession,
+    pot: &'a Pot,
+}
+impl super::withdrawal::Link for WithdrawalLink<'_> {
+    fn coins(&mut self) -> Result<Vec<Coin>, String> {
+        read_pot(self.session, self.pot)
+    }
+    fn relay_fee(&mut self) -> Result<u64, String> {
+        read_relay_fee(self.session)
+    }
+    fn published(&mut self, txid: &str, raw: &str) -> Result<bool, String> {
+        match self.session.transaction(txid) {
+            Ok(value) if value.eq_ignore_ascii_case(raw) => Ok(true),
+            Ok(_) => Err("server returned different send transaction bytes".into()),
+            Err(error)
+                if error
+                    .to_ascii_lowercase()
+                    .contains("no such mempool or blockchain transaction") =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn broadcast(&mut self, raw: &str) -> Result<String, String> {
+        self.session.broadcast_raw(raw)
+    }
 }
 
 /// What the miner reads each round.
@@ -602,7 +762,7 @@ struct Snapshot {
 }
 
 /// About the size of a claim, for counting the claims a pot pays.
-const CLAIM_BYTES_ESTIMATE: u64 = 850;
+const CLAIM_BYTES_ESTIMATE: u64 = 1_000;
 
 /// The claims `coins` pay, each claim taking its 1,000 sats and fee from one
 /// coin and leaving at least the pot's minimum change.
@@ -616,7 +776,7 @@ fn claims_paid(coins: &[Coin], relay_fee_sats_per_kb: u64) -> u64 {
 }
 
 fn snapshot(
-    session: &mut ElectrumSession,
+    session: &mut SourceSession,
     deployment: &Deployment,
     pot: &Pot,
 ) -> Result<Snapshot, String> {
@@ -642,8 +802,7 @@ fn snapshot(
 fn recipient_name(recipient: Recipient) -> &'static str {
     match recipient {
         Recipient::Miner => "you",
-        Recipient::Project => "the project donation",
-        Recipient::Collaborator => "the collaborator donation",
+        Recipient::Project | Recipient::Collaborator => "donation",
     }
 }
 
@@ -659,15 +818,34 @@ fn mine(
     pot: &Pot,
     addresses: &[String; 3],
     journal_path: &Path,
+    claim_key: Option<&RecoveryKey>,
     monitor: &super::ui::Monitor,
 ) -> Result<(), String> {
     use super::pending::{Journal, Pending, Prepared};
+    let _pot_lock = super::withdrawal::lock(journal_path)?;
+    let mut transfers = super::withdrawal::Transfers::open(
+        &journal_path.with_extension("send.json"),
+        pot,
+        claim_key,
+    )?;
     let mut pkhs = [[0u8; 20]; 3];
     for (pkh, address) in pkhs.iter_mut().zip(addresses) {
         pkh.copy_from_slice(&crate::tx::cashaddr_to_p2pkh_locking(address)?[3..23]);
     }
-    let mut journal = Journal::open(journal_path, deployment, pot, &pkhs)?;
-    if dry_run && journal.pending().is_some() {
+    let mut journal = Journal::open_with_key(
+        journal_path,
+        deployment,
+        pot,
+        &pkhs,
+        claim_key.map(RecoveryKey::secret),
+    )?;
+    monitor.pending(journal.pending().is_some());
+    if transfers.active() && journal.pending().is_some() {
+        return Err(
+            "both a claim and a send need recovery; journals preserved, no inputs spent".into(),
+        );
+    }
+    if dry_run && (journal.pending().is_some() || transfers.active()) {
         return Err("a pending ELECTRIC claim needs recovery; run without --dry-run".into());
     }
     monitor.event(format!(
@@ -680,49 +858,88 @@ fn mine(
     }
     let policy = deployment.donation_policy(cfg.token_donation);
     let schedule = Mutex::new(Schedule::new(policy.scheme, SCHEDULE_UNIT, rand::random())?);
+    monitor.set_donation_display(policy.scheme);
     let next_nonce = AtomicU64::new(rand::random());
-    let mut session: Option<ElectrumSession> = None;
+    let mut session: Option<SourceSession> = None;
     let mut spent: Option<(String, u32)> = None;
     while !monitor.stopped() {
         let link = match session.as_mut() {
             Some(link) => link,
-            None => match connect(cfg) {
+            None => match connect(cfg, Some(deployment), Some(pot)) {
                 Ok(link) => {
+                    if let Some(reason) = &link.fallback_reason {
+                        monitor.event(format!("Node unavailable; using Fulcrum: {reason}"));
+                    }
+                    monitor.connected(&link.url);
                     monitor.event(format!("Connected: {}", link.url));
                     session.insert(link)
                 }
                 Err(error) => {
                     monitor.state("Reconnecting");
-                    monitor.event(format!("Fulcrum: {error}"));
+                    monitor.event(format!("Source: {error}"));
                     monitor.wait(IDLE_POLL);
                     continue;
                 }
             },
         };
+        // Owner withdrawals do not need a live ELECTRIC baton. They do wait
+        // for any already-verified claim, which owns its reserved pot coin.
+        if !dry_run && journal.pending().is_none() {
+            let mut transfer_link = WithdrawalLink { session: link, pot };
+            match transfers.poll(pot, claim_key, &mut transfer_link, &monitor.withdrawal) {
+                Ok(true) => {
+                    monitor.state("ELECTRIC pot reserved for Max/send");
+                    monitor.wait(Duration::from_millis(500));
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let retry_snapshot = link.retry_snapshot(&error);
+                    monitor
+                        .withdrawal
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .failure(error, transfers.active());
+                    // Preserve a native watcher's confirmed/mempool cache on
+                    // snapshot churn; stale state is never returned as work.
+                    // Other failures retain the existing failover behavior.
+                    if !retry_snapshot {
+                        session = None;
+                    }
+                    monitor.wait(BATON_POLL);
+                    continue;
+                }
+            }
+        }
         let now = match snapshot(link, deployment, pot) {
             Ok(now) => {
                 monitor.pot_balance(now.pot_sats, now.pot_claims);
+                monitor.job(
+                    now.tip,
+                    now.baton.state.difficulty,
+                    (CLAIM_BYTES_ESTIMATE * now.relay_fee.max(1_000)).div_ceil(1_000),
+                );
                 now
             }
             Err(error) => {
                 monitor.state("Reconnecting; pending proof retained");
-                monitor.event(format!("Fulcrum: {error}"));
-                session = None;
+                monitor.event(format!("Source: {error}"));
+                if !link.retry_snapshot(&error) {
+                    session = None;
+                }
                 monitor.wait(IDLE_POLL);
                 continue;
             }
         };
         if let Some(mut pending) = journal.pending() {
+            monitor.pending(true);
             monitor.state("Submitting saved claim");
             if let Some(prepared) = &pending.prepared {
                 let expected = crate::reward::transaction_id(
                     &hex::decode(&prepared.raw).map_err(|_| "invalid saved claim")?,
                 );
                 let outcome = claim_outcome(&now.baton, &pending.baton, &expected, |txid| {
-                    link.rpc("blockchain.transaction.get", json!([txid, false]))?
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| "server returned invalid transaction data".into())
+                    link.transaction(txid)
                 });
                 match outcome {
                     Ok(ClaimOutcome::Accepted) => {
@@ -763,9 +980,10 @@ fn mine(
                     monitor.wait(IDLE_POLL);
                     continue;
                 };
-                let locktime = claim_locktime(now.baton.state, now.tip, deployment)
+                let locktime = pot
+                    .claim_locktime(now.baton.state, now.tip, deployment)
                     .ok_or("saved proof is not currently eligible for the pot")?;
-                let built = build_claim(
+                let built = build_authorized_claim(
                     deployment,
                     pot,
                     &pending.baton,
@@ -773,6 +991,7 @@ fn mine(
                     &pending.win,
                     locktime,
                     now.relay_fee,
+                    claim_key.map(RecoveryKey::secret),
                 )?;
                 pending.prepared = Some(Prepared {
                     coin: coin.clone(),
@@ -808,6 +1027,7 @@ fn mine(
             monitor.wait(BATON_POLL);
             continue;
         }
+        monitor.pending(false);
         if monitor.paused.load(Ordering::Relaxed) {
             monitor.state("Paused");
             monitor.wait(Duration::from_millis(100));
@@ -819,12 +1039,20 @@ fn mine(
             monitor.wait(IDLE_POLL);
             continue;
         }
-        if claim_locktime(state, now.tip, deployment).is_none() || state.difficulty > max_difficulty
-        {
+        if pot.claim_locktime(state, now.tip, deployment).is_none() {
             monitor.state(format!(
-                "Waiting for block {} · difficulty {}",
+                "Waiting for block {} · fee-pot replay protection",
                 state.last_height + 1,
-                state.difficulty
+            ));
+            monitor.wait(IDLE_POLL);
+            continue;
+        }
+        if state.difficulty > max_difficulty {
+            monitor.state(format!(
+                "Waiting for block {} · difficulty {} exceeds configured limit {}",
+                state.last_height + 1,
+                state.difficulty,
+                max_difficulty
             ));
             monitor.wait(IDLE_POLL);
             continue;
@@ -868,6 +1096,14 @@ fn mine(
                 if monitor.stopped() {
                     stop.store(true, Ordering::Relaxed);
                 }
+                if monitor
+                    .withdrawal
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .holding()
+                {
+                    stop.store(true, Ordering::Relaxed);
+                }
                 if polled.elapsed() < BATON_POLL || monitor.stopped() {
                     continue;
                 }
@@ -879,7 +1115,7 @@ fn mine(
                         stop.store(true, Ordering::Relaxed);
                     }
                     Err(error) => {
-                        monitor.event(format!("Fulcrum: {error}"));
+                        monitor.event(format!("Source: {error}"));
                         stop.store(true, Ordering::Relaxed);
                     }
                 }
@@ -911,6 +1147,7 @@ fn mine(
                     win,
                     prepared: None,
                 }))?;
+                monitor.pending(true);
             }
         }
     }
@@ -1041,6 +1278,55 @@ mod tests {
         assert_eq!(
             pot,
             pot_for(&cfg, &deploy, &args, &config, false).unwrap().0
+        );
+        let owner_args = ElectricDeploymentArgs {
+            owner_pot: true,
+            ..Default::default()
+        };
+        let (controlled, _, controlled_path) =
+            pot_for(&cfg, &deploy, &owner_args, &config, true).unwrap();
+        assert!(controlled.owner_destination);
+        assert!(controlled.authorized_claims);
+        assert_ne!(controlled.address(), pot.address());
+        assert_ne!(controlled_path.unwrap(), key_path);
+        assert_ne!(controlled.recovery_public_key, pot.recovery_public_key);
+        // A profile return retains the exact funded owner address and key;
+        // an explicitly selected older pot still overrides the saved mode.
+        cfg.electric_pot_mode = crate::config::ElectricPotMode::Owner;
+        assert_eq!(
+            controlled,
+            pot_for(&cfg, &deploy, &args, &config, false).unwrap().0
+        );
+        let restricted_args = ElectricDeploymentArgs {
+            restricted_pot: true,
+            ..Default::default()
+        };
+        let restricted = pot_for(&cfg, &deploy, &restricted_args, &config, false)
+            .unwrap()
+            .0;
+        assert!(!restricted.owner_destination && !restricted.authorized_claims);
+        cfg.electric_pot_mode = crate::config::ElectricPotMode::Restricted;
+        assert_eq!(
+            controlled,
+            pot_for(&cfg, &deploy, &owner_args, &config, false)
+                .unwrap()
+                .0
+        );
+        cfg.electric_pot_mode = crate::config::ElectricPotMode::Signed;
+        let alternate_config = dir.join("other-profile/config.json");
+        assert_eq!(
+            claim_journal_path(&cfg, &controlled, &config).unwrap(),
+            claim_journal_path(&cfg, &controlled, &alternate_config).unwrap()
+        );
+        assert_ne!(
+            claim_journal_path(&cfg, &pot, &config).unwrap(),
+            claim_journal_path(&cfg, &pot, &alternate_config).unwrap()
+        );
+        assert_eq!(
+            controlled,
+            pot_for(&cfg, &deploy, &owner_args, &config, false)
+                .unwrap()
+                .0
         );
         let backup = dir.join("backup.pot-key");
         std::fs::copy(&key_path, &backup).unwrap();

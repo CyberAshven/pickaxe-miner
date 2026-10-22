@@ -15,6 +15,12 @@ fn gpu_lock_path() -> Result<PathBuf, String> {
     Ok(root.join("Pickaxe").join("gpu.lock"))
 }
 
+/// #### PR #65: owner-pot recovery has one location per OS account and pot
+/// identity, even when the same key is selected from another config folder.
+pub(crate) fn pot_journal_path(name: &std::ffi::OsStr) -> Result<PathBuf, String> {
+    Ok(gpu_lock_path()?.with_file_name("electric").join(name))
+}
+
 fn try_lock(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

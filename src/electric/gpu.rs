@@ -51,6 +51,7 @@ pub fn search_all(
                         }
                         let (recipient, count) = {
                             let mut schedule = schedule.lock().unwrap_or_else(|e| e.into_inner());
+                            monitor.apply_donation(&mut schedule)?;
                             let recipient = schedule.recipient();
                             let count = schedule.limit_batch(MAX_BATCH);
                             schedule.record(count)?;

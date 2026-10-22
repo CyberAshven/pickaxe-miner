@@ -62,6 +62,8 @@ pub mod node;
 pub mod node_find;
 #[cfg(all(feature = "opencl", not(target_arch = "wasm32")))]
 pub mod opencl_photon;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_control;
 // #### PR #53: BCH P2Pool as a dependency Pickaxe installs, updates and runs.
 #[cfg(all(feature = "stratum-v2", not(target_arch = "wasm32")))]
 pub mod p2pool;

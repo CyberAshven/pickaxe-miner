@@ -64,6 +64,8 @@ pub const CUSTOM_JOB_BIT: u32 = 0x8000_0000;
 /// An accepted share on a Job Declaration job, on its way to the pool.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForwardShare {
+    /// The original job's recipient, including block-only and late shares.
+    pub donation: bool,
     /// The local server's template generation the job was built from.
     pub serial: u64,
     pub version: u32,

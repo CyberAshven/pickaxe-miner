@@ -28,7 +28,7 @@ allow = ["MITNFA"]
 # https://spdx.org/licenses/CDLA-Permissive-2.0.html. Scope to this crate.
 [[licenses.exceptions]]
 name = "webpki-root-certs"
-version = "=1.0.9"
+version = "=1.0.10"
 allow = ["CDLA-Permissive-2.0"]
 
 [bans]

@@ -1,8 +1,9 @@
 # ELECTRIC, as a second token
 
 Status: `pickaxe electric` mines the published mainnet contract as it is,
-with keyless fee-pot claims and a dedicated recovery key managed by Pickaxe
-(PR #51). Since PR #58 it searches on GPUs (CUDA, and the portable engine
+with a dedicated fee-pot key managed by Pickaxe. PR #65 signs both claims
+and refunds, allowing fresh same-height proofs without the former keyless
+pot's height gate. Since PR #58 it searches on GPUs (CUDA, and the portable engine
 for integrated and other GPUs), is a token choice in the setup, and has
 Pickaxe's own Chipnet deployment, where it has claimed live (below). No
 payout-wallet key is needed. The design note of 2026-10-13 (PR #50) is
@@ -21,9 +22,43 @@ Sources, read 2026-10-13 and 2026-10-15:
 ## Decision
 
 Mine the published contract beside BCH and PHOTON, on a GPU search, without
-the payout wallet's key in Pickaxe. A separate pot-only recovery key protects
-refunds. Document its replay weakness, never use it, and keep the
+the payout wallet's key in Pickaxe. A separate pot-only key protects claims
+and refunds. Document its replay weakness, never use it, and keep the
 deployment as data so a fixed contract is one new `Contract` variant.
+
+## Node or Fulcrum source
+
+#### PR #65
+
+ELECTRIC and hash-split setup show **BCH node** and **Fulcrum** connection
+controls. Their saved endpoints remain specific to Mainnet or Chipnet. A saved
+BCHN RPC endpoint is tried first; without a working node the ordinary mode
+uses Fulcrum and reports the reason. For node-only operation:
+
+```text
+pickaxe --network chipnet --node-rpc http://127.0.0.1:48332 --source node electric status
+pickaxe --network mainnet --node-rpc http://127.0.0.1:8332 --source node electric mine
+```
+
+`status` is read-only. `mine` uses the configured payout and funded pot; native
+RPC does not remove the reward's BCH output or network fees. Use the existing
+RPC cookie or `PICKAXE_NODE_RPC_USER` and `PICKAXE_NODE_RPC_PASSWORD` for login;
+keep credentials out of command history. Explicit `--source node` stops on a
+node error instead of silently using Fulcrum.
+
+The node source scans the confirmed UTXOs of the exact baton and pot scripts
+once, follows subsequent blocks and overlays unconfirmed transactions. Mempool
+eviction/replacement restores the confirmed base; a reorg or a gap over 24
+blocks rebuilds it. No wallet import, payout key or `txindex` is needed. A
+pruned node must retain the newly followed blocks. Discovery is bounded to
+4,096 mempool transactions and three attempts at a stable snapshot; an error
+leaves pending signed claims intact. Large/busy nodes can use Fulcrum instead.
+The same claim builder, donation schedule, signatures, journals and Max/send
+authorization are used for both sources.
+
+RPC references: [UTXO scan](https://docs.bitcoincashnode.org/doc/json-rpc/scantxoutset/),
+[mempool](https://docs.bitcoincashnode.org/doc/json-rpc/getrawmempool/),
+[decoded blocks](https://docs.bitcoincashnode.org/doc/json-rpc/getblock/).
 
 ## Replay
 
@@ -61,7 +96,7 @@ What Pickaxe does about it:
 
 - It never sends a proof twice (a set of sent proofs per run), and every
   search starts from fresh work on the current baton.
-- The pot pays only for a claim that moves the baton to a new height, or
+- Older restricted pots pay only for a claim that moves the baton to a new height, or
   for the claim right after it at the minimum difficulty. Those are the two
   claims per height that cannot be a replay of an earlier claim on that
   height. A later claim on the same height is the shape replays take, and
@@ -102,13 +137,117 @@ hashes an 80-byte header. ELECTRIC hashes 32 bytes with the recipient right
 after the height. Stratum cannot aim the nonce field at this preimage, and
 [merge-mining.md](merge-mining.md) Case A and [asic-tokens.md](asic-tokens.md)
 both need a contract that accepts header work. This one does not, so the
-ASIC farm keeps mining BCH and the CPU searches ELECTRIC beside it.
+ASIC farm keeps mining BCH and GPUs search ELECTRIC beside it.
 
 PHOTON cannot share work with it either; on one GPU the two split the time.
 A new ELECTRIC contract could be merge-mined with PHOTON as the parent,
 without changing PHOTON: see [photon-electric-auxpow.md](photon-electric-auxpow.md).
 
-## Paying the fee with an owner-recoverable pot
+## Signed fee-pot claims
+
+#### PR #65: funding cost
+
+The pot pays **1,000 sats attached to each token reward, plus that claim's
+network fee**. The 1,000 sats remain in the recipient's token output; they
+are not a network fee and do not automatically return to the pot. Donation
+work wins also use a token output and network fee from the pot. Moving token
+outputs later needs another transaction and fee; their BCH must not be
+recycled by burning the tokens.
+
+A signed pot can pay multiple claims within one BCH block. Removing the older
+pot's wait therefore increases both the possible reward count and the rate of
+BCH spending. Funding is a number of affordable claims, not a guaranteed
+duration or profit. The dashboard shows ELECTRIC's remaining pot balance and
+a conservative per-claim estimate, separately from the shared GPU information.
+The actual fee comes from the serialized claim and the server's relay fee.
+
+### Pickaxe-controlled receiving wallet and owner pot
+
+#### PR #65
+
+`pickaxe electric wallet` creates or reopens a dedicated payout key beside
+the configuration, separately for each network. It prints the public receiving
+address and QR, plus the private backup file's path. The key itself is never
+printed. Back it up before using the address. The existing payout wallet,
+profile and pot keys are not imported or overwritten. This is a separate
+receiving wallet, not a recovery key for previous payouts.
+
+To prepare a new owner-controlled fee pot for the selected receiving address:
+
+```text
+pickaxe --address YOUR_RECEIVING_ADDRESS electric pot --owner-pot
+pickaxe --address YOUR_RECEIVING_ADDRESS electric mine --owner-pot
+pickaxe --address YOUR_RECEIVING_ADDRESS split --share photon=80 --share electric=20 --owner-electric-pot
+```
+
+These flags are explicit: existing startup commands retain the previous pot.
+The owner pot uses its own key file and funding address. Its claims remain
+signed and keep the same recipient, change and fee constraints. Its refund
+branch allows a chosen destination only with the committed owner's signature;
+it still permits exactly one input and one plain-BCH output with a capped fee.
+It does not redirect funds held by an older covenant. Those funds can refund
+only to the destination permanently committed by that older covenant, then
+need that wallet's spending key to move again.
+
+In the owner-pot TUI, **F** opens funding, **M** selects Max/send. Enter the
+destination, press **Enter** to preview the total amount, fee and transaction
+count, then **Y** to send after the quote is displayed. Holding or repeating
+Enter cannot confirm a transfer. **Esc** cancels an unapproved quote.
+Addresses are checked against the session's network. A quote expires after
+60 seconds and is invalidated if coins change or the relay fee rises. Max
+sends each pot coin separately, each within the covenant fee cap; an
+uneconomic coin prevents the whole quote rather than silently burning it.
+This transfers plain BCH from the pot, not token rewards from the payout wallet.
+
+The supervisor finishes any pending reward claim before quoting, then holds
+ELECTRIC's pot while editing or sending; PHOTON can continue. Exact approved
+transfers are saved privately before broadcast, restored after restart and
+counted as propagated only after fetching identical transaction bytes. A
+timeout or conflicting spend retains the journal and keeps its inputs reserved.
+Approved transfers cannot be cancelled by closing the panel. The same pot's
+claim and refund commands take an OS lock. New owner pots share one journal
+location per OS account and pot identity, even across different config folders;
+older pots retain their existing journal locations. Files are retained for recovery.
+Keep the original key and journal backups until all transfers are settled.
+
+The receiving-wallet key and pot key are separate. A newly created empty pot
+must be funded before mining can use it; creating keys moves no existing BCH.
+
+#### PR #65
+
+New pots require the dedicated pot key to sign each claim and refund.
+Fresh proofs can be mined repeatedly at the same block height, up to the
+token contract's difficulty limit. The old height gate is unnecessary for
+these pots: a public ELECTRIC proof alone cannot authorize spending their BCH.
+The signature commits to both input outpoints, the spent pot amount and all
+outputs. The covenant still restricts the reward recipients, exact transaction
+shape, change to the same pot and the maximum fee. Pending signed claims are
+saved before broadcast and rebuilt with the same key on recovery.
+
+**Existing funded pots:** their scripts and addresses cannot change in place.
+The same recovery-key file is reused; it is never replaced. `electric status
+--restricted-pot` and `electric refund --restricted-pot` select the previous
+owner-recoverable pot. Refunds still return BCH only to the original payout
+wallet. Use that wallet to fund the new signed pot shown in setup or by
+`electric pot`. Review the refund transaction preview before
+adding `--broadcast`. Pickaxe never moves these funds automatically or imports
+the payout wallet's key. `--legacy-pot` continues to select the oldest pot
+without a recovery key. Each version keeps its own pending journal.
+
+The following historical keyless-claim description applies only to those
+older funded pots. Their protection is retained for recovery and compatibility.
+
+Live Chipnet check (2026-10-21): a separately funded signed pot completed four
+claims at height 328750. Start9 BCHN independently returned all four exact
+transactions; three were same-height continuations, two above the minimum
+difficulty. They paid 938 sats each for 938 bytes (3,752 sats total fees),
+and delivered 4,000 sats alongside their token rewards. The miner then waited
+for more pot funding, with no pending claim. Mainnet pot funds were untouched.
+The independent standard/consensus BCH VM suite covers 33 valid and refused
+claims/refunds, including wrong-key/unsigned claims, changed outpoints and
+amounts, duplicate pots, and all permitted recipients.
+
+## Previous owner-recoverable pots
 
 #### PR #51
 

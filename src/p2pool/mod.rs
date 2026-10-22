@@ -5,6 +5,8 @@
 //! shows whether it runs and whether the BCH node answers. It never changes
 //! or reimplements P2Pool's logic: P2Pool is updated, not integrated.
 pub mod http;
+#[cfg(feature = "stratum-v2")]
+pub mod jd;
 pub mod launch;
 pub mod own;
 pub mod release;

@@ -178,6 +178,13 @@ pub enum Commands {
         /// TOKEN=PERCENT, once per token; multiples of 5, at most 100 in all.
         #[arg(long = "share", value_name = "TOKEN=PERCENT", required = true)]
         shares: Vec<String>,
+        /// Keep mining the previous funded ELECTRIC pot until its owner
+        /// migrates the BCH to a signed-claim pot.
+        #[arg(long)]
+        restricted_electric_pot: bool,
+        /// New owner-controlled pot with Max/send; old funded pots remain separate.
+        #[arg(long, conflicts_with = "restricted_electric_pot")]
+        owner_electric_pot: bool,
     },
     /// #### PR #53
     /// BCH P2Pool as a dependency Pickaxe installs from P2Pool's releases,
@@ -233,6 +240,9 @@ pub enum P2poolCommand {
 /// #### PR #51
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum ElectricCommand {
+    /// Create/reopen a separate owner-only payout wallet beside the config.
+    /// Prints its public address, QR and backup path, never its private key.
+    Wallet,
     /// Create/load a dedicated recovery key and print the fee pot's address.
     Pot {
         #[command(flatten)]
@@ -308,6 +318,14 @@ pub struct ElectricDeploymentArgs {
     /// Use an already-funded keyless pot from the original ELECTRIC build.
     #[arg(long)]
     pub legacy_pot: bool,
+    /// Use the previous recovery-key pot, whose keyless claims wait between heights.
+    /// Its funding address and refund key remain available for existing funds.
+    #[arg(long, conflicts_with = "legacy_pot")]
+    pub restricted_pot: bool,
+    /// Create/use a separate pot whose saved key controls withdrawals to any
+    /// valid BCH address. This does not migrate funds from previous pots.
+    #[arg(long, conflicts_with_all = ["legacy_pot", "restricted_pot"])]
+    pub owner_pot: bool,
     /// The deployment's token category ID.
     #[arg(long, value_name = "HEX")]
     pub electric_category: Option<String>,
@@ -457,6 +475,10 @@ pub enum StratumV2Command {
             requires = "upstream"
         )]
         job_declaration: Option<JobDeclarationMode>,
+        /// Verified P2Pool node's read-only /jd_prepare URL. Payout and share
+        /// commitments are prepared there, using the allocated pool token.
+        #[arg(long, value_name = "URL", requires = "job_declaration")]
+        p2pool_prepare_api: Option<String>,
         /// #### PR #42
         /// Take templates from an SV2 Template Provider, tried before your
         /// node: sv2tp://HOST:PORT/KEY, such as another Pickaxe's
@@ -530,6 +552,16 @@ pub enum JobDeclarationMode {
     /// Coinbase-only: custom jobs from tokens; the pool never sees the
     /// transactions, and this node submits the blocks.
     Coinbase,
+    /// Full-Template with no fallback to the pool's transaction selection.
+    FullRequired,
+    /// Coinbase-only with no fallback to the pool's transaction selection.
+    CoinbaseRequired,
+}
+
+impl JobDeclarationMode {
+    pub fn requires_own_templates(self) -> bool {
+        matches!(self, Self::FullRequired | Self::CoinbaseRequired)
+    }
 }
 
 /// #### PR #42: the Job Declaration modes a public pool accepts.
@@ -1415,5 +1447,44 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["pickaxe", "stratum-v2", "check-node", "--chipnet"]).is_ok());
+    }
+
+    #[test]
+    fn owner_pot_flags_are_explicit_and_cannot_select_a_previous_pot_too() {
+        assert!(Cli::try_parse_from(["pickaxe", "electric", "wallet"]).is_ok());
+        assert!(Cli::try_parse_from(["pickaxe", "electric", "pot", "--owner-pot"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "electric",
+            "mine",
+            "--owner-pot",
+            "--restricted-pot"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "electric",
+            "mine",
+            "--owner-pot",
+            "--legacy-pot"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "split",
+            "--share",
+            "electric=100",
+            "--owner-electric-pot"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "pickaxe",
+            "split",
+            "--share",
+            "electric=100",
+            "--owner-electric-pot",
+            "--restricted-electric-pot"
+        ])
+        .is_err());
     }
 }

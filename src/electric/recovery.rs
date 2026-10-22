@@ -29,6 +29,14 @@ impl RecoveryKey {
                     file.write_all(&key.0.to_secret_bytes())
                         .and_then(|()| file.sync_all())
                         .map_err(|_| "cannot save pot recovery key; no funding address created")?;
+                    #[cfg(unix)]
+                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        fs::File::open(parent)
+                            .and_then(|dir| dir.sync_all())
+                            .map_err(|_| {
+                                "cannot sync recovery key directory; no funding address created"
+                            })?;
+                    }
                     return Ok(key);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

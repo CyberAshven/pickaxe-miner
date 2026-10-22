@@ -138,6 +138,39 @@ pub fn get(url: &str, accept: &str, limit: usize, timeout: Duration) -> Result<R
 }
 
 fn get_once(url: &str, accept: &str, limit: usize, timeout: Duration) -> Result<Response, String> {
+    request_once(url, "GET", accept, None, limit, timeout)
+}
+
+/// POST a bounded preparation request. No redirect can forward its identity
+/// or token to another service. Authentication remains the API's responsibility.
+pub fn post_json(
+    url: &str,
+    body: &[u8],
+    limit: usize,
+    timeout: Duration,
+) -> Result<Response, String> {
+    validate_preparation_url(url)?;
+    if body.len() > 8192 {
+        return Err("P2Pool preparation request is too large".into());
+    }
+    request_once(url, "POST", "application/json", Some(body), limit, timeout)
+        .map_err(|_| "P2Pool preparation connection or response failed".to_owned())
+}
+
+/// Remote preparation carries job tokens and identities; require authenticated
+/// TLS. Plain HTTP is only for a helper on this computer, never a public node.
+pub fn validate_preparation_url(url: &str) -> Result<(), String> {
+    crate::config::validate_p2pool_preparation_url(url)
+}
+
+fn request_once(
+    url: &str,
+    method: &str,
+    accept: &str,
+    body: Option<&[u8]>,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Response, String> {
     let target = parse_url(url)?;
     let stream = (target.host.as_str(), target.port)
         .to_socket_addrs()
@@ -155,21 +188,31 @@ fn get_once(url: &str, accept: &str, limit: usize, timeout: Duration) -> Result<
         (true, 443) | (false, 80) => host,
         (_, port) => format!("{host}:{port}"),
     };
+    let content = body.map_or_else(String::new, |body| {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    });
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pickaxe-miner/{}\r\nAccept: {accept}\r\n\
-         Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
+        "{method} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pickaxe-miner/{}\r\nAccept: {accept}\r\n\
+         Accept-Encoding: identity\r\n{content}Connection: close\r\n\r\n",
         target.path,
         env!("CARGO_PKG_VERSION"),
     );
+    let mut request = request.into_bytes();
+    if let Some(body) = body {
+        request.extend(body);
+    }
     let raw = if target.secure {
         let mut tls = crate::tls::connect(&target.host, stream)?;
-        tls.write_all(request.as_bytes())
+        tls.write_all(&request)
             .map_err(|error| format!("{url}: {error}"))?;
         read_capped(&mut tls, limit + HEADER_ROOM)
     } else {
         let mut stream = stream;
         stream
-            .write_all(request.as_bytes())
+            .write_all(&request)
             .map_err(|error| format!("{url}: {error}"))?;
         read_capped(&mut stream, limit + HEADER_ROOM)
     }
@@ -374,5 +417,44 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(response.body, b"data");
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    #[test]
+    fn preparation_transport_requires_tls_or_literal_loopback_and_never_logs_login() {
+        assert!(validate_preparation_url("https://pool.example/jd_prepare").is_ok());
+        assert!(validate_preparation_url("http://127.0.0.1:8000/jd_prepare").is_ok());
+        assert!(validate_preparation_url("http://[::1]:8000/jd_prepare").is_ok());
+        assert!(validate_preparation_url("http://pool.example/jd_prepare").is_err());
+        assert!(validate_preparation_url("http://127.0.0.1.example/jd_prepare").is_err());
+        let error =
+            validate_preparation_url("https://owner:secret@pool.example/jd_prepare").unwrap_err();
+        assert!(!error.contains("secret"));
+        assert!(validate_preparation_url("https://pool.example/jd_prepare\r\nOther: bad").is_err());
+    }
+
+    #[test]
+    fn preparation_never_follows_redirects_or_sends_an_oversized_body() {
+        let port=tests::serve(vec![b"HTTP/1.1 307 Redirect\r\nLocation: https://other.example/\r\nContent-Length: 0\r\n\r\n".to_vec()]);
+        let response = post_json(
+            &format!("http://127.0.0.1:{port}/jd_prepare"),
+            b"{}",
+            100,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(response.status, 307);
+        assert!(post_json(
+            "http://127.0.0.1:1/jd_prepare",
+            &vec![0; 8193],
+            100,
+            Duration::from_secs(1)
+        )
+        .unwrap_err()
+        .contains("too large"));
     }
 }
