@@ -337,7 +337,7 @@ fn session(
         if let Some(value) = monitor.summary().donation {
             final_cfg.token_donations.insert("ELECTRIC".into(), value);
         }
-        crate::tui::remember_token_session(&final_cfg, devices, config_path, Vec::new(), true)?;
+        crate::tui::remember_token_session(&final_cfg, devices, config_path, Vec::new(), true);
     }
     result
 }

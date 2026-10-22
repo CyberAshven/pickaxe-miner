@@ -4594,12 +4594,16 @@ pub fn run(
     state.set_devices(devices);
     let mut terminal = TerminalSession::enter()?;
     let mut quit = false;
+    // Only a finished B request opens profiles; q, Ctrl+C or a signal while
+    // pending rewards settle still quit.
+    let mut to_profiles = false;
     let mut last_draw = Instant::now() - DRAW_INTERVAL;
 
     let mut last_status_log: Option<Instant> = None;
     while !quit && !stop.load(Ordering::Relaxed) {
         let snapshot = supervisor.snapshot();
         if state.profiles_ready(snapshot.pending_winners > 0, Instant::now()) {
+            to_profiles = true;
             break;
         }
         state.record_sample(&snapshot, Instant::now());
@@ -4636,7 +4640,7 @@ pub fn run(
     }
 
     drop(terminal);
-    if state.profiles_requested && !stop.load(Ordering::Relaxed) {
+    if to_profiles && !stop.load(Ordering::Relaxed) {
         crate::session_control::request_profiles();
     }
     Ok(supervisor.stop())

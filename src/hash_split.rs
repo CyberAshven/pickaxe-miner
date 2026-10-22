@@ -712,7 +712,7 @@ pub fn run_with_pot_mode(
                 )
             })
             .collect();
-        crate::tui::remember_token_session(&final_cfg, gpus, config_path, pairs, false)?;
+        crate::tui::remember_token_session(&final_cfg, gpus, config_path, pairs, false);
     }
     outcome
 }

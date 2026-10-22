@@ -1199,7 +1199,7 @@ fn run_headless_mining(
                 profile_cfg.token.as_str().into(),
                 final_snapshot.token_donation,
             );
-            tui::remember_token_session(&profile_cfg, gpus, config_path, Vec::new(), false)?;
+            tui::remember_token_session(&profile_cfg, gpus, config_path, Vec::new(), false);
         }
         print_runtime_snapshot(&final_snapshot, false);
         return Ok(Some(SessionSettings {
@@ -1460,6 +1460,8 @@ fn main() {
 }
 
 fn run_application(open_profiles: bool) {
+    // A session started from the command line has no profile to update.
+    pickaxe_miner::session_control::set_active_profile(None);
     let mut args = cli::parse();
     if open_profiles {
         // A profile can change networks, devices and servers; CLI overrides
@@ -1944,7 +1946,12 @@ fn run_application(open_profiles: bool) {
                         &node_cookies_path,
                         overrides,
                     ) {
-                        Ok(Some(setup)) => setup,
+                        Ok(Some(setup)) => {
+                            pickaxe_miner::session_control::set_active_profile(Some(
+                                setup.profile_name.clone(),
+                            ));
+                            setup
+                        }
                         Ok(None) => return,
                         Err(error) => {
                             eprintln!("error: {error}");
