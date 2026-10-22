@@ -243,11 +243,73 @@ struct Record {
     next: usize,
 }
 
+pub(super) use super::source::Spender;
+
 pub(super) trait Link {
-    fn coins(&mut self) -> Result<Vec<Coin>, String>;
+    /// Every plain-BCH coin the pot can spend now, and whether its
+    /// transaction is confirmed.
+    fn coins(&mut self) -> Result<Vec<(Coin, bool)>, String>;
     fn relay_fee(&mut self) -> Result<u64, String>;
+    fn tip(&mut self) -> Result<u32, String>;
     fn published(&mut self, txid: &str, raw: &str) -> Result<bool, String>;
     fn broadcast(&mut self, raw: &str) -> Result<String, String>;
+    /// What spent a pot coin that is no longer spendable.
+    fn spender(&mut self, coin: &Coin) -> Result<Spender, String>;
+}
+
+/// #### PR #65: a poll that did not finish. Quote, journal and pending-send
+/// failures keep the source connection; `source` marks a failed read or
+/// broadcast, after which the supervisor may reconnect.
+#[derive(Debug)]
+pub(super) struct PollError {
+    pub message: String,
+    pub source: bool,
+}
+
+impl From<String> for PollError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            source: false,
+        }
+    }
+}
+
+impl From<&str> for PollError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+fn source(message: String) -> PollError {
+    PollError {
+        message,
+        source: true,
+    }
+}
+
+/// #### PR #65: a broadcast refused for paying too little. The transaction's
+/// fee is fixed, so retrying the same bytes cannot succeed.
+fn fee_rejected(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "min relay fee not met",
+        "mempool min fee not met",
+        "insufficient fee",
+        "insufficient priority",
+    ]
+    .iter()
+    .any(|reason| error.contains(reason))
+}
+
+/// One step of an approved send.
+enum Step {
+    /// Waiting for the network; the pot stays reserved.
+    Pending,
+    /// One more transfer is known to the network.
+    Advanced,
+    /// The send can no longer complete; its journal is archived and the pot released.
+    Abandoned(String),
 }
 
 pub(super) struct Transfers {
@@ -255,6 +317,8 @@ pub(super) struct Transfers {
     binding: String,
     approved: Option<Record>,
     quote: Option<(Plan, Instant)>,
+    /// The last spend search for an unavailable input, per tip and transfer.
+    searched: Option<(u32, usize, Spender)>,
 }
 
 impl Transfers {
@@ -302,6 +366,7 @@ impl Transfers {
             binding,
             approved,
             quote: None,
+            searched: None,
         })
     }
 
@@ -323,6 +388,166 @@ impl Transfers {
             .is_some_and(|r| r.next < r.plan.raw.len())
     }
 
+    /// #### PR #65: keeps the exact approved send beside its journal, named
+    /// by its hash like a superseded claim, and releases the pot.
+    fn archive(&mut self, label: &str) -> Result<(), String> {
+        let record = self.approved.as_ref().ok_or("no approved Max/send")?;
+        let bytes = serde_json::to_vec(record).map_err(|_| "cannot encode pot send")?;
+        let archive = self.path.with_extension(format!(
+            "{}.{label}.json",
+            hex::encode(crate::proof::hash256(&bytes))
+        ));
+        fs::rename(&self.path, &archive)
+            .map_err(|_| "cannot archive the pot send journal; it is retained")?;
+        #[cfg(unix)]
+        fs::File::open(self.path.parent().unwrap_or(Path::new(".")))
+            .and_then(|f| f.sync_all())
+            .map_err(|_| "cannot sync pot send directory")?;
+        self.approved = None;
+        self.quote = None;
+        self.searched = None;
+        Ok(())
+    }
+
+    /// What spent transfer `index`'s input, searched once per tip.
+    fn spender(
+        &mut self,
+        link: &mut dyn Link,
+        index: usize,
+        coin: &Coin,
+    ) -> Result<Spender, PollError> {
+        let tip = link.tip().map_err(source)?;
+        if let Some((at, searched, spender)) = &self.searched {
+            if *at == tip && *searched == index {
+                return Ok(spender.clone());
+            }
+        }
+        let spender = link.spender(coin).map_err(source)?;
+        if spender != Spender::Unspent {
+            self.searched = Some((tip, index, spender.clone()));
+        }
+        Ok(spender)
+    }
+
+    /// #### PR #65: checks the next approved transfer, broadcasting it when
+    /// `broadcast` allows. The send is abandoned only when it cannot confirm:
+    /// its input was spent by another confirmed transaction, or the network
+    /// refused its fee while no transfer left to send is in the mempool or chain.
+    fn step(&mut self, link: &mut dyn Link, broadcast: bool) -> Result<Step, PollError> {
+        let record = self.approved.as_ref().ok_or("no approved Max/send")?;
+        let index = record.next;
+        let count = record.plan.raw.len();
+        let raw = record.plan.raw[index].clone();
+        let coin = record.plan.coins[index].clone();
+        let txid = crate::reward::transaction_id(
+            &hex::decode(&raw).map_err(|_| "invalid saved pot send")?,
+        );
+        if !link.published(&txid, &raw).map_err(source)? {
+            // Each transfer spends exactly its own pot coin.
+            if link
+                .coins()
+                .map_err(source)?
+                .iter()
+                .any(|(spendable, _)| *spendable == coin)
+            {
+                if !broadcast {
+                    return Ok(Step::Pending);
+                }
+                return match link.broadcast(&raw) {
+                    Ok(id) if id.eq_ignore_ascii_case(&txid) => Ok(Step::Pending),
+                    Ok(_) => Err(source(
+                        "server returned another send transaction id; journal retained".into(),
+                    )),
+                    Err(error) if fee_rejected(&error) => self.abandon_unsent(link, index),
+                    Err(error) => Err(source(error)),
+                };
+            }
+            match self.spender(link, index, &coin)? {
+                // Located in a block: the identical transaction confirmed.
+                Spender::Confirmed(id) if id.eq_ignore_ascii_case(&txid) => {}
+                Spender::Confirmed(_) => {
+                    self.archive("superseded")?;
+                    return Ok(Step::Abandoned(format!(
+                        "A confirmed transaction outside this Max/send spent its pot coin, so \
+                         transfer {} of {count} can never confirm. The rest of the send was \
+                         abandoned (its journal is kept) and the pot is released; prepare Max \
+                         again for a fresh quote.",
+                        index + 1
+                    )));
+                }
+                Spender::Mempool(_) => {
+                    return Err(
+                        "approved send input is spent by an unconfirmed transaction; \
+                         waiting until it confirms or leaves the mempool"
+                            .into(),
+                    )
+                }
+                Spender::Unspent => return Ok(Step::Pending),
+                Spender::Unknown => return Err(
+                    "approved send input is unavailable; retaining its transaction for recovery"
+                        .into(),
+                ),
+            }
+        }
+        // Persist advancement only after fetching or locating the identical transaction.
+        let record = self.approved.as_ref().ok_or("no approved Max/send")?;
+        let next = Record {
+            version: 1,
+            binding: record.binding.clone(),
+            plan: record.plan.clone(),
+            next: index + 1,
+        };
+        self.save(&next)?;
+        self.approved = Some(next);
+        self.searched = None;
+        Ok(Step::Advanced)
+    }
+
+    /// The network refused transfer `index`'s fee. Its input is still
+    /// spendable, so it is in neither the mempool nor the chain; abandon the
+    /// send only if no later transfer reached them either.
+    fn abandon_unsent(&mut self, link: &mut dyn Link, index: usize) -> Result<Step, PollError> {
+        let plan = self
+            .approved
+            .as_ref()
+            .ok_or("no approved Max/send")?
+            .plan
+            .clone();
+        for raw in &plan.raw[index + 1..] {
+            let txid = crate::reward::transaction_id(
+                &hex::decode(raw).map_err(|_| "invalid saved pot send")?,
+            );
+            if link.published(&txid, raw).map_err(source)? {
+                return Err(
+                    "the network refused an approved transfer's fee while a later one is known; \
+                     journal retained"
+                        .into(),
+                );
+            }
+        }
+        self.archive("abandoned")?;
+        Ok(Step::Abandoned(format!(
+            "The network refused this Max/send's fee. None of its {} unsent transfer(s) is in \
+             the mempool or chain, so the send was abandoned (its journal is kept) and the pot is \
+             released; prepare Max again for a fresh quote.",
+            plan.raw.len() - index
+        )))
+    }
+
+    /// #### PR #65: settles an approved send without broadcasting, for a
+    /// refund: records propagated transfers and abandons one that can no
+    /// longer confirm. Returns what happened when the send ended.
+    pub fn settle(&mut self, link: &mut dyn Link) -> Result<Option<String>, PollError> {
+        while self.active() {
+            match self.step(link, false)? {
+                Step::Pending => return Ok(None),
+                Step::Advanced => {}
+                Step::Abandoned(message) => return Ok(Some(message)),
+            }
+        }
+        Ok(Some("The approved Max/send has propagated.".into()))
+    }
+
     /// Called only after the claim journal is drained, on the same supervisor
     /// thread. A broadcast reply alone is never counted as a received transfer.
     pub fn poll(
@@ -331,7 +556,7 @@ impl Transfers {
         key: Option<&RecoveryKey>,
         link: &mut dyn Link,
         control: &std::sync::Mutex<Control>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, PollError> {
         let request = control
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -341,13 +566,25 @@ impl Transfers {
             match request {
                 Some(Request::Prepare(destination)) => {
                     self.quote = None;
-                    let prepared = plan(
-                        pot,
-                        key.ok_or("owner key unavailable")?,
-                        &destination,
-                        link.coins()?,
-                        link.relay_fee()?,
-                    );
+                    let key = key.ok_or("owner key unavailable")?;
+                    let coins = link.coins().map_err(source)?;
+                    let relay_fee = link.relay_fee().map_err(source)?;
+                    // #### PR #65: an unconfirmed coin can vanish with its
+                    // parent, so quotes spend confirmed coins only.
+                    let waiting: u64 = coins
+                        .iter()
+                        .filter(|(_, confirmed)| !confirmed)
+                        .map(|(coin, _)| coin.value)
+                        .sum();
+                    let confirmed = confirmed_coins(coins);
+                    let prepared = if confirmed.is_empty() && waiting > 0 {
+                        Err(format!(
+                            "no confirmed plain BCH in this pot yet; {waiting} sats await a \
+                             confirmation"
+                        ))
+                    } else {
+                        plan(pot, key, &destination, confirmed, relay_fee)
+                    };
                     let mut c = control.lock().unwrap_or_else(|e| e.into_inner());
                     if c.view.phase == Phase::Idle {
                         return Ok(false);
@@ -361,8 +598,14 @@ impl Transfers {
                                 amount: plan.amount,
                                 fee: plan.fee,
                                 count: plan.raw.len(),
-                                message: "Y sends Max; Esc cancels. Quote expires in 60 seconds."
-                                    .into(),
+                                message: if waiting > 0 {
+                                    format!(
+                                        "Y sends Max; Esc cancels. Quote expires in 60 seconds. \
+                                         {waiting} unconfirmed sats are not included."
+                                    )
+                                } else {
+                                    "Y sends Max; Esc cancels. Quote expires in 60 seconds.".into()
+                                },
                                 ..View::default()
                             };
                             self.quote = Some((plan, Instant::now()));
@@ -378,8 +621,8 @@ impl Transfers {
                     if time.elapsed() > Duration::from_secs(60) {
                         return Err("Max/send quote expired; prepare it again".into());
                     }
-                    let current = link.coins()?;
-                    if link.relay_fee()? > plan.relay_fee
+                    let current = confirmed_coins(link.coins().map_err(source)?);
+                    if link.relay_fee().map_err(source)? > plan.relay_fee
                         || current.len() != plan.coins.len()
                         || !plan.coins.iter().all(|coin| current.contains(coin))
                     {
@@ -393,6 +636,7 @@ impl Transfers {
                     };
                     self.save(&record)?; // Durable approval before the first network side effect.
                     self.approved = Some(record);
+                    self.searched = None;
                 }
                 Some(Request::Cancel) => self.quote = None,
                 None => {}
@@ -400,7 +644,6 @@ impl Transfers {
         }
         if self.active() {
             let record = self.approved.as_ref().unwrap();
-            let i = record.next;
             {
                 let mut c = control.lock().unwrap_or_else(|e| e.into_inner());
                 c.view = View {
@@ -411,45 +654,40 @@ impl Transfers {
                     count: record.plan.raw.len(),
                     message: format!(
                         "Checking transfer {} of {}; approved sends survive restart.",
-                        i + 1,
+                        record.next + 1,
                         record.plan.raw.len()
                     ),
                     ..View::default()
                 };
             }
-            let raw = &record.plan.raw[i];
-            let txid = crate::reward::transaction_id(
-                &hex::decode(raw).map_err(|_| "invalid saved pot send")?,
-            );
-            if link.published(&txid, raw)? {
-                // Persist advancement only after fetching the identical transaction.
-                let mut next = Record {
-                    version: 1,
-                    binding: record.binding.clone(),
-                    plan: record.plan.clone(),
-                    next: i + 1,
-                };
-                self.save(&next)?;
-                std::mem::swap(self.approved.as_mut().unwrap(), &mut next);
-                if !self.active() {
+            match self.step(link, true)? {
+                Step::Pending => {}
+                Step::Advanced => {
+                    if !self.active() {
+                        let mut c = control.lock().unwrap_or_else(|e| e.into_inner());
+                        c.view.phase = Phase::Complete;
+                        c.view.message =
+                            "Max/send propagated. Transfers may still be unconfirmed.".into();
+                    }
+                }
+                Step::Abandoned(message) => {
                     let mut c = control.lock().unwrap_or_else(|e| e.into_inner());
-                    c.view.phase = Phase::Complete;
-                    c.view.message =
-                        "Max/send propagated. Transfers may still be unconfirmed.".into();
-                }
-            } else {
-                if !link.coins()?.contains(&record.plan.coins[i]) {
-                    return Err("approved send input is unavailable; retaining its transaction for recovery".into());
-                }
-                if !link.broadcast(raw)?.eq_ignore_ascii_case(&txid) {
-                    return Err(
-                        "server returned another send transaction id; journal retained".into(),
-                    );
+                    c.view.phase = Phase::Error;
+                    c.view.message = message;
+                    c.request = None;
+                    c.preview_presented = false;
                 }
             }
         }
         Ok(self.active() || control.lock().unwrap_or_else(|e| e.into_inner()).holding())
     }
+}
+
+fn confirmed_coins(coins: Vec<(Coin, bool)>) -> Vec<Coin> {
+    coins
+        .into_iter()
+        .filter_map(|(coin, confirmed)| confirmed.then_some(coin))
+        .collect()
 }
 
 #[cfg(test)]
@@ -531,11 +769,19 @@ mod tests {
         }
     }
     struct Fake {
+        /// Confirmed, spendable pot coins.
         coins: Vec<Coin>,
         rate: u64,
         published: Vec<String>,
         attempts: Vec<String>,
         lost_reply: bool,
+        // #### PR #65
+        unconfirmed: Vec<Coin>,
+        tip: u32,
+        spenders: Vec<(Coin, Spender)>,
+        searches: usize,
+        reject: Option<String>,
+        offline: bool,
     }
     impl Fake {
         fn new(f: &Fixture) -> Self {
@@ -545,7 +791,19 @@ mod tests {
                 published: Vec::new(),
                 attempts: Vec::new(),
                 lost_reply: false,
+                unconfirmed: Vec::new(),
+                tip: 100,
+                spenders: Vec::new(),
+                searches: 0,
+                reject: None,
+                offline: false,
             }
+        }
+        /// Another transaction spends `coin`: it leaves the spendable set.
+        fn spent(&mut self, coin: &Coin, by: Spender) {
+            self.coins.retain(|c| c != coin);
+            self.spenders.retain(|(c, _)| c != coin);
+            self.spenders.push((coin.clone(), by));
         }
     }
     fn approve(c: &Mutex<Control>) {
@@ -555,22 +813,45 @@ mod tests {
         c.confirm();
     }
     impl Link for Fake {
-        fn coins(&mut self) -> Result<Vec<Coin>, String> {
-            Ok(self.coins.clone())
+        fn coins(&mut self) -> Result<Vec<(Coin, bool)>, String> {
+            if self.offline {
+                return Err("connection reset".into());
+            }
+            Ok(self
+                .coins
+                .iter()
+                .map(|coin| (coin.clone(), true))
+                .chain(self.unconfirmed.iter().map(|coin| (coin.clone(), false)))
+                .collect())
         }
         fn relay_fee(&mut self) -> Result<u64, String> {
             Ok(self.rate)
+        }
+        fn tip(&mut self) -> Result<u32, String> {
+            Ok(self.tip)
         }
         fn published(&mut self, _: &str, raw: &str) -> Result<bool, String> {
             Ok(self.published.iter().any(|s| s == raw))
         }
         fn broadcast(&mut self, raw: &str) -> Result<String, String> {
             self.attempts.push(raw.into());
+            if let Some(reason) = &self.reject {
+                return Err(reason.clone());
+            }
             self.published.push(raw.into());
             if self.lost_reply {
                 return Err("lost reply".into());
             }
             Ok(crate::reward::transaction_id(&hex::decode(raw).unwrap()))
+        }
+        fn spender(&mut self, coin: &Coin) -> Result<Spender, String> {
+            self.searches += 1;
+            Ok(self
+                .spenders
+                .iter()
+                .find(|(c, _)| c == coin)
+                .map(|(_, by)| by.clone())
+                .unwrap_or(Spender::Unknown))
         }
     }
 
@@ -682,5 +963,256 @@ mod tests {
         assert!(lock(&f.dir.join("another-config/claim.json")).is_err());
         drop(first);
         assert!(lock(&lock_path).is_ok());
+    }
+
+    // #### PR #65
+    fn poll(
+        txs: &mut Transfers,
+        f: &Fixture,
+        link: &mut Fake,
+        c: &Mutex<Control>,
+    ) -> Result<bool, PollError> {
+        txs.poll(&f.pot, Some(&f.key), link, c)
+    }
+
+    fn archived(f: &Fixture, label: &str) -> Vec<PathBuf> {
+        fs::read_dir(&f.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().ends_with(&format!(".{label}.json")))
+            .collect()
+    }
+
+    #[test]
+    fn quotes_spend_only_confirmed_coins() {
+        let f = Fixture::new();
+        let c = f.control();
+        let mut txs = f.transfers();
+        let mut link = Fake::new(&f);
+        link.unconfirmed.push(Coin {
+            txid: "56".repeat(32),
+            vout: 2,
+            value: 40_000,
+        });
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap());
+        let view = c.lock().unwrap().view();
+        assert_eq!(view.phase, Phase::Preview);
+        assert_eq!(view.amount + view.fee, 35_000);
+        assert_eq!(view.count, 2);
+        assert!(view
+            .message
+            .contains("40000 unconfirmed sats are not included"));
+        // The coin confirming after the quote changes the balance: quote again.
+        approve(&c);
+        let confirmed = link.unconfirmed.remove(0);
+        link.coins.push(confirmed);
+        assert!(!poll(&mut txs, &f, &mut link, &c).unwrap_err().source);
+        assert!(link.attempts.is_empty() && !f.path().exists());
+        // Unconfirmed funding alone is never quoted.
+        link.unconfirmed = std::mem::take(&mut link.coins);
+        let c = f.control();
+        assert!(!poll(&mut txs, &f, &mut link, &c).unwrap());
+        let view = c.lock().unwrap().view();
+        assert_eq!(view.phase, Phase::Error);
+        assert!(
+            view.message.contains("no confirmed plain BCH"),
+            "{}",
+            view.message
+        );
+        assert!(txs.quote.is_none() && link.attempts.is_empty() && !f.path().exists());
+    }
+
+    #[test]
+    fn only_a_confirmed_conflicting_spend_abandons_the_send_and_releases_the_pot() {
+        let f = Fixture::new();
+        let c = f.control();
+        let mut txs = f.transfers();
+        let mut link = Fake::new(&f);
+        poll(&mut txs, &f, &mut link, &c).unwrap();
+        approve(&c);
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap());
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap());
+        assert_eq!(txs.approved.as_ref().unwrap().next, 1);
+        let first = f.coins[0].clone();
+        link.coins.retain(|coin| *coin != first); // Spent by our own first transfer.
+        let second = f.coins[1].clone();
+        let other = "ab".repeat(32);
+        // An unconfirmed conflict can still be evicted, and an unexplained
+        // missing input may still return: both keep the pot reserved.
+        link.spent(&second, Spender::Mempool(other.clone()));
+        for _ in 0..2 {
+            let error = poll(&mut txs, &f, &mut link, &c).unwrap_err();
+            assert!(!error.source, "{}", error.message);
+            assert!(txs.active() && f.path().exists());
+        }
+        assert_eq!(link.searches, 1, "one search per tip");
+        link.tip += 1;
+        link.spent(&second, Spender::Unknown);
+        assert!(!poll(&mut txs, &f, &mut link, &c).unwrap_err().source);
+        assert_eq!(link.searches, 2);
+        assert!(f.transfers().active());
+        let journal = fs::read(f.path()).unwrap();
+        link.tip += 1;
+        link.spent(&second, Spender::Confirmed(other));
+        assert!(!poll(&mut txs, &f, &mut link, &c).unwrap());
+        assert!(!txs.active() && !f.path().exists());
+        assert!(!f.transfers().active());
+        let view = c.lock().unwrap().view();
+        assert_eq!(view.phase, Phase::Error);
+        assert!(
+            view.message.contains("can never confirm"),
+            "{}",
+            view.message
+        );
+        assert!(!c.lock().unwrap().holding());
+        let kept = archived(&f, "superseded");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read(&kept[0]).unwrap(), journal);
+        assert_eq!(link.attempts.len(), 1);
+        // A stale approval cannot send: only a fresh quote and Y can.
+        c.lock().unwrap().request = Some(Request::Confirm);
+        assert!(poll(&mut txs, &f, &mut link, &c).is_err());
+        let fresh = Coin {
+            txid: "78".repeat(32),
+            vout: 0,
+            value: 30_000,
+        };
+        link.coins.push(fresh.clone());
+        let c = f.control();
+        poll(&mut txs, &f, &mut link, &c).unwrap();
+        assert_eq!(c.lock().unwrap().view.phase, Phase::Preview);
+        assert_eq!(c.lock().unwrap().view.count, 1);
+        approve(&c);
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap());
+        assert_eq!(txs.approved.as_ref().unwrap().plan.coins, vec![fresh]);
+        assert_eq!(link.attempts.len(), 2);
+    }
+
+    #[test]
+    fn our_transfer_located_in_a_block_counts_as_propagated() {
+        let f = Fixture::new();
+        let c = f.control();
+        let mut txs = f.transfers();
+        let mut link = Fake::new(&f);
+        poll(&mut txs, &f, &mut link, &c).unwrap();
+        approve(&c);
+        link.lost_reply = true;
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap_err().source);
+        link.lost_reply = false;
+        // A source without a transaction index no longer finds it by id.
+        let raw = link.published.remove(0);
+        let ours = crate::reward::transaction_id(&hex::decode(&raw).unwrap());
+        link.spent(&f.coins[0].clone(), Spender::Confirmed(ours.to_uppercase()));
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap());
+        assert_eq!(txs.approved.as_ref().unwrap().next, 1);
+        assert!(archived(&f, "superseded").is_empty());
+        assert_eq!(link.attempts.len(), 1);
+    }
+
+    #[test]
+    fn a_fee_refusal_abandons_only_a_send_with_nothing_in_the_mempool_or_chain() {
+        let f = Fixture::new();
+        let c = f.control();
+        let mut txs = f.transfers();
+        let mut link = Fake::new(&f);
+        poll(&mut txs, &f, &mut link, &c).unwrap();
+        approve(&c);
+        // Any other refusal keeps the approved send for retry.
+        link.reject = Some("connection reset by peer".into());
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap_err().source);
+        assert!(txs.active() && f.path().exists());
+        let refusal = "the transaction was rejected by network rules.\n\n\
+                       min relay fee not met, 200 < 226 (code 66)";
+        link.reject = Some(refusal.into());
+        // Part of the send is known: never abandoned.
+        let later = txs.approved.as_ref().unwrap().plan.raw[1].clone();
+        link.published.push(later.clone());
+        assert!(!poll(&mut txs, &f, &mut link, &c).unwrap_err().source);
+        assert!(txs.active() && f.path().exists());
+        link.published.clear();
+        let journal = fs::read(f.path()).unwrap();
+        assert!(!poll(&mut txs, &f, &mut link, &c).unwrap());
+        assert!(!txs.active() && !f.path().exists() && !f.transfers().active());
+        let view = c.lock().unwrap().view();
+        assert_eq!(view.phase, Phase::Error);
+        assert!(
+            view.message.contains("refused this Max/send's fee"),
+            "{}",
+            view.message
+        );
+        let kept = archived(&f, "abandoned");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read(&kept[0]).unwrap(), journal);
+        assert!(link.published.is_empty());
+        // The approval does not carry over; a new quote and Y send again.
+        c.lock().unwrap().request = Some(Request::Confirm);
+        assert!(poll(&mut txs, &f, &mut link, &c).is_err());
+        link.reject = None;
+        link.rate = 2000;
+        let c = f.control();
+        poll(&mut txs, &f, &mut link, &c).unwrap();
+        assert_eq!(c.lock().unwrap().view.phase, Phase::Preview);
+        approve(&c);
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap());
+        assert_eq!(txs.approved.as_ref().unwrap().plan.relay_fee, 2000);
+        assert_eq!(link.published.len(), 1);
+        for reason in [
+            "66: mempool min fee not met",
+            "insufficient priority",
+            "Insufficient fee",
+        ] {
+            assert!(fee_rejected(reason));
+        }
+        for reason in ["txn-mempool-conflict", "bad-txns-inputs-missingorspent", ""] {
+            assert!(!fee_rejected(reason));
+        }
+    }
+
+    #[test]
+    fn quote_errors_keep_the_source_connection_and_read_failures_do_not() {
+        let f = Fixture::new();
+        let c = f.control();
+        let mut txs = f.transfers();
+        let mut link = Fake::new(&f);
+        poll(&mut txs, &f, &mut link, &c).unwrap();
+        txs.quote.as_mut().unwrap().1 -= Duration::from_secs(61);
+        approve(&c);
+        let error = poll(&mut txs, &f, &mut link, &c).unwrap_err();
+        assert!(!error.source && error.message.contains("expired"));
+        c.lock().unwrap().request = Some(Request::Confirm);
+        let error = poll(&mut txs, &f, &mut link, &c).unwrap_err();
+        assert!(!error.source && error.message.contains("no current"));
+        let c = f.control();
+        link.offline = true;
+        assert!(poll(&mut txs, &f, &mut link, &c).unwrap_err().source);
+        assert!(link.attempts.is_empty());
+    }
+
+    #[test]
+    fn refund_settles_a_send_without_broadcasting() {
+        let f = Fixture::new();
+        let c = f.control();
+        let mut txs = f.transfers();
+        let mut link = Fake::new(&f);
+        poll(&mut txs, &f, &mut link, &c).unwrap();
+        approve(&c);
+        link.lost_reply = true;
+        assert!(poll(&mut txs, &f, &mut link, &c).is_err());
+        link.lost_reply = false;
+        drop(txs);
+        // The first transfer propagated; the second is still spendable, so
+        // the refund waits for the TUI to send it.
+        let mut refund = f.transfers();
+        assert_eq!(refund.settle(&mut link).unwrap(), None);
+        assert!(refund.active());
+        assert_eq!(refund.approved.as_ref().unwrap().next, 1);
+        assert_eq!(link.attempts.len(), 1);
+        link.spent(&f.coins[1].clone(), Spender::Confirmed("cd".repeat(32)));
+        let mut refund = f.transfers();
+        let ended = refund.settle(&mut link).unwrap().unwrap();
+        assert!(ended.contains("can never confirm"), "{ended}");
+        assert!(!refund.active() && !f.path().exists());
+        assert_eq!(archived(&f, "superseded").len(), 1);
+        assert_eq!(link.attempts.len(), 1);
     }
 }

@@ -1583,8 +1583,13 @@ fn run_application(open_profiles: bool) {
             shares,
             restricted_electric_pot,
             owner_electric_pot,
+            signed_electric_pot,
         } => {
             use std::io::IsTerminal;
+            let mut cfg = cfg.clone();
+            if signed_electric_pot {
+                cfg.choose_electric_pot(Some(config::ElectricPotMode::Signed));
+            }
             let result = hash_split::Shares::parse(&shares, cfg.network).and_then(|shares| {
                 let gpus = backend::resolve_mining_devices(backend_kind, &effective_device)?;
                 hash_split::run_with_pot_mode(

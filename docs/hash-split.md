@@ -240,6 +240,9 @@ day: PHOTON 1,688 MH/s (benchmark), ELECTRIC about 2,900 MH/s (dry run).
 `split --restricted-electric-pot` explicitly uses the previous owner-recoverable
 ELECTRIC covenant with the same key file and journal binding. Its original
 height rule remains part of that existing on-chain covenant. The default uses
-the signed-claim pot. Funding cannot transfer between those covenant versions
+the signed-claim pot, except that while it cannot pay a claim and the previous
+pot with the same key can, ELECTRIC's share keeps mining the previous funded pot
+until it is migrated; `--signed-electric-pot` keeps the signed-claim pot. Each
+token's saved donation applies to its own share, including ELECTRIC's. Funding cannot transfer between those covenant versions
 automatically: refund the previous pot to its original payout wallet, then fund
 the new pot from that wallet. No payout-wallet key is imported by Pickaxe.

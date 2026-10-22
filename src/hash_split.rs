@@ -695,13 +695,13 @@ pub fn run_with_pot_mode(
             .insert("ELECTRIC".into(), donation);
     }
     if crate::session_control::profiles_requested() {
-        final_cfg.electric_pot_mode = if owner_electric_pot {
-            crate::config::ElectricPotMode::Owner
+        // #### PR #65: a pot flag is an explicit choice; otherwise the
+        // session's own choice (or the default) is kept.
+        if owner_electric_pot {
+            final_cfg.choose_electric_pot(Some(crate::config::ElectricPotMode::Owner));
         } else if restricted_electric_pot {
-            crate::config::ElectricPotMode::Restricted
-        } else {
-            cfg.electric_pot_mode
-        };
+            final_cfg.choose_electric_pot(Some(crate::config::ElectricPotMode::Restricted));
+        }
         let pairs = slots
             .iter()
             .map(|slot| {

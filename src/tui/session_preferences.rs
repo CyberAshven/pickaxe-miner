@@ -96,6 +96,7 @@ fn save_token_session(
     choices.electric = electric;
     choices.split = split;
     choices.electric_pot_mode = cfg.electric_pot_mode;
+    choices.electric_pot_chosen = cfg.electric_pot_choice().is_some();
     choices.token_donations = cfg.token_donations.clone();
     let name = profiles.upsert(index, &name, settings)?;
     ProfileChoices::save(&path, &name, &choices)?;
