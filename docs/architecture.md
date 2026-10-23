@@ -428,10 +428,11 @@ What this means for Pickaxe, and what step 1 did:
    - ASIC-exclusive tokens: the SAFA reference core, the token worker and
      the Chipnet ASIC test token; the registry stays empty until a token
      exists.
-   - Merge-mined tokens: the coinbase commitment, proofs, the claim worker
-     and the Chipnet test token, also under Job Declaration; Case A (a share
-     wins a token at its lower difficulty) and Case B (a token that needs a
-     BCH block) both, with no hashrate taken from BCH.
+   - Merge-mined tokens: the v2 common format (coinbase output 0, a tree of
+     169-byte leaves, `AuxProof` v2 and its reference verifier), the claim
+     worker and the Chipnet test token, also under Job Declaration: a share
+     wins a token at the token's own, lower difficulty, with no hashrate
+     taken from BCH. A public pool's miners get the empty commitment.
    - Pool connectors: Template Distribution both ways, Job Declaration in
      both modes (server and client), fallback pools and group channels.
    - Own node: chain checks, saved nodes checked, this computer and another

@@ -64,7 +64,7 @@ unverified; an empty token registry is not an implemented live contract.
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pool mode and both Job Declaration modes implemented; local live Chipnet shares, custom jobs and payouts checked on 2026-10-15. Pool failover delivered fresh real-node jobs on 2026-10-16 without hashing. Independent external-pool interoperability and accepted blocks through failover/JD remain pending. |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Real ZMQ and TP new-parent/minimum-difficulty delivery checked on 2026-10-15; remote guided setup and live recovery remain. |
 | T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | SAFA reference core, firmware work path, worker, simulated Chipnet test token and setup implemented in #42. Registry remains empty pending a deployed author contract and covenant-VM/live proof. |
-| T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Case A/B commitments, independent reference proof verification, journals, worker and JD integration implemented in #42; docs/merge-mining.md exists. Author covenant/VM proof and deployment remain external prerequisites. #53 adds a VM proof that PHOTON's live contract can be the parent of an AuxPoW token (docs/photon-electric-auxpow.md); that token's contract is the author's. |
+| T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Merge-mining v2 common format (agreed with BCH P2Pool; v1's Case B removed), golden vectors, independent reference proof verification, journals, worker, pool/role rules and JD integration; docs/merge-mining.md is the v2 spec. Author covenant/VM proof and deployment remain external prerequisites. #53 adds a VM proof that PHOTON's live contract can be the parent of an AuxPoW token (docs/photon-electric-auxpow.md); that token's contract is the author's. |
 | F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Audited merged #35: claim readiness no longer waits for another GPU batch; shutdown still drains safely. Existing host regression retained and passing; no new GPU soak claimed. |
 | F2 | Intel, native HIP discrete AMD, Linux GPU and Apple Silicon validation | Actual hardware reports; compile results are insufficient | Pending hardware evidence |
 | F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | PR #48 adds native WDDM utilization and dedicated-memory counters to the shared sampler, matched by PCI address. Live counter reads passed for the NVIDIA discrete and AMD integrated adapters on one Windows PC. Missing/ambiguous PCI identity, linked adapters and unavailable counters remain unsupported; power, temperature and clocks still need vendor support. |
@@ -3303,3 +3303,33 @@ channel at P2Pool alpha nodes) merged in.
 Not in this change: GPUs mining BCH (with merge-mined CashTokens) over SV2
 pools and P2Pool, which needs a BCH header kernel; running a P2Pool node for
 other miners from the setup.
+
+## Merge-mining v2: the common format
+
+Branch `feat/merge-mining-v2`, on `dev`.
+
+- **Format:** v1 is replaced by the v2 common format agreed with BCH
+  P2Pool (docs/merge-mining.md): output 0 `CTMM 02` with root, `h` and salt
+  (the empty commitment is all zero); slots
+  `u32le(SHA256(0x02 ‖ salt ‖ category)[0..4]) mod 2^h`; domain-separated
+  leaf (`0x00`) and node (`0x01`) hashes; a 169-byte leaf binding the lock
+  hash, state hash, payout hash, target and `ext`; `AuxProof` v2 (the header
+  first, `d ≤ 25`, no leaf data). Case B (tickets, mode B, its registry
+  fields) is gone; version `03` is reserved for it.
+- **Reference verifier:** steps 1-9 rewritten for v2 and run on every proof's
+  bytes before it is journaled. Golden vectors (a two-token tree, a whole
+  224-byte proof and the empty commitment) are unit tests and are printed in
+  the spec; an independent re-derivation matched them byte for byte.
+- **Roles:** solo commits the operator's own root on every channel; a public
+  pool's jobs carry the empty commitment (no token floor, no wins, the fee
+  never reaches tokens); under Job Declaration only shares that meet the
+  pool's target are forwarded (`jd::client::for_pool`), token-only hits stay
+  local. The own-root check refuses token merge mining for a job whose
+  coinbase lacks the expected output 0 and says so on the dashboard.
+- **Privacy:** fresh salt bytes per merge-mined standard-channel job, no tag
+  by default, one claim per journal row, and `--claim-delay` (default 5-60 s,
+  recorded as `broadcast_after`).
+
+Not in this change: BCH P2Pool building output 0 in this format (Pickaxe
+still refuses tokens with a P2Pool-prepared coinbase), a claim builder, and
+live or covenant-VM checks.

@@ -337,12 +337,13 @@ counts as the overview line below.
 
 While tokens are merge-mined, every local job on the pool's plan, the
 declared coinbase (Full-Template) and the custom job's outputs carry the
-commitment as output 0 and each Case B ticket (worth 0) after the pool's
-outputs. The pool's rule allows exactly that shape (R5-R8 above); the
-pool cannot see the leaves, which bind the miner's own script (the pool's
-first output) with the pool's whole donation rate as the donation's split,
-since no donation work runs here. Wins are proven by the client, as in solo
-mining, and need nothing from the pool. On Chipnet the hidden test token
+commitment (format v2, docs/merge-mining.md) as output 0 before the pool's
+outputs. The pool's rule allows exactly that shape (R5-R8 above); the pool
+cannot see the leaves, which bind the miner's own script (the pool's first
+output). Wins are proven by the client, as in solo mining, and need nothing
+from the pool. Only shares that meet the pool's target are sent to it: a
+share that meets only a token's target stays with the client, which proves
+and journals it. On Chipnet the hidden test token
 rides it with `--merge-test-token 1000` beside `--job-declaration`; at a
 pool without `--job-declaration` the server refuses the flag, as the pool
 builds the blocks there. Connection info then reads "Merge-mined tokens: on
