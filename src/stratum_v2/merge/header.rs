@@ -258,4 +258,52 @@ mod tests {
         long.extend([0; 202]);
         assert!(HeaderWin::decode(&long).is_err());
     }
+
+    // #### PR #65: export the existing payout forwarders for an independent
+    // BCH VM check. This registers no token and introduces no claim contract.
+    #[test]
+    fn vm_forwarder_vectors() {
+        use crate::donation::bch::BchPayout;
+        use crate::stratum_v2::payout;
+        let scripts: Vec<Vec<u8>> = [0x11, 0x22]
+            .into_iter()
+            .map(|byte| {
+                let mut script = vec![0x76, 0xa9, 0x14];
+                script.extend([byte; 20]);
+                script.extend([0x88, 0xac]);
+                script
+            })
+            .collect();
+        let mut samples = Vec::new();
+        for donation_work in [false, true] {
+            let policy = BchPayout {
+                donation_work,
+                ..BchPayout::default()
+            };
+            let destination = payout::beneficiary(&scripts, policy);
+            assert_eq!(destination, &scripts[usize::from(donation_work)]);
+            for extended in [false, true] {
+                let script = if extended {
+                    let (mut prefix, suffix) = extended_parts(7, destination).unwrap();
+                    prefix.extend([0x44; 24]);
+                    prefix.extend(suffix);
+                    prefix
+                } else {
+                    standard_script(7, &[0x44; 16], destination).unwrap()
+                };
+                samples.push(serde_json::json!({
+                    "role": if donation_work { "donation-work" } else { "personal" },
+                    "channel": if extended { "extended" } else { "standard" },
+                    "script": hex::encode(script),
+                    "destination": hex::encode(destination),
+                    "category": "ab".repeat(32),
+                    "amount": if donation_work { "17000" } else { "60000000" },
+                }));
+            }
+        }
+        if let Some(path) = std::env::var_os("PICKAXE_MERGE_VM_PROOF") {
+            std::fs::write(path, serde_json::to_vec(&samples).unwrap()).unwrap();
+        }
+        assert_eq!(samples.len(), 4);
+    }
 }
