@@ -3329,6 +3329,9 @@ Branch `feat/merge-mining-v2`, on `dev`.
 - **Privacy:** fresh salt bytes per merge-mined standard-channel job, no tag
   by default, one claim per journal row, and `--claim-delay` (default 5-60 s,
   recorded as `broadcast_after`).
+- **Donation:** with no per-claim split, the merge-mined token donation is
+  all work at the whole setting (1.5% of work at the default), from a token
+  balance in the work allocation; BCH's own donation is unchanged.
 
 Not in this change: BCH P2Pool building output 0 in this format (Pickaxe
 still refuses tokens with a P2Pool-prepared coinbase), a claim builder, and

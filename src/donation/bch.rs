@@ -215,6 +215,14 @@ pub struct BchPayout {
     pub fee: Option<PoolFee>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fee_work: bool,
+    /// #### merge-mining v2: `None` when the job merge-mines no token of
+    /// this server's own; otherwise whether its token leaves pay the
+    /// donation. Merge-mined tokens have no per-claim split, so their whole
+    /// donation (the same setting as BCH's) is this work: `Some(true)` on
+    /// every BCH donation-work job and on enough others to reach the full
+    /// rate. It never changes the BCH amounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_donation_work: Option<bool>,
 }
 
 impl BchPayout {

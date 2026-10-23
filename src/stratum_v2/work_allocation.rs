@@ -67,6 +67,25 @@ impl WorkAllocation {
         self.position < u64::from(rate.bps()) * (PERIOD_NS / 10_000)
     }
 
+    // #### merge-mining v2: the merge-mined token donation is all work
+    // What: a job that merge-mines this server's own tokens has its token
+    // leaves pay the donation on the whole setting's share of work (1.5% at
+    // the default), not BCH's work third: every BCH donation-work job, and
+    // enough other jobs to make up the rest. Without accepted shares it is
+    // the first `rate` of each 10-minute cycle (which holds BCH's donation
+    // window); with them, a balance of validated work on token jobs alone.
+    // Why: v2 leaves carry no per-claim split, so the work is the token
+    // donation's only part.
+    // Look here if: merge-mined token donation jobs take more or less work
+    // than the donation setting.
+    /// Whether the job now pays merge-mined tokens' donation, at `rate`.
+    pub fn merge_token_donation_work(&self, rate: BchDonation) -> bool {
+        self.balance.as_ref().map_or_else(
+            || self.position < rate.pool_work_units(PERIOD_NS),
+            |balance| u16::from(rate) != 0 && balance.token_due(),
+        )
+    }
+
     // #### PR #48: validated work, not elapsed time, repays BCH work quotas.
     // Old jobs keep their own rates and recipient, including late valid shares.
     pub fn accepted(
@@ -85,6 +104,13 @@ impl WorkAllocation {
             (1.0 - donation) * f64::from(u16::from(fee.rate)) / divisor
         });
         self.credit(target, donation, fee, payout.donation_work, payout.fee_work);
+        // #### merge-mining v2: shares on token jobs repay the token
+        // donation at the whole rate (see `merge_token_donation_work`).
+        if let (Some(token_work), Some(balance)) = (payout.token_donation_work, &mut self.balance) {
+            let rate = f64::from(u16::from(payout.donation)) / 10_000.0;
+            let donated = token_work || payout.donation_work;
+            balance.token += balance.share * (rate - f64::from(u8::from(donated)));
+        }
     }
 
     pub fn pool_accepted(
@@ -115,6 +141,7 @@ impl WorkAllocation {
         let balance = self.balance.get_or_insert(WorkBalance {
             donation: 0.0,
             fee: 0.0,
+            token: 0.0,
             phase,
             share: hashes,
         });
@@ -140,6 +167,8 @@ impl WorkAllocation {
 struct WorkBalance {
     donation: f64,
     fee: f64,
+    /// #### merge-mining v2: the merge-mined token donation's balance.
+    token: f64,
     // #### PR #48: the randomized startup phase is a fraction of the latest
     // share, not of the first. Vardiff can ease the target far below the
     // start difficulty; an offset fixed in first-share hashes would then
@@ -155,6 +184,10 @@ impl WorkBalance {
 
     fn fee_due(&self) -> bool {
         self.fee > (1.0 - self.phase) * self.share
+    }
+
+    fn token_due(&self) -> bool {
+        self.token > self.phase * self.share
     }
 }
 
@@ -187,6 +220,7 @@ mod tests {
                     donation_work: allocation.donation_work(rate),
                     fee: Some(fee),
                     fee_work: !allocation.donation_work(rate) && allocation.fee_work(rate, fee),
+                    token_donation_work: None,
                 };
                 let work = super::super::telemetry::expected_hashes(&target);
                 total += work;
@@ -238,6 +272,7 @@ mod tests {
                     donation_work,
                     fee: Some(fee),
                     fee_work: !donation_work && allocation.fee_work(rate, fee),
+                    token_donation_work: None,
                 };
                 let work = super::super::telemetry::expected_hashes(target);
                 donated += if payout.donation_work { work } else { 0.0 };
@@ -253,6 +288,64 @@ mod tests {
             (charged - 0.995 * 0.01 * total).abs() < 1.0,
             "charged {charged}"
         );
+    }
+
+    // #### merge-mining v2: the merge-mined token donation is all work
+    // What: on jobs that merge-mine tokens, the token leaves pay the donation
+    // on the whole setting's share of validated work (1.5%, 2% and 4.5%
+    // here, across difficulties and start phases), while BCH's donation work
+    // stays a third of it; before any share, the token window is the first
+    // `rate` of the cycle and holds BCH's.
+    // Look here if: `merge_token_donation_work` or the token balance changes.
+    #[test]
+    fn merge_mined_token_donation_work_is_the_whole_configured_rate() {
+        use crate::donation::bch::BchPayout;
+        for (rate, phase) in [("1.5", 0), ("2", PERIOD_NS / 2), ("4.5", PERIOD_NS - 1)] {
+            let rate: BchDonation = rate.parse().unwrap();
+            let configured = f64::from(u16::from(rate)) / 10_000.0;
+            let mut allocation = WorkAllocation::new(phase);
+            let (mut total, mut bch, mut token) = (0.0, 0.0, 0.0);
+            for n in 0..100_000u64 {
+                let mut target = [255; 32];
+                target[31] >>= (n / 137) % 5;
+                let donation_work = allocation.donation_work(rate);
+                let payout = BchPayout {
+                    donation: rate,
+                    donation_work,
+                    token_donation_work: Some(
+                        donation_work || allocation.merge_token_donation_work(rate),
+                    ),
+                    ..BchPayout::default()
+                };
+                let work = super::super::telemetry::expected_hashes(&target);
+                total += work;
+                bch += if payout.donation_work { work } else { 0.0 };
+                token += if payout.token_donation_work == Some(true) {
+                    work
+                } else {
+                    0.0
+                };
+                allocation.accepted(&target, payout);
+            }
+            assert!(
+                (token / total - configured).abs() < 0.0001,
+                "{rate}: tokens {}",
+                token / total
+            );
+            assert!(
+                (bch / total - configured / 3.0).abs() < 0.0001,
+                "{rate}: BCH {}",
+                bch / total
+            );
+        }
+        let rate = BchDonation::default();
+        let window = rate.pool_work_units(PERIOD_NS);
+        assert!(WorkAllocation::new(0).merge_token_donation_work(rate));
+        assert!(WorkAllocation::new(window - 1).merge_token_donation_work(rate));
+        assert!(!WorkAllocation::new(window).merge_token_donation_work(rate));
+        assert!(rate.work_units(PERIOD_NS) < window);
+        let none: BchDonation = "0".parse().unwrap();
+        assert!(!WorkAllocation::new(0).merge_token_donation_work(none));
     }
 
     #[test]

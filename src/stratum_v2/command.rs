@@ -1388,10 +1388,15 @@ fn started_text(started: &Started) -> String {
     text
 }
 
-/// The donation as the dashboard shows it, with its two parts.
+/// The donation as the dashboard shows it, with its two parts, and
+/// (#### merge-mining v2) merge-mined tokens', which is all work: their
+/// claims have no split.
 fn donation_summary(donation: BchDonation) -> String {
     let (work, reward) = donation.shares();
-    format!("{donation} ({work} of work · {reward} of block rewards)")
+    format!(
+        "{donation} ({work} of work · {reward} of block rewards; merge-mined tokens \
+         {donation} of work)"
+    )
 }
 
 /// Advanced settings: the donation, adjustable from 0% to 100%.
@@ -1413,7 +1418,8 @@ fn render_advanced(
     } else {
         format!(
             "{work} of mining work and {reward} of each block reward go to the Pickaxe donation \
-             address."
+             address. For merge-mined tokens the whole {donation} is mining work, since their \
+             claims have no split."
         )
     };
     let mut text = format!(
@@ -4223,7 +4229,7 @@ mod tests {
         .unwrap();
         let header = measured.header(measured.updated);
         assert!(
-            header.contains("block rewards) · 0.50% of work so far · Live"),
+            header.contains("tokens 1.50% of work) · 0.50% of work so far · Live"),
             "{header}"
         );
         // In pool mode the measured share is the work the pool acknowledged,
@@ -4321,14 +4327,14 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         assert_eq!(
             donation_summary(BchDonation::default()),
-            "1.50% (0.50% of work · 1.00% of block rewards)"
+            "1.50% (0.50% of work · 1.00% of block rewards; merge-mined tokens 1.50% of work)"
         );
         let two: BchDonation = "2".parse().unwrap();
         assert_eq!(
             donation_summary(two),
-            "2.00% (0.67% of work · 1.34% of block rewards)"
+            "2.00% (0.67% of work · 1.34% of block rewards; merge-mined tokens 2.00% of work)"
         );
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
         terminal
             .draw(|f| {
                 render_advanced(

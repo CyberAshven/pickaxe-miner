@@ -848,6 +848,12 @@ impl MiningSession {
     /// #### PR #40
     /// Makes this connection a public pool's: each channel pays the address
     /// its user connects with, and the operator's fee address is added.
+    /// #### merge-mining v2: a public pool's session, whose channels carry
+    /// the empty commitment.
+    pub fn is_public(&self) -> bool {
+        self.public.is_some()
+    }
+
     pub fn set_public(&mut self, public: Option<super::payout::PublicPool>) {
         self.public = public;
     }

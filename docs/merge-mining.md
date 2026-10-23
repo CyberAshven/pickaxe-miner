@@ -142,8 +142,8 @@ these steps, and runs them on every proof before keeping it (fail closed):
 
 - **Solo** (the operator is the miner): Pickaxe commits its own root for its
   own devices, on standard and extended channels and SV1 firmware through the
-  adapter. Each leaf pays the miner's script or, in a donation-work job, the
-  donation's.
+  adapter. Each leaf pays the miner's script or, in the token donation's
+  work (the whole donation setting, see Donation), the donation's.
 - **Pickaxe as a public pool** (serving other people's devices): their jobs
   carry the **empty commitment**. An operator-chosen token root never sits on
   other people's devices, the pool fee never reaches tokens, and no share of
@@ -198,13 +198,20 @@ and leaves BCH mining unaffected.
 
 ## Donation
 
-Merge-mined tokens follow the one BCH ASIC donation setting through work: in
-a donation-work job each leaf pays the Pickaxe donation's script, as that job's
-BCH does. A split of each claim is token-defined (the leaf's `ext`); no
-registered token defines one yet, so Pickaxe sets `ext` to 32 zero bytes. A
-public pool's fee never reaches tokens. Under Job Declaration no donation work
-runs (the pool's rule takes the donation from the coinbase), so leaves pay the
-miner.
+Merge-mined tokens follow the one BCH ASIC donation setting (default 1.5%,
+anything from 0% to 100% in Advanced settings), and their whole donation is
+mining work: v2 leaves carry no per-claim split. At 1.5%, the leaves of 1.5% of
+the work pay the Pickaxe donation's script. That is every BCH donation-work job
+(BCH's third of the setting, whose BCH also goes to the donation) and enough
+other jobs, whose BCH still pays the miner, to make up the rest. The work
+allocation weighs accepted shares by difficulty, as for BCH. The BCH donation
+itself (two thirds from block rewards, one third work) is unchanged.
+
+A split of each claim is token-defined (the leaf's `ext`); no registered token
+defines one yet, so Pickaxe sets `ext` to 32 zero bytes. A public pool's fee
+never reaches tokens. Under Job Declaration no donation work runs (the pool's
+rule takes the donation from the coinbase, and every local job shares the
+declared coinbase), so leaves pay the miner there.
 
 ## Coinbase size
 

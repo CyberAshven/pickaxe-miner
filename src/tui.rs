@@ -6026,7 +6026,8 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
                 (
                     "Donation",
                     Span::raw(format!(
-                        "{} of BCH and merge-mined CashTokens ({reward} of rewards · {work} of work)",
+                        "{0} of BCH ({reward} of rewards · {work} of work) and {0} of \
+                         merge-mined CashTokens' work",
                         state.config.bch_donation
                     )),
                     "< >  0% to 100%",
@@ -8298,8 +8299,8 @@ mod tests {
 
     // #### PR #42
     // What: the ASIC modes' server options live in an Advanced section that
-    // opens with Enter on its header; the donation row names BCH and
-    // merge-mined tokens with its 2:1 split and reaches 0%; the start
+    // opens with Enter on its header; the donation row names BCH's 2:1
+    // split and merge-mined tokens' all-work share, and reaches 0%; the start
     // difficulty halves, doubles and takes a typed value; ports are checked;
     // backup pools need their key; profiles keep every value; and Start lands
     // on a row inside the section when that row is wrong.
@@ -8328,7 +8329,8 @@ mod tests {
         let screen = setup_text(&setup);
         assert!(
             screen.contains(
-                "1.50% of BCH and merge-mined CashTokens (1.00% of rewards · 0.50% of work)"
+                "1.50% of BCH (1.00% of rewards · 0.50% of work) and 1.50% of merge-mined \
+                 CashTokens' work"
             ),
             "{screen}"
         );
