@@ -249,11 +249,12 @@ token authors. The format above does not depend on them.
   - `height_delta = cb_height − 1 − anchor_height`. The header's own time
     stands in for the parent's. The exponent uses floor division (not
     truncation) when it is negative.
-  - Mainnet band: `computed / 2 ≤ header_target ≤ computed × 1.05`
-    (asymmetric). Multi-hour gaps happen, and the header's time is only a
-    stand-in for the parent's, hence the room on the hard side.
-  - Test networks also accept `nBits == powLimit` (`allow_pow_limit`, for
-    min-difficulty blocks), and get a ×/÷8 band on the hard side.
+  - Mainnet: `computed/2 ≤ header_target ≤ computed × 1.05` (asymmetric).
+    Multi-hour gaps happen, and the header's time is only a stand-in for the
+    parent's, hence the room on the hard side.
+  - Test networks accept `computed/8 ≤ header_target ≤ computed × 1.05`, or
+    nBits equal to the network's powLimit (`allow_pow_limit`), with their own
+    `half_life` and anchor.
   - After `Δh ≥ 4,032` blocks without a claim, the covenant also accepts the
     fallback band, capped at 4 doublings on the hard side and ×1.1 on the easy
     side (`CAP = 4`), so a future change to BCH's difficulty algorithm cannot
