@@ -96,6 +96,9 @@ pub struct Channel {
     /// latest job (the own-root check), until the server takes it for the
     /// dashboard.
     token_refusal: Option<&'static str>,
+    /// #### merge-mining v2: the latest job's tokens were refused by the
+    /// own-root check, so it mines BCH alone and gets no token floor.
+    tokens_refused: bool,
 }
 
 /// #### PR #42: whose job a channel mines.
@@ -263,6 +266,7 @@ impl Channel {
             rolled: DEVICE_EXTRANONCE_SIZE,
             compact: false,
             token_refusal: None,
+            tokens_refused: false,
         })
     }
 
@@ -426,6 +430,7 @@ impl Channel {
         // #### merge-mining v2: the own-root check (see
         // `commitment::check_own_root`): the coinbases devices hash carry
         // this job's commitment as output 0, or the job mines BCH alone.
+        self.tokens_refused = false;
         let aux = aux.filter(|aux| {
             match own_root(
                 aux,
@@ -437,6 +442,7 @@ impl Channel {
                 Ok(()) => true,
                 Err(reason) => {
                     self.token_refusal = Some(reason);
+                    self.tokens_refused = true;
                     false
                 }
             }
@@ -890,8 +896,10 @@ impl Channel {
     /// own devices only. A public pool's channel (it names an operator)
     /// carries the empty commitment and a Job Declaration client's channel
     /// at this pool mines the client's jobs, so neither gets one.
+    /// A job whose tokens the own-root check refused mines BCH alone, so it
+    /// gets no floor either.
     pub fn floor_for(&self, template: &BchTemplate) -> Option<Hash> {
-        if self.operator.is_some() || self.custom_only {
+        if self.operator.is_some() || self.custom_only || self.tokens_refused {
             return None;
         }
         template.tokens().map(|set| *set.easiest())
@@ -1800,6 +1808,17 @@ mod tests {
             double_sha256(&scripts(&payout(), None)[0])
         );
         assert!(solo.take_token_refusal().is_none());
+        // A job whose tokens the own-root check refused mines BCH alone and
+        // gets no token floor; the next accepted job brings it back.
+        solo.tokens_refused = true;
+        assert_eq!(solo.floor_for(&template), None);
+        solo.install_with_payout(4, 1, template.clone(), BchPayout::default())
+            .unwrap();
+        assert!(!solo.tokens_refused);
+        assert_eq!(
+            solo.floor_for(&template),
+            Some(*token_set(TOKEN_BITS).easiest())
+        );
     }
 
     /// A target easier than any test share's hash, so every share is

@@ -286,6 +286,14 @@ impl MiningSession {
             channel.install_with_payout(id, generation, template.clone(), payout)?;
             if let Some(reason) = channel.take_token_refusal() {
                 self.token_refusal = Some(reason);
+                // The job mines BCH alone: drop the token floor before it
+                // goes out, so firmware sends no shares that cannot win.
+                if tokens.is_some() && channel.settle(&template.target, None, maximum) {
+                    frames.push(mining(Mining::SetTarget(SetTarget {
+                        channel_id: channel.id,
+                        maximum_target: (&channel.target).into(),
+                    }))?);
+                }
             }
             if broadcast.contains(&channel.id) {
                 immediates.insert(channel.id, immediate);
@@ -974,11 +982,13 @@ impl MiningSession {
         // `Channel::settle`).
         let tokens = channel.floor_for(template);
         channel.settle(&template.target, tokens.as_ref(), &maximum);
-        let target = channel.target;
         channel.install_with_payout(*id, *generation, template.clone(), self.payout_policy)?;
         if let Some(reason) = channel.take_token_refusal() {
             self.token_refusal = Some(reason);
+            // BCH alone: no token floor (see `Channel::floor_for`).
+            channel.settle(&template.target, None, &maximum);
         }
+        let target = channel.target;
         // #### PR #42: an extended channel joins its payout's group, made
         // with the next id when it is the first; the group is announced here
         // and never moved (no SetGroupChannel).
