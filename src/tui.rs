@@ -5388,8 +5388,10 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
             SetupStep::Token => {
                 "[Up/Down] choose   [Type] search name, category or covenant   [Enter] select   [Esc] back"
             }
+            // #### PR #69: one 78-column line, so an 80-column window keeps
+            // the second footer row for the status line (Start's warnings).
             SetupStep::Settings if state.electric_in_use() => {
-                "[Up/Down] row   [Left/Right] change   [Enter] edit / start   [F] fee pot QR   [Esc] back"
+                "[Up/Down] row  [Left/Right] change  [Enter] edit/start  [F] pot QR  [Esc] back"
             }
             SetupStep::Settings => {
                 "[Up/Down] row   [Left/Right] change   [Enter] edit / start   [Esc] back"
@@ -9182,10 +9184,18 @@ mod tests {
             "Balance: 2832 sats · pays no claim yet",
             &pot.address[..30],
             "[F] shows the QR code full-screen",
-            "[F] fee pot QR",
+            "[F] pot QR  [Esc] back",
         ] {
             assert!(screen.contains(expected), "{expected}: {screen}");
         }
+        // The keys fit one footer row, so a status line still shows.
+        setup.status_line = "The fee pot cannot pay a claim yet.".into();
+        let screen = draw(&setup, 80, 24);
+        assert!(
+            screen.contains("The fee pot cannot pay a claim yet."),
+            "{screen}"
+        );
+        setup.status_line.clear();
         // Large enough: the whole QR code in the side panel.
         assert!(whole(&draw(&setup, 120, 50), &pot.qr));
         // F: full-screen, whole at 80x24 and 100x30, the large one when it fits.
