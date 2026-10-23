@@ -328,6 +328,7 @@ pub fn asic_serve_command(
         pool_tag,
         start_difficulty: options.start_difficulty.filter(|_| !joining),
         merge_test_token: None,
+        claim_delay: None,
         // Templates come from this server's own node; a token has none.
         tp_listen: options
             .template_port

@@ -444,6 +444,13 @@ pub enum StratumV2Command {
         /// (the pool builds the blocks otherwise). Hidden: it is for tests.
         #[arg(long, value_name = "DIFFICULTY", hide = true)]
         merge_test_token: Option<u64>,
+        /// #### merge-mining v2
+        /// How long after a merge-mined token win its claim may be
+        /// broadcast: SECONDS, or MIN-MAX seconds drawn at random for each
+        /// claim (default 5-60). Each claim is its own transaction. To hide
+        /// where claims come from, route this computer through Tor yourself.
+        #[arg(long, value_name = "SECONDS")]
+        claim_delay: Option<String>,
         /// #### PR #42
         /// Serve this node's block templates to SV2 pools, Job Declaration
         /// clients and P2Pool (SV2 Template Distribution) at this address,
@@ -1203,6 +1210,17 @@ mod tests {
                     ..
                 }
             })
+        ));
+        // #### merge-mining v2: the claim broadcast delay.
+        let cli = parse(&["--claim-delay", "10-20"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve {
+                    claim_delay: Some(ref delay),
+                    ..
+                }
+            }) if delay == "10-20"
         ));
     }
 

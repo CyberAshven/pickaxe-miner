@@ -160,10 +160,11 @@ pub fn run(
     // #### PR #42: template providers, tried before the nodes, told the
     // coinbase bytes this server may add (with the test token's when asked
     // for; its registry row decides the network, so mainnet refuses it).
-    let (providers, test_token) = match &action {
+    let (providers, test_token, claim_delay) = match &action {
         StratumV2Command::Serve {
             template_provider,
             merge_test_token,
+            claim_delay,
             ..
         } => (
             template_provider
@@ -171,15 +172,20 @@ pub fn run(
                 .map(|text| super::tdp::client::TdpAddress::parse(text))
                 .collect::<Result<Vec<_>, _>>()?,
             *merge_test_token,
+            claim_delay
+                .as_deref()
+                .map(super::merge::hub::ClaimDelay::parse)
+                .transpose()?
+                .unwrap_or_default(),
         ),
-        _ => (Vec::new(), None),
+        _ => (Vec::new(), None, Default::default()),
     };
     let tokens = match test_token {
         Some(difficulty) => Some(Arc::new(super::merge::hub::TokenHub::test_token(
             config.network,
             config_path.with_extension("sv2-token-proofs.json"),
             super::merge::hub::bits_for_difficulty(difficulty)?,
-            Default::default(),
+            claim_delay,
         )?)),
         None => None,
     };
