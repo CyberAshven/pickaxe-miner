@@ -92,6 +92,9 @@ pub struct MiningSession {
     groups: BTreeMap<u32, Group>,
     /// #### PR #42: the server mines a token that fixes the version slot.
     fixed_version: bool,
+    /// #### merge-mining v2: why token merge mining was refused for a job
+    /// (the own-root check), taken by the server for the dashboard.
+    pub token_refusal: Option<&'static str>,
 }
 
 pub struct Responses {
@@ -147,6 +150,7 @@ impl MiningSession {
             grouping: false,
             groups: BTreeMap::new(),
             fixed_version: false,
+            token_refusal: None,
         })
     }
 
@@ -270,15 +274,19 @@ impl MiningSession {
             // template, back up to the share difficulty. SetTarget precedes
             // the job so the job carries the new target.
             // #### PR #42: and floor it at the easiest merge-mined token
-            // target, within 15 times vardiff's (see `Channel::settle`).
-            let tokens = template.tokens().and_then(|set| set.easiest_a());
-            if channel.settle(&template.target, tokens, maximum) {
+            // target, within 15 times vardiff's (see `Channel::settle`), on
+            // this server's own devices only (`Channel::floor_for`).
+            let tokens = channel.floor_for(&template);
+            if channel.settle(&template.target, tokens.as_ref(), maximum) {
                 frames.push(mining(Mining::SetTarget(SetTarget {
                     channel_id: channel.id,
                     maximum_target: (&channel.target).into(),
                 }))?);
             }
             channel.install_with_payout(id, generation, template.clone(), payout)?;
+            if let Some(reason) = channel.take_token_refusal() {
+                self.token_refusal = Some(reason);
+            }
             if broadcast.contains(&channel.id) {
                 immediates.insert(channel.id, immediate);
                 continue;
@@ -334,6 +342,9 @@ impl MiningSession {
                 maximum_target: (&target).into(),
             }))?);
             channel.install_with_payout(*next_id, generation, template, payout)?;
+            if let Some(reason) = channel.take_token_refusal() {
+                self.token_refusal = Some(reason);
+            }
             frames.extend(job_frames(channel, true)?);
         }
         Ok(frames)
@@ -955,10 +966,13 @@ impl MiningSession {
         let (id, generation, template) = self.current.as_ref().unwrap();
         // #### PR #42: a new channel starts with the token floor too (see
         // `Channel::settle`).
-        let tokens = template.tokens().and_then(|set| set.easiest_a());
-        channel.settle(&template.target, tokens, &maximum);
+        let tokens = channel.floor_for(template);
+        channel.settle(&template.target, tokens.as_ref(), &maximum);
         let target = channel.target;
         channel.install_with_payout(*id, *generation, template.clone(), self.payout_policy)?;
+        if let Some(reason) = channel.take_token_refusal() {
+            self.token_refusal = Some(reason);
+        }
         // #### PR #42: an extended channel joins its payout's group, made
         // with the next id when it is the first; the group is announced here
         // and never moved (no SetGroupChannel).
@@ -1476,24 +1490,16 @@ mod tests {
     /// #### PR #42: the extranonce test devices roll on extended channels.
     const DEVICE_EXTRANONCE: [u8; DEVICE_EXTRANONCE_SIZE] = [0x23; DEVICE_EXTRANONCE_SIZE];
 
-    /// #### PR #42: the test template merge-mining the test token in both
-    /// modes (its Case A target `bits`), with block difficulty no test share
-    /// reaches when `hard`.
+    /// #### PR #42: the test template merge-mining the test token (its
+    /// target `bits`), with block difficulty no test share reaches when
+    /// `hard`.
     fn token_template(bits: u32, hard: bool) -> BchTemplate {
         use super::super::merge::{
             registry::TEST_TOKEN,
             set::{SetEntry, TokenSet, TokenState},
-            OutPoint,
         };
-        let baton = OutPoint {
-            txid: [0x22; 32],
-            vout: 0,
-        };
-        let state = TokenState::new(baton, bits).unwrap();
-        let entries = vec![
-            SetEntry::share_target(&TEST_TOKEN, state),
-            SetEntry::block_required(&TEST_TOKEN),
-        ];
+        let state = TokenState::new([0x22; 32], [0x33; 32], bits).unwrap();
+        let entries = vec![SetEntry::new(&TEST_TOKEN, state)];
         let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
         if hard {
             template.target = compact_target(0x1a00ffff).unwrap();
@@ -1654,9 +1660,10 @@ mod tests {
     // #### PR #42: token wins leave with the responses
     #[test]
     fn responses_carry_token_wins_for_standard_and_extended_submits() {
-        // Case A at 2^248: about one share in 256 wins; no share is a block.
+        // A target of 2^248: about one share in 256 wins; no share is a
+        // block.
         let template = Arc::new(token_template(0x2001_0000, true));
-        let target = *template.tokens().unwrap().easiest_a().unwrap();
+        let target = *template.tokens().unwrap().easiest();
         for kind in [ChannelKind::Standard, ChannelKind::Extended] {
             let mut server =
                 MiningSession::new(MiningNetwork::Chipnet, payout(), [7; 12], [255; 32]).unwrap();
@@ -1684,14 +1691,13 @@ mod tests {
                 let win = responses.token_wins.remove(0);
                 assert_eq!(win.entries, [0]);
                 assert_eq!((win.header, win.hash), (device.header, hash));
-                assert!(!win.block);
                 // The coinbase is the one the device hashed, and its output
                 // 0 is the job's commitment.
                 if kind == ChannelKind::Extended {
                     assert_eq!(win.coinbase, device.coinbase);
                 }
                 let head = 47 + usize::from(win.coinbase[41]);
-                assert_eq!(win.coinbase[head..head + 53], win.aux.outputs.commitment);
+                assert_eq!(win.coinbase[head..head + 53], win.aux.output);
                 win.proof(0).unwrap();
             }
             assert!(wins > 0, "{kind:?}");
@@ -1714,16 +1720,15 @@ mod tests {
             .receive(submit_share(&device, ChannelKind::Standard, 0, nonce), NOW)
             .unwrap();
         assert_eq!(responses.blocks.len(), 1);
-        assert_eq!(responses.token_wins.len(), 1);
-        let win = &responses.token_wins[0];
-        assert!(win.block);
-        let entries: &[u16] = if meets_target(&hash, &target) {
-            &[0, 1]
+        // A block wins the token only when it meets the token's target.
+        if meets_target(&hash, &target) {
+            assert_eq!(responses.token_wins.len(), 1);
+            let win = &responses.token_wins[0];
+            assert_eq!(win.entries, [0]);
+            assert_eq!(win.coinbase, responses.blocks[0].coinbase.bytes);
         } else {
-            &[1]
-        };
-        assert_eq!(win.entries, entries);
-        assert_eq!(win.coinbase, responses.blocks[0].coinbase.bytes);
+            assert!(responses.token_wins.is_empty());
+        }
     }
 
     // #### PR #42: best share from the carried hash

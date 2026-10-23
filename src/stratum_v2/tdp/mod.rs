@@ -28,17 +28,8 @@ pub const MAX_TP_CLIENTS: usize = 8;
 pub const PAYOUT_RESERVE: u32 = 122;
 
 /// #### PR #42: the reserve a template client declares: the payouts, and
-/// with merge-mined tokens the 53-byte commitment and a 46-byte ticket per
-/// Case B token.
+/// with merge-mined tokens the 53-byte commitment (whatever their number).
 pub fn reserve(tokens: Option<&super::merge::set::TokenSet>) -> u32 {
-    use super::merge::{commitment::OUTPUT_LEN, leaf::Mode, registry::TICKET_LEN};
-    PAYOUT_RESERVE
-        + tokens.map_or(0, |set| {
-            let tickets = set
-                .entries()
-                .iter()
-                .filter(|entry| entry.mode == Mode::BlockRequired)
-                .count();
-            (OUTPUT_LEN + TICKET_LEN * tickets) as u32
-        })
+    use super::merge::commitment::OUTPUT_LEN;
+    PAYOUT_RESERVE + tokens.map_or(0, |_| OUTPUT_LEN as u32)
 }

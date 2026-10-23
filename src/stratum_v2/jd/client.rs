@@ -876,7 +876,7 @@ fn uplink(
                         status.update(|summary| summary.pushed += 1);
                     }
                 }
-                if !meets_target(&share.hash, &pool_target) {
+                if !for_pool(&share, &pool_target) {
                     continue;
                 }
                 if let Some((_, job)) = jobs
@@ -1203,6 +1203,22 @@ fn declare(
         },
         merkle_path: path.try_into().map_err(|_| "merkle path too long")?,
     }))?)
+}
+
+// #### merge-mining v2: only the pool's shares go to the pool
+// What: a local share goes to the pool only when its hash meets the pool's
+// current share target. A share that meets only a merge-mined token's
+// target (the local device target is eased toward it, `Channel::settle`) is
+// a token-only hit: it stays local, journaled and claimed by this server,
+// and is never sent as a share.
+// Why: the pool credits shares at its own target; token-only hits are work
+// the pool did not ask for, and sending them would leak the local token
+// easing upstream.
+// Look here if: the pool rejects low-difficulty shares while tokens are
+// merge-mined, or a token win reaches the pool as a share.
+/// Whether `share` is one for the pool: its hash meets the pool's target.
+pub(crate) fn for_pool(share: &ForwardShare, pool_target: &Hash) -> bool {
+    meets_target(&share.hash, pool_target)
 }
 
 // #### PR #42: shares forwarded to the pool without blocking

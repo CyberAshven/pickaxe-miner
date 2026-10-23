@@ -1,20 +1,22 @@
-//! #### PR #42
-//! Merge mining for BCH covenant tokens, v1 draft (no token exists yet).
+//! #### PR #42, merge-mining v2
+//! Merge mining for BCH covenant tokens, the v2 common format (no token
+//! exists yet).
 //!
 //! One commitment in coinbase output 0 commits to a small tree of token
-//! leaves, so the same SHA-256 share can win tokens that accept a share
-//! target (Case A, no BCH block needed) and tokens that need a found BCH
-//! block (Case B, claimed through a coinbase ticket after maturity), both in
-//! one coinbase. Each leaf binds the job's payout, so a win cannot be
-//! redirected.
+//! leaves, so the same SHA-256 share can win every token whose target it
+//! meets, with no BCH block needed. Each leaf binds the job's payout, so a
+//! win cannot be redirected.
 //!
-//! The byte layouts in these files are normative until the merge-mining
-//! spec in the docs repeats them: [`commitment`] (output 0, 53 bytes),
-//! [`leaf`] (176 bytes), [`tree`] (slots and nodes), [`proof`] (`AuxProof`
-//! v1) and [`verify`] (the Rust reference of what a covenant checks).
+//! The byte layouts in these files are normative, repeated with golden
+//! vectors in docs/merge-mining.md: [`commitment`] (output 0, 53 bytes),
+//! [`leaf`] (169 bytes), [`tree`] (slots and nodes), [`proof`] (`AuxProof`
+//! v2) and [`verify`] (the Rust reference of what a covenant checks).
+//! v1's block-required mode (Case B) is gone; version 03 is reserved for it.
 //!
 //! Both networks' registries are empty, so no coinbase changes until a
 //! token is registered; the Chipnet test token exists for tests only.
+//! [`safa`], [`header`] and [`source`] are the separate ASIC-exclusive mode
+//! (docs/asic-tokens.md).
 
 pub mod commitment;
 pub mod header;
@@ -26,6 +28,8 @@ pub mod safa;
 pub mod set;
 pub mod source;
 pub mod tree;
+#[cfg(test)]
+mod vectors;
 pub mod verify;
 
 pub use super::template::Hash;

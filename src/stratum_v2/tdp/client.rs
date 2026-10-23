@@ -768,19 +768,20 @@ mod tests {
     }
 
     // #### PR #42
-    // What: the reserve is 122 bytes for the payouts alone, and 221 with
-    // the Chipnet test token (a 53-byte commitment and one 46-byte ticket).
+    // What: the reserve is 122 bytes for the payouts alone, and 175 with
+    // the Chipnet test token (the 53-byte commitment).
     // Look here if: tdp::reserve changes.
     #[test]
-    fn the_reserve_is_122_and_221_with_the_test_token() {
+    fn the_reserve_is_122_and_175_with_the_test_token() {
         assert_eq!(super::super::reserve(None), 122);
         let directory = super::super::super::journal::TestDirectory::new();
         let hub = super::super::super::merge::hub::TokenHub::test_token(
             crate::config::MiningNetwork::Chipnet,
             directory.0.join("proofs.json"),
             0x207f_ffff,
+            Default::default(),
         )
         .unwrap();
-        assert_eq!(super::super::reserve(hub.current().as_deref()), 221);
+        assert_eq!(super::super::reserve(hub.current().as_deref()), 175);
     }
 }

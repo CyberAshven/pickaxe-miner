@@ -1,4 +1,4 @@
-//! #### PR #42
+//! #### PR #42, merge-mining v2
 //! The server's merge-mining hub: the token set jobs carry, the claim
 //! worker's proofs and their journal.
 //!
@@ -11,17 +11,22 @@
 //! proof stops at "proven". A journal that cannot be written turns token
 //! claims off and leaves BCH mining as it is.
 //!
+//! Privacy: each journal row is one claim, broadcast in its own transaction
+//! (never batched with a proof from another share), no earlier than its
+//! `broadcast_after` time, a small random delay after the win
+//! ([`ClaimDelay`], 5 to 60 seconds by default).
+//!
 //! No token is registered on either network. The Chipnet test token
-//! (`stratum-v2 serve --merge-test-token`) has a simulated baton: its anchor
-//! moves to the winning header after each proven Case A win, which changes
-//! the set and makes the server re-issue jobs on the same parent.
+//! (`stratum-v2 serve --merge-test-token`) has a simulated baton: a
+//! synthetic lock hash, and a state hash that moves to the winning header's
+//! hash after each proven win, which changes the set and makes the server
+//! re-issue jobs on the same parent.
 
 use super::{
-    leaf::Mode,
     registry::{MergeToken, TEST_TOKEN},
     set::{SetEntry, TokenSet, TokenState},
-    verify::{verify_a, verify_b, ClaimView},
-    Hash, OutPoint,
+    verify::{verify, ClaimView},
+    Hash,
 };
 use crate::config::MiningNetwork;
 use crate::stratum_v2::{channel::TokenWin, payout, template::double_sha256};
@@ -40,16 +45,64 @@ const KEPT_PROOFS: usize = 256;
 /// Token states recently won, so each is proven once.
 const RECENT_STATES: usize = 256;
 
-/// One won entry, as the dashboard lists it.
+/// One proven win, as the dashboard lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvenWin {
     pub token: &'static str,
-    pub mode: Mode,
     pub height: u32,
 }
 
-/// The test token's simulated baton: where its next Case A state is.
+/// #### merge-mining v2: the claim broadcast delay
+/// What: how long after a win its claim may be broadcast, drawn per claim
+/// at random from `min..=max` seconds (5 to 60 by default; `0-0` for none).
+/// Why: a claim broadcast the moment a share is found ties the claim to the
+/// share's timing and to the sender's connection; a small random delay
+/// loosens both. Routing the broadcast through Tor is up to the operator.
+/// Look here if: a journal row's `broadcast_after` is before its
+/// `found_at`, or `--claim-delay` is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimDelay {
+    pub min: u32,
+    pub max: u32,
+}
+
+impl Default for ClaimDelay {
+    fn default() -> Self {
+        Self { min: 5, max: 60 }
+    }
+}
+
+/// The longest claim delay accepted: one day.
+const MAX_CLAIM_DELAY: u32 = 86_400;
+
+impl ClaimDelay {
+    /// `SECONDS` or `MIN-MAX` seconds, at most a day.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let error = || "--claim-delay takes SECONDS or MIN-MAX seconds, at most 86400".to_owned();
+        let number = |part: &str| part.trim().parse::<u32>().map_err(|_| error());
+        let (min, max) = match text.split_once('-') {
+            Some((min, max)) => (number(min)?, number(max)?),
+            None => {
+                let seconds = number(text)?;
+                (seconds, seconds)
+            }
+        };
+        if min > max || max > MAX_CLAIM_DELAY {
+            return Err(error());
+        }
+        Ok(Self { min, max })
+    }
+
+    /// A delay drawn from `min..=max`.
+    pub fn pick(&self) -> u64 {
+        let span = u64::from(self.max - self.min) + 1;
+        u64::from(self.min) + rand::random::<u64>() % span
+    }
+}
+
+/// The test token's simulated baton: its synthetic lock hash and target.
 struct TestBaton {
+    lock_hash: Hash,
     target_bits: u32,
 }
 
@@ -59,8 +112,9 @@ pub struct TokenHub {
     set: RwLock<Option<Arc<TokenSet>>>,
     changed: AtomicBool,
     test: Option<TestBaton>,
-    /// (category, mode, anchor) of states already won.
-    won: Mutex<VecDeque<(Hash, u8, OutPoint)>>,
+    delay: ClaimDelay,
+    /// (category, state hash) of states already won.
+    won: Mutex<VecDeque<(Hash, Hash)>>,
     /// Why token claims are off, after a journal failure.
     off: Mutex<Option<String>>,
 }
@@ -109,8 +163,9 @@ pub fn difficulty_for_bits(bits: u32) -> f64 {
 
 impl TokenHub {
     // #### PR #42: the Chipnet test token
-    // What: a hub that merge-mines the test token in both modes, its Case A
-    // state anchored to a simulated baton at `target_bits`.
+    // What: a hub that merge-mines the test token, its state anchored to a
+    // simulated baton at `target_bits`: a synthetic lock hash and a state
+    // hash that each proven win moves.
     // Why: no real token exists; this runs the whole path (commitment,
     // shares, proofs, journal, re-issued jobs) on Chipnet devices.
     // Look here if: the flag is accepted on mainnet, or the test token's
@@ -121,6 +176,7 @@ impl TokenHub {
         network: MiningNetwork,
         journal_path: PathBuf,
         target_bits: u32,
+        delay: ClaimDelay,
     ) -> Result<Self, String> {
         if TEST_TOKEN.network != network {
             return Err("the merge-mining test token exists only on Chipnet".into());
@@ -130,27 +186,27 @@ impl TokenHub {
             journal_path,
             set: RwLock::new(None),
             changed: AtomicBool::new(false),
-            test: Some(TestBaton { target_bits }),
+            test: Some(TestBaton {
+                lock_hash: super::sha256(b"pickaxe merge-mining test token baton"),
+                target_bits,
+            }),
+            delay,
             won: Mutex::new(VecDeque::new()),
             off: Mutex::new(None),
         };
-        let anchor = OutPoint {
-            txid: super::sha256(b"pickaxe merge-mining test token anchor"),
-            vout: 0,
-        };
-        hub.set_test_state(anchor, 1)?;
+        hub.set_test_state(super::sha256(b"pickaxe merge-mining test token state"), 1)?;
         Ok(hub)
     }
 
-    fn set_test_state(&self, anchor: OutPoint, serial: u64) -> Result<(), String> {
+    fn set_test_state(&self, state_hash: Hash, serial: u64) -> Result<(), String> {
         let Some(test) = &self.test else {
             return Ok(());
         };
         let token: &'static MergeToken = &TEST_TOKEN;
-        let entries = vec![
-            SetEntry::share_target(token, TokenState::new(anchor, test.target_bits)?),
-            SetEntry::block_required(token),
-        ];
+        let entries = vec![SetEntry::new(
+            token,
+            TokenState::new(test.lock_hash, state_hash, test.target_bits)?,
+        )];
         let set = TokenSet::new(self.network, entries, serial)?;
         if let Ok(mut current) = self.set.write() {
             *current = Some(Arc::new(set));
@@ -172,6 +228,12 @@ impl TokenHub {
     /// Why token claims are off, if they are.
     pub fn off(&self) -> Option<String> {
         self.off.lock().ok().and_then(|off| off.clone())
+    }
+
+    fn turn_off(&self, reason: String) {
+        if let Ok(mut off) = self.off.lock() {
+            *off = Some(reason);
+        }
     }
 
     /// Whether this win holds a token state not won before; checked on the
@@ -197,65 +259,61 @@ impl TokenHub {
     }
 
     /// The claim worker's part for one win: each won entry's proof, checked
-    /// as a covenant checks it, then saved. Returns the entries proven.
+    /// from its bytes as a covenant checks it, then saved, one claim per
+    /// row. Returns the entries proven.
     pub fn record(&self, win: &TokenWin) -> Vec<ProvenWin> {
         let mut proven = Vec::new();
         let mut kept = Vec::new();
-        for (entry, view) in claim_views(self.network, win) {
+        let found_at = unix_now();
+        for (entry, payout) in claim_payouts(self.network, win) {
             let item = &win.aux.entries[usize::from(entry)];
-            let checked = win.proof(entry).and_then(|proof| {
-                match item.mode {
-                    Mode::ShareTarget => verify_a(&proof, &view.view()),
-                    Mode::BlockRequired => verify_b(&proof, &view.view()),
-                }?;
-                proof.to_bytes()
-            });
+            let view = ClaimView {
+                category: item.token.category,
+                lock_hash: item.leaf.lock_hash,
+                state_hash: item.leaf.state_hash,
+                payout: &payout,
+                target_bits: item.leaf.target_bits,
+                ext: item.leaf.ext,
+                max_aux_height: item.token.max_aux_height,
+            };
+            let checked = win
+                .proof(entry)
+                .and_then(|proof| proof.to_bytes())
+                .and_then(|bytes| verify(&bytes, &view).map(|_| bytes));
             match checked {
                 Ok(bytes) => {
                     kept.push(serde_json::json!({
                         "token": item.token.name,
                         "category": hex::encode(item.token.category),
-                        "mode": if item.mode == Mode::ShareTarget { "A" } else { "B" },
-                        "anchor": format!("{}:{}", hex::encode(view.anchor.txid), view.anchor.vout),
+                        "state": hex::encode(item.leaf.state_hash),
+                        "format": "AuxProof v2",
                         "height": win.height,
-                        "found_at": unix_now(),
+                        "found_at": found_at,
+                        "broadcast_after": found_at + self.delay.pick(),
                         "proof": hex::encode(bytes),
                         "status": "proven",
                     }));
                     proven.push(ProvenWin {
                         token: item.token.name,
-                        mode: item.mode,
                         height: win.height,
                     });
                 }
                 // A proof Pickaxe built that fails its own check is a bug:
                 // it is never kept as claimable.
-                Err(_) => {
-                    if let Ok(mut off) = self.off.lock() {
-                        *off = Some("a token proof failed its own check".into());
-                    }
-                }
+                Err(_) => self.turn_off("a token proof failed its own check".into()),
             }
         }
         if !kept.is_empty() {
             if let Err(error) = self.save(kept) {
-                if let Ok(mut off) = self.off.lock() {
-                    *off = Some(format!("token proofs cannot be saved: {error}"));
-                }
+                self.turn_off(format!("token proofs cannot be saved: {error}"));
                 return Vec::new();
             }
         }
-        // The test token's baton moves to the winning header.
-        if self.test.is_some() && proven.iter().any(|win| win.mode == Mode::ShareTarget) {
+        // The test token's state moves to the winning header's hash.
+        if self.test.is_some() && !proven.is_empty() {
             let serial = self.current().map_or(1, |set| set.serial() + 1);
-            let anchor = OutPoint {
-                txid: double_sha256(&win.header),
-                vout: 0,
-            };
-            if let Err(error) = self.set_test_state(anchor, serial) {
-                if let Ok(mut off) = self.off.lock() {
-                    *off = Some(error);
-                }
+            if let Err(error) = self.set_test_state(double_sha256(&win.header), serial) {
+                self.turn_off(error);
             }
         }
         proven
@@ -295,110 +353,42 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
 }
 
-/// The token states a win holds: Case A's baton, Case B's ticket.
-fn states(win: &TokenWin) -> Vec<(Hash, u8, OutPoint)> {
-    let txid = double_sha256(&win.coinbase);
+/// The token states a win holds: (category, state hash) per won entry.
+fn states(win: &TokenWin) -> Vec<(Hash, Hash)> {
     win.entries
         .iter()
         .filter_map(|entry| win.aux.entries.get(usize::from(*entry)))
-        .map(|item| {
-            let anchor = match (item.mode, item.ticket_vout) {
-                (Mode::BlockRequired, Some(vout)) => OutPoint { txid, vout },
-                _ => OutPoint {
-                    txid: item.leaf.anchor_hash,
-                    vout: item.leaf.anchor_index,
-                },
-            };
-            (item.token.category, item.mode.byte(), anchor)
-        })
+        .map(|item| (item.token.category, item.leaf.state_hash))
         .collect()
 }
 
-/// What a claim of one won entry would show its covenant.
-struct View {
-    category: Hash,
-    anchor: OutPoint,
-    ticket: Option<OutPoint>,
-    payout: Vec<u8>,
-    split: Option<(u16, Vec<u8>)>,
-    target_bits: u32,
-    max_aux_height: u8,
-    start_height: u32,
-}
-
-impl View {
-    fn view(&self) -> ClaimView<'_> {
-        ClaimView {
-            category: self.category,
-            anchor: self.anchor,
-            ticket: self.ticket,
-            payout: &self.payout,
-            split: self
-                .split
-                .as_ref()
-                .map(|(bps, script)| (*bps, script.as_slice())),
-            target_bits: self.target_bits,
-            ext: [0; 32],
-            max_aux_height: self.max_aux_height,
-            start_height: self.start_height,
-        }
+/// Each won entry with the payout locking bytecode its claim would pay:
+/// the job's beneficiary (the miner, or the donation in its work jobs), or
+/// under Job Declaration the miner's own script, the pool's first output.
+/// The verifier hashes it again, so a job whose leaf bound anything else
+/// fails its own check.
+fn claim_payouts(network: MiningNetwork, win: &TokenWin) -> Vec<(u16, Vec<u8>)> {
+    // Other people's devices carry the empty commitment, so a public
+    // pool's job never has a win to claim; refuse one all the same.
+    if win.operator.is_some() {
+        return Vec::new();
     }
-}
-
-/// Each won entry with the claim view its proof is checked against: the
-/// job's beneficiary and split, the Case A baton or the Case B ticket.
-fn claim_views(network: MiningNetwork, win: &TokenWin) -> Vec<(u16, View)> {
-    // #### PR #42: a Job Declaration job's leaves bind its plan's terms: the
-    // miner's own script and the pool's whole donation rate.
-    let (beneficiary, split) = match win.declared.as_deref() {
-        Some(plan) => {
-            let Some((miner, split)) = plan.token_terms() else {
-                return Vec::new();
-            };
-            (
-                miner.to_vec(),
-                split.map(|(bps, script)| (bps, script.to_vec())),
-            )
-        }
+    let payout = match win.declared.as_deref() {
+        Some(plan) => match plan.token_payout() {
+            Some(miner) => miner.to_vec(),
+            None => return Vec::new(),
+        },
         None => {
-            let Ok(scripts) = payout::scripts(network, &win.miner, win.operator.as_deref()) else {
+            let Ok(scripts) = payout::scripts(network, &win.miner, None) else {
                 return Vec::new();
             };
-            (
-                payout::beneficiary(&scripts, win.payout).to_vec(),
-                payout::token_split(win.payout, &scripts[1])
-                    .map(|(bps, script)| (bps, script.to_vec())),
-            )
+            payout::token_payout(&scripts, win.payout).to_vec()
         }
     };
-    let txid = double_sha256(&win.coinbase);
     win.entries
         .iter()
-        .filter_map(|entry| {
-            let item = win.aux.entries.get(usize::from(*entry))?;
-            let baton = OutPoint {
-                txid: item.leaf.anchor_hash,
-                vout: item.leaf.anchor_index,
-            };
-            let (anchor, ticket) = match (item.mode, item.ticket_vout) {
-                (Mode::BlockRequired, Some(vout)) => (baton, Some(OutPoint { txid, vout })),
-                (Mode::BlockRequired, None) => return None,
-                (Mode::ShareTarget, _) => (baton, None),
-            };
-            Some((
-                *entry,
-                View {
-                    category: item.token.category,
-                    anchor,
-                    ticket,
-                    payout: beneficiary.clone(),
-                    split: split.clone(),
-                    target_bits: item.leaf.target_bits,
-                    max_aux_height: item.token.max_aux_height,
-                    start_height: item.token.start_height,
-                },
-            ))
-        })
+        .filter(|entry| win.aux.entries.get(usize::from(**entry)).is_some())
+        .map(|entry| (*entry, payout.clone()))
         .collect()
 }
 
@@ -409,7 +399,7 @@ mod tests {
     // #### PR #42
     // What: the test token's difficulty becomes a compact target that
     // expands back; the test token is refused off Chipnet; a new hub carries
-    // a set with both modes and reports it changed once.
+    // a one-token set and reports it changed once.
     // Look here if: bits_for_difficulty or TokenHub::test_token changes.
     #[test]
     fn the_test_token_is_chipnet_only_and_its_difficulty_round_trips() {
@@ -434,16 +424,54 @@ mod tests {
         assert_eq!(difficulty_for_bits(0x2000_0000), 0.0);
         assert!(bits_for_difficulty(0).is_err());
         let path = std::env::temp_dir().join("pickaxe-hub-unused.json");
-        assert!(
-            TokenHub::test_token(MiningNetwork::Mainnet, path.clone(), 0x1d00ffff)
-                .unwrap_err()
-                .contains("only on Chipnet")
-        );
-        let hub = TokenHub::test_token(MiningNetwork::Chipnet, path, 0x1d00ffff).unwrap();
+        assert!(TokenHub::test_token(
+            MiningNetwork::Mainnet,
+            path.clone(),
+            0x1d00ffff,
+            ClaimDelay::default()
+        )
+        .unwrap_err()
+        .contains("only on Chipnet"));
+        let hub = TokenHub::test_token(
+            MiningNetwork::Chipnet,
+            path,
+            0x1d00ffff,
+            ClaimDelay::default(),
+        )
+        .unwrap();
         let set = hub.current().unwrap();
-        assert_eq!(set.entries().len(), 2);
+        assert_eq!(set.entries().len(), 1);
+        let state = set.entries()[0].state;
+        assert_eq!(
+            state.lock_hash,
+            super::super::sha256(b"pickaxe merge-mining test token baton")
+        );
+        assert_eq!(
+            state.state_hash,
+            super::super::sha256(b"pickaxe merge-mining test token state")
+        );
         assert!(hub.take_changed());
         assert!(!hub.take_changed());
         assert!(hub.off().is_none());
+    }
+
+    // #### merge-mining v2: the claim broadcast delay
+    #[test]
+    fn claim_delays_parse_and_stay_in_range() {
+        assert_eq!(ClaimDelay::default(), ClaimDelay { min: 5, max: 60 });
+        assert_eq!(ClaimDelay::parse("5-60"), Ok(ClaimDelay::default()));
+        assert_eq!(ClaimDelay::parse("0"), Ok(ClaimDelay { min: 0, max: 0 }));
+        assert_eq!(
+            ClaimDelay::parse(" 10 - 20 "),
+            Ok(ClaimDelay { min: 10, max: 20 })
+        );
+        for bad in ["", "-", "60-5", "a-b", "-5", "86401", "1-86401"] {
+            assert!(ClaimDelay::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(ClaimDelay { min: 0, max: 0 }.pick(), 0);
+        let delay = ClaimDelay::default();
+        for _ in 0..1_000 {
+            assert!((5..=60).contains(&delay.pick()));
+        }
     }
 }

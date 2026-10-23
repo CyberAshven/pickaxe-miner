@@ -120,6 +120,9 @@ pub struct ServerStats {
     pub token_wins_dropped: u64,
     pub recent_token_wins: VecDeque<FoundTokenWin>,
     pub tokens_off: Option<String>,
+    /// #### merge-mining v2: why the latest job refused token merge mining
+    /// (its coinbase's output 0 is not this server's commitment).
+    pub tokens_refused: Option<&'static str>,
     /// #### PR #42: the Template Distribution server's counts, when it
     /// serves templates or still holds relayed blocks.
     pub template_server: Option<TemplateServerStats>,
@@ -247,8 +250,6 @@ pub struct TemplateServerStats {
 #[derive(Clone, Debug)]
 pub struct FoundTokenWin {
     pub token: &'static str,
-    /// 'A' (the share met the token's target) or 'B' (a found block).
-    pub mode: char,
     pub height: u32,
     pub worker: String,
     pub found: Instant,
@@ -615,12 +616,6 @@ pub fn run_with(
                                 for found in proven {
                                     stats.recent_token_wins.push_back(FoundTokenWin {
                                         token: found.token,
-                                        mode: if found.mode == super::merge::leaf::Mode::ShareTarget
-                                        {
-                                            'A'
-                                        } else {
-                                            'B'
-                                        },
                                         height: found.height,
                                         worker: worker.clone(),
                                         found: Instant::now(),
@@ -2605,6 +2600,11 @@ fn serve_device(
                     // #### PR #40: named by its channel's user identity.
                     if let Some(identity) = mining.identity.take() {
                         stats.device_stats.set_worker(device, &identity);
+                    }
+                    // #### merge-mining v2: a job refused token merge
+                    // mining (the own-root check) says so on the dashboard.
+                    if let Some(reason) = mining.token_refusal.take() {
+                        stats.tokens_refused = Some(reason);
                     }
                     if let Some(event) = responses.share_event {
                         stats

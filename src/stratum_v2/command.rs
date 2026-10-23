@@ -179,6 +179,7 @@ pub fn run(
             config.network,
             config_path.with_extension("sv2-token-proofs.json"),
             super::merge::hub::bits_for_difficulty(difficulty)?,
+            Default::default(),
         )?)),
         None => None,
     };
@@ -2016,21 +2017,24 @@ fn connect_text(page: &ConnectPage) -> String {
         ServeMode::Public => {
             "\nUsername: the miner's own BCH address (q or p; the prefix may be left out), \
              optionally followed by .name; the blocks they find pay it. SV2 devices give it \
-             as their user identity.\n"
+             as their user identity.\nMerge-mined tokens: miners' jobs carry the empty \
+             commitment, so no token root of yours sits on their devices and the pool fee \
+             never reaches tokens.\n"
         }
         // #### PR #42: with Job Declaration, this node builds the blocks.
         ServeMode::JoinPool if page.job_declaration => {
             "\nUsername: any name for the device; it names the device on the workers page. \
              This computer mines at the pool for you with your node's templates (Job \
              Declaration), and the pool's own jobs while the pool refuses them.\nMerge-mined \
-             tokens: on while your templates are mined; your node builds the blocks, and \
-             token wins pay your payout address.\n"
+             tokens: on while your templates are mined; your node builds the blocks, token \
+             wins pay your payout address, and only shares that meet the pool's target go to \
+             the pool.\n"
         }
         ServeMode::JoinPool => {
             "\nUsername: any name for the device; it names the device on the workers page. \
              This computer mines at the pool for you.\nMerge-mined tokens are off at a pool: \
              the pool builds the blocks, so this computer cannot add token commitments. Mine \
-             solo or run your own pool to merge-mine.\n"
+             solo, or at a pool with Job Declaration, to merge-mine.\n"
         }
     });
     // #### PR #42: where miners' own templates go.
@@ -2253,9 +2257,9 @@ fn status_json(
             "wins": snapshot.token_wins,
             "dropped": snapshot.token_wins_dropped,
             "off": snapshot.tokens_off,
+            "refused": snapshot.tokens_refused,
             "recent": snapshot.recent_token_wins.iter().map(|win| serde_json::json!({
                 "token": win.token,
-                "mode": win.mode.to_string(),
                 "height": win.height,
                 "worker": win.worker,
                 "seconds_ago": win.found.elapsed().as_secs(),
@@ -2941,10 +2945,10 @@ fn records_line(stats: &ServerStats) -> String {
     let tokens = match (&stats.tokens_off, stats.recent_token_wins.back()) {
         (Some(off), _) => format!(" · Tokens off: {off}"),
         (None, Some(last)) => format!(
-            " · Token wins {} (last: {} case {} by {}{})",
+            " · Token wins {} (last: {} at #{} by {}{})",
             stats.recent_token_wins.len(),
             last.token,
-            last.mode,
+            last.height,
             last.worker,
             if stats.token_wins_dropped > 0 {
                 format!("; {} dropped", stats.token_wins_dropped)
@@ -2953,6 +2957,12 @@ fn records_line(stats: &ServerStats) -> String {
             }
         ),
         (None, None) => String::new(),
+    };
+    // #### merge-mining v2: a job whose coinbase failed the own-root check
+    // mines BCH alone; the dashboard says why.
+    let tokens = match stats.tokens_refused {
+        Some(reason) => format!("{tokens} · Token merge mining refused for a job: {reason}"),
+        None => tokens,
     };
     // #### PR #42: an ASIC-exclusive token's wins.
     let header = stats
@@ -3270,24 +3280,35 @@ mod tests {
         stats.token_wins_dropped = 1;
         stats.recent_token_wins.push_back(server::FoundTokenWin {
             token: "Pickaxe test token",
-            mode: 'A',
             height: 325_909,
             worker: "rig1 #1".into(),
             found: Instant::now(),
         });
         let line = records_line(&stats);
         assert!(
-            line.contains("Token wins 1 (last: Pickaxe test token case A by rig1 #1; 1 dropped)"),
+            line.contains(
+                "Token wins 1 (last: Pickaxe test token at #325909 by rig1 #1; 1 dropped)"
+            ),
             "{line}"
         );
         let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
         assert_eq!(status["tokens"]["wins"], 2);
         assert_eq!(status["tokens"]["dropped"], 1);
-        assert_eq!(status["tokens"]["recent"][0]["mode"], "A");
         assert_eq!(status["tokens"]["recent"][0]["height"], 325_909);
+        assert!(status["tokens"]["refused"].is_null());
+        // #### merge-mining v2: a job refused by the own-root check.
+        stats.tokens_refused = Some("output 0 is not this server's token commitment");
+        assert!(records_line(&stats).contains(
+            "Token merge mining refused for a job: output 0 is not this server's token commitment"
+        ));
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(
+            status["tokens"]["refused"],
+            "output 0 is not this server's token commitment"
+        );
         stats.tokens_off = Some("token proofs cannot be saved: disk full".into());
         assert!(records_line(&stats).contains("Tokens off: token proofs cannot be saved"));
-        assert!(super::super::status_report().contains("merge mining: commitment v1 (draft)"));
+        assert!(super::super::status_report().contains("merge mining: common format v2"));
     }
 
     // #### PR #42

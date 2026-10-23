@@ -174,9 +174,8 @@ impl PayoutRule {
 }
 
 /// The merge-mining shape a coinbase may take: at most one commitment, as
-/// output 0, worth 0 and exact; tickets anywhere; no token-prefixed output
-/// (a coinbase cannot create CashTokens); fewer than 0xfd outputs with a
-/// commitment.
+/// output 0, worth 0 and exact (v2); no token-prefixed output (a coinbase
+/// cannot create CashTokens); fewer than 0xfd outputs with a commitment.
 pub fn check_commitments(outputs: &[(u64, Vec<u8>)]) -> Result<(), String> {
     let mut commitment = false;
     for (index, (value, script)) in outputs.iter().enumerate() {
@@ -342,7 +341,7 @@ mod tests {
         let script = AuxCommitment {
             root: [7; 32],
             height: 2,
-            nonce: 9,
+            salt: 9,
         }
         .script()
         .to_vec();
