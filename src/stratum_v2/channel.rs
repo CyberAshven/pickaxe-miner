@@ -895,6 +895,21 @@ impl Channel {
         template.tokens().map(|set| *set.easiest())
     }
 
+    /// #### merge-mining v2: after the own-root check refused the current
+    /// job's tokens, settle back to the plain target and give the job that
+    /// target too (it was issued at the floor), so a BCH-only job accepts no
+    /// token-floor shares. True when the device must be told (SetTarget).
+    pub fn drop_token_floor(&mut self, maximum: &Hash) -> bool {
+        let Some(block) = self.job.as_ref().map(|job| job.template.target) else {
+            return false;
+        };
+        let changed = self.settle(&block, None, maximum);
+        if let Some(job) = self.job.as_mut() {
+            job.target = self.target;
+        }
+        changed
+    }
+
     /// The current job's token floor: none when its tokens were refused by
     /// the own-root check (it carries no commitment and mines BCH alone), so
     /// a refusal never outlives its job.
@@ -1818,6 +1833,19 @@ mod tests {
         solo.install_with_payout(4, 1, template.clone(), BchPayout::default())
             .unwrap();
         assert_eq!(solo.job_floor(), Some(easiest));
+        // A job issued at the floor and then refused takes the plain target
+        // too, so it accepts no token-floor shares.
+        let maximum = [0xff; 32];
+        solo.settle(&template.target, Some(&easiest), &maximum);
+        solo.install_with_payout(5, 1, template.clone(), BchPayout::default())
+            .unwrap();
+        // Stand in for an issued-at-the-floor target the plain one differs from.
+        solo.job.as_mut().unwrap().target = easiest;
+        solo.job.as_mut().unwrap().aux = None;
+        solo.drop_token_floor(&maximum);
+        assert_eq!(solo.job().unwrap().target, solo.target);
+        // Already plain: settling again without a floor changes nothing.
+        assert!(!solo.settle(&template.target, None, &maximum));
     }
 
     /// A target easier than any test share's hash, so every share is
