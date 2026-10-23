@@ -8,6 +8,15 @@ This developer-only deterministic harness verifies the production reward settlem
 
 `photon-auxpow.mjs` checks that the live PHOTON v3.2 covenant accepts a claim whose reward goes to a P2SH32 payout carrying an ELECTRIC commitment, so PHOTON's proof covers it (AuxPoW style; see `docs/photon-electric-auxpow.md`). A 700-sat payout is dust for that output, 800 sats is standard, and only the miner key spends the reward.
 
+`merge-forwarder.mjs` executes the existing ASIC header-token payout forwarders
+exported by Rust, for personal and donation-work recipients on standard and
+extended channels. Both BCH 2026 VMs accept 12 intended spends and reject 32
+recipient, category, amount and composed-input mutations. The existing Rust
+merge suite separately checks Case A share-target and Case B block-required
+proofs, including payout/donation commitments and tampering. This is a small
+offline check of existing adapters; it registers no token, adds no claim
+contract, and does not establish compatibility with an unspecified future token.
+
 It is intentionally offline: no Fulcrum or node connection, production key, external funding, or broadcast is used. The test checks consensus and standard-mode validity, CashToken conservation, covenant-preserving state, adversarial mutations, and an exact serialization fingerprint shared with the Rust settlement regression.
 
 Run:
