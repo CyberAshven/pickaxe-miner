@@ -3389,6 +3389,21 @@ Branch `feat/merge-mining-v2`, on `dev`.
     setup.
   - A claim's miner output now carries exactly 800 satoshis, as the
     covenant checks.
+  - Following P2Pool's covenant fixes:
+    - the agreed thread rule
+      `u32le(HASH256(payout_hash ‖ cb_height)[0..4]) mod threads`, then the
+      next minable thread;
+    - the vault keeps at least 800 satoshis;
+    - share scripts are at most 35 bytes;
+    - the fallback band is a constant `ref >> 4` to `ref × 1.1`;
+    - ASERT's exponent truncates, then its shift floors (with a vector).
+  - Won states are rebuilt from the journal at start. A sent claim is asked
+    for before it is sent again, and a trade that only moved the vault does
+    not count as a try.
+  - P2Pool's Chipnet fixture (copied verbatim) is reproduced by the
+    loader: `K`, lock, `lock_hash` and vault address. Its claim inputs are
+    exported in `cli.mjs claim` format, so P2Pool's hex can be compared
+    byte for byte.
   - Evidence: P2Pool's numbers reproduced in host tests:
     - `K` 1,946 / 1,943;
     - unlocking bytes 1,597 / 1,731 for its two measured proof shapes;

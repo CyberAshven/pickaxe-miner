@@ -382,10 +382,19 @@ token authors. The format above does not depend on them.
     `0x1d00ffff` / 1,605,451,779 on chipnet; `allow_pow_limit`, true on test
     networks.
   - `height_delta = cb_height − 1 − anchor_height`. The header's own time
-    stands in for the parent's. The arithmetic is BCHN's `CalculateASERT`:
-    the exponent's division truncates toward zero and its integer part is a
-    flooring shift (BCH P2Pool's covenant settled on BCHN's rounding; an
-    earlier draft of this rule said floor division).
+    stands in for the parent's. The arithmetic is BCHN's `CalculateASERT`,
+    in two steps:
+    1. `exponent = ((time_diff − 600 × (height_delta + 1)) × 65536) /
+       half_life`, a division that truncates toward zero (C++ int64 `/`);
+    2. `shifts = exponent >> 16`, an arithmetic shift (floor), and
+       `frac = exponent & 0xffff`.
+
+    BCH P2Pool confirmed this is intended and matches BCHN; an earlier draft
+    of this rule said floor division. Vector: Chipnet's anchor, 100 blocks
+    on and one second behind schedule (`time_diff = 60,599`). The exponent
+    is −65536 / 3600, which truncates to −18 (floor division would give
+    −19). Then `shifts = −1`, `frac = 65518`, factor 131,047 and target
+    `0xfff2800c8 << 188`; floor division would give `0xfff2000d << 192`.
   - Mainnet: `computed/2 ≤ header_target ≤ computed × 1.05` (asymmetric).
     Multi-hour gaps happen, and the header's time is only a stand-in for the
     parent's, hence the room on the hard side.
@@ -394,10 +403,10 @@ token authors. The format above does not depend on them.
     `half_life` and anchor.
   - After `Δh ≥ 4,032` blocks without a claim, the covenant also accepts the
     fallback band around `ref`, the last claim header's nBits kept in the
-    state: `ref >> min(⌊Δh / 288⌋, 4) ≤ target ≤ ref × 1.1` (`CAP = 4`), so a
-    future change to BCH's difficulty algorithm cannot freeze a thread.
-    From 4,032 blocks on, `⌊Δh / 288⌋` is at least 14, so the hard side is
-    always `ref >> 4`.
+    state: `ref >> 4 ≤ target ≤ ref × 1.1`, so a future change to BCH's
+    difficulty algorithm cannot freeze a thread. (An earlier form,
+    `ref >> min(⌊Δh / 288⌋, 4)`, is the same wherever it applies: from
+    4,032 blocks on, `⌊Δh / 288⌋` is at least 14.)
 
 ### Risks
 
@@ -729,17 +738,35 @@ One JSON object, at most 1 MiB:
   state: thread, state height, target bits, ref bits (each u32 LE).
 - The hub reads the vaults from Fulcrum (`blockchain.scripthash.listunspent`
   with tokens, on the lock's script hash) every 20 seconds.
-- A coinbase holds one leaf per category, so a job carries one thread. The
-  thread must meet three conditions:
-  - its state is older than the job's height;
-  - this server has not already won its state;
+- A coinbase holds one leaf per category, so a job carries one thread. A
+  thread is minable at a height when:
+  - its state is older than the height;
+  - its state is not already won here (a state is claimed once; the won
+    states are rebuilt from the journal's proven and broadcast rows when the
+    server starts);
   - its vault holds enough for a claim (`K + 4,000 + 3 × 800 + 800`
     satoshis).
-- Among those, the job takes the easiest claim target at that height (the
-  lowest thread on a tie).
+- **The thread rule** (agreed with BCH P2Pool): a leaf paying `payout_hash`
+  in a coinbase at `cb_height` mines
+
+  ```text
+  thread = u32le(HASH256(payout_hash ‖ u32le(cb_height))[0..4]) mod threads
+  ```
+
+  or, when that thread is not minable, the next index mod `threads` that
+  is. `payout_hash` is the leaf's own (the miner's, or a work job's
+  recipient's), so on a public pool each miner's leaf may mine another
+  thread. With a power-of-two thread count (tSAFA has 4) this equals
+  reading the whole hash as a little-endian number mod `threads`.
+- Vector: `payout_hash = HASH256(76a914 12×20 88ac) =
+  22650758a42ebfd7306e771ad24c442cad795ed9e549392233729f647a2b1be5`. At
+  `cb_height` 329,001 the hash is `90d29130…67c0d7bf`; its u32le is
+  814,862,992, so the leaf takes thread 0 of 4 (1 of 3). At 329,002 the hash
+  is `af5ced2f…`, and the leaf takes thread 3 of 4. If thread 0 is not
+  minable at 329,001, the leaf takes thread 1, then 2, then 3.
+- The claim does not check the rule: the covenant accepts any thread.
 - The leaf binds the vault's `lock_hash`, `HASH256` of its commitment, the
   claim target for that height, and the payout and split as any leaf does.
-- A win moves the next jobs to another thread: a state can be claimed once.
 
 ### The claim transaction
 
@@ -759,12 +786,18 @@ transaction.
 - The reward is `⌊vault tokens / 420,000⌋`; the shares follow Split above.
 - The vault pays `S` to `3S` satoshis, `S = K + |proof|`. Pickaxe pays `S`
   (1 sat/byte of the bound; the claim is always smaller than `S`).
-- Pickaxe also refuses:
-  - a payout or split script over 35 bytes (`K` allows no more);
-  - a claim whose unlocking bytecode exceeds 10,000 bytes;
-  - a claim that would leave the vault's satoshis below BCHN's dust,
-    `3 × (output size + 148)`. The covenant would accept that claim, but no
-    node relays it.
+- The covenant requires that every share output (miner, donation, fee)
+  pays a script of at most 35 bytes (P2PKH, P2SH20 or P2SH32, as `K`
+  assumes). It also requires the vault to keep at least 800 satoshis, the
+  fee coming from its cash alone.
+- Pickaxe refuses a claim that would leave the vault fewer than 800
+  satoshis or BCHN's dust, `3 × (output size + 148)` (756 for the largest
+  vault output, so 800 rules). It also refuses a claim whose unlocking
+  bytecode exceeds 10,000 bytes.
+- An operator whose fee script were longer than 35 bytes could not take
+  tSAFA's fee slot. Pickaxe never has one: payout, donation and pool fee
+  addresses are CashAddrs (25, 23 or 35-byte scripts). `--safa-deployment`
+  still refuses to start if any of them is longer.
 - The header's nBits must pass the ASERT band at the coinbase height, or the
   fallback band (see Token-level rules).
 
@@ -788,7 +821,12 @@ tip, then moves each tSAFA row of the proof journal on:
   the claim's and in a block, or once the vault has moved on with the claim
   known to Fulcrum.
   - It becomes **stale** if another claim moved the thread first.
-  - If the claim has left the mempool, it is sent again.
+  - While the vault is still in the claim's state but not its output, the
+    claimer asks Fulcrum for the claim. In the mempool or a block, it is
+    left alone. If it is gone and a market trade moved the vault's outpoint,
+    it is built again against the new one without counting a try. If it is
+    gone and the vault is where the claim found it, it is sent again as a
+    retry.
 - A market trade replaces the vault's outpoint but keeps its state, so a
   win is still claimed against the traded vault.
 
@@ -796,7 +834,8 @@ Journal rows for tSAFA carry, besides a proof's fields:
 
 - `commitment`, the vault's state when mined;
 - `payout_script`, plus `donation_script` and `fee_script` (or null);
-- once claimed: `txid`, `claimed_at`, `fee_sats`;
+- once claimed: `txid`, `vault_outpoint` (the outpoint it spent),
+  `claimed_at`, `fee_sats`;
 - on retries: `attempts`, `next_attempt` and `error`.
 
 The file stays owner-only.
@@ -816,9 +855,30 @@ apart from the builder:
 - output 0's script, category, capability and next state;
 - CLTV, the leaf and proof, the ASERT and fallback bands;
 - the reward, the shares and their outputs;
-- the `S` to `3S` fee, the size bound and the vault's dust.
+- the `S` to `3S` fee, the size bound, the vault's 800 satoshis and dust,
+  and share scripts of at most 35 bytes.
 
 Every claim the builder makes passes it before it is broadcast.
+
+### Cross-checks with BCH P2Pool
+
+- `src/stratum_v2/merge/test_data/tsafa-chipnet-fixture.json` is BCH
+  P2Pool's fixture, copied verbatim from its
+  `tools/safa-auxpow/test_data`. It is what P2Pool's `cli.mjs params`
+  prints for a fake Chipnet deployment: funding outpoint `11…11:0`, 4
+  threads, 84,000,000,000 virtual satoshis, never broadcast.
+- Pickaxe's loader reproduces P2Pool's values from that file's redeem
+  script (1,366 bytes):
+  - `K` 1,946;
+  - the lock `aa2031973ed4…646e87`;
+  - `lock_hash` `ffced6fb…ef4a7a57`;
+  - the vault address `bchtest:rvcew0k5…`.
+- `safa_auxpow::tests::the_fixture_claim_matches_p2pools` builds a claim for
+  it from fixed inputs. With `PICKAXE_SAFA_EXPORT=DIR`, it writes P2Pool's
+  `cli.mjs claim` inputs there (`deployment.json`, `claim.json`) beside
+  Pickaxe's hex. Once P2Pool's hex for them is in
+  `test_data/tsafa-chipnet-claim.json`, the test compares the two byte for
+  byte.
 
 ## What Pickaxe does today
 
