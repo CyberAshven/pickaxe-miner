@@ -100,8 +100,11 @@ pub struct JdTarget {
 // What: a Job Declaration client's login names the miner's own donation
 // setting as `,pickaxe-donation=<percent>` (to the 0.5% step below, as of
 // each session's start), so a Pickaxe pool's tokens carry it instead of the
-// pool's setting. A pool that refuses the device channel with the option is
-// asked again without it, and keeps its own setting.
+// pool's setting. A pool that refuses the channel for the login itself
+// (`unknown-user`, as a pool that cannot read options answers, or a Pickaxe
+// pool's `invalid-donation`) is asked again without it, and keeps its own
+// setting; any other refusal is a failure like any other, and the option
+// stays.
 // Why: the Pickaxe donation is the miner's choice on any pool; under Job
 // Declaration it is paid in the coinbase only, at the token's rate. The key
 // is Pickaxe's own: BCH P2Pool reads `donation=` for its own, independent
@@ -112,6 +115,18 @@ pub struct JdTarget {
 /// named `,pickaxe-donation=`.
 const PICKAXE_DONATION_REFUSED: &str =
     "the pool refused the login's donation option; using the pool's own donation setting";
+
+/// Whether a channel refusal is about the login itself, not a passing
+/// state of the pool such as `no-template-available`.
+fn refuses_login(frame: &mut SerializedFrame) -> bool {
+    frame.header().msg_type() == MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR
+        && binary_sv2::from_bytes::<OpenMiningChannelError>(frame.payload()).is_ok_and(|error| {
+            matches!(
+                error.error_code.as_ref(),
+                b"unknown-user" | b"invalid-donation"
+            )
+        })
+}
 
 impl JdTarget {
     /// The login the pool sees: the identity, with the miner's donation
@@ -550,6 +565,7 @@ fn uplink(
         open(&mut pool, 2, JD_COMPACT_ROLLABLE)?;
         frame = answer(&mut replies, stop)?;
     }
+    let login_refused = target.pickaxe_donation.is_some() && refuses_login(&mut frame);
     let (channel, mut group, mut pool_target, prefix, rollable) = match frame.header().msg_type() {
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS => {
             let opened: OpenExtendedMiningChannelSuccess =
@@ -562,7 +578,7 @@ fn uplink(
                 usize::from(opened.extranonce_size),
             )
         }
-        _ if target.pickaxe_donation.is_some() => return Err(PICKAXE_DONATION_REFUSED.into()),
+        _ if login_refused => return Err(PICKAXE_DONATION_REFUSED.into()),
         _ => return Err("the pool refused the Job Declaration channel".into()),
     };
     if rollable < JD_COMPACT_ROLLABLE {
@@ -1353,6 +1369,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(login.donation, Some("1.5".parse().unwrap()));
+        // Only a refusal of the login drops the option.
+        let refusal = |code: &'static str| {
+            mining(Mining::OpenMiningChannelError(OpenMiningChannelError {
+                request_id: 1,
+                error_code: code.try_into().unwrap(),
+            }))
+            .unwrap()
+        };
+        assert!(refuses_login(&mut refusal("unknown-user")));
+        assert!(refuses_login(&mut refusal("invalid-donation")));
+        assert!(!refuses_login(&mut refusal("no-template-available")));
+        assert!(!refuses_login(&mut refusal("max-target-out-of-range")));
     }
     use crate::stratum_v2::template_tests::rpc_template;
 

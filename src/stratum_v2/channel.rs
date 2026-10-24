@@ -325,10 +325,17 @@ impl Channel {
         // Why: the Pickaxe donation is the miner's choice, down to 0, even
         // on someone else's pool; the operator's fee is unaffected.
         // Look here if: a miner's `,donation=` does not change their jobs.
+        // Until the session's work allocation is at the miner's rate (its
+        // first job, see `MiningSession::donation_choice`), the token work
+        // flags follow only the BCH work this job keeps: a pool default's
+        // token donation or fee work never rides a miner's first job.
         if let Some(choice) = self.donation {
             if payout.donation != choice {
                 payout.donation = choice;
                 payout.donation_work &= u16::from(choice) != 0;
+                payout.token_donation_work =
+                    payout.token_donation_work.map(|_| payout.donation_work);
+                payout.token_fee_work = payout.token_fee_work.map(|_| payout.fee_work);
             }
         }
         if self.job.as_ref().is_some_and(|job| job.id == id)
@@ -1895,6 +1902,19 @@ mod tests {
             ..claim_view(&scripts)
         };
         verify_proof(&win.proof(0).unwrap(), &view).unwrap();
+        // The first job at donation=0 never keeps a pool default's token
+        // donation work, so no leaf of it pays the donation.
+        let pool_default = BchPayout {
+            token_donation_work: Some(true),
+            token_fee_work: Some(true),
+            ..coinbase_fee
+        };
+        let job = channel
+            .install_with_payout(2, 4, template.clone(), pool_default)
+            .unwrap();
+        assert!(!job.payout.donation_work);
+        assert_eq!(job.payout.token_donation_work, Some(false));
+        assert_eq!(job.payout.token_fee_work, Some(false));
     }
 
     /// A target easier than any test share's hash, so every share is
