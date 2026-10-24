@@ -3372,6 +3372,36 @@ Branch `feat/merge-mining-v2`, on `dev`.
     refused, SV1 firmware getting its leaves end to end from a public pool,
     and the leaf log.
 
+- **tSAFA claims (Chipnet only):** BCH P2Pool's SAFA AuxPoW covenant,
+  matched in Rust (`merge/safa_auxpow.rs`) without copying it:
+  - The deployment file: network, category, threads, virtual reserve and
+    redeem script, with `K` and the P2SH32 lock derived and checked.
+  - The 16-byte thread state, the DAA, and the ASERT and fallback bands.
+  - The claim builder: one input, the four unlocking pushes, the vault with
+    the next state, the shares with 800 satoshis each, the CLTV lock time,
+    and the vault paying `S = K + |proof|`.
+  - An independent check of each claim's bytes before broadcast.
+  - The claimer: vaults and broadcasts through Fulcrum, journal states
+    proven, broadcast, confirmed, stale and failed, retries, and dashboard
+    counts.
+  - Gated by the hidden `serve --safa-deployment <FILE>`: Chipnet only, own
+    templates only, refused on mainnet and at a pool, never offered by the
+    setup.
+  - A claim's miner output now carries exactly 800 satoshis, as the
+    covenant checks.
+  - Evidence: P2Pool's numbers reproduced in host tests:
+    - `K` 1,946 / 1,943;
+    - unlocking bytes 1,597 / 1,731 for its two measured proof shapes;
+    - shares 980,100 / 10,000 / 9,900 and 980,198 / 0 / 19,802;
+    - DAA bits 0x2001bffe;
+    - the ASERT band edges and real headers;
+    - token target, nBits and BIP34 vectors.
+  - Also tested: a byte-exact claim written field by field; the check
+    refusing P2Pool's list of attacks; a win from share to confirmed claim
+    through a fake chain.
+  - No claim has been run through the covenant in a VM: Pickaxe has no
+    Rust BCH VM, and tSAFA's compiled covenant is not published yet.
+
 Not in this change: BCH P2Pool building output 0 in this format (Pickaxe
-still refuses tokens with a P2Pool-prepared coinbase), a claim builder, and
-live or covenant-VM checks.
+still refuses tokens with a P2Pool-prepared coinbase), and live or
+covenant-VM checks.

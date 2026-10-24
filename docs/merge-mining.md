@@ -369,8 +369,11 @@ token authors. The format above does not depend on them.
 - **Height.** `<cb_height> OP_CHECKLOCKTIMEVERIFY`, with the strict
   `state_height < cb_height`: a claim's coinbase must be newer than the
   thread's state.
-- **Difficulty adjustment:** `min(Δh, 288) / threads`, with
-  `Δh = cb_height − state_height`.
+- **Difficulty adjustment:** the claim's target is the state's eased by the
+  blocks since the last claim, `target × (⌊min(Δh, 288) × 5000 / threads⌋ +
+  5000) / 10000`, clamped to 1 and `0x7fffff << 232` and rounded down to
+  canonical token bits, with `Δh = cb_height − state_height`. The leaf
+  commits these bits, and they become the next state's.
 - **BCH only.** The covenant checks the header's nBits against ASERT at the
   coinbase's BIP34 height:
   - Per-network parameters, from BCHN's chainparams: `half_life` 172,800 s on
@@ -379,8 +382,10 @@ token authors. The format above does not depend on them.
     `0x1d00ffff` / 1,605,451,779 on chipnet; `allow_pow_limit`, true on test
     networks.
   - `height_delta = cb_height − 1 − anchor_height`. The header's own time
-    stands in for the parent's. The exponent uses floor division (not
-    truncation) when it is negative.
+    stands in for the parent's. The arithmetic is BCHN's `CalculateASERT`:
+    the exponent's division truncates toward zero and its integer part is a
+    flooring shift (BCH P2Pool's covenant settled on BCHN's rounding; an
+    earlier draft of this rule said floor division).
   - Mainnet: `computed/2 ≤ header_target ≤ computed × 1.05` (asymmetric).
     Multi-hour gaps happen, and the header's time is only a stand-in for the
     parent's, hence the room on the hard side.
@@ -388,9 +393,11 @@ token authors. The format above does not depend on them.
     nBits equal to the network's powLimit (`allow_pow_limit`), with their own
     `half_life` and anchor.
   - After `Δh ≥ 4,032` blocks without a claim, the covenant also accepts the
-    fallback band, capped at 4 doublings on the hard side and ×1.1 on the easy
-    side (`CAP = 4`), so a future change to BCH's difficulty algorithm cannot
-    freeze a thread.
+    fallback band around `ref`, the last claim header's nBits kept in the
+    state: `ref >> min(⌊Δh / 288⌋, 4) ≤ target ≤ ref × 1.1` (`CAP = 4`), so a
+    future change to BCH's difficulty algorithm cannot freeze a thread.
+    From 4,032 blocks on, `⌊Δh / 288⌋` is at least 14, so the hard side is
+    always `ref >> 4`.
 
 ### Risks
 
@@ -671,6 +678,148 @@ ffff7f20
   with 800 satoshis). A reward of 50,000 pays the miner all 50,000: the
   donation's 500 and the fee's 495 are worth under 1,000 satoshis.
 
+## tSAFA on Chipnet
+
+tSAFA is the Chipnet test deployment of BCH P2Pool's SAFA AuxPoW covenant
+(the merge-mined variant of the SAFA draft, in P2Pool's
+`tools/safa-auxpow`). Pickaxe merge-mines it and claims its wins, written
+from the covenant's rules (`src/stratum_v2/merge/safa_auxpow.rs`); nothing
+of P2Pool's is copied or run.
+
+### The gate
+
+- Only `stratum-v2 serve --safa-deployment <FILE>` (a hidden flag) mines
+  it, and only on Chipnet, with this server's own templates (solo or
+  `--public`).
+- It is refused on mainnet, at a pool (`--upstream`; a Pickaxe pool's Job
+  Declaration check knows no tSAFA row), and beside `--merge-test-token`.
+- The setup never offers it, and neither network's registry has a SAFA row.
+
+### The deployment file
+
+One JSON object, at most 1 MiB:
+
+```json
+{
+  "version": 1,
+  "name": "tSAFA",
+  "network": "chipnet",
+  "category": "<the genesis txid, as a txid is shown>",
+  "threads": 4,
+  "virtual_sats": "84000000000",
+  "redeem_script": "<the covenant's bytes, hex>"
+}
+```
+
+- The redeem script fixes the covenant. Pickaxe derives the vaults' P2SH32
+  lock (`aa20 HASH256(redeem) 87`), the leaves' `lock_hash` and the fee
+  constant `K = 577 + the redeem script's push length + its length`.
+- P2Pool's `cli.mjs params` prints the redeem script with `fee_k`,
+  `redeem_script_bytes`, `locking_bytecode` and `lock_hash`. When the file
+  carries any of them, they must agree.
+- A redeem script that does not push the file's `K`, its virtual reserve,
+  the reward divisor 420,000 and the `CTMP 02` proof magic is refused as
+  another deployment's covenant.
+- `name` is optional (1 to 32 printable characters).
+
+### Threads and jobs
+
+- A vault (one per thread) is a covenant output holding fungible tokens,
+  satoshis and one mutable NFT whose 16-byte commitment is the thread's
+  state: thread, state height, target bits, ref bits (each u32 LE).
+- The hub reads the vaults from Fulcrum (`blockchain.scripthash.listunspent`
+  with tokens, on the lock's script hash) every 20 seconds.
+- A coinbase holds one leaf per category, so a job carries one thread. The
+  thread must meet three conditions:
+  - its state is older than the job's height;
+  - this server has not already won its state;
+  - its vault holds enough for a claim (`K + 4,000 + 3 × 800 + 800`
+    satoshis).
+- Among those, the job takes the easiest claim target at that height (the
+  lowest thread on a tie).
+- The leaf binds the vault's `lock_hash`, `HASH256` of its commitment, the
+  claim target for that height, and the payout and split as any leaf does.
+- A win moves the next jobs to another thread: a state can be claimed once.
+
+### The claim transaction
+
+The covenant fixes the claim completely. It needs no signature, so two
+claimants who build it with the same fee rate and lock time build the same
+transaction.
+
+| Part | Value |
+|---|---|
+| version | 2 |
+| inputs | exactly one, the vault, sequence `0xfffffffe` |
+| unlocking | minimal pushes: the split preimage (69 bytes, or empty), `payout_hash` (32), the `AuxProof` v2, the redeem script |
+| output 0 | the vault: its own script; its category with a mutable NFT whose commitment is the next state (thread, coinbase height, claim target bits, the header's nBits); its tokens less the reward; its satoshis less the fee and 800 per share output |
+| outputs 1.. | the miner's share (to `payout_hash`), the donation's, the fee's, in that order, each only when above 0, each exactly 800 satoshis and fungible tokens only |
+| lock time | the coinbase height (any height at or above it is valid; never a time) |
+
+- The reward is `⌊vault tokens / 420,000⌋`; the shares follow Split above.
+- The vault pays `S` to `3S` satoshis, `S = K + |proof|`. Pickaxe pays `S`
+  (1 sat/byte of the bound; the claim is always smaller than `S`).
+- Pickaxe also refuses:
+  - a payout or split script over 35 bytes (`K` allows no more);
+  - a claim whose unlocking bytecode exceeds 10,000 bytes;
+  - a claim that would leave the vault's satoshis below BCHN's dust,
+    `3 × (output size + 148)`. The covenant would accept that claim, but no
+    node relays it.
+- The header's nBits must pass the ASERT band at the coinbase height, or the
+  fallback band (see Token-level rules).
+
+### The claimer
+
+Every 20 seconds (60 after a failure) a thread reads the vaults and the
+tip, then moves each tSAFA row of the proof journal on:
+
+- **proven**: waiting. Once its `broadcast_after` has passed and the chain
+  has reached its coinbase height (its lock time is final from then on),
+  the claimer builds the claim against the thread's current vault.
+  - If the vault is already in another state, the row becomes **stale**
+    (another claim was first).
+  - If the covenant would refuse the claim, the row becomes **failed**, with
+    the reason.
+  - Otherwise the claimer checks the claim's bytes and broadcasts it
+    through Fulcrum, and the row becomes **broadcast**, with its `txid`.
+  - A refused broadcast or a missing vault is retried after 30 seconds,
+    doubling up to an hour. After 10 tries the row becomes **failed**.
+- **broadcast**: the row becomes **confirmed** once the vault's output is
+  the claim's and in a block, or once the vault has moved on with the claim
+  known to Fulcrum.
+  - It becomes **stale** if another claim moved the thread first.
+  - If the claim has left the mempool, it is sent again.
+- A market trade replaces the vault's outpoint but keeps its state, so a
+  win is still claimed against the traded vault.
+
+Journal rows for tSAFA carry, besides a proof's fields:
+
+- `commitment`, the vault's state when mined;
+- `payout_script`, plus `donation_script` and `fee_script` (or null);
+- once claimed: `txid`, `claimed_at`, `fee_sats`;
+- on retries: `attempts`, `next_attempt` and `error`.
+
+The file stays owner-only.
+
+The dashboard's records line shows `tSAFA claims: N confirmed, N sent, N
+waiting, N lost, N failed (N vaults)`. The status file's `tokens.claims`
+has the same counts, never an address or a script.
+
+### Before broadcast
+
+Pickaxe has no BCH script VM, so no Pickaxe test runs a built claim through
+the covenant itself. Instead, `check_claim` reads the claim's bytes back the
+way the covenant's introspection does. It checks every rule above, written
+apart from the builder:
+
+- the one input and its four pushes, ending in this redeem script;
+- output 0's script, category, capability and next state;
+- CLTV, the leaf and proof, the ASERT and fallback bands;
+- the reward, the shares and their outputs;
+- the `S` to `3S` fee, the size bound and the vault's dust.
+
+Every claim the builder makes passes it before it is broadcast.
+
 ## What Pickaxe does today
 
 - Builds the commitment and the tree into every job when a token is
@@ -689,6 +838,8 @@ ffff7f20
   reveals.
 - Shows token wins on the dashboard and in the status file, never with an
   address, and says when the own-root check refused a job.
+- Merge-mines tSAFA on Chipnet from an explicit deployment file and claims
+  its wins through Fulcrum (see [tSAFA on Chipnet](#tsafa-on-chipnet)).
 - A hidden `stratum-v2 serve --merge-test-token <DIFFICULTY>` merge-mines a
   Chipnet test token (a synthetic lock hash and state hash; the state moves to
   the winning header's hash after each proven win) to try all of this with real
@@ -699,8 +850,12 @@ ffff7f20
 ## Still open
 
 - **A first real token.** Its authors write the covenant (with these checks
-  and the token-level rules) and Pickaxe adds its row to the registry and a
-  claim builder that broadcasts its claims.
+  and the token-level rules) and Pickaxe adds its row to the registry; its
+  claims follow tSAFA's builder if it is the SAFA covenant.
+- **tSAFA in a VM.** Pickaxe's claims are checked against the covenant's
+  rules in Rust, not run through the covenant: that needs tSAFA's compiled
+  redeem script and a BCH 2026 VM (Libauth, as P2Pool's tests use), and a
+  run against BCHN once tSAFA is broadcast.
 - **BCH P2Pool** building output 0 in this format, so Pickaxe can merge-mine
   there.
 - **Disclosure at remote pools:** the adapter asks only its own server for
