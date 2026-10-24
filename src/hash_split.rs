@@ -1218,6 +1218,12 @@ mod tests {
             wait_until("the first round", || !layout.lock().unwrap().is_empty());
             assert!(layout.lock().unwrap().starts_with("measuring the GPUs"));
             wait_until("whole GPUs", || *layout.lock().unwrap() == whole);
+            // The layout is written before the GPUs are given: wait for
+            // ELECTRIC to hold GPUs 1-4 and mine GPU 5 before measuring.
+            wait_until("whole GPUs given", || {
+                (0..4).all(|gpu| electric.held[gpu].load(Ordering::Relaxed))
+                    && !electric.held[4].load(Ordering::Relaxed)
+            });
             let before: Vec<Duration> = (0..5).map(|gpu| electric.mined_on(gpu)).collect();
             std::thread::sleep(period * 5);
             let gained: Vec<Duration> = (0..5)
