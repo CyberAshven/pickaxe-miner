@@ -1,0 +1,4 @@
+{
+  "note": "Pickaxe's claim for BCH P2Pool's Chipnet tSAFA fixture (tsafa-chipnet-fixture.json, copied from P2Pool). Run safa_auxpow::tests::the_fixture_claim_matches_p2pools with PICKAXE_SAFA_EXPORT=DIR to write its cli.mjs claim inputs; put the hex P2Pool's `node cli.mjs claim deployment.json claim.json` prints for them in p2pool_claim_hex, and the test compares it with Pickaxe's byte for byte.",
+  "p2pool_claim_hex": null
+}

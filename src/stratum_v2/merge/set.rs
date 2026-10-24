@@ -10,7 +10,7 @@
 //! ([`AuxJob::empty`]).
 
 use super::{
-    super::template::meets_target,
+    super::template::{double_sha256, meets_target},
     commitment::{AuxCommitment, OUTPUT_LEN},
     leaf::Leaf,
     registry::{MergeToken, MAX_TOKENS},
@@ -20,6 +20,7 @@ use super::{
     Hash,
 };
 use crate::config::MiningNetwork;
+use std::sync::Arc;
 
 /// A token's live state: the hashes its next leaf binds and its target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +67,45 @@ pub struct TokenSet {
     easiest: Hash,
     serial: u64,
     dropped: Vec<SetEntry>,
+    /// #### merge-mining v2: tokens with threads (tSAFA), by category.
+    threads: Vec<(Hash, Arc<ThreadChoice>)>,
+}
+
+// #### merge-mining v2: a token with threads
+// What: for a token whose vaults are threads (tSAFA), the state each
+// minable thread's leaf binds at the set's height; each job's leaf mines
+// the thread `safa_auxpow::thread_start` gives for its payout hash, or the
+// next minable one after it (mod the thread count).
+// Why: the agreed rule spreads miners over the threads by their payout,
+// so on a public pool each miner's leaf may name another thread.
+// Look here if: a job's tSAFA leaf names another thread than the rule.
+/// The minable threads of one token at one height.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadChoice {
+    /// The coinbase height the states are for.
+    pub height: u32,
+    /// How many threads the token has.
+    pub count: u32,
+    /// The minable threads and their states, in any order.
+    pub states: Vec<(u32, TokenState)>,
+}
+
+impl ThreadChoice {
+    /// The thread a leaf paying `payout_hash` mines, and its state.
+    pub fn pick(&self, payout_hash: &Hash) -> Option<(u32, TokenState)> {
+        if self.count == 0 {
+            return None;
+        }
+        let start = super::safa_auxpow::thread_start(payout_hash, self.height, self.count);
+        self.states
+            .iter()
+            .filter(|(thread, _)| *thread < self.count)
+            .min_by_key(|(thread, _)| {
+                (u64::from(*thread) + u64::from(self.count) - u64::from(start))
+                    % u64::from(self.count)
+            })
+            .copied()
+    }
 }
 
 /// Whether target `a` is easier (a larger number) than `b`.
@@ -177,7 +217,30 @@ impl TokenSet {
             easiest,
             serial,
             dropped,
+            threads: Vec::new(),
         })
+    }
+
+    /// #### merge-mining v2: the token `category` mines one of `choice`'s
+    /// threads per job (see `ThreadChoice`); the easiest target covers them
+    /// all.
+    pub fn with_threads(mut self, category: Hash, choice: ThreadChoice) -> Self {
+        for (_, state) in &choice.states {
+            if easier(&state.target, &self.easiest) {
+                self.easiest = state.target;
+            }
+        }
+        self.threads.retain(|(known, _)| *known != category);
+        self.threads.push((category, Arc::new(choice)));
+        self
+    }
+
+    /// The thread choice of the token `category`, if it has threads.
+    pub fn threads(&self, category: &Hash) -> Option<&ThreadChoice> {
+        self.threads
+            .iter()
+            .find(|(known, _)| known == category)
+            .map(|(_, choice)| choice.as_ref())
     }
 
     pub fn entries(&self) -> &[SetEntry] {
@@ -271,19 +334,25 @@ impl AuxJob {
                 } else {
                     (terms.plain_payout, Split::NONE)
                 };
+                // #### merge-mining v2: a token with threads mines the
+                // thread its payout hash picks.
+                let state = set
+                    .threads(&entry.token.category)
+                    .and_then(|choice| choice.pick(&double_sha256(payout)))
+                    .map_or(entry.state, |(_, state)| state);
                 AuxEntry {
                     token: entry.token,
                     slot: *slot,
                     leaf: Leaf::new(
                         entry.token.category,
-                        entry.state.lock_hash,
-                        entry.state.state_hash,
+                        state.lock_hash,
+                        state.state_hash,
                         payout,
-                        entry.state.target_bits,
+                        state.target_bits,
                         split.ext(),
                     ),
                     split,
-                    target: entry.state.target,
+                    target: state.target,
                 }
             })
             .collect();
@@ -294,12 +363,18 @@ impl AuxJob {
             height: set.layout.height,
             salt: set.layout.salt,
         };
+        // The easiest of this job's own leaves.
+        let easiest = entries
+            .iter()
+            .map(|entry| entry.target)
+            .reduce(|best, target| if easier(&target, &best) { target } else { best })
+            .unwrap_or(set.easiest);
         Self {
             commitment,
             entries,
             tree,
             output: commitment.output(),
-            easiest: Some(set.easiest),
+            easiest: Some(easiest),
             serial: set.serial,
         }
     }

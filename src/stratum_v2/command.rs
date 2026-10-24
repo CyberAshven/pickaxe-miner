@@ -217,6 +217,25 @@ pub fn run(
                         .into(),
                 );
             }
+            // #### merge-mining v2: every tSAFA claim output pays a script
+            // of at most 35 bytes (P2PKH, P2SH20, P2SH32), as the covenant
+            // checks: the payout, the donation and a public pool's fee
+            // address must fit (an operator whose fee script did not could
+            // not take tSAFA's fee slot). CashAddr scripts always do.
+            let scripts = super::payout::scripts(
+                config.network,
+                &config.payout_address,
+                public.as_ref().map(|pool| pool.address.as_str()),
+            )?;
+            if scripts
+                .iter()
+                .any(|script| script.len() > super::merge::safa_auxpow::MAX_PAYOUT_SCRIPT)
+            {
+                return Err(
+                    "tSAFA claims pay scripts of at most 35 bytes; the payout, donation or pool fee address is longer"
+                        .into(),
+                );
+            }
             let deployment = super::merge::safa_auxpow::Deployment::load(&path)?;
             Some(Arc::new(super::merge::hub::TokenHub::safa(
                 config.network,

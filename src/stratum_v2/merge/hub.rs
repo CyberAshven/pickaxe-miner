@@ -26,7 +26,7 @@
 use super::{
     registry::{MergeToken, TEST_TOKEN},
     safa_auxpow::{self, build_claim, Chain, ClaimTerms, Deployment, Vault},
-    set::{SetEntry, TokenSet, TokenState},
+    set::{SetEntry, ThreadChoice, TokenSet, TokenState},
     split::Split,
     verify::{verify, ClaimView},
     Hash,
@@ -130,12 +130,14 @@ pub struct TokenHub {
 
 // #### merge-mining v2: tSAFA's threads
 // What: with a deployment file, the hub merge-mines one tSAFA thread per
-// job: of the vaults Fulcrum lists, one whose state is older than the
-// job's height, not already won here and whose satoshis pay a claim, with
-// the easiest claim target at that height (the lowest thread on a tie).
-// The leaf commits the vault's lock hash, its state hash and the claim
-// target the covenant computes for that height. The set is built per
-// height and rebuilt when the vaults change or a thread's state is won.
+// job. A thread is minable at a height when Fulcrum lists its vault, its
+// state is older than the height, that state is not already won here and
+// its satoshis pay a claim. Each job's leaf takes the thread the agreed
+// rule gives its payout hash (`safa_auxpow::thread_start`), or the next
+// minable one (`set::ThreadChoice`). The leaf commits the vault's lock
+// hash, its state hash and the claim target the covenant computes for that
+// height. The set is built per height and rebuilt when the vaults change
+// or a thread's state is won.
 // Why: a coinbase holds one leaf per category, and every thread shares
 // tSAFA's; a won state is worth one claim, so mining it again is wasted.
 // Look here if: no tSAFA leaf reaches jobs, or a won thread is mined
@@ -371,7 +373,7 @@ impl TokenHub {
         let vaults = safa.vaults.lock().ok()?.clone();
         let won = self.won.lock().ok()?.clone();
         let deployment = &safa.deployment;
-        let chosen = vaults
+        let minable: Vec<(&Vault, TokenState)> = vaults
             .iter()
             .filter(|vault| !won.contains(&(deployment.category, vault.state_hash())))
             .filter(|vault| vault.value >= claim_reserve(deployment))
@@ -382,23 +384,40 @@ impl TokenHub {
                     .filter(|delta| *delta > 0)?;
                 let bits =
                     safa_auxpow::claim_target_bits(state.target_bits, delta, deployment.threads)?;
-                Some((safa_auxpow::expand_token_target(bits)?, bits, vault))
+                let state = TokenState::new(deployment.lock_hash, vault.state_hash(), bits).ok()?;
+                Some((vault, state))
             })
-            .max_by(|a, b| a.0.cmp(&b.0).then(b.2.thread().cmp(&a.2.thread())));
-        let set = chosen.and_then(|(_, bits, vault)| {
-            let state = TokenState::new(deployment.lock_hash, vault.state_hash(), bits).ok()?;
+            .collect();
+        let set = minable.first().and_then(|(_, first)| {
             let serial = safa.serial.fetch_add(1, Ordering::AcqRel) + 1;
-            let set =
-                TokenSet::new(self.network, vec![SetEntry::new(safa.token, state)], serial).ok()?;
+            let set = TokenSet::new(
+                self.network,
+                vec![SetEntry::new(safa.token, *first)],
+                serial,
+            )
+            .ok()?
+            .with_threads(
+                deployment.category,
+                ThreadChoice {
+                    height,
+                    count: deployment.threads,
+                    states: minable
+                        .iter()
+                        .map(|(vault, state)| (vault.thread(), *state))
+                        .collect(),
+                },
+            );
             if let Ok(mut mined) = safa.mined.lock() {
-                if !mined
-                    .iter()
-                    .any(|known| known.commitment == vault.commitment)
-                {
-                    if mined.len() >= MINED_VAULTS {
-                        mined.pop_front();
+                for (vault, _) in &minable {
+                    if !mined
+                        .iter()
+                        .any(|known| known.commitment == vault.commitment)
+                    {
+                        if mined.len() >= MINED_VAULTS {
+                            mined.pop_front();
+                        }
+                        mined.push_back((*vault).clone());
                     }
-                    mined.push_back(vault.clone());
                 }
             }
             Some(Arc::new(set))
@@ -1091,36 +1110,69 @@ mod tests {
     }
 
     // #### merge-mining v2: tSAFA's threads
-    // What: jobs at a height mine the easiest thread whose state is older,
-    // whose vault pays a claim and whose state was not won here; a win
-    // moves the next jobs to another thread; the hub is Chipnet only.
-    // Look here if: `TokenHub::current_for` changes.
+    // What: a thread is minable when its state is older than the height,
+    // its vault pays a claim and its state was not won here; each job's
+    // leaf mines the thread HASH256(payout_hash ‖ height) picks, or the
+    // next minable one; a win leaves its thread to the next one; the hub
+    // is Chipnet only.
+    // Look here if: `TokenHub::current_for` or `ThreadChoice` changes.
     #[test]
-    fn tsafa_jobs_mine_the_easiest_open_thread() {
+    fn tsafa_jobs_mine_the_thread_their_payout_picks() {
+        use super::super::{
+            safa_auxpow::{tests::p2pkh, thread_start},
+            set::{AuxJob, LeafTerms},
+        };
         let (height, _, _) = super::super::safa_auxpow::tests::chipnet_block();
         let (hub, path) = safa_hub("threads");
         assert!(hub.current_for(height).is_none(), "no vaults read yet");
-        hub.set_vaults(vec![
-            safa_vault(0, height - 1, 0x1d00_ffff, 2_000_000),
+        let vaults = [
+            safa_vault(0, height, 0x207f_ffff, 2_000_000),
             safa_vault(1, height - 10, 0x2000_ffff, 2_000_000),
-            safa_vault(2, height, 0x207f_ffff, 2_000_000),
+            safa_vault(2, height - 1, 0x1d00_ffff, 2_000_000),
             safa_vault(3, height - 10, 0x207f_ffff, 1_000),
-        ]);
+        ];
+        hub.set_vaults(vaults.to_vec());
         assert!(hub.take_changed());
         let set = hub.current_for(height).unwrap();
-        let entry = set.entries()[0];
+        let category = set.entries()[0].token.category;
+        let choice = set.threads(&category).unwrap();
         assert_eq!(
-            entry.state.state_hash,
-            safa_vault(1, height - 10, 0x2000_ffff, 2_000_000).state_hash()
+            choice
+                .states
+                .iter()
+                .map(|(thread, _)| *thread)
+                .collect::<Vec<_>>(),
+            [1, 2]
         );
-        assert_eq!(entry.state.target_bits, 0x2001_bffe);
         assert!(
             Arc::ptr_eq(&set, &hub.current_for(height).unwrap()),
             "built once per height"
         );
-        // A win of thread 1's state moves jobs to thread 0.
+        let leaf_thread = |set: &TokenSet, payout: &[u8]| {
+            let aux = AuxJob::build(set, &LeafTerms::plain(payout));
+            let state = aux.entries[0].leaf.state_hash;
+            vaults
+                .iter()
+                .position(|vault| vault.state_hash() == state)
+                .unwrap()
+        };
+        // Thread 0 is not older than the height and thread 3 cannot pay:
+        // starts 0, 1 and 3 mine thread 1, start 2 mines thread 2.
+        let mut starts = [false; 4];
+        for byte in 0..64u8 {
+            let payout = p2pkh(byte);
+            let start = thread_start(&double_sha256(&payout), height, 4);
+            starts[start as usize] = true;
+            let expected = if start == 2 { 2 } else { 1 };
+            assert_eq!(leaf_thread(&set, &payout), expected, "start {start}");
+        }
+        assert_eq!(starts, [true; 4], "every start was tried");
+        // The vector: P2PKH 0x12…12 at 329,001 starts at thread 0.
+        assert_eq!(thread_start(&double_sha256(&p2pkh(0x12)), height, 4), 0);
+        assert_eq!(leaf_thread(&set, &p2pkh(0x12)), 1);
+        // A win of thread 1's state leaves thread 2 for every payout.
         if let Ok(mut won) = hub.won.lock() {
-            won.push_back((entry.token.category, entry.state.state_hash));
+            won.push_back((category, vaults[1].state_hash()));
         }
         hub.safa
             .as_ref()
@@ -1128,10 +1180,9 @@ mod tests {
             .generation
             .fetch_add(1, Ordering::AcqRel);
         let set = hub.current_for(height).unwrap();
-        assert_eq!(
-            set.entries()[0].state.state_hash,
-            safa_vault(0, height - 1, 0x1d00_ffff, 2_000_000).state_hash()
-        );
+        for byte in 0..16u8 {
+            assert_eq!(leaf_thread(&set, &p2pkh(byte)), 2);
+        }
         let _ = std::fs::remove_file(path);
         assert!(TokenHub::safa(
             MiningNetwork::Mainnet,
@@ -1159,8 +1210,8 @@ mod tests {
         let coinbase = [&head[..], &aux.output, &tail].concat();
         let (_, time, bits) = chipnet_block();
         let merkle = double_sha256(&coinbase);
-        let target =
-            super::super::verify::expand_compact(set.entries()[0].state.target_bits).unwrap();
+        // The job's own leaf: the thread its payout picks.
+        let target = aux.entries[0].target;
         let mut header = [0u8; 80];
         header[..4].copy_from_slice(&0x2000_0000u32.to_le_bytes());
         header[36..68].copy_from_slice(&merkle);

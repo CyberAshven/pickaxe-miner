@@ -55,9 +55,6 @@ pub const OUTPUT_SATS: u64 = super::split::SPLIT_OUTPUT_SATS;
 pub const EASE_CAP: u32 = 288;
 /// Blocks without a claim after which the fallback nBits band applies.
 pub const FALLBACK_DELTA: u32 = 4_032;
-/// The fallback's hard side doubles every 288 blocks, at most 4 times.
-pub const FALLBACK_STEP: u32 = 288;
-pub const FALLBACK_CAP: u32 = 4;
 /// A claim's bytes besides the proof and the redeem script, at their
 /// largest: version 4, input count 1, outpoint 36, unlocking length 3,
 /// sequence 4, output count 1, the vault output 104, three token outputs of
@@ -199,9 +196,18 @@ pub fn decode_header_bits(bits: u32) -> Option<BigUint> {
 /// covenant has none).
 fn asert_target(reference: &BigUint, time_diff: i64, height_diff: i64, half_life: i64) -> BigUint {
     let span = i128::from(time_diff) - 600 * i128::from(height_diff);
+    // #### merge-mining v2: BCHN's two roundings, as the covenant does them
+    // What: the exponent's division truncates toward zero (C++ int64 `/`,
+    // and Rust's), then `shifts = exponent >> 16` is an arithmetic shift
+    // (floor) and `frac = exponent & 0xffff`.
+    // Why: BCH P2Pool's covenant and BCHN both round this way; floor
+    // division gives another target for a negative exponent that the half
+    // life does not divide.
+    // Look here if: a header near the band's edge is judged otherwise than
+    // the covenant judges it.
     let exponent = (span - 600) * 65_536 / i128::from(half_life);
     let shifts = exponent >> 16;
-    let fraction = u128::try_from(exponent - shifts * 65_536).unwrap_or(0);
+    let fraction = u128::try_from(exponent & 0xffff).unwrap_or(0);
     let factor = 65_536
         + ((195_766_423_245_049 * fraction
             + 971_821_376 * fraction * fraction
@@ -227,7 +233,7 @@ fn asert_target(reference: &BigUint, time_diff: i64, height_diff: i64, half_life
 // `computed / 2 <= target <= computed × 1.05`, Chipnet `computed / 8` to
 // `computed × 1.05` or exactly the limit's bits. After 4,032 blocks without
 // a claim a header outside it may still pass the fallback band around the
-// state's `ref_bits`: `ref >> min(⌊dh / 288⌋, 4) <= target <= ref × 1.1`.
+// state's `ref_bits`: `ref >> 4 <= target <= ref × 1.1`.
 // Why: so only BCH-shaped headers mine a thread, while a change to BCH's
 // difficulty algorithm cannot freeze one.
 // Look here if: a claim is refused for its header's nBits.
@@ -254,12 +260,13 @@ pub fn asert_band(network: MiningNetwork, bits: u32, time: u32, height: u32) -> 
     Some(target >= &computed / band.hard_divisor && target * 100u32 <= computed * 105u32)
 }
 
-/// The DAA-change fallback band: `None` where either nBits is invalid.
-pub fn fallback_band(bits: u32, ref_bits: u32, height_delta: u32) -> Option<bool> {
+/// The DAA-change fallback band, which applies from 4,032 blocks without a
+/// claim: `ref >> 4 <= target <= ref × 1.1` (`None` where either nBits is
+/// invalid).
+pub fn fallback_band(bits: u32, ref_bits: u32) -> Option<bool> {
     let reference = decode_header_bits(ref_bits)?;
     let target = decode_header_bits(bits)?;
-    let doublings = (height_delta / FALLBACK_STEP).min(FALLBACK_CAP);
-    Some(target >= (&reference >> doublings) && target * 10u32 <= reference * 11u32)
+    Some(target >= (&reference >> 4u32) && target * 10u32 <= reference * 11u32)
 }
 
 /// Whether a header at `height`, `height_delta` blocks after the state,
@@ -270,9 +277,7 @@ fn bch_header(network: MiningNetwork, header: &[u8; 80], height: u32, state: &Th
     let delta = height.saturating_sub(state.height);
     match asert_band(network, bits, time, height) {
         Some(true) => true,
-        Some(false) => {
-            delta >= FALLBACK_DELTA && fallback_band(bits, state.ref_bits, delta) == Some(true)
-        }
+        Some(false) => delta >= FALLBACK_DELTA && fallback_band(bits, state.ref_bits) == Some(true),
         None => false,
     }
 }
@@ -301,6 +306,25 @@ pub fn coinbase_height(head: &[u8]) -> Option<u64> {
             .rev()
             .fold(0u64, |value, byte| value << 8 | u64::from(*byte)),
     )
+}
+
+// #### merge-mining v2: which thread a leaf mines
+// What: `thread = u32le(HASH256(payout_hash ‖ cb_height u32le)[0..4]) mod
+// threads`; when that thread cannot be mined (its state is not older than
+// the height, its state is already won, or its vault cannot pay a claim),
+// the next index mod threads is tried, and so on.
+// Why: agreed with BCH P2Pool so miners spread over the threads instead of
+// all racing for one, and so a miner's thread follows from what its leaf
+// binds alone.
+// Look here if: a job's tSAFA leaf names another thread than this rule.
+/// The first thread a leaf paying `payout_hash` at coinbase height
+/// `height` tries.
+pub fn thread_start(payout_hash: &Hash, height: u32, threads: u32) -> u32 {
+    let mut seed = [0u8; 36];
+    seed[..32].copy_from_slice(payout_hash);
+    seed[32..].copy_from_slice(&height.to_le_bytes());
+    let digest = double_sha256(&seed);
+    u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) % threads.max(1)
 }
 
 // ---- thread state ----
@@ -775,6 +799,17 @@ fn dust(size: usize) -> u64 {
     3 * (size as u64 + 148)
 }
 
+// #### merge-mining v2: the vault's floor
+// What: a claim leaves the vault at least 800 satoshis and at least BCHN's
+// dust for its output.
+// Why: BCH P2Pool's covenant requires 800; below dust no node relays the
+// claim and the thread would wait for a buyer.
+// Look here if: a claim is refused for the vault's satoshis.
+/// The fewest satoshis a claim may leave the vault.
+fn vault_floor(size: usize) -> u64 {
+    dust(size).max(OUTPUT_SATS)
+}
+
 // #### merge-mining v2: the claim builder
 // What: the claim the covenant accepts for `proof` against `vault`, at
 // `fee_rate` satoshis per byte of its size bound (1 to 3) and lock time
@@ -887,8 +922,8 @@ pub fn plan_claim(
         .checked_sub(fee + OUTPUT_SATS * outputs.len() as u64)
         .ok_or("the vault cannot pay the claim's fee and outputs")?;
     let vault_output = vault_output(deployment, vault_value, vault.tokens - reward, &next_state);
-    if vault_value < dust(vault_output.len()) {
-        return Err("the vault's satoshis left after the claim would be dust".into());
+    if vault_value < vault_floor(vault_output.len()) {
+        return Err("the vault would keep fewer than 800 satoshis, or dust".into());
     }
     let locktime = locktime.unwrap_or(height);
     if locktime < height || locktime >= LOCKTIME_THRESHOLD {
@@ -1325,6 +1360,12 @@ pub fn check_claim(deployment: &Deployment, vault: &Vault, raw: &[u8]) -> Result
         .collect();
     check_claim_outputs(&expected, &seen, &deployment.category)
         .map_err(|error| format!("the covenant would refuse this claim: {error}"))?;
+    if tx.outputs[1..]
+        .iter()
+        .any(|output| output.locking.len() > MAX_PAYOUT_SCRIPT)
+    {
+        return refuse("a share output's script is longer than 35 bytes");
+    }
     // The vault pays S to 3S.
     let size_bound = deployment.fee_k + proof.len() as u64;
     let paid = OUTPUT_SATS * expected.len() as u64;
@@ -1346,8 +1387,8 @@ pub fn check_claim(deployment: &Deployment, vault: &Vault, raw: &[u8]) -> Result
         &expected_next,
     )
     .len();
-    if vault_out.value < dust(vault_size) {
-        return Err("the vault's satoshis left after the claim would be dust".into());
+    if vault_out.value < vault_floor(vault_size) {
+        return refuse("the vault keeps fewer than 800 satoshis, or dust");
     }
     Ok(())
 }
@@ -1603,7 +1644,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn scenario(setup: Setup) -> Scenario {
-        let deployment = deployment(setup.virtual_sats);
+        scenario_with(deployment(setup.virtual_sats), setup)
+    }
+
+    /// A claim's inputs, mined, against `deployment`.
+    pub(crate) fn scenario_with(deployment: Deployment, setup: Setup) -> Scenario {
         let vault = Vault {
             outpoint: OutPoint {
                 txid: double_sha256(b"vault outpoint"),
@@ -2274,6 +2319,285 @@ pub(crate) mod tests {
         assert!(at(4_032, bits).is_err());
     }
 
+    // #### merge-mining v2: BCHN's ASERT rounding
+    // What: with Chipnet's anchor, 100 blocks after it and one second
+    // behind schedule, the exponent is -65536 / 3600: truncated to -18 (not
+    // floored to -19), so shifts -1 and frac 65518 give the target
+    // 0xfff2800c8 << 188; floor division would give 0xfff2000d << 192.
+    #[test]
+    fn asert_truncates_its_exponent_then_floors_its_shift() {
+        let reference = decode_header_bits(0x1d00_ffff).unwrap();
+        let target = asert_target(&reference, 600 * 101 - 1, 100, 3_600);
+        let expected = BigUint::parse_bytes(b"fff2800c8", 16).unwrap() << 188u32;
+        assert_eq!(target, expected);
+        let floored = BigUint::parse_bytes(b"fff2000d", 16).unwrap() << 192u32;
+        assert_ne!(target, floored);
+        assert_eq!((-65_536i128 / 3_600) >> 16, -1);
+        assert_eq!(-18i128 & 0xffff, 65_518);
+        // A larger lag: exponent -32786 (floor would give -32787).
+        let target = asert_target(&reference, 600 * 101 - 1_801, 100, 3_600);
+        assert_eq!(
+            target,
+            BigUint::parse_bytes(b"b4f7cb078", 16).unwrap() << 188u32
+        );
+    }
+
+    // #### merge-mining v2: the thread rule's vector (also in the spec)
+    // What: a leaf paying P2PKH 0x12…12 at height 329,001 starts at thread
+    // 0 of 4 (HASH256 90d29130…), at 329,002 at thread 3 (af5ced2f…).
+    #[test]
+    fn a_leafs_thread_follows_its_payout_and_height() {
+        let payout_hash = double_sha256(&p2pkh(0x12));
+        assert_eq!(
+            hex::encode(payout_hash),
+            "22650758a42ebfd7306e771ad24c442cad795ed9e549392233729f647a2b1be5"
+        );
+        let mut seed = payout_hash.to_vec();
+        seed.extend(329_001u32.to_le_bytes());
+        assert_eq!(
+            hex::encode(double_sha256(&seed)),
+            "90d29130927f1d6975eaa0ecfe310fb3534814632b447f1faa3c81ba67c0d7bf"
+        );
+        assert_eq!(thread_start(&payout_hash, 329_001, 4), 0);
+        assert_eq!(thread_start(&payout_hash, 329_002, 4), 3);
+        assert_eq!(thread_start(&payout_hash, 329_001, 3), 814_862_992 % 3);
+        assert_eq!(thread_start(&payout_hash, 329_001, 1), 0);
+    }
+
+    // #### merge-mining v2: the vault's floor and the 35-byte scripts
+    // What: a claim that would leave the vault 799 satoshis is refused by
+    // the builder and by the check; a payout script of 36 bytes is refused.
+    #[test]
+    fn a_claim_leaves_the_vault_800_satoshis_and_pays_short_scripts() {
+        let probe = scenario(Setup::default());
+        let claim = probe.claim(1).unwrap();
+        let spend = claim.plan.fee + OUTPUT_SATS;
+        let at = |value: u64| {
+            scenario(Setup {
+                value,
+                ..Setup::default()
+            })
+        };
+        assert!(at(spend + 800).claim(1).is_ok());
+        let short = at(spend + 799);
+        assert!(short.claim(1).unwrap_err().contains("800"));
+        // The check refuses it too, from bytes built with 800 and the
+        // vault's value lowered by one.
+        let good = at(spend + 800);
+        let raw = good.claim(1).unwrap().raw;
+        let less = Vault {
+            value: good.vault.value - 1,
+            ..good.vault.clone()
+        };
+        assert!(check_claim(&good.deployment, &less, &raw).is_err());
+        let mut long = probe.terms.clone();
+        long.payout = vec![0x51; 36];
+        assert!(build_claim(
+            &probe.deployment,
+            &probe.vault,
+            &probe.proof,
+            &long,
+            1,
+            None
+        )
+        .unwrap_err()
+        .contains("35 bytes"));
+    }
+
+    /// #### merge-mining v2: a claim's inputs in BCH P2Pool's
+    /// `tools/safa-auxpow/cli.mjs claim` format: its `deployment.json` and
+    /// `claim.json` (txids and the category in display order, amounts as
+    /// decimal strings, scripts and the proof in hex).
+    pub(crate) fn cli_inputs(
+        scenario: &Scenario,
+        fee_rate: u64,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let deployment = serde_json::json!({
+            "network": "chipnet",
+            "threads": scenario.deployment.threads,
+            "virtual_sats": scenario.deployment.virtual_sats.to_string(),
+            "category": scenario.deployment.category_display(),
+        });
+        let mut txid = scenario.vault.outpoint.txid;
+        txid.reverse();
+        let mut claim = serde_json::json!({
+            "outpoint": {"txid": hex::encode(txid), "vout": scenario.vault.outpoint.vout},
+            "vault": {
+                "value_sats": scenario.vault.value.to_string(),
+                "token_amount": scenario.vault.tokens.to_string(),
+                "commitment": hex::encode(scenario.vault.commitment),
+            },
+            "payout_script": hex::encode(&scenario.terms.payout),
+            "proof": hex::encode(&scenario.proof),
+            "fee_rate": fee_rate,
+        });
+        let split = &scenario.terms.split;
+        if !split.is_none() {
+            let script = |slot: &super::super::split::Slot, script: &Option<Vec<u8>>| {
+                if slot.is_empty() {
+                    String::new()
+                } else {
+                    script.as_deref().map(hex::encode).unwrap_or_default()
+                }
+            };
+            claim["split"] = serde_json::json!({
+                "donation_bps": split.donation_slot().bps(),
+                "donation_script": script(split.donation_slot(), &scenario.terms.donation),
+                "fee_bps": split.fee_slot().bps(),
+                "fee_script": script(split.fee_slot(), &scenario.terms.fee),
+            });
+        }
+        (deployment, claim)
+    }
+
+    /// #### merge-mining v2: BCH P2Pool's Chipnet tSAFA fixture, copied
+    /// verbatim from `tools/safa-auxpow/test_data/tsafa-chipnet-fixture.json`
+    /// in CyberAshven/BitcoinCash-p2poolv2 (PR #33, commit 4be6db6c): what
+    /// P2Pool's `cli.mjs params` prints for a fake Chipnet deployment
+    /// (funding outpoint 11…11:0, 4 threads, 84,000,000,000 virtual
+    /// satoshis, 2,000,000 satoshis per thread), never broadcast.
+    const P2POOL_FIXTURE: &str = include_str!("test_data/tsafa-chipnet-fixture.json");
+    /// Pickaxe's slot for the hex P2Pool builds from the exported claim.
+    const P2POOL_CLAIM: &str = include_str!("test_data/tsafa-chipnet-claim.json");
+
+    /// The fixture's deployment, read by Pickaxe's loader from P2Pool's
+    /// `params` and its category.
+    pub(crate) fn fixture_deployment() -> Deployment {
+        let fixture: serde_json::Value = serde_json::from_str(P2POOL_FIXTURE).unwrap();
+        let mut json = fixture["params"].clone();
+        json["version"] = 1.into();
+        json["category"] = fixture["deployment"]["category"].clone();
+        Deployment::from_json(&json.to_string()).unwrap()
+    }
+
+    // #### merge-mining v2: P2Pool's covenant, read by Pickaxe's loader
+    // What: from the fixture's redeem script (1,366 bytes) the loader
+    // derives P2Pool's K (1,946), lock, lock_hash and token-aware P2SH32
+    // vault address, and accepts the fixture's own copies of them.
+    // Look here if: Deployment::from_json or CLAIM_FIXED_BYTES changes.
+    #[test]
+    fn the_loader_reproduces_p2pools_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(P2POOL_FIXTURE).unwrap();
+        let deployment = fixture_deployment();
+        assert_eq!(deployment.redeem_script.len(), 1_366);
+        assert!(hex::encode(&deployment.redeem_script).starts_with("45557f7c0543544d50"));
+        assert!(hex::encode(&deployment.redeem_script).ends_with("6c6ea2695395a169756851"));
+        assert_eq!(deployment.fee_k, 1_946);
+        assert_eq!(
+            hex::encode(&deployment.locking_bytecode),
+            "aa2031973ed4278dbf3c8fdc3aa98599ca0adb2557a6a048b9ff0b2245626901646e87"
+        );
+        assert_eq!(
+            hex::encode(deployment.lock_hash),
+            "ffced6fb23ce80f020f9a70b709cf85ae3273a6cadf57bd30cf57982ef4a7a57"
+        );
+        assert_eq!(deployment.threads, 4);
+        assert_eq!(deployment.virtual_sats, 84_000_000_000);
+        assert_eq!(deployment.category, [0x11; 32]);
+        // The token-aware P2SH32 CashAddr: type 3, a 32-byte hash.
+        let address = crate::tx::cashaddr_with_version(
+            0x1b,
+            &deployment.locking_bytecode[2..34],
+            MiningNetwork::Chipnet,
+        );
+        assert_eq!(
+            address,
+            fixture["params"]["vault_address"].as_str().unwrap()
+        );
+        assert_eq!(
+            address,
+            "bchtest:rvcew0k5y7xm70y0msa2npveeg9dkf2h56sy3w0lpv3y2cnfq9jxu6cwnmemh"
+        );
+    }
+
+    /// The claim exported for P2Pool: the fixture's deployment, thread 0
+    /// (the agreed rule's thread for P2PKH 0x12…12 at 329,001) ten blocks
+    /// after its last claim, the fixture's seed and supply, and a 1%/1%
+    /// split to P2PKH 0xd0…d0 and 0xfe…fe.
+    fn fixture_scenario() -> Scenario {
+        let fixture: serde_json::Value = serde_json::from_str(P2POOL_FIXTURE).unwrap();
+        let (height, _, bits) = chipnet_block();
+        let thread = thread_start(&double_sha256(&p2pkh(0x12)), height, 4);
+        let amount = |key: &str| {
+            fixture["genesis"][key]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        scenario_with(
+            fixture_deployment(),
+            Setup {
+                state: ThreadState {
+                    thread,
+                    height: height - 10,
+                    target_bits: 0x2000_ffff,
+                    ref_bits: bits,
+                },
+                value: amount("seed_sats"),
+                tokens: amount("supply_per_thread"),
+                split: Some((100, 100)),
+                ..Setup::default()
+            },
+        )
+    }
+
+    // #### merge-mining v2: the claim P2Pool builds too
+    // What: the fixture's claim is built from fixed inputs (the reward is
+    // 1,250,000,000: 12,500,000 to the donation, 12,375,000 to the fee).
+    // With PICKAXE_SAFA_EXPORT naming a directory, its `deployment.json`
+    // and `claim.json` (P2Pool's `cli.mjs claim` input) and Pickaxe's own
+    // hex are written there. Once `tsafa-chipnet-claim.json` holds the hex
+    // P2Pool builds from them, the two must be equal byte for byte.
+    // Look here if: P2Pool's claim and Pickaxe's differ.
+    #[test]
+    fn the_fixture_claim_matches_p2pools() {
+        let scenario = fixture_scenario();
+        let claim = scenario.claim(1).unwrap();
+        assert_eq!(claim.plan.reward, 1_250_000_000);
+        assert_eq!(
+            claim.plan.shares,
+            Shares {
+                miner: 1_225_125_000,
+                donation: 12_500_000,
+                fee: 12_375_000
+            }
+        );
+        let (deployment_json, claim_json) = cli_inputs(&scenario, 1);
+        assert_eq!(deployment_json["category"], "11".repeat(32));
+        assert_eq!(claim_json["split"]["donation_bps"], 100);
+        if let Some(directory) = std::env::var_os("PICKAXE_SAFA_EXPORT") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let write = |name: &str, value: &serde_json::Value| {
+                std::fs::write(
+                    directory.join(name),
+                    serde_json::to_vec_pretty(value).unwrap(),
+                )
+                .unwrap()
+            };
+            write("deployment.json", &deployment_json);
+            write("claim.json", &claim_json);
+            write(
+                "pickaxe-claim.json",
+                &serde_json::json!({
+                    "txid": claim.txid,
+                    "hex": hex::encode(&claim.raw),
+                    "size": claim.raw.len(),
+                    "size_bound": claim.plan.size_bound,
+                    "fee_sats": claim.plan.fee.to_string(),
+                    "coinbase_height": claim.plan.height,
+                    "target_bits": format!("{:08x}", claim.plan.target_bits),
+                    "next_state": hex::encode(claim.plan.next_state),
+                }),
+            );
+        }
+        let slot: serde_json::Value = serde_json::from_str(P2POOL_CLAIM).unwrap();
+        if let Some(theirs) = slot["p2pool_claim_hex"].as_str() {
+            assert_eq!(hex::encode(&claim.raw), theirs);
+        }
+    }
+
     // #### merge-mining v2: the ASERT band's edges (P2Pool's vectors)
     #[test]
     fn the_asert_band_matches_p2pools_edges() {
@@ -2352,15 +2676,16 @@ pub(crate) mod tests {
         );
         // The fallback band.
         let reference = decode_header_bits(0x1804_dafe).unwrap();
-        let band = |target: BigUint, delta| fallback_band(compact(&target), 0x1804_dafe, delta);
-        assert_eq!(band(reference.clone(), 4_032), Some(true));
-        assert_eq!(band(&reference >> 4u32, 4_032), Some(true));
+        let band = |target: BigUint| fallback_band(compact(&target), 0x1804_dafe);
+        assert_eq!(band(reference.clone()), Some(true));
+        assert_eq!(band(&reference >> 4u32), Some(true));
         assert_eq!(
-            band((&reference >> 4u32) - (BigUint::one() << 160u32), 4_032),
+            band((&reference >> 4u32) - (BigUint::one() << 160u32)),
             Some(false)
         );
-        assert_eq!(band(&reference * 11u32 / 10u32, 4_032), Some(true));
-        assert_eq!(band(&reference * 12u32 / 10u32, 4_032), Some(false));
+        assert_eq!(band(&reference * 11u32 / 10u32), Some(true));
+        assert_eq!(band(&reference * 12u32 / 10u32), Some(false));
+        assert_eq!(fallback_band(0, 0x1804_dafe), None);
     }
 
     /// BCHN's GetCompact, for the band tests.
