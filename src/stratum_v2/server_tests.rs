@@ -985,6 +985,14 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
         let entry = &entries[0];
         assert_eq!(entry["status"], "proven");
         assert_eq!(entry["format"], "AuxProof v2");
+        // #### merge-mining v2: the split preimage the claim reveals: 1% of
+        // the win to the donation.
+        let donation = crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
+            MiningNetwork::Chipnet,
+        ))
+        .unwrap();
+        let split = super::merge::split::Split::donation(100, &donation).unwrap();
+        assert_eq!(entry["split"], hex::encode(split.preimage()));
         assert_eq!(entry["state"], hex::encode(first_state));
         let found = entry["found_at"].as_u64().unwrap();
         let after = entry["broadcast_after"].as_u64().unwrap();

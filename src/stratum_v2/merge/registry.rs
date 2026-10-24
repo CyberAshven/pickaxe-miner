@@ -69,6 +69,10 @@ pub struct MergeToken {
     pub max_aux_height: u8,
     /// Which token stays when the tree cannot hold them all: higher stays.
     pub priority: u8,
+    /// #### merge-mining v2: whether the covenant verifies the per-win split
+    /// (`split::Split`). Without it the leaf's ext is 0 and the donation
+    /// (and a fee) are taken as work instead.
+    pub split: bool,
 }
 
 impl MergeToken {
@@ -118,6 +122,7 @@ pub const TEST_TOKEN: MergeToken = MergeToken {
     verifier_sha256: None,
     max_aux_height: MAX_HEIGHT,
     priority: 0,
+    split: true,
 };
 
 /// #### PR #42: a token mined by its own 80-byte header instead of BCH
@@ -202,6 +207,8 @@ mod tests {
             super::super::sha256(b"pickaxe merge-mining test token v1")
         );
         TEST_TOKEN.verify().unwrap();
+        // #### merge-mining v2: the test token exercises the split.
+        assert!(TEST_TOKEN.split);
         // Rows that could not be mined or claimed as written are refused.
         let refused: [fn(&mut MergeToken); 3] = [
             |t| t.name = " ",

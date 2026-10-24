@@ -2003,11 +2003,16 @@ impl JobAvailability {
             // `WorkAllocation::token_donation_work`).
             let p2pool = matches!(donation, JobDonation::P2Pool(_));
             // #### merge-mining v2: a job that merge-mines this server's own
-            // tokens (solo: no Job Declaration plan, not a public pool)
-            // pays their donation in work at the whole rate (see
-            // `WorkAllocation::merge_token_donation_work`).
+            // tokens (solo: no Job Declaration plan, not a public pool), one
+            // of which has no split support, pays that token's donation in
+            // work at the whole rate (see
+            // `WorkAllocation::merge_token_donation_work`). Split tokens take
+            // two thirds from each win and only BCH's donation work.
             let merged = matches!(donation, JobDonation::Bch(_))
-                && job.template.tokens().is_some()
+                && job
+                    .template
+                    .tokens()
+                    .is_some_and(|set| set.entries().iter().any(|entry| !entry.token.split))
                 && job.template.jd_plan().is_none()
                 && !mining.is_public();
             let (donation, donation_work) = match donation {
@@ -2745,29 +2750,36 @@ mod retry_tests {
         }
     }
 
-    // #### merge-mining v2: the merge-mined token donation is all work
-    // What: on a solo template with tokens, a job pays the token donation in
-    // BCH's donation window, then on its own (BCH pays the miner, the leaves
-    // the donation) until the whole 1.5% of the cycle, then neither; a
-    // public pool's job takes no token donation work.
+    // #### merge-mining v2: a token without split support donates in work
+    // What: on a solo template with such a token, a job pays its donation
+    // in BCH's donation window, then on its own (BCH pays the miner, the
+    // leaves the donation) until the whole 1.5% of the cycle, then neither;
+    // a split token's jobs take only BCH's work third, with 1% of each win
+    // in their split; a public pool's job takes no token donation work.
     // Look here if: `token_donation_work` or `merge_token_donation_work`
     // changes.
     #[test]
     fn merge_mined_token_donation_work_follows_the_whole_setting() {
         use super::super::channel::{Channel, ChannelKind};
-        use super::super::merge::set::tests::test_set;
+        use super::super::merge::{
+            set::tests::{plain_test_set, test_set},
+            split::Split,
+        };
         let start = Instant::now();
         let payout = super::super::template_tests::payout();
         let scripts = super::super::payout::scripts(MiningNetwork::Chipnet, &payout, None).unwrap();
-        let mut template =
-            BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
-        template.commit(Arc::new(test_set()));
-        let job = PublishedJob {
-            generation: 99,
-            serial: 1,
-            template: Arc::new(template),
-            valid_until: start + Duration::from_secs(30),
+        let published = |set| {
+            let mut template =
+                BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
+            template.commit(Arc::new(set));
+            PublishedJob {
+                generation: 99,
+                serial: 1,
+                template: Arc::new(template),
+                valid_until: start + Duration::from_secs(30),
+            }
         };
+        let job = published(plain_test_set());
         let session = || {
             let mut mining =
                 MiningSession::new(MiningNetwork::Chipnet, payout.clone(), [17; 12], [255; 32])
@@ -2818,6 +2830,36 @@ mod retry_tests {
                     .unwrap();
             let first_payout = if bch { &scripts[1] } else { &scripts[0] };
             assert_eq!(tx.output[1].script_pubkey.as_bytes(), &first_payout[..]);
+        }
+        // A split token: only BCH's donation work, 1% of each win otherwise.
+        let split_job = published(test_set());
+        let mut mining = session();
+        let mut availability = JobAvailability::new(0);
+        for (seconds, bch) in [(0, true), (5, false)] {
+            availability
+                .update(
+                    &mut mining,
+                    Some(split_job.clone()),
+                    start + Duration::from_secs(seconds),
+                    JobDonation::Bch(BchDonation::default()),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let current = mining.channels[&1].job().unwrap();
+            assert_eq!(current.payout.donation_work, bch, "{seconds}");
+            assert_eq!(current.payout.token_donation_work, None, "{seconds}");
+            let entry = &current.aux.as_ref().unwrap().entries[0];
+            let (payout, split) = if bch {
+                (&scripts[1], Split::NONE)
+            } else {
+                (&scripts[0], Split::donation(100, &scripts[1]).unwrap())
+            };
+            assert_eq!(
+                entry.leaf.payout_hash,
+                super::super::template::double_sha256(payout)
+            );
+            assert_eq!(entry.split, split, "{seconds}");
         }
         // A public pool's jobs take no token donation work.
         let mut public = session();

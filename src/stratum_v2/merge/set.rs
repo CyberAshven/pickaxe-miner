@@ -14,6 +14,7 @@ use super::{
     commitment::{AuxCommitment, OUTPUT_LEN},
     leaf::Leaf,
     registry::{MergeToken, MAX_TOKENS},
+    split::Split,
     tree::{AuxTree, Layout, MAX_HEIGHT},
     verify::expand_compact,
     Hash,
@@ -203,13 +204,45 @@ impl TokenSet {
     }
 }
 
-/// One entry of a job: where its leaf sits, the leaf and its target.
+/// One entry of a job: where its leaf sits, the leaf, the split its ext
+/// commits to (none for a token without split support) and its target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuxEntry {
     pub token: &'static MergeToken,
     pub slot: u32,
     pub leaf: Leaf,
+    pub split: Split,
     pub target: Hash,
+}
+
+// #### merge-mining v2: what a job's leaves bind
+// What: a token whose covenant verifies splits binds `payout` with `split`
+// in its ext; one without split support binds `plain_payout` with ext 0,
+// its donation (and a fee) taken as work instead. In a BCH donation-work
+// job both payouts are the donation and the split is none.
+// Why: a split is only safe in a leaf whose covenant checks it; a token
+// that would read ext as zero must never see one.
+// Look here if: a leaf's ext is non-zero for a token without split
+// support, or a work job's leaf carries a split.
+/// The payouts and split a job's leaves bind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafTerms<'a> {
+    /// What a split token's leaf pays, with `split` in its ext.
+    pub payout: &'a [u8],
+    pub split: Split,
+    /// What a token without split support pays, with ext 0.
+    pub plain_payout: &'a [u8],
+}
+
+impl<'a> LeafTerms<'a> {
+    /// Every leaf pays `payout`, with no split.
+    pub fn plain(payout: &'a [u8]) -> Self {
+        Self {
+            payout,
+            split: Split::NONE,
+            plain_payout: payout,
+        }
+    }
 }
 
 /// One job's merge-mining: entries in set order, the tree, its commitment
@@ -226,25 +259,32 @@ pub struct AuxJob {
 }
 
 impl AuxJob {
-    /// Builds the leaves for a job paying `payout_script`. `ext` is 32 zero
-    /// bytes: no registered token defines one yet.
-    pub fn build(set: &TokenSet, payout_script: &[u8]) -> Self {
+    /// Builds the leaves for a job on `terms` (see [`LeafTerms`]).
+    pub fn build(set: &TokenSet, terms: &LeafTerms) -> Self {
         let entries: Vec<AuxEntry> = set
             .entries
             .iter()
             .zip(&set.layout.slots)
-            .map(|(entry, slot)| AuxEntry {
-                token: entry.token,
-                slot: *slot,
-                leaf: Leaf::new(
-                    entry.token.category,
-                    entry.state.lock_hash,
-                    entry.state.state_hash,
-                    payout_script,
-                    entry.state.target_bits,
-                    [0; 32],
-                ),
-                target: entry.state.target,
+            .map(|(entry, slot)| {
+                let (payout, split) = if entry.token.split {
+                    (terms.payout, terms.split)
+                } else {
+                    (terms.plain_payout, Split::NONE)
+                };
+                AuxEntry {
+                    token: entry.token,
+                    slot: *slot,
+                    leaf: Leaf::new(
+                        entry.token.category,
+                        entry.state.lock_hash,
+                        entry.state.state_hash,
+                        payout,
+                        entry.state.target_bits,
+                        split.ext(),
+                    ),
+                    split,
+                    target: entry.state.target,
+                }
             })
             .collect();
         let leaves: Vec<Hash> = entries.iter().map(|e| e.leaf.hash()).collect();
@@ -307,12 +347,27 @@ impl AuxJob {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::stratum_v2::merge::{registry::TEST_TOKEN, tree::fold};
+    use crate::stratum_v2::merge::{registry::TEST_TOKEN, split::Split, tree::fold};
 
     /// The test token's state: a synthetic lock and state hash, about one
     /// share in 4,096 wins.
     pub(crate) fn test_state() -> TokenState {
         TokenState::new([0x22; 32], [0x33; 32], 0x1f10_0000).unwrap()
+    }
+
+    /// #### merge-mining v2: the test token as if its covenant verified no
+    /// split.
+    pub(crate) fn plain_test_set() -> TokenSet {
+        let token = Box::leak(Box::new(MergeToken {
+            split: false,
+            ..TEST_TOKEN
+        }));
+        TokenSet::new(
+            MiningNetwork::Chipnet,
+            vec![SetEntry::new(token, test_state())],
+            1,
+        )
+        .unwrap()
     }
 
     pub(crate) fn test_set() -> TokenSet {
@@ -354,18 +409,26 @@ pub(crate) mod tests {
         assert!(TokenState::new([0; 32], [0; 32], 0x0200_0001).is_err());
 
         let payout = [0x76, 0xa9, 0x14];
-        let job = AuxJob::build(&set, &payout);
+        let donation = [0xa9, 0x14];
+        let split = Split::donation(100, &donation).unwrap();
+        let terms = LeafTerms {
+            payout: &payout,
+            split,
+            plain_payout: &donation,
+        };
+        let job = AuxJob::build(&set, &terms);
         assert_eq!(job.output, job.commitment.output());
         assert_eq!(job.commitment.root, job.tree.root());
         assert_eq!(job.entries[0].leaf.lock_hash, [0x22; 32]);
         assert_eq!(job.entries[0].leaf.state_hash, [0x33; 32]);
         assert_eq!(job.entries[0].target, test_state().target);
+        let double = crate::stratum_v2::template::double_sha256;
         for (index, entry) in job.entries.iter().enumerate() {
-            assert_eq!(
-                entry.leaf.payout_hash,
-                crate::stratum_v2::template::double_sha256(&payout)
-            );
-            assert_eq!(entry.leaf.ext, [0; 32]);
+            // Both tokens verify splits: the payout and the split's ext.
+            assert_eq!(entry.leaf.payout_hash, double(&payout));
+            assert_eq!(entry.leaf.ext, split.ext());
+            assert_ne!(entry.leaf.ext, [0; 32]);
+            assert_eq!(entry.split, split);
             let branch = job.branch(index).unwrap();
             assert_eq!(
                 fold(entry.leaf.hash(), entry.slot, &branch),
@@ -373,8 +436,25 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(job.branch(2), None);
+        // #### merge-mining v2: a token without split support binds the
+        // plain payout with ext 0.
+        let plain = SetEntry::new(
+            Box::leak(Box::new(MergeToken {
+                category: [8; 32],
+                split: false,
+                ..TEST_TOKEN
+            })),
+            test_state(),
+        );
+        let mixed = TokenSet::new(MiningNetwork::Chipnet, vec![a, plain], 1).unwrap();
+        let job = AuxJob::build(&mixed, &terms);
+        assert_eq!(job.entries[0].leaf.ext, split.ext());
+        assert_eq!(job.entries[1].leaf.payout_hash, double(&donation));
+        assert_eq!(job.entries[1].leaf.ext, [0; 32]);
+        assert_eq!(job.entries[1].split, Split::NONE);
         // Another payout gives another root on the same layout.
-        let other = AuxJob::build(&set, &[0x51]);
+        let job = AuxJob::build(&set, &terms);
+        let other = AuxJob::build(&set, &LeafTerms::plain(&[0x51]));
         assert_ne!(other.commitment.root, job.commitment.root);
         assert_eq!(other.commitment.salt, job.commitment.salt);
         // The empty commitment: no entry, no win, no target.
@@ -433,7 +513,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(set.easiest(), &easy.target);
-        let job = AuxJob::build(&set, &[0x51]);
+        let job = AuxJob::build(&set, &LeafTerms::plain(&[0x51]));
         let target = test_state().target;
         // The header rule: a hash equal to the target wins, one above misses.
         let mut above = target;

@@ -287,6 +287,10 @@ impl TokenHub {
                         "category": hex::encode(item.token.category),
                         "state": hex::encode(item.leaf.state_hash),
                         "format": "AuxProof v2",
+                        // #### merge-mining v2: the split preimage the
+                        // claim reveals, when the leaf carries one.
+                        "split": (!item.split.is_none())
+                            .then(|| hex::encode(item.split.preimage())),
                         "height": win.height,
                         "found_at": found_at,
                         "broadcast_after": found_at + self.delay.pick(),

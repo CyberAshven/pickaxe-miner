@@ -67,15 +67,16 @@ impl WorkAllocation {
         self.position < u64::from(rate.bps()) * (PERIOD_NS / 10_000)
     }
 
-    // #### merge-mining v2: the merge-mined token donation is all work
-    // What: a job that merge-mines this server's own tokens has its token
-    // leaves pay the donation on the whole setting's share of work (1.5% at
-    // the default), not BCH's work third: every BCH donation-work job, and
-    // enough other jobs to make up the rest. Without accepted shares it is
-    // the first `rate` of each 10-minute cycle (which holds BCH's donation
-    // window); with them, a balance of validated work on token jobs alone.
-    // Why: v2 leaves carry no per-claim split, so the work is the token
-    // donation's only part.
+    // #### merge-mining v2: a token without split support donates in work
+    // What: a job that merge-mines a token of this server's own whose
+    // covenant verifies no split has that token's leaves pay the donation
+    // on the whole setting's share of work (1.5% at the default), not BCH's
+    // work third: every BCH donation-work job, and enough other jobs to make
+    // up the rest. Without accepted shares it is the first `rate` of each
+    // 10-minute cycle (which holds BCH's donation window); with them, a
+    // balance of validated work on those jobs alone. Split tokens take two
+    // thirds of the setting from each win and only BCH's work third.
+    // Why: without a split, work is such a token's donation's only part.
     // Look here if: merge-mined token donation jobs take more or less work
     // than the donation setting.
     /// Whether the job now pays merge-mined tokens' donation, at `rate`.

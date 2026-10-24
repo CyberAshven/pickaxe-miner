@@ -128,6 +128,14 @@ impl BchDonation {
         (u128::from(units) * u128::from(self.0) * 2 / 30_000) as u64
     }
 
+    /// #### merge-mining v2: the block-reward share as a rate in hundredths
+    /// of a percent, `reward_units(10_000)`: 100 (1%) at the 1.5% default.
+    /// A merge-mined token's donation slot takes it from each win, as a
+    /// block's donation output takes `reward_units` from its reward.
+    pub fn reward_bps(self) -> u16 {
+        self.reward_units(10_000) as u16
+    }
+
     /// The work and block-reward shares as shown to the miner, each rounded
     /// up to two decimals: "0.50%" and "1.00%" at 1.5%, "0.67%" and "1.34%"
     /// at 2%.
@@ -216,11 +224,12 @@ pub struct BchPayout {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fee_work: bool,
     /// #### merge-mining v2: `None` when the job merge-mines no token of
-    /// this server's own; otherwise whether its token leaves pay the
-    /// donation. Merge-mined tokens have no per-claim split, so their whole
-    /// donation (the same setting as BCH's) is this work: `Some(true)` on
-    /// every BCH donation-work job and on enough others to reach the full
-    /// rate. It never changes the BCH amounts.
+    /// this server's own without split support; otherwise whether those
+    /// tokens' leaves pay the donation. A token whose covenant verifies no
+    /// split takes its whole donation (the same setting as BCH's) as this
+    /// work: `Some(true)` on every BCH donation-work job and on enough others
+    /// to reach the full rate. Split tokens take two thirds from each win
+    /// instead (`merge::split`). It never changes the BCH amounts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_donation_work: Option<bool>,
 }

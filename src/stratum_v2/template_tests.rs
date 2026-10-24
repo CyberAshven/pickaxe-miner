@@ -457,8 +457,9 @@ fn golden_extended_coinbase_with_a_token() {
 }
 
 /// #### merge-mining v2: the test token's root on the test template's
-/// miner job (its leaf binds the miner's script).
-const GOLDEN_TOKEN_ROOT: &str = "b9ef32fd3a54d122613f3ae09a59fbe531e3a8e65b336bce0e66728ae328f863";
+/// miner job (its leaf binds the miner's script, with 1% of each win to the
+/// donation in its split).
+const GOLDEN_TOKEN_ROOT: &str = "a022c34ac234c2ac6a7b3b76a31eb0aad9612cfd83d662de94e3f231c6da4057";
 
 #[test]
 fn extended_coinbase_parts_preserve_nonempty_odd_and_even_merkle_trees() {
@@ -777,7 +778,8 @@ fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
     use super::jd::{plan::JdPlan, policy::PayoutRule, token::PoolRates};
     use super::merge::{
         commitment::AuxCommitment,
-        set::{tests::test_set, AuxJob},
+        set::{tests::test_set, AuxJob, LeafTerms},
+        split::{Slot, Split},
     };
     use std::sync::Arc;
     let network = MiningNetwork::Chipnet;
@@ -804,8 +806,23 @@ fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
     let set = Arc::new(test_set());
     template.commit(set.clone());
     let aux = template.declared_aux().unwrap().unwrap();
-    let expected = AuxJob::build(&set, &[0x51]);
+    // #### merge-mining v2: the leaves pay the miner with the pool's whole
+    // donation rate and its fee in the split, as the coinbase pays them.
+    let split = Split::new(
+        Slot::new(150, &[0x53]).unwrap(),
+        Slot::new(100, &[0x52]).unwrap(),
+    );
+    let expected = AuxJob::build(
+        &set,
+        &LeafTerms {
+            payout: &[0x51],
+            split,
+            plain_payout: &[0x51],
+        },
+    );
     assert_eq!(aux.output, expected.output);
+    assert_eq!(aux.entries[0].split, split);
+    assert_eq!(aux.entries[0].leaf.ext, split.ext());
     // Every local job on the plan shares it, whatever its own payout says.
     let local = template
         .aux_job(network, &payout(), None, Default::default())

@@ -243,7 +243,11 @@ pub(crate) mod tests {
             state_hash: state.state_hash,
             payout: &scripts[0],
             target_bits: state.target_bits,
-            ext: [0; 32],
+            // #### merge-mining v2: the miner job's split, 1% of each win to
+            // the donation.
+            ext: crate::stratum_v2::merge::split::Split::donation(100, &scripts[1])
+                .unwrap()
+                .ext(),
             max_aux_height: TEST_TOKEN.max_aux_height,
         }
     }

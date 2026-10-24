@@ -6,7 +6,8 @@ use super::jd::plan::JdPlan;
 use super::merge::{
     commitment::OUTPUT_LEN,
     header::{forwarder_body, MAX_P2S, TAG},
-    set::{AuxJob, TokenSet},
+    set::{AuxJob, LeafTerms, TokenSet},
+    split::{Slot, Split},
     OutPoint,
 };
 use crate::config::MiningNetwork;
@@ -734,7 +735,32 @@ impl BchTemplate {
         let miner = plan
             .token_payout()
             .ok_or("the pool's plan has no outputs")?;
-        Ok(Some(AuxJob::build(set, miner)))
+        // #### merge-mining v2: the pool's split
+        // What: a split leaf on a Job Declaration plan pays the miner and
+        // puts the pool's donation (its whole rate to its donation output)
+        // in the donation slot and the pool's fee (its rate to its fee
+        // output) in the fee slot, as the declared coinbase pays them.
+        // Why: no donation work runs under Job Declaration, so the pool's
+        // rule takes BCH's donation and fee from the coinbase; tokens follow
+        // the same rule. The pool checks it in a later change.
+        // Look here if: a Job Declaration leaf's split differs from the
+        // pool's rates.
+        let slot = |bps: u16, output: Option<u8>| match output
+            .and_then(|index| plan.scripts.get(usize::from(index)))
+        {
+            Some(script) => Slot::new(bps, script),
+            None => Ok(Slot::EMPTY),
+        };
+        let split = Split::new(
+            slot(plan.rates.donation_bps, plan.rates.donation_output).map_err(|e| e.to_string())?,
+            slot(plan.rates.fee_bps, plan.rates.fee_output).map_err(|e| e.to_string())?,
+        );
+        let terms = LeafTerms {
+            payout: miner,
+            split,
+            plain_payout: miner,
+        };
+        Ok(Some(AuxJob::build(set, &terms)))
     }
 
     /// The outputs a custom job carries for this Job Declaration template:
@@ -826,10 +852,31 @@ impl BchTemplate {
             return Ok(Some(AuxJob::empty()));
         }
         let scripts = super::payout::scripts(network, payout, None)?;
-        Ok(Some(AuxJob::build(
-            set,
-            super::payout::token_payout(&scripts, policy),
-        )))
+        // #### merge-mining v2: the donation's split
+        // What: a miner job's split leaves pay the miner with the donation
+        // setting's block-reward share (1% at the 1.5% default) in the
+        // donation slot; a BCH donation-work job's leaves pay the donation
+        // with ext 0, the setting's work share. Tokens without split support
+        // pay the job's plain token payout with ext 0.
+        // Why: merge-mined tokens split as BCH does: two thirds from each
+        // win, one third as work.
+        // Look here if: a token's donation differs from BCH's at the same
+        // setting.
+        let split = if policy.donation_work {
+            Split::NONE
+        } else {
+            Split::donation(policy.donation.reward_bps(), &scripts[1]).map_err(|e| e.to_string())?
+        };
+        let terms = LeafTerms {
+            payout: if policy.donation_work {
+                &scripts[1]
+            } else {
+                &scripts[0]
+            },
+            split,
+            plain_payout: super::payout::token_payout(&scripts, policy),
+        };
+        Ok(Some(AuxJob::build(set, &terms)))
     }
 
     /// Build one channel's coinbase. The caller assigns a unique extranonce;

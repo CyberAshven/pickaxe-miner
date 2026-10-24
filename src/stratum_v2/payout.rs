@@ -92,12 +92,12 @@ pub fn beneficiary(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
 }
 
 /// #### merge-mining v2
-/// The payout a merge-mined token's leaf binds: the donation's script in
-/// the job's token donation work (BCH donation-work jobs and the others
-/// that bring the token donation to the whole setting, see
-/// `BchPayout::token_donation_work`), the miner's otherwise. Never a public
-/// pool operator's: the pool fee never reaches tokens. A split of each claim
-/// is token-defined (the leaf's `ext`), so Pickaxe adds none.
+/// The payout the leaf of a merge-mined token without split support binds:
+/// the donation's script in the job's token donation work (BCH
+/// donation-work jobs and the others that bring that donation to the whole
+/// setting, see `BchPayout::token_donation_work`), the miner's otherwise.
+/// Never a public pool operator's. Split tokens carry their donation in the
+/// leaf's ext instead (`BchTemplate::aux_job`).
 pub fn token_payout(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
     if policy.donation_work || policy.token_donation_work == Some(true) {
         &scripts[1]

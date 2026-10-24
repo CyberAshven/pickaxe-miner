@@ -1388,15 +1388,12 @@ fn started_text(started: &Started) -> String {
     text
 }
 
-/// The donation as the dashboard shows it, with its two parts, and
-/// (#### merge-mining v2) merge-mined tokens', which is all work: their
-/// claims have no split.
+/// The donation as the dashboard shows it, with its two parts; (####
+/// merge-mining v2) merge-mined tokens split the same way, the reward part
+/// from each win.
 fn donation_summary(donation: BchDonation) -> String {
     let (work, reward) = donation.shares();
-    format!(
-        "{donation} ({work} of work · {reward} of block rewards; merge-mined tokens \
-         {donation} of work)"
-    )
+    format!("{donation} ({work} of work · {reward} of block rewards and token wins)")
 }
 
 /// Advanced settings: the donation, adjustable from 0% to 100%.
@@ -1417,9 +1414,9 @@ fn render_advanced(
         )
     } else {
         format!(
-            "{work} of mining work and {reward} of each block reward go to the Pickaxe donation \
-             address. For merge-mined tokens the whole {donation} is mining work, since their \
-             claims have no split."
+            "{work} of mining work and {reward} of each block reward and merge-mined token win \
+             go to the Pickaxe donation address. A token whose covenant takes no split gives \
+             the whole {donation} as mining work instead."
         )
     };
     let mut text = format!(
@@ -4229,7 +4226,7 @@ mod tests {
         .unwrap();
         let header = measured.header(measured.updated);
         assert!(
-            header.contains("tokens 1.50% of work) · 0.50% of work so far · Live"),
+            header.contains("token wins) · 0.50% of work so far · Live"),
             "{header}"
         );
         // In pool mode the measured share is the work the pool acknowledged,
@@ -4327,12 +4324,12 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         assert_eq!(
             donation_summary(BchDonation::default()),
-            "1.50% (0.50% of work · 1.00% of block rewards; merge-mined tokens 1.50% of work)"
+            "1.50% (0.50% of work · 1.00% of block rewards and token wins)"
         );
         let two: BchDonation = "2".parse().unwrap();
         assert_eq!(
             donation_summary(two),
-            "2.00% (0.67% of work · 1.34% of block rewards; merge-mined tokens 2.00% of work)"
+            "2.00% (0.67% of work · 1.34% of block rewards and token wins)"
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
         terminal

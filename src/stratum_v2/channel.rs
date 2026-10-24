@@ -997,6 +997,7 @@ mod tests {
     use super::super::merge::{
         registry::TEST_TOKEN,
         set::{SetEntry, TokenSet, TokenState},
+        split::Split,
         verify::{verify, verify_proof, ClaimView},
         OutPoint,
     };
@@ -1136,11 +1137,11 @@ mod tests {
                     None => assert!(!tokens),
                 }
             }
-            // #### merge-mining v2: the donation's rate is not in the leaf;
-            // only donation work changes the payout a leaf binds.
+            // #### merge-mining v2: the donation's rate is in the leaf's
+            // split, and donation work changes the payout: three roots.
             roots.sort_unstable();
             roots.dedup();
-            assert_eq!(roots.len(), if tokens { 2 } else { 0 });
+            assert_eq!(roots.len(), if tokens { 3 } else { 0 });
         }
     }
     #[test]
@@ -1556,7 +1557,8 @@ mod tests {
             state_hash: STATE,
             payout: &scripts[0],
             target_bits: TOKEN_BITS,
-            ext: [0; 32],
+            // #### merge-mining v2: 1% of each win to the donation.
+            ext: Split::donation(100, &scripts[1]).unwrap().ext(),
             max_aux_height: TEST_TOKEN.max_aux_height,
         }
     }
@@ -1885,9 +1887,19 @@ mod tests {
             let job = channel
                 .install_with_payout(id, 3, template.clone(), policy)
                 .unwrap();
-            let leaf = job.aux.as_ref().unwrap().entries[0].leaf;
+            let entry = &job.aux.as_ref().unwrap().entries[0];
+            let leaf = entry.leaf;
             assert_eq!(leaf.payout_hash, double_sha256(beneficiary));
-            assert_eq!(leaf.ext, [0; 32]);
+            // #### merge-mining v2: a miner job's leaf carries the donation's
+            // block-reward share (1%) in its split; a donation-work job's,
+            // none.
+            let split = if policy.donation_work {
+                Split::NONE
+            } else {
+                Split::donation(100, &scripts[1]).unwrap()
+            };
+            assert_eq!(entry.split, split);
+            assert_eq!(leaf.ext, split.ext());
             // The commitment (worth 0) first, then the job's own payouts.
             let tx: Transaction = consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
             assert_eq!(tx.output[0].value.to_sat(), 0);
