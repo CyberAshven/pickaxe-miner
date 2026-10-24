@@ -449,21 +449,23 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     // #### merge-mining v2: one donation at a pool
     // What: where the adapter donates by itself at a remote pool (its
     // donation channel, at the miner's setting), the device's own channel
-    // asks the pool for none: `,donation=0` after the identity, unless the
-    // identity already names a donation. A pool that refuses the option is
-    // asked once more without it.
-    // Why: a Pickaxe public pool (and BCH P2Pool) takes the Pickaxe
-    // donation from each miner unless their login chooses otherwise, so the
-    // device donated twice: through the adapter's donation channel and
-    // through the pool's own rule.
-    // Look here if: a device donates twice at a Pickaxe pool, or a pool
-    // refuses every login with an option.
+    // asks a Pickaxe pool for none: `,pickaxe-donation=0` after the
+    // identity, unless the identity already names a donation. A pool that
+    // refuses the option is asked once more without it.
+    // Why: a Pickaxe public pool takes the Pickaxe donation from each miner
+    // unless their login chooses otherwise, so the device donated twice:
+    // through the adapter's donation channel and through the pool's own
+    // rule. The key is Pickaxe's own: BCH P2Pool reads `donation=` for its
+    // own, independent donation, which the adapter must never zero.
+    // Look here if: a device donates twice at a Pickaxe pool, a P2Pool
+    // node's donation drops to 0 for Pickaxe miners, or a pool refuses every
+    // login with an option.
     let mut base = upstream.identity.clone();
     let mut zero =
         upstream.remote && upstream.donation.is_some() && !names_donation(&upstream.identity);
     let identity_of = |base: &str, zero: bool| {
         if zero {
-            format!("{base},donation=0")
+            format!("{base},pickaxe-donation=0")
         } else {
             base.to_owned()
         }
@@ -536,12 +538,14 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     })
 }
 
-/// #### merge-mining v2: whether a login already names a donation option.
-fn names_donation(identity: &str) -> bool {
+/// #### merge-mining v2: whether a login already names a donation option
+/// (`donation=` or Pickaxe's own `pickaxe-donation=`).
+pub(super) fn names_donation(identity: &str) -> bool {
     identity.split_once(',').is_some_and(|(_, options)| {
-        options
-            .split(',')
-            .any(|option| option.trim_start().starts_with("donation="))
+        options.split(',').any(|option| {
+            let option = option.trim_start();
+            option.starts_with("donation=") || option.starts_with("pickaxe-donation=")
+        })
     })
 }
 
@@ -2647,6 +2651,7 @@ mod tests {
         assert!(!names_donation("bchtest:qq.rig"));
         assert!(!names_donation("bchtest:qq.donation=1"));
         assert!(names_donation("bchtest:qq.rig,donation=0"));
+        assert!(names_donation("bchtest:qq.rig,pickaxe-donation=0"));
         assert!(names_donation("bchtest:qq,p2p=bchtest:qz, donation=2"));
         assert!(!names_donation("bchtest:qq,p2p=bchtest:qz"));
     }

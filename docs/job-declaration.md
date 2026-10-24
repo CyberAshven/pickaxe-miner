@@ -333,10 +333,14 @@ counts as the overview line below.
   dropped · 1 blocks pushed · 340 shares sent (338 accepted, 2 rejected) · 0
   fallbacks", and the status file's `jd_client` the same counts.
 - The donation is paid in the coinbase, as the pool's rule requires, so there
-  is no donation work under Job Declaration. Its rate is the one the pool's
-  tokens carry: at a Pickaxe pool, the login's `,donation=` choice
-  (`--upstream-user ADDRESS,donation=0.5`) or the pool's setting. The local
-  donation setting does not reach the pool, so nothing is donated twice.
+  is no donation work under Job Declaration, and nothing is donated twice.
+  Its rate is the one the pool's tokens carry. At a Pickaxe pool that is the
+  miner's own donation setting, which the client names after the login as
+  `,pickaxe-donation=<percent>` (to the 0.5% step below, as of each
+  session's start), or a `,donation=` the login names itself
+  (`--upstream-user ADDRESS,donation=0.5`). A pool that refuses the option is
+  asked again without it and applies its own setting. BCH P2Pool is never
+  sent the option: its `donation=` is P2Pool's own donation.
 - A pool token whose rates add to over 100% is refused (the client falls back
   to the pool's own jobs), so a bad token cannot break the payout math.
 

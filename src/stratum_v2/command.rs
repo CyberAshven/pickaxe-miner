@@ -506,6 +506,11 @@ pub fn run(
                 p2pool_prepare_api: p2pool_prepare_api.clone(),
                 required: p2pool_prepare_api.is_some()
                     || job_declaration.is_some_and(|mode| mode.requires_own_templates()),
+                // #### merge-mining v2: the miner's donation at a Pickaxe
+                // pool, never at BCH P2Pool (see `JdTarget::login`).
+                pickaxe_donation: (p2pool_prepare_api.is_none()
+                    && !super::sv1::names_donation(&pool.identity))
+                .then(|| donation.clone()),
             })
             .collect();
         if p2pool_prepare_api.is_some() {

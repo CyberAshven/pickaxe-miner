@@ -226,7 +226,8 @@ these steps, and runs them on every proof before keeping it (fail closed):
   output 0 before the pool's outputs. Its leaves bind the miner's own script
   (the pool's first output), and their split is what the coinbase pays: the
   miner's donation (the PX token's donation rate, which a Pickaxe pool takes
-  from the login's `,donation=`) and the pool's fee, both whole, as no work
+  from the login: the client names the miner's own setting as
+  `,pickaxe-donation=`) and the pool's fee, both whole, as no work
   rotates under Job Declaration. The client discloses the leaves in
   `DeclareMiningJob.excess_data`, and the pool refuses a declaration whose
   leaves do not match (see [Job Declaration
@@ -331,14 +332,18 @@ username, an SV2 `user_identity` and a Job Declaration `user_identifier`.
 - BCH P2Pool reads the same key for its own donation (0 to 10%, apart from
   its operator fee, refused above 10%). Pickaxe does not check P2Pool logins
   itself.
+- `pickaxe-donation=<percent>` means the same on a Pickaxe pool, and only
+  Pickaxe pools read it. A login names one or the other, not both.
 
 **One donation at a pool.** Pickaxe's SV1 adapter donates by itself at a
 remote pool: its own donation channel, at the miner's setting. A Pickaxe
 pool would also take its donation from the device's channel, so the adapter
-now names `,donation=0` after the device's login there (unless the login
-already names a donation), and asks once more without it if the pool refuses
-the option. Under Job Declaration there is no local donation work, so the
-donation is only the coinbase's, at the rate the login chooses.
+now names `,pickaxe-donation=0` after the device's login there (unless the
+login already names a donation), and asks once more without it if the pool
+refuses the option. It never names `donation=`: at a BCH P2Pool node that
+key is P2Pool's own donation, which is independent of Pickaxe's and stays
+the miner's choice. Under Job Declaration there is no local donation work,
+so the donation is only the coinbase's, at the rate the login chooses.
 
 ## Coinbase size
 

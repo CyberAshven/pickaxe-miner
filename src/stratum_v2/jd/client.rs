@@ -89,6 +89,48 @@ pub struct JdTarget {
     pub mode: JdMode,
     pub p2pool_prepare_api: Option<String>,
     pub required: bool,
+    /// #### merge-mining v2: the miner's own donation setting, named to a
+    /// Pickaxe pool as `,pickaxe-donation=` (see `login`); `None` at BCH
+    /// P2Pool, when the identity names a donation itself, and once the pool
+    /// refused the option.
+    pub pickaxe_donation: Option<Arc<RwLock<crate::donation::bch::BchDonation>>>,
+}
+
+// #### merge-mining v2: the miner's donation at a Pickaxe pool
+// What: a Job Declaration client's login names the miner's own donation
+// setting as `,pickaxe-donation=<percent>` (to the 0.5% step below, as of
+// each session's start), so a Pickaxe pool's tokens carry it instead of the
+// pool's setting. A pool that refuses the device channel with the option is
+// asked again without it, and keeps its own setting.
+// Why: the Pickaxe donation is the miner's choice on any pool; under Job
+// Declaration it is paid in the coinbase only, at the token's rate. The key
+// is Pickaxe's own: BCH P2Pool reads `donation=` for its own, independent
+// donation.
+// Look here if: a Job Declaration miner's coinbase donation is the pool's
+// setting instead of theirs, or a pool refuses every session.
+/// What a session says when the pool refused the channel of a login that
+/// named `,pickaxe-donation=`.
+const PICKAXE_DONATION_REFUSED: &str =
+    "the pool refused the login's donation option; using the pool's own donation setting";
+
+impl JdTarget {
+    /// The login the pool sees: the identity, with the miner's donation
+    /// setting where `pickaxe_donation` names one.
+    fn login(&self) -> String {
+        match &self.pickaxe_donation {
+            Some(rate) => {
+                let bps = u16::from(*rate.read().unwrap_or_else(|poisoned| poisoned.into_inner()));
+                let bps = bps - bps % 50;
+                format!(
+                    "{},pickaxe-donation={}.{:02}",
+                    self.identity,
+                    bps / 100,
+                    bps % 100
+                )
+            }
+            None => self.identity.clone(),
+        }
+    }
 }
 
 /// What the dashboard shows of the client; never an identity or token.
@@ -314,13 +356,15 @@ fn spawn_with(
     });
     let shared = status.clone();
     let worker = thread::spawn(move || {
+        let mut targets = targets;
         let mut serial = 0u64;
         let mut failures = 0u32;
         let mut next = 0usize;
         while !stop.load(Ordering::Relaxed) {
-            let Some(target) = targets.get(next) else {
+            let Some(target) = targets.get(next).cloned() else {
                 return;
             };
+            let target = &target;
             // #### PR #65: a paused session waits without a connection (see
             // `spawn_p2pool`).
             if paused() {
@@ -347,6 +391,13 @@ fn spawn_with(
             shared.set_plan(None);
             if stop.load(Ordering::Relaxed) {
                 break;
+            }
+            // #### merge-mining v2: then without the donation option (see
+            // `JdTarget::login`).
+            if matches!(&result, Err(error) if error == PICKAXE_DONATION_REFUSED) {
+                targets[next].pickaxe_donation = None;
+                shared.update(|summary| summary.last_error = result.err());
+                continue;
             }
             if paused() {
                 failures = 0;
@@ -456,6 +507,7 @@ fn uplink(
     paused: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let full = target.mode == JdMode::FullTemplate;
+    let login = target.login();
     let (mut jd, mut jd_replies) = connect(target, if full { Limits::JD } else { Limits::DEVICE })?;
     setup(
         target,
@@ -476,11 +528,7 @@ fn uplink(
         pool.send(mining(Mining::OpenExtendedMiningChannel(
             OpenExtendedMiningChannel {
                 request_id,
-                user_identity: target
-                    .identity
-                    .as_str()
-                    .try_into()
-                    .map_err(|_| "identity too long")?,
+                user_identity: login.as_str().try_into().map_err(|_| "identity too long")?,
                 nominal_hash_rate: 1e12,
                 max_target: (&[0xff; 32]).into(),
                 min_extranonce_size: rollable as u16,
@@ -514,6 +562,7 @@ fn uplink(
                 usize::from(opened.extranonce_size),
             )
         }
+        _ if target.pickaxe_donation.is_some() => return Err(PICKAXE_DONATION_REFUSED.into()),
         _ => return Err("the pool refused the Job Declaration channel".into()),
     };
     if rollable < JD_COMPACT_ROLLABLE {
@@ -522,7 +571,7 @@ fn uplink(
     let compact = rollable < JD_ROLLABLE;
     let mut requests = 0u32;
     for _ in 0..TOKENS_AHEAD {
-        allocate(target, &mut jd, &mut requests)?;
+        allocate(&login, &mut jd, &mut requests)?;
     }
     let mut tokens: VecDeque<Vec<u8>> = VecDeque::new();
     let (first, mut scripts) = token_for(
@@ -595,7 +644,7 @@ fn uplink(
         }
         if let Some(p2pool) = &plan.p2pool {
             for _ in 0..p2pool.consumed.swap(0, Ordering::Relaxed) {
-                allocate(target, &mut jd, &mut requests)?;
+                allocate(&login, &mut jd, &mut requests)?;
             }
         }
         while let Some(mut frame) = jd_replies.receive(Duration::from_millis(5))? {
@@ -836,7 +885,7 @@ fn uplink(
                     continue;
                 };
                 if plan.p2pool.is_none() {
-                    allocate(target, &mut jd, &mut requests)?;
+                    allocate(&login, &mut jd, &mut requests)?;
                 }
                 if full {
                     let request = next_declaration;
@@ -1008,15 +1057,11 @@ fn answer(receiver: &mut Receiver, stop: &AtomicBool) -> Result<SerializedFrame,
     Err("the pool did not answer".into())
 }
 
-fn allocate(target: &JdTarget, jd: &mut Sender, requests: &mut u32) -> Result<(), String> {
+fn allocate(login: &str, jd: &mut Sender, requests: &mut u32) -> Result<(), String> {
     *requests = requests.wrapping_add(1);
     jd.send(encoded(
         AllocateMiningJobToken {
-            user_identifier: target
-                .identity
-                .as_str()
-                .try_into()
-                .map_err(|_| "identity too long")?,
+            user_identifier: login.try_into().map_err(|_| "identity too long")?,
             request_id: *requests,
         },
         MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN,
@@ -1269,6 +1314,46 @@ fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### merge-mining v2: the miner's donation at a Pickaxe pool
+    #[test]
+    fn a_login_names_the_miners_donation_to_the_step_below() {
+        use crate::donation::bch::BchDonation;
+        let target = |donation: Option<u16>| JdTarget {
+            address: String::new(),
+            authority: [0; 32],
+            identity: "bchtest:qq.rig".into(),
+            retry: Duration::from_secs(1),
+            mode: JdMode::FullTemplate,
+            p2pool_prepare_api: None,
+            required: false,
+            pickaxe_donation: donation
+                .map(|bps| Arc::new(RwLock::new(BchDonation::try_from(bps).unwrap()))),
+        };
+        assert_eq!(target(None).login(), "bchtest:qq.rig");
+        assert_eq!(
+            target(Some(150)).login(),
+            "bchtest:qq.rig,pickaxe-donation=1.50"
+        );
+        assert_eq!(
+            target(Some(75)).login(),
+            "bchtest:qq.rig,pickaxe-donation=0.50"
+        );
+        assert_eq!(
+            target(Some(0)).login(),
+            "bchtest:qq.rig,pickaxe-donation=0.00"
+        );
+        // The pool reads it back as the donation.
+        let login = crate::stratum_v2::payout::identity_login(
+            crate::config::MiningNetwork::Chipnet,
+            &format!(
+                "{},pickaxe-donation=1.50",
+                crate::stratum_v2::template_tests::payout()
+            ),
+        )
+        .unwrap();
+        assert_eq!(login.donation, Some("1.5".parse().unwrap()));
+    }
     use crate::stratum_v2::template_tests::rpc_template;
 
     fn template() -> BchTemplate {
@@ -1503,6 +1588,7 @@ mod tests {
             mode: JdMode::CoinbaseOnly,
             p2pool_prepare_api: Some("http://127.0.0.1:1/jd_prepare".into()),
             required: true,
+            pickaxe_donation: None,
         };
         let (handle, _worker) = spawn_p2pool(
             vec![target],
@@ -1609,6 +1695,7 @@ mod tests {
                 mode,
                 p2pool_prepare_api: Some(config["api"].as_str().unwrap().into()),
                 required: true,
+                pickaxe_donation: None,
             };
             let session_stop = Arc::new(AtomicBool::new(false));
             let guard = Stop(session_stop.clone());

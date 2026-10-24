@@ -354,6 +354,17 @@ impl Running {
         pool: &Running,
         mode: super::jd::JdMode,
     ) -> Self {
+        Self::jd_client_donating(node, pool, mode, None)
+    }
+
+    /// #### merge-mining v2: a Job Declaration client naming `donation`
+    /// to the pool as `,pickaxe-donation=`.
+    pub(super) fn jd_client_donating(
+        node: Arc<Mutex<Node>>,
+        pool: &Running,
+        mode: super::jd::JdMode,
+        donation: Option<crate::donation::bch::BchDonation>,
+    ) -> Self {
         Self::start_config(
             vec![node],
             Arc::new(TestDirectory::new()),
@@ -369,6 +380,7 @@ impl Running {
                 identity: payout(),
                 retry: Duration::from_millis(500),
                 mode,
+                pickaxe_donation: donation.map(|rate| Arc::new(std::sync::RwLock::new(rate))),
             }),
             Vec::new(),
         )
@@ -398,6 +410,7 @@ impl Running {
                 identity: payout(),
                 retry: Duration::from_millis(500),
                 mode,
+                pickaxe_donation: None,
             }),
             Vec::new(),
         )
@@ -2698,8 +2711,8 @@ fn public_pool_miners_can_see_their_leaves() {
 // #### merge-mining v2: one donation at a pool
 // What: the adapter, which donates on its own channel at a remote pool,
 // asks a Pickaxe public pool for no donation on the device's channel
-// (`,donation=0`): the device's block pays the miner and the operator's
-// fee, nothing to the donation.
+// (`,pickaxe-donation=0`, a key BCH P2Pool does not read): the device's
+// block pays the miner and the operator's fee, nothing to the donation.
 // Look here if: a device at a Pickaxe pool donates twice, or the adapter's
 // login options change.
 #[test]
@@ -3354,6 +3367,59 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
     device.sender.close();
 }
 
+// #### merge-mining v2: the miner's donation at a Pickaxe pool
+// What: a Job Declaration client whose own donation setting is 0% names it
+// (`,pickaxe-donation=0.00`) to a Pickaxe pool whose own setting is 1.5%:
+// the block pays the miner and the pool's 1% fee, nothing to the donation.
+// Look here if: `JdTarget::login` or the pool's login options change.
+#[test]
+fn a_jd_client_names_its_own_donation_to_a_pickaxe_pool() {
+    let pool = Running::jd_pool(super::payout::PublicPool {
+        fee: Some(crate::donation::bch::PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: crate::donation::bch::FeeMode::Work,
+        }),
+        address: address(0x34),
+    });
+    let miner_node = pool_node();
+    let client = Running::jd_client_donating(
+        miner_node.clone(),
+        &pool,
+        super::jd::JdMode::CoinbaseOnly,
+        Some("0".parse().unwrap()),
+    );
+    client.wait(|stats| {
+        stats
+            .jd_client
+            .as_ref()
+            .is_some_and(|jd| jd.state == "active")
+    });
+    let mut device = Device::connect(&client, true);
+    device.solve_and_submit(0);
+    client.wait(|stats| stats.blocks_accepted == 1);
+    let submitted = miner_node.lock().unwrap().submitted.clone();
+    let block: Block = consensus::deserialize(&hex::decode(&submitted[0]).unwrap()).unwrap();
+    let outputs: Vec<(u64, Vec<u8>)> = block.txdata[0]
+        .output
+        .iter()
+        .map(|output| (output.value.to_sat(), output.script_pubkey.to_bytes()))
+        .collect();
+    let mut miner = vec![0x76, 0xa9, 0x14];
+    miner.extend([0x12; 20]);
+    miner.extend([0x88, 0xac]);
+    assert_eq!(
+        outputs,
+        vec![
+            (309_375_000, miner),
+            (
+                3_125_000,
+                crate::tx::cashaddr_to_coinbase_locking(&address(0x34)).unwrap()
+            ),
+        ]
+    );
+    device.sender.close();
+}
+
 // #### PR #56
 // What: a pool granting only 8 rollable bytes, as BCH P2Pool does, refuses
 // the client's 16; the client asks again for 8 and mines in the compact
@@ -3610,6 +3676,7 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
             identity: payout(),
             retry: Duration::from_millis(200),
             mode: super::jd::JdMode::FullTemplate,
+            pickaxe_donation: None,
         }],
         stop.clone(),
     );

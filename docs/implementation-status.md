@@ -3363,8 +3363,9 @@ Branch `feat/merge-mining-v2`, on `dev`.
     miner's script) and split (the miner's donation and the pool's fee),
     refusing with `invalid-coinbase-tx`. Coinbase-only mines no tokens.
   - One donation at a pool: the SV1 adapter, which donates on its own channel
-    at a remote pool, names `,donation=0` for the device's channel (asking
-    again without it if refused).
+    at a remote pool, names `,pickaxe-donation=0` for the device's channel
+    (asking again without it if refused); a Pickaxe pool reads that key as
+    `donation=`, and BCH P2Pool's own donation is never zeroed.
   - Evidence: host tests for each rule, including a public pool miner at
     `donation=0` with a 2% coinbase fee (the leaf's split is the fee slot
     alone, and its proof verifies), a declaration with a wrong fee slot

@@ -22,9 +22,11 @@ pub struct PublicPool {
 // #### merge-mining v2: login options
 // What: a public pool's username is `ADDRESS[.worker][,key=value]...`. The
 // options come after the first comma: `donation=<percent>` sets this
-// miner's whole Pickaxe donation (0 to 100 in 0.5% steps), `p2p=` is BCH
-// P2Pool's share address and is ignored here, and other keys are ignored
-// too. A malformed donation, or two of them, refuses the login.
+// miner's whole Pickaxe donation (0 to 100 in 0.5% steps), as does
+// `pickaxe-donation=`, the key only Pickaxe pools read (Pickaxe's own SV1
+// adapter names it, see `sv1::open`); `p2p=` is BCH P2Pool's share address
+// and is ignored here, and other keys are ignored too. A malformed
+// donation, or two of them, refuses the login.
 // Why: the Pickaxe donation is the miner's choice even on someone else's
 // pool; without the option the pool's own setting applies, as before.
 // Look here if: a username with options is refused, or a donation option
@@ -51,7 +53,7 @@ pub fn identity_login(network: MiningNetwork, identity: &str) -> Result<Login, S
         .filter(|option| !option.trim().is_empty())
     {
         let (key, value) = option.split_once('=').unwrap_or((option, ""));
-        if key.trim() != "donation" {
+        if !matches!(key.trim(), "donation" | "pickaxe-donation") {
             continue;
         }
         let rate: BchDonation = value
@@ -246,6 +248,11 @@ mod tests {
             (format!("{bare},donation=100"), rate("100")),
             (format!("{bare}.rig1,p2p=x"), None),
             (format!("{bare},other=1,donation=1.5"), rate("1.5")),
+            (format!("{bare}.rig1,pickaxe-donation=0"), rate("0")),
+            (
+                format!("{bare},p2p=bchtest:qq,pickaxe-donation=0.5"),
+                rate("0.5"),
+            ),
         ] {
             assert_eq!(
                 login(&identity),
@@ -265,6 +272,8 @@ mod tests {
             ",donation=-1",
             ",donation",
             ",donation=1,donation=1",
+            ",donation=1,pickaxe-donation=0",
+            ",pickaxe-donation=0.25",
         ] {
             assert_eq!(
                 login(&format!("{bare}.rig1{bad}")),
