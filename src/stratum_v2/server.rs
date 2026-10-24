@@ -3825,4 +3825,44 @@ mod p2pool_tests {
         device.update(None, at(60), 0, hold).unwrap();
         assert!(device.update(None, at(63), 0, hold).is_err());
     }
+
+    // #### merge-mining v2
+    // What: with a token set registered, a P2Pool template still prepares
+    // and its job reaches the device, mining BCH alone with no token
+    // commitment, and the dashboard is told why.
+    // Look here if: `BchTemplate::tokens_refused`, `prepare_p2pool` or the
+    // channel's job install changes.
+    #[test]
+    fn registered_tokens_never_stop_p2pool_jobs() {
+        use super::super::merge::set::tests::test_set;
+        let (url, _requests) = serve(vec![Answer::Valid]);
+        let start = Instant::now();
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        template.commit(Arc::new(test_set()));
+        template.declare(p2pool_plan(1, &url, "owner", 8));
+        template
+            .prepare_p2pool()
+            .expect("a token set does not stop the preparation");
+        template.set_declaration_id(1);
+        assert!(template.declared_aux().unwrap().is_none());
+        let job = PublishedJob {
+            generation: 1,
+            serial: (1 << 32) | 1,
+            template: Arc::new(template),
+            valid_until: start + Duration::from_secs(30),
+        };
+        let mut device = Device::new();
+        assert!(
+            device
+                .update(Some(&job), start, 0, Acknowledged::personal(1))
+                .unwrap()
+                > 0
+        );
+        let mined = device.job().expect("the device mines BCH");
+        assert!(mined.aux.is_none());
+        assert_eq!(
+            device.mining.token_refusal,
+            Some("P2Pool's coinbase does not carry the token commitment yet")
+        );
+    }
 }

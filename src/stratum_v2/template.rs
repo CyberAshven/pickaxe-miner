@@ -598,12 +598,9 @@ impl BchTemplate {
     /// It cannot change the independently sourced transaction list or revenue.
     pub fn prepare_p2pool(&mut self) -> Result<(), String> {
         self.p2pool = None;
+        // A token set does not stop it: P2Pool's coinbase carries no token
+        // commitment, so its jobs mine BCH alone (see `tokens_refused`).
         if let Some(plan) = self.jd.as_ref().and_then(|plan| plan.p2pool.as_ref()) {
-            if self.tokens.is_some() {
-                return Err(
-                    "this token set does not yet have a P2Pool-compatible aux proof adapter".into(),
-                );
-            }
             self.p2pool = Some(Arc::new(plan.prepare(
                 self.height,
                 self.bits,
@@ -731,6 +728,9 @@ impl BchTemplate {
         let (Some(plan), Some(set)) = (self.jd.as_ref(), self.tokens.as_ref()) else {
             return Ok(None);
         };
+        if self.is_p2pool() {
+            return Ok(None);
+        }
         let miner = plan
             .token_payout()
             .ok_or("the pool's plan has no outputs")?;
@@ -779,6 +779,21 @@ impl BchTemplate {
 
     pub fn tokens(&self) -> Option<&Arc<TokenSet>> {
         self.tokens.as_ref()
+    }
+
+    // #### merge-mining v2: P2Pool
+    // What: under P2Pool's own templates a token set is not merge-mined:
+    // `aux_job` gives no commitment, the job mines BCH alone, and this
+    // reason reaches the dashboard.
+    // Why: P2Pool builds the coinbase and does not put this format's output
+    // 0 in it yet; a token set must not stop BCH work there.
+    // Look here if: tokens are registered at P2Pool and devices get no job,
+    // or P2Pool builds output 0 in this format.
+    /// Why this template's token set is not merge-mined, if it has one that
+    /// is not.
+    pub fn tokens_refused(&self) -> Option<&'static str> {
+        (self.tokens.is_some() && self.is_p2pool())
+            .then_some("P2Pool's coinbase does not carry the token commitment yet")
     }
 
     // #### merge-mining v2: pool and role rules

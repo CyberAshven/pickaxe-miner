@@ -159,7 +159,8 @@ these steps, and runs them on every proof before keeping it (fail closed):
 - **BCH P2Pool:** the same forwarding rule applies. Pickaxe does not yet
   merge-mine at P2Pool: its prepared coinbase carries P2Pool's own auxiliary
   output today, and a P2Pool that builds output 0 in this format is still to
-  come.
+  come. With tokens registered, P2Pool jobs mine BCH alone and the dashboard
+  says why.
 - **A pool without Job Declaration:** no merge mining. The pool builds the
   coinbase, so Pickaxe cannot add the commitment.
 - **Own-root check:** where Pickaxe is the miner side and sees the coinbase

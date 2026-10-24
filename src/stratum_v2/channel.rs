@@ -369,6 +369,11 @@ impl Channel {
         let aux = template
             .aux_job(self.network, &self.payout, self.operator.as_deref(), payout)?
             .map(Arc::new);
+        // #### merge-mining v2: under P2Pool the job mines BCH alone (see
+        // `BchTemplate::tokens_refused`).
+        if let Some(reason) = template.tokens_refused() {
+            self.token_refusal = Some(reason);
+        }
         // #### merge-mining v2: a fresh extranonce per merge-mined job
         // What: on a standard channel, where this server fills the whole
         // extranonce, a job that commits a token root gets fresh random
