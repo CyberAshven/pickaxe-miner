@@ -2593,9 +2593,11 @@ pub(crate) mod tests {
             );
         }
         let slot: serde_json::Value = serde_json::from_str(P2POOL_CLAIM).unwrap();
-        if let Some(theirs) = slot["p2pool_claim_hex"].as_str() {
-            assert_eq!(hex::encode(&claim.raw), theirs);
-        }
+        // BCH P2Pool's `cli.mjs claim` built the same transaction.
+        let theirs = slot["p2pool_claim_hex"]
+            .as_str()
+            .expect("P2Pool's claim hex for the fixture");
+        assert_eq!(hex::encode(&claim.raw), theirs);
     }
 
     // #### merge-mining v2: the ASERT band's edges (P2Pool's vectors)
