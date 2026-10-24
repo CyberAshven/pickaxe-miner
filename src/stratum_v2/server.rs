@@ -79,8 +79,72 @@ pub struct ServerConfig {
     pub token_donation: Option<crate::donation::TokenDonation>,
     /// #### PR #42: the node's ZMQ block notices (tcp://HOST:PORT).
     pub node_zmq: Option<String>,
+    /// #### merge-mining v2: a public pool's leaf log for its standard
+    /// channels (owner-only JSON lines, capped; see `LeafLog`).
+    pub leaf_log_path: Option<PathBuf>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
+}
+
+// #### merge-mining v2: the leaf log
+// What: a public pool's standard-channel jobs that commit a token root are
+// logged as JSON lines (time, channel, job, output 0 and the leaf
+// disclosure, never an address) to `<config>.sv2-leaves.jsonl`, readable by
+// the owner alone. A writer thread takes them through a bounded queue the
+// device threads never wait on; past 8 MiB the log moves to `.1` and starts
+// again.
+// Why: a standard channel's device cannot take the disclosure frames; the
+// operator can publish this log so those miners can check their leaves.
+// Look here if: the log is missing lines, grows without bound, or a device
+// thread waits on it.
+/// The leaf log's writer, fed without waiting.
+struct LeafLog {
+    lines: SyncSender<String>,
+}
+
+/// Where the leaf log moves to, past its cap.
+const LEAF_LOG_BYTES: u64 = 8 << 20;
+
+impl LeafLog {
+    fn start(path: PathBuf, stop: Arc<AtomicBool>) -> Self {
+        let (lines, receive) = mpsc::sync_channel::<String>(1_024);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let Ok(line) = receive.recv_timeout(Duration::from_millis(250)) else {
+                    continue;
+                };
+                let _ = append_private(&path, &line);
+            }
+        });
+        Self { lines }
+    }
+
+    fn add(&self, lines: Vec<String>) {
+        for line in lines {
+            if self.lines.try_send(line).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// Appends one line to an owner-only file, moving a file past the cap to
+/// `.1` first.
+fn append_private(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= LEAF_LOG_BYTES) {
+        std::fs::rename(path, path.with_extension("jsonl.1"))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.write_all(b"\n")
 }
 
 #[derive(Default, Clone, Debug)]
@@ -291,6 +355,8 @@ pub(super) struct Shared {
     /// #### PR #42: the claim worker's queue, bounded; device threads never
     /// wait on it.
     claims: Option<SyncSender<(TokenWin, String)>>,
+    /// #### merge-mining v2: the leaf log, on a public pool.
+    leaf_log: Option<LeafLog>,
     /// #### PR #42: what Template Distribution sessions share with the node
     /// worker, when templates are served or relayed blocks wait.
     pub(super) relay: Option<Relay>,
@@ -645,6 +711,10 @@ pub fn run_with(
         stop: stop.clone(),
         solved: Mutex::new(SolvedParents::default()),
         claims,
+        leaf_log: config
+            .leaf_log_path
+            .clone()
+            .map(|path| LeafLog::start(path, stop.clone())),
         relay,
         lanes: Arc::default(),
         declared,
@@ -2393,6 +2463,13 @@ fn serve_device(
             for frame in availability.retarget(&mut mining)? {
                 sender.send(frame)?;
             }
+            // #### merge-mining v2: the leaf log's lines (see `LeafLog`).
+            if !mining.leaf_log.is_empty() {
+                let lines = std::mem::take(&mut mining.leaf_log);
+                if let Some(log) = shared.leaf_log.as_ref() {
+                    log.add(lines);
+                }
+            }
             if let Some(mut frame) = receiver.receive(Duration::from_millis(100))? {
                 // #### PR #42: JD sessions on the SV2 listener (see
                 // `serve_declarator`).
@@ -3186,6 +3263,7 @@ mod retry_tests {
             stop: Arc::default(),
             solved: Mutex::default(),
             claims: None,
+            leaf_log: None,
             relay: None,
             lanes: Arc::default(),
             declared: None,
@@ -3338,6 +3416,7 @@ mod retry_tests {
                 stop: Arc::default(),
                 solved: Mutex::default(),
                 claims: None,
+                leaf_log: None,
                 relay: None,
                 lanes: Arc::default(),
                 declared: None,
@@ -3476,6 +3555,7 @@ mod p2pool_tests {
             stop: Arc::default(),
             solved: Mutex::default(),
             claims: None,
+            leaf_log: None,
             relay: None,
             lanes: Arc::default(),
             declared: None,

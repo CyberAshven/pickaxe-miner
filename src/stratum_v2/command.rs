@@ -593,6 +593,10 @@ pub fn run(
                 }),
                 header_work: header_work.clone(),
                 node_zmq: node_zmq.clone(),
+                // #### merge-mining v2: a public pool's leaf log.
+                leaf_log_path: public
+                    .as_ref()
+                    .map(|_| config_path.with_extension("sv2-leaves.jsonl")),
                 #[cfg(test)]
                 allocation_phase: None,
             };

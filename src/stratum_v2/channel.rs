@@ -450,21 +450,39 @@ impl Channel {
         // #### merge-mining v2: the own-root check (see
         // `commitment::check_own_root`): the coinbases devices hash carry
         // this job's commitment as output 0, or the job mines BCH alone.
-        let aux = aux.filter(|aux| {
-            match own_root(
+        // #### merge-mining v2: and on a public pool, the audit rule (see
+        // `disclosure::audit_public`): every leaf pays the miner, or in a
+        // work job the donation or the operator.
+        let audit = |aux: &AuxJob| -> Result<(), &'static str> {
+            let Some(operator) = self.operator.as_deref() else {
+                return Ok(());
+            };
+            let scripts = super::payout::scripts(self.network, &self.payout, Some(operator))
+                .map_err(|_| "a public pool miner's payout has no script")?;
+            super::merge::disclosure::audit_public(
+                &super::merge::disclosure::Disclosure::from_job(aux),
+                &scripts[0],
+                &scripts[1],
+                &scripts[2],
+            )
+        };
+        let checked = aux.as_deref().map(|aux| {
+            own_root(
                 aux,
                 &standard_coinbase.bytes,
                 &parts,
                 &self.extranonce_prefix,
                 self.rolled,
-            ) {
-                Ok(()) => true,
-                Err(reason) => {
-                    self.token_refusal = Some(reason);
-                    false
-                }
-            }
+            )
+            .and_then(|()| audit(aux))
         });
+        let aux = match checked {
+            Some(Err(reason)) => {
+                self.token_refusal = Some(reason);
+                None
+            }
+            _ => aux,
+        };
         self.retain_previous(&template);
         self.job = Some(Job {
             id,

@@ -432,10 +432,15 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     )?)?;
     let reply = receive.receive(DEADLINE)?.ok_or("SV2 setup timed out")?;
     validate_setup_reply(reply, upstream.fixed_version)?;
+    // #### merge-mining v2: this server's disclosure extension, asked for
+    // only here (a remote pool may not know the negotiation).
+    let merge = !upstream.remote && negotiate_merge(&mut send, &mut receive)?;
     // #### PR #40: a public pool opens the device's channel at authorize.
     if upstream.public {
         return Ok(Opened {
-            bridge: Bridge::public().with_fixed_version(upstream.fixed_version),
+            bridge: Bridge::public()
+                .with_fixed_version(upstream.fixed_version)
+                .with_merge(merge),
             send,
             receive,
             local,
@@ -523,7 +528,8 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
     });
     Ok(Opened {
         bridge: Bridge::new(opened, upstream.remote, donation)?
-            .with_fixed_version(upstream.fixed_version),
+            .with_fixed_version(upstream.fixed_version)
+            .with_merge(merge),
         send,
         receive,
         local,
@@ -537,6 +543,32 @@ fn names_donation(identity: &str) -> bool {
             .split(',')
             .any(|option| option.trim_start().starts_with("donation="))
     })
+}
+
+/// #### merge-mining v2: asks this server for the disclosure extension
+/// (SV2 extensions negotiation); whether it granted it.
+fn negotiate_merge(send: &mut Sender, receive: &mut Receiver) -> Result<bool, String> {
+    use super::merge::disclosure::{
+        extensions_payload, requested_extensions, EXTENSION, NEGOTIATION, REQUEST_EXTENSIONS,
+        REQUEST_EXTENSIONS_SUCCESS,
+    };
+    send.send(super::wire::extension_frame(
+        NEGOTIATION,
+        REQUEST_EXTENSIONS,
+        false,
+        &extensions_payload(1, &[EXTENSION]),
+    )?)?;
+    let mut reply = receive
+        .receive(DEADLINE)?
+        .ok_or("SV2 extensions negotiation timed out")?;
+    let header = reply.header();
+    if header.ext_type_without_channel_msg() != NEGOTIATION
+        || header.msg_type() != REQUEST_EXTENSIONS_SUCCESS
+    {
+        return Ok(false);
+    }
+    Ok(requested_extensions(reply.payload())
+        .is_some_and(|(request, granted)| request == 1 && granted.contains(&EXTENSION)))
 }
 
 /// #### PR #67
@@ -874,6 +906,11 @@ struct Bridge {
     public: Public,
     /// #### PR #42: see `Upstream::fixed_version`.
     fixed: bool,
+    /// #### merge-mining v2: this server sends the disclosure extension
+    /// (`merge_available`), and the firmware asked for it in
+    /// mining.configure (`merge_wanted`, the `pickaxe-merge` extension).
+    merge_available: bool,
+    merge_wanted: bool,
 }
 
 /// #### PR #40
@@ -948,6 +985,8 @@ impl Bridge {
             owned: remote,
             public: Public::Off,
             fixed: false,
+            merge_available: false,
+            merge_wanted: false,
         })
     }
 
@@ -955,6 +994,65 @@ impl Bridge {
     fn with_fixed_version(mut self, fixed: bool) -> Self {
         self.fixed = fixed;
         self
+    }
+
+    /// #### merge-mining v2: whether this server sends the disclosure.
+    fn with_merge(mut self, available: bool) -> Self {
+        self.merge_available = available;
+        self
+    }
+
+    // #### merge-mining v2: the disclosure relayed to SV1 firmware
+    // What: firmware that asked for `pickaxe-merge` in mining.configure gets
+    // its jobs' leaves (`pickaxe.merge_leaves`: job id, output 0, the
+    // CTMD disclosure and each leaf's aux branch, all hex) and its wins'
+    // proofs (`pickaxe.merge_proof`: job id, token category, AuxProof v2 and
+    // the split preimage or ""). Other firmware never sees them.
+    // Why: SV1 miners on someone else's pool can check their leaves and
+    // claim their wins.
+    // Look here if: firmware that asked gets no leaves, or other firmware
+    // gets unknown notifications.
+    /// The SV1 notification for one disclosure frame, for firmware that
+    /// asked; nothing for anything else.
+    fn merge_message(&self, kind: u8, payload: &[u8]) -> Result<Option<Value>, String> {
+        use super::merge::disclosure::{JobLeaves, WinProof, JOB_LEAVES, WIN_PROOF};
+        if !self.merge_wanted {
+            return Ok(None);
+        }
+        let ours = |channel: u32| addressed_to(channel, self.user.channel, self.user.group);
+        Ok(match kind {
+            JOB_LEAVES => {
+                let leaves = JobLeaves::decode(payload)?;
+                ours(leaves.channel).then(|| {
+                    json!({"id":null,"method":"pickaxe.merge_leaves","params":[
+                        leaves.job.to_string(),
+                        hex::encode(leaves.output),
+                        hex::encode(leaves.disclosure.encode()),
+                        leaves
+                            .branches
+                            .iter()
+                            .map(|branch| hex::encode(branch.concat()))
+                            .collect::<Vec<_>>(),
+                    ]})
+                })
+            }
+            WIN_PROOF => {
+                let proof = WinProof::decode(payload)?;
+                ours(proof.channel).then(|| {
+                    json!({"id":null,"method":"pickaxe.merge_proof","params":[
+                        proof.job.to_string(),
+                        hex::encode(proof.category),
+                        hex::encode(&proof.proof),
+                        if proof.split.is_none() {
+                            String::new()
+                        } else {
+                            hex::encode(proof.split.preimage())
+                        },
+                    ]})
+                })
+            }
+            _ => None,
+        })
     }
 
     /// #### PR #40
@@ -993,6 +1091,8 @@ impl Bridge {
             owned: true,
             public: Public::Waiting,
             fixed: false,
+            merge_available: false,
+            merge_wanted: false,
         }
     }
 
@@ -1243,6 +1343,12 @@ impl Bridge {
                         json!(false),
                     );
                 }
+                // #### merge-mining v2: the disclosure, when this server
+                // sends it.
+                if names.iter().any(|name| name == "pickaxe-merge") {
+                    result.insert("pickaxe-merge".into(), json!(self.merge_available));
+                    self.merge_wanted = self.merge_available;
+                }
                 if names.iter().any(|name| name == "version-rolling") && !self.fixed {
                     let mask = match value.pointer("/params/1/version-rolling.mask") {
                         Some(Value::String(s)) => {
@@ -1450,6 +1556,11 @@ impl Bridge {
         let channel_message = frame.header().channel_msg();
         let mut out = Vec::new();
         let mut verdicts = Vec::new();
+        // #### merge-mining v2: the disclosure extension's frames.
+        if frame.header().ext_type_without_channel_msg() == super::merge::disclosure::EXTENSION {
+            out.extend(self.merge_message(kind, frame.payload())?);
+            return Ok((out, verdicts));
+        }
         // #### PR #48: a channel message starts with its channel id; one for
         // a dropped donation channel, or a group only it was in, is no longer
         // anyone's (see `dropped`).
@@ -2460,6 +2571,74 @@ mod tests {
         );
         assert!(bridge.tick(Instant::now()).unwrap().is_empty());
         assert!(bridge.donation_request().unwrap().is_none());
+    }
+
+    // #### merge-mining v2: the disclosure relayed to SV1 firmware
+    // What: firmware that asks for pickaxe-merge (and a server that sends
+    // it) gets its channel's leaves and proofs as notifications; another
+    // channel's are not its own; firmware that did not ask gets nothing, and
+    // a server without the extension answers the request with false.
+    // Look here if: `merge_message` or the configure answer changes.
+    #[test]
+    fn firmware_that_asks_gets_its_leaves_and_proofs() {
+        use super::super::merge::{
+            disclosure::{JobLeaves, WinProof, EXTENSION, JOB_LEAVES, WIN_PROOF},
+            set::{tests::test_set, AuxJob, LeafTerms},
+        };
+        let open = || OpenExtendedMiningChannelSuccess {
+            request_id: 1,
+            channel_id: 3,
+            group_channel_id: 0,
+            target: (&[255u8; 32]).into(),
+            extranonce_size: 8,
+            extranonce_prefix: [7u8; 16].as_slice().try_into().unwrap(),
+        };
+        let job = AuxJob::build(&test_set(), &LeafTerms::plain(&[0x51]));
+        let leaves = |channel| {
+            super::super::wire::extension_frame(
+                EXTENSION,
+                JOB_LEAVES,
+                true,
+                &JobLeaves::from_job(channel, 7, &job).encode(),
+            )
+            .unwrap()
+        };
+        let configure = |bridge: &mut Bridge| {
+            bridge
+                .request(
+                    json!({"id":1,"method":"mining.configure","params":[["pickaxe-merge"],{}]}),
+                )
+                .unwrap()
+                .0
+        };
+        let mut bridge = Bridge::new(open(), false, None).unwrap().with_merge(true);
+        let answer = configure(&mut bridge);
+        assert_eq!(answer[0]["result"]["pickaxe-merge"], true);
+        let out = bridge.upstream(leaves(3)).unwrap().0;
+        assert_eq!(out[0]["method"], "pickaxe.merge_leaves");
+        assert_eq!(out[0]["params"][0], "7");
+        assert_eq!(out[0]["params"][1], hex::encode(job.output));
+        assert!(bridge.upstream(leaves(4)).unwrap().0.is_empty());
+        let proof = WinProof {
+            channel: 3,
+            job: 7,
+            category: [1; 32],
+            proof: vec![2; 10],
+            split: Default::default(),
+        };
+        let frame =
+            super::super::wire::extension_frame(EXTENSION, WIN_PROOF, true, &proof.encode())
+                .unwrap();
+        let out = bridge.upstream(frame).unwrap().0;
+        assert_eq!(out[0]["method"], "pickaxe.merge_proof");
+        assert_eq!(out[0]["params"][2], hex::encode([2; 10]));
+        assert_eq!(out[0]["params"][3], "");
+        // Firmware that did not ask, and a server without the extension.
+        let mut quiet = Bridge::new(open(), false, None).unwrap().with_merge(true);
+        assert!(quiet.upstream(leaves(3)).unwrap().0.is_empty());
+        let mut without = Bridge::new(open(), false, None).unwrap();
+        assert_eq!(configure(&mut without)[0]["result"]["pickaxe-merge"], false);
+        assert!(without.upstream(leaves(3)).unwrap().0.is_empty());
     }
 
     // #### merge-mining v2: one donation at a pool

@@ -605,6 +605,9 @@ impl Running {
         let secret = [17; 32];
         let authority = server::authority_public(&secret).unwrap();
         let config = ServerConfig {
+            leaf_log_path: public
+                .as_ref()
+                .map(|_| state_directory.0.join("leaves.jsonl")),
             public,
             donation,
             allocation_phase: Some(300_000_000_000),
@@ -2583,6 +2586,113 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
     assert!(work.donation > 0.0 && work.personal == 0.0 && work.fee == 0.0);
     assert_eq!(work.shares(), Some((1.0, 0.0)));
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+// #### merge-mining v2: disclosure to miners on a public pool
+// What: SV1 firmware that asks for pickaxe-merge at a public pool that
+// merge-mines the test token gets its jobs' leaves, which rebuild its root
+// and pay its own address; a standard-channel device's jobs go to the
+// owner-only leaf log instead.
+// Look here if: the adapter's negotiation, `disclose` or the leaf log
+// changes.
+#[test]
+fn public_pool_miners_can_see_their_leaves() {
+    use super::merge::{disclosure::Disclosure, hub::TokenHub};
+    use std::io::{BufRead, Write};
+    let directory = Arc::new(TestDirectory::new());
+    let hub = Arc::new(
+        TokenHub::test_token(
+            MiningNetwork::Chipnet,
+            directory.0.join("token-proofs.json"),
+            0x1d00_ffff,
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let node = Arc::new(Mutex::new(Node {
+        height: 325908,
+        tip: "ab".repeat(32),
+        reject: false,
+        submissions: 0,
+        lose_replies: false,
+        submitted: Vec::new(),
+        known: std::collections::HashSet::new(),
+        unavailable: false,
+        public: true,
+        transactions: Vec::new(),
+        spendable: Vec::new(),
+        validations: 0,
+        parent_time: None,
+    }));
+    let public = super::payout::PublicPool {
+        fee: None,
+        address: address(2),
+    };
+    let server = Running::start_full(vec![node], directory.clone(), Some(public), Some(hub));
+    let adapter = FirmwareAdapter::public(&server);
+    let miner = address(3);
+    let write = TcpStream::connect(adapter.address).unwrap();
+    write
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut read = std::io::BufReader::new(write.try_clone().unwrap());
+    let mut write = write;
+    let mut send = |value: Value| {
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        write.write_all(&bytes).unwrap();
+    };
+    let mut next = || {
+        let mut line = String::new();
+        read.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    send(
+        json!({"id":1,"method":"mining.configure","params":[["version-rolling","pickaxe-merge"],{"version-rolling.mask":"1fffe000"}]}),
+    );
+    let configured = next();
+    assert_eq!(configured["result"]["pickaxe-merge"], true, "{configured}");
+    send(json!({"id":2,"method":"mining.subscribe","params":["test"]}));
+    assert!(next()["result"].is_array());
+    send(json!({"id":3,"method":"mining.authorize","params":[miner.clone()]}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let leaves = loop {
+        assert!(Instant::now() < deadline, "no leaves reached the firmware");
+        let message = next();
+        if message["method"] == "pickaxe.merge_leaves" {
+            break message;
+        }
+    };
+    let output = hex::decode(leaves["params"][1].as_str().unwrap()).unwrap();
+    let commitment = super::merge::commitment::AuxCommitment::parse(&output).unwrap();
+    let disclosure =
+        Disclosure::decode(&hex::decode(leaves["params"][2].as_str().unwrap()).unwrap()).unwrap();
+    disclosure.check_root(&commitment).unwrap();
+    let script = crate::tx::cashaddr_to_p2pkh_locking(&miner).unwrap();
+    assert_eq!(
+        disclosure.leaves[0].leaf.payout_hash,
+        super::template::double_sha256(&script)
+    );
+    assert_eq!(leaves["params"][3].as_array().unwrap().len(), 1);
+    // A standard-channel device: the leaf log.
+    let log = directory.0.join("leaves.jsonl");
+    let device = Device::connect_as(&server, false, &address(4));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&log).is_ok_and(|text| text.lines().count() >= 1) {
+        assert!(Instant::now() < deadline, "no leaf log line");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let text = std::fs::read_to_string(&log).unwrap();
+    let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(line["leaves"].as_str().unwrap().starts_with("43544d4402"));
+    assert!(!text.contains("bchtest"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    drop(device);
 }
 
 // #### merge-mining v2: one donation at a pool
