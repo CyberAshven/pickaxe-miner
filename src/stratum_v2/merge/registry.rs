@@ -212,7 +212,7 @@ pub struct HeaderToken {
     /// The covenant, once one is deployed.
     pub deployment: Option<CovenantDeployment>,
     /// The least share of mining work its donation takes.
-    pub donation_minimum: TokenDonation,
+    pub donation_default: TokenDonation,
 }
 
 /// The header-shaped tokens registered on `network`: none yet, on either
@@ -242,7 +242,7 @@ pub const HEADER_TEST_TOKEN: HeaderToken = HeaderToken {
         ..CANONICAL
     },
     deployment: None,
-    donation_minimum: NEW_TOKEN_DONATION,
+    donation_default: NEW_TOKEN_DONATION,
 };
 
 #[cfg(test)]
@@ -252,7 +252,7 @@ mod tests {
     // #### PR #42
     // What: no header token is registered on either network; the ASIC test
     // token is Chipnet-only, SAFA's canonical layout with BIP320 rolling,
-    // a 1.5% donation minimum and no covenant.
+    // a 1.5% default donation and no covenant.
     // Look here if: the header token registry changes.
     #[test]
     fn header_registries_are_empty_and_the_asic_test_token_is_chipnet_only() {
@@ -265,7 +265,7 @@ mod tests {
         );
         assert_eq!(HEADER_TEST_TOKEN.params.version, VersionRule::Bip320);
         assert_eq!(HEADER_TEST_TOKEN.params.daa, CANONICAL.daa);
-        assert_eq!(HEADER_TEST_TOKEN.donation_minimum, NEW_TOKEN_DONATION);
+        assert_eq!(HEADER_TEST_TOKEN.donation_default, NEW_TOKEN_DONATION);
         assert!(HEADER_TEST_TOKEN.deployment.is_none());
     }
 

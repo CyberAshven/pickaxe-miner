@@ -11,15 +11,16 @@ relay minimum; they cannot expose a changing mempool floor through that method.
 
 Edit `MiningToken::fee_policy` in `src/config.rs` to select a token's mode,
 fee shares and payout addresses. This compiled policy is each token's
-minimum: PHOTON's 4% work share, and 1.5% (also the default) for every token
-added later (`donation::NEW_TOKEN_DONATION`). A miner can raise it, never lower
-it, in 0.5% steps in the mining dashboard's Advanced settings (`a`), with
-`--token-donation PERCENT`, or in a saved profile; anything above the minimum is
-more of the work for the project's donation address (`fee_policy_at`). A
-change applies to every GPU at its next batch and to every rig of a
-coordinator at once, and a value below the minimum mines at the minimum. BCH
-and its merge-mined tokens keep their own policy (`donation/bch.rs`), which a
-miner can set down to 0%.
+default: PHOTON's and ELECTRIC's 4% work share, and 1.5% for every token
+added later (`donation::NEW_TOKEN_DONATION`). A miner can raise or lower it,
+down to 0%, in 0.5% steps in the mining dashboard's Advanced settings (`a`),
+with `--token-donation PERCENT`, or in a saved profile. Anything above the
+default is more of the work for the project's donation address; below it,
+the project's and the collaborator's shares shrink in proportion, to none at
+0% (`TokenDonation::work_shares`, `fee_policy_at`). A change applies to every
+GPU at its next batch and to every rig of a coordinator at once. BCH and its
+merge-mined tokens keep their own policy (`donation/bch.rs`), which a miner
+can also set down to 0%.
 Addresses are validated before mining; each network may use different recipients.
 Do not edit the historical address/percentage constants used by legacy recovery.
 

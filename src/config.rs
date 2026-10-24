@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Historical reward split, retained to recover older pending payouts.
-/// New PHOTON mining uses the separate 4% policy in `donation`.
+/// New PHOTON mining uses the separate policy in `donation` (4% by default).
 pub const DONATION_BPS: u16 = 200;
 
 /// Historical addresses: frozen for legacy payout recovery and its VM proof.
@@ -127,35 +127,33 @@ impl MiningToken {
     pub const GPU_SUPPORTED: &[Self] = &[Self::Photon];
 
     /// #### PR #32
-    /// The least a miner donates to mine this token: PHOTON's 4% work share.
-    /// Every token added later uses `donation::NEW_TOKEN_DONATION` (1.5%).
-    pub fn donation_minimum(self) -> crate::donation::TokenDonation {
+    /// The donation a miner gives to mine this token unless they change it:
+    /// PHOTON's 4% work share. A miner can lower it to 0% or raise it. Every
+    /// token added later uses `donation::NEW_TOKEN_DONATION` (1.5%).
+    pub fn donation_default(self) -> crate::donation::TokenDonation {
         match self {
             Self::Photon => crate::donation::TokenDonation::from_bps(400),
         }
     }
 
     /// The token's policy at a donation the miner chose: anything above the
-    /// minimum goes to the project's donation address, as more of the work.
+    /// default goes to the project's donation address, as more of the work;
+    /// below it every share shrinks in proportion (`TokenDonation::work_shares`).
     pub fn fee_policy_at(
         self,
         network: MiningNetwork,
         donation: crate::donation::TokenDonation,
     ) -> crate::donation::Policy {
         let mut policy = self.fee_policy(network);
-        let extra = donation
-            .at_least(self.donation_minimum())
-            .bps()
-            .saturating_sub(self.donation_minimum().bps());
-        if let crate::donation::Scheme::Work([project, _]) = &mut policy.scheme {
-            *project = project.saturating_add(extra);
+        if let crate::donation::Scheme::Work(shares) = &mut policy.scheme {
+            *shares = donation.work_shares(self.donation_default(), *shares);
         }
         policy
     }
 
     /// Maintainer-editable mode, shares and recipients. The protocol must support
-    /// its selected payout scheme before mining starts. This is the minimum;
-    /// `fee_policy_at` adds what a miner chose above it.
+    /// its selected payout scheme before mining starts. This is the default;
+    /// `fee_policy_at` applies what a miner chose instead.
     pub fn fee_policy(self, network: MiningNetwork) -> crate::donation::Policy {
         use crate::donation::{Policy, Scheme};
         match self {
@@ -382,10 +380,11 @@ impl RuntimeConfig {
         self.electric_pot_chosen = mode.is_some();
     }
 
-    /// #### PR #32: the token donation in effect, never below the minimum.
+    /// #### PR #32: the token donation in effect: the miner's, or the
+    /// token's default.
     pub fn token_donation(&self) -> crate::donation::TokenDonation {
-        let minimum = self.token.donation_minimum();
-        self.token_donation.unwrap_or(minimum).at_least(minimum)
+        self.token_donation
+            .unwrap_or_else(|| self.token.donation_default())
     }
 
     /// The selected token's policy at the donation in effect.
@@ -809,7 +808,7 @@ impl SavedDevices {
 pub struct SavedConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bch_donation_bps: Option<crate::donation::bch::BchDonation>,
-    /// #### PR #32: a token donation raised above its minimum.
+    /// #### PR #32: a token donation other than its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_donation_bps: Option<crate::donation::TokenDonation>,
     pub network: Option<String>,
@@ -1336,7 +1335,7 @@ impl SavedConfig {
             network: Some(runtime.network.as_str().to_string()),
             bch_donation_bps: (runtime.bch_donation != Default::default())
                 .then_some(runtime.bch_donation),
-            token_donation_bps: (runtime.token_donation() != runtime.token.donation_minimum())
+            token_donation_bps: (runtime.token_donation() != runtime.token.donation_default())
                 .then(|| runtime.token_donation()),
             token: Some(runtime.token.as_str().to_string()),
             backend: Some(backend.to_string()),
@@ -1970,7 +1969,7 @@ mod tests {
 
     // #### PR #32
     #[test]
-    fn a_raised_photon_donation_adds_only_to_the_project_share() {
+    fn a_photon_donation_moves_from_its_default_down_to_zero() {
         use crate::donation::TokenDonation;
         let six = TokenDonation::from_bps(600);
         let mainnet = MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, six);
@@ -1978,16 +1977,21 @@ mod tests {
         assert_eq!(mainnet.scheme.description(), "Donation: 6%");
         let chipnet = MiningToken::Photon.fee_policy_at(MiningNetwork::Chipnet, six);
         assert_eq!(chipnet.scheme.work(), [600, 0]);
-        // Below the minimum, the minimum applies.
+        // #### 2026-10-24: below the default every share shrinks, to none.
         let low =
             MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, TokenDonation::from_bps(100));
-        assert_eq!(low.scheme.work(), [200, 200]);
+        assert_eq!(low.scheme.work(), [50, 50]);
+        let none =
+            MiningToken::Photon.fee_policy_at(MiningNetwork::Mainnet, TokenDonation::from_bps(0));
+        assert_eq!(none.scheme.work(), [0, 0]);
+        assert_eq!(none.scheme.description(), "Donation: 0%");
         let mut cfg = RuntimeConfig::default();
         assert_eq!(cfg.token_donation().bps(), 400);
         cfg.token_donation = Some(TokenDonation::from_bps(150));
-        assert_eq!(cfg.token_donation().bps(), 400);
-        assert_eq!(cfg.fee_policy().scheme.work(), [200, 200]);
-        // The saved setting only holds a raised value.
+        assert_eq!(cfg.token_donation().bps(), 150);
+        assert_eq!(cfg.fee_policy().scheme.work(), [75, 75]);
+        cfg.token_donation = None;
+        // The saved setting only holds a value other than the default.
         cfg.set_payout(PAYOUT.into()).unwrap();
         let saved = SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &cfg);
         assert_eq!(saved.token_donation_bps, None);
@@ -1995,7 +1999,7 @@ mod tests {
         let saved = SavedConfig::from_effective("cuda", &DeviceSelection::Indices(vec![0]), &cfg);
         assert_eq!(saved.token_donation_bps, Some(six));
         assert_eq!(
-            MiningToken::Photon.donation_minimum(),
+            MiningToken::Photon.donation_default(),
             TokenDonation::from_bps(400)
         );
         assert_eq!(crate::donation::NEW_TOKEN_DONATION.bps(), 150);

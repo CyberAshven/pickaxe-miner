@@ -441,9 +441,7 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
             let up = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
             if let Some((_, runtime)) = miners.runtimes.iter().find(|(t, _)| *t == token) {
                 let snapshot = runtime.snapshot();
-                let next = snapshot
-                    .token_donation
-                    .adjusted(up, snapshot.donation_minimum);
+                let next = snapshot.token_donation.adjusted(up);
                 apply_result(
                     runtime.set_donation(next),
                     &format!("Donation {next}"),
@@ -454,8 +452,8 @@ fn token_key(key: KeyEvent, miners: &Miners<'_>, state: &mut TuiState) -> Result
                     let current = monitor
                         .summary()
                         .donation
-                        .unwrap_or(crate::electric::DONATION_MINIMUM);
-                    let next = current.adjusted(up, crate::electric::DONATION_MINIMUM);
+                        .unwrap_or(crate::electric::DONATION_DEFAULT);
+                    let next = current.adjusted(up);
                     apply_result(
                         monitor.request_donation(miners.network, next),
                         &format!("ELECTRIC donation {next}"),
@@ -1037,7 +1035,12 @@ pub(super) mod tests {
         assert_eq!(monitor.summary().donation.unwrap().bps(), 450);
         token_key(key(KeyCode::Left), &miners, &mut state).unwrap();
         token_key(key(KeyCode::Left), &miners, &mut state).unwrap();
-        assert_eq!(monitor.summary().donation.unwrap().bps(), 400);
+        assert_eq!(monitor.summary().donation.unwrap().bps(), 350);
+        // #### 2026-10-24: down to 0%, and no lower.
+        for _ in 0..8 {
+            token_key(key(KeyCode::Left), &miners, &mut state).unwrap();
+        }
+        assert_eq!(monitor.summary().donation.unwrap().bps(), 0);
         assert!(!monitor.stopped());
         token_key(key(KeyCode::Esc), &miners, &mut state).unwrap();
         assert!(!token_key(key(KeyCode::Char('b')), &miners, &mut state).unwrap());

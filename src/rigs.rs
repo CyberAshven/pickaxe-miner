@@ -1151,7 +1151,7 @@ mod net {
                                     .map_err(|_| "malformed job from the coordinator")?;
                                 let donation = wire
                                     .donation
-                                    .unwrap_or_else(|| MiningToken::Photon.donation_minimum());
+                                    .unwrap_or_else(|| MiningToken::Photon.donation_default());
                                 let job = MiningJob::try_from(wire)?;
                                 // A job this rig cannot mine ends the
                                 // connection and is retried; only a failure

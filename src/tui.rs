@@ -228,8 +228,9 @@ pub fn gpu_launch(server: Option<&ServerSetup>, options: &ServerOptions) -> Opti
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AsicToken {
     pub name: &'static str,
-    /// The least share of mining work its donation takes.
-    pub donation_minimum: crate::donation::TokenDonation,
+    /// The share of mining work its donation takes unless the miner
+    /// changes it (down to 0%).
+    pub donation_default: crate::donation::TokenDonation,
     /// It keeps the block version fixed, which most current ASICs cannot
     /// mine at full speed.
     pub fixed_version: bool,
@@ -243,7 +244,7 @@ fn registered_asic_tokens(network: MiningNetwork) -> Vec<AsicToken> {
             .iter()
             .map(|token| AsicToken {
                 name: token.name,
-                donation_minimum: token.donation_minimum,
+                donation_default: token.donation_default,
                 fixed_version: token.params.version
                     == crate::stratum_v2::merge::safa::VersionRule::Fixed,
             })
@@ -2044,7 +2045,7 @@ impl SetupFlow {
 
     /// #### PR #42: what the TokenDonation row sets: an ASIC-exclusive
     /// token's donation, or in the GPU modes the GPU token's; its name, the
-    /// donation and its minimum.
+    /// donation and its default.
     fn token_donation_terms(
         &self,
     ) -> Option<(
@@ -2057,12 +2058,12 @@ impl SetupFlow {
                 (
                     token.name.to_owned(),
                     self.asic_token_donation(token),
-                    token.donation_minimum,
+                    token.donation_default,
                 )
             });
         }
         if self.electric || self.split {
-            let minimum = crate::electric::DONATION_MINIMUM;
+            let default = crate::electric::DONATION_DEFAULT;
             return Some((
                 if self.split {
                     "PHOTON + ELECTRIC"
@@ -2079,15 +2080,14 @@ impl SetupFlow {
                     })
                     .copied()
                     .or(self.config.token_donation)
-                    .unwrap_or(minimum)
-                    .at_least(minimum),
-                minimum,
+                    .unwrap_or(default),
+                default,
             ));
         }
         Some((
             self.config.token.as_str().to_owned(),
             self.config.token_donation(),
-            self.config.token.donation_minimum(),
+            self.config.token.donation_default(),
         ))
     }
 
@@ -2099,12 +2099,9 @@ impl SetupFlow {
             .copied()
     }
 
-    /// The chosen token's donation: the saved one, never below its minimum.
+    /// The chosen token's donation: the saved one, or its default.
     fn asic_token_donation(&self, token: AsicToken) -> crate::donation::TokenDonation {
-        self.config
-            .token_donation
-            .unwrap_or(token.donation_minimum)
-            .at_least(token.donation_minimum)
+        self.config.token_donation.unwrap_or(token.donation_default)
     }
 
     /// Job Declaration mode and whether the miner permits pool templates.
@@ -2441,7 +2438,7 @@ impl SetupFlow {
         } else {
             self.saved_server()
         };
-        // A token's donation is measured against its own minimum, not the
+        // A token's donation is measured against its own default, not the
         // GPU token's.
         if let Some(token) = self.chosen_asic_token().filter(|_| {
             settings
@@ -2450,7 +2447,7 @@ impl SetupFlow {
                 .is_some_and(|s| s.asic_token.is_some())
         }) {
             let donation = self.asic_token_donation(token);
-            settings.token_donation_bps = (donation != token.donation_minimum).then_some(donation);
+            settings.token_donation_bps = (donation != token.donation_default).then_some(donation);
         }
         settings
     }
@@ -3087,8 +3084,8 @@ impl SetupFlow {
                     }
                     SettingsRow::JobDeclaration => self.cycle_job_declaration(forward),
                     SettingsRow::AcceptJd => self.cycle_accept_jd(forward),
-                    // #### PR #42: the token, and its donation from its
-                    // minimum up in 0.5% steps.
+                    // #### PR #42: the token, and its donation in 0.5%
+                    // steps, down to 0%.
                     SettingsRow::AsicToken => {
                         let count = (self.asic_tokens)(self.config.network).len().max(1);
                         self.asic_token = (self.asic_token.min(count - 1)
@@ -3096,8 +3093,8 @@ impl SetupFlow {
                             % count;
                     }
                     SettingsRow::TokenDonation => {
-                        if let Some((_, donation, minimum)) = self.token_donation_terms() {
-                            let next = donation.adjusted(forward, minimum);
+                        if let Some((_, donation, _)) = self.token_donation_terms() {
+                            let next = donation.adjusted(forward);
                             self.config.token_donation = Some(next);
                             if self.split {
                                 for (token, _) in self.shares().iter() {
@@ -4755,7 +4752,7 @@ pub(crate) fn benchmark_render_load(stop: Arc<AtomicBool>) -> Result<u64, String
         job_source: Default::default(),
         started_at: 0,
         token_donation: crate::donation::TokenDonation::from_bps(400),
-        donation_minimum: crate::donation::TokenDonation::from_bps(400),
+        donation_default: crate::donation::TokenDonation::from_bps(400),
     };
     snapshot.search.intensity = 100;
     snapshot.search.rate = 500_000.0;
@@ -4874,14 +4871,12 @@ fn handle_key(
             KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => state.advanced_mode = false,
             KeyCode::Left | KeyCode::Right | KeyCode::Char('-') | KeyCode::Char('+') => {
                 let raise = matches!(key.code, KeyCode::Right | KeyCode::Char('+'));
-                let next = snapshot
-                    .token_donation
-                    .adjusted(raise, snapshot.donation_minimum);
+                let next = snapshot.token_donation.adjusted(raise);
                 if next == snapshot.token_donation {
                     state.status_line = if raise {
                         "The donation is at its highest.".into()
                     } else {
-                        format!("{} is this token's minimum.", snapshot.donation_minimum)
+                        "The donation is at 0%.".into()
                     };
                 } else {
                     apply_result(
@@ -5832,9 +5827,9 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
             SettingsRow::TokenDonation => (
                 "Donation",
                 match state.token_donation_terms() {
-                    None => dim("the token's own, at least its minimum"),
-                    Some((name, donation, minimum)) => Span::raw(format!(
-                        "{donation} of {name} mining work (at least {minimum})"
+                    None => dim("the token's own, by default"),
+                    Some((name, donation, default)) => Span::raw(format!(
+                        "{donation} of {name} mining work (default {default})"
                     )),
                 },
                 "< >  0.5% steps",
@@ -7895,8 +7890,8 @@ fn render_advanced_with_scope(
         ]),
         Line::from(""),
         dim(format!(
-            "A share of the mining work itself mines for the Pickaxe donation address. This token's minimum is {}; raise it in 0.5% steps.",
-            snapshot.donation_minimum
+            "A share of the mining work itself mines for the Pickaxe donation address. This token's default is {}; change it in 0.5% steps, down to 0%.",
+            snapshot.donation_default
         )),
         dim(session_note.unwrap_or("It applies to every GPU and rig at once and is saved to your profile when you stop.").into()),
     ];
@@ -8243,7 +8238,7 @@ mod tests {
             job_source: Default::default(),
             started_at: 0,
             token_donation: crate::donation::TokenDonation::from_bps(400),
-            donation_minimum: crate::donation::TokenDonation::from_bps(400),
+            donation_default: crate::donation::TokenDonation::from_bps(400),
         }
     }
 
@@ -8995,12 +8990,12 @@ mod tests {
         vec![
             AsicToken {
                 name: "Pickaxe ASIC test token",
-                donation_minimum: crate::donation::TokenDonation::from_bps(150),
+                donation_default: crate::donation::TokenDonation::from_bps(150),
                 fixed_version: false,
             },
             AsicToken {
                 name: "Fixed test token",
-                donation_minimum: crate::donation::TokenDonation::from_bps(400),
+                donation_default: crate::donation::TokenDonation::from_bps(400),
                 fixed_version: true,
             },
         ]
@@ -9071,14 +9066,14 @@ mod tests {
     }
 
     // #### PR #42
-    // What: the token's donation row starts at the token's minimum (or the
-    // saved value), moves in 0.5% steps, never goes below the minimum, and
-    // the profile saves only a raised value, measured against the token's
-    // own minimum rather than the GPU token's.
+    // What: the token's donation row starts at the token's default (or the
+    // saved value) and moves in 0.5% steps, down to 0% (2026-10-24); the
+    // profile saves only a value other than the default, measured against
+    // the token's own default rather than the GPU token's.
     // Look here if: asic_token_donation, the TokenDonation row or
     // profile_settings change.
     #[test]
-    fn token_donation_row_never_goes_below_the_minimum() {
+    fn token_donation_row_moves_from_the_token_default_down_to_zero() {
         use crate::donation::TokenDonation;
         let mut setup = setup_for(MiningMode::Asic);
         setup.asic_tokens = two_asic_tokens;
@@ -9088,15 +9083,20 @@ mod tests {
         assert!(setup.advanced_open);
         assert!(
             setup_text(&setup)
-                .contains("1.50% of Pickaxe ASIC test token mining work (at least 1.50%)"),
+                .contains("1.50% of Pickaxe ASIC test token mining work (default 1.50%)"),
             "{}",
             setup_text(&setup)
         );
         setup.handle_key(key(KeyCode::Left));
         assert_eq!(
             setup.config.token_donation,
-            Some(TokenDonation::from_bps(150))
+            Some(TokenDonation::from_bps(100))
         );
+        assert_eq!(
+            setup.profile_settings().token_donation_bps,
+            Some(TokenDonation::from_bps(100))
+        );
+        setup.handle_key(key(KeyCode::Right));
         assert_eq!(setup.profile_settings().token_donation_bps, None);
         setup.handle_key(key(KeyCode::Right));
         assert_eq!(
@@ -9113,15 +9113,24 @@ mod tests {
             settings.server.as_ref().unwrap().asic_token.as_deref(),
             Some("Pickaxe ASIC test token")
         );
-        // A token with a 4% minimum lifts the 2% to its minimum.
+        // A token with a 4% default keeps the chosen 2%, and goes to 0%.
         setup.asic_token = 1;
-        assert!(setup_text(&setup).contains("4.00% of Fixed test token mining work"));
-        setup.handle_key(key(KeyCode::Left));
+        assert!(
+            setup_text(&setup).contains("2.00% of Fixed test token mining work (default 4.00%)"),
+            "{}",
+            setup_text(&setup)
+        );
+        for _ in 0..5 {
+            setup.handle_key(key(KeyCode::Left));
+        }
         assert_eq!(
             setup.config.token_donation,
-            Some(TokenDonation::from_bps(400))
+            Some(TokenDonation::from_bps(0))
         );
-        assert_eq!(setup.profile_settings().token_donation_bps, None);
+        assert_eq!(
+            setup.profile_settings().token_donation_bps,
+            Some(TokenDonation::from_bps(0))
+        );
     }
 
     // #### PR #42
@@ -10119,26 +10128,30 @@ mod tests {
 
     // #### PR #42
     // What: in the GPU modes the donation row is the GPU token's, from its
-    // minimum up in 0.5% steps and never below it.
+    // default in 0.5% steps, down to 0% (2026-10-24) and no lower.
     // Look here if: token_donation_terms changes.
     #[test]
-    fn gpu_donation_row_never_goes_below_the_token_minimum() {
+    fn gpu_donation_row_steps_from_its_default_down_to_zero() {
         let mut setup = setup_for(MiningMode::Gpu);
         setup.open_settings(SettingsRow::TokenDonation);
         assert!(
-            setup_text(&setup).contains("4.00% of PHOTON mining work (at least 4.00%)"),
+            setup_text(&setup).contains("4.00% of PHOTON mining work (default 4.00%)"),
             "{}",
             setup_text(&setup)
-        );
-        setup.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            setup.config.token_donation(),
-            setup.config.token.donation_minimum()
         );
         setup.handle_key(key(KeyCode::Right));
         assert_eq!(
             setup.config.token_donation(),
             crate::donation::TokenDonation::from_bps(450)
+        );
+        for _ in 0..10 {
+            setup.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(setup.config.token_donation().bps(), 0);
+        assert!(
+            setup_text(&setup).contains("0.00% of PHOTON mining work (default 4.00%)"),
+            "{}",
+            setup_text(&setup)
         );
     }
 
@@ -12057,7 +12070,7 @@ mod tests {
 
     // #### PR #32
     #[test]
-    fn advanced_settings_show_the_donation_and_its_minimum() {
+    fn advanced_settings_show_the_donation_and_its_default() {
         let mut snapshot = test_snapshot();
         snapshot.token_donation = crate::donation::TokenDonation::from_bps(550);
         let mut state = TuiState::new(&snapshot);
@@ -12075,7 +12088,7 @@ mod tests {
             .collect();
         assert!(text.contains("Advanced settings"), "{text}");
         assert!(text.contains("Donation   5.50%"), "{text}");
-        assert!(text.contains("minimum is 4.00%"), "{text}");
+        assert!(text.contains("default is 4.00%"), "{text}");
         assert!(!text.contains("Rigs join on"), "{text}");
         // #### PR #42: a coordinator's start values.
         let mut pool = snapshot.clone();
@@ -12587,7 +12600,7 @@ mod tests {
             job_source: Default::default(),
             started_at: 0,
             token_donation: crate::donation::TokenDonation::from_bps(400),
-            donation_minimum: crate::donation::TokenDonation::from_bps(400),
+            donation_default: crate::donation::TokenDonation::from_bps(400),
         };
         let mut state = TuiState::new(&snapshot);
         for i in 0..(EVENT_HISTORY_CAP + 20) {
