@@ -1468,12 +1468,18 @@ impl Bridge {
                 if error.request_id != 1 {
                     return Err("unexpected SV2 channel error".into());
                 }
-                self.local_rejection = Some("username is not a payout address");
-                out.push(reject(
-                    authorize,
-                    24,
-                    "the username must be your payout address on this network",
-                ));
+                // #### merge-mining v2: a malformed `,donation=` says so.
+                if error.error_code.as_ref() == b"invalid-donation" {
+                    self.local_rejection = Some("invalid donation option");
+                    out.push(reject(authorize, 24, super::payout::DONATION_OPTION_ERROR));
+                } else {
+                    self.local_rejection = Some("username is not a payout address");
+                    out.push(reject(
+                        authorize,
+                        24,
+                        "the username must be your payout address on this network",
+                    ));
+                }
             }
             // #### PR #40: the pool's answer to the donation channel.
             MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS if self.remote => {

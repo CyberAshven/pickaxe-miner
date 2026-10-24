@@ -279,6 +279,44 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
     let token = PxToken::decode(success.mining_job_token.as_ref()).unwrap();
     assert_eq!((token.rates.donation_bps, token.rates.fee_bps), (150, 100));
     assert!(!token.full_template);
+    // #### merge-mining v2: the miner's own donation choice sets the
+    // token's donation rate; the fee stays. At 0 the token names no
+    // donation output, and a malformed choice is refused.
+    for (option, donation_bps, outputs) in [(",donation=0.5", 50, 3), (",donation=0", 0, 2)] {
+        let mut chosen = session
+            .receive(
+                &mut allocate(&format!("{miner}.rig1{option}"), 11),
+                &declarator,
+                &NO_CONTEXT,
+                now,
+            )
+            .unwrap();
+        let success: AllocateMiningJobTokenSuccess =
+            binary_sv2::from_bytes(chosen.frames[0].payload()).unwrap();
+        let token = PxToken::decode(success.mining_job_token.as_ref()).unwrap();
+        assert_eq!(
+            (token.rates.donation_bps, token.rates.fee_bps),
+            (donation_bps, 100),
+            "{option}"
+        );
+        assert_eq!(
+            parse_outputs(success.coinbase_outputs.as_ref())
+                .unwrap()
+                .len(),
+            outputs
+        );
+    }
+    assert_eq!(
+        session
+            .receive(
+                &mut allocate(&format!("{miner},donation=7.25"), 12),
+                &declarator,
+                &NO_CONTEXT,
+                now
+            )
+            .err(),
+        Some(crate::stratum_v2::payout::DONATION_OPTION_ERROR.into())
+    );
     let outputs = parse_outputs(success.coinbase_outputs.as_ref()).unwrap();
     assert_eq!(outputs.len(), 3);
     assert!(outputs.iter().all(|(value, _)| *value == 0));
@@ -286,6 +324,8 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
         declarator.redeem(success.mining_job_token.as_ref(), &miner, now),
         Ok(Custom::CoinbaseOnly(_))
     ));
+    // The chosen-donation tokens above are not redeemed here.
+    session.close(&declarator);
     assert!(session
         .receive(
             &mut allocate("not-an-address", 10),

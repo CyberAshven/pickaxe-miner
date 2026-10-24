@@ -95,6 +95,10 @@ pub struct MiningSession {
     /// #### merge-mining v2: why token merge mining was refused for a job
     /// (the own-root check), taken by the server for the dashboard.
     pub token_refusal: Option<&'static str>,
+    /// #### merge-mining v2: on a public pool, the donation choice of this
+    /// connection's logins (`None` inside: the pool's setting), fixed by its
+    /// first channel.
+    donation_choice: Option<Option<crate::donation::bch::BchDonation>>,
 }
 
 pub struct Responses {
@@ -151,7 +155,22 @@ impl MiningSession {
             groups: BTreeMap::new(),
             fixed_version: false,
             token_refusal: None,
+            donation_choice: None,
         })
+    }
+
+    // #### merge-mining v2: one donation choice per connection
+    // What: a public pool connection's first channel fixes its donation
+    // choice (its login's `,donation=`, or none for the pool's setting); a
+    // later channel whose login chooses otherwise is refused with
+    // `donation-mismatch`.
+    // Why: the work allocation that makes donation-work jobs runs per
+    // connection, at one rate; a proxy carrying miners with different
+    // choices would otherwise donate at the wrong rate for some of them.
+    // Look here if: a proxy's channels are refused with donation-mismatch.
+    /// The donation this connection's miners chose, if they chose one.
+    pub fn donation_choice(&self) -> Option<crate::donation::bch::BchDonation> {
+        self.donation_choice.flatten()
     }
 
     /// #### PR #42: the server mines a token that fixes the version slot:
@@ -935,14 +954,26 @@ impl MiningSession {
         if identity != super::sv1::LOCAL_IDENTITY {
             self.identity = Some(identity.to_owned());
         }
-        // #### PR #40: in a public pool, the user's own address.
-        let payout = match &self.public {
-            Some(_) => match super::payout::identity_payout(self.network, identity) {
-                Ok(payout) => payout,
+        // #### PR #40: in a public pool, the user's own address; ####
+        // merge-mining v2: and their donation choice.
+        let (payout, donation) = match &self.public {
+            Some(_) => match super::payout::identity_login(self.network, identity) {
+                Ok(login) => (login.payout, login.donation),
+                Err(error) if error == super::payout::DONATION_OPTION_ERROR => {
+                    return Ok(vec![open_error(request, "invalid-donation")?]);
+                }
                 Err(_) => return Ok(vec![open_error(request, "unknown-user")?]),
             },
-            None => self.payout.clone(),
+            None => (self.payout.clone(), None),
         };
+        if self.public.is_some() {
+            match self.donation_choice {
+                Some(choice) if choice != donation => {
+                    return Ok(vec![open_error(request, "donation-mismatch")?]);
+                }
+                _ => self.donation_choice = Some(donation),
+            }
+        }
         self.next_channel += 1;
         // Every device starts at the configured share target; vardiff moves
         // it from there.
@@ -956,6 +987,7 @@ impl MiningSession {
         )?;
         if let Some(public) = &self.public {
             channel.set_operator(Some(&public.address))?;
+            channel.set_donation(donation);
         }
         if let Some(lanes) = &self.lanes {
             channel.set_lane(lanes.next.fetch_add(1, Ordering::Relaxed), compact);
@@ -2627,6 +2659,73 @@ mod tests {
         assert!(targets.contains(&(MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, group)));
         assert!(targets.contains(&(MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, alone)));
         assert_eq!(targets.len(), 4);
+    }
+
+    // #### merge-mining v2: one donation choice per connection
+    // What: on a public pool a login's `,donation=` is that miner's donation
+    // on every job: at 0 the coinbase pays the miner and the fee, nothing to
+    // the donation, even when the session's policy says 1.5%; a later
+    // channel choosing otherwise is refused (donation-mismatch), and a
+    // malformed choice is refused (invalid-donation).
+    // Look here if: login options or `donation_choice` change.
+    #[test]
+    fn a_public_pool_login_chooses_its_donation_per_connection() {
+        let declarator = super::super::jd::server::tests::declarator();
+        let miner = payout();
+        let donor = crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
+            MiningNetwork::Chipnet,
+        ))
+        .unwrap();
+        let public = |server: &mut MiningSession| {
+            server.set_public(Some(declarator.public.clone()));
+            assert_eq!(
+                server.receive(setup(4), NOW).unwrap().frames[0]
+                    .header()
+                    .msg_type(),
+                1
+            );
+        };
+        let mut server = session();
+        public(&mut server);
+        assert_eq!(server.donation_choice(), None);
+        let (channel, _, _) =
+            open_extended(&mut server, &format!("{miner}.rig1,donation=0")).unwrap();
+        assert_eq!(server.donation_choice(), Some("0".parse().unwrap()));
+        let job = server.channels[&channel].job().unwrap();
+        assert_eq!(u16::from(job.payout.donation), 0);
+        assert!(!job.payout.donation_work);
+        let tx: stratum_core::bitcoin::Transaction =
+            stratum_core::bitcoin::consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
+        assert!(tx
+            .output
+            .iter()
+            .all(|output| output.script_pubkey.as_bytes() != donor.as_slice()));
+        // The same choice may open another channel; another may not.
+        assert!(open_extended(&mut server, &format!("{miner}.rig2,donation=0")).is_ok());
+        assert_eq!(
+            open_extended(&mut server, &format!("{miner}.rig3")),
+            Err("donation-mismatch".into())
+        );
+        assert_eq!(
+            open_extended(&mut server, &format!("{miner}.rig3,donation=1")),
+            Err("donation-mismatch".into())
+        );
+        // A malformed choice.
+        let mut server = session();
+        public(&mut server);
+        assert_eq!(
+            open_extended(&mut server, &format!("{miner},donation=0.3")),
+            Err("invalid-donation".into())
+        );
+        // Without the option, the pool's setting, as before.
+        let mut server = session();
+        public(&mut server);
+        let (channel, _, _) = open_extended(&mut server, &miner).unwrap();
+        assert_eq!(server.donation_choice(), None);
+        assert_eq!(
+            server.channels[&channel].job().unwrap().payout.donation,
+            Default::default()
+        );
     }
 
     // #### PR #42

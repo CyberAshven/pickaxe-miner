@@ -4,7 +4,7 @@
 
 use crate::{
     config::{self, MiningNetwork},
-    donation::bch::{BchPayout, PoolFee},
+    donation::bch::{BchDonation, BchPayout, PoolFee},
     tx::{cashaddr_to_coinbase_locking, cashaddr_to_p2pkh_locking},
 };
 
@@ -19,10 +19,67 @@ pub struct PublicPool {
     pub address: String,
 }
 
+// #### merge-mining v2: login options
+// What: a public pool's username is `ADDRESS[.worker][,key=value]...`. The
+// options come after the first comma: `donation=<percent>` sets this
+// miner's whole Pickaxe donation (0 to 100 in 0.5% steps), `p2p=` is BCH
+// P2Pool's share address and is ignored here, and other keys are ignored
+// too. A malformed donation, or two of them, refuses the login.
+// Why: the Pickaxe donation is the miner's choice even on someone else's
+// pool; without the option the pool's own setting applies, as before.
+// Look here if: a username with options is refused, or a donation option
+// does not change a miner's donation.
+/// A public pool miner's login: the payout address and the donation they
+/// chose, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Login {
+    pub payout: String,
+    pub donation: Option<BchDonation>,
+}
+
+/// The message a malformed `donation=` refuses a login with.
+pub const DONATION_OPTION_ERROR: &str =
+    "donation= takes a percentage from 0 to 100 in 0.5% steps, such as ,donation=0.5";
+
+/// Reads a public pool username: the payout and its options.
+pub fn identity_login(network: MiningNetwork, identity: &str) -> Result<Login, String> {
+    let identity = identity.trim();
+    let (user, options) = identity.split_once(',').unwrap_or((identity, ""));
+    let mut donation = None;
+    for option in options
+        .split(',')
+        .filter(|option| !option.trim().is_empty())
+    {
+        let (key, value) = option.split_once('=').unwrap_or((option, ""));
+        if key.trim() != "donation" {
+            continue;
+        }
+        let rate: BchDonation = value
+            .trim()
+            .parse()
+            .map_err(|_| DONATION_OPTION_ERROR.to_owned())?;
+        if donation.is_some() || u16::from(rate) % 50 != 0 {
+            return Err(DONATION_OPTION_ERROR.into());
+        }
+        donation = Some(rate);
+    }
+    Ok(Login {
+        payout: user_payout(network, user)?,
+        donation,
+    })
+}
+
 /// The payout a public pool's miner connects with: their address, with or
-/// without its network prefix, optionally followed by `.worker`.
+/// without its network prefix, optionally followed by `.worker` (and, ####
+/// merge-mining v2, login options after a comma). The server reads the
+/// whole login (`identity_login`); this is its address alone.
+#[cfg(test)]
 pub fn identity_payout(network: MiningNetwork, identity: &str) -> Result<String, String> {
-    let address = identity.trim().split('.').next().unwrap_or_default();
+    identity_login(network, identity).map(|login| login.payout)
+}
+
+fn user_payout(network: MiningNetwork, user: &str) -> Result<String, String> {
+    let address = user.trim().split('.').next().unwrap_or_default();
     let address = if address.contains(':') {
         address.to_owned()
     } else {
@@ -144,6 +201,54 @@ mod tests {
             assert!(identity_payout(network, bad).is_err(), "{bad}");
         }
         assert!(identity_payout(MiningNetwork::Mainnet, &payout).is_err());
+    }
+
+    // #### merge-mining v2: login options
+    #[test]
+    fn a_login_may_choose_its_donation() {
+        let network = MiningNetwork::Chipnet;
+        let payout = super::super::template_tests::payout();
+        let bare = payout.split_once(':').unwrap().1.to_owned();
+        let login = |identity: &str| identity_login(network, identity);
+        let rate = |text: &str| Some(text.parse::<BchDonation>().unwrap());
+        for (identity, donation) in [
+            (payout.clone(), None),
+            (format!("{payout},donation=0"), rate("0")),
+            (format!("{bare}.rig1,donation=0.5"), rate("0.5")),
+            (
+                format!("{payout}.rig1,p2p=bchtest:qq,donation=2"),
+                rate("2"),
+            ),
+            (format!("{bare},donation=100"), rate("100")),
+            (format!("{bare}.rig1,p2p=x"), None),
+            (format!("{bare},other=1,donation=1.5"), rate("1.5")),
+        ] {
+            assert_eq!(
+                login(&identity),
+                Ok(Login {
+                    payout: payout.clone(),
+                    donation
+                }),
+                "{identity}"
+            );
+            assert_eq!(identity_payout(network, &identity), Ok(payout.clone()));
+        }
+        for bad in [
+            ",donation=0.25",
+            ",donation=101",
+            ",donation=",
+            ",donation=x",
+            ",donation=-1",
+            ",donation",
+            ",donation=1,donation=1",
+        ] {
+            assert_eq!(
+                login(&format!("{bare}.rig1{bad}")),
+                Err(DONATION_OPTION_ERROR.into()),
+                "{bad}"
+            );
+        }
+        assert!(login(",donation=1").is_err());
     }
 
     // #### PR #40

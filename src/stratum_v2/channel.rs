@@ -92,6 +92,9 @@ pub struct Channel {
     rolled: usize,
     /// #### PR #56: a Job Declaration lane in the compact layout.
     compact: bool,
+    /// #### merge-mining v2: a public pool miner's own donation choice
+    /// (`,donation=` in their login), which every job of theirs keeps.
+    donation: Option<crate::donation::bch::BchDonation>,
     /// #### merge-mining v2: why token merge mining was refused for the
     /// latest job (the own-root check), until the server takes it for the
     /// dashboard.
@@ -263,6 +266,7 @@ impl Channel {
             rolled: DEVICE_EXTRANONCE_SIZE,
             compact: false,
             token_refusal: None,
+            donation: None,
         })
     }
 
@@ -310,8 +314,23 @@ impl Channel {
         id: u32,
         generation: u64,
         template: Arc<BchTemplate>,
-        payout: BchPayout,
+        mut payout: BchPayout,
     ) -> Result<&Job, String> {
+        // #### merge-mining v2: the miner's own donation choice
+        // What: a public pool miner who chose a donation in their login
+        // gets it on every job: the coinbase's reward part, the token
+        // donation slot and (with the session's work allocation at the same
+        // rate, see `MiningSession::donation_choice`) the donation work. At
+        // 0% no job is donation work.
+        // Why: the Pickaxe donation is the miner's choice, down to 0, even
+        // on someone else's pool; the operator's fee is unaffected.
+        // Look here if: a miner's `,donation=` does not change their jobs.
+        if let Some(choice) = self.donation {
+            if payout.donation != choice {
+                payout.donation = choice;
+                payout.donation_work &= u16::from(choice) != 0;
+            }
+        }
         if self.job.as_ref().is_some_and(|job| job.id == id)
             || self.previous.iter().any(|job| job.id == id)
         {
@@ -886,6 +905,12 @@ impl Channel {
     /// The address this channel's blocks pay.
     pub fn payout(&self) -> &str {
         &self.payout
+    }
+
+    /// #### merge-mining v2: a public pool miner's donation choice, set
+    /// before the first job.
+    pub fn set_donation(&mut self, donation: Option<crate::donation::bch::BchDonation>) {
+        self.donation = donation;
     }
 
     /// #### merge-mining v2: the token floor this channel's device may mine

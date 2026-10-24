@@ -2328,9 +2328,15 @@ fn serve_device(
             // #### PR #42: under Job Declaration the custom job's coinbase
             // pays the donation, so no local job is donation work; on an
             // ASIC-exclusive token the donation is that token's share of work.
+            // #### merge-mining v2: a public pool miner's own donation choice
+            // sets this connection's rate (see `MiningSession::donation_choice`).
+            let chosen = mining.donation_choice();
             let donation = || -> Result<JobDonation, String> {
                 if let Some(rate) = config.token_donation {
                     return Ok(JobDonation::Token(rate));
+                }
+                if let Some(choice) = chosen.filter(|_| config.public.is_some()) {
+                    return Ok(JobDonation::Bch(choice));
                 }
                 if config
                     .uplink
