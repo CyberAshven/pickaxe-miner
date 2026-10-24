@@ -3321,10 +3321,9 @@ Branch `feat/merge-mining-v2`, on `dev`.
   224-byte proof and the empty commitment) are unit tests and are printed in
   the spec; an independent re-derivation matched them byte for byte.
 - **Roles:** solo commits the operator's own root on every channel; a public
-  pool's jobs carry the empty commitment (no token floor, no wins, the fee
-  never reaches tokens); under Job Declaration only shares that meet the
-  pool's target are forwarded (`jd::client::for_pool`), token-only hits stay
-  local. The own-root check refuses token merge mining for a job whose
+  pool commits one root per miner (below); under Job Declaration only shares
+  that meet the pool's target are forwarded (`jd::client::for_pool`),
+  token-only hits stay local. The own-root check refuses token merge mining for a job whose
   coinbase lacks the expected output 0 and says so on the dashboard.
 - **Privacy:** fresh salt bytes per merge-mined standard-channel job, no tag
   by default, one claim per journal row, and `--claim-delay` (default 5-60 s,
@@ -3337,6 +3336,40 @@ Branch `feat/merge-mining-v2`, on `dev`.
   Under Job Declaration the leaves carry the pool's donation rate and fee. A
   token without split support (the registry flag) keeps `ext = 0` and gives
   its whole donation as work.
+
+- **Public pools and Job Declaration (stage 2 of the split):**
+  - A login may end in `,donation=<percent>` (0-100% in 0.5% steps) on SV1,
+    SV2 and Job Declaration; it sets that miner's whole BCH donation
+    (coinbase, work and token slot; the PX token's rate under Job
+    Declaration), never the fee. Malformed values are refused with one
+    message (`invalid-donation`); one choice per connection
+    (`donation-mismatch`). Other option keys, such as P2Pool's `,p2p=`,
+    pass through.
+  - Each public pool miner mines their own root: leaves bind their identity
+    script, the split holds two thirds of their donation and the operator's
+    coinbase fee (whole in `coinbase` mode, two thirds in `both`, none in
+    `work`); donation-work and fee-work jobs pay their recipient whole with
+    `ext = 0`; tokens without split support take the donation and then the
+    fee as work. The own-root check and an audit rule (every leaf pays the
+    miner, or a work job's recipient) run before each job goes out.
+  - Disclosure, opt-in: the SV2 extension `0x4D4D` (JobLeaves, WinProof)
+    negotiated with RequestExtensions; SV1 `pickaxe-merge` in
+    mining.configure, relayed as `pickaxe.merge_leaves` and
+    `pickaxe.merge_proof`; standard channels' leaves in the owner-only,
+    8 MiB-capped `<config>.sv2-leaves.jsonl`.
+  - Job Declaration: Full-Template clients put the `CTMD` disclosure of
+    their leaves in `excess_data`; the pool rebuilds output 0's root and
+    checks each leaf's token (registered, split-capable), payout (the
+    miner's script) and split (the miner's donation and the pool's fee),
+    refusing with `invalid-coinbase-tx`. Coinbase-only mines no tokens.
+  - One donation at a pool: the SV1 adapter, which donates on its own channel
+    at a remote pool, names `,donation=0` for the device's channel (asking
+    again without it if refused).
+  - Evidence: host tests for each rule, including a public pool miner at
+    `donation=0` with a 2% coinbase fee (the leaf's split is the fee slot
+    alone, and its proof verifies), a declaration with a wrong fee slot
+    refused, SV1 firmware getting its leaves end to end from a public pool,
+    and the leaf log.
 
 Not in this change: BCH P2Pool building output 0 in this format (Pickaxe
 still refuses tokens with a P2Pool-prepared coinbase), a claim builder, and

@@ -71,9 +71,13 @@ identity, a token or an address.
 | Mining | `OpenExtendedMiningChannel{user_identity, min_extranonce_size 16}` | `Success{extranonce_prefix 16 bytes, extranonce_size 16}`, and no job of the pool's |
 
 - The `user_identifier` is the miner's payout address, as their mining
-  username is at a public pool (an optional `.worker` suffix is allowed). One
-  that is not an address ends the Job Declaration session, because the spec
-  has no error message for it.
+  username is at a public pool (an optional `.worker` suffix is allowed),
+  optionally followed by `,donation=<percent>`, the miner's own donation
+  (0 to 100% in 0.5% steps; see [merge-mining.md](merge-mining.md#the-login-option)).
+  The token's donation rate is that choice, or the pool's setting without
+  one; the fee stays the pool's. One that is not an address, or a malformed
+  donation, ends the Job Declaration session, because the spec has no error
+  message for it.
 - `coinbase_outputs` names the outputs the coinbase must carry, each worth 0
   in the message: the miner's own script first (the spec's pool payout
   output), then the pool's fee, then the Pickaxe donation. Outputs whose rate
@@ -102,7 +106,8 @@ identity, a token or an address.
 - `coinbase_tx_prefix` runs up to the whole extranonce (the channel's 16-byte
   prefix and the 16 rolled bytes), `coinbase_tx_suffix` from the input's
   sequence. `wtxid_list` holds the transaction ids (BCH has no witnesses) in
-  canonical order; `excess_data` is ignored.
+  canonical order. `excess_data` is empty, or, when output 0 is a merge-mining
+  root, the disclosure of its token leaves (below).
 - A Full-Template session's frames may take 16 MiB each way: a declaration
   lists up to 65,535 transaction ids, and missing transactions come back in
   one frame. A Coinbase-only session keeps a device's 1 MiB.
@@ -119,6 +124,7 @@ identity, a token or an address.
 | the script does not start with the pool's height: the block before or after the pool's (a race at a new block) | `stale-chain-tip` |
 | any other height | `invalid-coinbase-tx` |
 | the outputs break the payout rule below | `invalid-coinbase-tx` |
+| a merge-mining root without its leaves in `excess_data`, or leaves that do not make the root, name an unknown token or one without split support, or do not pay the miner, the donation and the pool's fee (see [Merge-mined tokens](#merge-mined-tokens-under-job-declaration)) | `invalid-coinbase-tx` |
 | the transaction ids are not in canonical (CTOR) order, or more than 65,535 | `invalid-job` |
 | `version` differs from the pool's outside the version-rolling bits | `invalid-job` |
 | a provided transaction is malformed, a coinbase, or not the one asked for | `invalid-job` |
@@ -327,7 +333,10 @@ counts as the overview line below.
   dropped · 1 blocks pushed · 340 shares sent (338 accepted, 2 rejected) · 0
   fallbacks", and the status file's `jd_client` the same counts.
 - The donation is paid in the coinbase, as the pool's rule requires, so there
-  is no donation work under Job Declaration.
+  is no donation work under Job Declaration. Its rate is the one the pool's
+  tokens carry: at a Pickaxe pool, the login's `,donation=` choice
+  (`--upstream-user ADDRESS,donation=0.5`) or the pool's setting. The local
+  donation setting does not reach the pool, so nothing is donated twice.
 - A pool token whose rates add to over 100% is refused (the client falls back
   to the pool's own jobs), so a bad token cannot break the payout math.
 
@@ -335,12 +344,18 @@ counts as the overview line below.
 
 #### PR #42
 
-While tokens are merge-mined, every local job on the pool's plan, the
-declared coinbase (Full-Template) and the custom job's outputs carry the
+While tokens are merge-mined with Full-Template, every local job on the
+pool's plan, the declared coinbase and the custom job's outputs carry the
 commitment (format v2, docs/merge-mining.md) as output 0 before the pool's
-outputs. The pool's rule allows exactly that shape (R5-R8 above); the pool
-cannot see the leaves, which bind the miner's own script (the pool's first
-output). Wins are proven by the client, as in solo mining, and need nothing
+outputs. The leaves bind the miner's own script (the pool's first output),
+and their split is the token's donation and the pool's fee, both whole. The
+client puts the leaves in `DeclareMiningJob.excess_data` (the `CTMD` v2
+disclosure, [merge-mining.md](merge-mining.md#job-declaration-leaves-excess_data)),
+and the pool rebuilds output 0's root from them and checks each leaf: a
+registered token that verifies splits, paying the miner, with exactly the
+donation and the fee. Coinbase-only cannot show the pool its leaves, so it
+mines no tokens (the client says so, and the pool refuses a root on a custom
+job). Wins are proven by the client, as in solo mining, and need nothing
 from the pool. Only shares that meet the pool's target are sent to it: a
 share that meets only a token's target stays with the client, which proves
 and journals it. On Chipnet the hidden test token

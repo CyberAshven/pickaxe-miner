@@ -432,7 +432,8 @@ What this means for Pickaxe, and what step 1 did:
      169-byte leaves, `AuxProof` v2 and its reference verifier), the claim
      worker and the Chipnet test token, also under Job Declaration: a share
      wins a token at the token's own, lower difficulty, with no hashrate
-     taken from BCH. A public pool's miners get the empty commitment.
+     taken from BCH. A public pool gives each miner a root of their own,
+     with their donation and the operator's fee in its split.
    - Pool connectors: Template Distribution both ways, Job Declaration in
      both modes (server and client), fallback pools and group channels.
    - Own node: chain checks, saved nodes checked, this computer and another

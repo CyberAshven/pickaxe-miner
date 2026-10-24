@@ -135,9 +135,10 @@ which the vault's fee pays for. The miner's output carries the token's payout
 dust (a token-level rule).
 
 **Work jobs** (donation work and fee work) carry `ext = 0`: their leaves pay
-the donation (or the fee) whole. A token whose covenant does not verify splits
-(the registry's `split` flag) gets `ext = 0` on every leaf, and its donation
-and fee are taken as work instead.
+the donation (or the operator) whole. A token whose covenant does not verify
+splits (the registry's `split` flag) gets `ext = 0` on every leaf, and its
+donation and fee are taken as work instead; under Job Declaration, where no
+work rotates, such a token is refused.
 
 ### Proof (`AuxProof` v2)
 
@@ -196,20 +197,44 @@ these steps, and runs them on every proof before keeping it (fail closed):
   own devices, on standard and extended channels and SV1 firmware through the
   adapter. Each leaf pays the miner's script with the donation in its split,
   or, in a donation-work job, the donation's script whole (see Donation).
-- **Pickaxe as a public pool** (serving other people's devices): an
-  operator's pool fee reaches tokens as it reaches BCH, and the miner cannot
-  remove it, so a public pool will build per-miner roots: each leaf binds the
-  miner's payout, and its split carries the donation and the fee. That is the
-  next stage, with the disclosure to extended and SV1 miners that lets them
-  check their leaf before hashing. Until then a public pool's jobs carry the
-  **empty commitment**: no share of theirs wins a token, and their device
-  target is never eased toward a token's.
-- **Job Declaration** (Pickaxe at a pool with its own templates): the
-  declared coinbase carries the commitment as output 0 before the pool's
-  outputs, and its leaves bind the miner's own script (the pool's first
-  output), with the pool's donation rate and fee in the split, as the
-  coinbase pays them. The pool checks the leaves in a later stage; until
-  then clients put the fee in honestly. Only shares that meet the **pool's**
+- **Pickaxe as a public pool** (serving other people's devices): each miner
+  mines a root of their own, on standard and extended channels and SV1
+  firmware through the adapter. Each leaf's `payout_hash` binds the miner's
+  identity script (the payout address in their login, with or without
+  `.worker`), and its split carries:
+  - the **donation slot**: the reward share of the miner's donation (two
+    thirds of their `,donation=` choice, or of the pool's setting without
+    one; see [The login option](#the-login-option)), to the Pickaxe
+    donation's script;
+  - the **fee slot**: the operator's fee from the coinbase, to the fee
+    address's script: the whole rate in `coinbase` mode, two thirds in
+    `both`, and none in `work`.
+
+  A donation-work job's leaves pay the donation whole, and a fee-work job's
+  (`work` mode, and `both`'s third) pay the operator whole, both with
+  `ext = 0`, as their BCH does. The operator's fee reaches tokens as it
+  reaches BCH and the miner cannot remove it; the donation is the miner's to
+  set, down to 0. A token without split support takes both as work: its
+  leaves pay the donation whole for the miner's donation share of the work,
+  then the operator whole for the fee's share of what the donation leaves
+  (fee × (1 − donation)), and the miner otherwise; BCH in those jobs pays as
+  it would. Before a job goes out, the pool checks the own-root rule and the
+  audit rule (see [Disclosure](#disclosure)); a job that fails either mines
+  BCH alone and the dashboard says why.
+- **Job Declaration** (Pickaxe at a pool with its own templates,
+  Full-Template only): the declared coinbase carries the commitment as
+  output 0 before the pool's outputs. Its leaves bind the miner's own script
+  (the pool's first output), and their split is what the coinbase pays: the
+  miner's donation (the PX token's donation rate, which a Pickaxe pool takes
+  from the login's `,donation=`) and the pool's fee, both whole, as no work
+  rotates under Job Declaration. The client discloses the leaves in
+  `DeclareMiningJob.excess_data`, and the pool refuses a declaration whose
+  leaves do not match (see [Job Declaration
+  leaves](#job-declaration-leaves-excess_data)). Coinbase-only Job
+  Declaration has no way to show the pool its leaves, so it mines no
+  tokens: the client builds no root and says why, and the pool refuses a
+  custom job whose output 0 is a non-empty root
+  (`invalid-coinbase-tx-outputs`). Only shares that meet the **pool's**
   share target go to the pool.
   Token-only hits (meeting a token's target but not the pool's) stay local:
   journaled and claimed by Pickaxe, never sent as shares. The local device
@@ -220,12 +245,13 @@ these steps, and runs them on every proof before keeping it (fail closed):
   output today, and a P2Pool that builds output 0 in this format is still to
   come. With tokens registered, P2Pool jobs mine BCH alone and the dashboard
   says why.
-- **A pool without Job Declaration:** no merge mining. The pool builds the
-  coinbase, so Pickaxe cannot add the commitment.
-- **Own-root check:** where Pickaxe is the miner side and sees the coinbase
-  (the coinbases it builds for its devices, standard and extended, and the
-  Job Declaration coinbase they share), it checks before hashing that output 0
-  is exactly the commitment it expects. If not, the job mines BCH alone, with
+- **A pool without Job Declaration:** the pool builds the coinbase, so
+  Pickaxe adds no commitment of its own. A Pickaxe public pool merge-mines
+  for its miners itself (above); another pool does not.
+- **Own-root check:** where Pickaxe builds the coinbase its devices hash
+  (solo and public pool, standard and extended, and the Job Declaration
+  coinbase they share), it checks before a job goes out that output 0 is
+  exactly the commitment it expects. If not, the job mines BCH alone, with
   no token merge mining, and the dashboard says why.
 - **GPU mining:** not applicable. PHOTON's work is over its own transaction,
   not a block header.
@@ -259,22 +285,60 @@ and leaves BCH mining unaffected.
 ## Donation
 
 Merge-mined tokens follow the one BCH ASIC donation setting (default 1.5%,
-anything from 0% to 100% in Advanced settings), split as BCH's is:
+anything from 0% to 100% in Advanced settings; on a public pool, the miner's
+`,donation=` choice or the pool's setting), split as BCH's is:
 
 - **Two thirds from each win:** the reward share (1% at 1.5%,
-  `BchDonation::reward_units` of 10,000) is the donation slot's rate on every
-  leaf of the miner's own jobs, as a block's donation output takes it from the
-  reward.
+  `BchDonation::reward_bps`) is the donation slot's rate on every leaf of the
+  miner's own jobs, as a block's donation output takes it from the reward.
 - **One third as work:** BCH's donation-work jobs (0.5% of the work at 1.5%)
   have leaves that pay the donation whole, with `ext = 0`.
 - A setting of 0% means no donation: no slot and no work.
 
 Under Job Declaration no donation work runs (every local job shares the
-declared coinbase), so the leaves carry the pool's whole donation rate and its
-fee in the split, as the declared coinbase pays BCH's. A token whose covenant
-verifies no split takes its whole donation (1.5%) as work instead: every BCH
-donation-work job, and enough other jobs to make up the rest, whose BCH still
-pays the miner.
+declared coinbase), so the leaves carry the token's whole donation rate (the
+miner's choice at a Pickaxe pool) and the pool's whole fee in the split, as
+the declared coinbase pays BCH's. A token whose covenant verifies no split
+takes its whole donation (1.5%) as work instead: every BCH donation-work job,
+and enough other jobs to make up the rest, whose BCH still pays the miner. On
+a public pool such a token takes the operator's whole fee as work too, after
+the donation (see Pool and role rules); under Job Declaration it is refused.
+
+## The login option
+
+On a Pickaxe public pool a miner chooses their own donation after their
+payout address: `<address>[.worker][,donation=<percent>]`, such as
+`bitcoincash:qq….rig1,donation=0.5`. The same login works as an SV1
+username, an SV2 `user_identity` and a Job Declaration `user_identifier`.
+
+- `<percent>` is 0 to 100 in 0.5% steps, as the BCH donation setting is.
+  Anything else (`7.25`, `-1`, `abc`, a second `donation=`) is refused with
+  "donation= takes a percentage from 0 to 100 in 0.5% steps, such as
+  ,donation=0.5": SV2 `invalid-donation`, a refused authorize for SV1
+  firmware with that reason, and an ended session under Job Declaration (as
+  for any identity the pool cannot read).
+- Without the option the pool's donation setting applies.
+- It sets the miner's whole BCH donation: the coinbase's reward share, the
+  donation work and the donation slot in token leaves; under Job
+  Declaration, the PX token's donation rate. The pool's fee does not change,
+  and is still taken from what the donation leaves.
+- Options follow the first comma, separated by commas; keys other than
+  `donation` are left alone, so BCH P2Pool's `,p2p=<share address>` passes
+  through. The payout is the part before the first comma.
+- One connection keeps one choice: its first channel fixes it, and a later
+  channel whose login names another donation (or none after one) is refused
+  with `donation-mismatch`, as donation work is allocated per connection.
+- BCH P2Pool reads the same key for its own donation (0 to 10%, apart from
+  its operator fee, refused above 10%). Pickaxe does not check P2Pool logins
+  itself.
+
+**One donation at a pool.** Pickaxe's SV1 adapter donates by itself at a
+remote pool: its own donation channel, at the miner's setting. A Pickaxe
+pool would also take its donation from the device's channel, so the adapter
+now names `,donation=0` after the device's login there (unless the login
+already names a donation), and asks once more without it if the pool refuses
+the option. Under Job Declaration there is no local donation work, so the
+donation is only the coinbase's, at the rate the login chooses.
 
 ## Coinbase size
 
@@ -333,9 +397,132 @@ token authors. The format above does not depend on them.
 - **A BCH difficulty-algorithm change** would require a token migration; the
   `Δh ≥ 4,032` fallback band keeps threads moving until then.
 - **Fees.** Fees above 1 sat/byte stall claims: the vault pays a fixed rate.
-- **Standard channels.** A public pool's empty commitment on standard channels
-  (whose devices never see the coinbase) is a trust assumption. It can be
-  audited after the fact: every block the pool finds shows its output 0.
+- **Standard channels.** A standard channel's device never sees its coinbase,
+  so its leaves on a public pool are a trust assumption. They can be audited
+  after the fact: the operator's leaf log (see [Disclosure](#disclosure)),
+  which the operator may publish, and every block the pool finds shows its
+  output 0.
+
+## Disclosure
+
+A miner on someone else's pool checks that their leaves pay them before
+hashing, and claims their own wins. Disclosure is opt-in, so firmware that
+does not ask sees nothing new.
+
+### The disclosure (`CTMD` v2)
+
+The leaves behind one output 0, in a small versioned format; the same bytes
+go in Job Declaration's `excess_data` and to miners (normative):
+
+```text
+off len   field
+0   4     "CTMD"
+4   1     02
+5   1     n, the leaves (0 to 16)
+then n times:
+    169   the leaf preimage
+    1     00: ext is zero; 01: a split follows
+    69    the split preimage (with 01 only)
+```
+
+A reader accepts exactly one disclosure (nothing trailing; each leaf and
+split canonical; each split's SHA-256 equal to its leaf's `ext`), then
+rebuilds the tree from these leaves alone, at output 0's `h` and salt, each
+leaf in its own slot and every other slot empty, and requires output 0's
+root. A leaf left out, added or changed gives another root.
+
+### SV2: the `0x4D4D` extension
+
+A client asks for extension type `0x4D4D` through SV2 extensions negotiation
+(type `0x0001`, `RequestExtensions` `0x00`: `u16 request_id | u16 n |
+n × u16`, answered by `RequestExtensions.Success` `0x01` with the granted
+types), at any time after `SetupConnection`. A Pickaxe server grants it, then
+sends that connection, on the channel bit, after each job that commits a
+non-empty root:
+
+```text
+JobLeaves (0x00):  channel u32 | job u32 | output 0 (53) | u16 n | CTMD (n)
+                   | each leaf's aux branch, in CTMD order (32 × h, leaf to root)
+WinProof  (0x01):  channel u32 | job u32 | category (32) | u16 n | AuxProof v2 (n)
+                   | u8 m (0 or 69) | the split preimage (m)
+```
+
+All integers are little-endian. A `WinProof` follows the share's
+acknowledgement when the share wins a token. Extended channels see their
+coinbase, so with these they can check output 0, rebuild the root and keep
+their own proofs. `0x4D4D` ("MM") is Pickaxe's choice: SV2 has no registry
+of private extension types yet.
+
+### SV1: `pickaxe-merge`
+
+SV1 firmware asks for `pickaxe-merge` in `mining.configure` (beside
+`version-rolling`); the answer is `true` where the server sends the
+disclosure, otherwise `false`. Then, per job, a notification
+
+```text
+{"id":null,"method":"pickaxe.merge_leaves",
+ "params":["<job id>","<output 0 hex>","<CTMD hex>",["<aux branch hex>", ...]]}
+```
+
+and, on a win,
+
+```text
+{"id":null,"method":"pickaxe.merge_proof",
+ "params":["<job id>","<category hex>","<AuxProof v2 hex>","<split preimage hex or empty>"]}
+```
+
+The adapter asks for the extension only from its own server (solo, a public
+pool's SV1 port, Job Declaration's local server); at a remote pool it does
+not, and answers `false`.
+
+### Standard channels: the leaf log
+
+Standard channels cannot take extension frames, so a public pool writes one
+JSON line per standard-channel job that commits a root to
+`<config>.sv2-leaves.jsonl`, beside the other `sv2-*` journals:
+
+```text
+{"time":<unix seconds>,"channel":<id>,"job":<id>,"output0":"<hex>","leaves":"<CTMD hex>"}
+```
+
+It is readable by the owner alone and never names an address (the leaves
+carry script hashes). A writer thread takes the lines through a bounded
+queue, so devices never wait on it, and past 8 MiB the log moves to
+`.jsonl.1` and starts again. The operator may publish it.
+
+### The audit rule
+
+On a public pool every leaf's `payout_hash` is `HASH256` of the miner's
+registered payout script (the address in their login), except in a work job,
+whose leaves pay the donation or the operator whole with `ext = 0`. A split
+pays only the Pickaxe donation's script and the operator's. Pickaxe checks
+this before sending each job (a job that fails mines BCH alone), and anyone
+holding a disclosure can check it too. The rates are the miner's to check:
+the donation slot is two thirds of their choice, and the fee slot the
+operator's published coinbase fee.
+
+## Job Declaration leaves (`excess_data`)
+
+A Full-Template client whose declared coinbase's output 0 is a non-empty root
+puts the `CTMD` disclosure of its leaves in `DeclareMiningJob.excess_data`
+(empty without tokens). The pool refuses the declaration with
+`invalid-coinbase-tx`, saying why, when:
+
+- output 0 is a non-empty root and `excess_data` is empty, or `excess_data`
+  is not empty without one;
+- the disclosure does not decode, or its leaves do not make output 0's root;
+- a leaf names a token that is not in the pool's registry (on Chipnet the
+  test token counts);
+- a leaf's token does not verify splits (it cannot pay the pool's fee under
+  Job Declaration);
+- a leaf's `payout_hash` is not `HASH256` of the miner's identity script (the
+  first of the token's outputs);
+- a leaf's split is not exactly the donation slot (the PX token's donation
+  rate, to the Pickaxe donation's script; empty at 0) followed by the fee
+  slot (the pool's fee rate, to its fee script; empty at 0).
+
+A Coinbase-only custom job (`SetCustomMiningJob` with an allocated token)
+carries no disclosure, so its output 0 must not be a non-empty root.
 
 ## Golden vectors
 
@@ -482,8 +669,14 @@ ffff7f20
 ## What Pickaxe does today
 
 - Builds the commitment and the tree into every job when a token is
-  merge-mined (solo), with the donation's split in each miner job's leaves,
-  and the empty commitment into a public pool's jobs.
+  merge-mined: solo, with the donation's split in each miner job's leaves,
+  and on a public pool one root per miner, with their donation and the
+  operator's fee.
+- Lets a public pool's miners choose their donation in their login, and
+  discloses their leaves and proofs to extended channels and SV1 firmware
+  that ask, and in the leaf log for standard channels.
+- Under Job Declaration, discloses the declared leaves to the pool, and as a
+  pool, checks them.
 - Checks every share against each token, hands wins to a claim worker, proves
   them, verifies each proof from its bytes as a covenant would, and saves it
   to `<config>.sv2-token-proofs.json`, readable by the owner alone, one claim
@@ -505,8 +698,8 @@ ffff7f20
   claim builder that broadcasts its claims.
 - **BCH P2Pool** building output 0 in this format, so Pickaxe can merge-mine
   there.
-- **Public pools' per-miner roots** (the fee and donation in each miner's
-  split), their disclosure to extended and SV1 miners, and the Job Declaration
-  pool's check of the declared leaves.
+- **Disclosure at remote pools:** the adapter asks only its own server for
+  the disclosure; asking a remote Pickaxe pool needs a way to tell it from a
+  pool that does not know the negotiation.
 - **Live checks:** a BCHN node accepting a template with the commitment
   (`validateblocktemplate`), and a covenant judged by a BCHN regtest node.
