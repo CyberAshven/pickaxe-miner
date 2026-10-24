@@ -1,102 +1,126 @@
-//! #### PR #42
-//! The aux tree: one slot per (token, mode), single SHA-256 nodes.
+//! #### PR #42, merge-mining v2
+//! The aux tree: one slot per token category, domain-separated SHA-256.
 //!
-//! - Slot: `u32le(SHA256(category ‖ mode ‖ u32le(nonce))[0..4]) mod 2^h`.
+//! - Slot: `u32le(SHA256(0x02 ‖ salt_le4 ‖ category32)[0..4]) mod 2^h`.
 //!   The category is in the slot and in the leaf, so a commitment for one
-//!   token never verifies for another; the nonce moves collisions, so no
-//!   category can be ground to collide with a popular one for every nonce.
-//! - Node: `SHA256(left ‖ right)`. At level i, bit i of the slot set means
-//!   `SHA256(sibling ‖ current)`, otherwise `SHA256(current ‖ sibling)`.
-//! - An empty slot is 32 zero bytes, and the depth is the commitment's `h`.
+//!   token never verifies for another; the salt moves collisions.
+//! - Leaf hash: `SHA256(0x00 ‖ preimage)` (see [`super::leaf`]).
+//! - Node: `SHA256(0x01 ‖ left ‖ right)`. At level i, bit i of the slot set
+//!   means the current node is the right child, `SHA256(0x01 ‖ sibling ‖
+//!   current)`; otherwise `SHA256(0x01 ‖ current ‖ sibling)`.
+//! - An empty leaf slot is 32 zero bytes. Internal nodes are always hashed
+//!   from their children, never replaced by zero bytes. The depth is the
+//!   commitment's `h`, at most 16.
 //!
-//! The layout (height, nonce and slots) depends only on the entries'
-//! categories and modes, never on a payout, so it is searched once per token
-//! set; each job then hashes only its leaves and at most 2^h nodes.
+//! The builder starts at the smallest `h` that holds the leaves, tries salts
+//! 0..65,536 at each `h`, then the next `h`; past `h = 16` it is an error.
+//! The layout depends only on the categories, never on a payout, so it is
+//! searched once per token set.
 
-use super::{leaf::Mode, sha256, Hash};
+use super::{sha256, Hash};
 
 /// The tallest tree: 2^16 slots.
 pub const MAX_HEIGHT: u8 = 16;
-/// Nonces tried at each height: 0..65,536.
-pub const NONCES: u32 = 1 << 16;
+/// At most this many leaves (tokens) in one coinbase.
+pub const MAX_LEAVES: usize = 16;
+/// Salts the builder tries at each height: 0..65,536. A verifier accepts
+/// any salt.
+pub const SALTS: u32 = 1 << 16;
+/// The domain byte of a node.
+pub const NODE_PREFIX: u8 = 0x01;
+/// The domain byte of a slot.
+pub const SLOT_PREFIX: u8 = 0x02;
 
-/// The slot of `(category, mode)` in a tree of height `height` (at most 16).
-pub fn slot(category: &Hash, mode: Mode, nonce: u32, height: u8) -> u32 {
+/// The slot of `category` in a tree of height `height` (at most 16).
+pub fn slot(category: &Hash, salt: u32, height: u8) -> u32 {
     let mut seed = [0; 37];
-    seed[..32].copy_from_slice(category);
-    seed[32] = mode.byte();
-    seed[33..].copy_from_slice(&nonce.to_le_bytes());
+    seed[0] = SLOT_PREFIX;
+    seed[1..5].copy_from_slice(&salt.to_le_bytes());
+    seed[5..].copy_from_slice(category);
     let digest = sha256(&seed);
     let value = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
     value & (1u32 << height.min(MAX_HEIGHT)).wrapping_sub(1)
 }
 
-/// One entry to place in the tree. When the slots cannot be made distinct,
-/// the entry with the lowest priority is dropped (on a tie, the later one).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Placement {
-    pub category: Hash,
-    pub mode: Mode,
-    pub priority: u8,
+/// `SHA256(0x01 ‖ left ‖ right)`.
+pub fn node(left: &Hash, right: &Hash) -> Hash {
+    let mut pair = [0; 65];
+    pair[0] = NODE_PREFIX;
+    pair[1..33].copy_from_slice(left);
+    pair[33..].copy_from_slice(right);
+    sha256(&pair)
 }
 
-/// Where each entry sits: the tree's height, the nonce and one slot per
-/// entry, in entry order.
+/// Where each leaf sits: the tree's height, the salt and one slot per
+/// category, in the order given.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub height: u8,
-    pub nonce: u32,
+    pub salt: u32,
     pub slots: Vec<u32>,
 }
 
-/// No height up to the limit and no nonce gives every entry its own slot;
-/// `entry` is the one to drop before searching again.
+/// Why no layout holds the categories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Dropped {
-    pub entry: usize,
+pub enum LayoutError {
+    /// One category twice: one leaf per token category per coinbase.
+    Duplicate,
+    /// More than 16 tokens.
+    TooMany,
+    /// No salt gives every category its own slot at any height up to the
+    /// limit.
+    NoSalt,
+}
+
+impl std::fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Duplicate => "a token category is listed twice",
+            Self::TooMany => "at most 16 tokens per coinbase",
+            Self::NoSalt => "no salt gives every token its own slot",
+        })
+    }
 }
 
 impl Layout {
-    /// Tries heights from `ceil(log2 n)` up to `max_height` (at most 16),
-    /// and at each height nonces 0..65,536, and keeps the first layout whose
-    /// slots are all distinct: the smallest height first, then the smallest
-    /// nonce, so the result is the same on every run.
-    pub fn search(entries: &[Placement], max_height: u8) -> Result<Self, Dropped> {
-        let lowest = |among: &mut dyn Iterator<Item = usize>| Dropped {
-            entry: among
-                .min_by_key(|&index| (entries[index].priority, std::cmp::Reverse(index)))
-                .unwrap_or(0),
-        };
-        // The same (category, mode) twice collides at every height and nonce.
-        for (index, entry) in entries.iter().enumerate() {
-            if let Some(first) = entries[..index]
-                .iter()
-                .position(|other| other.category == entry.category && other.mode == entry.mode)
-            {
-                return Err(lowest(&mut [first, index].into_iter()));
-            }
+    /// Tries heights from the smallest that holds every leaf up to
+    /// `max_height` (at most 16), and at each height salts 0..65,536, and
+    /// keeps the first layout whose slots are all distinct: the smallest
+    /// height first, then the smallest salt, so the result is the same on
+    /// every run and in every implementation.
+    pub fn search(categories: &[Hash], max_height: u8) -> Result<Self, LayoutError> {
+        if categories.len() > MAX_LEAVES {
+            return Err(LayoutError::TooMany);
         }
-        let count = entries.len();
+        if categories
+            .iter()
+            .enumerate()
+            .any(|(index, category)| categories[..index].contains(category))
+        {
+            return Err(LayoutError::Duplicate);
+        }
+        let count = categories.len();
         let min_height = count.max(1).next_power_of_two().trailing_zeros() as u8;
         let mut slots = vec![0; count];
-        let mut sorted = vec![0; count];
         for height in min_height..=max_height.min(MAX_HEIGHT) {
-            for nonce in 0..NONCES {
-                for (slot_of, entry) in slots.iter_mut().zip(entries) {
-                    *slot_of = slot(&entry.category, entry.mode, nonce, height);
+            // A salt is dropped at its first collision, so a height that
+            // cannot hold the leaves costs a few hashes per salt.
+            'salts: for salt in 0..SALTS {
+                for (index, category) in categories.iter().enumerate() {
+                    let placed = slot(category, salt, height);
+                    if slots[..index].contains(&placed) {
+                        continue 'salts;
+                    }
+                    slots[index] = placed;
                 }
-                sorted.copy_from_slice(&slots);
-                sorted.sort_unstable();
-                if sorted.windows(2).all(|pair| pair[0] != pair[1]) {
-                    return Ok(Self {
-                        height,
-                        nonce,
-                        slots,
-                    });
-                }
+                return Ok(Self {
+                    height,
+                    salt,
+                    slots,
+                });
             }
         }
-        Err(lowest(&mut (0..count)))
+        Err(LayoutError::NoSalt)
     }
 }
 
@@ -106,15 +130,9 @@ pub struct AuxTree {
     levels: Vec<Vec<Hash>>,
 }
 
-fn node(left: &Hash, right: &Hash) -> Hash {
-    let mut pair = [0; 64];
-    pair[..32].copy_from_slice(left);
-    pair[32..].copy_from_slice(right);
-    sha256(&pair)
-}
-
 impl AuxTree {
-    /// Puts `leaves[i]` at `layout.slots[i]`; every other slot is empty.
+    /// Puts `leaves[i]` at `layout.slots[i]`; every other leaf slot is 32
+    /// zero bytes, and every node above is hashed from its children.
     pub fn build(layout: &Layout, leaves: &[Hash]) -> Self {
         let mut level = vec![[0; 32]; 1usize << layout.height.min(MAX_HEIGHT)];
         for (slot, leaf) in layout.slots.iter().zip(leaves) {
@@ -176,50 +194,41 @@ pub fn fold(leaf: Hash, slot: u32, branch: &[Hash]) -> Hash {
 mod tests {
     use super::*;
 
-    fn entry(byte: u8, mode: Mode, priority: u8) -> Placement {
-        Placement {
-            category: [byte; 32],
-            mode,
-            priority,
-        }
-    }
-
-    // #### PR #42
+    // #### merge-mining v2
     #[test]
-    fn slot_follows_the_formula_and_depends_on_nonce_and_mode() {
+    fn slot_and_node_follow_the_formulas() {
         let category = [0x5a; 32];
-        let mut seed = category.to_vec();
-        seed.push(0x41);
+        let mut seed = vec![0x02];
         seed.extend(9u32.to_le_bytes());
+        seed.extend(category);
         let digest = sha256(&seed);
         let value = u32::from_le_bytes(digest[..4].try_into().unwrap());
         for height in 0..=MAX_HEIGHT {
             assert_eq!(
-                slot(&category, Mode::ShareTarget, 9, height),
+                slot(&category, 9, height),
                 value % (1 << height),
                 "h={height}"
             );
         }
-        assert_eq!(slot(&category, Mode::ShareTarget, 9, 0), 0);
-        let at = |mode, nonce| slot(&category, mode, nonce, MAX_HEIGHT);
-        assert_ne!(at(Mode::ShareTarget, 9), at(Mode::ShareTarget, 10));
-        assert_ne!(at(Mode::ShareTarget, 9), at(Mode::BlockRequired, 9));
-        assert_ne!(
-            at(Mode::ShareTarget, 9),
-            slot(&[0x5b; 32], Mode::ShareTarget, 9, 16)
-        );
+        assert_eq!(slot(&category, 9, 0), 0);
+        assert_ne!(slot(&category, 9, 16), slot(&category, 10, 16));
+        assert_ne!(slot(&category, 9, 16), slot(&[0x5b; 32], 9, 16));
+        let mut pair = vec![0x01];
+        pair.extend([1; 32]);
+        pair.extend([2; 32]);
+        assert_eq!(node(&[1; 32], &[2; 32]), sha256(&pair));
     }
 
-    // #### PR #42
+    // #### merge-mining v2
     #[test]
-    fn layout_prefers_the_smallest_height_and_is_deterministic() {
-        let one = [entry(1, Mode::ShareTarget, 0)];
+    fn layout_prefers_the_smallest_height_then_salt_and_is_deterministic() {
+        let one = [[1; 32]];
         let layout = Layout::search(&one, MAX_HEIGHT).unwrap();
         assert_eq!(
             layout,
             Layout {
                 height: 0,
-                nonce: 0,
+                salt: 0,
                 slots: vec![0]
             }
         );
@@ -227,37 +236,46 @@ mod tests {
         assert_eq!(tree.root(), [0x77; 32]);
         assert_eq!(tree.height(), 0);
         assert!(tree.branch(0).is_empty());
-        let eight: Vec<_> = (1..=8).map(|b| entry(b, Mode::ShareTarget, 0)).collect();
+        let eight: Vec<Hash> = (1..=8).map(|b| [b; 32]).collect();
         let layout = Layout::search(&eight, MAX_HEIGHT).unwrap();
         assert!((3..=4).contains(&layout.height), "{layout:?}");
         assert_eq!(Layout::search(&eight, MAX_HEIGHT).unwrap(), layout);
-        let mut slots = layout.slots.clone();
-        slots.sort_unstable();
-        slots.dedup();
-        assert_eq!(slots.len(), 8);
-        // No smaller height has a nonce, and no smaller nonce at this height.
-        let distinct = |height, nonce| {
-            let mut slots: Vec<_> = eight
-                .iter()
-                .map(|e| slot(&e.category, e.mode, nonce, height))
-                .collect();
+        let distinct = |height, salt| {
+            let mut slots: Vec<_> = eight.iter().map(|c| slot(c, salt, height)).collect();
             slots.sort_unstable();
             slots.windows(2).all(|pair| pair[0] != pair[1])
         };
-        assert!((0..layout.nonce).all(|nonce| !distinct(layout.height, nonce)));
+        assert!(distinct(layout.height, layout.salt));
+        assert!((0..layout.salt).all(|salt| !distinct(layout.height, salt)));
         if layout.height == 4 {
-            assert!((0..NONCES).all(|nonce| !distinct(3, nonce)));
+            assert!((0..SALTS).all(|salt| !distinct(3, salt)));
         }
+        // No category: the empty layout (its tree's root is zero).
+        let empty = Layout::search(&[], MAX_HEIGHT).unwrap();
+        assert_eq!((empty.height, empty.salt), (0, 0));
+        assert_eq!(AuxTree::build(&empty, &[]).root(), [0; 32]);
     }
 
-    // #### PR #42
+    // #### merge-mining v2
+    #[test]
+    fn layouts_refuse_duplicates_too_many_and_no_room() {
+        assert_eq!(
+            Layout::search(&[[1; 32], [2; 32], [1; 32]], MAX_HEIGHT),
+            Err(LayoutError::Duplicate)
+        );
+        let many: Vec<Hash> = (0..17).map(|b| [b; 32]).collect();
+        assert_eq!(Layout::search(&many, MAX_HEIGHT), Err(LayoutError::TooMany));
+        assert!(Layout::search(&many[..16], MAX_HEIGHT).is_ok());
+        // Three leaves never fit a tree of height 1.
+        assert_eq!(Layout::search(&many[..3], 1), Err(LayoutError::NoSalt));
+    }
+
+    // #### merge-mining v2
     #[test]
     fn every_branch_folds_to_the_root() {
         for count in [1u8, 2, 3, 5, 8] {
-            let entries: Vec<_> = (0..count)
-                .map(|b| entry(b, Mode::BlockRequired, 0))
-                .collect();
-            let layout = Layout::search(&entries, MAX_HEIGHT).unwrap();
+            let categories: Vec<Hash> = (0..count).map(|b| [b; 32]).collect();
+            let layout = Layout::search(&categories, MAX_HEIGHT).unwrap();
             let leaves: Vec<Hash> = (0..count).map(|b| [b.wrapping_add(100); 32]).collect();
             let tree = AuxTree::build(&layout, &leaves);
             assert_eq!(tree.height(), layout.height);
@@ -274,49 +292,16 @@ mod tests {
                 }
             }
         }
-        // Empty slots are zero leaves: a two-slot tree with one leaf.
+        // Empty leaf slots are zero bytes, but nodes above them are hashed:
+        // a four-slot tree with one leaf at slot 2.
         let layout = Layout {
-            height: 1,
-            nonce: 0,
-            slots: vec![1],
+            height: 2,
+            salt: 0,
+            slots: vec![2],
         };
         let tree = AuxTree::build(&layout, &[[9; 32]]);
-        assert_eq!(tree.root(), node(&[0; 32], &[9; 32]));
-        assert_eq!(tree.branch(1), vec![[0; 32]]);
-    }
-
-    // #### PR #42
-    #[test]
-    fn colliding_tokens_drop_the_lowest_priority() {
-        // Three entries cannot fit a height-1 tree: the lowest priority goes.
-        let entries = [
-            entry(1, Mode::ShareTarget, 5),
-            entry(2, Mode::ShareTarget, 1),
-            entry(3, Mode::BlockRequired, 9),
-        ];
-        assert_eq!(Layout::search(&entries, 1), Err(Dropped { entry: 1 }));
-        assert!(Layout::search(&[entries[0], entries[2]], 1).is_ok());
-        // On equal priorities the later entry goes.
-        let tied = [
-            entry(1, Mode::ShareTarget, 3),
-            entry(2, Mode::ShareTarget, 3),
-        ];
-        assert_eq!(Layout::search(&tied, 0), Err(Dropped { entry: 1 }));
-        // The same token and mode twice always collide; the lower one goes.
-        let twice = [
-            entry(4, Mode::ShareTarget, 8),
-            entry(1, Mode::ShareTarget, 0),
-            entry(4, Mode::ShareTarget, 2),
-        ];
-        assert_eq!(
-            Layout::search(&twice, MAX_HEIGHT),
-            Err(Dropped { entry: 2 })
-        );
-        // One token in both modes takes two slots.
-        let both = [
-            entry(4, Mode::ShareTarget, 0),
-            entry(4, Mode::BlockRequired, 0),
-        ];
-        assert_eq!(Layout::search(&both, MAX_HEIGHT).unwrap().height, 1);
+        let empty_pair = node(&[0; 32], &[0; 32]);
+        assert_eq!(tree.root(), node(&empty_pair, &node(&[9; 32], &[0; 32])));
+        assert_eq!(tree.branch(2), vec![[0; 32], empty_pair]);
     }
 }

@@ -79,8 +79,72 @@ pub struct ServerConfig {
     pub token_donation: Option<crate::donation::TokenDonation>,
     /// #### PR #42: the node's ZMQ block notices (tcp://HOST:PORT).
     pub node_zmq: Option<String>,
+    /// #### merge-mining v2: a public pool's leaf log for its standard
+    /// channels (owner-only JSON lines, capped; see `LeafLog`).
+    pub leaf_log_path: Option<PathBuf>,
     #[cfg(test)]
     pub allocation_phase: Option<u64>,
+}
+
+// #### merge-mining v2: the leaf log
+// What: a public pool's standard-channel jobs that commit a token root are
+// logged as JSON lines (time, channel, job, output 0 and the leaf
+// disclosure, never an address) to `<config>.sv2-leaves.jsonl`, readable by
+// the owner alone. A writer thread takes them through a bounded queue the
+// device threads never wait on; past 8 MiB the log moves to `.1` and starts
+// again.
+// Why: a standard channel's device cannot take the disclosure frames; the
+// operator can publish this log so those miners can check their leaves.
+// Look here if: the log is missing lines, grows without bound, or a device
+// thread waits on it.
+/// The leaf log's writer, fed without waiting.
+struct LeafLog {
+    lines: SyncSender<String>,
+}
+
+/// Where the leaf log moves to, past its cap.
+const LEAF_LOG_BYTES: u64 = 8 << 20;
+
+impl LeafLog {
+    fn start(path: PathBuf, stop: Arc<AtomicBool>) -> Self {
+        let (lines, receive) = mpsc::sync_channel::<String>(1_024);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let Ok(line) = receive.recv_timeout(Duration::from_millis(250)) else {
+                    continue;
+                };
+                let _ = append_private(&path, &line);
+            }
+        });
+        Self { lines }
+    }
+
+    fn add(&self, lines: Vec<String>) {
+        for line in lines {
+            if self.lines.try_send(line).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// Appends one line to an owner-only file, moving a file past the cap to
+/// `.1` first.
+fn append_private(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= LEAF_LOG_BYTES) {
+        std::fs::rename(path, path.with_extension("jsonl.1"))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.write_all(b"\n")
 }
 
 #[derive(Default, Clone, Debug)]
@@ -120,6 +184,12 @@ pub struct ServerStats {
     pub token_wins_dropped: u64,
     pub recent_token_wins: VecDeque<FoundTokenWin>,
     pub tokens_off: Option<String>,
+    /// #### merge-mining v2: why the latest job refused token merge mining
+    /// (its coinbase's output 0 is not this server's commitment).
+    pub tokens_refused: Option<&'static str>,
+    /// #### merge-mining v2: what the tSAFA claimer did, when tSAFA is
+    /// merge-mined.
+    pub token_claims: Option<super::merge::hub::ClaimCounts>,
     /// #### PR #42: the Template Distribution server's counts, when it
     /// serves templates or still holds relayed blocks.
     pub template_server: Option<TemplateServerStats>,
@@ -247,8 +317,6 @@ pub struct TemplateServerStats {
 #[derive(Clone, Debug)]
 pub struct FoundTokenWin {
     pub token: &'static str,
-    /// 'A' (the share met the token's target) or 'B' (a found block).
-    pub mode: char,
     pub height: u32,
     pub worker: String,
     pub found: Instant,
@@ -290,6 +358,8 @@ pub(super) struct Shared {
     /// #### PR #42: the claim worker's queue, bounded; device threads never
     /// wait on it.
     claims: Option<SyncSender<(TokenWin, String)>>,
+    /// #### merge-mining v2: the leaf log, on a public pool.
+    leaf_log: Option<LeafLog>,
     /// #### PR #42: what Template Distribution sessions share with the node
     /// worker, when templates are served or relayed blocks wait.
     pub(super) relay: Option<Relay>,
@@ -412,7 +482,8 @@ fn with_tokens(
     tokens: Option<&TokenHub>,
 ) -> (BchTemplate, u64) {
     template.tag(tag);
-    match tokens.and_then(TokenHub::current) {
+    // #### merge-mining v2: tSAFA's thread depends on the job's height.
+    match tokens.and_then(|hub| hub.current_for(template.height)) {
         Some(set) => {
             let serial = set.serial();
             template.commit(set);
@@ -615,12 +686,6 @@ pub fn run_with(
                                 for found in proven {
                                     stats.recent_token_wins.push_back(FoundTokenWin {
                                         token: found.token,
-                                        mode: if found.mode == super::merge::leaf::Mode::ShareTarget
-                                        {
-                                            'A'
-                                        } else {
-                                            'B'
-                                        },
                                         height: found.height,
                                         worker: worker.clone(),
                                         found: Instant::now(),
@@ -641,6 +706,41 @@ pub fn run_with(
         }
         None => (None, None),
     };
+    // #### merge-mining v2: the tSAFA claimer
+    // What: every 20 seconds (60 after a failure), one round of
+    // `TokenHub::safa_tick` through Fulcrum: the vaults jobs mine, then the
+    // claims of proven wins; its counts reach the dashboard.
+    // Why: the claimer waits on the network; devices and templates never
+    // wait on it.
+    // Look here if: tSAFA claims or vaults never update on the dashboard.
+    let safa_claimer = config
+        .tokens
+        .clone()
+        .filter(|hub| hub.is_safa())
+        .map(|hub| {
+            let stats = stats.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let Some(mut chain) = hub.safa_chain() else {
+                    return;
+                };
+                let mut next = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    if Instant::now() >= next {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0, |elapsed| elapsed.as_secs());
+                        let round = hub.safa_tick(&mut chain, now);
+                        if let Ok(mut stats) = stats.lock() {
+                            stats.token_claims = hub.claim_counts();
+                        }
+                        let wait = if round.is_ok() { 20 } else { 60 };
+                        next = Instant::now() + Duration::from_secs(wait);
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+            })
+        });
     let shared = Arc::new(Shared {
         job: RwLock::new(None),
         stats: stats.clone(),
@@ -650,6 +750,10 @@ pub fn run_with(
         stop: stop.clone(),
         solved: Mutex::new(SolvedParents::default()),
         claims,
+        leaf_log: config
+            .leaf_log_path
+            .clone()
+            .map(|path| LeafLog::start(path, stop.clone())),
         relay,
         lanes: Arc::default(),
         declared,
@@ -1067,6 +1171,9 @@ pub fn run_with(
         .map_err(|_| "template worker stopped unexpectedly")??;
     if let Some(worker) = claim_worker {
         let _ = worker.join();
+    }
+    if let Some(claimer) = safa_claimer {
+        let _ = claimer.join();
     }
     if let Some(reason) = *shared
         .fatal
@@ -2007,6 +2114,19 @@ impl JobAvailability {
             // #### PR #42: a token's donation is all work (see
             // `WorkAllocation::token_donation_work`).
             let p2pool = matches!(donation, JobDonation::P2Pool(_));
+            // #### merge-mining v2: a job that merge-mines a root of its own
+            // (solo, or a public pool miner's; not under Job Declaration)
+            // with a token without split support pays that token's donation,
+            // and a public pool's fee, in work at the whole rate (see
+            // `WorkAllocation::merge_token_donation_work` and
+            // `merge_token_fee_work`). Split tokens take their coinbase share
+            // from each win and only BCH's work share.
+            let merged = matches!(donation, JobDonation::Bch(_))
+                && job
+                    .template
+                    .tokens()
+                    .is_some_and(|set| set.entries().iter().any(|entry| !entry.token.split))
+                && job.template.jd_plan().is_none();
             let (donation, donation_work) = match donation {
                 JobDonation::Bch(rate) => (rate, self.allocation.donation_work(rate)),
                 // #### PR #65: see `donation_readiness`.
@@ -2027,6 +2147,23 @@ impl JobAvailability {
                 fee,
                 fee_work: !donation_work
                     && fee.is_some_and(|fee| self.allocation.fee_work(donation, fee)),
+                token_donation_work: merged
+                    .then(|| donation_work || self.allocation.merge_token_donation_work(donation)),
+                token_fee_work: None,
+            };
+            // The token's fee work, when its donation work does not take
+            // the job.
+            let token_fee_work = match (merged, fee) {
+                (true, Some(fee)) => Some(
+                    payout.fee_work
+                        || (payout.token_donation_work != Some(true)
+                            && self.allocation.merge_token_fee_work(donation, fee)),
+                ),
+                _ => None,
+            };
+            let payout = BchPayout {
+                token_fee_work,
+                ..payout
             };
             let published = job.clone();
             if donation_work && p2pool {
@@ -2318,9 +2455,15 @@ fn serve_device(
             // #### PR #42: under Job Declaration the custom job's coinbase
             // pays the donation, so no local job is donation work; on an
             // ASIC-exclusive token the donation is that token's share of work.
+            // #### merge-mining v2: a public pool miner's own donation choice
+            // sets this connection's rate (see `MiningSession::donation_choice`).
+            let chosen = mining.donation_choice();
             let donation = || -> Result<JobDonation, String> {
                 if let Some(rate) = config.token_donation {
                     return Ok(JobDonation::Token(rate));
+                }
+                if let Some(choice) = chosen.filter(|_| config.public.is_some()) {
+                    return Ok(JobDonation::Bch(choice));
                 }
                 if config
                     .uplink
@@ -2361,6 +2504,13 @@ fn serve_device(
             }
             for frame in availability.retarget(&mut mining)? {
                 sender.send(frame)?;
+            }
+            // #### merge-mining v2: the leaf log's lines (see `LeafLog`).
+            if !mining.leaf_log.is_empty() {
+                let lines = std::mem::take(&mut mining.leaf_log);
+                if let Some(log) = shared.leaf_log.as_ref() {
+                    log.add(lines);
+                }
             }
             if let Some(mut frame) = receiver.receive(Duration::from_millis(100))? {
                 // #### PR #42: JD sessions on the SV2 listener (see
@@ -2606,6 +2756,11 @@ fn serve_device(
                     if let Some(identity) = mining.identity.take() {
                         stats.device_stats.set_worker(device, &identity);
                     }
+                    // #### merge-mining v2: a job refused token merge
+                    // mining (the own-root check) says so on the dashboard.
+                    if let Some(reason) = mining.token_refusal.take() {
+                        stats.tokens_refused = Some(reason);
+                    }
                     if let Some(event) = responses.share_event {
                         stats
                             .device_stats
@@ -2733,6 +2888,143 @@ mod retry_tests {
             assert_eq!(next.generation, 99);
             assert_eq!(next.payout.donation_work, expected);
         }
+    }
+
+    // #### merge-mining v2: a token without split support donates in work
+    // What: on a solo template with such a token, a job pays its donation
+    // in BCH's donation window, then on its own (BCH pays the miner, the
+    // leaves the donation) until the whole 1.5% of the cycle, then neither;
+    // a split token's jobs take only BCH's work third, with 1% of each win
+    // in their split; a public pool's job takes no token donation work.
+    // Look here if: `token_donation_work` or `merge_token_donation_work`
+    // changes.
+    #[test]
+    fn merge_mined_token_donation_work_follows_the_whole_setting() {
+        use super::super::channel::{Channel, ChannelKind};
+        use super::super::merge::{
+            set::tests::{plain_test_set, test_set},
+            split::Split,
+        };
+        let start = Instant::now();
+        let payout = super::super::template_tests::payout();
+        let scripts = super::super::payout::scripts(MiningNetwork::Chipnet, &payout, None).unwrap();
+        let published = |set| {
+            let mut template =
+                BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
+            template.commit(Arc::new(set));
+            PublishedJob {
+                generation: 99,
+                serial: 1,
+                template: Arc::new(template),
+                valid_until: start + Duration::from_secs(30),
+            }
+        };
+        let job = published(plain_test_set());
+        let session = || {
+            let mut mining =
+                MiningSession::new(MiningNetwork::Chipnet, payout.clone(), [17; 12], [255; 32])
+                    .unwrap();
+            mining.insert_channel(
+                Channel::new(
+                    1,
+                    ChannelKind::Standard,
+                    [255; 32],
+                    [17; 12],
+                    MiningNetwork::Chipnet,
+                    &payout,
+                )
+                .unwrap(),
+                [255; 32],
+            );
+            mining
+        };
+        let mut mining = session();
+        let mut availability = JobAvailability::new(0);
+        // 1.5% of the 10-minute cycle is 9 s; BCH's third of it, 3 s.
+        for (seconds, bch, token, leaf) in [
+            (0, true, true, &scripts[1]),
+            (5, false, true, &scripts[1]),
+            (10, false, false, &scripts[0]),
+        ] {
+            availability
+                .update(
+                    &mut mining,
+                    Some(job.clone()),
+                    start + Duration::from_secs(seconds),
+                    JobDonation::Bch(BchDonation::default()),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let current = mining.channels[&1].job().unwrap();
+            assert_eq!(current.payout.donation_work, bch, "{seconds}");
+            assert_eq!(current.payout.token_donation_work, Some(token), "{seconds}");
+            let leaf_payout = current.aux.as_ref().unwrap().entries[0].leaf.payout_hash;
+            assert_eq!(
+                leaf_payout,
+                super::super::template::double_sha256(leaf),
+                "{seconds}"
+            );
+            let tx: stratum_core::bitcoin::Transaction =
+                stratum_core::bitcoin::consensus::deserialize(&current.standard_coinbase.bytes)
+                    .unwrap();
+            let first_payout = if bch { &scripts[1] } else { &scripts[0] };
+            assert_eq!(tx.output[1].script_pubkey.as_bytes(), &first_payout[..]);
+        }
+        // A split token: only BCH's donation work, 1% of each win otherwise.
+        let split_job = published(test_set());
+        let mut mining = session();
+        let mut availability = JobAvailability::new(0);
+        for (seconds, bch) in [(0, true), (5, false)] {
+            availability
+                .update(
+                    &mut mining,
+                    Some(split_job.clone()),
+                    start + Duration::from_secs(seconds),
+                    JobDonation::Bch(BchDonation::default()),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let current = mining.channels[&1].job().unwrap();
+            assert_eq!(current.payout.donation_work, bch, "{seconds}");
+            assert_eq!(current.payout.token_donation_work, None, "{seconds}");
+            let entry = &current.aux.as_ref().unwrap().entries[0];
+            let (payout, split) = if bch {
+                (&scripts[1], Split::NONE)
+            } else {
+                (&scripts[0], Split::donation(100, &scripts[1]).unwrap())
+            };
+            assert_eq!(
+                entry.leaf.payout_hash,
+                super::super::template::double_sha256(payout)
+            );
+            assert_eq!(entry.split, split, "{seconds}");
+        }
+        // A public pool's miner takes it too, at their own donation.
+        let mut public = session();
+        public.set_public(Some(super::super::payout::PublicPool {
+            fee: None,
+            address: payout.clone(),
+        }));
+        JobAvailability::new(0)
+            .update(
+                &mut public,
+                Some(job.clone()),
+                start,
+                JobDonation::Bch(BchDonation::default()),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            public.channels[&1]
+                .job()
+                .unwrap()
+                .payout
+                .token_donation_work,
+            Some(true)
+        );
     }
 
     #[test]
@@ -2989,6 +3281,7 @@ mod retry_tests {
                 tokens: Mutex::new(VecDeque::new()),
                 consumed: std::sync::atomic::AtomicUsize::new(0),
             })),
+            full_template: true,
         });
         let (events, _receive) = mpsc::sync_channel(1);
         let status = Arc::new(JdStatus {
@@ -3012,6 +3305,7 @@ mod retry_tests {
             stop: Arc::default(),
             solved: Mutex::default(),
             claims: None,
+            leaf_log: None,
             relay: None,
             lanes: Arc::default(),
             declared: None,
@@ -3106,6 +3400,7 @@ mod retry_tests {
                 },
                 pool_target: [255; 32],
                 p2pool: None,
+                full_template: true,
             });
             let mut template =
                 BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
@@ -3163,6 +3458,7 @@ mod retry_tests {
                 stop: Arc::default(),
                 solved: Mutex::default(),
                 claims: None,
+                leaf_log: None,
                 relay: None,
                 lanes: Arc::default(),
                 declared: None,
@@ -3269,6 +3565,7 @@ mod p2pool_tests {
             },
             pool_target: [255; 32],
             p2pool: Some(Arc::new(crate::p2pool::jd::fake::plan(url, owner, tokens))),
+            full_template: true,
         })
     }
 
@@ -3300,6 +3597,7 @@ mod p2pool_tests {
             stop: Arc::default(),
             solved: Mutex::default(),
             claims: None,
+            leaf_log: None,
             relay: None,
             lanes: Arc::default(),
             declared: None,
@@ -3714,5 +4012,45 @@ mod p2pool_tests {
         }
         device.update(None, at(60), 0, hold).unwrap();
         assert!(device.update(None, at(63), 0, hold).is_err());
+    }
+
+    // #### merge-mining v2
+    // What: with a token set registered, a P2Pool template still prepares
+    // and its job reaches the device, mining BCH alone with no token
+    // commitment, and the dashboard is told why.
+    // Look here if: `BchTemplate::tokens_refused`, `prepare_p2pool` or the
+    // channel's job install changes.
+    #[test]
+    fn registered_tokens_never_stop_p2pool_jobs() {
+        use super::super::merge::set::tests::test_set;
+        let (url, _requests) = serve(vec![Answer::Valid]);
+        let start = Instant::now();
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        template.commit(Arc::new(test_set()));
+        template.declare(p2pool_plan(1, &url, "owner", 8));
+        template
+            .prepare_p2pool()
+            .expect("a token set does not stop the preparation");
+        template.set_declaration_id(1);
+        assert!(template.declared_aux().unwrap().is_none());
+        let job = PublishedJob {
+            generation: 1,
+            serial: (1 << 32) | 1,
+            template: Arc::new(template),
+            valid_until: start + Duration::from_secs(30),
+        };
+        let mut device = Device::new();
+        assert!(
+            device
+                .update(Some(&job), start, 0, Acknowledged::personal(1))
+                .unwrap()
+                > 0
+        );
+        let mined = device.job().expect("the device mines BCH");
+        assert!(mined.aux.is_none());
+        assert_eq!(
+            device.mining.token_refusal,
+            Some("P2Pool's coinbase does not carry the token commitment yet")
+        );
     }
 }

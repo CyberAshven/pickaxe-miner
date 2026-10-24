@@ -64,7 +64,7 @@ unverified; an empty token registry is not an implemented live contract.
 | D2 | SV2 pool failover, own templates via Job Declaration, supported coinbase payouts | Compatible pool tests preserving CTOR | Pool mode and both Job Declaration modes implemented; local live Chipnet shares, custom jobs and payouts checked on 2026-10-15. Pool failover delivered fresh real-node jobs on 2026-10-16 without hashing. Independent external-pool interoperability and accepted blocks through failover/JD remain pending. |
 | D3 | Guided local-node detection, cookies, name/version/sync and automatic fallback | Setup UI and connection/failure tests | Implemented in #42/#43: local/remote/Tailscale discovery, saved cookies, chain checks, ZMQ notices, GPU return-to-node and ASIC fallback pools. Real ZMQ and TP new-parent/minimum-difficulty delivery checked on 2026-10-15; remote guided setup and live recovery remain. |
 | T1 | ASIC-exclusive header jobs (SAFA-style) | Author's contract/deployment, VM proof, firmware and live test | SAFA reference core, firmware work path, worker, simulated Chipnet test token and setup implemented in #42. Registry remains empty pending a deployed author contract and covenant-VM/live proof. |
-| T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Case A/B commitments, independent reference proof verification, journals, worker and JD integration implemented in #42; docs/merge-mining.md exists. Author covenant/VM proof and deployment remain external prerequisites. #53 adds a VM proof that PHOTON's live contract can be the parent of an AuxPoW token (docs/photon-electric-auxpow.md); that token's contract is the author's. |
+| T2 | BCH plus all compatible merge-mined tokens | Agreed covenant, coinbase commitment/merkle proof and VM/live proof | Merge-mining v2 common format (agreed with BCH P2Pool; v1's Case B removed), golden vectors, independent reference proof verification, journals, worker, pool/role rules and JD integration; docs/merge-mining.md is the v2 spec. Author covenant/VM proof and deployment remain external prerequisites. #53 adds a VM proof that PHOTON's live contract can be the parent of an AuxPoW token (docs/photon-electric-auxpow.md); that token's contract is the author's. |
 | F1 | Claim without waiting for slow GPUs | Review merged #35 and retain race/regression tests | Audited merged #35: claim readiness no longer waits for another GPU batch; shutdown still drains safely. Existing host regression retained and passing; no new GPU soak claimed. |
 | F2 | Intel, native HIP discrete AMD, Linux GPU and Apple Silicon validation | Actual hardware reports; compile results are insufficient | Pending hardware evidence |
 | F3 | Windows wgpu telemetry without vendor tools | Real portable-adapter metrics or explicit unavailable state | PR #48 adds native WDDM utilization and dedicated-memory counters to the shared sampler, matched by PCI address. Live counter reads passed for the NVIDIA discrete and AMD integrated adapters on one Windows PC. Missing/ambiguous PCI identity, linked adapters and unavailable counters remain unsupported; power, temperature and clocks still need vendor support. |
@@ -3303,3 +3303,120 @@ channel at P2Pool alpha nodes) merged in.
 Not in this change: GPUs mining BCH (with merge-mined CashTokens) over SV2
 pools and P2Pool, which needs a BCH header kernel; running a P2Pool node for
 other miners from the setup.
+
+## Merge-mining v2: the common format
+
+Branch `feat/merge-mining-v2`, on `dev`.
+
+- **Format:** v1 is replaced by the v2 common format agreed with BCH
+  P2Pool (docs/merge-mining.md): output 0 `CTMM 02` with root, `h` and salt
+  (the empty commitment is all zero); slots
+  `u32le(SHA256(0x02 ‖ salt ‖ category)[0..4]) mod 2^h`; domain-separated
+  leaf (`0x00`) and node (`0x01`) hashes; a 169-byte leaf binding the lock
+  hash, state hash, payout hash, target and `ext`; `AuxProof` v2 (the header
+  first, `d ≤ 25`, no leaf data). Case B (tickets, mode B, its registry
+  fields) is gone; version `03` is reserved for it.
+- **Reference verifier:** steps 1-9 rewritten for v2 and run on every proof's
+  bytes before it is journaled. Golden vectors (a two-token tree, a whole
+  224-byte proof and the empty commitment) are unit tests and are printed in
+  the spec; an independent re-derivation matched them byte for byte.
+- **Roles:** solo commits the operator's own root on every channel; a public
+  pool commits one root per miner (below); under Job Declaration only shares
+  that meet the pool's target are forwarded (`jd::client::for_pool`),
+  token-only hits stay local. The own-root check refuses token merge mining for a job whose
+  coinbase lacks the expected output 0 and says so on the dashboard.
+- **Privacy:** fresh salt bytes per merge-mined standard-channel job, no tag
+  by default, one claim per journal row, and `--claim-delay` (default 5-60 s,
+  recorded as `broadcast_after`).
+- **Donation and split:** a leaf's `ext` commits to a donation slot and a fee
+  slot (a canonical 69-byte preimage; shares rounded down in turn; shares
+  under 1,000 satoshis at the AMM price stay with the miner). Merge-mined
+  tokens split as BCH does: the reward share (1% at 1.5%) in each miner job's
+  donation slot, BCH's donation-work jobs (0.5%) paying the donation whole.
+  Under Job Declaration the leaves carry the pool's donation rate and fee. A
+  token without split support (the registry flag) keeps `ext = 0` and gives
+  its whole donation as work.
+
+- **Public pools and Job Declaration (stage 2 of the split):**
+  - A login may end in `,donation=<percent>` (0-100% in 0.5% steps) on SV1,
+    SV2 and Job Declaration; it sets that miner's whole BCH donation
+    (coinbase, work and token slot; the PX token's rate under Job
+    Declaration), never the fee. Malformed values are refused with one
+    message (`invalid-donation`); one choice per connection
+    (`donation-mismatch`). Other option keys, such as P2Pool's `,p2p=`,
+    pass through.
+  - Each public pool miner mines their own root: leaves bind their identity
+    script, the split holds two thirds of their donation and the operator's
+    coinbase fee (whole in `coinbase` mode, two thirds in `both`, none in
+    `work`); donation-work and fee-work jobs pay their recipient whole with
+    `ext = 0`; tokens without split support take the donation and then the
+    fee as work. The own-root check and an audit rule (every leaf pays the
+    miner, or a work job's recipient) run before each job goes out.
+  - Disclosure, opt-in: the SV2 extension `0x4D4D` (JobLeaves, WinProof)
+    negotiated with RequestExtensions; SV1 `pickaxe-merge` in
+    mining.configure, relayed as `pickaxe.merge_leaves` and
+    `pickaxe.merge_proof`; standard channels' leaves in the owner-only,
+    8 MiB-capped `<config>.sv2-leaves.jsonl`.
+  - Job Declaration: Full-Template clients put the `CTMD` disclosure of
+    their leaves in `excess_data`; the pool rebuilds output 0's root and
+    checks each leaf's token (registered, split-capable), payout (the
+    miner's script) and split (the miner's donation and the pool's fee),
+    refusing with `invalid-coinbase-tx`. Coinbase-only mines no tokens.
+  - One donation at a pool: the SV1 adapter, which donates on its own channel
+    at a remote pool, names `,pickaxe-donation=0` for the device's channel
+    (asking again without it if refused); a Pickaxe pool reads that key as
+    `donation=`, and BCH P2Pool's own donation is never zeroed.
+  - Evidence: host tests for each rule, including a public pool miner at
+    `donation=0` with a 2% coinbase fee (the leaf's split is the fee slot
+    alone, and its proof verifies), a declaration with a wrong fee slot
+    refused, SV1 firmware getting its leaves end to end from a public pool,
+    and the leaf log.
+
+- **tSAFA claims (Chipnet only):** BCH P2Pool's SAFA AuxPoW covenant,
+  matched in Rust (`merge/safa_auxpow.rs`) without copying it:
+  - The deployment file: network, category, threads, virtual reserve and
+    redeem script, with `K` and the P2SH32 lock derived and checked.
+  - The 16-byte thread state, the DAA, and the ASERT and fallback bands.
+  - The claim builder: one input, the four unlocking pushes, the vault with
+    the next state, the shares with 800 satoshis each, the CLTV lock time,
+    and the vault paying `S = K + |proof|`.
+  - An independent check of each claim's bytes before broadcast.
+  - The claimer: vaults and broadcasts through Fulcrum, journal states
+    proven, broadcast, confirmed, stale and failed, retries, and dashboard
+    counts.
+  - Gated by the hidden `serve --safa-deployment <FILE>`: Chipnet only, own
+    templates only, refused on mainnet and at a pool, never offered by the
+    setup.
+  - A claim's miner output now carries exactly 800 satoshis, as the
+    covenant checks.
+  - Following P2Pool's covenant fixes:
+    - the agreed thread rule
+      `u32le(HASH256(payout_hash ‖ cb_height)[0..4]) mod threads`, then the
+      next minable thread;
+    - the vault keeps at least 800 satoshis;
+    - share scripts are at most 35 bytes;
+    - the fallback band is a constant `ref >> 4` to `ref × 1.1`;
+    - ASERT's exponent truncates, then its shift floors (with a vector).
+  - Won states are rebuilt from the journal at start. A sent claim is asked
+    for before it is sent again, and a trade that only moved the vault does
+    not count as a try.
+  - P2Pool's Chipnet fixture (copied verbatim) is reproduced by the
+    loader: `K`, lock, `lock_hash` and vault address. Its claim inputs are
+    exported in `cli.mjs claim` format, so P2Pool's hex can be compared
+    byte for byte.
+  - Evidence: P2Pool's numbers reproduced in host tests:
+    - `K` 1,946 / 1,943;
+    - unlocking bytes 1,597 / 1,731 for its two measured proof shapes;
+    - shares 980,100 / 10,000 / 9,900 and 980,198 / 0 / 19,802;
+    - DAA bits 0x2001bffe;
+    - the ASERT band edges and real headers;
+    - token target, nBits and BIP34 vectors.
+  - Also tested: a byte-exact claim written field by field; the check
+    refusing P2Pool's list of attacks; a win from share to confirmed claim
+    through a fake chain.
+  - No claim has been run through the covenant in a VM: Pickaxe has no
+    Rust BCH VM, and tSAFA's compiled covenant is not published yet.
+
+Not in this change: BCH P2Pool building output 0 in this format (Pickaxe
+still refuses tokens with a P2Pool-prepared coinbase), and live or
+covenant-VM checks.

@@ -444,6 +444,26 @@ pub enum StratumV2Command {
         /// (the pool builds the blocks otherwise). Hidden: it is for tests.
         #[arg(long, value_name = "DIFFICULTY", hide = true)]
         merge_test_token: Option<u64>,
+        /// #### merge-mining v2
+        /// Merge-mines tSAFA, the Chipnet test deployment of BCH P2Pool's
+        /// SAFA AuxPoW covenant, from this deployment file (JSON), and
+        /// claims its wins through Fulcrum. Chipnet only, with this
+        /// server's own templates (solo or --public). Hidden: it is for
+        /// tests.
+        #[arg(
+            long,
+            value_name = "FILE",
+            hide = true,
+            conflicts_with_all = ["upstream", "merge_test_token", "asic_token", "asic_test_token"]
+        )]
+        safa_deployment: Option<std::path::PathBuf>,
+        /// #### merge-mining v2
+        /// How long after a merge-mined token win its claim may be
+        /// broadcast: SECONDS, or MIN-MAX seconds drawn at random for each
+        /// claim (default 5-60). Each claim is its own transaction. To hide
+        /// where claims come from, route this computer through Tor yourself.
+        #[arg(long, value_name = "SECONDS")]
+        claim_delay: Option<String>,
         /// #### PR #42
         /// Serve this node's block templates to SV2 pools, Job Declaration
         /// clients and P2Pool (SV2 Template Distribution) at this address,
@@ -1203,6 +1223,33 @@ mod tests {
                     ..
                 }
             })
+        ));
+        // #### merge-mining v2: tSAFA from a deployment file, never at a
+        // pool and never with the test token.
+        let cli = parse(&["--safa-deployment", "tsafa.json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve {
+                    safa_deployment: Some(ref path),
+                    ..
+                }
+            }) if path == std::path::Path::new("tsafa.json")
+        ));
+        let mut args = upstream.to_vec();
+        args.extend(["--safa-deployment", "tsafa.json"]);
+        assert!(parse(&args).is_err());
+        assert!(parse(&["--safa-deployment", "a.json", "--merge-test-token", "1"]).is_err());
+        // #### merge-mining v2: the claim broadcast delay.
+        let cli = parse(&["--claim-delay", "10-20"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StratumV2 {
+                command: StratumV2Command::Serve {
+                    claim_delay: Some(ref delay),
+                    ..
+                }
+            }) if delay == "10-20"
         ));
     }
 

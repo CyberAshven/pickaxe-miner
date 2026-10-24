@@ -432,6 +432,7 @@ pub(in crate::stratum_v2) mod tests {
                 },
                 pool_target: [0xff; 32],
                 p2pool: None,
+                full_template: true,
             }));
             let parts = template.declared_parts().unwrap();
             let shape = CoinbaseShape::parse(&parts.prefix, &parts.suffix).unwrap();

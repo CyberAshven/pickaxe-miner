@@ -492,13 +492,27 @@ impl DeclaratorSession {
                 self.allocations.push_back(answer_at);
                 responses.not_before = (answer_at > now).then_some(answer_at);
                 let identity = request.user_identifier.as_utf8_or_hex();
-                let payout =
-                    crate::stratum_v2::payout::identity_payout(declarator.network, &identity)
-                        .map_err(|_| "unknown user")?;
-                let donation = *declarator
-                    .donation
-                    .read()
-                    .map_err(|_| "donation setting unavailable")?;
+                // #### merge-mining v2: the miner's own donation choice
+                // (`,donation=`) sets the token's donation rate; the pool's
+                // fee stays as it is.
+                let login =
+                    crate::stratum_v2::payout::identity_login(declarator.network, &identity)
+                        .map_err(|error| {
+                            use crate::stratum_v2::payout::DONATION_OPTION_ERROR;
+                            if error == DONATION_OPTION_ERROR {
+                                DONATION_OPTION_ERROR
+                            } else {
+                                "unknown user"
+                            }
+                        })?;
+                let payout = login.payout;
+                let donation = match login.donation {
+                    Some(choice) => choice,
+                    None => *declarator
+                        .donation
+                        .read()
+                        .map_err(|_| "donation setting unavailable")?,
+                };
                 let rule = PayoutRule::public_pool(
                     declarator.network,
                     &payout,
@@ -690,10 +704,19 @@ impl DeclaratorSession {
                 "wrong height",
             ));
         }
-        PayoutRule::from_rates(declarator.network, &payout, &declarator.public, rates)
-            .map_err(|_| Refusal::new("invalid-mining-job-token", "unknown payout"))?
-            .check(&shape.outputs)
+        let rule = PayoutRule::from_rates(declarator.network, &payout, &declarator.public, rates)
+            .map_err(|_| Refusal::new("invalid-mining-job-token", "unknown payout"))?;
+        rule.check(&shape.outputs)
             .map_err(|why| Refusal::new("invalid-coinbase-tx", why))?;
+        // #### merge-mining v2: the declared token leaves (see
+        // `policy::check_leaves`).
+        super::policy::check_leaves(
+            declarator.network,
+            &rule,
+            &shape.outputs,
+            request.excess_data.as_ref(),
+        )
+        .map_err(|why| Refusal::new("invalid-coinbase-tx", why))?;
         if request.wtxid_list.len() > MAX_DECLARED_TXS {
             return Err(Refusal::new("invalid-job", "more than 65,535 transactions"));
         }

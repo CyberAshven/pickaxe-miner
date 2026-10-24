@@ -6,10 +6,6 @@
 use super::{policy::PayoutRule, token::PoolRates};
 use crate::stratum_v2::template::Hash;
 
-/// #### PR #42: what merge-mined token leaves bind: the payout script, and
-/// the donation's split (its share in hundredths of a percent and script).
-pub type TokenTerms<'a> = (&'a [u8], Option<(u16, &'a [u8])>);
-
 /// One plan per pool session; a new session or token rates make a new one,
 /// with a new serial.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +27,11 @@ pub struct JdPlan {
     pub pool_target: Hash,
     /// PPLNS construction belongs to the independently verified P2Pool node.
     pub p2pool: Option<std::sync::Arc<crate::p2pool::jd::Plan>>,
+    /// #### merge-mining v2: the client declares each template's
+    /// transactions (Full-Template), so DeclareMiningJob can carry its token
+    /// leaves for the pool to check; a Coinbase-only plan merge-mines no
+    /// token.
+    pub full_template: bool,
 }
 
 impl JdPlan {
@@ -64,19 +65,12 @@ impl JdPlan {
             .collect()
     }
 
-    /// #### PR #42: what merge-mined token leaves bind under this plan: the
-    /// miner's own script (the pool's first output) and the donation's
-    /// split, the pool's whole donation rate to its donation output (no
-    /// donation work runs under Job Declaration); `None` without outputs.
-    pub fn token_terms(&self) -> Option<TokenTerms<'_>> {
-        let miner = self.scripts.first()?;
-        let split = self
-            .rates
-            .donation_output
-            .and_then(|index| self.scripts.get(usize::from(index)))
-            .filter(|_| self.rates.donation_bps > 0)
-            .map(|script| (self.rates.donation_bps, script.as_slice()));
-        Some((miner.as_slice(), split))
+    /// #### merge-mining v2: the payout merge-mined token leaves bind under
+    /// this plan: the miner's own script, the pool's first output (no
+    /// donation work runs under Job Declaration, and a split is
+    /// token-defined); `None` without outputs.
+    pub fn token_payout(&self) -> Option<&[u8]> {
+        self.scripts.first().map(Vec::as_slice)
     }
 
     /// The rollable bytes the pool takes: the job id, the pad, the lane and
@@ -140,6 +134,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            full_template: true,
         };
         assert!(plan.is_valid());
         assert_eq!(plan.rollable(), 16);

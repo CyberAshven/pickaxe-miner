@@ -135,7 +135,7 @@ proof, and `835dfb0c…ee18` was the cheap claim after it with a 3-zero proof.
 The algorithm is SHA-256d, so a SHA-256 engine can grind it, but a BCH ASIC
 hashes an 80-byte header. ELECTRIC hashes 32 bytes with the recipient right
 after the height. Stratum cannot aim the nonce field at this preimage, and
-[merge-mining.md](merge-mining.md) Case A and [asic-tokens.md](asic-tokens.md)
+[merge-mining.md](merge-mining.md) and [asic-tokens.md](asic-tokens.md)
 both need a contract that accepts header work. This one does not, so the
 ASIC farm keeps mining BCH and GPUs search ELECTRIC beside it.
 

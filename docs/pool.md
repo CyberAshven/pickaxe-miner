@@ -96,6 +96,11 @@ JSON start line (`--no-tui`) lists the same addresses under `connect`.
   Another Pickaxe joins with that same line (Join a pool).
 - A username that is not a payout address on the pool's network is refused
   when the device authorizes, with that reason.
+- A miner may set their own Pickaxe donation by adding `,donation=<percent>`
+  to the username (0 to 100 in 0.5% steps, such as
+  `bitcoincash:q….rig1,donation=0.5`); without it your pool's setting
+  applies. It never changes your fee. Details are in
+  [merge-mining.md](merge-mining.md#the-login-option).
 - The workers page names each device by its worker name (`rig1` in
   `bitcoincash:q….rig1`), never by its address; a device that gives only an
   address keeps a generated label.
@@ -119,8 +124,15 @@ JSON start line (`--no-tui`) lists the same addresses under `connect`.
 ## Fees
 
 - **Order**: the Pickaxe donation comes off first, in full (1.5% by default;
-  Advanced settings or `--donation` can set it from 0% to 100%). Your pool fee
+  Advanced settings or `--donation` set the pool's default from 0% to 100%,
+  and each miner may choose their own with `,donation=`). Your pool fee
   comes off what is left, and the miner keeps the rest.
+- **Merge-mined tokens**: each miner mines a root of their own, so their
+  token wins pay them, with the donation and your fee taken from each win as
+  from a block (your coinbase fee in full, two thirds in `both` mode; fee
+  work pays you whole). Miners that ask can see their leaves; standard
+  channels' leaves go to `<config>.sv2-leaves.jsonl`, which you may publish
+  (see [merge-mining.md](merge-mining.md#disclosure)).
 - **Where the fee comes from** (`--pool-fee-mode`):
   - `coinbase`: an output to your fee address in every block a miner finds;
   - `work`: that share of each miner's difficulty-weighted accepted work mines to your fee address,
@@ -147,8 +159,9 @@ a fee; with SV1 they can decode the coinbase parts of each job.
 `--accept-job-declaration` lets miners mine their own node's templates at
 your pool (SV2 Job Declaration), on the pool's SV2 port, in both of the
 spec's modes (or one, with `full` or `coinbase`). Their coinbase must pay your
-fee and the Pickaxe donation in full, whatever your fee mode, because their
-jobs cannot rotate work; the pool checks every custom job's outputs before
+fee and the Pickaxe donation (the miner's `,donation=` choice, or your
+setting) in full, whatever your fee mode, because their jobs cannot rotate
+work; the pool checks every custom job's outputs before
 accepting it. With Full-Template, a miner declares the transactions too: your
 node checks the template (`validateblocktemplate`) and gets the miner's blocks
 as well as the miner's own node. With Coinbase-only, only their nodes submit
