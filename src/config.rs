@@ -194,8 +194,9 @@ impl MiningToken {
         {
             Ok(Self::Photon)
         } else if query.eq_ignore_ascii_case("electric") {
-            // #### PR #51: a CPU token with its own command.
-            Err("ELECTRIC mines on the CPU with `pickaxe electric mine`".into())
+            // #### PR #51: a token with its own command; since PR #58 it mines
+            // on GPUs and iGPUs, as PHOTON does.
+            Err("ELECTRIC mines with `pickaxe electric mine` or from the setup screen".into())
         } else {
             Err("unknown token name, category ID, or covenant bytecode; try PHOTON".into())
         }
