@@ -2843,7 +2843,7 @@ mod tests {
         server.receive(setup(4), NOW).unwrap();
         // A device opened before the negotiation (its first job's frames
         // carry no leaves), whose shares come later.
-        let mut device = open_device(&mut server, ChannelKind::Extended);
+        let device = open_device(&mut server, ChannelKind::Extended);
         let ask = extension_frame(
             NEGOTIATION,
             REQUEST_EXTENSIONS,
@@ -2899,7 +2899,6 @@ mod tests {
         let proof = WinProof::decode(proof.payload()).unwrap();
         assert_eq!(proof.channel, device.channel);
         crate::stratum_v2::merge::proof::AuxProof::from_bytes(&proof.proof).unwrap();
-        device.header[76..].copy_from_slice(&1u32.to_le_bytes());
         // A client that did not ask gets neither.
         let mut quiet =
             MiningSession::new(MiningNetwork::Chipnet, payout(), [7; 12], [255; 32]).unwrap();
