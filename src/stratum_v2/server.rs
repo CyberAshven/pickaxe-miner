@@ -187,6 +187,9 @@ pub struct ServerStats {
     /// #### merge-mining v2: why the latest job refused token merge mining
     /// (its coinbase's output 0 is not this server's commitment).
     pub tokens_refused: Option<&'static str>,
+    /// #### merge-mining v2: what the tSAFA claimer did, when tSAFA is
+    /// merge-mined.
+    pub token_claims: Option<super::merge::hub::ClaimCounts>,
     /// #### PR #42: the Template Distribution server's counts, when it
     /// serves templates or still holds relayed blocks.
     pub template_server: Option<TemplateServerStats>,
@@ -479,7 +482,8 @@ fn with_tokens(
     tokens: Option<&TokenHub>,
 ) -> (BchTemplate, u64) {
     template.tag(tag);
-    match tokens.and_then(TokenHub::current) {
+    // #### merge-mining v2: tSAFA's thread depends on the job's height.
+    match tokens.and_then(|hub| hub.current_for(template.height)) {
         Some(set) => {
             let serial = set.serial();
             template.commit(set);
@@ -702,6 +706,41 @@ pub fn run_with(
         }
         None => (None, None),
     };
+    // #### merge-mining v2: the tSAFA claimer
+    // What: every 20 seconds (60 after a failure), one round of
+    // `TokenHub::safa_tick` through Fulcrum: the vaults jobs mine, then the
+    // claims of proven wins; its counts reach the dashboard.
+    // Why: the claimer waits on the network; devices and templates never
+    // wait on it.
+    // Look here if: tSAFA claims or vaults never update on the dashboard.
+    let safa_claimer = config
+        .tokens
+        .clone()
+        .filter(|hub| hub.is_safa())
+        .map(|hub| {
+            let stats = stats.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let Some(mut chain) = hub.safa_chain() else {
+                    return;
+                };
+                let mut next = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    if Instant::now() >= next {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0, |elapsed| elapsed.as_secs());
+                        let round = hub.safa_tick(&mut chain, now);
+                        if let Ok(mut stats) = stats.lock() {
+                            stats.token_claims = hub.claim_counts();
+                        }
+                        let wait = if round.is_ok() { 20 } else { 60 };
+                        next = Instant::now() + Duration::from_secs(wait);
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+            })
+        });
     let shared = Arc::new(Shared {
         job: RwLock::new(None),
         stats: stats.clone(),
@@ -1132,6 +1171,9 @@ pub fn run_with(
         .map_err(|_| "template worker stopped unexpectedly")??;
     if let Some(worker) = claim_worker {
         let _ = worker.join();
+    }
+    if let Some(claimer) = safa_claimer {
+        let _ = claimer.join();
     }
     if let Some(reason) = *shared
         .fatal

@@ -160,11 +160,12 @@ pub fn run(
     // #### PR #42: template providers, tried before the nodes, told the
     // coinbase bytes this server may add (with the test token's when asked
     // for; its registry row decides the network, so mainnet refuses it).
-    let (providers, test_token, claim_delay) = match &action {
+    let (providers, test_token, claim_delay, safa_deployment) = match &action {
         StratumV2Command::Serve {
             template_provider,
             merge_test_token,
             claim_delay,
+            safa_deployment,
             ..
         } => (
             template_provider
@@ -177,17 +178,55 @@ pub fn run(
                 .map(super::merge::hub::ClaimDelay::parse)
                 .transpose()?
                 .unwrap_or_default(),
+            safa_deployment.clone(),
         ),
-        _ => (Vec::new(), None, Default::default()),
+        _ => (Vec::new(), None, Default::default(), None),
     };
-    let tokens = match test_token {
-        Some(difficulty) => Some(Arc::new(super::merge::hub::TokenHub::test_token(
+    // #### merge-mining v2: the tSAFA gate
+    // What: tSAFA is merge-mined only from an explicit deployment file
+    // (`--safa-deployment`), on Chipnet, with this server's own templates;
+    // mainnet, a pool and the test token beside it are refused, and the
+    // setup never offers it.
+    // Why: tSAFA is for testing the claim path; no SAFA token is mined on
+    // mainnet, and at a pool the pool builds the coinbase (a Pickaxe pool's
+    // Job Declaration check knows no tSAFA row).
+    // Look here if: tSAFA starts without its file, or anywhere but
+    // Chipnet.
+    let tokens = match (test_token, safa_deployment) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "--safa-deployment and --merge-test-token are one token each; use one".into(),
+            )
+        }
+        (Some(difficulty), None) => Some(Arc::new(super::merge::hub::TokenHub::test_token(
             config.network,
             config_path.with_extension("sv2-token-proofs.json"),
             super::merge::hub::bits_for_difficulty(difficulty)?,
             claim_delay,
         )?)),
-        None => None,
+        (None, Some(path)) => {
+            if config.network != config::MiningNetwork::Chipnet {
+                return Err(
+                    "--safa-deployment is Chipnet only: tSAFA is a test token, and no SAFA token is mined on mainnet"
+                        .into(),
+                );
+            }
+            if !pools.is_empty() {
+                return Err(
+                    "--safa-deployment mines this server's own templates (solo or --public), not at a pool"
+                        .into(),
+                );
+            }
+            let deployment = super::merge::safa_auxpow::Deployment::load(&path)?;
+            Some(Arc::new(super::merge::hub::TokenHub::safa(
+                config.network,
+                config_path.with_extension("sv2-token-proofs.json"),
+                deployment,
+                claim_delay,
+                config.electrum_endpoints(),
+            )?))
+        }
+        (None, None) => None,
     };
     // #### PR #42: an ASIC-exclusive token instead of BCH
     // What: `--asic-test-token` mines the Chipnet ASIC test token's simulated
@@ -217,7 +256,7 @@ pub fn run(
         )?)),
         _ => None,
     };
-    let reserve = super::tdp::reserve(tokens.as_ref().and_then(|hub| hub.current()).as_deref());
+    let reserve = super::tdp::reserve_for(tokens.is_some());
     let node = if (pools.is_empty() || declaring) && header_work.is_none() {
         Some(preflight_sources(config, &providers, reserve)?)
     } else {
@@ -2277,6 +2316,8 @@ fn status_json(
             "dropped": snapshot.token_wins_dropped,
             "off": snapshot.tokens_off,
             "refused": snapshot.tokens_refused,
+            // #### merge-mining v2: tSAFA's claims, as counts.
+            "claims": snapshot.token_claims.as_ref().map(token_claims_json),
             "recent": snapshot.recent_token_wins.iter().map(|win| serde_json::json!({
                 "token": win.token,
                 "height": win.height,
@@ -2939,6 +2980,21 @@ fn work_line(stats: &ServerStats, pool: bool) -> String {
     }
 }
 
+/// #### merge-mining v2: tSAFA's claim counts for the status file (never an
+/// address or a script).
+fn token_claims_json(claims: &super::merge::hub::ClaimCounts) -> serde_json::Value {
+    serde_json::json!({
+        "token": claims.token,
+        "vaults": claims.vaults,
+        "waiting": claims.waiting,
+        "sent": claims.sent,
+        "confirmed": claims.confirmed,
+        "lost": claims.lost,
+        "failed": claims.failed,
+        "error": claims.error,
+    })
+}
+
 fn records_line(stats: &ServerStats) -> String {
     let best = stats
         .best_share
@@ -2981,6 +3037,25 @@ fn records_line(stats: &ServerStats) -> String {
     // mines BCH alone; the dashboard says why.
     let tokens = match stats.tokens_refused {
         Some(reason) => format!("{tokens} · Token merge mining refused for a job: {reason}"),
+        None => tokens,
+    };
+    // #### merge-mining v2: tSAFA's claims.
+    let tokens = match &stats.token_claims {
+        Some(claims) => format!(
+            "{tokens} · {} claims: {} confirmed, {} sent, {} waiting, {} lost, {} failed ({} vaults){}",
+            claims.token,
+            claims.confirmed,
+            claims.sent,
+            claims.waiting,
+            claims.lost,
+            claims.failed,
+            claims.vaults,
+            claims
+                .error
+                .as_deref()
+                .map(|error| format!("; {error}"))
+                .unwrap_or_default()
+        ),
         None => tokens,
     };
     // #### PR #42: an ASIC-exclusive token's wins.
@@ -3325,6 +3400,21 @@ mod tests {
             status["tokens"]["refused"],
             "output 0 is not this server's token commitment"
         );
+        // #### merge-mining v2: tSAFA's claims.
+        stats.token_claims = Some(crate::stratum_v2::merge::hub::ClaimCounts {
+            token: "tSAFA",
+            vaults: 4,
+            waiting: 1,
+            sent: 2,
+            confirmed: 3,
+            lost: 1,
+            failed: 0,
+            error: None,
+        });
+        assert!(records_line(&stats)
+            .contains("tSAFA claims: 3 confirmed, 2 sent, 1 waiting, 1 lost, 0 failed (4 vaults)"));
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(status["tokens"]["claims"]["confirmed"], 3);
         stats.tokens_off = Some("token proofs cannot be saved: disk full".into());
         assert!(records_line(&stats).contains("Tokens off: token proofs cannot be saved"));
         assert!(super::super::status_report().contains("merge mining: common format v2"));

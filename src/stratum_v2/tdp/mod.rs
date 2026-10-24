@@ -30,6 +30,13 @@ pub const PAYOUT_RESERVE: u32 = 122;
 /// #### PR #42: the reserve a template client declares: the payouts, and
 /// with merge-mined tokens the 53-byte commitment (whatever their number).
 pub fn reserve(tokens: Option<&super::merge::set::TokenSet>) -> u32 {
+    reserve_for(tokens.is_some())
+}
+
+/// #### merge-mining v2: the coinbase bytes this server may add, with room
+/// for the commitment when tokens are merge-mined (tSAFA's set exists only
+/// once its vaults are read).
+pub fn reserve_for(commitment: bool) -> u32 {
     use super::merge::commitment::OUTPUT_LEN;
-    PAYOUT_RESERVE + tokens.map_or(0, |_| OUTPUT_LEN as u32)
+    PAYOUT_RESERVE + if commitment { OUTPUT_LEN as u32 } else { 0 }
 }
