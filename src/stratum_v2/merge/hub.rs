@@ -844,6 +844,7 @@ fn advance_claim(
                 Ok(_) => {
                     row["status"] = "broadcast".into();
                     row["txid"] = claim.txid.into();
+                    row["vault_outpoint"] = outpoint_text(vault).into();
                     row["claimed_at"] = now.into();
                     row["fee_sats"] = claim.plan.fee.into();
                     row["error"] = serde_json::Value::Null;
@@ -866,11 +867,31 @@ fn advance_claim(
                 }
                 return false;
             }
+            // #### merge-mining v2: a sent claim not yet in the vault
+            // What: while the thread's vault is still in the claim's state
+            // but not the claim's output, the claim is asked for first: in
+            // the mempool or a block, it is left alone. Gone, it is sent
+            // again: at once and without counting a try when a market trade
+            // moved the vault's outpoint (the claim spent the old one), as
+            // a retry when the vault is where the claim found it.
+            // Why: treating every such round as a dropped claim resent live
+            // claims and marked them failed after ten rounds.
+            // Look here if: a tSAFA claim in the mempool is sent again or
+            // fails.
             if hex::encode(vault.state_hash()) == state {
-                // The claim left the mempool; the vault still waits for it.
-                retry(row, now, "the claim left the mempool; it is sent again");
-                if row["status"] == "proven" {
-                    row["next_attempt"] = now.into();
+                match chain.known(&txid) {
+                    Ok(true) | Err(_) => return false,
+                    Ok(false) if row["vault_outpoint"] != outpoint_text(vault).as_str() => {
+                        row["status"] = "proven".into();
+                        row["next_attempt"] = now.into();
+                        row["error"] = "a trade moved the vault; the claim is built again".into();
+                    }
+                    Ok(false) => {
+                        retry(row, now, "the claim left the mempool; it is sent again");
+                        if row["status"] == "proven" {
+                            row["next_attempt"] = now.into();
+                        }
+                    }
                 }
                 return true;
             }
@@ -886,6 +907,13 @@ fn advance_claim(
         }
         _ => false,
     }
+}
+
+/// A vault's outpoint as `txid:vout` (display order).
+fn outpoint_text(vault: &Vault) -> String {
+    let mut txid = vault.outpoint.txid;
+    txid.reverse();
+    format!("{}:{}", hex::encode(txid), vault.outpoint.vout)
 }
 
 fn unix_now() -> u64 {
@@ -1475,6 +1503,71 @@ mod tests {
             }
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    // #### merge-mining v2: a sent claim not yet in the vault
+    // What: a sent claim the chain still knows is left alone however many
+    // rounds the vault shows its old state (also after a trade moved the
+    // vault); once the chain no longer knows it, a trade's new outpoint
+    // gets a rebuilt claim without counting a try, and a dropped claim
+    // counts one.
+    // Look here if: advance_claim's broadcast branch changes.
+    #[test]
+    fn a_live_claim_is_not_retried_as_dropped() {
+        use super::super::safa_auxpow::tests::chipnet_block;
+        let (height, _, _) = chipnet_block();
+        let (hub, path) = safa_hub("live");
+        let vault = safa_vault(1, height - 10, 0x2000_ffff, 2_000_000);
+        let mut chain = FakeChain {
+            tip: height,
+            vaults: vec![vault.clone()],
+            sent: Vec::new(),
+            refuse: None,
+            known: true,
+        };
+        hub.safa_tick(&mut chain, 0).unwrap();
+        let win = safa_win(&hub, height);
+        assert!(hub.first(&win));
+        assert_eq!(hub.record(&win).len(), 1);
+        let now = unix_now() + 1;
+        hub.safa_tick(&mut chain, now).unwrap();
+        assert_eq!(chain.sent.len(), 1);
+        // A trade moved the vault (same state, another outpoint) while the
+        // claim is still known: twelve rounds change nothing.
+        let traded = Vault {
+            outpoint: super::super::OutPoint {
+                txid: [0x99; 32],
+                vout: 0,
+            },
+            value: vault.value + 5_000,
+            ..vault.clone()
+        };
+        chain.vaults = vec![traded.clone()];
+        for round in 0..12 {
+            hub.safa_tick(&mut chain, now + round).unwrap();
+        }
+        let row = &journal_rows(&path)[0];
+        assert_eq!(row["status"], "broadcast");
+        assert!(row["attempts"].is_null());
+        assert_eq!(chain.sent.len(), 1);
+        // The trade won: the claim is gone, so it is built again against
+        // the new outpoint, without counting a try.
+        chain.known = false;
+        hub.safa_tick(&mut chain, now + 20).unwrap();
+        assert_eq!(journal_rows(&path)[0]["status"], "proven");
+        assert!(journal_rows(&path)[0]["attempts"].is_null());
+        hub.safa_tick(&mut chain, now + 21).unwrap();
+        assert_eq!(chain.sent.len(), 2);
+        let resent = &journal_rows(&path)[0];
+        assert_eq!(resent["status"], "broadcast");
+        assert_eq!(resent["vault_outpoint"], format!("{}:0", "99".repeat(32)));
+        // Dropped from the mempool, the vault where the claim found it: a
+        // counted retry.
+        hub.safa_tick(&mut chain, now + 22).unwrap();
+        let row = &journal_rows(&path)[0];
+        assert_eq!(row["status"], "proven");
+        assert_eq!(row["attempts"], 1);
+        let _ = std::fs::remove_file(path);
     }
 
     // #### merge-mining v2: the claim broadcast delay
