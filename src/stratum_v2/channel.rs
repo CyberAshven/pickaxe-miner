@@ -2056,6 +2056,7 @@ mod tests {
             },
             pool_target,
             p2pool: None,
+            full_template: true,
         };
         let mut raw = rpc_template();
         let mut txs = vec![transaction(1), transaction(2), transaction(3)];
@@ -2277,6 +2278,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            full_template: true,
         };
         template.declare(Arc::new(plan.clone()));
         let template = Arc::new(template);
@@ -2364,6 +2366,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            full_template: true,
         };
         template.declare(Arc::new(plan.clone()));
         template.set_declaration_id(73);

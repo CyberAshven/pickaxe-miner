@@ -797,6 +797,7 @@ fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
         },
         pool_target: [0xff; 32],
         p2pool: None,
+        full_template: true,
     };
     template.declare(Arc::new(plan.clone()));
     let pool_outputs = plan.outputs(template.coinbase_value);

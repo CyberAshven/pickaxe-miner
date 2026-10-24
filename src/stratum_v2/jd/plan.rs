@@ -27,6 +27,11 @@ pub struct JdPlan {
     pub pool_target: Hash,
     /// PPLNS construction belongs to the independently verified P2Pool node.
     pub p2pool: Option<std::sync::Arc<crate::p2pool::jd::Plan>>,
+    /// #### merge-mining v2: the client declares each template's
+    /// transactions (Full-Template), so DeclareMiningJob can carry its token
+    /// leaves for the pool to check; a Coinbase-only plan merge-mines no
+    /// token.
+    pub full_template: bool,
 }
 
 impl JdPlan {
@@ -129,6 +134,7 @@ mod tests {
             },
             pool_target: [0xff; 32],
             p2pool: None,
+            full_template: true,
         };
         assert!(plan.is_valid());
         assert_eq!(plan.rollable(), 16);

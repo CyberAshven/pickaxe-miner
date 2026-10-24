@@ -729,7 +729,9 @@ impl BchTemplate {
         let (Some(plan), Some(set)) = (self.jd.as_ref(), self.tokens.as_ref()) else {
             return Ok(None);
         };
-        if self.is_p2pool() {
+        // #### merge-mining v2: only Full-Template declarations carry the
+        // leaves the pool checks (`merge::disclosure`).
+        if self.is_p2pool() || !plan.full_template {
             return Ok(None);
         }
         let miner = plan
@@ -818,8 +820,16 @@ impl BchTemplate {
     /// Why this template's token set is not merge-mined, if it has one that
     /// is not.
     pub fn tokens_refused(&self) -> Option<&'static str> {
-        (self.tokens.is_some() && self.is_p2pool())
-            .then_some("P2Pool's coinbase does not carry the token commitment yet")
+        self.tokens.as_ref()?;
+        if self.is_p2pool() {
+            return Some("P2Pool's coinbase does not carry the token commitment yet");
+        }
+        // #### merge-mining v2: a Coinbase-only declaration cannot show the
+        // pool its leaves, so the pool refuses a token commitment there.
+        self.jd
+            .as_ref()
+            .is_some_and(|plan| !plan.full_template)
+            .then_some("Coinbase-only Job Declaration cannot show the pool its token leaves; use Full-Template")
     }
 
     // #### merge-mining v2: pool and role rules

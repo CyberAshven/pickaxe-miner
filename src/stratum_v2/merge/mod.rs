@@ -19,6 +19,7 @@
 //! (docs/asic-tokens.md).
 
 pub mod commitment;
+pub mod disclosure;
 pub mod header;
 pub mod hub;
 pub mod leaf;

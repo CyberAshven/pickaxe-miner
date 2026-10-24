@@ -441,7 +441,29 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
             local,
         });
     }
-    let mut identity = upstream.identity.clone();
+    // #### merge-mining v2: one donation at a pool
+    // What: where the adapter donates by itself at a remote pool (its
+    // donation channel, at the miner's setting), the device's own channel
+    // asks the pool for none: `,donation=0` after the identity, unless the
+    // identity already names a donation. A pool that refuses the option is
+    // asked once more without it.
+    // Why: a Pickaxe public pool (and BCH P2Pool) takes the Pickaxe
+    // donation from each miner unless their login chooses otherwise, so the
+    // device donated twice: through the adapter's donation channel and
+    // through the pool's own rule.
+    // Look here if: a device donates twice at a Pickaxe pool, or a pool
+    // refuses every login with an option.
+    let mut base = upstream.identity.clone();
+    let mut zero =
+        upstream.remote && upstream.donation.is_some() && !names_donation(&upstream.identity);
+    let identity_of = |base: &str, zero: bool| {
+        if zero {
+            format!("{base},donation=0")
+        } else {
+            base.to_owned()
+        }
+    };
+    let mut identity = identity_of(&base, zero);
     let mut retried = false;
     let mut reply = loop {
         // The refused request was answered, so the retry reuses its id;
@@ -477,15 +499,18 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
         // #### PR #67: a BCH P2Pool node refused the identity's share
         // address (or its lack of one): asked once more the other way.
         match (upstream.remote && !retried)
-            .then(|| p2pool_retry_identity(&identity, code.as_deref()))
+            .then(|| p2pool_retry_identity(&base, code.as_deref()))
             .flatten()
         {
             Some(next) => {
-                identity = next;
+                base = next;
                 retried = true;
             }
+            // #### merge-mining v2: then without the donation option.
+            None if zero => zero = false,
             None => return Err(refusal),
         }
+        identity = identity_of(&base, zero);
     };
     let opened: OpenExtendedMiningChannelSuccess =
         binary_sv2::from_bytes(reply.payload()).map_err(|_| "invalid channel reply")?;
@@ -502,6 +527,15 @@ fn open(upstream: &Upstream) -> Result<Opened, String> {
         send,
         receive,
         local,
+    })
+}
+
+/// #### merge-mining v2: whether a login already names a donation option.
+fn names_donation(identity: &str) -> bool {
+    identity.split_once(',').is_some_and(|(_, options)| {
+        options
+            .split(',')
+            .any(|option| option.trim_start().starts_with("donation="))
     })
 }
 
@@ -2426,6 +2460,16 @@ mod tests {
         );
         assert!(bridge.tick(Instant::now()).unwrap().is_empty());
         assert!(bridge.donation_request().unwrap().is_none());
+    }
+
+    // #### merge-mining v2: one donation at a pool
+    #[test]
+    fn a_login_names_a_donation_only_after_its_options_comma() {
+        assert!(!names_donation("bchtest:qq.rig"));
+        assert!(!names_donation("bchtest:qq.donation=1"));
+        assert!(names_donation("bchtest:qq.rig,donation=0"));
+        assert!(names_donation("bchtest:qq,p2p=bchtest:qz, donation=2"));
+        assert!(!names_donation("bchtest:qq,p2p=bchtest:qz"));
     }
 
     // #### PR #40

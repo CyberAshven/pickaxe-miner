@@ -746,6 +746,8 @@ impl MiningSession {
         let outputs = parse_outputs(outputs).map_err(|_| "invalid-coinbase-tx-outputs")?;
         rule.check(&outputs)
             .map_err(|_| "invalid-coinbase-tx-outputs")?;
+        // #### merge-mining v2: no token root without its declared leaves.
+        super::jd::policy::check_no_root(&outputs).map_err(|_| "invalid-coinbase-tx-outputs")?;
         let id = self.next_custom_id()?;
         let template = Arc::new(BchTemplate::custom(
             &context,

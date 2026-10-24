@@ -71,6 +71,24 @@ impl Leaf {
         bytes
     }
 
+    /// #### merge-mining v2: reads a 169-byte preimage with this tag and
+    /// version; anything else is not a leaf.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; LEN] = bytes.try_into().ok()?;
+        if bytes[..4] != TAG || bytes[4] != VERSION {
+            return None;
+        }
+        let hash = |at: usize| -> Hash { bytes[at..at + 32].try_into().unwrap_or([0; 32]) };
+        Some(Self {
+            category: hash(5),
+            lock_hash: hash(37),
+            state_hash: hash(69),
+            payout_hash: hash(101),
+            target_bits: u32::from_le_bytes([bytes[133], bytes[134], bytes[135], bytes[136]]),
+            ext: hash(137),
+        })
+    }
+
     /// `SHA256(0x00 ‖ preimage)`: the domain byte keeps a leaf from ever
     /// being read as a node.
     pub fn hash(&self) -> Hash {
@@ -117,6 +135,11 @@ mod tests {
         assert_eq!(bytes[137..169], [0xe5; 32]);
         assert_eq!(leaf.hash(), sha256(&[&[0][..], &bytes[..]].concat()));
         assert_ne!(leaf.hash(), sha256(&bytes));
+        assert_eq!(Leaf::parse(&bytes), Some(leaf));
+        assert_eq!(Leaf::parse(&bytes[..168]), None);
+        let mut other = bytes;
+        other[4] = 3;
+        assert_eq!(Leaf::parse(&other), None);
         assert_eq!(lock_hash(&[0x51]), double_sha256(&[0x51]));
         // Every field is bound.
         let changes: [fn(&mut Leaf); 6] = [

@@ -704,10 +704,19 @@ impl DeclaratorSession {
                 "wrong height",
             ));
         }
-        PayoutRule::from_rates(declarator.network, &payout, &declarator.public, rates)
-            .map_err(|_| Refusal::new("invalid-mining-job-token", "unknown payout"))?
-            .check(&shape.outputs)
+        let rule = PayoutRule::from_rates(declarator.network, &payout, &declarator.public, rates)
+            .map_err(|_| Refusal::new("invalid-mining-job-token", "unknown payout"))?;
+        rule.check(&shape.outputs)
             .map_err(|why| Refusal::new("invalid-coinbase-tx", why))?;
+        // #### merge-mining v2: the declared token leaves (see
+        // `policy::check_leaves`).
+        super::policy::check_leaves(
+            declarator.network,
+            &rule,
+            &shape.outputs,
+            request.excess_data.as_ref(),
+        )
+        .map_err(|why| Refusal::new("invalid-coinbase-tx", why))?;
         if request.wtxid_list.len() > MAX_DECLARED_TXS {
             return Err(Refusal::new("invalid-job", "more than 65,535 transactions"));
         }

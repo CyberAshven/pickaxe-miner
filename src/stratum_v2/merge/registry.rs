@@ -104,6 +104,19 @@ pub fn tokens(network: MiningNetwork) -> &'static [MergeToken] {
     }
 }
 
+/// #### merge-mining v2: the token a pool knows by `category` on
+/// `network`: a registered one, or on Chipnet the test token (which exists
+/// for tests only and is never in a list).
+pub fn known(network: MiningNetwork, category: &Hash) -> Option<&'static MergeToken> {
+    tokens(network)
+        .iter()
+        .find(|token| token.category == *category)
+        .or_else(|| {
+            (network == TEST_TOKEN.network && TEST_TOKEN.category == *category)
+                .then_some(&TEST_TOKEN)
+        })
+}
+
 /// SHA-256 of "pickaxe merge-mining test token v1" (the category is the
 /// token's identity, not the format's version).
 const TEST_CATEGORY: Hash = [

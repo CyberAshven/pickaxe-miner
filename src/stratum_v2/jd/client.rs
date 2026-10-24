@@ -564,6 +564,7 @@ fn uplink(
         rates: first.1,
         pool_target,
         p2pool,
+        full_template: full,
     });
     if !plan.is_valid() {
         return Err("the pool's token names outputs it does not list, or rates over 100%".into());
@@ -1070,6 +1071,10 @@ fn declaration(
 ) -> Result<SerializedFrame, String> {
     let parts = template.declared_parts()?;
     let txids: Vec<binary_sv2::U256> = template.transaction_ids().iter().map(Into::into).collect();
+    let excess = template
+        .declared_aux()?
+        .map(|aux| crate::stratum_v2::merge::disclosure::Disclosure::from_job(&aux).encode())
+        .unwrap_or_default();
     encoded(
         DeclareMiningJob {
             request_id: request,
@@ -1086,7 +1091,12 @@ fn declaration(
                 .try_into()
                 .map_err(|_| "coinbase suffix too long")?,
             wtxid_list: txids.try_into().map_err(|_| "too many transactions")?,
-            excess_data: (&[][..]).try_into().map_err(|_| "excess data too long")?,
+            // #### merge-mining v2: the token leaves behind output 0, for
+            // the pool to check (`merge::disclosure`); none without tokens.
+            excess_data: excess
+                .as_slice()
+                .try_into()
+                .map_err(|_| "excess data too long")?,
         },
         MESSAGE_TYPE_DECLARE_MINING_JOB,
         false,
@@ -1423,6 +1433,7 @@ mod tests {
             },
             pool_target: [255; 32],
             p2pool: None,
+            full_template: true,
         })));
         donor.status.acknowledged.store(6, Ordering::Relaxed);
         assert_eq!(handle.acknowledged(), 7);

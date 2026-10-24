@@ -3162,6 +3162,7 @@ mod retry_tests {
                 tokens: Mutex::new(VecDeque::new()),
                 consumed: std::sync::atomic::AtomicUsize::new(0),
             })),
+            full_template: true,
         });
         let (events, _receive) = mpsc::sync_channel(1);
         let status = Arc::new(JdStatus {
@@ -3279,6 +3280,7 @@ mod retry_tests {
                 },
                 pool_target: [255; 32],
                 p2pool: None,
+                full_template: true,
             });
             let mut template =
                 BchTemplate::from_rpc(&super::super::template_tests::rpc_template()).unwrap();
@@ -3442,6 +3444,7 @@ mod p2pool_tests {
             },
             pool_target: [255; 32],
             p2pool: Some(Arc::new(crate::p2pool::jd::fake::plan(url, owner, tokens))),
+            full_template: true,
         })
     }
 

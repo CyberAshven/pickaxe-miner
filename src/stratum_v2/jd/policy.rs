@@ -173,6 +173,116 @@ impl PayoutRule {
     // #### end PR #42 ####
 }
 
+// #### merge-mining v2: the pool's check of declared leaves
+// What: a Full-Template declaration whose output 0 is a non-empty root must
+// disclose its leaves in `excess_data` (`merge::disclosure`). The pool
+// rebuilds the root from them, and checks each leaf: its token is in the
+// pool's registry (the Chipnet test token counts on Chipnet) and verifies
+// splits, its payout is the miner's own script, and its split is exactly the
+// token's donation (the miner's choice) and the pool's fee, to their
+// scripts. Anything else refuses the declaration.
+// Why: the pool cannot see a coinbase's leaves otherwise, and a client
+// could leave the fee out of its tokens' wins.
+// Look here if: a declaration with tokens is refused, or a pool accepts one
+// whose leaves skip its fee.
+/// Checks the token leaves `excess` discloses for `outputs`, under `rule`,
+/// against the pool's registry on `network`.
+pub fn check_leaves(
+    network: MiningNetwork,
+    rule: &PayoutRule,
+    outputs: &[(u64, Vec<u8>)],
+    excess: &[u8],
+) -> Result<(), String> {
+    check_leaves_with(
+        |category| crate::stratum_v2::merge::registry::known(network, category),
+        rule,
+        outputs,
+        excess,
+    )
+}
+
+/// `check_leaves` with the tokens `known` names.
+fn check_leaves_with(
+    known: impl Fn(
+        &crate::stratum_v2::template::Hash,
+    ) -> Option<&'static crate::stratum_v2::merge::registry::MergeToken>,
+    rule: &PayoutRule,
+    outputs: &[(u64, Vec<u8>)],
+    excess: &[u8],
+) -> Result<(), String> {
+    use crate::stratum_v2::{
+        merge::{
+            disclosure::Disclosure,
+            split::{Slot, Split},
+        },
+        template::double_sha256,
+    };
+    let commitment = outputs
+        .first()
+        .and_then(|(_, script)| AuxCommitment::parse_script(script));
+    let Some(commitment) = commitment.filter(|commitment| !commitment.is_empty()) else {
+        return if excess.is_empty() {
+            Ok(())
+        } else {
+            Err("token leaves without a token commitment".into())
+        };
+    };
+    if excess.is_empty() {
+        return Err("a token commitment needs its leaves in excess_data".into());
+    }
+    let disclosure = Disclosure::decode(excess)?;
+    disclosure.check_root(&commitment)?;
+    let slot = |pair: &Option<(Vec<u8>, u16)>| match pair {
+        Some((script, bps)) => Slot::new(*bps, script),
+        None => Ok(Slot::EMPTY),
+    };
+    let split = Split::new(
+        slot(&rule.donation).map_err(|error| error.to_string())?,
+        slot(&rule.fee).map_err(|error| error.to_string())?,
+    );
+    let miner = double_sha256(&rule.miner);
+    for disclosed in &disclosure.leaves {
+        let token = known(&disclosed.leaf.category)
+            .ok_or("a token leaf names a token the pool does not know")?;
+        if !token.split {
+            return Err(format!(
+                "{} takes no split, so it cannot pay the pool's fee under Job Declaration",
+                token.name
+            ));
+        }
+        if disclosed.leaf.payout_hash != miner {
+            return Err(format!("{}'s leaf does not pay the miner", token.name));
+        }
+        if disclosed.split != split {
+            return Err(format!(
+                "{}'s split is not the donation and the pool's fee",
+                token.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+// #### merge-mining v2: no tokens in Coinbase-only custom jobs
+// What: a Coinbase-only custom job's output 0 may be the empty commitment
+// or none, never a token root.
+// Why: Coinbase-only sends no declaration, so the pool could never check
+// the leaves behind a root.
+// Look here if: a Coinbase-only client's custom jobs are refused for their
+// output 0.
+/// Refuses a token root in a custom job that disclosed no leaves.
+pub fn check_no_root(outputs: &[(u64, Vec<u8>)]) -> Result<(), String> {
+    match outputs
+        .first()
+        .and_then(|(_, script)| AuxCommitment::parse_script(script))
+    {
+        Some(commitment) if !commitment.is_empty() => {
+            Err("a Coinbase-only custom job cannot carry a token commitment".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The merge-mining shape a coinbase may take: at most one commitment, as
 /// output 0, worth 0 and exact (v2); no token-prefixed output (a coinbase
 /// cannot create CashTokens); fewer than 0xfd outputs with a commitment.
@@ -329,6 +439,95 @@ mod tests {
             donation.parse().unwrap(),
         )
         .unwrap()
+    }
+
+    // #### merge-mining v2: the pool's check of declared leaves
+    // What: leaves that rebuild output 0 and pay the miner with the token's
+    // donation and the pool's fee pass; a wrong fee slot, a missing fee, a
+    // leaf paying another script, an unknown token, a token without split
+    // support, a leaf left out, leaves without a root or a root without
+    // leaves are refused; a Coinbase-only job may carry the empty
+    // commitment but no root.
+    // Look here if: `check_leaves` or `check_no_root` changes.
+    #[test]
+    fn declared_leaves_must_pay_the_miner_the_donation_and_the_pools_fee() {
+        use crate::stratum_v2::merge::{
+            disclosure::Disclosure,
+            registry::{MergeToken, TEST_TOKEN},
+            set::{tests::test_set, AuxJob, LeafTerms},
+            split::{Slot, Split},
+        };
+        let rule = rule("1.5", "1");
+        let donation = rule.donation.clone().unwrap();
+        let fee = rule.fee.clone().unwrap();
+        let split = |d: u16, f: u16| {
+            Split::new(
+                Slot::new(d, &donation.0).unwrap(),
+                Slot::new(f, &fee.0).unwrap(),
+            )
+        };
+        let job = |payout: &[u8], split: Split| {
+            AuxJob::build(
+                &test_set(),
+                &LeafTerms {
+                    payout,
+                    split,
+                    plain_payout: payout,
+                },
+            )
+        };
+        let outputs = |job: &AuxJob| {
+            let mut outputs = paying(&rule, 304_734_375, 3_078_125, 4_687_500);
+            outputs.insert(0, (0, job.commitment.script().to_vec()));
+            outputs
+        };
+        let known = |category: &crate::stratum_v2::template::Hash| {
+            (*category == TEST_TOKEN.category).then_some(&TEST_TOKEN)
+        };
+        let check =
+            |job: &AuxJob, excess: &[u8]| check_leaves_with(known, &rule, &outputs(job), excess);
+        let good = job(&rule.miner, split(150, 100));
+        let excess = Disclosure::from_job(&good).encode();
+        assert_eq!(check(&good, &excess), Ok(()));
+        // The fee slot at another rate, or none; the leaf paying another
+        // script.
+        for (wrong, why) in [
+            (job(&rule.miner, split(150, 50)), "split"),
+            (job(&rule.miner, split(150, 0)), "split"),
+            (job(&fee.0, split(150, 100)), "does not pay the miner"),
+        ] {
+            let error = check(&wrong, &Disclosure::from_job(&wrong).encode()).unwrap_err();
+            assert!(error.contains(why), "{error}");
+        }
+        // An unknown token, and a token without split support.
+        assert!(check_leaves_with(|_| None, &rule, &outputs(&good), &excess)
+            .unwrap_err()
+            .contains("does not know"));
+        let plain = Box::leak(Box::new(MergeToken {
+            split: false,
+            ..TEST_TOKEN
+        }));
+        assert!(
+            check_leaves_with(|_| Some(&*plain), &rule, &outputs(&good), &excess)
+                .unwrap_err()
+                .contains("takes no split")
+        );
+        // A leaf left out (another job's leaves), leaves without a root,
+        // a root without leaves.
+        let other = job(&rule.miner, split(150, 50));
+        assert!(check(&good, &Disclosure::from_job(&other).encode()).is_err());
+        let rootless = paying(&rule, 304_734_375, 3_078_125, 4_687_500);
+        assert!(check_leaves_with(known, &rule, &rootless, &excess).is_err());
+        assert_eq!(check_leaves_with(known, &rule, &rootless, &[]), Ok(()));
+        assert!(check(&good, &[]).unwrap_err().contains("needs its leaves"));
+        // The empty commitment needs no leaves.
+        let mut empty = rootless.clone();
+        empty.insert(0, (0, AuxCommitment::EMPTY.script().to_vec()));
+        assert_eq!(check_leaves_with(known, &rule, &empty, &[]), Ok(()));
+        // Coinbase-only: the empty commitment or none, never a root.
+        assert_eq!(check_no_root(&rootless), Ok(()));
+        assert_eq!(check_no_root(&empty), Ok(()));
+        assert!(check_no_root(&outputs(&good)).is_err());
     }
 
     // #### PR #42
