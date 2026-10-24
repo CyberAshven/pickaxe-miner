@@ -1018,21 +1018,29 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
     }
 }
 
-// #### merge-mining v2: pool and role rules
-// What: a public pool that merge-mines the test token puts the empty
-// commitment on its miners' jobs: their block carries it as output 0, and
-// no share of theirs wins or is proven.
-// Look here if: a public pool's block carries a token root, or its miners'
-// shares reach the claim worker.
+// #### merge-mining v2: per-miner roots on a public pool
+// What: a public pool that merge-mines the test token gives each miner a
+// root of their own: a miner finds a block whose output 0 is a non-empty
+// root; their share wins the token, which the claim worker proves and
+// journals with the split preimage of the default donation's 1% and the
+// operator's 2% coinbase-mode fee. (A login's donation=0, which leaves the
+// fee slot alone, is in the channel tests.)
+// Look here if: a public pool's miners stop winning tokens, or their split
+// names the donation they declined.
 #[test]
-fn a_public_pools_miners_mine_the_empty_commitment() {
-    use super::merge::{commitment::AuxCommitment, hub::TokenHub};
+fn a_public_pools_miners_mine_their_own_roots() {
+    use super::merge::{
+        commitment::AuxCommitment,
+        hub::TokenHub,
+        split::{Slot, Split},
+    };
     use crate::donation::bch::{FeeMode, PoolFee};
     let directory = Arc::new(TestDirectory::new());
+    let proofs = directory.0.join("token-proofs.json");
     let hub = Arc::new(
         TokenHub::test_token(
             MiningNetwork::Chipnet,
-            directory.0.join("token-proofs.json"),
+            proofs.clone(),
             0x207f_ffff,
             Default::default(),
         )
@@ -1053,34 +1061,44 @@ fn a_public_pools_miners_mine_the_empty_commitment() {
         validations: 0,
         parent_time: None,
     }));
+    let operator = address(2);
     let public = super::payout::PublicPool {
         fee: Some(PoolFee {
             rate: "2".parse().unwrap(),
             mode: FeeMode::Coinbase,
         }),
-        address: address(2),
+        address: operator.clone(),
     };
     let server = Running::start_full(vec![node], directory.clone(), Some(public), Some(hub));
-    for (round, extended) in [false, true].into_iter().enumerate() {
-        let mut device = Device::connect_as(&server, extended, &address(3));
-        device.solve_and_submit(0);
-        server.wait(|stats| stats.blocks_accepted == round as u64 + 1);
+    let miner = address(3);
+    let mut device = Device::connect_as(&server, false, &miner);
+    device.solve_and_submit(0);
+    server.wait(|stats| stats.blocks_accepted == 1);
+    server.wait(|stats| !stats.recent_token_wins.is_empty());
+    let block: Block = {
         let node = server.node.lock().unwrap();
-        let block: Block =
-            consensus::deserialize(&hex::decode(node.submitted.last().unwrap()).unwrap()).unwrap();
-        let coinbase = &block.txdata[0];
-        assert_eq!(coinbase.output[0].value.to_sat(), 0);
-        assert_eq!(
-            coinbase.output[0].script_pubkey.as_bytes(),
-            AuxCommitment::EMPTY.script()
-        );
-        drop(node);
-        device.sender.close();
-    }
+        consensus::deserialize(&hex::decode(node.submitted.last().unwrap()).unwrap()).unwrap()
+    };
+    let output = &block.txdata[0].output[0];
+    assert_eq!(output.value.to_sat(), 0);
+    let root = AuxCommitment::parse_script(output.script_pubkey.as_bytes()).unwrap();
+    assert!(!root.is_empty());
     let stats = server.stats.lock().unwrap().clone();
-    assert_eq!(stats.token_wins, 0);
-    assert!(stats.recent_token_wins.is_empty());
-    assert!(!directory.0.join("token-proofs.json").exists());
+    assert_eq!(stats.token_wins, 1);
+    assert!(stats.tokens_off.is_none(), "{:?}", stats.tokens_off);
+    let saved: Value = serde_json::from_slice(&std::fs::read(&proofs).unwrap()).unwrap();
+    let entry = &saved["entries"][0];
+    assert_eq!(entry["status"], "proven");
+    let operator_script = crate::tx::cashaddr_to_p2pkh_locking(&operator).unwrap();
+    let donor =
+        crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(MiningNetwork::Chipnet))
+            .unwrap();
+    let split = Split::new(
+        Slot::new(100, &donor).unwrap(),
+        Slot::new(200, &operator_script).unwrap(),
+    );
+    assert_eq!(entry["split"], hex::encode(split.preimage()));
+    device.sender.close();
 }
 
 #[test]

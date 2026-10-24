@@ -439,7 +439,7 @@ fn golden_extended_coinbase_with_a_token() {
         .unwrap();
     assert_eq!(standard.bytes.len(), 143);
     assert_eq!(build(&[7; 20], None, policy).len(), 196);
-    // A public pool with a coinbase fee carries the empty commitment: 238.
+    // A public pool with a coinbase fee carries its miner's own root: 238.
     let operator = crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], network).unwrap();
     let fee = BchPayout {
         fee: Some(PoolFee {
@@ -450,10 +450,9 @@ fn golden_extended_coinbase_with_a_token() {
     };
     let public = build(&[7; 28], Some(&operator), fee);
     assert_eq!(public.len(), 238);
-    assert_eq!(
-        super::merge::commitment::output_zero(&public),
-        Some(&AuxCommitment::EMPTY.output()[..])
-    );
+    let root = AuxCommitment::parse(super::merge::commitment::output_zero(&public).unwrap());
+    assert!(root.is_some_and(|root| !root.is_empty()));
+    assert_ne!(public[204 - 53 - 4..], a[204 - 53 - 4..]);
 }
 
 /// #### merge-mining v2: the test token's root on the test template's

@@ -148,33 +148,57 @@ pub fn beneficiary(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
     }
 }
 
-/// #### merge-mining v2
-/// The payout the leaf of a merge-mined token without split support binds:
-/// the donation's script in the job's token donation work (BCH
-/// donation-work jobs and the others that bring that donation to the whole
-/// setting, see `BchPayout::token_donation_work`), the miner's otherwise.
-/// Never a public pool operator's. Split tokens carry their donation in the
-/// leaf's ext instead (`BchTemplate::aux_job`).
-pub fn token_payout(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
-    if policy.donation_work || policy.token_donation_work == Some(true) {
+// #### merge-mining v2: what a job's token leaves bind
+// What: a split token's leaf pays the miner with the donation's reward share
+// (two thirds of the miner's donation setting) in the donation slot and, on
+// a public pool, the operator's coinbase-mode fee share in the fee slot; a
+// work job's leaf pays its recipient whole with no split (the donation in
+// donation work, the operator in fee work). A token without split support
+// pays the miner, or the donation or operator in their token work
+// (`BchPayout::token_donation_work`, `BchPayout::token_fee_work`), with no
+// split.
+// Why: merge-mined tokens split as BCH does: the donation and the fee take
+// their coinbase share from each win and their work share as work.
+// Look here if: a token's leaf pays another recipient or split than the
+// BCH coinbase of the same job would.
+/// The payouts and split a job's token leaves bind, for the recipients
+/// `scripts` (`scripts()`'s: the miner, the donation and a public pool's
+/// operator) and the job's policy.
+pub fn leaf_terms(
+    scripts: &[Vec<u8>],
+    policy: BchPayout,
+) -> Result<super::merge::set::LeafTerms<'_>, String> {
+    use super::merge::split::{Slot, Split};
+    let operator = scripts.get(2);
+    let (payout, split) = if policy.donation_work {
+        (&scripts[1], Split::NONE)
+    } else if let (true, Some(operator)) = (policy.fee_work, operator) {
+        (operator, Split::NONE)
+    } else {
+        let donation = Slot::new(policy.donation.reward_bps(), &scripts[1]);
+        let fee = match (policy.fee, operator) {
+            (Some(fee), Some(operator)) => Slot::new(fee.reward_bps(), operator),
+            _ => Ok(Slot::EMPTY),
+        };
+        let split = Split::new(
+            donation.map_err(|error| error.to_string())?,
+            fee.map_err(|error| error.to_string())?,
+        );
+        (&scripts[0], split)
+    };
+    let plain = if policy.donation_work || policy.token_donation_work == Some(true) {
         &scripts[1]
     } else {
-        &scripts[0]
-    }
-}
-
-/// #### merge-mining v2
-/// The payout a split token's leaf binds: the donation's script in BCH
-/// donation-work jobs (the setting's work third), the miner's otherwise; the
-/// rest of the donation is the leaf's split. Unlike `token_payout` it never
-/// follows `token_donation_work`, which only tokens without split support
-/// take.
-pub fn split_token_payout(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
-    if policy.donation_work {
-        &scripts[1]
-    } else {
-        &scripts[0]
-    }
+        match operator {
+            Some(operator) if policy.fee_work || policy.token_fee_work == Some(true) => operator,
+            _ => &scripts[0],
+        }
+    };
+    Ok(super::merge::set::LeafTerms {
+        payout,
+        split,
+        plain_payout: plain,
+    })
 }
 
 #[cfg(test)]
@@ -280,9 +304,14 @@ mod tests {
         assert!(cashaddr_to_coinbase_locking("bchtest:qqqq").is_err());
     }
 
-    // #### merge-mining v2
+    // #### merge-mining v2: what a job's token leaves bind
+    // What: a miner job's split leaf pays the miner with the donation's
+    // reward share and the operator's coinbase share in its split; work jobs
+    // pay their recipient whole with no split; a token without split
+    // support pays the miner unless its token work says otherwise.
     #[test]
-    fn token_payout_is_the_miner_or_the_donation_never_the_fee() {
+    fn leaf_terms_follow_the_bch_split() {
+        use super::super::merge::split::{Slot, Split};
         use crate::donation::bch::{BchDonation, FeeMode};
         let network = MiningNetwork::Chipnet;
         let operator = crate::tx::cashaddr_with_version(1 << 3, &[0x33; 20], network);
@@ -292,33 +321,84 @@ mod tests {
             Some(&operator),
         )
         .unwrap();
-        let default = BchPayout::default();
-        for bps in (0..=10_000).step_by(500) {
+        let fee = |mode| {
+            Some(PoolFee {
+                rate: "2".parse().unwrap(),
+                mode,
+            })
+        };
+        let donation = |bps| Slot::new(bps, &scripts[1]).unwrap();
+        let operator_slot = |bps| Slot::new(bps, &scripts[2]).unwrap();
+        // The default donation, no fee: 1% to the donation.
+        let terms = leaf_terms(&scripts, BchPayout::default()).unwrap();
+        assert_eq!(terms.payout, &scripts[0][..]);
+        assert_eq!(terms.split, Split::new(donation(100), Slot::EMPTY));
+        assert_eq!(terms.plain_payout, &scripts[0][..]);
+        // A 2% fee: all of it in coinbase mode, two thirds in both, none in
+        // work mode; a miner at 0% donation has the fee slot alone.
+        for (mode, bps) in [
+            (FeeMode::Coinbase, 200),
+            (FeeMode::Both, 133),
+            (FeeMode::Work, 0),
+        ] {
             let policy = BchPayout {
-                donation: BchDonation::try_from(bps).unwrap(),
-                ..default
+                donation: BchDonation::try_from(0).unwrap(),
+                fee: fee(mode),
+                ..BchPayout::default()
             };
-            assert_eq!(token_payout(&scripts, policy), &scripts[0][..]);
+            let terms = leaf_terms(&scripts, policy).unwrap();
+            let expected = if bps == 0 {
+                Split::NONE
+            } else {
+                Split::new(Slot::EMPTY, operator_slot(bps))
+            };
+            assert_eq!(terms.split, expected, "{mode:?}");
         }
+        // Work jobs: their recipient whole, no split.
         let donation_job = BchPayout {
             donation_work: true,
-            ..default
+            fee: fee(FeeMode::Work),
+            ..BchPayout::default()
         };
-        assert_eq!(token_payout(&scripts, donation_job), &scripts[1][..]);
-        assert_eq!(beneficiary(&scripts, donation_job), &scripts[1][..]);
+        let terms = leaf_terms(&scripts, donation_job).unwrap();
+        assert_eq!(
+            (terms.payout, terms.split, terms.plain_payout),
+            (&scripts[1][..], Split::NONE, &scripts[1][..])
+        );
         let fee_job = BchPayout {
-            fee: Some(PoolFee {
-                rate: "2".parse().unwrap(),
-                mode: FeeMode::Work,
-            }),
             fee_work: true,
-            ..default
+            fee: fee(FeeMode::Work),
+            ..BchPayout::default()
         };
-        // BCH fee work pays the operator; a token never does.
-        assert_eq!(beneficiary(&scripts, fee_job), &scripts[2][..]);
-        assert_eq!(token_payout(&scripts, fee_job), &scripts[0][..]);
+        let terms = leaf_terms(&scripts, fee_job).unwrap();
+        assert_eq!(
+            (terms.payout, terms.split, terms.plain_payout),
+            (&scripts[2][..], Split::NONE, &scripts[2][..])
+        );
+        // A token without split support in its token work.
+        let token_donation = BchPayout {
+            token_donation_work: Some(true),
+            ..BchPayout::default()
+        };
+        assert_eq!(
+            leaf_terms(&scripts, token_donation).unwrap().plain_payout,
+            &scripts[1][..]
+        );
+        let token_fee = BchPayout {
+            fee: fee(FeeMode::Coinbase),
+            token_fee_work: Some(true),
+            ..BchPayout::default()
+        };
+        let terms = leaf_terms(&scripts, token_fee).unwrap();
+        assert_eq!(terms.plain_payout, &scripts[2][..]);
+        assert_eq!(terms.payout, &scripts[0][..]);
+        // Solo: no operator, never a fee.
+        let solo = super::scripts(network, &super::super::template_tests::payout(), None).unwrap();
+        let terms = leaf_terms(&solo, token_fee).unwrap();
+        assert_eq!(terms.split.fee_slot(), &Slot::EMPTY);
+        assert_eq!(terms.plain_payout, &solo[0][..]);
         // A zero-value coinbase pays the beneficiary, as before.
-        for policy in [default, donation_job, fee_job] {
+        for policy in [BchPayout::default(), donation_job, fee_job] {
             assert_eq!(
                 outputs(0, &scripts, policy),
                 vec![(0, beneficiary(&scripts, policy).to_vec())]

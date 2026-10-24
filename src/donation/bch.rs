@@ -210,6 +210,15 @@ impl PoolFee {
             FeeMode::Both => self.rate.reward_units(units),
         }
     }
+
+    /// #### merge-mining v2: the coinbase share as a rate in hundredths of a
+    /// percent, `reward_units(10_000)`: the whole rate in coinbase mode, none
+    /// in work mode, two thirds in both. A merge-mined token's fee slot takes
+    /// it from what the donation leaves of each win, as BCH's fee output
+    /// takes it from what the donation leaves of the reward.
+    pub fn reward_bps(self) -> u16 {
+        self.reward_units(10_000) as u16
+    }
 }
 
 /// Immutable policy attached to a job and its durable solved-block record.
@@ -232,6 +241,13 @@ pub struct BchPayout {
     /// instead (`merge::split`). It never changes the BCH amounts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_donation_work: Option<bool>,
+    /// #### merge-mining v2: as `token_donation_work`, for a public pool's
+    /// fee: `None` without a fee or a token without split support; otherwise
+    /// whether those tokens' leaves pay the operator. Such a token takes the
+    /// whole fee (of what its donation leaves) as this work: `Some(true)` on
+    /// every BCH fee-work job and on enough others to reach the full rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_fee_work: Option<bool>,
 }
 
 impl BchPayout {

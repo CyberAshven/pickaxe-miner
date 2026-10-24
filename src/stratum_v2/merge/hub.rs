@@ -368,10 +368,10 @@ fn states(win: &TokenWin) -> Vec<(Hash, Hash)> {
 
 // #### merge-mining v2: each entry's own payout
 // What: each won entry is claimed with the payout its own leaf binds, as
-// `BchTemplate::aux_job` chose it: a split token's
-// (`payout::split_token_payout`) or a token without split support's
-// (`payout::token_payout`), which differ in a job that pays the latter's
-// donation work; under Job Declaration both are the miner's own script.
+// `BchTemplate::aux_job` chose it (`payout::leaf_terms`): a split token's
+// or a token without split support's, which differ in a job that pays the
+// latter's token work; under Job Declaration both are the miner's own
+// script.
 // Why: one payout for the whole win failed the proof check of the other
 // kind of token in a mixed set and turned token claims off.
 // Look here if: a mixed set's win fails its own proof check.
@@ -381,22 +381,21 @@ fn states(win: &TokenWin) -> Vec<(Hash, Hash)> {
 fn claim_payouts(network: MiningNetwork, win: &TokenWin) -> Vec<(u16, Vec<u8>)> {
     // Other people's devices carry the empty commitment, so a public
     // pool's job never has a win to claim; refuse one all the same.
-    if win.operator.is_some() {
-        return Vec::new();
-    }
     let (split, plain) = match win.declared.as_deref() {
         Some(plan) => match plan.token_payout() {
             Some(miner) => (miner.to_vec(), miner.to_vec()),
             None => return Vec::new(),
         },
+        // #### merge-mining v2: on a public pool, the miner's own leaves
+        // (`payout::leaf_terms` with the operator).
         None => {
-            let Ok(scripts) = payout::scripts(network, &win.miner, None) else {
+            let Ok(scripts) = payout::scripts(network, &win.miner, win.operator.as_deref()) else {
                 return Vec::new();
             };
-            (
-                payout::split_token_payout(&scripts, win.payout).to_vec(),
-                payout::token_payout(&scripts, win.payout).to_vec(),
-            )
+            let Ok(terms) = payout::leaf_terms(&scripts, win.payout) else {
+                return Vec::new();
+            };
+            (terms.payout.to_vec(), terms.plain_payout.to_vec())
         }
     };
     win.entries

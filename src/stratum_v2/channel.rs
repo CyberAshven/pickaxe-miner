@@ -914,12 +914,12 @@ impl Channel {
     }
 
     /// #### merge-mining v2: the token floor this channel's device may mine
-    /// at on `template`: its token set's easiest target, for this server's
-    /// own devices only. A public pool's channel (it names an operator)
-    /// carries the empty commitment and a Job Declaration client's channel
-    /// at this pool mines the client's jobs, so neither gets one.
+    /// at on `template`: its token set's easiest target, for every device
+    /// that mines a root of its own (this server's, or a public pool
+    /// miner's). A Job Declaration client's channel at this pool mines the
+    /// client's jobs, so it gets none.
     pub fn floor_for(&self, template: &BchTemplate) -> Option<Hash> {
-        if self.operator.is_some() || self.custom_only {
+        if self.custom_only {
             return None;
         }
         template.tokens().map(|set| *set.easiest())
@@ -1771,22 +1771,23 @@ mod tests {
         }
     }
 
-    // #### merge-mining v2: pool and role rules
-    // What: a public pool's channels (they name an operator) carry the empty
-    // commitment as output 0, in every work job (miner, donation, fee),
-    // with no token floor and no win; the operator's own solo channel on
-    // the same template commits the token root.
-    // Look here if: a public pool's job carries a non-empty root, or a pool
-    // fee reaches tokens.
+    // #### merge-mining v2: per-miner roots on a public pool
+    // What: a public pool's channels commit a root of their miner's own: a
+    // miner job's leaf pays the miner with the donation's reward share and
+    // the coinbase-mode fee in its split; a donation-work job's pays the
+    // donation, a fee-work job's the operator, whole and with ext 0. A miner
+    // at donation=0 with a 2% coinbase-mode fee has the fee slot alone. Their
+    // devices get the token floor, and their shares win.
+    // Look here if: `payout::leaf_terms` or public pool roots change.
     #[test]
-    fn public_pool_jobs_carry_the_empty_commitment() {
-        use super::super::merge::commitment::AuxCommitment;
-        use crate::donation::bch::{FeeMode, PoolFee};
+    fn public_pool_miners_mine_their_own_roots() {
+        use super::super::merge::split::{Slot, Split};
+        use crate::donation::bch::{BchDonation, FeeMode, PoolFee};
         let network = MiningNetwork::Chipnet;
         let template = token_template(token_set(TOKEN_BITS));
         let operator = crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], network).unwrap();
         let other = crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x56; 20], network).unwrap();
-        let miner_job = BchPayout {
+        let work_fee = BchPayout {
             fee: Some(PoolFee {
                 rate: "2".parse().unwrap(),
                 mode: FeeMode::Work,
@@ -1794,90 +1795,88 @@ mod tests {
             ..BchPayout::default()
         };
         let plans = [
-            miner_job,
+            work_fee,
             BchPayout {
                 donation_work: true,
-                ..miner_job
+                ..work_fee
             },
             BchPayout {
                 fee_work: true,
-                ..miner_job
+                ..work_fee
             },
         ];
         for kind in [ChannelKind::Standard, ChannelKind::Extended] {
             for miner in [payout(), other.clone()] {
+                let scripts = scripts(&miner, Some(&operator));
                 let mut channel =
                     Channel::new(1, kind, vardiff_start(), [9; 12], network, &miner).unwrap();
                 channel.set_operator(Some(&operator)).unwrap();
-                assert_eq!(channel.floor_for(&template), None);
+                assert_eq!(
+                    channel.floor_for(&template),
+                    Some(*token_set(TOKEN_BITS).easiest())
+                );
                 for (id, policy) in (1u32..).zip(plans) {
                     let job = channel
                         .install_with_payout(id, 3, template.clone(), policy)
                         .unwrap()
                         .clone();
                     let aux = job.aux.as_ref().unwrap();
-                    assert!(aux.is_empty() && aux.commitment.is_empty());
-                    assert_eq!(aux.easiest, None);
-                    let tx: Transaction =
-                        consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
-                    assert_eq!(tx.output[0].value.to_sat(), 0);
-                    assert_eq!(
-                        tx.output[0].script_pubkey.as_bytes(),
-                        AuxCommitment::EMPTY.script()
-                    );
-                    // SV1 firmware and extended channels find it in the
-                    // suffix, after the sequence and the output count.
-                    assert_eq!(job.parts.suffix[5..58], AuxCommitment::EMPTY.output());
-                }
-                // No share wins anything.
-                for nonce in 0..64 {
-                    let mut input = share(nonce);
-                    input.job_id = 3;
-                    input.nonce = nonce;
-                    input.extranonce = device_extranonce(kind);
-                    if let Ok(share) = channel.check(input, 1700000010) {
-                        assert!(share.token_wins.is_empty() && share.token_win().is_none());
-                    }
+                    assert!(!aux.is_empty());
+                    let entry = &aux.entries[0];
+                    let (beneficiary, split) = if policy.donation_work {
+                        (&scripts[1], Split::NONE)
+                    } else if policy.fee_work {
+                        (&scripts[2], Split::NONE)
+                    } else {
+                        // Work mode: the fee is work, so no fee slot.
+                        (&scripts[0], Split::donation(100, &scripts[1]).unwrap())
+                    };
+                    assert_eq!(entry.leaf.payout_hash, double_sha256(beneficiary));
+                    assert_eq!(entry.split, split);
+                    assert_eq!(entry.leaf.ext, split.ext());
+                    // SV1 firmware and extended channels find the root in
+                    // the suffix, after the sequence and the output count.
+                    assert_eq!(job.parts.suffix[5..58], aux.output);
                 }
             }
         }
-        // The operator's own solo channel commits the token root.
-        let mut solo = channel_on(1, ChannelKind::Standard, template.clone());
-        assert_eq!(
-            solo.floor_for(&template),
-            Some(*token_set(TOKEN_BITS).easiest())
-        );
-        let aux = solo.job().unwrap().aux.clone().unwrap();
-        assert!(!aux.is_empty());
-        assert_eq!(
-            aux.entries[0].leaf.payout_hash,
-            double_sha256(&scripts(&payout(), None)[0])
-        );
-        assert!(solo.take_token_refusal().is_none());
-        // A job whose tokens the own-root check refused (no commitment)
-        // keeps no floor on a vardiff retarget; the next job's floor comes
-        // from its own template, so a refusal never outlives its job.
-        let easiest = *token_set(TOKEN_BITS).easiest();
-        assert_eq!(solo.job_floor(), Some(easiest));
-        solo.job.as_mut().unwrap().aux = None;
-        assert_eq!(solo.job_floor(), None);
-        assert_eq!(solo.floor_for(&template), Some(easiest));
-        solo.install_with_payout(4, 1, template.clone(), BchPayout::default())
+        // donation=0 and a 2% coinbase-mode fee: the fee slot alone.
+        let mut channel = Channel::new(
+            1,
+            ChannelKind::Standard,
+            vardiff_start(),
+            [9; 12],
+            network,
+            &payout(),
+        )
+        .unwrap();
+        channel.set_operator(Some(&operator)).unwrap();
+        channel.set_donation(Some(BchDonation::try_from(0).unwrap()));
+        let coinbase_fee = BchPayout {
+            fee: Some(PoolFee {
+                rate: "2".parse().unwrap(),
+                mode: FeeMode::Coinbase,
+            }),
+            ..BchPayout::default()
+        };
+        let job = channel
+            .install_with_payout(1, 3, template.clone(), coinbase_fee)
             .unwrap();
-        assert_eq!(solo.job_floor(), Some(easiest));
-        // A job issued at the floor and then refused takes the plain target
-        // too, so it accepts no token-floor shares.
-        let maximum = [0xff; 32];
-        solo.settle(&template.target, Some(&easiest), &maximum);
-        solo.install_with_payout(5, 1, template.clone(), BchPayout::default())
-            .unwrap();
-        // Stand in for an issued-at-the-floor target the plain one differs from.
-        solo.job.as_mut().unwrap().target = easiest;
-        solo.job.as_mut().unwrap().aux = None;
-        solo.drop_token_floor(&maximum);
-        assert_eq!(solo.job().unwrap().target, solo.target);
-        // Already plain: settling again without a floor changes nothing.
-        assert!(!solo.settle(&template.target, None, &maximum));
+        let entry = &job.aux.as_ref().unwrap().entries[0];
+        let scripts = scripts(&payout(), Some(&operator));
+        let fee_only = Split::new(Slot::EMPTY, Slot::new(200, &scripts[2]).unwrap());
+        assert_eq!(entry.split, fee_only);
+        assert_eq!(entry.leaf.ext, fee_only.ext());
+        assert_eq!(entry.leaf.payout_hash, double_sha256(&scripts[0]));
+        // Its shares win the token, and the proof verifies with that split.
+        let mut sequence = 0;
+        let (share, _) = submit_until_win(&mut channel, &mut sequence, &[]);
+        let win = share.token_win().unwrap();
+        let view = ClaimView {
+            ext: fee_only.ext(),
+            ..claim_view(&scripts)
+        };
+        verify_proof(&win.proof(0).unwrap(), &view).unwrap();
     }
 
     /// A target easier than any test share's hash, so every share is

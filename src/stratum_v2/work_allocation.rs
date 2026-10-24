@@ -87,6 +87,33 @@ impl WorkAllocation {
         )
     }
 
+    // #### merge-mining v2: a token without split support pays the fee in
+    // work
+    // What: on a public pool, a job with such a token has its leaves pay the
+    // operator on the whole fee's share of what the token's donation leaves
+    // ((1 − donation) × fee, at any fee mode): every BCH fee-work job, and
+    // enough other jobs to make up the rest. Without accepted shares it is
+    // the window right after the token donation's in each 10-minute cycle;
+    // with them, a balance of validated work on those jobs alone.
+    // Why: the operator's fee applies to tokens and the miner cannot remove
+    // it; without a split it can only be work.
+    // Look here if: such a token's fee jobs take more or less work than the
+    // fee.
+    /// Whether the job now pays a public pool's fee for tokens without split
+    /// support, after the token donation at `rate`.
+    pub fn merge_token_fee_work(
+        &self,
+        rate: BchDonation,
+        fee: crate::donation::bch::PoolFee,
+    ) -> bool {
+        if let Some(balance) = &self.balance {
+            return u16::from(fee.rate) != 0 && balance.token_fee_due();
+        }
+        let donation = rate.pool_work_units(PERIOD_NS);
+        let fee = fee.rate.pool_work_units(PERIOD_NS - donation);
+        (donation..donation + fee).contains(&self.position)
+    }
+
     // #### PR #48: validated work, not elapsed time, repays BCH work quotas.
     // Old jobs keep their own rates and recipient, including late valid shares.
     pub fn accepted(
@@ -111,6 +138,16 @@ impl WorkAllocation {
             let rate = f64::from(u16::from(payout.donation)) / 10_000.0;
             let donated = token_work || payout.donation_work;
             balance.token += balance.share * (rate - f64::from(u8::from(donated)));
+        }
+        // #### merge-mining v2: and the fee at its whole rate, of what the
+        // whole donation leaves (see `merge_token_fee_work`).
+        if let (Some(token_work), Some(fee), Some(balance)) =
+            (payout.token_fee_work, payout.fee, &mut self.balance)
+        {
+            let donation = f64::from(u16::from(payout.donation)) / 10_000.0;
+            let rate = (1.0 - donation) * f64::from(u16::from(fee.rate)) / 10_000.0;
+            let charged = token_work || payout.fee_work;
+            balance.token_fee += balance.share * (rate - f64::from(u8::from(charged)));
         }
     }
 
@@ -143,6 +180,7 @@ impl WorkAllocation {
             donation: 0.0,
             fee: 0.0,
             token: 0.0,
+            token_fee: 0.0,
             phase,
             share: hashes,
         });
@@ -170,6 +208,8 @@ struct WorkBalance {
     fee: f64,
     /// #### merge-mining v2: the merge-mined token donation's balance.
     token: f64,
+    /// #### merge-mining v2: and a public pool fee's, for the same tokens.
+    token_fee: f64,
     // #### PR #48: the randomized startup phase is a fraction of the latest
     // share, not of the first. Vardiff can ease the target far below the
     // start difficulty; an offset fixed in first-share hashes would then
@@ -189,6 +229,10 @@ impl WorkBalance {
 
     fn token_due(&self) -> bool {
         self.token > self.phase * self.share
+    }
+
+    fn token_fee_due(&self) -> bool {
+        self.token_fee > (1.0 - self.phase) * self.share
     }
 }
 
@@ -222,6 +266,7 @@ mod tests {
                     fee: Some(fee),
                     fee_work: !allocation.donation_work(rate) && allocation.fee_work(rate, fee),
                     token_donation_work: None,
+                    token_fee_work: None,
                 };
                 let work = super::super::telemetry::expected_hashes(&target);
                 total += work;
@@ -274,6 +319,7 @@ mod tests {
                     fee: Some(fee),
                     fee_work: !donation_work && allocation.fee_work(rate, fee),
                     token_donation_work: None,
+                    token_fee_work: None,
                 };
                 let work = super::super::telemetry::expected_hashes(target);
                 donated += if payout.donation_work { work } else { 0.0 };
@@ -298,6 +344,62 @@ mod tests {
     // stays a third of it; before any share, the token window is the first
     // `rate` of the cycle and holds BCH's.
     // Look here if: `merge_token_donation_work` or the token balance changes.
+    // #### merge-mining v2: a token without split support pays the fee in
+    // work
+    // What: on a public pool with a 2% fee (coinbase mode), such a token's
+    // leaves pay the operator on the whole fee's share of what its 1.5%
+    // donation leaves, while its donation work stays the whole 1.5%.
+    // Look here if: `merge_token_fee_work` or the token fee balance changes.
+    #[test]
+    fn a_public_pool_fee_reaches_tokens_without_split_support_as_work() {
+        use crate::donation::bch::{BchPayout, FeeMode, PoolFee};
+        let rate = BchDonation::default();
+        let fee = PoolFee {
+            rate: "2".parse().unwrap(),
+            mode: FeeMode::Coinbase,
+        };
+        let mut allocation = WorkAllocation::new(PERIOD_NS / 7);
+        let (mut total, mut donated, mut charged) = (0.0, 0.0, 0.0);
+        for n in 0..100_000u64 {
+            let mut target = [255; 32];
+            target[31] >>= (n / 137) % 5;
+            let donation_work = allocation.donation_work(rate);
+            let token_donation = donation_work || allocation.merge_token_donation_work(rate);
+            let payout = BchPayout {
+                donation: rate,
+                donation_work,
+                fee: Some(fee),
+                token_donation_work: Some(token_donation),
+                token_fee_work: Some(!token_donation && allocation.merge_token_fee_work(rate, fee)),
+                ..BchPayout::default()
+            };
+            let work = super::super::telemetry::expected_hashes(&target);
+            total += work;
+            if payout.token_donation_work == Some(true) {
+                donated += work;
+            }
+            if payout.token_fee_work == Some(true) {
+                charged += work;
+            }
+            allocation.accepted(&target, payout);
+        }
+        assert!(
+            (donated / total - 0.015).abs() < 0.0001,
+            "{}",
+            donated / total
+        );
+        let fee_share = (1.0 - 0.015) * 0.02;
+        assert!(
+            (charged / total - fee_share).abs() < 0.0001,
+            "{}",
+            charged / total
+        );
+        // Before any share: the window right after the token donation's.
+        let donation = rate.pool_work_units(PERIOD_NS);
+        assert!(!WorkAllocation::new(donation - 1).merge_token_fee_work(rate, fee));
+        assert!(WorkAllocation::new(donation).merge_token_fee_work(rate, fee));
+    }
+
     #[test]
     fn merge_mined_token_donation_work_is_the_whole_configured_rate() {
         use crate::donation::bch::BchPayout;

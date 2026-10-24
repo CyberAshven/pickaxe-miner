@@ -2026,9 +2026,10 @@ fn connect_text(page: &ConnectPage) -> String {
         ServeMode::Public => {
             "\nUsername: the miner's own BCH address (q or p; the prefix may be left out), \
              optionally followed by .name; the blocks they find pay it. SV2 devices give it \
-             as their user identity.\nMerge-mined tokens: miners' jobs carry the empty \
-             commitment, so no token root of yours sits on their devices and the pool fee \
-             never reaches tokens.\n"
+             as their user identity. Adding ,donation=<percent> (0 to 100 in 0.5% steps) \
+             sets that miner's own Pickaxe donation.\nMerge-mined tokens: each miner mines \
+             a root of their own; its token wins pay them, minus their donation and your fee \
+             as each token allows.\n"
         }
         // #### PR #42: with Job Declaration, this node builds the blocks.
         ServeMode::JoinPool if page.job_declaration => {

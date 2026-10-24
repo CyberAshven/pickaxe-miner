@@ -848,10 +848,16 @@ impl BchTemplate {
         let Some(set) = self.tokens.as_ref() else {
             return Ok(None);
         };
-        if operator.is_some() {
-            return Ok(Some(AuxJob::empty()));
-        }
-        let scripts = super::payout::scripts(network, payout, None)?;
+        // #### merge-mining v2: per-miner roots on a public pool
+        // What: a public pool's job (it names an operator) commits a root
+        // of its miner's own: each leaf binds the miner's payout, and its
+        // split carries the miner's donation choice and the operator's fee;
+        // donation-work and fee-work jobs pay their recipient whole.
+        // Why: the operator's fee applies to tokens as to BCH and the miner
+        // cannot remove it, while the donation is the miner's choice.
+        // Look here if: a public pool miner's leaf names another payout or
+        // split than their BCH coinbase.
+        let scripts = super::payout::scripts(network, payout, operator)?;
         // #### merge-mining v2: the donation's split
         // What: a miner job's split leaves pay the miner with the donation
         // setting's block-reward share (1% at the 1.5% default) in the
@@ -862,16 +868,7 @@ impl BchTemplate {
         // win, one third as work.
         // Look here if: a token's donation differs from BCH's at the same
         // setting.
-        let split = if policy.donation_work {
-            Split::NONE
-        } else {
-            Split::donation(policy.donation.reward_bps(), &scripts[1]).map_err(|e| e.to_string())?
-        };
-        let terms = LeafTerms {
-            payout: super::payout::split_token_payout(&scripts, policy),
-            split,
-            plain_payout: super::payout::token_payout(&scripts, policy),
-        };
+        let terms = super::payout::leaf_terms(&scripts, policy)?;
         Ok(Some(AuxJob::build(set, &terms)))
     }
 

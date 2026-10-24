@@ -2002,19 +2002,19 @@ impl JobAvailability {
             // #### PR #42: a token's donation is all work (see
             // `WorkAllocation::token_donation_work`).
             let p2pool = matches!(donation, JobDonation::P2Pool(_));
-            // #### merge-mining v2: a job that merge-mines this server's own
-            // tokens (solo: no Job Declaration plan, not a public pool), one
-            // of which has no split support, pays that token's donation in
-            // work at the whole rate (see
-            // `WorkAllocation::merge_token_donation_work`). Split tokens take
-            // two thirds from each win and only BCH's donation work.
+            // #### merge-mining v2: a job that merge-mines a root of its own
+            // (solo, or a public pool miner's; not under Job Declaration)
+            // with a token without split support pays that token's donation,
+            // and a public pool's fee, in work at the whole rate (see
+            // `WorkAllocation::merge_token_donation_work` and
+            // `merge_token_fee_work`). Split tokens take their coinbase share
+            // from each win and only BCH's work share.
             let merged = matches!(donation, JobDonation::Bch(_))
                 && job
                     .template
                     .tokens()
                     .is_some_and(|set| set.entries().iter().any(|entry| !entry.token.split))
-                && job.template.jd_plan().is_none()
-                && !mining.is_public();
+                && job.template.jd_plan().is_none();
             let (donation, donation_work) = match donation {
                 JobDonation::Bch(rate) => (rate, self.allocation.donation_work(rate)),
                 // #### PR #65: see `donation_readiness`.
@@ -2037,6 +2037,21 @@ impl JobAvailability {
                     && fee.is_some_and(|fee| self.allocation.fee_work(donation, fee)),
                 token_donation_work: merged
                     .then(|| donation_work || self.allocation.merge_token_donation_work(donation)),
+                token_fee_work: None,
+            };
+            // The token's fee work, when its donation work does not take
+            // the job.
+            let token_fee_work = match (merged, fee) {
+                (true, Some(fee)) => Some(
+                    payout.fee_work
+                        || (payout.token_donation_work != Some(true)
+                            && self.allocation.merge_token_fee_work(donation, fee)),
+                ),
+                _ => None,
+            };
+            let payout = BchPayout {
+                token_fee_work,
+                ..payout
             };
             let published = job.clone();
             if donation_work && p2pool {
@@ -2867,7 +2882,7 @@ mod retry_tests {
             );
             assert_eq!(entry.split, split, "{seconds}");
         }
-        // A public pool's jobs take no token donation work.
+        // A public pool's miner takes it too, at their own donation.
         let mut public = session();
         public.set_public(Some(super::super::payout::PublicPool {
             fee: None,
@@ -2889,7 +2904,7 @@ mod retry_tests {
                 .unwrap()
                 .payout
                 .token_donation_work,
-            None
+            Some(true)
         );
     }
 
