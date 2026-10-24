@@ -160,10 +160,12 @@ pub fn run(
     // #### PR #42: template providers, tried before the nodes, told the
     // coinbase bytes this server may add (with the test token's when asked
     // for; its registry row decides the network, so mainnet refuses it).
-    let (providers, test_token) = match &action {
+    let (providers, test_token, claim_delay, safa_deployment) = match &action {
         StratumV2Command::Serve {
             template_provider,
             merge_test_token,
+            claim_delay,
+            safa_deployment,
             ..
         } => (
             template_provider
@@ -171,16 +173,79 @@ pub fn run(
                 .map(|text| super::tdp::client::TdpAddress::parse(text))
                 .collect::<Result<Vec<_>, _>>()?,
             *merge_test_token,
+            claim_delay
+                .as_deref()
+                .map(super::merge::hub::ClaimDelay::parse)
+                .transpose()?
+                .unwrap_or_default(),
+            safa_deployment.clone(),
         ),
-        _ => (Vec::new(), None),
+        _ => (Vec::new(), None, Default::default(), None),
     };
-    let tokens = match test_token {
-        Some(difficulty) => Some(Arc::new(super::merge::hub::TokenHub::test_token(
+    // #### merge-mining v2: the tSAFA gate
+    // What: tSAFA is merge-mined only from an explicit deployment file
+    // (`--safa-deployment`), on Chipnet, with this server's own templates;
+    // mainnet, a pool and the test token beside it are refused, and the
+    // setup never offers it.
+    // Why: tSAFA is for testing the claim path; no SAFA token is mined on
+    // mainnet, and at a pool the pool builds the coinbase (a Pickaxe pool's
+    // Job Declaration check knows no tSAFA row).
+    // Look here if: tSAFA starts without its file, or anywhere but
+    // Chipnet.
+    let tokens = match (test_token, safa_deployment) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "--safa-deployment and --merge-test-token are one token each; use one".into(),
+            )
+        }
+        (Some(difficulty), None) => Some(Arc::new(super::merge::hub::TokenHub::test_token(
             config.network,
             config_path.with_extension("sv2-token-proofs.json"),
             super::merge::hub::bits_for_difficulty(difficulty)?,
+            claim_delay,
         )?)),
-        None => None,
+        (None, Some(path)) => {
+            if config.network != config::MiningNetwork::Chipnet {
+                return Err(
+                    "--safa-deployment is Chipnet only: tSAFA is a test token, and no SAFA token is mined on mainnet"
+                        .into(),
+                );
+            }
+            if !pools.is_empty() {
+                return Err(
+                    "--safa-deployment mines this server's own templates (solo or --public), not at a pool"
+                        .into(),
+                );
+            }
+            // #### merge-mining v2: every tSAFA claim output pays a script
+            // of at most 35 bytes (P2PKH, P2SH20, P2SH32), as the covenant
+            // checks: the payout, the donation and a public pool's fee
+            // address must fit (an operator whose fee script did not could
+            // not take tSAFA's fee slot). CashAddr scripts always do.
+            let scripts = super::payout::scripts(
+                config.network,
+                &config.payout_address,
+                public.as_ref().map(|pool| pool.address.as_str()),
+            )?;
+            if scripts
+                .iter()
+                .any(|script| script.len() > super::merge::safa_auxpow::MAX_PAYOUT_SCRIPT)
+            {
+                return Err(
+                    "tSAFA claims pay scripts of at most 35 bytes; the payout, donation or pool fee address is longer"
+                        .into(),
+                );
+            }
+            let deployment = super::merge::safa_auxpow::Deployment::load(&path)?;
+            Some(Arc::new(super::merge::hub::TokenHub::safa(
+                config.network,
+                config_path.with_extension("sv2-token-proofs.json"),
+                deployment,
+                claim_delay,
+                config.electrum_endpoints(),
+            )?))
+        }
+        (None, None) => None,
     };
     // #### PR #42: an ASIC-exclusive token instead of BCH
     // What: `--asic-test-token` mines the Chipnet ASIC test token's simulated
@@ -210,7 +275,7 @@ pub fn run(
         )?)),
         _ => None,
     };
-    let reserve = super::tdp::reserve(tokens.as_ref().and_then(|hub| hub.current()).as_deref());
+    let reserve = super::tdp::reserve_for(tokens.is_some());
     let node = if (pools.is_empty() || declaring) && header_work.is_none() {
         Some(preflight_sources(config, &providers, reserve)?)
     } else {
@@ -499,6 +564,11 @@ pub fn run(
                 p2pool_prepare_api: p2pool_prepare_api.clone(),
                 required: p2pool_prepare_api.is_some()
                     || job_declaration.is_some_and(|mode| mode.requires_own_templates()),
+                // #### merge-mining v2: the miner's donation at a Pickaxe
+                // pool, never at BCH P2Pool (see `JdTarget::login`).
+                pickaxe_donation: (p2pool_prepare_api.is_none()
+                    && !super::sv1::names_donation(&pool.identity))
+                .then(|| donation.clone()),
             })
             .collect();
         if p2pool_prepare_api.is_some() {
@@ -584,6 +654,10 @@ pub fn run(
                 }),
                 header_work: header_work.clone(),
                 node_zmq: node_zmq.clone(),
+                // #### merge-mining v2: a public pool's leaf log.
+                leaf_log_path: public
+                    .as_ref()
+                    .map(|_| config_path.with_extension("sv2-leaves.jsonl")),
                 #[cfg(test)]
                 allocation_phase: None,
             };
@@ -1379,10 +1453,12 @@ fn started_text(started: &Started) -> String {
     text
 }
 
-/// The donation as the dashboard shows it, with its two parts.
+/// The donation as the dashboard shows it, with its two parts; (####
+/// merge-mining v2) merge-mined tokens split the same way, the reward part
+/// from each win.
 fn donation_summary(donation: BchDonation) -> String {
     let (work, reward) = donation.shares();
-    format!("{donation} ({work} of work · {reward} of block rewards)")
+    format!("{donation} ({work} of work · {reward} of block rewards and token wins)")
 }
 
 /// Advanced settings: the donation, adjustable from 0% to 100%.
@@ -1403,8 +1479,9 @@ fn render_advanced(
         )
     } else {
         format!(
-            "{work} of mining work and {reward} of each block reward go to the Pickaxe donation \
-             address."
+            "{work} of mining work and {reward} of each block reward and merge-mined token win \
+             go to the Pickaxe donation address. A token whose covenant takes no split gives \
+             the whole {donation} as mining work instead."
         )
     };
     let mut text = format!(
@@ -2014,21 +2091,25 @@ fn connect_text(page: &ConnectPage) -> String {
         ServeMode::Public => {
             "\nUsername: the miner's own BCH address (q or p; the prefix may be left out), \
              optionally followed by .name; the blocks they find pay it. SV2 devices give it \
-             as their user identity.\n"
+             as their user identity. Adding ,donation=<percent> (0 to 100 in 0.5% steps) \
+             sets that miner's own Pickaxe donation.\nMerge-mined tokens: each miner mines \
+             a root of their own; its token wins pay them, minus their donation and your fee \
+             as each token allows.\n"
         }
         // #### PR #42: with Job Declaration, this node builds the blocks.
         ServeMode::JoinPool if page.job_declaration => {
             "\nUsername: any name for the device; it names the device on the workers page. \
              This computer mines at the pool for you with your node's templates (Job \
              Declaration), and the pool's own jobs while the pool refuses them.\nMerge-mined \
-             tokens: on while your templates are mined; your node builds the blocks, and \
-             token wins pay your payout address.\n"
+             tokens: on while your templates are mined; your node builds the blocks, token \
+             wins pay your payout address, and only shares that meet the pool's target go to \
+             the pool.\n"
         }
         ServeMode::JoinPool => {
             "\nUsername: any name for the device; it names the device on the workers page. \
              This computer mines at the pool for you.\nMerge-mined tokens are off at a pool: \
              the pool builds the blocks, so this computer cannot add token commitments. Mine \
-             solo or run your own pool to merge-mine.\n"
+             solo, or at a pool with Job Declaration, to merge-mine.\n"
         }
     });
     // #### PR #42: where miners' own templates go.
@@ -2251,9 +2332,11 @@ fn status_json(
             "wins": snapshot.token_wins,
             "dropped": snapshot.token_wins_dropped,
             "off": snapshot.tokens_off,
+            "refused": snapshot.tokens_refused,
+            // #### merge-mining v2: tSAFA's claims, as counts.
+            "claims": snapshot.token_claims.as_ref().map(token_claims_json),
             "recent": snapshot.recent_token_wins.iter().map(|win| serde_json::json!({
                 "token": win.token,
-                "mode": win.mode.to_string(),
                 "height": win.height,
                 "worker": win.worker,
                 "seconds_ago": win.found.elapsed().as_secs(),
@@ -2914,6 +2997,21 @@ fn work_line(stats: &ServerStats, pool: bool) -> String {
     }
 }
 
+/// #### merge-mining v2: tSAFA's claim counts for the status file (never an
+/// address or a script).
+fn token_claims_json(claims: &super::merge::hub::ClaimCounts) -> serde_json::Value {
+    serde_json::json!({
+        "token": claims.token,
+        "vaults": claims.vaults,
+        "waiting": claims.waiting,
+        "sent": claims.sent,
+        "confirmed": claims.confirmed,
+        "lost": claims.lost,
+        "failed": claims.failed,
+        "error": claims.error,
+    })
+}
+
 fn records_line(stats: &ServerStats) -> String {
     let best = stats
         .best_share
@@ -2939,10 +3037,10 @@ fn records_line(stats: &ServerStats) -> String {
     let tokens = match (&stats.tokens_off, stats.recent_token_wins.back()) {
         (Some(off), _) => format!(" · Tokens off: {off}"),
         (None, Some(last)) => format!(
-            " · Token wins {} (last: {} case {} by {}{})",
+            " · Token wins {} (last: {} at #{} by {}{})",
             stats.recent_token_wins.len(),
             last.token,
-            last.mode,
+            last.height,
             last.worker,
             if stats.token_wins_dropped > 0 {
                 format!("; {} dropped", stats.token_wins_dropped)
@@ -2951,6 +3049,31 @@ fn records_line(stats: &ServerStats) -> String {
             }
         ),
         (None, None) => String::new(),
+    };
+    // #### merge-mining v2: a job whose coinbase failed the own-root check
+    // mines BCH alone; the dashboard says why.
+    let tokens = match stats.tokens_refused {
+        Some(reason) => format!("{tokens} · Token merge mining refused for a job: {reason}"),
+        None => tokens,
+    };
+    // #### merge-mining v2: tSAFA's claims.
+    let tokens = match &stats.token_claims {
+        Some(claims) => format!(
+            "{tokens} · {} claims: {} confirmed, {} sent, {} waiting, {} lost, {} failed ({} vaults){}",
+            claims.token,
+            claims.confirmed,
+            claims.sent,
+            claims.waiting,
+            claims.lost,
+            claims.failed,
+            claims.vaults,
+            claims
+                .error
+                .as_deref()
+                .map(|error| format!("; {error}"))
+                .unwrap_or_default()
+        ),
+        None => tokens,
     };
     // #### PR #42: an ASIC-exclusive token's wins.
     let header = stats
@@ -3268,24 +3391,50 @@ mod tests {
         stats.token_wins_dropped = 1;
         stats.recent_token_wins.push_back(server::FoundTokenWin {
             token: "Pickaxe test token",
-            mode: 'A',
             height: 325_909,
             worker: "rig1 #1".into(),
             found: Instant::now(),
         });
         let line = records_line(&stats);
         assert!(
-            line.contains("Token wins 1 (last: Pickaxe test token case A by rig1 #1; 1 dropped)"),
+            line.contains(
+                "Token wins 1 (last: Pickaxe test token at #325909 by rig1 #1; 1 dropped)"
+            ),
             "{line}"
         );
         let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
         assert_eq!(status["tokens"]["wins"], 2);
         assert_eq!(status["tokens"]["dropped"], 1);
-        assert_eq!(status["tokens"]["recent"][0]["mode"], "A");
         assert_eq!(status["tokens"]["recent"][0]["height"], 325_909);
+        assert!(status["tokens"]["refused"].is_null());
+        // #### merge-mining v2: a job refused by the own-root check.
+        stats.tokens_refused = Some("output 0 is not this server's token commitment");
+        assert!(records_line(&stats).contains(
+            "Token merge mining refused for a job: output 0 is not this server's token commitment"
+        ));
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(
+            status["tokens"]["refused"],
+            "output 0 is not this server's token commitment"
+        );
+        // #### merge-mining v2: tSAFA's claims.
+        stats.token_claims = Some(crate::stratum_v2::merge::hub::ClaimCounts {
+            token: "tSAFA",
+            vaults: 4,
+            waiting: 1,
+            sent: 2,
+            confirmed: 3,
+            lost: 1,
+            failed: 0,
+            error: None,
+        });
+        assert!(records_line(&stats)
+            .contains("tSAFA claims: 3 confirmed, 2 sent, 1 waiting, 1 lost, 0 failed (4 vaults)"));
+        let status = status_json("chipnet", None, None, &stats, BchDonation::default(), &[]);
+        assert_eq!(status["tokens"]["claims"]["confirmed"], 3);
         stats.tokens_off = Some("token proofs cannot be saved: disk full".into());
         assert!(records_line(&stats).contains("Tokens off: token proofs cannot be saved"));
-        assert!(super::super::status_report().contains("merge mining: commitment v1 (draft)"));
+        assert!(super::super::status_report().contains("merge mining: common format v2"));
     }
 
     // #### PR #42
@@ -4194,7 +4343,7 @@ mod tests {
         .unwrap();
         let header = measured.header(measured.updated);
         assert!(
-            header.contains("block rewards) · 0.50% of work so far · Live"),
+            header.contains("token wins) · 0.50% of work so far · Live"),
             "{header}"
         );
         // In pool mode the measured share is the work the pool acknowledged,
@@ -4292,14 +4441,14 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         assert_eq!(
             donation_summary(BchDonation::default()),
-            "1.50% (0.50% of work · 1.00% of block rewards)"
+            "1.50% (0.50% of work · 1.00% of block rewards and token wins)"
         );
         let two: BchDonation = "2".parse().unwrap();
         assert_eq!(
             donation_summary(two),
-            "2.00% (0.67% of work · 1.34% of block rewards)"
+            "2.00% (0.67% of work · 1.34% of block rewards and token wins)"
         );
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
         terminal
             .draw(|f| {
                 render_advanced(

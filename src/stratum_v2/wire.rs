@@ -92,6 +92,19 @@ pub struct MiningSession {
     groups: BTreeMap<u32, Group>,
     /// #### PR #42: the server mines a token that fixes the version slot.
     fixed_version: bool,
+    /// #### merge-mining v2: why token merge mining was refused for a job
+    /// (the own-root check), taken by the server for the dashboard.
+    pub token_refusal: Option<&'static str>,
+    /// #### merge-mining v2: on a public pool, the donation choice of this
+    /// connection's logins (`None` inside: the pool's setting), fixed by its
+    /// first channel.
+    donation_choice: Option<Option<crate::donation::bch::BchDonation>>,
+    /// #### merge-mining v2: the client asked for the merge-mining
+    /// disclosure extension (`merge::disclosure`).
+    merge_disclosure: bool,
+    /// #### merge-mining v2: leaf log lines (JSON) for jobs on a public
+    /// pool's standard channels, taken by the server for its leaf log.
+    pub leaf_log: Vec<String>,
 }
 
 pub struct Responses {
@@ -147,7 +160,69 @@ impl MiningSession {
             grouping: false,
             groups: BTreeMap::new(),
             fixed_version: false,
+            token_refusal: None,
+            donation_choice: None,
+            merge_disclosure: false,
+            leaf_log: Vec::new(),
         })
+    }
+
+    // #### merge-mining v2: disclosure to miners
+    // What: after a job reaches a channel whose job commits a non-empty
+    // root, a client that negotiated the extension gets its JobLeaves frame;
+    // a public pool's standard channel (whose device cannot take the frame)
+    // gets a leaf log line instead.
+    // Why: miners on someone else's pool can check their leaves; an
+    // operator can publish the log for standard-channel devices.
+    // Look here if: leaves are missing after a job, or sent to a client
+    // that never asked for them.
+    /// The disclosure of `channel`'s current job: its frame for a client
+    /// that asked, its log line on a public pool's standard channel.
+    fn disclose(&mut self, channel: u32) -> Result<Option<SerializedFrame>, String> {
+        use super::merge::disclosure::{Disclosure, JobLeaves, EXTENSION, JOB_LEAVES};
+        let Some(channel) = self.channels.get(&channel) else {
+            return Ok(None);
+        };
+        let Some(job) = channel.job() else {
+            return Ok(None);
+        };
+        let Some(aux) = job.aux.as_deref().filter(|aux| !aux.is_empty()) else {
+            return Ok(None);
+        };
+        if self.public.is_some() && channel.kind == ChannelKind::Standard {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            self.leaf_log.push(
+                serde_json::json!({
+                    "time": now,
+                    "channel": channel.id,
+                    "job": job.id,
+                    "output0": hex::encode(aux.output),
+                    "leaves": hex::encode(Disclosure::from_job(aux).encode()),
+                })
+                .to_string(),
+            );
+        }
+        if !self.merge_disclosure {
+            return Ok(None);
+        }
+        let leaves = JobLeaves::from_job(channel.id, job.id, aux);
+        extension_frame(EXTENSION, JOB_LEAVES, true, &leaves.encode()).map(Some)
+    }
+
+    // #### merge-mining v2: one donation choice per connection
+    // What: a public pool connection's first channel fixes its donation
+    // choice (its login's `,donation=`, or none for the pool's setting); a
+    // later channel whose login chooses otherwise is refused with
+    // `donation-mismatch`.
+    // Why: the work allocation that makes donation-work jobs runs per
+    // connection, at one rate; a proxy carrying miners with different
+    // choices would otherwise donate at the wrong rate for some of them.
+    // Look here if: a proxy's channels are refused with donation-mismatch.
+    /// The donation this connection's miners chose, if they chose one.
+    pub fn donation_choice(&self) -> Option<crate::donation::bch::BchDonation> {
+        self.donation_choice.flatten()
     }
 
     /// #### PR #42: the server mines a token that fixes the version slot:
@@ -270,15 +345,28 @@ impl MiningSession {
             // template, back up to the share difficulty. SetTarget precedes
             // the job so the job carries the new target.
             // #### PR #42: and floor it at the easiest merge-mined token
-            // target, within 15 times vardiff's (see `Channel::settle`).
-            let tokens = template.tokens().and_then(|set| set.easiest_a());
-            if channel.settle(&template.target, tokens, maximum) {
+            // target, within 15 times vardiff's (see `Channel::settle`), on
+            // this server's own devices only (`Channel::floor_for`).
+            let tokens = channel.floor_for(&template);
+            if channel.settle(&template.target, tokens.as_ref(), maximum) {
                 frames.push(mining(Mining::SetTarget(SetTarget {
                     channel_id: channel.id,
                     maximum_target: (&channel.target).into(),
                 }))?);
             }
             channel.install_with_payout(id, generation, template.clone(), payout)?;
+            if let Some(reason) = channel.take_token_refusal() {
+                self.token_refusal = Some(reason);
+                // The job mines BCH alone: drop the token floor (the job's
+                // own target too) before it goes out, so firmware sends no
+                // shares that cannot win.
+                if tokens.is_some() && channel.drop_token_floor(maximum) {
+                    frames.push(mining(Mining::SetTarget(SetTarget {
+                        channel_id: channel.id,
+                        maximum_target: (&channel.target).into(),
+                    }))?);
+                }
+            }
             if broadcast.contains(&channel.id) {
                 immediates.insert(channel.id, immediate);
                 continue;
@@ -297,6 +385,11 @@ impl MiningSession {
                 &immediates,
             )?);
         }
+        // #### merge-mining v2: each channel's leaves after its job.
+        let ids: Vec<u32> = self.channels.keys().copied().collect();
+        for id in ids {
+            frames.extend(self.disclose(id)?);
+        }
         Ok(frames)
     }
 
@@ -307,6 +400,7 @@ impl MiningSession {
     /// counter; the previous job stays valid for work in flight.
     pub fn retarget(&mut self, next_id: &mut u32) -> Result<Vec<SerializedFrame>, String> {
         let mut frames = Vec::new();
+        let mut retargeted = Vec::new();
         for channel in self.channels.values_mut() {
             let maximum = self
                 .maximum_targets
@@ -334,13 +428,58 @@ impl MiningSession {
                 maximum_target: (&target).into(),
             }))?);
             channel.install_with_payout(*next_id, generation, template, payout)?;
+            if let Some(reason) = channel.take_token_refusal() {
+                self.token_refusal = Some(reason);
+            }
             frames.extend(job_frames(channel, true)?);
+            retargeted.push(channel.id);
+        }
+        // #### merge-mining v2: each new job's leaves.
+        for id in retargeted {
+            frames.extend(self.disclose(id)?);
         }
         Ok(frames)
     }
 
     pub fn receive(&mut self, mut frame: SerializedFrame, now: u32) -> Result<Responses, String> {
         let header = frame.header();
+        // #### merge-mining v2: the extensions negotiation (type 0x0001):
+        // the disclosure extension is granted when asked for, every other
+        // extension left out of the answer.
+        if header.ext_type_without_channel_msg() == super::merge::disclosure::NEGOTIATION
+            && header.msg_type() == super::merge::disclosure::REQUEST_EXTENSIONS
+            && !header.channel_msg()
+        {
+            use super::merge::disclosure::{
+                extensions_payload, requested_extensions, EXTENSION, NEGOTIATION,
+                REQUEST_EXTENSIONS_SUCCESS,
+            };
+            if self.setup_flags.is_none() {
+                return Err("extensions requested before setup".into());
+            }
+            let (request, asked) =
+                requested_extensions(frame.payload()).ok_or("malformed extensions request")?;
+            let granted: Vec<u16> = asked
+                .into_iter()
+                .filter(|extension| *extension == EXTENSION)
+                .collect();
+            self.merge_disclosure |= !granted.is_empty();
+            return Ok(Responses {
+                frames: vec![extension_frame(
+                    NEGOTIATION,
+                    REQUEST_EXTENSIONS_SUCCESS,
+                    false,
+                    &extensions_payload(request, &granted),
+                )?],
+                blocks: Vec::new(),
+                token_wins: Vec::new(),
+                share_event: None,
+                accepted_work: None,
+                custom_job: None,
+                forward: Vec::new(),
+                header_wins: Vec::new(),
+            });
+        }
         if header.ext_type_without_channel_msg() != 0 {
             return Err("unsupported SV2 extension".into());
         }
@@ -707,6 +846,8 @@ impl MiningSession {
         let outputs = parse_outputs(outputs).map_err(|_| "invalid-coinbase-tx-outputs")?;
         rule.check(&outputs)
             .map_err(|_| "invalid-coinbase-tx-outputs")?;
+        // #### merge-mining v2: no token root without its declared leaves.
+        super::jd::policy::check_no_root(&outputs).map_err(|_| "invalid-coinbase-tx-outputs")?;
         let id = self.next_custom_id()?;
         let template = Arc::new(BchTemplate::custom(
             &context,
@@ -837,6 +978,12 @@ impl MiningSession {
     /// #### PR #40
     /// Makes this connection a public pool's: each channel pays the address
     /// its user connects with, and the operator's fee address is added.
+    /// #### merge-mining v2: a public pool's session, whose channels carry
+    /// the empty commitment.
+    pub fn is_public(&self) -> bool {
+        self.public.is_some()
+    }
+
     pub fn set_public(&mut self, public: Option<super::payout::PublicPool>) {
         self.public = public;
     }
@@ -909,14 +1056,26 @@ impl MiningSession {
         if identity != super::sv1::LOCAL_IDENTITY {
             self.identity = Some(identity.to_owned());
         }
-        // #### PR #40: in a public pool, the user's own address.
-        let payout = match &self.public {
-            Some(_) => match super::payout::identity_payout(self.network, identity) {
-                Ok(payout) => payout,
+        // #### PR #40: in a public pool, the user's own address; ####
+        // merge-mining v2: and their donation choice.
+        let (payout, donation) = match &self.public {
+            Some(_) => match super::payout::identity_login(self.network, identity) {
+                Ok(login) => (login.payout, login.donation),
+                Err(error) if error == super::payout::DONATION_OPTION_ERROR => {
+                    return Ok(vec![open_error(request, "invalid-donation")?]);
+                }
                 Err(_) => return Ok(vec![open_error(request, "unknown-user")?]),
             },
-            None => self.payout.clone(),
+            None => (self.payout.clone(), None),
         };
+        if self.public.is_some() {
+            match self.donation_choice {
+                Some(choice) if choice != donation => {
+                    return Ok(vec![open_error(request, "donation-mismatch")?]);
+                }
+                _ => self.donation_choice = Some(donation),
+            }
+        }
         self.next_channel += 1;
         // Every device starts at the configured share target; vardiff moves
         // it from there.
@@ -930,6 +1089,7 @@ impl MiningSession {
         )?;
         if let Some(public) = &self.public {
             channel.set_operator(Some(&public.address))?;
+            channel.set_donation(donation);
         }
         if let Some(lanes) = &self.lanes {
             channel.set_lane(lanes.next.fetch_add(1, Ordering::Relaxed), compact);
@@ -955,10 +1115,15 @@ impl MiningSession {
         let (id, generation, template) = self.current.as_ref().unwrap();
         // #### PR #42: a new channel starts with the token floor too (see
         // `Channel::settle`).
-        let tokens = template.tokens().and_then(|set| set.easiest_a());
-        channel.settle(&template.target, tokens, &maximum);
-        let target = channel.target;
+        let tokens = channel.floor_for(template);
+        channel.settle(&template.target, tokens.as_ref(), &maximum);
         channel.install_with_payout(*id, *generation, template.clone(), self.payout_policy)?;
+        if let Some(reason) = channel.take_token_refusal() {
+            self.token_refusal = Some(reason);
+            // BCH alone: no token floor (see `Channel::drop_token_floor`).
+            channel.drop_token_floor(&maximum);
+        }
+        let target = channel.target;
         // #### PR #42: an extended channel joins its payout's group, made
         // with the next id when it is the first; the group is announced here
         // and never moved (no SetGroupChannel).
@@ -1012,7 +1177,9 @@ impl MiningSession {
         }];
         frames.extend(job_frames(&channel, false)?);
         self.maximum_targets.insert(channel.id, maximum);
+        let id = channel.id;
         self.channels.insert(channel.id, channel);
+        frames.extend(self.disclose(id)?);
         Ok(frames)
     }
 
@@ -1031,6 +1198,7 @@ impl MiningSession {
     ) -> Result<ShareEvent, String> {
         let id = share.channel_id;
         let sequence = share.sequence;
+        let job_id = share.job_id;
         let result = self
             .channels
             .get_mut(&id)
@@ -1077,6 +1245,11 @@ impl MiningSession {
                 // Look here if: a winning share is acknowledged but its
                 // token win never reaches the server.
                 if let Some(win) = share.token_win() {
+                    // #### merge-mining v2: the miner gets each won entry's
+                    // proof, when it asked for the disclosure.
+                    if self.merge_disclosure {
+                        frames.extend(win_proofs(id, job_id, &win)?);
+                    }
                     token_wins.push(win);
                 }
                 // #### end PR #42 ####
@@ -1210,6 +1383,57 @@ fn open_error(id: u32, code: &'static str) -> Result<SerializedFrame, String> {
         request_id: id,
         error_code: code.try_into().unwrap(),
     }))
+}
+
+/// #### merge-mining v2: a frame of extension `extension` (with the
+/// channel bit when `channel`) and message `kind` around `payload`, as the
+/// SV2 framing writes it: the type (u16 LE), the message type, the length
+/// (u24 LE) and the payload.
+pub fn extension_frame(
+    extension: u16,
+    kind: u8,
+    channel: bool,
+    payload: &[u8],
+) -> Result<SerializedFrame, String> {
+    let length = u32::try_from(payload.len())
+        .ok()
+        .filter(|length| *length < 1 << 24)
+        .ok_or("SV2 extension message exceeds frame size")?;
+    let mut bytes = Vec::with_capacity(6 + payload.len());
+    let extension = extension | if channel { 0x8000 } else { 0 };
+    bytes.extend_from_slice(&extension.to_le_bytes());
+    bytes.push(kind);
+    bytes.extend_from_slice(&length.to_le_bytes()[..3]);
+    bytes.extend_from_slice(payload);
+    SerializedFrame::from_bytes(bytes).map_err(|_| "SV2 frame encoding failed".into())
+}
+
+/// #### merge-mining v2: a WinProof frame for each entry `win` won.
+fn win_proofs(channel: u32, job: u32, win: &TokenWin) -> Result<Vec<SerializedFrame>, String> {
+    use super::merge::disclosure::{WinProof, EXTENSION, WIN_PROOF};
+    let mut frames = Vec::new();
+    for entry in &win.entries {
+        let Some(item) = win.aux.entries.get(usize::from(*entry)) else {
+            continue;
+        };
+        let Ok(proof) = win.proof(*entry).and_then(|proof| proof.to_bytes()) else {
+            continue;
+        };
+        let message = WinProof {
+            channel,
+            job,
+            category: item.token.category,
+            proof,
+            split: item.split,
+        };
+        frames.push(extension_frame(
+            EXTENSION,
+            WIN_PROOF,
+            true,
+            &message.encode(),
+        )?);
+    }
+    Ok(frames)
 }
 
 pub fn mining(msg: Mining<'_>) -> Result<SerializedFrame, String> {
@@ -1476,24 +1700,16 @@ mod tests {
     /// #### PR #42: the extranonce test devices roll on extended channels.
     const DEVICE_EXTRANONCE: [u8; DEVICE_EXTRANONCE_SIZE] = [0x23; DEVICE_EXTRANONCE_SIZE];
 
-    /// #### PR #42: the test template merge-mining the test token in both
-    /// modes (its Case A target `bits`), with block difficulty no test share
-    /// reaches when `hard`.
+    /// #### PR #42: the test template merge-mining the test token (its
+    /// target `bits`), with block difficulty no test share reaches when
+    /// `hard`.
     fn token_template(bits: u32, hard: bool) -> BchTemplate {
         use super::super::merge::{
             registry::TEST_TOKEN,
             set::{SetEntry, TokenSet, TokenState},
-            OutPoint,
         };
-        let baton = OutPoint {
-            txid: [0x22; 32],
-            vout: 0,
-        };
-        let state = TokenState::new(baton, bits).unwrap();
-        let entries = vec![
-            SetEntry::share_target(&TEST_TOKEN, state),
-            SetEntry::block_required(&TEST_TOKEN),
-        ];
+        let state = TokenState::new([0x22; 32], [0x33; 32], bits).unwrap();
+        let entries = vec![SetEntry::new(&TEST_TOKEN, state)];
         let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
         if hard {
             template.target = compact_target(0x1a00ffff).unwrap();
@@ -1654,9 +1870,10 @@ mod tests {
     // #### PR #42: token wins leave with the responses
     #[test]
     fn responses_carry_token_wins_for_standard_and_extended_submits() {
-        // Case A at 2^248: about one share in 256 wins; no share is a block.
+        // A target of 2^248: about one share in 256 wins; no share is a
+        // block.
         let template = Arc::new(token_template(0x2001_0000, true));
-        let target = *template.tokens().unwrap().easiest_a().unwrap();
+        let target = *template.tokens().unwrap().easiest();
         for kind in [ChannelKind::Standard, ChannelKind::Extended] {
             let mut server =
                 MiningSession::new(MiningNetwork::Chipnet, payout(), [7; 12], [255; 32]).unwrap();
@@ -1684,14 +1901,13 @@ mod tests {
                 let win = responses.token_wins.remove(0);
                 assert_eq!(win.entries, [0]);
                 assert_eq!((win.header, win.hash), (device.header, hash));
-                assert!(!win.block);
                 // The coinbase is the one the device hashed, and its output
                 // 0 is the job's commitment.
                 if kind == ChannelKind::Extended {
                     assert_eq!(win.coinbase, device.coinbase);
                 }
                 let head = 47 + usize::from(win.coinbase[41]);
-                assert_eq!(win.coinbase[head..head + 53], win.aux.outputs.commitment);
+                assert_eq!(win.coinbase[head..head + 53], win.aux.output);
                 win.proof(0).unwrap();
             }
             assert!(wins > 0, "{kind:?}");
@@ -1714,16 +1930,15 @@ mod tests {
             .receive(submit_share(&device, ChannelKind::Standard, 0, nonce), NOW)
             .unwrap();
         assert_eq!(responses.blocks.len(), 1);
-        assert_eq!(responses.token_wins.len(), 1);
-        let win = &responses.token_wins[0];
-        assert!(win.block);
-        let entries: &[u16] = if meets_target(&hash, &target) {
-            &[0, 1]
+        // A block wins the token only when it meets the token's target.
+        if meets_target(&hash, &target) {
+            assert_eq!(responses.token_wins.len(), 1);
+            let win = &responses.token_wins[0];
+            assert_eq!(win.entries, [0]);
+            assert_eq!(win.coinbase, responses.blocks[0].coinbase.bytes);
         } else {
-            &[1]
-        };
-        assert_eq!(win.entries, entries);
-        assert_eq!(win.coinbase, responses.blocks[0].coinbase.bytes);
+            assert!(responses.token_wins.is_empty());
+        }
     }
 
     // #### PR #42: best share from the carried hash
@@ -2605,6 +2820,181 @@ mod tests {
         assert!(targets.contains(&(MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, group)));
         assert!(targets.contains(&(MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, alone)));
         assert_eq!(targets.len(), 4);
+    }
+
+    // #### merge-mining v2: disclosure to miners
+    // What: a client that negotiates the disclosure extension gets the
+    // granted type back, then a JobLeaves frame after each job that commits
+    // a root (rebuilding output 0) and a WinProof after a share that wins
+    // a token; a client that did not ask gets neither; an unknown extension
+    // is left out of the answer. A public pool's standard channel gets a
+    // leaf log line per job.
+    // Look here if: the negotiation or `disclose` changes.
+    #[test]
+    fn a_client_that_asks_gets_its_leaves_and_proofs() {
+        use super::super::merge::disclosure::{
+            extensions_payload, requested_extensions, JobLeaves, WinProof, EXTENSION, JOB_LEAVES,
+            NEGOTIATION, REQUEST_EXTENSIONS, REQUEST_EXTENSIONS_SUCCESS, WIN_PROOF,
+        };
+        let template = Arc::new(token_template(0x207f_ffff, true));
+        let mut server =
+            MiningSession::new(MiningNetwork::Chipnet, payout(), [7; 12], [255; 32]).unwrap();
+        server.set_job(9, 3, template.clone()).unwrap();
+        server.receive(setup(4), NOW).unwrap();
+        // A device opened before the negotiation (its first job's frames
+        // carry no leaves), whose shares come later.
+        let device = open_device(&mut server, ChannelKind::Extended);
+        let ask = extension_frame(
+            NEGOTIATION,
+            REQUEST_EXTENSIONS,
+            false,
+            &extensions_payload(5, &[EXTENSION, 0x0002]),
+        )
+        .unwrap();
+        let mut reply = server.receive(ask, NOW).unwrap().frames;
+        assert_eq!(
+            reply[0].header().ext_type_without_channel_msg(),
+            NEGOTIATION
+        );
+        assert_eq!(reply[0].header().msg_type(), REQUEST_EXTENSIONS_SUCCESS);
+        assert_eq!(
+            requested_extensions(reply[0].payload()),
+            Some((5, vec![EXTENSION]))
+        );
+        let (channel, _, _) = open_extended(&mut server, "device").unwrap();
+        // The next job's frames end with its leaves.
+        let mut frames = server.set_job(10, 4, template.clone()).unwrap();
+        let disclosed: Vec<JobLeaves> = frames
+            .iter_mut()
+            .filter(|frame| frame.header().ext_type_without_channel_msg() == EXTENSION)
+            .map(|frame| {
+                assert_eq!(frame.header().msg_type(), JOB_LEAVES);
+                assert!(frame.header().channel_msg());
+                JobLeaves::decode(frame.payload()).unwrap()
+            })
+            .collect();
+        // One for each channel: the device's and this one.
+        assert_eq!(disclosed.len(), 2);
+        let leaves = disclosed
+            .into_iter()
+            .find(|leaves| leaves.channel == channel)
+            .unwrap();
+        let job = server.channels[&channel].job().unwrap();
+        assert_eq!(leaves.job, job.id);
+        assert_eq!(leaves.output, job.aux.as_ref().unwrap().output);
+        // Every share wins at this target: the win's proof follows the
+        // acknowledgement.
+        let mut responses = server
+            .receive(submit_share(&device, ChannelKind::Extended, 0, 0), NOW)
+            .unwrap();
+        assert_eq!(responses.token_wins.len(), 1);
+        let proof = responses
+            .frames
+            .iter_mut()
+            .find(|frame| {
+                frame.header().msg_type() == WIN_PROOF
+                    && frame.header().ext_type_without_channel_msg() == EXTENSION
+            })
+            .expect("proof");
+        let proof = WinProof::decode(proof.payload()).unwrap();
+        assert_eq!(proof.channel, device.channel);
+        crate::stratum_v2::merge::proof::AuxProof::from_bytes(&proof.proof).unwrap();
+        // A client that did not ask gets neither.
+        let mut quiet =
+            MiningSession::new(MiningNetwork::Chipnet, payout(), [7; 12], [255; 32]).unwrap();
+        quiet.set_job(9, 3, template.clone()).unwrap();
+        quiet.receive(setup(4), NOW).unwrap();
+        open_extended(&mut quiet, "device").unwrap();
+        let frames = quiet.set_job(10, 4, template.clone()).unwrap();
+        assert!(frames
+            .iter()
+            .all(|frame| frame.header().ext_type_without_channel_msg() == 0));
+        // A public pool's standard channel: a leaf log line per job.
+        let declarator = super::super::jd::server::tests::declarator();
+        let mut public = session();
+        public.set_public(Some(declarator.public.clone()));
+        public.set_job(9, 3, template.clone()).unwrap();
+        public.receive(setup(4), NOW).unwrap();
+        let miner = payout();
+        let request = OpenStandardMiningChannel {
+            request_id: 1,
+            user_identity: miner.as_str().try_into().unwrap(),
+            nominal_hash_rate: 1e12,
+            max_target: (&[255; 32]).into(),
+        };
+        let open = mining(Mining::OpenStandardMiningChannel(request)).unwrap();
+        public.receive(open, NOW).unwrap();
+        assert_eq!(public.leaf_log.len(), 1);
+        let line: serde_json::Value = serde_json::from_str(&public.leaf_log[0]).unwrap();
+        assert!(line["leaves"].as_str().unwrap().starts_with("43544d4402"));
+        assert!(!public.leaf_log[0].contains("bchtest"));
+    }
+
+    // #### merge-mining v2: one donation choice per connection
+    // What: on a public pool a login's `,donation=` is that miner's donation
+    // on every job: at 0 the coinbase pays the miner and the fee, nothing to
+    // the donation, even when the session's policy says 1.5%; a later
+    // channel choosing otherwise is refused (donation-mismatch), and a
+    // malformed choice is refused (invalid-donation).
+    // Look here if: login options or `donation_choice` change.
+    #[test]
+    fn a_public_pool_login_chooses_its_donation_per_connection() {
+        let declarator = super::super::jd::server::tests::declarator();
+        let miner = payout();
+        let donor = crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
+            MiningNetwork::Chipnet,
+        ))
+        .unwrap();
+        let public = |server: &mut MiningSession| {
+            server.set_public(Some(declarator.public.clone()));
+            assert_eq!(
+                server.receive(setup(4), NOW).unwrap().frames[0]
+                    .header()
+                    .msg_type(),
+                1
+            );
+        };
+        let mut server = session();
+        public(&mut server);
+        assert_eq!(server.donation_choice(), None);
+        let (channel, _, _) =
+            open_extended(&mut server, &format!("{miner}.rig1,donation=0")).unwrap();
+        assert_eq!(server.donation_choice(), Some("0".parse().unwrap()));
+        let job = server.channels[&channel].job().unwrap();
+        assert_eq!(u16::from(job.payout.donation), 0);
+        assert!(!job.payout.donation_work);
+        let tx: stratum_core::bitcoin::Transaction =
+            stratum_core::bitcoin::consensus::deserialize(&job.standard_coinbase.bytes).unwrap();
+        assert!(tx
+            .output
+            .iter()
+            .all(|output| output.script_pubkey.as_bytes() != donor.as_slice()));
+        // The same choice may open another channel; another may not.
+        assert!(open_extended(&mut server, &format!("{miner}.rig2,donation=0")).is_ok());
+        assert_eq!(
+            open_extended(&mut server, &format!("{miner}.rig3")),
+            Err("donation-mismatch".into())
+        );
+        assert_eq!(
+            open_extended(&mut server, &format!("{miner}.rig3,donation=1")),
+            Err("donation-mismatch".into())
+        );
+        // A malformed choice.
+        let mut server = session();
+        public(&mut server);
+        assert_eq!(
+            open_extended(&mut server, &format!("{miner},donation=0.3")),
+            Err("invalid-donation".into())
+        );
+        // Without the option, the pool's setting, as before.
+        let mut server = session();
+        public(&mut server);
+        let (channel, _, _) = open_extended(&mut server, &miner).unwrap();
+        assert_eq!(server.donation_choice(), None);
+        assert_eq!(
+            server.channels[&channel].job().unwrap().payout.donation,
+            Default::default()
+        );
     }
 
     // #### PR #42

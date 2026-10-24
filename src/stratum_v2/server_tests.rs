@@ -154,26 +154,22 @@ impl NodeRpc for Rpc {
                 ))
                 .unwrap();
                 // #### PR #42: a merge-mining coinbase adds a zero-value
-                // commitment (output 0, OP_RETURN) and Case B tickets; the
-                // payouts are the other outputs.
+                // commitment (output 0, OP_RETURN); the payouts are the
+                // other outputs.
                 let token_outputs = coinbase
                     .output
                     .iter()
                     .filter(|output| {
-                        let script = output.script_pubkey.as_bytes();
                         output.value.to_sat() == 0
-                            && (script.first() == Some(&0x6a)
-                                || super::merge::registry::is_ticket_script(script))
+                            && output.script_pubkey.as_bytes().first() == Some(&0x6a)
                     })
                     .count();
                 let payouts: Vec<_> = coinbase
                     .output
                     .iter()
                     .filter(|output| {
-                        let script = output.script_pubkey.as_bytes();
                         !(output.value.to_sat() == 0
-                            && (script.first() == Some(&0x6a)
-                                || super::merge::registry::is_ticket_script(script)))
+                            && output.script_pubkey.as_bytes().first() == Some(&0x6a))
                     })
                     .collect();
                 if node.public {
@@ -189,10 +185,11 @@ impl NodeRpc for Rpc {
                 }
                 assert!(coinbase.input[0].witness.is_empty());
                 let size = consensus::serialize(coinbase).len();
+                // #### merge-mining v2: the commitment adds 53 bytes.
                 if token_outputs == 0 {
                     assert!((100..=200).contains(&size));
                 } else {
-                    assert!((200..=400).contains(&size), "{size}");
+                    assert!((153..=253).contains(&size), "{size}");
                 }
                 node.submissions += 1;
                 if node.reject {
@@ -357,6 +354,17 @@ impl Running {
         pool: &Running,
         mode: super::jd::JdMode,
     ) -> Self {
+        Self::jd_client_donating(node, pool, mode, None)
+    }
+
+    /// #### merge-mining v2: a Job Declaration client naming `donation`
+    /// to the pool as `,pickaxe-donation=`.
+    pub(super) fn jd_client_donating(
+        node: Arc<Mutex<Node>>,
+        pool: &Running,
+        mode: super::jd::JdMode,
+        donation: Option<crate::donation::bch::BchDonation>,
+    ) -> Self {
         Self::start_config(
             vec![node],
             Arc::new(TestDirectory::new()),
@@ -372,6 +380,7 @@ impl Running {
                 identity: payout(),
                 retry: Duration::from_millis(500),
                 mode,
+                pickaxe_donation: donation.map(|rate| Arc::new(std::sync::RwLock::new(rate))),
             }),
             Vec::new(),
         )
@@ -401,6 +410,7 @@ impl Running {
                 identity: payout(),
                 retry: Duration::from_millis(500),
                 mode,
+                pickaxe_donation: None,
             }),
             Vec::new(),
         )
@@ -608,6 +618,9 @@ impl Running {
         let secret = [17; 32];
         let authority = server::authority_public(&secret).unwrap();
         let config = ServerConfig {
+            leaf_log_path: public
+                .as_ref()
+                .map(|_| state_directory.0.join("leaves.jsonl")),
             public,
             donation,
             allocation_phase: Some(300_000_000_000),
@@ -923,24 +936,35 @@ impl Device {
     }
 }
 
-// #### PR #42
+// #### PR #42, merge-mining v2
 // What: a device mines the Chipnet test token through the real server: its
-// share wins Case A (the token's target) and, being a block, Case B; the
-// claim worker proves both, saves them owner-only, lists them on the
-// dashboard and moves the test token's baton, which re-issues jobs; a win is
-// never proven twice; the acknowledgement does not wait for any of it.
+// share wins the token (the token's target); the claim worker proves it,
+// saves it owner-only (an `AuxProof` v2 that verifies, one claim per row,
+// broadcast no earlier than its random delay), lists it on the dashboard
+// and moves the test token's state, which re-issues jobs; a win is never
+// proven twice; the acknowledgement does not wait for any of it.
 // Look here if: the claim worker, the token hand-off or the re-publish on a
 // token change changes.
 #[test]
 fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
-    use super::merge::hub::TokenHub;
+    use super::merge::{
+        hub::{ClaimDelay, TokenHub},
+        proof::AuxProof,
+    };
     for extended in [false, true] {
         let directory = Arc::new(TestDirectory::new());
         let proofs = directory.0.join("token-proofs.json");
-        // The node's own target, so every share wins the Case A state.
+        // The node's own target, so every share wins the token's state.
         let hub = Arc::new(
-            TokenHub::test_token(MiningNetwork::Chipnet, proofs.clone(), 0x207f_ffff).unwrap(),
+            TokenHub::test_token(
+                MiningNetwork::Chipnet,
+                proofs.clone(),
+                0x207f_ffff,
+                ClaimDelay::default(),
+            )
+            .unwrap(),
         );
+        let first_state = hub.current().unwrap().entries()[0].state.state_hash;
         let node = Arc::new(Mutex::new(Node {
             height: 325908,
             tip: "ab".repeat(32),
@@ -959,14 +983,13 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
         let server = Running::start_full(vec![node], directory, None, Some(hub.clone()));
         let mut device = Device::connect(&server, extended);
         device.solve_and_submit(0);
-        server.wait(|stats| stats.recent_token_wins.len() >= 2);
+        server.wait(|stats| !stats.recent_token_wins.is_empty());
         let stats = server.stats.lock().unwrap().clone();
         assert_eq!(stats.token_wins, 1, "one share, one hand-off");
         assert_eq!(stats.token_wins_dropped, 0);
         assert!(stats.tokens_off.is_none(), "{:?}", stats.tokens_off);
-        let mut modes: Vec<char> = stats.recent_token_wins.iter().map(|win| win.mode).collect();
-        modes.sort_unstable();
-        assert_eq!(modes, ['A', 'B']);
+        assert!(stats.tokens_refused.is_none(), "{:?}", stats.tokens_refused);
+        assert_eq!(stats.recent_token_wins.len(), 1);
         assert!(stats
             .recent_token_wins
             .iter()
@@ -974,8 +997,25 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
         let saved: Value = serde_json::from_slice(&std::fs::read(&proofs).unwrap()).unwrap();
         assert_eq!(saved["network"], "chipnet");
         let entries = saved["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| entry["status"] == "proven"));
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["status"], "proven");
+        assert_eq!(entry["format"], "AuxProof v2");
+        // #### merge-mining v2: the split preimage the claim reveals: 1% of
+        // the win to the donation.
+        let donation = crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(
+            MiningNetwork::Chipnet,
+        ))
+        .unwrap();
+        let split = super::merge::split::Split::donation(100, &donation).unwrap();
+        assert_eq!(entry["split"], hex::encode(split.preimage()));
+        assert_eq!(entry["state"], hex::encode(first_state));
+        let found = entry["found_at"].as_u64().unwrap();
+        let after = entry["broadcast_after"].as_u64().unwrap();
+        assert!((found + 5..=found + 60).contains(&after), "{found} {after}");
+        let proof =
+            AuxProof::from_bytes(&hex::decode(entry["proof"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(proof.height, 0);
         assert!(!String::from_utf8(std::fs::read(&proofs).unwrap())
             .unwrap()
             .contains(&payout()));
@@ -985,10 +1025,96 @@ fn a_device_mines_the_test_token_and_each_state_is_proven_once() {
             let mode = std::fs::metadata(&proofs).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        // The baton moved to the winning header: a new set, new jobs.
-        assert_eq!(hub.current().unwrap().serial(), 2);
+        // The state moved to the winning header's hash: a new set, new
+        // jobs.
+        let set = hub.current().unwrap();
+        assert_eq!(set.serial(), 2);
+        assert_ne!(set.entries()[0].state.state_hash, first_state);
         device.sender.close();
     }
+}
+
+// #### merge-mining v2: per-miner roots on a public pool
+// What: a public pool that merge-mines the test token gives each miner a
+// root of their own: a miner finds a block whose output 0 is a non-empty
+// root; their share wins the token, which the claim worker proves and
+// journals with the split preimage of the default donation's 1% and the
+// operator's 2% coinbase-mode fee. (A login's donation=0, which leaves the
+// fee slot alone, is in the channel tests.)
+// Look here if: a public pool's miners stop winning tokens, or their split
+// names the donation they declined.
+#[test]
+fn a_public_pools_miners_mine_their_own_roots() {
+    use super::merge::{
+        commitment::AuxCommitment,
+        hub::TokenHub,
+        split::{Slot, Split},
+    };
+    use crate::donation::bch::{FeeMode, PoolFee};
+    let directory = Arc::new(TestDirectory::new());
+    let proofs = directory.0.join("token-proofs.json");
+    let hub = Arc::new(
+        TokenHub::test_token(
+            MiningNetwork::Chipnet,
+            proofs.clone(),
+            0x207f_ffff,
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let node = Arc::new(Mutex::new(Node {
+        height: 325908,
+        tip: "ab".repeat(32),
+        reject: false,
+        submissions: 0,
+        lose_replies: false,
+        submitted: Vec::new(),
+        known: std::collections::HashSet::new(),
+        unavailable: false,
+        public: true,
+        transactions: Vec::new(),
+        spendable: Vec::new(),
+        validations: 0,
+        parent_time: None,
+    }));
+    let operator = address(2);
+    let public = super::payout::PublicPool {
+        fee: Some(PoolFee {
+            rate: "2".parse().unwrap(),
+            mode: FeeMode::Coinbase,
+        }),
+        address: operator.clone(),
+    };
+    let server = Running::start_full(vec![node], directory.clone(), Some(public), Some(hub));
+    let miner = address(3);
+    let mut device = Device::connect_as(&server, false, &miner);
+    device.solve_and_submit(0);
+    server.wait(|stats| stats.blocks_accepted == 1);
+    server.wait(|stats| !stats.recent_token_wins.is_empty());
+    let block: Block = {
+        let node = server.node.lock().unwrap();
+        consensus::deserialize(&hex::decode(node.submitted.last().unwrap()).unwrap()).unwrap()
+    };
+    let output = &block.txdata[0].output[0];
+    assert_eq!(output.value.to_sat(), 0);
+    let root = AuxCommitment::parse_script(output.script_pubkey.as_bytes()).unwrap();
+    assert!(!root.is_empty());
+    let stats = server.stats.lock().unwrap().clone();
+    assert_eq!(stats.token_wins, 1);
+    assert!(stats.tokens_off.is_none(), "{:?}", stats.tokens_off);
+    let saved: Value = serde_json::from_slice(&std::fs::read(&proofs).unwrap()).unwrap();
+    let entry = &saved["entries"][0];
+    assert_eq!(entry["status"], "proven");
+    let operator_script = crate::tx::cashaddr_to_p2pkh_locking(&operator).unwrap();
+    let donor =
+        crate::tx::cashaddr_to_p2pkh_locking(crate::donation::bch::address(MiningNetwork::Chipnet))
+            .unwrap();
+    let split = Split::new(
+        Slot::new(100, &donor).unwrap(),
+        Slot::new(200, &operator_script).unwrap(),
+    );
+    assert_eq!(entry["split"], hex::encode(split.preimage()));
+    device.sender.close();
 }
 
 #[test]
@@ -2475,6 +2601,193 @@ fn at_a_remote_pool_the_donation_mines_on_its_own_channel_and_the_pool_accepts_i
     device.write.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
+// #### merge-mining v2: disclosure to miners on a public pool
+// What: SV1 firmware that asks for pickaxe-merge at a public pool that
+// merge-mines the test token gets its jobs' leaves, which rebuild its root
+// and pay its own address; a standard-channel device's jobs go to the
+// owner-only leaf log instead.
+// Look here if: the adapter's negotiation, `disclose` or the leaf log
+// changes.
+#[test]
+fn public_pool_miners_can_see_their_leaves() {
+    use super::merge::{disclosure::Disclosure, hub::TokenHub};
+    use std::io::{BufRead, Write};
+    let directory = Arc::new(TestDirectory::new());
+    let hub = Arc::new(
+        TokenHub::test_token(
+            MiningNetwork::Chipnet,
+            directory.0.join("token-proofs.json"),
+            0x1d00_ffff,
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let node = Arc::new(Mutex::new(Node {
+        height: 325908,
+        tip: "ab".repeat(32),
+        reject: false,
+        submissions: 0,
+        lose_replies: false,
+        submitted: Vec::new(),
+        known: std::collections::HashSet::new(),
+        unavailable: false,
+        public: true,
+        transactions: Vec::new(),
+        spendable: Vec::new(),
+        validations: 0,
+        parent_time: None,
+    }));
+    let public = super::payout::PublicPool {
+        fee: None,
+        address: address(2),
+    };
+    let server = Running::start_full(vec![node], directory.clone(), Some(public), Some(hub));
+    let adapter = FirmwareAdapter::public(&server);
+    let miner = address(3);
+    let write = TcpStream::connect(adapter.address).unwrap();
+    write
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut read = std::io::BufReader::new(write.try_clone().unwrap());
+    let mut write = write;
+    let mut send = |value: Value| {
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        write.write_all(&bytes).unwrap();
+    };
+    let mut next = || {
+        let mut line = String::new();
+        read.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    send(
+        json!({"id":1,"method":"mining.configure","params":[["version-rolling","pickaxe-merge"],{"version-rolling.mask":"1fffe000"}]}),
+    );
+    let configured = next();
+    assert_eq!(configured["result"]["pickaxe-merge"], true, "{configured}");
+    send(json!({"id":2,"method":"mining.subscribe","params":["test"]}));
+    assert!(next()["result"].is_array());
+    send(json!({"id":3,"method":"mining.authorize","params":[miner.clone()]}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let leaves = loop {
+        assert!(Instant::now() < deadline, "no leaves reached the firmware");
+        let message = next();
+        if message["method"] == "pickaxe.merge_leaves" {
+            break message;
+        }
+    };
+    let output = hex::decode(leaves["params"][1].as_str().unwrap()).unwrap();
+    let commitment = super::merge::commitment::AuxCommitment::parse(&output).unwrap();
+    let disclosure =
+        Disclosure::decode(&hex::decode(leaves["params"][2].as_str().unwrap()).unwrap()).unwrap();
+    disclosure.check_root(&commitment).unwrap();
+    let script = crate::tx::cashaddr_to_p2pkh_locking(&miner).unwrap();
+    assert_eq!(
+        disclosure.leaves[0].leaf.payout_hash,
+        super::template::double_sha256(&script)
+    );
+    assert_eq!(leaves["params"][3].as_array().unwrap().len(), 1);
+    // A standard-channel device: the leaf log.
+    let log = directory.0.join("leaves.jsonl");
+    let device = Device::connect_as(&server, false, &address(4));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&log).is_ok_and(|text| text.lines().count() >= 1) {
+        assert!(Instant::now() < deadline, "no leaf log line");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let text = std::fs::read_to_string(&log).unwrap();
+    let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(line["leaves"].as_str().unwrap().starts_with("43544d4402"));
+    assert!(!text.contains("bchtest"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    drop(device);
+}
+
+// #### merge-mining v2: one donation at a pool
+// What: the adapter, which donates on its own channel at a remote pool,
+// asks a Pickaxe public pool for no donation on the device's channel
+// (`,pickaxe-donation=0`, a key BCH P2Pool does not read): the device's
+// block pays the miner and the operator's fee, nothing to the donation.
+// Look here if: a device at a Pickaxe pool donates twice, or the adapter's
+// login options change.
+#[test]
+fn the_adapter_asks_a_pickaxe_pool_for_no_second_donation() {
+    use crate::donation::bch::{FeeMode, PoolFee};
+    use crate::tx::cashaddr_to_p2pkh_locking;
+    let operator = address(6);
+    let pool = Running::public(super::payout::PublicPool {
+        fee: Some(PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: FeeMode::Coinbase,
+        }),
+        address: operator.clone(),
+    });
+    let miner = address(7);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(ServerStats::default()));
+    let upstreams = vec![super::sv1::Upstream {
+        address: pool.address.to_string(),
+        authority: pool.authority,
+        identity: miner.clone(),
+        remote: true,
+        donation: Some(super::sv1::DonationRoute {
+            identity: crate::donation::bch::address(MiningNetwork::Chipnet).to_owned(),
+            rate: Arc::new(std::sync::RwLock::new("0".parse().unwrap())),
+            fallback: None,
+        }),
+        public: false,
+        prefer: None,
+        fixed_version: false,
+    }];
+    let thread = {
+        let stop = stop.clone();
+        let stats = stats.clone();
+        thread::spawn(move || super::sv1::run(listener, upstreams, stop, stats))
+    };
+    let adapter = FirmwareAdapter {
+        stop,
+        thread: Some(thread),
+        address,
+    };
+    let mut device = FirmwareDevice::connect(&adapter, true, false);
+    let (hash, submit) = device.solve(0, true);
+    device.send(submit);
+    // The pool may follow the login's donation with a new job first.
+    let ack = loop {
+        let message = device.receive();
+        if !message["id"].is_null() {
+            break message;
+        }
+    };
+    assert_eq!(ack["result"], true, "{ack}");
+    pool.wait(|stats| stats.blocks_accepted == 1);
+    let node = pool.node.lock().unwrap();
+    assert_eq!(node.tip, hash);
+    let block: Block =
+        consensus::deserialize(&hex::decode(node.submitted.last().unwrap()).unwrap()).unwrap();
+    let outputs: Vec<Vec<u8>> = block.txdata[0]
+        .output
+        .iter()
+        .map(|output| output.script_pubkey.to_bytes())
+        .collect();
+    assert_eq!(
+        outputs,
+        vec![
+            cashaddr_to_p2pkh_locking(&miner).unwrap(),
+            cashaddr_to_p2pkh_locking(&operator).unwrap(),
+        ]
+    );
+    drop(node);
+    device.write.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
 // #### PR #40
 #[test]
 fn sv1_firmware_at_a_public_pool_is_paid_at_the_address_it_names() {
@@ -3054,6 +3367,59 @@ fn coinbase_only_pickaxe_jdc_mines_at_a_pickaxe_jds_on_loopback() {
     device.sender.close();
 }
 
+// #### merge-mining v2: the miner's donation at a Pickaxe pool
+// What: a Job Declaration client whose own donation setting is 0% names it
+// (`,pickaxe-donation=0.00`) to a Pickaxe pool whose own setting is 1.5%:
+// the block pays the miner and the pool's 1% fee, nothing to the donation.
+// Look here if: `JdTarget::login` or the pool's login options change.
+#[test]
+fn a_jd_client_names_its_own_donation_to_a_pickaxe_pool() {
+    let pool = Running::jd_pool(super::payout::PublicPool {
+        fee: Some(crate::donation::bch::PoolFee {
+            rate: "1".parse().unwrap(),
+            mode: crate::donation::bch::FeeMode::Work,
+        }),
+        address: address(0x34),
+    });
+    let miner_node = pool_node();
+    let client = Running::jd_client_donating(
+        miner_node.clone(),
+        &pool,
+        super::jd::JdMode::CoinbaseOnly,
+        Some("0".parse().unwrap()),
+    );
+    client.wait(|stats| {
+        stats
+            .jd_client
+            .as_ref()
+            .is_some_and(|jd| jd.state == "active")
+    });
+    let mut device = Device::connect(&client, true);
+    device.solve_and_submit(0);
+    client.wait(|stats| stats.blocks_accepted == 1);
+    let submitted = miner_node.lock().unwrap().submitted.clone();
+    let block: Block = consensus::deserialize(&hex::decode(&submitted[0]).unwrap()).unwrap();
+    let outputs: Vec<(u64, Vec<u8>)> = block.txdata[0]
+        .output
+        .iter()
+        .map(|output| (output.value.to_sat(), output.script_pubkey.to_bytes()))
+        .collect();
+    let mut miner = vec![0x76, 0xa9, 0x14];
+    miner.extend([0x12; 20]);
+    miner.extend([0x88, 0xac]);
+    assert_eq!(
+        outputs,
+        vec![
+            (309_375_000, miner),
+            (
+                3_125_000,
+                crate::tx::cashaddr_to_coinbase_locking(&address(0x34)).unwrap()
+            ),
+        ]
+    );
+    device.sender.close();
+}
+
 // #### PR #56
 // What: a pool granting only 8 rollable bytes, as BCH P2Pool does, refuses
 // the client's 16; the client asks again for 8 and mines in the compact
@@ -3181,22 +3547,24 @@ fn full_template_declares_provides_a_missing_transaction_and_both_nodes_get_the_
     device.sender.close();
 }
 
-// #### PR #42
+// #### PR #42, merge-mining v2
 // What: a Job Declaration client merge-mines the Chipnet test token at a
-// Pickaxe pool, in both modes: the pool accepts the custom job (and the
-// declaration) with the commitment as output 0 and the ticket after its
-// outputs; the device's share wins the token in both cases at the client,
-// which proves them; the block carries the commitment and reaches the
-// client's node and, Full-Template, the pool's.
-// Look here if: declared_aux, the custom job's outputs or the pool's
-// commitment rule change.
+// Pickaxe pool with Full-Template: the pool checks the leaves in the
+// declaration's excess_data and accepts the custom job with the commitment
+// as output 0 before its outputs; the device's share wins the token at the
+// client, which proves it; the block carries the commitment and reaches
+// both nodes. With Coinbase-only, which shows the pool no leaves, the
+// client mines BCH alone and says why.
+// Look here if: declared_aux, the leaf disclosure or the pool's checks
+// change.
 #[test]
 fn merge_mined_tokens_ride_job_declaration_to_a_pickaxe_pool() {
-    use super::merge::{commitment::AuxCommitment, hub::TokenHub, registry::is_ticket_script};
+    use super::merge::{commitment::AuxCommitment, hub::TokenHub};
     for mode in [
         super::jd::JdMode::CoinbaseOnly,
         super::jd::JdMode::FullTemplate,
     ] {
+        let full = mode == super::jd::JdMode::FullTemplate;
         let public = super::payout::PublicPool {
             fee: Some(crate::donation::bch::PoolFee {
                 rate: "1".parse().unwrap(),
@@ -3210,12 +3578,13 @@ fn merge_mined_tokens_ride_job_declaration_to_a_pickaxe_pool() {
             super::jd::JdMode::FullTemplate => Running::jd_pool_full(pool_side.clone(), public),
         };
         let directory = Arc::new(TestDirectory::new());
-        // The node's own target, so every share wins the Case A state.
+        // The node's own target, so every share wins the token's state.
         let hub = Arc::new(
             TokenHub::test_token(
                 MiningNetwork::Chipnet,
                 directory.0.join("token-proofs.json"),
                 0x207f_ffff,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -3230,16 +3599,28 @@ fn merge_mined_tokens_ride_job_declaration_to_a_pickaxe_pool() {
         let mut device = Device::connect(&client, true);
         device.solve_and_submit(0);
         client.wait(|stats| stats.blocks_accepted == 1);
-        client.wait(|stats| stats.recent_token_wins.len() >= 2);
+        if full {
+            client.wait(|stats| !stats.recent_token_wins.is_empty());
+        }
         let stats = client.stats.lock().unwrap().clone();
         assert!(
             stats.tokens_off.is_none(),
             "{mode:?}: {:?}",
             stats.tokens_off
         );
-        let mut modes: Vec<char> = stats.recent_token_wins.iter().map(|win| win.mode).collect();
-        modes.sort_unstable();
-        assert_eq!(modes, ['A', 'B'], "{mode:?}");
+        if full {
+            assert!(stats.tokens_refused.is_none(), "{mode:?}");
+            assert_eq!(stats.recent_token_wins.len(), 1, "{mode:?}");
+        } else {
+            assert_eq!(
+                stats.tokens_refused,
+                Some(
+                    "Coinbase-only Job Declaration cannot show the pool its token leaves; \
+                     use Full-Template"
+                )
+            );
+            assert!(stats.recent_token_wins.is_empty());
+        }
         let submitted = miner_node.lock().unwrap().submitted[0].clone();
         let block: Block = consensus::deserialize(&hex::decode(&submitted).unwrap()).unwrap();
         let outputs: Vec<(u64, Vec<u8>)> = block.txdata[0]
@@ -3247,22 +3628,23 @@ fn merge_mined_tokens_ride_job_declaration_to_a_pickaxe_pool() {
             .iter()
             .map(|output| (output.value.to_sat(), output.script_pubkey.to_bytes()))
             .collect();
-        assert_eq!(outputs.len(), 5, "{mode:?}");
-        assert_eq!(outputs[0].0, 0);
-        assert!(AuxCommitment::parse_script(&outputs[0].1).is_some());
+        let payouts = if full {
+            assert_eq!(outputs.len(), 4, "{mode:?}");
+            assert_eq!(outputs[0].0, 0);
+            assert!(AuxCommitment::parse_script(&outputs[0].1).is_some_and(|c| !c.is_empty()));
+            &outputs[1..4]
+        } else {
+            assert_eq!(outputs.len(), 3, "{mode:?}");
+            &outputs[..]
+        };
         assert_eq!(
-            outputs[1..4]
-                .iter()
-                .map(|(value, _)| *value)
-                .collect::<Vec<_>>(),
+            payouts.iter().map(|(value, _)| *value).collect::<Vec<_>>(),
             [304_734_375, 3_078_125, 4_687_500]
         );
-        assert_eq!(outputs[4].0, 0);
-        assert!(is_ticket_script(&outputs[4].1));
         pool.wait(|stats| {
             stats.shares_accepted >= 1 && stats.jd_server.as_ref().is_some_and(|jd| jd.blocks >= 1)
         });
-        if mode == super::jd::JdMode::FullTemplate {
+        if full {
             pool.wait(|stats| {
                 stats
                     .jd_server
@@ -3294,6 +3676,7 @@ fn a_pool_without_job_declaration_leaves_the_local_server_without_work() {
             identity: payout(),
             retry: Duration::from_millis(200),
             mode: super::jd::JdMode::FullTemplate,
+            pickaxe_donation: None,
         }],
         stop.clone(),
     );

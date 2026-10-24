@@ -173,8 +173,20 @@ fn declare_frame(
     id: u32,
     token: &[u8],
     version: u32,
+    parts: &(Vec<u8>, Vec<u8>),
+    txids: &[Hash],
+) -> SerializedFrame {
+    declare_frame_with(id, token, version, parts, txids, &[])
+}
+
+/// #### merge-mining v2: a declaration with `excess` as its excess data.
+fn declare_frame_with(
+    id: u32,
+    token: &[u8],
+    version: u32,
     (prefix, suffix): &(Vec<u8>, Vec<u8>),
     txids: &[Hash],
+    excess: &[u8],
 ) -> SerializedFrame {
     let list: Vec<binary_sv2::U256> = txids.iter().map(Into::into).collect();
     encoded(
@@ -185,7 +197,7 @@ fn declare_frame(
             coinbase_tx_prefix: prefix.as_slice().try_into().unwrap(),
             coinbase_tx_suffix: suffix.as_slice().try_into().unwrap(),
             wtxid_list: list.try_into().unwrap(),
-            excess_data: (&[][..]).try_into().unwrap(),
+            excess_data: excess.try_into().unwrap(),
         },
         MESSAGE_TYPE_DECLARE_MINING_JOB,
         false,
@@ -279,6 +291,44 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
     let token = PxToken::decode(success.mining_job_token.as_ref()).unwrap();
     assert_eq!((token.rates.donation_bps, token.rates.fee_bps), (150, 100));
     assert!(!token.full_template);
+    // #### merge-mining v2: the miner's own donation choice sets the
+    // token's donation rate; the fee stays. At 0 the token names no
+    // donation output, and a malformed choice is refused.
+    for (option, donation_bps, outputs) in [(",donation=0.5", 50, 3), (",donation=0", 0, 2)] {
+        let mut chosen = session
+            .receive(
+                &mut allocate(&format!("{miner}.rig1{option}"), 11),
+                &declarator,
+                &NO_CONTEXT,
+                now,
+            )
+            .unwrap();
+        let success: AllocateMiningJobTokenSuccess =
+            binary_sv2::from_bytes(chosen.frames[0].payload()).unwrap();
+        let token = PxToken::decode(success.mining_job_token.as_ref()).unwrap();
+        assert_eq!(
+            (token.rates.donation_bps, token.rates.fee_bps),
+            (donation_bps, 100),
+            "{option}"
+        );
+        assert_eq!(
+            parse_outputs(success.coinbase_outputs.as_ref())
+                .unwrap()
+                .len(),
+            outputs
+        );
+    }
+    assert_eq!(
+        session
+            .receive(
+                &mut allocate(&format!("{miner},donation=7.25"), 12),
+                &declarator,
+                &NO_CONTEXT,
+                now
+            )
+            .err(),
+        Some(crate::stratum_v2::payout::DONATION_OPTION_ERROR.into())
+    );
     let outputs = parse_outputs(success.coinbase_outputs.as_ref()).unwrap();
     assert_eq!(outputs.len(), 3);
     assert!(outputs.iter().all(|(value, _)| *value == 0));
@@ -286,6 +336,8 @@ fn coinbase_only_is_offered_and_full_template_is_refused_until_enabled() {
         declarator.redeem(success.mining_job_token.as_ref(), &miner, now),
         Ok(Custom::CoinbaseOnly(_))
     ));
+    // The chosen-donation tokens above are not redeemed here.
+    session.close(&declarator);
     assert!(session
         .receive(
             &mut allocate("not-an-address", 10),
@@ -606,6 +658,84 @@ fn tip_races_become_stale_chain_tip_with_the_reason_in_details() {
 // come are missing-txs after 30 seconds; a Coinbase-only connection cannot
 // declare.
 // Look here if: the declaration checks change.
+// #### merge-mining v2: the pool's check of declared leaves
+// What: a Full-Template declaration whose output 0 is a token root is
+// accepted when its excess_data discloses leaves paying the miner with the
+// miner's donation and the pool's fee, and refused (invalid-coinbase-tx)
+// when their fee slot is wrong or the leaves are missing.
+// Look here if: `policy::check_leaves` or `declare` changes.
+#[test]
+fn a_declaration_with_a_wrong_fee_slot_is_refused() {
+    use crate::stratum_v2::merge::{
+        disclosure::Disclosure,
+        set::{tests::test_set, AuxJob, LeafTerms},
+        split::{Slot, Split},
+    };
+    let declarator = declarator_accepting(AcceptJd::FullTemplate);
+    let now = Instant::now();
+    let pool = Arc::new(context(2));
+    let current = Context {
+        current: Some(&pool),
+        recent: &[],
+    };
+    let (mut session, _, scripts) = full_session(&declarator, now);
+    // The pool's outputs: the miner, the fee (1%) and the donation (1.5%).
+    let declare = |session: &mut DeclaratorSession, fee_bps: u16, leaves: bool| {
+        let (token, _) = new_token(session, &declarator, now);
+        let split = Split::new(
+            Slot::new(150, &scripts[2]).unwrap(),
+            Slot::new(fee_bps, &scripts[1]).unwrap(),
+        );
+        let job = AuxJob::build(
+            &test_set(),
+            &LeafTerms {
+                payout: &scripts[0],
+                split,
+                plain_payout: &scripts[0],
+            },
+        );
+        let (prefix, mut suffix) = coinbase_parts(pool.height, &scripts);
+        // Output 0 before the pool's outputs: one more output.
+        let mut with_root = suffix[..4].to_vec();
+        with_root.push(suffix[4] + 1);
+        with_root.extend(job.output);
+        with_root.extend(&suffix[5..]);
+        suffix = with_root;
+        let excess = if leaves {
+            Disclosure::from_job(&job).encode()
+        } else {
+            Vec::new()
+        };
+        session
+            .receive(
+                &mut declare_frame_with(
+                    1,
+                    &token,
+                    pool.version,
+                    &(prefix, suffix),
+                    &ids(1..=2),
+                    &excess,
+                ),
+                &declarator,
+                &current,
+                now,
+            )
+            .unwrap()
+    };
+    let mut reply = declare(&mut session, 50, true);
+    let (code, details) = error(&mut reply);
+    assert_eq!(code, "invalid-coinbase-tx");
+    assert!(details.contains("pool's fee"), "{details}");
+    let mut reply = declare(&mut session, 100, false);
+    assert!(error(&mut reply).1.contains("needs its leaves"));
+    // The right leaves pass the leaf check: the declaration goes on.
+    let reply = declare(&mut session, 100, true);
+    assert!(reply
+        .frames
+        .iter()
+        .all(|frame| frame.header().msg_type() != MESSAGE_TYPE_DECLARE_MINING_JOB_ERROR));
+}
+
 #[test]
 fn declarations_are_checked_before_anything_is_asked() {
     let declarator = declarator_accepting(AcceptJd::Both);

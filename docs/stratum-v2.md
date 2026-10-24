@@ -561,9 +561,9 @@ provider 1 of 2"), and the status file's `template_source` gives its kind
 (`tdp` or `rpc`), place and count, never its address.
 
 - The client declares the coinbase bytes it may add
-  (`CoinbaseOutputConstraints`): 122 for the payouts, plus 53 for a
-  merge-mining commitment and 46 per Case B ticket while tokens are mined
-  (221 with the Chipnet test token). The template's size limit is the
+  (`CoinbaseOutputConstraints`): 122 for the payouts, plus 53 for the
+  merge-mining commitment while tokens are mined (175 with the Chipnet test
+  token). The template's size limit is the
   provider's transactions, the header and that reserve.
 - A template is checked as a node's is: the prefix a minimal BIP34 height
   push of at most 8 bytes, no required coinbase outputs and no excess data

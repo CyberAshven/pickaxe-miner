@@ -4,8 +4,10 @@
 
 use super::jd::plan::JdPlan;
 use super::merge::{
+    commitment::OUTPUT_LEN,
     header::{forwarder_body, MAX_P2S, TAG},
-    set::{AuxJob, AuxOutputs, TokenSet},
+    set::{AuxJob, LeafTerms, TokenSet},
+    split::{Slot, Split},
     OutPoint,
 };
 use crate::config::MiningNetwork;
@@ -597,12 +599,9 @@ impl BchTemplate {
     /// It cannot change the independently sourced transaction list or revenue.
     pub fn prepare_p2pool(&mut self) -> Result<(), String> {
         self.p2pool = None;
+        // A token set does not stop it: P2Pool's coinbase carries no token
+        // commitment, so its jobs mine BCH alone (see `tokens_refused`).
         if let Some(plan) = self.jd.as_ref().and_then(|plan| plan.p2pool.as_ref()) {
-            if self.tokens.is_some() {
-                return Err(
-                    "this token set does not yet have a P2Pool-compatible aux proof adapter".into(),
-                );
-            }
             self.p2pool = Some(Arc::new(plan.prepare(
                 self.height,
                 self.bits,
@@ -705,22 +704,22 @@ impl BchTemplate {
         let coinbase = self.coinbase_with_outputs(
             &vec![0; extranonce],
             plan.outputs(self.coinbase_value),
-            aux.as_ref().map(|aux| &aux.outputs),
+            aux.as_ref().map(|aux| &aux.output),
         )?;
         Ok(self.split(coinbase, extranonce))
     }
 
     // #### PR #42: merge-mined tokens under Job Declaration
     // What: a Job Declaration job with a token set carries the commitment as
-    // output 0 and the tickets (worth 0) after the pool's outputs, in every
-    // local coinbase, the declared one and the custom job's outputs alike.
-    // Its leaves bind the miner's own script (the pool's first output), and
-    // the donation's split is the pool's whole donation rate, since no
-    // donation work runs under Job Declaration; a pool with no donation has
-    // no split.
+    // output 0 before the pool's outputs, in every local coinbase, the
+    // declared one and the custom job's outputs alike. Its leaves bind the
+    // miner's own script (the pool's first output); no donation work runs
+    // under Job Declaration (the pool's rule takes the donation from the
+    // coinbase).
     // Why: the miner's node builds the blocks there, so merge-mined tokens
     // keep earning at a pool with no hashrate taken from BCH; the pool's
-    // rule allows exactly this shape (output 0, zero-value tickets).
+    // rule allows exactly this shape (output 0, worth 0). Only shares that
+    // meet the pool's own target are sent to it (`jd::client::for_pool`).
     // Look here if: a pool refuses declarations with a commitment, the local
     // coinbases differ from the declared one, or token wins under Job
     // Declaration name another payout.
@@ -730,15 +729,45 @@ impl BchTemplate {
         let (Some(plan), Some(set)) = (self.jd.as_ref(), self.tokens.as_ref()) else {
             return Ok(None);
         };
-        let (miner, split) = plan.token_terms().ok_or("the pool's plan has no outputs")?;
-        let first_ticket_vout =
-            u32::try_from(plan.scripts.len() + 1).map_err(|_| "too many coinbase outputs")?;
-        AuxJob::build(set, miner, split, first_ticket_vout).map(Some)
+        // #### merge-mining v2: only Full-Template declarations carry the
+        // leaves the pool checks (`merge::disclosure`).
+        if self.is_p2pool() || !plan.full_template {
+            return Ok(None);
+        }
+        let miner = plan
+            .token_payout()
+            .ok_or("the pool's plan has no outputs")?;
+        // #### merge-mining v2: the pool's split
+        // What: a split leaf on a Job Declaration plan pays the miner and
+        // puts the pool's donation (its whole rate to its donation output)
+        // in the donation slot and the pool's fee (its rate to its fee
+        // output) in the fee slot, as the declared coinbase pays them.
+        // Why: no donation work runs under Job Declaration, so the pool's
+        // rule takes BCH's donation and fee from the coinbase; tokens follow
+        // the same rule. The pool checks it in a later change.
+        // Look here if: a Job Declaration leaf's split differs from the
+        // pool's rates.
+        let slot = |bps: u16, output: Option<u8>| match output
+            .and_then(|index| plan.scripts.get(usize::from(index)))
+        {
+            Some(script) => Slot::new(bps, script),
+            None => Ok(Slot::EMPTY),
+        };
+        let split = Split::new(
+            slot(plan.rates.donation_bps, plan.rates.donation_output).map_err(|e| e.to_string())?,
+            slot(plan.rates.fee_bps, plan.rates.fee_output).map_err(|e| e.to_string())?,
+        );
+        let terms = LeafTerms {
+            payout: miner,
+            split,
+            plain_payout: miner,
+        };
+        Ok(Some(AuxJob::build(set, &terms)))
     }
 
     /// The outputs a custom job carries for this Job Declaration template:
-    /// the commitment first when tokens are merge-mined, the pool's outputs,
-    /// then the tickets.
+    /// the commitment first when tokens are merge-mined, then the pool's
+    /// outputs.
     pub fn declared_outputs(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
         self.check_p2pool_prepared()?;
         if let Some(prepared) = &self.p2pool {
@@ -747,15 +776,9 @@ impl BchTemplate {
         let plan = self.jd.as_ref().ok_or("not a Job Declaration template")?;
         let mut outputs = plan.outputs(self.coinbase_value);
         if let Some(aux) = self.declared_aux()? {
-            // Each is a whole output: 8 value bytes, the script's length
-            // and the script.
-            let split = |output: &[u8]| -> (u64, Vec<u8>) {
-                let mut value = [0; 8];
-                value.copy_from_slice(&output[..8]);
-                (u64::from_le_bytes(value), output[9..].to_vec())
-            };
-            outputs.insert(0, split(&aux.outputs.commitment));
-            outputs.extend(aux.outputs.tickets.iter().map(|ticket| split(ticket)));
+            // A whole output: 8 value bytes, the script's length and the
+            // script.
+            outputs.insert(0, (0, aux.output[9..].to_vec()));
         }
         Ok(outputs)
     }
@@ -772,13 +795,12 @@ impl BchTemplate {
 
     /// #### PR #42
     /// Attaches the token set to merge-mine in jobs built from this template.
-    /// It only feeds `aux_job`: a coinbase carries the commitment and tickets
-    /// only when the caller passes that job's `outputs` to
-    /// `coinbase_with_aux` or `coinbase_parts_with_aux`, which do not check
-    /// them against this set. `coinbase_with_payout` and
-    /// `coinbase_parts_with_payout` always build token-free coinbases.
-    /// Without a call (no token registered) jobs and coinbases stay as they
-    /// were.
+    /// It only feeds `aux_job`: a coinbase carries the commitment only when
+    /// the caller passes that job's output 0 to `coinbase_with_aux` or
+    /// `coinbase_parts_with_aux`, which do not check it against this set.
+    /// `coinbase_with_payout` and `coinbase_parts_with_payout` always build
+    /// token-free coinbases. Without a call (no token registered) jobs and
+    /// coinbases stay as they were.
     pub fn commit(&mut self, set: Arc<TokenSet>) {
         self.tokens = Some(set);
     }
@@ -787,11 +809,41 @@ impl BchTemplate {
         self.tokens.as_ref()
     }
 
-    /// #### PR #42
+    // #### merge-mining v2: P2Pool
+    // What: under P2Pool's own templates a token set is not merge-mined:
+    // `aux_job` gives no commitment, the job mines BCH alone, and this
+    // reason reaches the dashboard.
+    // Why: P2Pool builds the coinbase and does not put this format's output
+    // 0 in it yet; a token set must not stop BCH work there.
+    // Look here if: tokens are registered at P2Pool and devices get no job,
+    // or P2Pool builds output 0 in this format.
+    /// Why this template's token set is not merge-mined, if it has one that
+    /// is not.
+    pub fn tokens_refused(&self) -> Option<&'static str> {
+        self.tokens.as_ref()?;
+        if self.is_p2pool() {
+            return Some("P2Pool's coinbase does not carry the token commitment yet");
+        }
+        // #### merge-mining v2: a Coinbase-only declaration cannot show the
+        // pool its leaves, so the pool refuses a token commitment there.
+        self.jd
+            .as_ref()
+            .is_some_and(|plan| !plan.full_template)
+            .then_some("Coinbase-only Job Declaration cannot show the pool its token leaves; use Full-Template")
+    }
+
+    // #### merge-mining v2: pool and role rules
+    // What: with a token set, a job for the operator's own devices (solo,
+    // any channel) commits the operator's root, its leaves binding the
+    // miner or, in donation-work jobs, the donation; a public pool's job
+    // (it names an operator) carries the empty commitment; a Job
+    // Declaration job carries the declared coinbase's.
+    // Why: an operator-chosen token root must never sit on other people's
+    // devices, and the pool fee never reaches tokens.
+    // Look here if: a public pool's job carries a non-empty root, or a solo
+    // job carries none while tokens are merge-mined.
     /// One job's merge-mining for this template's token set, or `None`
-    /// without one. Its leaves bind the job's beneficiary (the miner, or
-    /// the donation or operator in their work jobs) and the donation's
-    /// split, and its tickets follow the job's payout outputs.
+    /// without one.
     pub fn aux_job(
         &self,
         network: MiningNetwork,
@@ -806,17 +858,28 @@ impl BchTemplate {
         let Some(set) = self.tokens.as_ref() else {
             return Ok(None);
         };
+        // #### merge-mining v2: per-miner roots on a public pool
+        // What: a public pool's job (it names an operator) commits a root
+        // of its miner's own: each leaf binds the miner's payout, and its
+        // split carries the miner's donation choice and the operator's fee;
+        // donation-work and fee-work jobs pay their recipient whole.
+        // Why: the operator's fee applies to tokens as to BCH and the miner
+        // cannot remove it, while the donation is the miner's choice.
+        // Look here if: a public pool miner's leaf names another payout or
+        // split than their BCH coinbase.
         let scripts = super::payout::scripts(network, payout, operator)?;
-        let outputs = super::payout::outputs(self.coinbase_value, &scripts, policy);
-        let first_ticket_vout =
-            u32::try_from(outputs.len() + 1).map_err(|_| "too many coinbase outputs")?;
-        AuxJob::build(
-            set,
-            super::payout::beneficiary(&scripts, policy),
-            super::payout::token_split(policy, &scripts[1]),
-            first_ticket_vout,
-        )
-        .map(Some)
+        // #### merge-mining v2: the donation's split
+        // What: a miner job's split leaves pay the miner with the donation
+        // setting's block-reward share (1% at the 1.5% default) in the
+        // donation slot; a BCH donation-work job's leaves pay the donation
+        // with ext 0, the setting's work share. Tokens without split support
+        // pay the job's plain token payout with ext 0.
+        // Why: merge-mined tokens split as BCH does: two thirds from each
+        // win, one third as work.
+        // Look here if: a token's donation differs from BCH's at the same
+        // setting.
+        let terms = super::payout::leaf_terms(&scripts, policy)?;
+        Ok(Some(AuxJob::build(set, &terms)))
     }
 
     /// Build one channel's coinbase. The caller assigns a unique extranonce;
@@ -841,7 +904,7 @@ impl BchTemplate {
         self.coinbase_with_aux(network, payout, operator, extranonce, policy, None)
     }
 
-    /// The coinbase with a job's merge-mining outputs, if any.
+    /// The coinbase with a job's merge-mining output 0, if any.
     pub fn coinbase_with_aux(
         &self,
         network: MiningNetwork,
@@ -849,7 +912,7 @@ impl BchTemplate {
         operator: Option<&str>,
         extranonce: &[u8],
         policy: crate::donation::bch::BchPayout,
-        aux: Option<&AuxOutputs>,
+        aux: Option<&[u8; OUTPUT_LEN]>,
     ) -> Result<Coinbase, String> {
         self.check_p2pool_prepared()?;
         if let Some(prepared) = &self.p2pool {
@@ -891,12 +954,12 @@ impl BchTemplate {
     }
 
     /// #### PR #42: the coinbase paying `outputs`, with a job's merge-mining
-    /// outputs, if any.
+    /// output 0, if any.
     fn coinbase_with_outputs(
         &self,
         extranonce: &[u8],
         outputs: Vec<(u64, Vec<u8>)>,
-        aux: Option<&AuxOutputs>,
+        commitment: Option<&[u8; OUTPUT_LEN]>,
     ) -> Result<Coinbase, String> {
         if extranonce.len() > 64 {
             return Err("extranonce exceeds coinbase budget".into());
@@ -918,32 +981,18 @@ impl BchTemplate {
         bytes.extend(script);
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         // #### PR #42: merge-mining commitment in output 0
-        // What: with tokens, output 0 is the 53-byte commitment (value 0) and
-        // each Case B token's 46-byte ticket (value 0) follows the payouts.
-        // Without tokens (`aux` is `None`, the default on both networks) the
-        // coinbase is byte for byte what it was.
-        // Why: a covenant finds output 0 from the single input alone, with no
-        // search, and output 0 does not compete with P2Pool's last-output
-        // share commitment. Case B tickets do come last here; a P2Pool
-        // coinbase would put its commitment after them, which the journal's
-        // trailing-ticket strip does not accept yet.
+        // What: with tokens, output 0 is the 53-byte commitment (value 0)
+        // before the payouts. Without tokens (`commitment` is `None`, the
+        // default on both networks) the coinbase is byte for byte what it
+        // was.
+        // Why: a covenant finds output 0 from the fixed-shape head alone,
+        // with no search, and output 0 does not compete with P2Pool's
+        // last-output share commitment.
         // The payouts, the script, the extranonce offset and the parts are
         // unchanged, so devices and SV1 firmware see only a longer suffix.
-        // Look here if: a token-enabled block is refused by the node, the
-        // B leaves name the wrong ticket vouts, or the output count reaches
-        // 0xfd.
-        let (commitment, tickets) = match aux {
-            Some(aux) => {
-                if !aux.tickets.is_empty()
-                    && usize::try_from(aux.first_ticket_vout).ok() != Some(outputs.len() + 1)
-                {
-                    return Err("token tickets do not follow the payout outputs".into());
-                }
-                (Some(&aux.commitment), aux.tickets.as_slice())
-            }
-            None => (None, &[][..]),
-        };
-        let count = outputs.len() + usize::from(commitment.is_some()) + tickets.len();
+        // Look here if: a token-enabled block is refused by the node, or the
+        // output count reaches 0xfd.
+        let count = outputs.len() + usize::from(commitment.is_some());
         if commitment.is_some() && count >= 0xfd {
             return Err("a merge-mined coinbase needs fewer than 253 outputs".into());
         }
@@ -955,9 +1004,6 @@ impl BchTemplate {
             bytes.extend_from_slice(&amount.to_le_bytes());
             compact_size(script.len(), &mut bytes);
             bytes.extend(script);
-        }
-        for ticket in tickets {
-            bytes.extend_from_slice(ticket);
         }
         // #### end PR #42 ####
         bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -992,7 +1038,7 @@ impl BchTemplate {
         self.coinbase_parts_with_aux(network, payout, operator, extranonce_len, policy, None)
     }
 
-    /// #### PR #42: the parts with a job's merge-mining outputs, which sit
+    /// #### PR #42: the parts with a job's merge-mining output 0, which sits
     /// in the suffix; the prefix and the merkle path are unchanged.
     pub fn coinbase_parts_with_aux(
         &self,
@@ -1001,7 +1047,7 @@ impl BchTemplate {
         operator: Option<&str>,
         extranonce_len: usize,
         policy: crate::donation::bch::BchPayout,
-        aux: Option<&AuxOutputs>,
+        aux: Option<&[u8; OUTPUT_LEN]>,
     ) -> Result<CoinbaseParts, String> {
         if extranonce_len > 64 {
             return Err("extranonce exceeds coinbase budget".into());

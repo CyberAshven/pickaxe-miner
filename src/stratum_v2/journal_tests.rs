@@ -93,18 +93,14 @@ fn open(dir: &TestDirectory) -> Journal {
     .unwrap()
 }
 
-/// #### PR #42: a block solved with the test token merge-mined in both
-/// modes: a commitment as output 0 and a ticket after the payouts. It comes
-/// from a channel's share path, which names the ticket's entry as won.
+/// #### PR #42: a block solved with the test token merge-mined: a
+/// commitment as output 0, before the payouts.
 fn solved_token_share(salt: u8) -> ValidatedShare {
-    use super::merge::{leaf::Mode, set::tests::test_set};
+    use super::merge::set::tests::test_set;
     let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
-    template.commit(Arc::new(test_set(&[
-        Mode::ShareTarget,
-        Mode::BlockRequired,
-    ])));
+    template.commit(Arc::new(test_set()));
     let share = solved_share_on(template, salt, Default::default(), &payout(), None);
-    assert!(share.block && share.token_wins.contains(&1));
+    assert!(share.block && share.aux.is_some());
     share
 }
 
@@ -159,7 +155,7 @@ fn edit_script(output: &mut stratum_core::bitcoin::TxOut, change: impl FnOnce(&m
 
 // #### PR #42
 #[test]
-fn a_block_with_a_commitment_and_tickets_enqueues_and_survives_reopen() {
+fn a_block_with_a_commitment_enqueues_and_survives_reopen() {
     let dir = TestDirectory::new();
     let share = solved_token_share(1);
     let mut journal = open(&dir);
@@ -184,7 +180,7 @@ fn a_leading_output_that_is_not_an_exact_commitment_is_refused() {
     // A valued output 0 (the satoshi taken from the miner).
     assert!(!opens_after(|outputs| move_a_satoshi(outputs, 0)));
     // The wrong magic, version or height, and the wrong length.
-    for (index, value) in [(2, b'X'), (6, 2), (39, 17)] {
+    for (index, value) in [(2, b'X'), (6, 3), (39, 17)] {
         assert!(
             !opens_after(|outputs| edit_script(&mut outputs[0], |s| s[index] = value)),
             "byte {index}"
@@ -200,31 +196,37 @@ fn a_leading_output_that_is_not_an_exact_commitment_is_refused() {
     assert!(!opens_after(|outputs| outputs.swap(0, 1)));
 }
 
-// #### PR #42
+// #### merge-mining v2
 #[test]
-fn a_valued_or_unknown_trailing_output_is_refused() {
-    // A valued ticket (the satoshi taken from the miner).
-    assert!(!opens_after(|outputs| move_a_satoshi(outputs, 3)));
-    // A ticket with another script: no capability, another opcode, longer.
-    for (index, value) in [(35, 0), (1, 0xcf), (36, 0x88)] {
-        assert!(
-            !opens_after(|outputs| edit_script(&mut outputs[3], |s| s[index] = value)),
-            "byte {index}"
-        );
-    }
-    assert!(!opens_after(
-        |outputs| edit_script(&mut outputs[3], |s| s.push(0x87))
-    ));
-    // A zero-value output after the tickets that is not a ticket.
+fn a_trailing_output_is_refused_and_v1_tickets_are_gone() {
+    // A zero-value output after the payouts, such as a v1 ticket.
     assert!(!opens_after(|outputs| {
-        let mut extra = outputs[3].clone();
+        let mut extra = outputs[2].clone();
+        extra.value = sats(0);
+        edit_script(&mut extra, |s| {
+            *s = vec![0x00, 0xce, 0x21];
+            s.extend([0xfe; 32]);
+            s.extend([0x02, 0x87]);
+        });
+        outputs.push(extra);
+    }));
+    // Another zero-value output after the payouts.
+    assert!(!opens_after(|outputs| {
+        let mut extra = outputs[2].clone();
+        extra.value = sats(0);
         edit_script(&mut extra, |s| *s = vec![0x6a]);
         outputs.push(extra);
     }));
-    // Tickets without a commitment.
-    assert!(!opens_after(|outputs| {
-        outputs.remove(0);
-    }));
+    // The empty commitment as output 0 is a commitment too.
+    assert!(opens_after(|outputs| edit_script(&mut outputs[0], |s| {
+        *s = super::merge::commitment::AuxCommitment::EMPTY
+            .script()
+            .to_vec()
+    })));
+    // A v1 commitment (version 01) is not.
+    assert!(!opens_after(|outputs| edit_script(&mut outputs[0], |s| {
+        s[6] = 1
+    })));
 }
 
 // #### PR #42

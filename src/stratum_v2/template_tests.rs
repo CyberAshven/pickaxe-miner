@@ -305,10 +305,7 @@ fn no_tokens_keeps_coinbase_bytes_identical() {
 // #### PR #42
 #[test]
 fn the_commitment_is_output_zero_and_the_parts_still_fit() {
-    use super::merge::{
-        commitment::AuxCommitment, leaf::Mode, registry::is_ticket_script, set::tests::test_set,
-        tree::fold,
-    };
+    use super::merge::{commitment::AuxCommitment, set::tests::test_set, tree::fold};
     use crate::donation::bch::BchPayout;
     use std::sync::Arc;
     let network = MiningNetwork::Chipnet;
@@ -319,10 +316,7 @@ fn the_commitment_is_output_zero_and_the_parts_still_fit() {
     raw["transactions"] = json!(txs);
     let plain = BchTemplate::from_rpc(&raw).unwrap();
     let mut template = plain.clone();
-    template.commit(Arc::new(test_set(&[
-        Mode::ShareTarget,
-        Mode::BlockRequired,
-    ])));
+    template.commit(Arc::new(test_set()));
     assert_eq!(template.tokens().unwrap().serial(), 1);
     let job = template
         .aux_job(network, &payout(), None, policy)
@@ -330,7 +324,7 @@ fn the_commitment_is_output_zero_and_the_parts_still_fit() {
         .unwrap();
     let extra = [7u8; 28];
     let coinbase = template
-        .coinbase_with_aux(network, &payout(), None, &extra, policy, Some(&job.outputs))
+        .coinbase_with_aux(network, &payout(), None, &extra, policy, Some(&job.output))
         .unwrap();
     let parts = template
         .coinbase_parts_with_aux(
@@ -339,7 +333,7 @@ fn the_commitment_is_output_zero_and_the_parts_still_fit() {
             None,
             extra.len(),
             policy,
-            Some(&job.outputs),
+            Some(&job.output),
         )
         .unwrap();
     let mut bytes = parts.prefix.clone();
@@ -353,15 +347,17 @@ fn the_commitment_is_output_zero_and_the_parts_still_fit() {
     assert_eq!(parts.prefix, plain_parts.prefix);
     assert_eq!(parts.merkle_path, plain_parts.merkle_path);
     // Output 0 sits right after the one-byte output count, found from the
-    // input alone, and the ticket right before the locktime.
+    // input alone.
     let script_len = usize::from(coinbase.bytes[41]);
-    assert_eq!(coinbase.bytes[46 + script_len], 4);
+    assert_eq!(coinbase.bytes[46 + script_len], 3);
     assert_eq!(
         coinbase.bytes[47 + script_len..100 + script_len],
-        job.outputs.commitment
+        job.output
     );
-    let end = coinbase.bytes.len() - 4;
-    assert_eq!(coinbase.bytes[end - 46..end], job.outputs.tickets[0]);
+    assert_eq!(
+        super::merge::commitment::output_zero(&coinbase.bytes),
+        Some(&job.output[..])
+    );
     let commitment =
         AuxCommitment::parse(&coinbase.bytes[47 + script_len..100 + script_len]).unwrap();
     assert_eq!(commitment, job.commitment);
@@ -373,44 +369,42 @@ fn the_commitment_is_output_zero_and_the_parts_still_fit() {
         );
     }
     // The block decodes, its merkle root checks, and the coinbase pays the
-    // same amounts: the commitment and the ticket are worth 0.
+    // same amounts: the commitment is worth 0.
     let header = template
         .header(&coinbase, template.version, template.current_time, 0)
         .unwrap();
     let block: Block = consensus::deserialize(&template.block(&coinbase, header).unwrap()).unwrap();
     assert!(block.check_merkle_root());
     let outputs = &block.txdata[0].output;
-    assert_eq!(outputs.len(), 4);
+    assert_eq!(outputs.len(), 3);
     assert_eq!(outputs[0].value.to_sat(), 0);
     assert_eq!(outputs[0].script_pubkey.as_bytes(), job.commitment.script());
-    let vout = job.entries[1].ticket_vout.unwrap() as usize;
-    assert_eq!(vout, 3);
-    assert_eq!(outputs[vout].value.to_sat(), 0);
-    assert!(is_ticket_script(outputs[vout].script_pubkey.as_bytes()));
     assert_eq!(
         outputs.iter().map(|o| o.value.to_sat()).sum::<u64>(),
         template.coinbase_value
     );
-    // Tickets must follow the payouts, or the B leaves would name the
-    // wrong vouts.
-    let mut wrong = job.outputs.clone();
-    wrong.first_ticket_vout += 1;
-    assert!(template
-        .coinbase_with_aux(network, &payout(), None, &extra, policy, Some(&wrong))
-        .is_err());
+    // #### merge-mining v2: no custom coinbase tag by default: the script
+    // is the height, the extranonce and nothing else.
+    assert_eq!(coinbase.bytes[41], 4 + 28);
+    assert_eq!(coinbase.bytes[42..46], [0x03, 0x15, 0xf9, 0x04]);
+    assert_eq!(coinbase.bytes[46..74], extra);
 }
 
-// #### PR #42
+// #### PR #42, merge-mining v2
+// What: the extended coinbase with the test token: its 53-byte commitment
+// (v2) as output 0, then the payouts; a public pool's carries the empty
+// commitment instead.
+// Look here if: the commitment, the leaf or the test token's state change.
 #[test]
-fn golden_extended_coinbase_with_an_a_token_and_a_b_ticket() {
-    use super::merge::{leaf::Mode, set::tests::test_set};
+fn golden_extended_coinbase_with_a_token() {
+    use super::merge::{commitment::AuxCommitment, set::tests::test_set};
     use crate::donation::bch::{BchPayout, FeeMode, PoolFee};
     use std::sync::Arc;
     let network = MiningNetwork::Chipnet;
     let policy = BchPayout::default();
-    let build = |modes: &[Mode], extranonce: &[u8], operator: Option<&str>, policy| {
+    let build = |extranonce: &[u8], operator: Option<&str>, policy| {
         let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
-        template.commit(Arc::new(test_set(modes)));
+        template.commit(Arc::new(test_set()));
         let job = template
             .aux_job(network, &payout(), operator, policy)
             .unwrap()
@@ -422,72 +416,30 @@ fn golden_extended_coinbase_with_an_a_token_and_a_b_ticket() {
                 operator,
                 extranonce,
                 policy,
-                Some(&job.outputs),
+                Some(&job.output),
             )
             .unwrap()
             .bytes
     };
-    let commitment = |root: &str, height: &str, nonce: &str| {
-        format!("00000000000000002c6a2a43544d4d01{root}{height}{nonce}")
+    let commitment = |root: &str, height: &str, salt: &str| {
+        format!("00000000000000002c6a2a43544d4d02{root}{height}{salt}")
     };
-    // One Case A token: the 53-byte commitment as output 0.
-    let a = build(&[Mode::ShareTarget], &[7; 28], None, policy);
+    // The test token: the 53-byte commitment as output 0.
+    let a = build(&[7; 28], None, policy);
     assert_eq!(a.len(), 204);
     let golden_a = format!(
         "{GOLDEN_HEAD}03{}{GOLDEN_PAYOUTS}00000000",
-        commitment(
-            "bbcfbf16c81f6c441f43cb1eedb2eeabfa563ba0bd9765c4bb9265d2f96c3a5d",
-            "00",
-            "00000000"
-        )
+        commitment(GOLDEN_TOKEN_ROOT, "00", "00000000")
     );
     assert_eq!(golden_hex(&a), golden_a);
-    // The test token in both modes: one commitment and one ticket.
-    let both = build(
-        &[Mode::ShareTarget, Mode::BlockRequired],
-        &[7; 28],
-        None,
-        policy,
-    );
-    assert_eq!(both.len(), 250);
-    let golden_both = format!(
-        "{GOLDEN_HEAD}04{}{GOLDEN_PAYOUTS}{}00000000",
-        commitment(
-            "5b7d3f2722c00b21e28af132bda1a61f157ba2ab94941635f53ad20dc6de0909",
-            "01",
-            "00000000"
-        ),
-        concat!(
-            "0000000000000000",
-            "25",
-            "00ce21",
-            "feab4bcd324f722033f5a1d67432f45caeba0e505b5ccaaf665555769425ad93",
-            "02",
-            "87"
-        )
-    );
-    assert_eq!(golden_hex(&both), golden_both);
-    // A standard channel's coinbase (20-byte extranonce): 143, 196, 242.
+    // A standard channel's coinbase (20-byte extranonce): 143 and 196.
     let plain = BchTemplate::from_rpc(&rpc_template()).unwrap();
     let standard = plain
         .coinbase_with_payout(network, &payout(), None, &[7; 20], policy)
         .unwrap();
     assert_eq!(standard.bytes.len(), 143);
-    assert_eq!(
-        build(&[Mode::ShareTarget], &[7; 20], None, policy).len(),
-        196
-    );
-    assert_eq!(
-        build(
-            &[Mode::ShareTarget, Mode::BlockRequired],
-            &[7; 20],
-            None,
-            policy
-        )
-        .len(),
-        242
-    );
-    // A public pool with a coinbase fee, with the commitment: 238.
+    assert_eq!(build(&[7; 20], None, policy).len(), 196);
+    // A public pool with a coinbase fee carries its miner's own root: 238.
     let operator = crate::tx::p2pkh_hash_to_cashaddr_for_network(&[0x34; 20], network).unwrap();
     let fee = BchPayout {
         fee: Some(PoolFee {
@@ -496,11 +448,17 @@ fn golden_extended_coinbase_with_an_a_token_and_a_b_ticket() {
         }),
         ..policy
     };
-    assert_eq!(
-        build(&[Mode::ShareTarget], &[7; 28], Some(&operator), fee).len(),
-        238
-    );
+    let public = build(&[7; 28], Some(&operator), fee);
+    assert_eq!(public.len(), 238);
+    let root = AuxCommitment::parse(super::merge::commitment::output_zero(&public).unwrap());
+    assert!(root.is_some_and(|root| !root.is_empty()));
+    assert_ne!(public[204 - 53 - 4..], a[204 - 53 - 4..]);
 }
+
+/// #### merge-mining v2: the test token's root on the test template's
+/// miner job (its leaf binds the miner's script, with 1% of each win to the
+/// donation in its split).
+const GOLDEN_TOKEN_ROOT: &str = "a022c34ac234c2ac6a7b3b76a31eb0aad9612cfd83d662de94e3f231c6da4057";
 
 #[test]
 fn extended_coinbase_parts_preserve_nonempty_odd_and_even_merkle_trees() {
@@ -810,19 +768,17 @@ fn provided_templates_are_checked_like_a_nodes() {
 // #### PR #42
 // What: under a Job Declaration plan with a token set, the declared
 // coinbase, every local job's coinbase and the custom job's outputs carry
-// the commitment as output 0 and the ticket (worth 0) after the pool's
-// outputs; the leaves bind the miner's script (the pool's first output) with
-// the pool's whole donation rate as the split, and the pool's rule accepts
-// the outputs. Without tokens they are the plan's outputs alone.
+// the commitment as output 0 before the pool's outputs; the leaves bind the
+// miner's script (the pool's first output), and the pool's rule accepts the
+// outputs. Without tokens they are the plan's outputs alone.
 // Look here if: declared_aux, declared_parts or declared_outputs change.
 #[test]
 fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
     use super::jd::{plan::JdPlan, policy::PayoutRule, token::PoolRates};
     use super::merge::{
         commitment::AuxCommitment,
-        leaf::Mode,
-        registry::is_ticket_script,
-        set::{tests::test_set, AuxJob},
+        set::{tests::test_set, AuxJob, LeafTerms},
+        split::{Slot, Split},
     };
     use std::sync::Arc;
     let network = MiningNetwork::Chipnet;
@@ -841,31 +797,46 @@ fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
         },
         pool_target: [0xff; 32],
         p2pool: None,
+        full_template: true,
     };
     template.declare(Arc::new(plan.clone()));
     let pool_outputs = plan.outputs(template.coinbase_value);
     assert!(template.declared_aux().unwrap().is_none());
     assert_eq!(template.declared_outputs().unwrap(), pool_outputs);
-    let set = Arc::new(test_set(&[Mode::ShareTarget, Mode::BlockRequired]));
+    let set = Arc::new(test_set());
     template.commit(set.clone());
     let aux = template.declared_aux().unwrap().unwrap();
-    let expected = AuxJob::build(&set, &[0x51], Some((150, &[0x53][..])), 4).unwrap();
-    assert_eq!(aux.outputs.commitment, expected.outputs.commitment);
-    assert_eq!(aux.outputs.tickets, expected.outputs.tickets);
-    assert_eq!(aux.outputs.first_ticket_vout, 4);
+    // #### merge-mining v2: the leaves pay the miner with the pool's whole
+    // donation rate and its fee in the split, as the coinbase pays them.
+    let split = Split::new(
+        Slot::new(150, &[0x53]).unwrap(),
+        Slot::new(100, &[0x52]).unwrap(),
+    );
+    let expected = AuxJob::build(
+        &set,
+        &LeafTerms {
+            payout: &[0x51],
+            split,
+            plain_payout: &[0x51],
+        },
+    );
+    assert_eq!(aux.output, expected.output);
+    assert_eq!(aux.entries[0].split, split);
+    assert_eq!(aux.entries[0].leaf.ext, split.ext());
     // Every local job on the plan shares it, whatever its own payout says.
     let local = template
         .aux_job(network, &payout(), None, Default::default())
         .unwrap()
         .unwrap();
-    assert_eq!(local.outputs.commitment, aux.outputs.commitment);
+    assert_eq!(local.output, aux.output);
     let outputs = template.declared_outputs().unwrap();
-    assert_eq!(outputs.len(), 5);
+    assert_eq!(outputs.len(), 4);
     assert_eq!(outputs[0].0, 0);
-    assert!(AuxCommitment::parse_script(&outputs[0].1).is_some());
+    assert_eq!(
+        AuxCommitment::parse_script(&outputs[0].1),
+        Some(aux.commitment)
+    );
     assert_eq!(&outputs[1..4], pool_outputs.as_slice());
-    assert_eq!(outputs[4].0, 0);
-    assert!(is_ticket_script(&outputs[4].1));
     let rule = PayoutRule {
         miner: vec![0x51],
         donation: Some((vec![0x53], 150)),
@@ -884,7 +855,7 @@ fn job_declaration_jobs_carry_the_commitment_and_the_pool_rule_accepts_them() {
             None,
             &extranonce,
             Default::default(),
-            Some(&local.outputs),
+            Some(&local.output),
         )
         .unwrap();
     let mut declared = parts.prefix.clone();
