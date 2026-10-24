@@ -1153,6 +1153,29 @@ mod tests {
         assert_eq!(shares(&slots), (75, 25));
     }
 
+    /// #### PR #72
+    /// What: stops the scheduler when dropped, a failed assertion included.
+    /// Why: the scope waits for the scheduler, which only stops on `stop`;
+    /// a failed assertion on a slow runner hung macOS CI for 27 minutes
+    /// instead of failing.
+    /// Look here if: a scheduler test hangs rather than failing.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Waits up to 10 seconds for `ready`, for slow runners.
+    fn wait_until(what: &str, ready: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn the_scheduler_gives_each_token_its_share_and_releases_every_hold_at_stop() {
         let (photon, electric) = (Fake::new(true, 1), Fake::new(true, 1));
@@ -1162,6 +1185,7 @@ mod tests {
         let layout = Mutex::new(String::new());
         std::thread::scope(|scope| {
             scope.spawn(|| schedule(&slots, &["GPU".into()], &stop, period, &layout));
+            let _stop = StopOnDrop(&stop);
             std::thread::sleep(period * 5);
             let (p, e) = (photon.mined(), electric.mined());
             let share = p.as_secs_f64() / (p + e).as_secs_f64();
@@ -1186,11 +1210,14 @@ mod tests {
         let period = Duration::from_millis(100);
         let layout = Mutex::new(String::new());
         let names = vec!["RTX 3070".to_string(); 5];
+        let whole = "GPU 1, 2, 3, 4 PHOTON · GPU 5 ELECTRIC";
         std::thread::scope(|scope| {
             scope.spawn(|| schedule(&slots, &names, &stop, period, &layout));
-            std::thread::sleep(period * 2);
+            let _stop = StopOnDrop(&stop);
+            // #### PR #72: each stage is waited for, not slept through.
+            wait_until("the first round", || !layout.lock().unwrap().is_empty());
             assert!(layout.lock().unwrap().starts_with("measuring the GPUs"));
-            std::thread::sleep(period * (MEASURE_ROUNDS + 1));
+            wait_until("whole GPUs", || *layout.lock().unwrap() == whole);
             let before: Vec<Duration> = (0..5).map(|gpu| electric.mined_on(gpu)).collect();
             std::thread::sleep(period * 5);
             let gained: Vec<Duration> = (0..5)
@@ -1198,11 +1225,7 @@ mod tests {
                 .collect();
             assert!(gained[..4].iter().all(Duration::is_zero), "{gained:?}");
             assert!(gained[4] > period * 4, "{gained:?}");
-            assert_eq!(
-                *layout.lock().unwrap(),
-                "GPU 1, 2, 3, 4 PHOTON · GPU 5 ELECTRIC"
-            );
-            stop.store(true, Ordering::Relaxed);
+            assert_eq!(*layout.lock().unwrap(), whole);
         });
         assert!(photon.released() && electric.released());
     }
