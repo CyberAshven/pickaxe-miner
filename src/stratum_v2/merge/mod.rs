@@ -26,6 +26,7 @@ pub mod leaf;
 pub mod proof;
 pub mod registry;
 pub mod safa;
+pub mod safa_auxpow;
 pub mod set;
 pub mod source;
 pub mod split;

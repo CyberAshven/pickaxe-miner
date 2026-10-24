@@ -88,12 +88,18 @@ pub fn verify(bytes: &[u8], view: &ClaimView) -> Result<AuxProof, ProofError> {
 
 /// Steps 2-9 on a decoded proof.
 pub fn verify_proof(proof: &AuxProof, view: &ClaimView) -> Result<(), ProofError> {
-    proof.check_shape()?;
-    let target = expand_compact(view.target_bits).ok_or(ProofError::Target)?;
     // 2. The leaf, from the claim alone.
-    let leaf = view.leaf();
+    verify_leaf(proof, &view.leaf(), view.max_aux_height)
+}
+
+/// #### merge-mining v2: steps 3-9 for a leaf a covenant has rebuilt (its
+/// `payout_hash` an unlocking argument, as BCH P2Pool's SAFA covenant reads
+/// it).
+pub fn verify_leaf(proof: &AuxProof, leaf: &Leaf, max_aux_height: u8) -> Result<(), ProofError> {
+    proof.check_shape()?;
+    let target = expand_compact(leaf.target_bits).ok_or(ProofError::Target)?;
     // 3. The slot, at a height the token allows.
-    if proof.height > view.max_aux_height.min(MAX_HEIGHT) {
+    if proof.height > max_aux_height.min(MAX_HEIGHT) {
         return Err(ProofError::Height);
     }
     let slot = tree::slot(&leaf.category, proof.salt, proof.height);
