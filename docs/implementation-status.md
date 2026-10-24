@@ -3329,9 +3329,14 @@ Branch `feat/merge-mining-v2`, on `dev`.
 - **Privacy:** fresh salt bytes per merge-mined standard-channel job, no tag
   by default, one claim per journal row, and `--claim-delay` (default 5-60 s,
   recorded as `broadcast_after`).
-- **Donation:** with no per-claim split, the merge-mined token donation is
-  all work at the whole setting (1.5% of work at the default), from a token
-  balance in the work allocation; BCH's own donation is unchanged.
+- **Donation and split:** a leaf's `ext` commits to a donation slot and a fee
+  slot (a canonical 69-byte preimage; shares rounded down in turn; shares
+  under 1,000 satoshis at the AMM price stay with the miner). Merge-mined
+  tokens split as BCH does: the reward share (1% at 1.5%) in each miner job's
+  donation slot, BCH's donation-work jobs (0.5%) paying the donation whole.
+  Under Job Declaration the leaves carry the pool's donation rate and fee. A
+  token without split support (the registry flag) keeps `ext = 0` and gives
+  its whole donation as work.
 
 Not in this change: BCH P2Pool building output 0 in this format (Pickaxe
 still refuses tokens with a P2Pool-prepared coinbase), a claim builder, and

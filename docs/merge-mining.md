@@ -82,12 +82,62 @@ off len field         value
 69  32  state_hash    token-defined; changes only on a successful claim
 101 32  payout_hash   HASH256(the payout output's locking bytecode)
 133 4   target_bits   the token's compact target, u32 LE
-137 32  ext           token-defined (a split, a donation), or 00 x 32
+137 32  ext           the split commitment (see Split), or 00 x 32 for none
 ```
 
 The state hash stops replays (a claim moves it), the payout hash stops
-redirection, and the target stops a claim at an easier one. A covenant builds
-the leaf from introspection; a proof never carries leaf data.
+redirection, the target stops a claim at an easier one, and `ext` binds how
+each win is shared. A covenant builds the leaf from introspection; a proof
+never carries leaf data.
+
+### Split
+
+`ext` commits to a donation slot and a fee slot, in that order:
+
+```text
+ext = 00 x 32                                                no split
+ext = SHA256(03 ‖ d_bps u16le ‖ d_hash 32 ‖ f_bps u16le ‖ f_hash 32)
+```
+
+The preimage is a fixed 69 bytes and canonical:
+
+- each rate (`d_bps`, `f_bps`) is 0 to 10,000 hundredths of a percent;
+- a rate of 0 has a zero hash, and a rate above 0 a non-zero hash;
+- two empty slots are the zero `ext`; that all-empty preimage is refused;
+- a hash is `HASH256` of the recipient's locking bytecode (`script_hash`, as
+  `payout_hash` is);
+- there is no other use of `ext`.
+
+The claim reveals the preimage; the covenant hashes it, checks it is
+canonical, and pays it.
+
+**Shares** of a reward `R` (in u128):
+
+```text
+d     = floor(R × d_bps / 10000)
+f     = floor((R − d) × f_bps / 10000)
+miner = R − d − f
+```
+
+A share worth less than `MIN_SHARE_SATS = 1,000` satoshis at the vault's AMM
+price counts as 0 and stays with the miner. The price is
+`share × (cash + virtual) / tokens`, rounded down, the covenant's formula; an
+AMM that holds no tokens prices nothing, so every split share is 0. The fee is
+still computed from what the raw donation left: dropping a small donation
+never raises the fee.
+
+**Claim outputs**, in order: the vault, the miner's remainder (paying
+`payout_hash`), the donation and the fee. Each of the last three is present
+only when its amount is above 0. A split output carries exactly 800 satoshis
+and fungible tokens only: the vault's category, no NFT capability, an amount
+of at least 1. Each present split output adds about 90 bytes to the claim,
+which the vault's fee pays for. The miner's output carries the token's payout
+dust (a token-level rule).
+
+**Work jobs** (donation work and fee work) carry `ext = 0`: their leaves pay
+the donation (or the fee) whole. A token whose covenant does not verify splits
+(the registry's `split` flag) gets `ext = 0` on every leaf, and its donation
+and fee are taken as work instead.
 
 ### Proof (`AuxProof` v2)
 
@@ -124,7 +174,9 @@ these steps, and runs them on every proof before keeping it (fail closed):
 1. **Decode** exactly one canonical `AuxProof` v2.
 2. **Rebuild the leaf** from introspection: the category, `HASH256` of the
    baton's locking bytecode, the token's state hash, `HASH256` of the payout
-   output's locking bytecode, the token's `target_bits` and `ext`.
+   output's locking bytecode, the token's `target_bits` and `ext` (zero, or
+   the SHA-256 of the split preimage the claim reveals, checked canonical;
+   the split's outputs are checked as in Split).
 3. **Slot** from the category, the salt and `h` (`h` at most the token's
    limit).
 4. **Fold the aux branch** from the leaf hash to the root.
@@ -142,16 +194,23 @@ these steps, and runs them on every proof before keeping it (fail closed):
 
 - **Solo** (the operator is the miner): Pickaxe commits its own root for its
   own devices, on standard and extended channels and SV1 firmware through the
-  adapter. Each leaf pays the miner's script or, in the token donation's
-  work (the whole donation setting, see Donation), the donation's.
-- **Pickaxe as a public pool** (serving other people's devices): their jobs
-  carry the **empty commitment**. An operator-chosen token root never sits on
-  other people's devices, the pool fee never reaches tokens, and no share of
-  theirs wins a token. Their device target is never eased toward a token's.
+  adapter. Each leaf pays the miner's script with the donation in its split,
+  or, in a donation-work job, the donation's script whole (see Donation).
+- **Pickaxe as a public pool** (serving other people's devices): an
+  operator's pool fee reaches tokens as it reaches BCH, and the miner cannot
+  remove it, so a public pool will build per-miner roots: each leaf binds the
+  miner's payout, and its split carries the donation and the fee. That is the
+  next stage, with the disclosure to extended and SV1 miners that lets them
+  check their leaf before hashing. Until then a public pool's jobs carry the
+  **empty commitment**: no share of theirs wins a token, and their device
+  target is never eased toward a token's.
 - **Job Declaration** (Pickaxe at a pool with its own templates): the
   declared coinbase carries the commitment as output 0 before the pool's
   outputs, and its leaves bind the miner's own script (the pool's first
-  output). Only shares that meet the **pool's** share target go to the pool.
+  output), with the pool's donation rate and fee in the split, as the
+  coinbase pays them. The pool checks the leaves in a later stage; until
+  then clients put the fee in honestly. Only shares that meet the **pool's**
+  share target go to the pool.
   Token-only hits (meeting a token's target but not the pool's) stay local:
   journaled and claimed by Pickaxe, never sent as shares. The local device
   target may be eased toward the token target; that easing is local and never
@@ -200,19 +259,22 @@ and leaves BCH mining unaffected.
 ## Donation
 
 Merge-mined tokens follow the one BCH ASIC donation setting (default 1.5%,
-anything from 0% to 100% in Advanced settings), and their whole donation is
-mining work: v2 leaves carry no per-claim split. At 1.5%, the leaves of 1.5% of
-the work pay the Pickaxe donation's script. That is every BCH donation-work job
-(BCH's third of the setting, whose BCH also goes to the donation) and enough
-other jobs, whose BCH still pays the miner, to make up the rest. The work
-allocation weighs accepted shares by difficulty, as for BCH. The BCH donation
-itself (two thirds from block rewards, one third work) is unchanged.
+anything from 0% to 100% in Advanced settings), split as BCH's is:
 
-A split of each claim is token-defined (the leaf's `ext`); no registered token
-defines one yet, so Pickaxe sets `ext` to 32 zero bytes. A public pool's fee
-never reaches tokens. Under Job Declaration no donation work runs (the pool's
-rule takes the donation from the coinbase, and every local job shares the
-declared coinbase), so leaves pay the miner there.
+- **Two thirds from each win:** the reward share (1% at 1.5%,
+  `BchDonation::reward_units` of 10,000) is the donation slot's rate on every
+  leaf of the miner's own jobs, as a block's donation output takes it from the
+  reward.
+- **One third as work:** BCH's donation-work jobs (0.5% of the work at 1.5%)
+  have leaves that pay the donation whole, with `ext = 0`.
+- A setting of 0% means no donation: no slot and no work.
+
+Under Job Declaration no donation work runs (every local job shares the
+declared coinbase), so the leaves carry the pool's whole donation rate and its
+fee in the split, as the declared coinbase pays BCH's. A token whose covenant
+verifies no split takes its whole donation (1.5%) as work instead: every BCH
+donation-work job, and enough other jobs to make up the rest, whose BCH still
+pays the miner.
 
 ## Coinbase size
 
@@ -360,14 +422,73 @@ target and ext above); with any other state hash the same bytes fail.
 00 00000000
 ```
 
+### Split shares
+
+`d_bps` and `f_bps` are the donation's and the fee's rates; shares are
+`(donation, fee, miner)`. Unit tests in `src/stratum_v2/merge/split.rs`.
+
+| reward | d_bps | f_bps | shares |
+|---|---|---|---|
+| 1 | 10000 | 10000 | (1, 0, 0) |
+| 1 | 9999 | 9999 | (0, 0, 1) |
+| 99 | 10000 | 10000 | (99, 0, 0) |
+| 99 | 9999 | 9999 | (98, 0, 1) |
+| 100 | 10000 | 10000 | (100, 0, 0) |
+| 100 | 9999 | 9999 | (99, 0, 1) |
+| 2^63−1 | 10000 | 10000 | (9223372036854775807, 0, 0) |
+| 2^63−1 | 9999 | 9999 | (9222449699651090329, 922244969965109, 92233720369) |
+| 99 | 100 | 200 | (0, 1, 98): the donation rounds to 0, the fee does not |
+| 1,000,000 | 10000 | 500 | (1000000, 0, 0): a whole donation leaves no fee |
+| 1,000,000 | 100 | 100 | (10000, 9900, 980100): both slots |
+| 1,001 | 5000 | 10000 | (500, 501, 0): no miner remainder |
+
+At one satoshi per token (cash 600,000 and virtual 400,000 satoshis for
+1,000,000 tokens), a share of 999 tokens (`MIN_SHARE_SATS − 1`) is worth 999
+satoshis and stays with the miner, and one of 1,000 is kept. Refused: a rate of
+10,001; a rate above 0 with a zero hash; a rate of 0 with a non-zero hash; the
+all-empty preimage.
+
+### A whole split leaf
+
+Token A of the two-token tree, with a 1% donation to P2PKH(`d0` × 20) and a 1%
+fee to P2PKH(`fe` × 20).
+
+- The split preimage (69 bytes):
+
+```text
+03 6400 8bc613f574964583c7b08b7925373515b513ed15b372bc727599c16434254d1c
+   6400 543bb5ec93f33a1c27a5822e4c638e9ab1e90e44c094fd7aaba51efc4e554c50
+```
+
+- ext: `79f31f395015b16c76e12673ec8f58329d81f1884d76a0d210d1f3158a8faa85`
+- The leaf (169 bytes):
+
+```text
+43544d4c02
+1111111111111111111111111111111111111111111111111111111111111111
+953ccfa596a6c6d39e5980194539124fdcff116a571455a212baed811f585ee0
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+22650758a42ebfd7306e771ad24c442cad795ed9e549392233729f647a2b1be5
+ffff7f20
+79f31f395015b16c76e12673ec8f58329d81f1884d76a0d210d1f3158a8faa85
+```
+
+- Leaf hash: `c40271368b4287df8fe3430e1bc3f9410b554874de698144fa04fe5df7033e41`
+- Claim outputs at one satoshi per token: a reward of 1,000,000 pays the
+  miner 980,100, the donation 10,000 and the fee 9,900 (each split output
+  with 800 satoshis). A reward of 50,000 pays the miner all 50,000: the
+  donation's 500 and the fee's 495 are worth under 1,000 satoshis.
+
 ## What Pickaxe does today
 
 - Builds the commitment and the tree into every job when a token is
-  merge-mined (solo), and the empty commitment into a public pool's jobs.
+  merge-mined (solo), with the donation's split in each miner job's leaves,
+  and the empty commitment into a public pool's jobs.
 - Checks every share against each token, hands wins to a claim worker, proves
   them, verifies each proof from its bytes as a covenant would, and saves it
   to `<config>.sv2-token-proofs.json`, readable by the owner alone, one claim
-  per row with its `broadcast_after` time.
+  per row with its `broadcast_after` time and the split preimage the claim
+  reveals.
 - Shows token wins on the dashboard and in the status file, never with an
   address, and says when the own-root check refused a job.
 - A hidden `stratum-v2 serve --merge-test-token <DIFFICULTY>` merge-mines a
@@ -384,5 +505,8 @@ target and ext above); with any other state hash the same bytes fail.
   claim builder that broadcasts its claims.
 - **BCH P2Pool** building output 0 in this format, so Pickaxe can merge-mine
   there.
+- **Public pools' per-miner roots** (the fee and donation in each miner's
+  split), their disclosure to extended and SV1 miners, and the Job Declaration
+  pool's check of the declared leaves.
 - **Live checks:** a BCHN node accepting a template with the commitment
   (`validateblocktemplate`), and a covenant judged by a BCHN regtest node.
