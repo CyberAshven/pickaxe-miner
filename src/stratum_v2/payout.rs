@@ -106,6 +106,20 @@ pub fn token_payout(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
     }
 }
 
+/// #### merge-mining v2
+/// The payout a split token's leaf binds: the donation's script in BCH
+/// donation-work jobs (the setting's work third), the miner's otherwise; the
+/// rest of the donation is the leaf's split. Unlike `token_payout` it never
+/// follows `token_donation_work`, which only tokens without split support
+/// take.
+pub fn split_token_payout(scripts: &[Vec<u8>], policy: BchPayout) -> &[u8] {
+    if policy.donation_work {
+        &scripts[1]
+    } else {
+        &scripts[0]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

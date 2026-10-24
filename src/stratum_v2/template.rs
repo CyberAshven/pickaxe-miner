@@ -868,11 +868,7 @@ impl BchTemplate {
             Split::donation(policy.donation.reward_bps(), &scripts[1]).map_err(|e| e.to_string())?
         };
         let terms = LeafTerms {
-            payout: if policy.donation_work {
-                &scripts[1]
-            } else {
-                &scripts[0]
-            },
+            payout: super::payout::split_token_payout(&scripts, policy),
             split,
             plain_payout: super::payout::token_payout(&scripts, policy),
         };

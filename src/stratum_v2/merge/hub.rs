@@ -366,9 +366,16 @@ fn states(win: &TokenWin) -> Vec<(Hash, Hash)> {
         .collect()
 }
 
-/// Each won entry with the payout locking bytecode its claim would pay:
-/// the job's beneficiary (the miner, or the donation in its work jobs), or
-/// under Job Declaration the miner's own script, the pool's first output.
+// #### merge-mining v2: each entry's own payout
+// What: each won entry is claimed with the payout its own leaf binds, as
+// `BchTemplate::aux_job` chose it: a split token's
+// (`payout::split_token_payout`) or a token without split support's
+// (`payout::token_payout`), which differ in a job that pays the latter's
+// donation work; under Job Declaration both are the miner's own script.
+// Why: one payout for the whole win failed the proof check of the other
+// kind of token in a mixed set and turned token claims off.
+// Look here if: a mixed set's win fails its own proof check.
+/// Each won entry with the payout locking bytecode its claim would pay.
 /// The verifier hashes it again, so a job whose leaf bound anything else
 /// fails its own check.
 fn claim_payouts(network: MiningNetwork, win: &TokenWin) -> Vec<(u16, Vec<u8>)> {
@@ -377,28 +384,112 @@ fn claim_payouts(network: MiningNetwork, win: &TokenWin) -> Vec<(u16, Vec<u8>)> 
     if win.operator.is_some() {
         return Vec::new();
     }
-    let payout = match win.declared.as_deref() {
+    let (split, plain) = match win.declared.as_deref() {
         Some(plan) => match plan.token_payout() {
-            Some(miner) => miner.to_vec(),
+            Some(miner) => (miner.to_vec(), miner.to_vec()),
             None => return Vec::new(),
         },
         None => {
             let Ok(scripts) = payout::scripts(network, &win.miner, None) else {
                 return Vec::new();
             };
-            payout::token_payout(&scripts, win.payout).to_vec()
+            (
+                payout::split_token_payout(&scripts, win.payout).to_vec(),
+                payout::token_payout(&scripts, win.payout).to_vec(),
+            )
         }
     };
     win.entries
         .iter()
-        .filter(|entry| win.aux.entries.get(usize::from(**entry)).is_some())
-        .map(|entry| (*entry, payout.clone()))
+        .filter_map(|entry| {
+            let item = win.aux.entries.get(usize::from(*entry))?;
+            let payout = if item.token.split { &split } else { &plain };
+            Some((*entry, payout.clone()))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #### merge-mining v2
+    // What: in a mixed set (a split token and one without split support)
+    // each won entry is claimed with the payout its own leaf binds: in a
+    // miner job, in the plain token's donation work and in BCH donation
+    // work.
+    // Look here if: claim_payouts or BchTemplate::aux_job changes.
+    #[test]
+    fn a_mixed_set_claims_each_entry_with_its_own_leaf_payout() {
+        use crate::donation::bch::BchPayout;
+        use crate::stratum_v2::{
+            merge::{
+                registry::{MergeToken, TEST_TOKEN},
+                set::{tests::test_state, SetEntry, TokenSet},
+            },
+            template::BchTemplate,
+            template_tests::{payout, rpc_template},
+        };
+        use std::sync::Arc;
+        let plain = Box::leak(Box::new(MergeToken {
+            category: [8; 32],
+            split: false,
+            ..TEST_TOKEN
+        }));
+        let set = TokenSet::new(
+            MiningNetwork::Chipnet,
+            vec![
+                SetEntry::new(&TEST_TOKEN, test_state()),
+                SetEntry::new(plain, test_state()),
+            ],
+            1,
+        )
+        .unwrap();
+        let mut template = BchTemplate::from_rpc(&rpc_template()).unwrap();
+        template.commit(Arc::new(set));
+        let policies = [
+            BchPayout::default(),
+            BchPayout {
+                token_donation_work: Some(true),
+                ..BchPayout::default()
+            },
+            BchPayout {
+                donation_work: true,
+                token_donation_work: Some(true),
+                ..BchPayout::default()
+            },
+        ];
+        for (case, policy) in policies.into_iter().enumerate() {
+            let aux = Arc::new(
+                template
+                    .aux_job(MiningNetwork::Chipnet, &payout(), None, policy)
+                    .unwrap()
+                    .unwrap(),
+            );
+            let win = TokenWin {
+                aux: aux.clone(),
+                entries: vec![0, 1],
+                coinbase: Vec::new(),
+                merkle_path: Vec::new(),
+                header: [0; 80],
+                hash: [0; 32],
+                height: 0,
+                payout: policy,
+                miner: payout(),
+                operator: None,
+                declared: None,
+            };
+            let claims = claim_payouts(MiningNetwork::Chipnet, &win);
+            assert_eq!(claims.len(), 2, "case {case}");
+            for (entry, script) in claims {
+                assert_eq!(
+                    double_sha256(&script),
+                    aux.entries[usize::from(entry)].leaf.payout_hash,
+                    "case {case}, entry {entry}"
+                );
+            }
+        }
+    }
 
     // #### PR #42
     // What: the test token's difficulty becomes a compact target that
