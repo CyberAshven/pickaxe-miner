@@ -823,6 +823,9 @@ struct SetupFlow {
     /// A share changes only after Enter opens it for editing, so a stray
     /// arrow key cannot move a split the operator settled on.
     share_editing: bool,
+    /// The ELECTRIC fee pot shown full-screen (F on the settings page), so
+    /// its QR code can be scanned whatever the terminal's size.
+    pot_view: bool,
     /// #### PR #53: the fee pot's balance as Start read it (sats, claims
     /// it pays), and the pot whose shortfall Start already warned about, so
     /// the next press starts anyway. Tests swap the reader.
@@ -1021,6 +1024,7 @@ impl SetupFlow {
             split: false,
             split_shares: None,
             share_editing: false,
+            pot_view: false,
             pot_balance: None,
             pot_warned: None,
             pot_reader: crate::electric::miner::pot_balance,
@@ -2472,6 +2476,7 @@ impl SetupFlow {
     fn open_settings(&mut self, row: SettingsRow) {
         self.step = SetupStep::Settings;
         self.share_editing = false;
+        self.pot_view = false;
         // #### PR #42: a row inside the closed Advanced section opens it.
         if !self.settings_rows().contains(&row) {
             self.advanced_open = true;
@@ -2953,7 +2958,17 @@ impl SetupFlow {
         let rows = self.settings_rows();
         let row = self.current_row();
         self.status_line.clear();
+        if self.pot_view {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('f' | 'F')
+            ) {
+                self.pot_view = false;
+            }
+            return SetupAction::Continue;
+        }
         match key.code {
+            KeyCode::Char('f' | 'F') if self.electric_in_use() => self.pot_view = true,
             // Esc first closes a share being edited, keeping its value.
             KeyCode::Esc if self.share_editing => self.share_editing = false,
             KeyCode::Esc => {
@@ -5299,6 +5314,12 @@ fn parse_palette_command(input: &str) -> Result<PaletteCommand, String> {
 /// Renders the current setup screen.
 fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
     let area = frame.area();
+    // #### PR #69: the fee pot full-screen takes the whole terminal, so its
+    // QR code fits whole even in small windows.
+    if state.step == SetupStep::Settings && state.pot_view && state.electric_in_use() {
+        render_electric_pot_full(frame, area, state);
+        return;
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -5367,6 +5388,11 @@ fn render_setup(frame: &mut Frame<'_>, state: &SetupFlow) {
             }
             SetupStep::Token => {
                 "[Up/Down] choose   [Type] search name, category or covenant   [Enter] select   [Esc] back"
+            }
+            // #### PR #69: one 78-column line, so an 80-column window keeps
+            // the second footer row for the status line (Start's warnings).
+            SetupStep::Settings if state.electric_in_use() => {
+                "[Up/Down] row  [Left/Right] change  [Enter] edit/start  [F] pot QR  [Esc] back"
             }
             SetupStep::Settings => {
                 "[Up/Down] row   [Left/Right] change   [Enter] edit / start   [Esc] back"
@@ -6218,44 +6244,185 @@ fn render_setup_settings(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
         frame.render_widget(settings, area);
         return;
     }
-    let pot = render_electric_pot(state);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(pot.1)])
+        .constraints([
+            Constraint::Min(40),
+            Constraint::Length(electric_pot_width(state)),
+        ])
         .split(area);
     frame.render_widget(settings, columns[0]);
-    frame.render_widget(pot.0, columns[1]);
+    frame.render_widget(render_electric_pot(state, columns[1]), columns[1]);
+}
+
+/// The fee pot panel's width: the QR code's, or the text's.
+fn electric_pot_width(state: &SetupFlow) -> u16 {
+    match &state.electric_pot {
+        None => 34,
+        Some((_, Err(_))) => 40,
+        Some((_, Ok(pot))) if pot.checking => 42,
+        Some((_, Ok(pot))) => {
+            (pot.qr.first().map_or(0, |row| row.chars().count()) as u16).max(42) + 2
+        }
+    }
+}
+
+/// #### PR #69: the pot's balance as one line.
+fn pot_balance_line(state: &SetupFlow) -> Line<'static> {
+    match &state.pot_balance {
+        None => Line::from(dim("Reading its balance…")),
+        Some(Ok((sats, 0))) => Line::from(Span::styled(
+            format!("Balance: {sats} sats · pays no claim yet"),
+            Style::default().fg(Color::Yellow),
+        )),
+        Some(Ok((sats, claims))) => Line::from(Span::styled(
+            format!(
+                "Balance: {sats} sats · pays {claims} claim{}",
+                if *claims == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(Color::Green),
+        )),
+        Some(Err(error)) => Line::from(dim(format!("Balance unread: {error}"))),
+    }
+}
+
+fn qr_line(row: &str, pad: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            row.to_owned(),
+            Style::default().fg(Color::White).bg(Color::Black),
+        ),
+    ])
+}
+
+/// #### PR #69: the fee pot full-screen (F), over the whole terminal: its
+/// balance, address and recovery key, and the largest whole QR code that
+/// fits, beside the text when there is width and under it otherwise.
+fn render_electric_pot_full(frame: &mut Frame<'_>, area: Rect, state: &SetupFlow) {
+    let block = Block::default()
+        .title(" ELECTRIC fee pot · scan to fund · [F] or [Esc] back ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let message = |frame: &mut Frame<'_>, text: &str| {
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(text.to_owned())]).wrap(Wrap { trim: false }),
+            inner,
+        );
+    };
+    let pot = match &state.electric_pot {
+        Some((_, Ok(pot))) if !pot.checking => pot,
+        Some((_, Ok(_))) => return message(frame, "Checking which fee pot mines…"),
+        Some((_, Err(error))) => return message(frame, error),
+        None => {
+            return message(
+                frame,
+                "No fee pot yet: enter your payout address in the settings.",
+            )
+        }
+    };
+    let text = vec![
+        pot_balance_line(state),
+        Line::from(""),
+        Line::from(Span::styled(
+            pot.address.clone(),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from("Send plain BCH here from your wallet."),
+        Line::from(dim("It pays each claim's 1,000 sats and fee;")),
+        Line::from(dim("the 1,000 sats come back with the tokens.")),
+        Line::from(""),
+        Line::from(format!("Refund key: {}", pot.key.display())),
+        Line::from(dim("Back it up; only it can refund the pot.")),
+    ];
+    let head = vec![
+        pot_balance_line(state),
+        Line::from(Span::styled(
+            pot.address.clone(),
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    let head_rows: u16 = head
+        .iter()
+        .map(|line| {
+            line.width()
+                .max(1)
+                .div_ceil(usize::from(inner.width.max(1))) as u16
+        })
+        .sum();
+    let large = crate::electric::ui::qr_lines_large(&pot.address).unwrap_or_default();
+    let size = |qr: &[String]| {
+        (
+            qr.first().map_or(0, |row| row.chars().count()) as u16,
+            qr.len() as u16,
+        )
+    };
+    // The text column beside the QR code; narrower than this, it goes under.
+    const TEXT_WIDTH: u16 = 30;
+    // Largest QR code first, beside the text and then under it.
+    for qr in [&large, &pot.qr] {
+        let (width, height) = size(qr);
+        if qr.is_empty() {
+            continue;
+        }
+        if height <= inner.height && width + 2 + TEXT_WIDTH <= inner.width {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(width + 2), Constraint::Min(TEXT_WIDTH)])
+                .split(inner);
+            let top = (inner.height - height) / 2;
+            let mut lines = vec![Line::from(""); usize::from(top)];
+            lines.extend(qr.iter().map(|row| qr_line(row, 1)));
+            frame.render_widget(Paragraph::new(lines), columns[0]);
+            frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), columns[1]);
+            return;
+        }
+        if width <= inner.width && head_rows + height <= inner.height {
+            let pad = usize::from((inner.width - width) / 2);
+            let mut lines = head;
+            lines.extend(qr.iter().map(|row| qr_line(row, pad)));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+            return;
+        }
+    }
+    let mut lines = text;
+    lines.insert(
+        1,
+        Line::from(Span::styled(
+            "Make the window larger to show the whole QR code.",
+            Style::default().fg(Color::Yellow),
+        )),
+    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// #### PR #58: ELECTRIC's fee pot, to fund before mining starts: its
-/// address, a QR code of it and where its recovery key is saved; and the
-/// panel's width.
-fn render_electric_pot(state: &SetupFlow) -> (Paragraph<'static>, u16) {
+/// address, a QR code of it and where its recovery key is saved.
+/// #### PR #69: its balance and address come first, and its QR code shows
+/// only when it fits whole in `area`; otherwise F shows it full-screen.
+fn render_electric_pot(state: &SetupFlow, area: Rect) -> Paragraph<'static> {
     let block = Block::default()
         .title(" ELECTRIC fee pot ")
         .borders(Borders::ALL);
-    let (lines, width) = match &state.electric_pot {
-        None => (
-            vec![
-                Line::from("Enter your payout address."),
-                Line::from(dim("Pickaxe then makes your fee pot")),
-                Line::from(dim("and shows it here to fund.")),
-            ],
-            34,
-        ),
-        Some((_, Err(error))) => (vec![Line::from(error.clone())], 40),
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let lines = match &state.electric_pot {
+        None => vec![
+            Line::from("Enter your payout address."),
+            Line::from(dim("Pickaxe then makes your fee pot")),
+            Line::from(dim("and shows it here to fund.")),
+        ],
+        Some((_, Err(error))) => vec![Line::from(error.clone())],
         // #### PR #65: no address to fund until it is known which pot mines.
-        Some((_, Ok(pot))) if pot.checking => (
-            vec![
-                Line::from("Checking which fee pot mines…"),
-                Line::from(dim("A previous funded pot with this key")),
-                Line::from(dim("is mined until it is migrated.")),
-                Line::from(format!("Refund key: {}", pot.key.display())),
-            ],
-            42,
-        ),
+        Some((_, Ok(pot))) if pot.checking => vec![
+            Line::from("Checking which fee pot mines…"),
+            Line::from(dim("A previous funded pot with this key")),
+            Line::from(dim("is mined until it is migrated.")),
+            Line::from(format!("Refund key: {}", pot.key.display())),
+        ],
         Some((_, Ok(pot))) => {
-            let qr_width = pot.qr.first().map_or(0, |row| row.chars().count()) as u16;
             let mut lines = Vec::new();
             if pot.previous {
                 let note = Style::default().fg(Color::Yellow);
@@ -6265,50 +6432,45 @@ fn render_electric_pot(state: &SetupFlow) -> (Paragraph<'static>, u16) {
                     Line::from(dim("Refund it to fund the signed-claim pot.")),
                 ]);
             }
+            // #### PR #53: what was read from the pot, first so it always shows.
+            lines.push(pot_balance_line(state));
             lines.extend([
-                Line::from("Send plain BCH here from your wallet."),
-                Line::from(dim("It pays each claim's 1,000 sats and fee;")),
-                Line::from(dim("the 1,000 sats come back with the tokens.")),
                 Line::from(Span::styled(
                     pot.address.clone(),
                     Style::default().fg(Color::Yellow),
                 )),
+                Line::from("Send plain BCH here from your wallet."),
+                Line::from(dim("It pays each claim's 1,000 sats and fee;")),
+                Line::from(dim("the 1,000 sats come back with the tokens.")),
             ]);
-            lines.extend(pot.qr.iter().map(|row| {
-                Line::from(Span::styled(
-                    row.clone(),
-                    Style::default().fg(Color::White).bg(Color::Black),
-                ))
-            }));
+            let rows_before: usize = lines
+                .iter()
+                .map(|line| line.width().max(1).div_ceil(inner_width.max(1)))
+                .sum();
+            let qr_width = pot.qr.first().map_or(0, |row| row.chars().count());
+            // The QR code only whole: a cut or wrapped one cannot be scanned.
+            if !pot.qr.is_empty()
+                && qr_width <= inner_width
+                && rows_before + pot.qr.len() < inner_height
+            {
+                let pad = (inner_width - qr_width) / 2;
+                lines.extend(pot.qr.iter().map(|row| qr_line(row, pad)));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "[F] shows the QR code full-screen",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
             lines.extend([
                 Line::from(format!("Refund key: {}", pot.key.display())),
                 Line::from(dim("Back it up; only it can refund the pot.")),
-                // #### PR #53: what was read from the pot.
-                match &state.pot_balance {
-                    None => Line::from(dim("Reading its balance…")),
-                    Some(Ok((sats, 0))) => Line::from(Span::styled(
-                        format!("Balance: {sats} sats · pays no claim yet"),
-                        Style::default().fg(Color::Yellow),
-                    )),
-                    Some(Ok((sats, claims))) => Line::from(Span::styled(
-                        format!(
-                            "Balance: {sats} sats · pays {claims} claim{}",
-                            if *claims == 1 { "" } else { "s" }
-                        ),
-                        Style::default().fg(Color::Green),
-                    )),
-                    Some(Err(error)) => Line::from(dim(format!("Balance unread: {error}"))),
-                },
             ]);
-            (lines, qr_width.max(42) + 2)
+            lines
         }
     };
-    (
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        width,
-    )
+    Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
 }
 
 /// #### PR #58: an ELECTRIC fee pot as the setup shows it.
@@ -8975,6 +9137,92 @@ mod tests {
     // #### PR #58: ELECTRIC is a GPU token whose setup makes and shows the
     // fee pot (address, QR code, saved recovery key) before mining starts,
     // and saves no profile.
+    // #### PR #69
+    // What: the fee pot's QR code is only ever drawn whole. The settings
+    // page's side panel shows the balance and address first and the QR code
+    // only when it fits; F shows the pot full-screen, with the largest whole
+    // QR code the terminal holds, and F, Esc or Enter go back.
+    // Why: in an 80x24 or 100x30 window the side panel cut or wrapped the
+    // QR code, which then could not be scanned, and hid the balance.
+    // Look here if: render_electric_pot(_full) or the settings keys change.
+    #[test]
+    fn the_fee_pot_qr_is_always_whole_and_f_shows_it_full_screen() {
+        let dir =
+            std::env::temp_dir().join(format!("pickaxe-pot-view-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut setup = setup_for(MiningMode::Gpu);
+        setup.profile_path = Some(dir.join("config.profiles.json"));
+        setup.step = SetupStep::Token;
+        type_text(&mut setup, "elec");
+        setup.handle_key(key(KeyCode::Enter));
+        setup.config.payout_address = chipnet_payout(5);
+        setup.refresh_electric_pot();
+        if let Some((_, Ok(pot))) = setup.electric_pot.as_mut() {
+            pot.checking = false;
+        }
+        setup.pot_balance = Some(Ok((2832, 0)));
+        let pot = setup.electric_pot.clone().unwrap().1.unwrap();
+        let large = crate::electric::ui::qr_lines_large(&pot.address).unwrap();
+        let draw = |setup: &SetupFlow, width: u16, height: u16| {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render_setup(frame, setup)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol().to_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let whole =
+            |screen: &str, qr: &[String]| qr.iter().all(|row| screen.contains(row.as_str()));
+        // Small window: no cut QR code in the side panel, the balance and
+        // the address first, and the way to the whole one.
+        let screen = draw(&setup, 80, 24);
+        assert!(!screen.contains('▀') && !screen.contains('▄'), "{screen}");
+        for expected in [
+            "Balance: 2832 sats · pays no claim yet",
+            &pot.address[..30],
+            "[F] shows the QR code full-screen",
+            "[F] pot QR  [Esc] back",
+        ] {
+            assert!(screen.contains(expected), "{expected}: {screen}");
+        }
+        // The keys fit one footer row, so a status line still shows.
+        setup.status_line = "The fee pot cannot pay a claim yet.".into();
+        let screen = draw(&setup, 80, 24);
+        assert!(
+            screen.contains("The fee pot cannot pay a claim yet."),
+            "{screen}"
+        );
+        setup.status_line.clear();
+        // Large enough: the whole QR code in the side panel.
+        assert!(whole(&draw(&setup, 120, 50), &pot.qr));
+        // F: full-screen, whole at 80x24 and 100x30, the large one when it fits.
+        setup.handle_key(key(KeyCode::Char('f')));
+        assert!(setup.pot_view);
+        for (width, height) in [(80, 24), (100, 30)] {
+            let screen = draw(&setup, width, height);
+            assert!(whole(&screen, &pot.qr), "{width}x{height}: {screen}");
+            assert!(screen.contains("Balance: 2832 sats"), "{screen}");
+            assert!(screen.contains("scan to fund"), "{screen}");
+        }
+        assert!(whole(&draw(&setup, 200, 60), &large));
+        // Other keys wait; F, Esc or Enter go back to the same row.
+        let row = setup.settings_row;
+        setup.handle_key(key(KeyCode::Down));
+        assert!(setup.pot_view && setup.settings_row == row);
+        setup.handle_key(key(KeyCode::Esc));
+        assert!(!setup.pot_view && setup.step == SetupStep::Settings);
+        setup.handle_key(key(KeyCode::Char('F')));
+        setup.handle_key(key(KeyCode::Enter));
+        assert!(!setup.pot_view);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn electric_setup_shows_the_fee_pot_to_fund_and_saves_its_profile() {
         let dir = std::env::temp_dir().join(format!(
