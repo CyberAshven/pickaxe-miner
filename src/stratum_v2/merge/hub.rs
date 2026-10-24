@@ -310,6 +310,7 @@ impl TokenHub {
             split: true,
         }));
         token.verify()?;
+        let won = won_in_journal(&journal_path, network, &deployment.category)?;
         Ok(Self {
             network,
             journal_path,
@@ -317,7 +318,7 @@ impl TokenHub {
             changed: AtomicBool::new(false),
             test: None,
             delay,
-            won: Mutex::new(VecDeque::new()),
+            won: Mutex::new(won),
             off: Mutex::new(None),
             safa: Some(SafaVaults {
                 deployment: Arc::new(deployment),
@@ -650,18 +651,7 @@ impl TokenHub {
             .journal
             .lock()
             .map_err(|_| "the token proof journal lock failed")?;
-        let mut entries = match std::fs::read(&self.journal_path) {
-            Ok(bytes) => {
-                let saved: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|_| "the token proof journal is unreadable")?;
-                if saved["version"] != 1 || saved["network"] != self.network.as_str() {
-                    return Err("the token proof journal is for another network or version".into());
-                }
-                saved["entries"].as_array().cloned().unwrap_or_default()
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.to_string()),
-        };
+        let mut entries = read_journal(&self.journal_path, self.network)?;
         if !change(&mut entries) {
             return Ok(());
         }
@@ -675,6 +665,59 @@ impl TokenHub {
         .map_err(|error| error.to_string())?;
         crate::config::write_private_atomic(&self.journal_path, &bytes)
     }
+}
+
+/// The proof journal's rows (none before it exists).
+fn read_journal(
+    path: &std::path::Path,
+    network: MiningNetwork,
+) -> Result<Vec<serde_json::Value>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let saved: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|_| "the token proof journal is unreadable")?;
+            if saved["version"] != 1 || saved["network"] != network.as_str() {
+                return Err("the token proof journal is for another network or version".into());
+            }
+            Ok(saved["entries"].as_array().cloned().unwrap_or_default())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+// #### merge-mining v2: won states survive a restart
+// What: a tSAFA hub opens with the states of its journal's live rows
+// (proven or broadcast) already won, newest last, so its jobs skip them
+// (and the thread rule walks past their threads).
+// Why: the won list lived in memory only; after a restart jobs mined
+// states that already had a pending claim, wasting work and journaling a
+// second proof for the same vault state.
+// Look here if: a restarted server mines a thread whose claim is pending.
+/// The (category, state hash) of `category`'s live rows in the journal.
+fn won_in_journal(
+    path: &std::path::Path,
+    network: MiningNetwork,
+    category: &Hash,
+) -> Result<VecDeque<(Hash, Hash)>, String> {
+    let category_hex = hex::encode(category);
+    let mut won = VecDeque::new();
+    for row in read_journal(path, network)? {
+        let live = matches!(row["status"].as_str(), Some("proven" | "broadcast"));
+        let state = row["state"]
+            .as_str()
+            .and_then(|text| hex::decode(text).ok())
+            .and_then(|bytes| <Hash>::try_from(bytes).ok());
+        if let (true, true, Some(state)) = (live, row["category"] == category_hex.as_str(), state) {
+            if !won.contains(&(*category, state)) {
+                if won.len() >= RECENT_STATES {
+                    won.pop_front();
+                }
+                won.push_back((*category, state));
+            }
+        }
+    }
+    Ok(won)
 }
 
 /// The satoshis a vault needs before its thread is mined: a claim's fee
@@ -1242,6 +1285,68 @@ mod tests {
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         saved["entries"].as_array().cloned().unwrap()
+    }
+
+    // #### merge-mining v2: won states survive a restart
+    // What: a hub reopened on a journal with a proven tSAFA row skips that
+    // state: the thread rule walks past its thread, and a share of it is
+    // not proven again; a stale or failed row does not count.
+    // Look here if: won_in_journal or TokenHub::safa change.
+    #[test]
+    fn a_restarted_hub_skips_states_it_already_won() {
+        use super::super::safa_auxpow::tests::chipnet_block;
+        let (height, _, _) = chipnet_block();
+        let (hub, path) = safa_hub("restart");
+        let vaults = vec![
+            safa_vault(1, height - 10, 0x2000_ffff, 2_000_000),
+            safa_vault(2, height - 10, 0x2000_ffff, 2_000_000),
+        ];
+        let mut chain = FakeChain {
+            tip: height - 1,
+            vaults: vec![vaults[0].clone()],
+            sent: Vec::new(),
+            refuse: None,
+            known: false,
+        };
+        hub.safa_tick(&mut chain, 0).unwrap();
+        let win = safa_win(&hub, height);
+        assert!(hub.first(&win));
+        assert_eq!(hub.record(&win).len(), 1);
+        drop(hub);
+        let reopen = || {
+            TokenHub::safa(
+                MiningNetwork::Chipnet,
+                path.clone(),
+                super::super::safa_auxpow::tests::deployment(42_000_000_000),
+                ClaimDelay { min: 0, max: 0 },
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let hub = reopen();
+        assert!(!hub.first(&win), "the journal's proven state is won");
+        hub.set_vaults(vaults.clone());
+        let set = hub.current_for(height).unwrap();
+        let category = set.entries()[0].token.category;
+        let threads: Vec<u32> = set
+            .threads(&category)
+            .unwrap()
+            .states
+            .iter()
+            .map(|(thread, _)| *thread)
+            .collect();
+        assert_eq!(threads, [2]);
+        // A stale row's state is free again.
+        hub.update_journal(|rows| {
+            rows[0]["status"] = "stale".into();
+            true
+        })
+        .unwrap();
+        let hub = reopen();
+        hub.set_vaults(vaults);
+        let set = hub.current_for(height).unwrap();
+        assert_eq!(set.threads(&category).unwrap().states.len(), 2);
+        let _ = std::fs::remove_file(path);
     }
 
     // #### merge-mining v2: a tSAFA win, from share to claim
