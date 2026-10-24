@@ -208,7 +208,7 @@ mod tests {
         );
         TEST_TOKEN.verify().unwrap();
         // #### merge-mining v2: the test token exercises the split.
-        assert!(TEST_TOKEN.split);
+        const { assert!(TEST_TOKEN.split) };
         // Rows that could not be mined or claimed as written are refused.
         let refused: [fn(&mut MergeToken); 3] = [
             |t| t.name = " ",
