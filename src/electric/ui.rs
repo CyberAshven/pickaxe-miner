@@ -109,6 +109,34 @@ struct PotView {
 /// `text` as QR code rows of half blocks, two modules per character, with
 /// a quiet zone of two modules. Light modules are drawn, so it scans with
 /// light characters on a dark background.
+/// The QR code at twice the size of `qr_lines`: one module per row and two
+/// characters wide, for a full-screen view a phone can scan from further
+/// away.
+pub fn qr_lines_large(text: &str) -> Result<Vec<String>, String> {
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M)
+        .map_err(|error| format!("QR code: {error}"))?;
+    let width = code.width();
+    let colors = code.to_colors();
+    const QUIET: usize = 2;
+    let size = width + 2 * QUIET;
+    Ok((0..size)
+        .map(|y| {
+            (0..size)
+                .map(|x| {
+                    let inside =
+                        (QUIET..QUIET + width).contains(&x) && (QUIET..QUIET + width).contains(&y);
+                    if !inside || colors[(y - QUIET) * width + (x - QUIET)] == qrcode::Color::Light
+                    {
+                        "██"
+                    } else {
+                        "  "
+                    }
+                })
+                .collect()
+        })
+        .collect())
+}
+
 pub fn qr_lines(text: &str) -> Result<Vec<String>, String> {
     let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M)
         .map_err(|error| format!("QR code: {error}"))?;
