@@ -71,7 +71,8 @@ with the coordinator's address and key (the one-line
 `stratum2+tcp://HOST:3340/KEY` fills both); Start mines as a rig.
 
 A rig needs no address, Fulcrum server or node of its own, and mines with the
-coordinator's donation setting (never below the token's minimum). It mines on
+coordinator's donation setting (the token's default unless changed, down to
+0%). It mines on
 every discrete GPU (`--device` and `--include-integrated` choose others), and
 prints one line per event: its GPUs at start, `connected`, each `job` and
 `winner`, and a `status` line with its rate every 10 seconds; `--json` prints
@@ -108,7 +109,7 @@ GPU mining keeps its farm values under **Advanced** on the settings page:
   coordinator (off by default; Left/Right turns port 3340 on, Enter types
   another), **This PC** (shown while the port is on) chooses whether it mines
   with its own GPUs too or only coordinates (`--rigs-only`), and the token
-  **Donation** (never below the token's minimum, 4% for PHOTON).
+  **Donation** (4% by default for PHOTON and ELECTRIC, down to 0%).
 - **Join a GPU pool or farm** (a rig): **Backups** takes backup coordinators,
   each `stratum2+tcp://HOST:3340/KEY`, tried in order after the main one,
   and **Rig name** names the rig on the coordinator's dashboard (the

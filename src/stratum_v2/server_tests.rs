@@ -641,7 +641,7 @@ impl Running {
             preferred,
             token_donation: header_work
                 .as_ref()
-                .map(|work| work.token().donation_minimum),
+                .map(|work| work.token().donation_default),
             header_work,
             node_zmq: None,
         };

@@ -141,7 +141,7 @@ pickaxe_miner stratum-v2 serve --config chipnet.json --listen 0.0.0.0:3336 \
 ```
 
 - **The test token** has SAFA's canonical layout with BIP320 version
-  rolling, a 1.5% donation minimum and no covenant. Its simulated thread
+  rolling, a 1.5% default donation and no covenant. Its simulated thread
   starts from a commitment naming no predecessor, keeps age 71 (so its
   target stays the one the difficulty sets), and starts its jobs two hours
   behind now, below the chain's median time.
@@ -155,9 +155,9 @@ pickaxe_miner stratum-v2 serve --config chipnet.json --listen 0.0.0.0:3336 \
   that follows it. A later win on the old thread is counted stale. A win
   that fails Pickaxe's own check is a bug: proofs turn off and devices keep
   mining.
-- **The donation** is the token's share of the work, never below its minimum
-  (the profile's token donation, 1.5% by default): donation jobs pay the
-  donation's forwarder.
+- **The donation** is the token's share of the work (the profile's token
+  donation, 1.5% by default, down to 0% if the miner chooses): donation jobs
+  pay the donation's forwarder.
 - The overview reads "no node: an ASIC-exclusive token instead of BCH" and
   lists the token with its difficulty and wins, such as "Pickaxe ASIC test
   token · difficulty 1.00K · wins 3 (2 proven, 1 stale, 0 dropped)"; its
