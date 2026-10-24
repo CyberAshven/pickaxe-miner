@@ -128,11 +128,10 @@ never raises the fee.
 
 **Claim outputs**, in order: the vault, the miner's remainder (paying
 `payout_hash`), the donation and the fee. Each of the last three is present
-only when its amount is above 0. A split output carries exactly 800 satoshis
+only when its amount is above 0. Each of them carries exactly 800 satoshis
 and fungible tokens only: the vault's category, no NFT capability, an amount
 of at least 1. Each present split output adds about 90 bytes to the claim,
-which the vault's fee pays for. The miner's output carries the token's payout
-dust (a token-level rule).
+which the vault's fee pays for.
 
 **Work jobs** (donation work and fee work) carry `ext = 0`: their leaves pay
 the donation (or the operator) whole. A token whose covenant does not verify
@@ -364,8 +363,9 @@ token authors. The format above does not depend on them.
 - **Fees and seeding.** The vault pays its own claim fee, computed at 1
   sat/byte from the sizes it parses out of the proof plus a constant `K`;
   `K` must include the redeem script and the commitment output. The claim has
-  an exact output count, and its payout output is capped at token dust. The
-  vault has no sponsor input, so seed every token thread with real BCH.
+  an exact output count, and each output after the vault carries exactly 800
+  satoshis. The vault has no sponsor input, so seed every token thread with
+  real BCH.
 - **Height.** `<cb_height> OP_CHECKLOCKTIMEVERIFY`, with the strict
   `state_height < cb_height`: a claim's coinbase must be newer than the
   thread's state.

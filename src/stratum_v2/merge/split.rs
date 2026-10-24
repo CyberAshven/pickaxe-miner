@@ -19,7 +19,7 @@
 //! A share worth less than [`MIN_SHARE_SATS`] at the vault's AMM price
 //! counts as 0 and stays with the miner. The claim's outputs are the vault,
 //! then the miner's remainder, the donation and the fee, each present only
-//! when above 0; a split output carries exactly [`SPLIT_OUTPUT_SATS`] and
+//! when above 0; each of them carries exactly [`SPLIT_OUTPUT_SATS`] and
 //! fungible tokens of the vault's category alone.
 //! Why: a merge-mined token's donation (and a pool's fee) follows BCH's
 //! formula: part of each win and part of the work.
@@ -37,7 +37,8 @@ pub const PREIMAGE_LEN: usize = 1 + 2 * (2 + 32);
 pub const MAX_BPS: u16 = 10_000;
 /// A share worth less than this many satoshis at the AMM price is 0.
 pub const MIN_SHARE_SATS: u64 = 1_000;
-/// The satoshis on each split output, exactly.
+/// The satoshis on each claim output after the vault (the miner's, the
+/// donation's and the fee's), exactly.
 pub const SPLIT_OUTPUT_SATS: u64 = 800;
 /// About how many bytes each split output adds to the claim, which the
 /// vault's fee pays for.
@@ -340,11 +341,16 @@ pub fn split_cost_sats(shares: &Shares, sats_per_byte: u64) -> u64 {
     split_outputs(shares) * (SPLIT_OUTPUT_SATS + SPLIT_OUTPUT_BYTES * sats_per_byte)
 }
 
+// #### merge-mining v2: 800 satoshis on every claim output
+// What: the miner's output, like the donation's and the fee's, carries
+// exactly 800 satoshis.
+// Why: BCH P2Pool's SAFA covenant checks all three the same way; a miner
+// output with more satoshis would take them from the vault.
+// Look here if: a claim's miner output is refused for its satoshis.
 /// Checks a claim's outputs after the vault against what its split
 /// expects: the same count and order, each paying its script and exactly
-/// its amount of the vault's fungible tokens, with no NFT; each split
-/// output carries exactly 800 satoshis. The miner's output carries the
-/// token's payout dust (a token-level rule, not checked here).
+/// its amount of the vault's fungible tokens, with no NFT, and each with
+/// exactly 800 satoshis.
 pub fn check_claim_outputs(
     expected: &[ExpectedOutput],
     outputs: &[TokenOutput],
@@ -359,7 +365,7 @@ pub fn check_claim_outputs(
             && got.nft.is_none()
             && got.amount == want.amount
             && got.amount >= 1
-            && (want.role == Role::Miner || got.sats == SPLIT_OUTPUT_SATS);
+            && got.sats == SPLIT_OUTPUT_SATS;
         if !fits {
             return Err(SplitError::Outputs);
         }
@@ -551,11 +557,12 @@ mod tests {
             nft: None,
             amount: want.amount,
         };
-        let good: Vec<_> = expected
-            .iter()
-            .map(|want| output(want, if want.role == Role::Miner { 1_000 } else { 800 }))
-            .collect();
+        let good: Vec<_> = expected.iter().map(|want| output(want, 800)).collect();
         assert_eq!(check_claim_outputs(&expected, &good, &category), Ok(()));
+        // The miner's output carries exactly 800 satoshis too.
+        let mut rich = good.clone();
+        rich[0].sats = 1_000;
+        assert!(check_claim_outputs(&expected, &rich, &category).is_err());
         // Another order, a missing output, 801 sats, an NFT, another
         // category or amount.
         let mut swapped = good.clone();
