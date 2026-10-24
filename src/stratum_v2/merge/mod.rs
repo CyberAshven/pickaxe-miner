@@ -27,6 +27,7 @@ pub mod registry;
 pub mod safa;
 pub mod set;
 pub mod source;
+pub mod split;
 pub mod tree;
 #[cfg(test)]
 mod vectors;
